@@ -20,6 +20,7 @@ test {
     _ = @import("antfly_local_sources").sql_aggregate_binding;
     _ = @import("antfly_local_sources").sql_compiler;
     _ = @import("antfly_local_sources").sql_scalar;
+    _ = @import("antfly_local_sources").sql_decision_eval;
     _ = @import("antfly_local_sources").sql_describe;
     _ = @import("antfly_local_sources").sql_runtime;
     _ = @import("insert_test.zig");

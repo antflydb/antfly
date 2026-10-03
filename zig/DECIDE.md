@@ -3,6 +3,108 @@
 Status: implemented in this worktree, based on `origin/main` at
 `f44ef220b7` (2026-09-29). The sections below retain the design rationale.
 
+The query DSL/SQL integration below is implemented on `design/decision-functions`. See [FUNCTIONS.md](FUNCTIONS.md) for the shared expression
+model, evaluation scope, and execution semantics.
+
+## Query integration (2026-10-02)
+
+Expose `ai_decide` consistently as a built-in in SQL and the JSON DSL. It accepts
+text state, named questions, and a configured decider and returns structured
+answers. Convenience built-ins expose one question as an ordinary scalar:
+
+| Built-in | Result | Mapping to existing contract |
+| --- | --- | --- |
+| `ai_decide` | Structured named answers | `answers` with choice/score/noul shapes |
+| `ai_choice` | Selected option ID | Highest-probability choice |
+| `ai_score` | Expected ordinal score | Sum of zero-based level index times probability |
+| `ai_probability` | Probability a statement is true | `noul` |
+
+Keep `/decide`, `/ai/v1/decide`, and the existing wire vocabulary unchanged.
+`ai_score` is not an arbitrary numeric rating. Probabilities are not assumed
+calibrated or comparable across models merely because they sum to one.
+
+Functions produce values consumed by computed predicates, projection, ordering,
+and aggregation. A decision is not itself a full-text retrieval primitive or a
+new graph node type. Named `compute` bindings retain results for multiple
+consumers; `where` compares those values. An explicit evaluation scope separates
+bounded, globally merged search candidates from all qualifying rows. Refer to
+[FUNCTIONS.md](FUNCTIONS.md) for JSON and SQL examples.
+
+### Decision providers
+
+Follow the capability/configuration boundary in `lib/reranking/src/mod.zig`,
+using `DecisionProvider` and `DeciderConfig`. A query references a configured
+instance with `decider: "support-decider"`; its configuration identifies the
+implementation with `provider: "antfly"`. Named configurations centralize
+credentials, endpoint policy, rate limits, and model settings.
+
+The initial implementation supports exactly two providers: `antfly` (Antfly
+inference) and `jev`. Both are required for the initial query-function release.
+OpenAI Decisions is in private preview and is deferred; its endpoint and schema
+are outside the initial design and implementation scope.
+
+```text
+DecisionProvider:
+  capabilities(config)
+  validate(specification)
+  evaluateBatch(context, specification, inputs)
+    -> ordered results + usage + provenance
+```
+
+Capabilities include question types, full-distribution support, input/question/
+option limits, batch size, concurrency limits, usage reporting, determinism,
+resolved model/version, and probability provenance. Bind and validate before
+retrieval. Batch responses preserve row alignment and expose item failures;
+errors fail the query unless an explicit alternative policy is selected.
+
+Start with `antfly`. The current endpoint accepts one state, so an HTTP adapter
+initially uses bounded concurrent requests. Add a multi-input inference contract
+later for actual server-side batching. Embedded consumers should reuse direct
+inference execution rather than loop back through HTTP. Both routes share
+validation, resource admission, deadlines, and cancellation.
+
+Implement the Jev adapter alongside Antfly, validating its contract against the
+capability model. A typed enum or numeric answer alone does not establish a
+probability distribution. Distinguish selected-value support from complete
+probabilities and reject probability-dependent operations when unsupported.
+Do not synthesize one-hot distributions or treat an LLM's self-reported
+confidence as equivalent to classifier probability. Preserve the expected
+ordinal meaning of score across adapters. Provider fallback is opt-in and
+records the provider/model that actually answered.
+
+### Execution, analytics, and stored decisions
+
+Use `DecisionEval` as a batch operator that supplies columns to the ordinary
+scalar evaluator. Avoid per-row network calls inside scalar evaluation. Apply
+authorization and ordinary independent filters before inference. Candidate
+evaluation follows global merging and precedes decision filtering/final limit;
+SQL full-match evaluation streams qualifying rows; DSL matches evaluation
+requires the complete relation to fit its explicit row and memory budgets. Budget exhaustion must not
+silently convert analytics into a sample.
+
+Return provider/model identity, usage, scope, and evaluation statistics. Define
+NULL propagation, error policy, conditional evaluation, cache reuse, and
+pagination consistently across SQL, JSON, and graph consumers, as specified in
+[FUNCTIONS.md](FUNCTIONS.md).
+
+Materialize decision outputs with the versioned decision asset producer for
+indexed consumption and repeated analytics. Store source revision, specification hash, model identity,
+and provenance. Refresh/invalidate explicitly as inputs or model specifications
+change. Graph integration begins with expressions over completed matches;
+traversal-time inference requires a separate frontier/work-budget contract.
+
+### Query integration sequence
+
+1. Shared function descriptors and expression binding.
+2. Antfly and Jev provider adapters and bounded `DecisionEval` execution.
+3. Candidate-stage JSON DSL and SQL projection/filtering.
+4. Full-match analytics using the same Antfly and Jev adapters.
+5. Graph-match expressions and versioned materialized enrichment.
+
+Validate global candidate windows, row/batch alignment, reuse, NULLs, SQL Boolean
+semantics, authorization, cancellation, budget failures, provider capabilities,
+and provenance before advertising these query surfaces. See FUNCTIONS.md for concrete supported combinations and validation commands.
+
 ## Implementation notes
 
 - `/ai/v1/decide` accepts the request shown below and returns all option

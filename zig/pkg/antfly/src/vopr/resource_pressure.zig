@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const request_admission = @import("../common/request_admission.zig");
+const request_admission = @import("antfly_local_sources").common_request_admission;
 const resource_manager = @import("antfly_local_sources").storage_resource_manager;
 const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 const vopr_durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");

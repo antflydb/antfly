@@ -602,3 +602,10 @@ comptime {
         }
     }
 }
+pub const functions_query_eval = @import("functions/query_eval.zig");
+pub const functions_runtime = @import("functions/runtime.zig");
+pub const functions_materialization = @import("functions/materialization.zig");
+pub const functions_decisions = @import("functions/decisions.zig");
+pub const functions_expressions = @import("functions/expressions.zig");
+pub const sql_decision_eval = @import("sql/decision_eval.zig");
+pub const common_request_admission = @import("common/request_admission.zig");

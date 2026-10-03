@@ -871,7 +871,7 @@ fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *d
         .schema_json_digest = schema_digest,
         .before_catalog_digest = before_catalog_digest,
         .after_catalog_digest = after_catalog_digest,
-        .raft_entry = .{ .term = 1, .index = 1 },
+        .ordered_receipt = .{ .term = 1, .index = 1 },
     });
     try parent.applyRelationalTopologyControl(.{ .action = .acknowledge_child_generation, .fence = parent_fence, .child_generations = &.{transition} }, null);
     {

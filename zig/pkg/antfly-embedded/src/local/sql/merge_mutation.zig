@@ -11,6 +11,8 @@ const describe = @import("describe.zig");
 const relation_binding = @import("relation_binding.zig");
 const joined_mutation = @import("joined_mutation.zig");
 const scalar = @import("scalar.zig");
+const decision_eval = @import("decision_eval.zig");
+const DecisionProvider = @import("../functions/decisions.zig").DecisionProvider;
 const Allocator = std.mem.Allocator;
 
 pub const Candidates = struct {
@@ -27,12 +29,16 @@ pub const Candidates = struct {
     /// The source-preserving join guarantees that a NULL target identity is a
     /// source-only row. SQL UNKNOWN does not satisfy a WHEN predicate.
     pub fn selectArm(self: Candidates, alloc: Allocator, cells: []const scalar.Datum, parameters: []const std.json.Value) !?usize {
+        return self.selectArmWithProvider(alloc, cells, parameters, null);
+    }
+
+    pub fn selectArmWithProvider(self: Candidates, alloc: Allocator, cells: []const scalar.Datum, parameters: []const std.json.Value, provider: ?DecisionProvider) !?usize {
         if (cells.len != self.query.columns.len or cells.len == 0) return error.InvalidSqlBackendResponse;
         const matched = !cells[0].sql_null;
         for (self.arms, 0..) |arm, index| {
             if (arm.matched != matched) continue;
             if (arm.predicate) |predicate| {
-                const result = try predicate.evaluate(alloc, cells, parameters, .{});
+                const result = try decision_eval.evaluate(alloc, provider, &predicate, cells, parameters);
                 if (result.sql_null) continue;
                 if (result.value != .bool) return error.InvalidSqlBackendResponse;
                 if (!result.value.bool) continue;
@@ -45,6 +51,10 @@ pub const Candidates = struct {
     /// Only the selected arm's programs run. Inactive expressions may contain
     /// errors and must never be evaluated during classification.
     pub fn evaluateValues(self: Candidates, alloc: Allocator, index: usize, cells: []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
+        return self.evaluateValuesWithProvider(alloc, index, cells, parameters, null);
+    }
+
+    pub fn evaluateValuesWithProvider(self: Candidates, alloc: Allocator, index: usize, cells: []const scalar.Datum, parameters: []const std.json.Value, provider: ?DecisionProvider) ![]const scalar.Datum {
         if (index >= self.arms.len or cells.len != self.query.columns.len) return error.InvalidSqlBackendResponse;
         const values = switch (self.arms[index].action) {
             .update => |assignments| assignments,
@@ -52,7 +62,7 @@ pub const Candidates = struct {
             .delete, .nothing => return &.{},
         };
         const result = try alloc.alloc(scalar.Datum, values.len);
-        for (values, result) |assignment, *output| output.* = if (assignment.program) |program| try program.evaluate(alloc, cells, parameters, .{}) else .{};
+        for (values, result) |assignment, *output| output.* = if (assignment.program) |program| try decision_eval.evaluate(alloc, provider, &program, cells, parameters) else .{};
         return result;
     }
 
@@ -60,25 +70,28 @@ pub const Candidates = struct {
     /// MERGE, unlike DELETE USING, must reject a target selected for more than
     /// one UPDATE/DELETE action rather than deduplicating or choosing a winner.
     pub fn classifyRows(self: Candidates, alloc: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value) ![]const ?usize {
-        return self.classifyRowsChecked(alloc, rows, nulls, parameters, null);
+        return self.classifyRowsChecked(alloc, alloc, rows, nulls, parameters, null, .{ .row_limit = (@import("runtime.zig").Limits{}).page_rows, .byte_limit = (@import("runtime.zig").Limits{}).page_bytes });
     }
 
-    fn classifyRowsChecked(self: Candidates, alloc: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, backend: ?catalog.Backend) ![]const ?usize {
+    fn classifyRowsChecked(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, backend: ?catalog.Backend, page_limits: decision_eval.PageBudget) ![]const ?usize {
         if (rows.len != nulls.len) return error.InvalidSqlBackendResponse;
+        for (self.arms) |arm| if (arm.predicate) |*program| {
+            if (decision_eval.hasExternal(program)) return self.classifyDecisionRows(alloc, scratch_allocator, rows, nulls, parameters, backend, page_limits);
+        };
         const selected = try alloc.alloc(?usize, rows.len);
         const cells = try alloc.alloc(scalar.Datum, self.query.columns.len);
         var affected: std.StringHashMapUnmanaged(void) = .empty;
         // Arm predicates return an ordinal, not a value borrowed from their
         // evaluator. Reuse one bounded scratch arena across candidate rows
         // instead of allocating and destroying an arena for every row.
-        var scratch = std.heap.ArenaAllocator.init(alloc);
+        var scratch = std.heap.ArenaAllocator.init(scratch_allocator);
         defer scratch.deinit();
         for (rows, nulls, selected) |row, flags, *slot| {
             if (backend) |active| try active.vtable.checkpoint(active.ptr);
             if (row.len != cells.len or flags.len != cells.len) return error.InvalidSqlBackendResponse;
             for (row, flags, cells) |value, is_null, *cell| cell.* = .{ .value = value, .sql_null = is_null };
             _ = scratch.reset(.retain_capacity);
-            slot.* = try self.selectArm(scratch.allocator(), cells, parameters);
+            slot.* = try self.selectArmWithProvider(scratch.allocator(), cells, parameters, if (backend) |active| active.decision_provider else null);
             if (slot.*) |index| switch (self.arms[index].action) {
                 .update, .delete => {
                     if (cells[0].sql_null or cells[0].value != .string) return error.InvalidSqlBackendResponse;
@@ -88,6 +101,118 @@ pub const Candidates = struct {
             };
         }
         return selected;
+    }
+
+    /// Arm order is SQL control flow: only unmatched rows of the appropriate
+    /// matched/source-only kind are eligible for the next predicate wave.
+    fn classifyDecisionRows(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, backend: ?catalog.Backend, page_limits: decision_eval.PageBudget) ![]const ?usize {
+        const selected = try alloc.alloc(?usize, rows.len);
+        @memset(selected, null);
+        var affected: std.StringHashMapUnmanaged(void) = .empty;
+        var arena = std.heap.ArenaAllocator.init(scratch_allocator);
+        defer arena.deinit();
+        var first: usize = 0;
+        while (first < rows.len) {
+            if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
+            const scratch = arena.allocator();
+            var budget = page_limits;
+            var page_cells: std.ArrayList([]const scalar.Datum) = .empty;
+            for (rows[first..], nulls[first..]) |row, flags| {
+                if (backend) |active| try active.vtable.checkpoint(active.ptr);
+                const input = try self.rowCells(scratch, row, flags);
+                try page_cells.append(scratch, input);
+                if (try budget.add(input)) break;
+            }
+            const cells = page_cells.items;
+            const end = first + cells.len;
+            for (self.arms, 0..) |arm, arm_index| {
+                var eligible: std.ArrayList([]const scalar.Datum) = .empty;
+                var positions: std.ArrayList(usize) = .empty;
+                for (cells, first..) |row, index| {
+                    if (selected[index] != null or arm.matched != !row[0].sql_null) continue;
+                    try eligible.append(scratch, row);
+                    try positions.append(scratch, index);
+                }
+                const values = if (arm.predicate) |*program|
+                    try decision_eval.evaluateBatch(scratch, if (backend) |active| active.decision_provider else null, program, eligible.items, parameters)
+                else
+                    null;
+                for (positions.items, 0..) |position, index| {
+                    if (values) |predicates| {
+                        if (predicates[index].sql_null) continue;
+                        if (predicates[index].value != .bool) return error.InvalidSqlBackendResponse;
+                        if (!predicates[index].value.bool) continue;
+                    }
+                    selected[position] = arm_index;
+                }
+            }
+            for (cells, first..) |row, index| if (selected[index]) |arm_index| switch (self.arms[arm_index].action) {
+                .update, .delete => {
+                    if (row[0].sql_null or row[0].value != .string) return error.InvalidSqlBackendResponse;
+                    if ((try affected.getOrPut(alloc, row[0].value.string)).found_existing) return error.SqlMutationCardinalityViolation;
+                },
+                .insert, .nothing => {},
+            };
+            first = end;
+        }
+        return selected;
+    }
+
+    fn rowCells(self: Candidates, alloc: Allocator, row: []const std.json.Value, flags: []const bool) ![]const scalar.Datum {
+        if (row.len == 0 or row.len != self.query.columns.len or flags.len != row.len) return error.InvalidSqlBackendResponse;
+        const cells = try alloc.alloc(scalar.Datum, row.len);
+        for (row, flags, cells) |value, is_null, *cell| cell.* = .{ .value = value, .sql_null = is_null };
+        return cells;
+    }
+
+    /// Resolve assignments only for each selected arm and retain their values
+    /// in the mutation arena. Pure mutation plans keep their existing hot path.
+    fn decisionAssignmentValues(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, rows: []const []const std.json.Value, nulls: []const []const bool, selected: []const ?usize, parameters: []const std.json.Value, page_limits: decision_eval.PageBudget) !?[]const ?[]const scalar.Datum {
+        var needed = false;
+        for (self.arms) |arm| switch (arm.action) {
+            .insert, .update => |assignments| for (assignments) |assignment| {
+                if (assignment.program) |*program| needed = needed or decision_eval.hasExternal(program);
+            },
+            .delete, .nothing => {},
+        };
+        if (!needed) return null;
+        const values = try alloc.alloc(?[]const scalar.Datum, rows.len);
+        @memset(values, null);
+        var arena = std.heap.ArenaAllocator.init(scratch_allocator);
+        defer arena.deinit();
+        for (self.arms, 0..) |arm, arm_index| {
+            const assignments = switch (arm.action) {
+                .insert, .update => |items| items,
+                .delete, .nothing => continue,
+            };
+            var first: usize = 0;
+            while (first < rows.len) {
+                if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
+                const scratch = arena.allocator();
+                var cells: std.ArrayList([]const scalar.Datum) = .empty;
+                var positions: std.ArrayList(usize) = .empty;
+                var budget = page_limits;
+                while (first < rows.len) : (first += 1) {
+                    if (selected[first] == null or selected[first].? != arm_index) continue;
+                    try backend.vtable.checkpoint(backend.ptr);
+                    try cells.append(scratch, try self.rowCells(scratch, rows[first], nulls[first]));
+                    try positions.append(scratch, first);
+                    const output = try alloc.alloc(scalar.Datum, assignments.len);
+                    @memset(output, .{});
+                    values[first] = output;
+                    if (try budget.add(cells.items[cells.items.len - 1])) {
+                        first += 1;
+                        break;
+                    }
+                }
+                for (assignments, 0..) |assignment, column| {
+                    const program = assignment.program orelse continue;
+                    const output = try decision_eval.evaluateBatch(scratch, backend.decision_provider, &program, cells.items, parameters);
+                    for (positions.items, output) |position, value| @constCast(values[position].?)[column] = try @import("operators.zig").cloneDatum(alloc, value);
+                }
+            }
+        }
+        return values;
     }
 
     /// Build one owned batch from the captured rows. This performs no write;
@@ -103,8 +228,19 @@ pub const Candidates = struct {
     };
 
     pub fn prepareWithSourceRows(self: Candidates, alloc: Allocator, backend: catalog.Backend, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, max_rows: usize, max_bytes: usize) !Prepared {
+        return self.prepareWithSourceRowsUsingScratch(alloc, alloc, backend, rows, nulls, parameters, max_rows, max_bytes);
+    }
+
+    /// Keep transient provider pages outside the owned mutation arena, so
+    /// releasing a page actually returns its memory to the request budget.
+    pub fn prepareWithSourceRowsUsingScratch(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, max_rows: usize, max_bytes: usize) !Prepared {
+        return self.prepareWithPageLimits(alloc, scratch_allocator, backend, rows, nulls, parameters, max_rows, max_bytes, .{ .row_limit = (@import("runtime.zig").Limits{}).page_rows, .byte_limit = (@import("runtime.zig").Limits{}).page_bytes });
+    }
+
+    fn prepareWithPageLimits(self: Candidates, alloc: Allocator, scratch_allocator: Allocator, backend: catalog.Backend, rows: []const []const std.json.Value, nulls: []const []const bool, parameters: []const std.json.Value, max_rows: usize, max_bytes: usize, page_limits: decision_eval.PageBudget) !Prepared {
         if (rows.len > max_rows or rows.len != nulls.len) return error.SqlResultTooLarge;
-        const selections = try self.classifyRowsChecked(alloc, rows, nulls, parameters, backend);
+        const selections = try self.classifyRowsChecked(alloc, scratch_allocator, rows, nulls, parameters, backend, page_limits);
+        const assignment_values = try self.decisionAssignmentValues(alloc, scratch_allocator, backend, rows, nulls, selections, parameters, page_limits);
         const cells = try alloc.alloc(scalar.Datum, self.query.columns.len);
         var mutations: std.ArrayList(catalog.Mutation) = .empty;
         var source_rows: std.ArrayList(usize) = .empty;
@@ -158,7 +294,7 @@ pub const Candidates = struct {
                 }
             }
             var key: ?[]const u8 = if (inserting) null else cells[0].value.string;
-            const values = try self.evaluateValues(alloc, arm_index, cells, parameters);
+            const values = if (assignment_values) |computed| computed[source_index] orelse &.{} else try self.evaluateValuesWithProvider(alloc, arm_index, cells, parameters, backend.decision_provider);
             for (assignments, values) |assignment, datum| {
                 if (assignment.program == null) continue; // DEFAULT: native preparation fills the absent cell.
                 const field = assignment.column;
@@ -873,7 +1009,7 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
         try read.select(bound.query);
     const flags = selected.sql_nulls orelse if (selected.rows.len == 0) &.{} else return error.InvalidSqlBackendResponse;
     if (flags.len != selected.rows.len) return error.InvalidSqlBackendResponse;
-    const prepared = try bound.prepareWithSourceRows(context.arena, context.backend, selected.rows, flags, context.parameters, context.limits.mutation_rows, context.limits.retained_bytes);
+    const prepared = try bound.prepareWithPageLimits(context.arena, context.alloc, context.backend, selected.rows, flags, context.parameters, context.limits.mutation_rows, context.limits.retained_bytes, .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes });
     if (bound.returning_plan) |plan| {
         if (prepared.mutations.len > context.limits.result_rows or prepared.source_rows.len != prepared.mutations.len) return error.SqlResultTooLarge;
         const normalized = if (prepared.mutations.len == 0) prepared.mutations else blk: {
@@ -883,8 +1019,11 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
         if (normalized.len != prepared.mutations.len) return error.InvalidSqlBackendResponse;
         const output_rows = try context.arena.alloc([]const std.json.Value, normalized.len);
         const output_nulls = try context.arena.alloc([]const bool, normalized.len);
+        var external = false;
+        for (plan.programs) |*program| external = external or decision_eval.hasExternal(program);
+        const returning_cells = if (external) try context.arena.alloc([]const scalar.Datum, normalized.len) else null;
         const cells = try context.arena.alloc(scalar.Datum, bound.query.columns.len);
-        for (normalized, prepared.mutations, prepared.source_rows, output_rows, output_nulls) |mutation, original, source_index, *values, *nulls| {
+        for (normalized, prepared.mutations, prepared.source_rows, output_rows, output_nulls, 0..) |mutation, original, source_index, *values, *nulls, returning_index| {
             try context.checkpoint();
             if (!std.mem.eql(u8, mutation.key, original.key) or mutation.expected_version != original.expected_version or
                 !std.meta.eql(mutation.expected_content_digest, original.expected_content_digest) or
@@ -904,15 +1043,50 @@ pub fn execute(context: anytype, bound: Candidates) !@import("runtime.zig").Outp
                     cells[index] = .{ .value = try describe.coerce(value, field.type), .sql_null = value == .null and !json_null };
                 }
             }
+            if (returning_cells) |all| {
+                all[returning_index] = try context.arena.dupe(scalar.Datum, cells);
+                continue;
+            }
             const projected = try context.arena.alloc(std.json.Value, plan.programs.len);
             const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
             for (plan.programs, projected, projected_nulls) |program, *value, *is_null| {
-                const datum = try program.evaluate(context.arena, cells, context.parameters, .{});
+                const datum = try decision_eval.evaluate(context.arena, context.backend.decision_provider, &program, cells, context.parameters);
                 value.* = try context.outputValue(datum.value);
                 is_null.* = datum.sql_null;
             }
             values.* = projected;
             nulls.* = projected_nulls;
+        }
+        if (returning_cells) |all| {
+            var arena = std.heap.ArenaAllocator.init(context.alloc);
+            defer arena.deinit();
+            var first: usize = 0;
+            while (first < all.len) {
+                try context.checkpoint();
+                if (!arena.reset(.retain_capacity)) return error.OutOfMemory;
+                const scratch = arena.allocator();
+                var budget: decision_eval.PageBudget = .{ .row_limit = context.limits.page_rows, .byte_limit = context.limits.page_bytes };
+                var end = first;
+                while (end < all.len) {
+                    const full = try budget.add(all[end]);
+                    end += 1;
+                    if (full) break;
+                }
+                const columns = try scratch.alloc([]const scalar.Datum, plan.programs.len);
+                for (plan.programs, columns) |*program, *values| values.* = try decision_eval.evaluateBatch(scratch, context.backend.decision_provider, program, all[first..end], context.parameters);
+                for (first..end) |index| {
+                    const projected = try context.arena.alloc(std.json.Value, plan.programs.len);
+                    const projected_nulls = try context.arena.alloc(bool, plan.programs.len);
+                    for (columns, projected, projected_nulls) |values, *value, *is_null| {
+                        const datum = values[index - first];
+                        value.* = try context.outputValue(datum.value);
+                        is_null.* = datum.sql_null;
+                    }
+                    output_rows[index] = projected;
+                    output_nulls[index] = projected_nulls;
+                }
+                first = end;
+            }
         }
         var output = try context.commitPreparedMutations(bound.target, normalized, "MERGE");
         output.columns = plan.columns;

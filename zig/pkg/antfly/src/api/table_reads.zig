@@ -557,6 +557,7 @@ pub const testing = if (builtin.is_test) struct {
 
 const ControlProvisionedTableReadCache = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -571,6 +572,7 @@ const PhysicalProvisionedTableReadCache = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
@@ -764,6 +766,7 @@ const PhysicalProvisionedTableReadCache = struct {
         return .{
             .backend_runtime = self.backend_runtime,
             .antfly_provider = providerWithCapabilityCache(self.antfly_provider, &@constCast(self).remote_capability_cache),
+            .decision_registry = self.decision_registry,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -2440,6 +2443,7 @@ fn encodeAlgebraicVectorWorkerRequestForSearchRequestAlloc(
 }
 
 pub const BoundTableReadSource = struct {
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     table_name: []const u8,
     db: *db_mod.DB,
     reads: raft_mod.FeatureDBReads,
@@ -2880,11 +2884,12 @@ pub const BoundTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
+        try validateDecisionRequest(alloc, req, self.decision_registry);
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
         try checkQueryDeadline(req);
 
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = collection_req orelse req;
+        const search_req = decisionCollectionRequest(collection_req orelse req);
         const start_ns = platform_time.monotonicNs();
         const phase_profile = benchQueryApiPhaseProfileEnabled();
         const prepare_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
@@ -2948,6 +2953,7 @@ pub const BoundTableReadSource = struct {
         const post_start_ns = if (phase_profile) platform_time.monotonicNs() else 0;
         try applyQueryPostProcessing(alloc, response_req, &result, &meta, .{
             .source_table = table_name,
+            .decision_registry = self.decision_registry,
             .backend_runtime = self.db.backend_runtime,
         });
         const post_ns = if (phase_profile) platform_time.monotonicNs() - post_start_ns else 0;
@@ -3274,6 +3280,7 @@ pub const ProvisionedTableReadSource = struct {
     resident_db: ?ResidentDbSource = null,
     hot_standby_read_gate: ?HotStandbyReadGate = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -3462,6 +3469,7 @@ pub const ProvisionedTableReadSource = struct {
         hosted.backend_runtime = self.backend_runtime;
         hosted.group_visible_root_generation = self.group_visible_root_generation;
         hosted.antfly_provider = self.antfly_provider;
+        hosted.decision_registry = self.decision_registry;
         hosted.inference_api_url = self.inference_api_url;
         hosted.secret_store = self.secret_store;
         hosted.remote_content = self.remote_content;
@@ -4199,6 +4207,7 @@ pub const ProvisionedTableReadSource = struct {
                 self.antfly_provider,
                 if (comptime control_only_storage_sources) null else if (self.cache) |cache| &cache.remote_capability_cache else null,
             ),
+            .decision_registry = self.decision_registry,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -4817,6 +4826,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try validateDecisionRequest(alloc, req, self.decision_registry);
         try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
@@ -4883,7 +4893,7 @@ pub const ProvisionedTableReadSource = struct {
                 // results below through the same routed physical provider.
             } else {
                 const local_collection_req = aggregationOnlyCollectionRequest(req);
-                const local_search_req = graphScopedSearchRequest(local_collection_req orelse req, group_ids.len, table_name);
+                const local_search_req = graphScopedSearchRequest(decisionCollectionRequest(local_collection_req orelse req), group_ids.len, table_name);
                 var execution = queryHostedLocalDetailed(routed.resident_db, routed.cache, routed.replica_root_dir, routed.catalog, routed.read_safety_barrier, alloc, group_ids[0], routed.visibleRootGeneration(group_ids[0]), routed.managedReadRuntimeConfig(), table_name, local_search_req, .stale, prepared.activity != null) catch |err| switch (err) {
                     error.ResidentDbRetryRequired => {
                         prepared.releaseActivity();
@@ -5002,7 +5012,7 @@ pub const ProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = graphScopedSearchRequest(collection_req orelse req, group_ids.len, table_name);
+        const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name);
         var merged = queryProvisionedAcrossGroups(routed, alloc, group_ids, search_req, table_name, .stale) catch |err| switch (err) {
             error.ResidentDbRetryRequired => {
                 prepared.releaseActivity();
@@ -5044,7 +5054,7 @@ pub const ProvisionedTableReadSource = struct {
     /// Ordinary single-shard aggregation is finalized by the physical provider
     /// under one read lease, before its captured generation is released.
     fn queryRequiresCoordinatorFinalization(req: db_mod.types.SearchRequest) bool {
-        return req.reranker != null or req.pruner != null or
+        return req.evaluation_limit > 0 or req.reranker != null or req.pruner != null or
             std.mem.indexOf(u8, req.aggregations_json, "\"algebraic_join\"") != null;
     }
 
@@ -6216,6 +6226,7 @@ pub const HostedProvisionedTableReadSource = struct {
     internal_service_issuer: ?[]const u8 = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -6317,6 +6328,7 @@ pub const HostedProvisionedTableReadSource = struct {
         return .{
             .backend_runtime = self.backend_runtime,
             .antfly_provider = providerWithCapabilityCache(self.antfly_provider, self.remote_capability_cache),
+            .decision_registry = self.decision_registry,
             .inference_api_url = self.inference_api_url,
             .secret_store = self.secret_store,
             .reranker_runtime = self.reranker_runtime,
@@ -7303,6 +7315,7 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
+        try validateDecisionRequest(alloc, req, hosted.decision_registry);
         const timed_req = graphTimedSearchRequest(req);
         // A graph retry re-runs its base scan and every shard fanout. Keep the
         // public retry budget to one fresh topology snapshot so churn cannot
@@ -7411,7 +7424,7 @@ pub const HostedProvisionedTableReadSource = struct {
             return try query_api.encodeQueryResponses(alloc, table_name, graph_req, meta, merged);
         }
         const collection_req = aggregationOnlyCollectionRequest(req);
-        const search_req = graphScopedSearchRequest(collection_req orelse req, group_ids.len, table_name);
+        const search_req = graphScopedSearchRequest(decisionCollectionRequest(collection_req orelse req), group_ids.len, table_name);
         var merged = try queryHostedAcrossGroups(self, alloc, group_ids, search_req, table_name, consistency);
         try checkQueryDeadline(req);
         defer merged.deinit();
@@ -8133,6 +8146,7 @@ fn routeDeadlineFromTimeoutMs(catalog: table_catalog.CatalogSource, timeout_ms: 
 const ManagedReadRuntimeConfig = struct {
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    decision_registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     reranker_runtime: ?*reranking_runtime.Runtime = null,
@@ -8570,7 +8584,60 @@ fn queryHostedAcrossGroupsParallel(
     return merged;
 }
 
+fn validateDecisionRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, registry: ?*const @import("antfly_local_sources").common_provider_registry.Registry) !void {
+    if (req.evaluation_limit == 0) return;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var empty_registry = @import("antfly_local_sources").common_provider_registry.Registry.init(a);
+    defer empty_registry.deinit();
+    const configs = registry orelse &empty_registry;
+    const raw = try std.json.parseFromSliceLeaky(std.json.Value, a, req.evaluation_json, .{});
+    const plan = try @import("antfly_local_sources").functions_expressions.Plan.parse(a, raw);
+    if (plan.graph_query) |name| {
+        var found = false;
+        for (req.graph_queries) |graph| if (std.mem.eql(u8, graph.name, name)) {
+            found = true;
+            if (graph.query.match_pattern == null or graph.query.aggregates.len > 0 or !graph.query.include_documents) return error.UnsupportedQueryRequest;
+            for (plan.required_fields) |field| {
+                const end = std.mem.indexOfScalar(u8, field, '.') orelse field.len;
+                var known = false;
+                for (graph.query.return_aliases) |alias| if (std.mem.eql(u8, alias, field[0..end])) {
+                    known = true;
+                    break;
+                };
+                if (!known) return error.UnknownFunctionBinding;
+            }
+        };
+        if (!found) return error.InvalidFunctionExpression;
+    }
+
+    const Validate = struct {
+        fn call(ptr: *anyopaque, name: []const u8, questions: std.json.Value) !void {
+            const cfgs: *const @import("antfly_local_sources").common_provider_registry.Registry = @ptrCast(@alignCast(ptr));
+            const cfg = try cfgs.getDeciderConfig(name);
+            try @import("antfly_local_sources").functions_decisions.validateQuestions(questions, @import("antfly_local_sources").functions_decisions.capabilities(cfg.provider));
+        }
+        fn unavailable(_: *anyopaque, _: std.mem.Allocator, _: []const @import("antfly_local_sources").functions_decisions.Request) ![]const std.json.Value {
+            return error.DecisionProviderUnavailable;
+        }
+    };
+    const provider: @import("antfly_local_sources").functions_decisions.DecisionProvider = .{ .ptr = @constCast(configs), .validate_fn = Validate.call, .evaluate_batch_fn = Validate.unavailable };
+    try @import("antfly_local_sources").functions_expressions.validatePlanProviders(a, plan, provider);
+}
+
+fn decisionCollectionRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
+    var copy = req;
+    if (req.hasHitEvaluation()) {
+        copy.limit = req.evaluation_limit;
+        copy.offset = 0;
+        copy.count_only = false;
+    }
+    return copy;
+}
+
 fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
+    if (req.hasHitEvaluation()) return req.evaluation_limit;
     if (req.graph_metric_rerank) |rerank| {
         return db_mod.types.graphMetricRerankCandidateCount(rerank, req.offset, req.limit);
     }
@@ -8593,7 +8660,7 @@ const DistributedCoordinatorPaging = struct {
 /// Graph-metric reranking is computed against shard-local published vectors,
 /// then merged by final score using the caller's page at the coordinator.
 fn distributedCoordinatorPaging(req: db_mod.types.SearchRequest) DistributedCoordinatorPaging {
-    if (req.reranker != null or req.pruner != null) return .{
+    if (req.hasHitEvaluation() or req.reranker != null or req.pruner != null) return .{
         .offset = 0,
         .limit = distributedSearchShardLimit(req),
     };
@@ -8759,6 +8826,10 @@ fn distributedSearchShardRequest(
     // Provider calls are coordinator-owned. In particular, a remote shard
     // must never rerank independently and then be reranked a second time after
     // the global merge.
+    copy.evaluation_json = "";
+    copy.evaluation_limit = 0;
+    copy.evaluation_matches = false;
+    copy.evaluation_graph = false;
     copy.reranker = null;
     copy.reranker_query_text = "";
     // Graph-metric scoring remains shard-local because its published vector is
@@ -11674,7 +11745,7 @@ fn profiledDenseQuery(req: db_mod.types.SearchRequest) ?ProfiledDenseQuery {
     if (req.graph_metric_queries.len > 0 or req.graph_metric_rerank != null) return null;
     if (req.dense_queries.len > 1) return null;
     if (req.merge_config != null) return null;
-    if (req.reranker != null or req.pruner != null) return null;
+    if (req.evaluation_limit > 0 or req.reranker != null or req.pruner != null) return null;
     if (req.dense_queries.len == 1) {
         var dense_req = req;
         dense_req.index_name = req.dense_queries[0].index_name;
@@ -11703,7 +11774,7 @@ fn isDenseOnlyQuery(req: db_mod.types.SearchRequest) bool {
     if (req.sparse != null or req.sparse_queries.len > 0) return false;
     if (req.graph_queries.len > 0) return false;
     if (req.graph_metric_queries.len > 0 or req.graph_metric_rerank != null) return false;
-    if (req.reranker != null or req.pruner != null) return false;
+    if (req.evaluation_limit > 0 or req.reranker != null or req.pruner != null) return false;
     if (req.filter_query_json.len > 0 or req.exclusion_query_json.len > 0) return false;
 
     const query_is_dense_or_neutral = switch (req.query) {
@@ -15223,6 +15294,10 @@ fn applyQueryPostProcessing(
     meta: *query_api.QueryResponseMeta,
     runtime_cfg: ManagedReadRuntimeConfig,
 ) !void {
+    if (req.evaluation_limit > 0) {
+        try @import("antfly_local_sources").functions_query_eval.apply(alloc, req, result, meta, runtime_cfg);
+        return;
+    }
     if ((req.reranker == null and req.pruner == null) or result.hits.len == 0) return;
     const candidate_count = if (req.reranker != null)
         try applyReranker(alloc, req, result, meta, runtime_cfg)
@@ -18694,6 +18769,27 @@ fn consumerTests() type {
             try std.testing.expect(capability.sortable);
             try std.testing.expectEqualStrings("observed_declared", capability.doc_value_coverage);
             try std.testing.expectEqualStrings("declared", capability.queryability_state);
+        }
+
+        test "api query contract graph evaluation preserves base hit paging and shard windows" {
+            const req: db_mod.types.SearchRequest = .{ .limit = 2, .offset = 3, .evaluation_limit = 20, .evaluation_graph = true };
+            const collection = decisionCollectionRequest(req);
+            try std.testing.expectEqual(@as(u32, 2), collection.limit);
+            try std.testing.expectEqual(@as(u32, 3), collection.offset);
+            const shard = distributedSearchShardRequest(req, &.{}, false);
+            try std.testing.expectEqual(@as(u32, 5), shard.limit);
+            try std.testing.expectEqual(@as(u32, 0), shard.offset);
+            try std.testing.expect(!shard.evaluation_graph);
+            const coordinator = distributedCoordinatorPaging(req);
+            try std.testing.expectEqual(@as(u32, 3), coordinator.offset);
+            try std.testing.expectEqual(@as(u32, 2), coordinator.limit);
+            var count = req;
+            count.count_only = true;
+            try std.testing.expect(decisionCollectionRequest(count).count_only);
+            var hits = req;
+            hits.evaluation_graph = false;
+            try std.testing.expectEqual(@as(u32, 20), decisionCollectionRequest(hits).limit);
+            try std.testing.expectEqual(@as(u32, 0), distributedCoordinatorPaging(hits).offset);
         }
 
         test "distributed reranking widens retrieval and stays coordinator owned" {

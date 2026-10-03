@@ -300,6 +300,7 @@ pub const MetadataServer = struct {
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+            public_read_source.decision_registry = if (cfg.api_server_cfg.node_config) |node_config| &node_config.registry else null;
             _ = public_read_source.withBackendRuntime(backend_runtime);
             _ = public_read_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_read_source.withSecretStore(cfg.api_server_cfg.secret_store);

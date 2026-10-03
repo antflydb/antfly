@@ -9,7 +9,7 @@ release changes belong to the separate licensing PR.
 
 | Owner | Responsibility |
 | --- | --- |
-| `pkg/antfly-embedded/src/local` | DB, WAL, LSM, indexes, search, graph execution, local transactions, local backups/restore, Lite, public C API and file CLI |
+| `pkg/antfly-embedded/src/local` | DB, WAL, LSM, indexes, search, graph execution, local transactions, local backups/restore, SQL and decision-function evaluation, Lite, public C API and file CLI |
 | `pkg/antfly-embedded/src/inference` | Antfly inference providers and embedding integration |
 | `pkg/inference` | Model execution, inference host and native provider exports |
 | `pkg/antfly/src` | HTTP handlers, distributed transactions, Raft coordination, cluster metadata, hot standby, server storage-owner adapters and private C API |

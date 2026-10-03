@@ -594,7 +594,7 @@ test "child FK generation schema install commits catalog and source release with
     fence.transition_id = 12;
     fence.admission_epoch = 2;
     try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = fence }, null);
-    const publication: db_mod.DB.PublishedChildSchema = .{ .fence = fence, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest, .raft_entry = .{ .term = 1, .index = 1 } };
+    const publication: db_mod.DB.PublishedChildSchema = .{ .fence = fence, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest, .ordered_receipt = .{ .term = 1, .index = 1 } };
     var changed = publication;
     changed.after_catalog_digest = @splat(9);
     try std.testing.expectError(error.IntegrityCatalogChanged, db.installPublishedChildSchema(alloc, after_json, changed));
@@ -602,8 +602,8 @@ test "child FK generation schema install commits catalog and source release with
     changed.before_schema_json_digest = @splat(9);
     try std.testing.expectError(error.IntegrityCatalogChanged, db.installPublishedChildSchema(alloc, after_json, changed));
     const command: topology.Command = .{ .action = .install_child_schema, .fence = fence, .child_schema_install = .{ .schema_json = after_json, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest } };
-    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.raft_entry);
-    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.raft_entry);
+    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.ordered_receipt);
+    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.ordered_receipt);
     const installed = (try db.getSchemaJson(alloc)).?;
     defer alloc.free(installed);
     try std.testing.expectEqualStrings(after_json, installed);
@@ -634,8 +634,8 @@ test "child FK generation schema install commits catalog and source release with
         .schema_json_digest = schema_json_digest,
         .before_catalog_digest = before_digest,
         .after_catalog_digest = @splat(9),
-        .applied_term = publication.raft_entry.term,
-        .applied_index = publication.raft_entry.index,
+        .applied_term = publication.ordered_receipt.term,
+        .applied_index = publication.ordered_receipt.index,
     });
     defer alloc.free(bad_payload);
     const bad_record: @import("replication_record.zig").Record = .{
@@ -655,8 +655,8 @@ test "child FK generation schema install commits catalog and source release with
         .schema_json_digest = schema_json_digest,
         .before_catalog_digest = before_digest,
         .after_catalog_digest = after_digest,
-        .applied_term = publication.raft_entry.term,
-        .applied_index = publication.raft_entry.index,
+        .applied_term = publication.ordered_receipt.term,
+        .applied_index = publication.ordered_receipt.index,
     });
     defer alloc.free(payload);
     const record: @import("replication_record.zig").Record = .{

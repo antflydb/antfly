@@ -497,6 +497,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    common_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     common_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
     common_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     common_openapi_mod.addImport("antfly_middleware_openapi", middleware_openapi_mod);

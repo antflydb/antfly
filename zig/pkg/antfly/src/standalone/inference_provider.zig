@@ -43,6 +43,7 @@ pub const inferenceProviderGenerateText = local.inferenceProviderGenerateText;
 pub const inferenceProviderGenerateTextWithContext = local.inferenceProviderGenerateTextWithContext;
 pub const inferenceProviderGenerateMessages = local.inferenceProviderGenerateMessages;
 pub const inferenceProviderGenerateJson = local.inferenceProviderGenerateJson;
+pub const inferenceProviderDecideJson = local.inferenceProviderDecideJson;
 pub const inferenceProviderGenerateMessagesWithContext = local.inferenceProviderGenerateMessagesWithContext;
 pub const inferenceProviderGenerateMessagesWithAttachments = local.inferenceProviderGenerateMessagesWithAttachments;
 pub const inferenceProviderGenerateMessagesWithAttachmentsWithContext = local.inferenceProviderGenerateMessagesWithAttachmentsWithContext;

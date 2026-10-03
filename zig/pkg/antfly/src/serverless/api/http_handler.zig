@@ -109,7 +109,7 @@ const parseOwnedJsonValueAlloc = json_helpers.parseOwnedJsonValueAlloc;
 const common_config = @import("antfly_local_sources").common_config;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const api_operation = @import("antfly_local_sources").api_operation;
-const request_admission = @import("../../common/request_admission.zig");
+const request_admission = @import("antfly_local_sources").common_request_admission;
 const RequestAdmission = request_admission.RequestAdmission;
 
 pub const HttpRequest = http_types.HttpRequest;

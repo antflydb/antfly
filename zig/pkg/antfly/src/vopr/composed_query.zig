@@ -9,7 +9,7 @@ const std = @import("std");
 const vopr = @import("vopr");
 const api_operation = @import("antfly_local_sources").api_operation;
 const query_api = @import("antfly_local_sources").api_query;
-const request_admission = @import("../common/request_admission.zig");
+const request_admission = @import("antfly_local_sources").common_request_admission;
 const db_types = @import("antfly_local_sources").storage_db_types;
 const graph_exec = @import("antfly_local_sources").storage_db_query_graph_exec;
 
