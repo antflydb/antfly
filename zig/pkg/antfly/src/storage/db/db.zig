@@ -9629,9 +9629,7 @@ pub const DB = struct {
     /// but cannot choose cleanup effects or mutate its local directory on its own.
     fn graphEndpointCleanupWriteAuthority(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        if (!replicationWriteGateAllowsBackgroundWork(self.local_execution.replication_write_gate)) return false;
-        try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
-        return true;
+        return if (self.local_execution.replication_write_gate) |gate| gate.allowsBackgroundWrite() else true;
     }
 
     fn canRunLocalGraphEndpointCleanup(self: *DB) !bool {

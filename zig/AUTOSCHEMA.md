@@ -286,6 +286,11 @@ public batch requests cannot supply these fields. Dropping afterimages would
 leave owner jobs stuck at their old phase. Ordered application uses the local
 receipt contract, while the server adapter owns consensus and replication
 policy (see `docs/design/local-replication-boundary.md`).
+Cleanup planning requires both background scheduling permission and current
+write admission through the generic replication gate, including its pinned
+owner generation. A denied owner leaves maintenance queued; ordered replay
+can still apply the primary's exact page. Execution rechecks admission at the
+ordinary mutation commit barriers.
 
 Relation edges are entity-sourced with document ownership: a relation whose
 endpoints reference extraction entities materializes only once resolution

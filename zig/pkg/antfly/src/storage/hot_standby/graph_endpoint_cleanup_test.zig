@@ -57,13 +57,12 @@ test "db graph endpoint cleanup pages HA mirrors exact effects across directory 
         const names = [_][]const u8{"standby-a"};
         if (sync_mirror) try stream.createSlot("standby-a", 0);
         var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-        primary.local_execution.replication_async_batch_mirror = .{
-            .publisher = publisher_adapter.bind(&stream),
+        primary.local_execution.replication_async_batch_mirror = publisher_adapter.bindMirror(&stream, .{
             .last_lsn = &last_lsn,
             .sync_policy = if (sync_mirror) .{ .mode = .remote_apply, .standby_names = &names, .failure_policy = .block } else .{},
             .sync_wait_ctx = &wait_ctx,
             .sync_wait_fn = Wait.wait,
-        };
+        });
         try std.testing.expect(try engine.test_support.runStandaloneGraphEndpointCleanupStep(&primary));
         var entry = (try stream.log.entryAt(alloc, last_lsn.load(.acquire))).?;
         defer entry.deinit(alloc);
@@ -159,7 +158,7 @@ test "db graph endpoint cleanup pages HA promotion requires fresh owner generati
         try std.testing.expect(try old_owner.core.store.hasGraphEndpointCleanup());
     }
     var primary_opts = opts;
-    primary_opts.replication_async_batch_mirror = .{ .publisher = publisher_adapter.bind(&stream) };
+    primary_opts.replication_async_batch_mirror = publisher_adapter.bindMirror(&stream, .{});
     var primary = try DB.open(alloc, directory.path(), primary_opts);
     defer primary.close();
     try std.testing.expect(!try primary.core.store.hasGraphEndpointCleanup());
@@ -205,7 +204,7 @@ test "db graph owner revival HA mirrors bounded checkpoints across restart and d
     }
     try replica.core.store.invalidateGraphDirectories();
     var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
-    primary.local_execution.replication_async_batch_mirror = .{ .publisher = publisher_adapter.bind(&stream), .last_lsn = &last_lsn };
+    primary.local_execution.replication_async_batch_mirror = publisher_adapter.bindMirror(&stream, .{ .last_lsn = &last_lsn });
     var gate: ha_public_gate_state_mod.State = .{};
     gate.role.store(@intFromEnum(ha_public_gate_state_mod.Role.standby), .release);
     const replica_options: OpenOptions = .{ .replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } }, .start_optional_runtimes = false, .start_index_workers = false };

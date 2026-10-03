@@ -214,6 +214,15 @@ pub const WriteGate = union(enum) {
         };
     }
 
+    /// Maintenance planning needs both scheduling permission and current write
+    /// admission, including an owner's pinned generation. A denial leaves work
+    /// queued; mutation execution must check again under its commit barriers.
+    pub fn allowsBackgroundWrite(self: WriteGate) bool {
+        if (!self.allowsBackgroundWork()) return false;
+        self.check() catch return false;
+        return true;
+    }
+
     pub fn currentGeneration(self: WriteGate) ?u64 {
         return switch (self) {
             .shared => |gate| gate.state.currentGeneration(),
@@ -273,12 +282,16 @@ test "storage.hot_standby engine shared admission pins generation across role ch
     const gate: WriteGate = .{ .shared = .{ .state = .{ .ptr = &state, .vtable = &State.vtable } } };
     const pinned = gate.pinned();
     try pinned.check();
+    try std.testing.expect(pinned.allowsBackgroundWrite());
     state.generation += 1;
     try std.testing.expectError(error.StaleWriteAdmission, pinned.check());
+    try std.testing.expect(!pinned.allowsBackgroundWrite());
     try gate.check();
+    try std.testing.expect(gate.allowsBackgroundWrite());
     state.standby = true;
     try std.testing.expectError(error.WriteAdmissionRejected, gate.check());
     try std.testing.expect(!gate.allowsBackgroundWork());
+    try std.testing.expect(!gate.allowsBackgroundWrite());
 }
 
 pub fn requiresDurableLifecycleReplication(req: @import("types.zig").BatchRequest) bool {
@@ -300,8 +313,13 @@ test "storage.hot_standby borrowed admission controls maintenance independently 
     const read_only: WriteGate = .{ .borrowed = .{ .ptr = &context, .check_fn = Check.reject, .allows_background_work = false } };
     try writable.check();
     try std.testing.expect(writable.allowsBackgroundWork());
+    try std.testing.expect(writable.allowsBackgroundWrite());
     try std.testing.expectError(error.WriteAdmissionRejected, read_only.check());
     try std.testing.expect(!read_only.allowsBackgroundWork());
+    try std.testing.expect(!read_only.allowsBackgroundWrite());
+    const denied: WriteGate = .{ .borrowed = .{ .ptr = &context, .check_fn = Check.reject } };
+    try std.testing.expect(denied.allowsBackgroundWork());
+    try std.testing.expect(!denied.allowsBackgroundWrite());
     try std.testing.expect(!writable.eql(read_only));
     try std.testing.expect(writable.eql(writable.pinned()));
 }
