@@ -19,6 +19,15 @@ pub const Bound = struct {
     predicate: ?scalar.Program = null,
     required: []const u32 = &.{},
 
+    pub fn validateDecisions(self: Bound, alloc: Allocator, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !void {
+        const evaluator = @import("decision_eval.zig");
+        if (self.predicate) |*program| try evaluator.validate(alloc, provider, program, parameters);
+        for (self.projections) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
+        for (self.orders) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
+        for (self.assignments) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
+        for (self.insert_rows) |row| for (row) |optional| if (optional) |*program| try evaluator.validate(alloc, provider, program, parameters);
+    }
+
     /// Page-local cells. Required ordinals only are materialized; generated
     /// expression values use the same page arena and cannot retain prior pages.
     pub fn cells(self: Bound, alloc: Allocator, row: catalog.Row) ![]const scalar.Datum {
@@ -27,29 +36,39 @@ pub const Bound = struct {
         @memset(out, .{});
         for (self.required) |ordinal| {
             const cell = try row.cell(self.columns[ordinal].name);
-            out[ordinal] = .{ .value = try @import("describe.zig").coerce(cell.value, self.columns[ordinal].type), .sql_null = cell.sql_null };
+            out[ordinal] = .{ .value = try @import("describe.zig").coerceAlloc(alloc, cell.value, self.columns[ordinal].type), .sql_null = cell.sql_null };
         }
         return out;
     }
 
     pub fn matches(self: Bound, alloc: Allocator, values: []const scalar.Datum, parameters: []const std.json.Value) !bool {
+        return self.matchesWithProvider(alloc, values, parameters, null);
+    }
+
+    pub fn matchesWithProvider(self: Bound, alloc: Allocator, values: []const scalar.Datum, parameters: []const std.json.Value, provider: ?@import("../functions/decisions.zig").DecisionProvider) !bool {
         const program = self.predicate orelse return true;
-        const value = try program.evaluate(alloc, values, parameters, .{});
+        const value = try @import("decision_eval.zig").evaluate(alloc, provider, &program, values, parameters);
         if (value.sql_null) return false;
         if (value.value != .bool) return error.SqlTypeMismatch;
         return value.value.bool;
     }
 };
 
-pub fn needsResidual(predicate: ?*const ast.Predicate) bool {
+pub fn needsResidual(table: ?catalog.Table, predicate: ?*const ast.Predicate) bool {
     const node = predicate orelse return false;
     return switch (node.*) {
-        .comparison => |comparison| (std.mem.eql(u8, comparison.field, "_id") and comparison.op != .eq) or
+        .comparison => |comparison| jsonColumn(table, comparison.field) or (std.mem.eql(u8, comparison.field, "_id") and comparison.op != .eq) or
             (comparison.value == .string and std.mem.eql(u8, std.mem.trim(u8, comparison.value.string, " \t\r\n"), "null")),
-        .is_null => false,
-        .conjunction => |pair| needsResidual(pair.left) or needsResidual(pair.right),
+        .is_null => |condition| jsonColumn(table, condition.field),
+        .conjunction => |pair| needsResidual(table, pair.left) or needsResidual(table, pair.right),
         .disjunction, .negation, .scalar => true,
     };
+}
+
+fn jsonColumn(table: ?catalog.Table, name: []const u8) bool {
+    const definition = table orelse return false;
+    const column = definition.column(name) catch return false;
+    return column.type == .json;
 }
 
 pub fn predicateScalar(alloc: Allocator, table: ?catalog.Table, predicate: *const ast.Predicate) !*const ast.Scalar {
@@ -67,17 +86,17 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
     if (statement == .insert) return bindInsert(alloc, table orelse return error.UndefinedTable, statement.insert, parameters, settings);
     const needed = switch (statement) {
         .select => |select| blk: {
-            if (needsResidual(select.predicate)) break :blk true;
+            if (needsResidual(table, select.predicate)) break :blk true;
             for (select.columns) |projection| if (projection.expression != null) break :blk true;
             for (select.order_by) |order| if (order.expression != null) break :blk true;
             break :blk false;
         },
         .update => |update| blk: {
-            if (needsResidual(update.predicate)) break :blk true;
+            if (needsResidual(table, update.predicate)) break :blk true;
             for (update.assignments) |assignment| if (assignment.expression != null) break :blk true;
             break :blk false;
         },
-        .delete => |delete| needsResidual(delete.predicate),
+        .delete => |delete| needsResidual(table, delete.predicate),
         else => false,
     };
     if (table != null and !needed) return .{};
@@ -132,7 +151,7 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         }
         if (!changed) break;
     }
-    if (predicate != null and (table == null or needsResidual(predicate))) {
+    if (predicate != null and (table == null or needsResidual(table, predicate))) {
         out.predicate = try builder.program(predicate_expression.?, .boolean);
         if (out.predicate.?.output_type.kind != null and out.predicate.?.output_type.kind != .boolean) return error.SqlTypeMismatch;
     }

@@ -2418,11 +2418,11 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_wait_for_sync(null, &invalid_sync),
     );
-    var invalid_ha: abi.HAReplicationRecordRequest = .{};
-    invalid_ha.version = abi.abi_version + 1;
+    var invalid_hot_standby: abi.HAReplicationRecordRequest = .{};
+    invalid_hot_standby.version = abi.abi_version + 1;
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
-        abi.antfly_storage_owner_apply_hot_standby_replication_record(null, &invalid_ha),
+        abi.antfly_storage_owner_apply_hot_standby_replication_record(null, &invalid_hot_standby),
     );
     var invalid_backup: abi.BackupRequest = .{};
     invalid_backup.version = abi.abi_version + 1;
@@ -2638,9 +2638,10 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(abi.abi_version, metrics.version);
     try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
-    for ([_]u32{ 71, abi.abi_version - 1 }) |old_version| {
-        // Reject both the original 304-byte layout and the last revision
-        // before these counters, without writing past the version word.
+    for (71..abi.abi_version) |version| {
+        const old_version: u32 = @intCast(version);
+        // Reject every earlier layout, including main's independent ABI
+        // changes, without writing past the version word.
         var old_caller: [@sizeOf(abi.ContextMetricsResult)]u8 align(@alignOf(abi.ContextMetricsResult)) = @splat(0xaa);
         std.mem.writeInt(u32, old_caller[0..4], old_version, .native);
         const as_result: *abi.ContextMetricsResult = @ptrCast(&old_caller);
@@ -3210,41 +3211,41 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         // An opaque owner cannot retain a pointer to this stack-local Port;
         // only its heap-owned creator adapter survives each completed bind.
         try std.testing.expect(transition.tryLock());
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
         transition.unlock();
         try std.testing.expectError(error.MetadataHAMigrationAfterBinding, source.migrateStandaloneRestoreJobs(&.{}));
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = initial } });
         var first = (try primary.log.entryAt(alloc, 1)).?;
         defer first.deinit(alloc);
-        try target.applyHARecord(first.record);
-        try target.applyHARecord(first.record);
+        try target.applyHotStandbyRecord(first.record);
+        try target.applyHotStandbyRecord(first.record);
         const actual = (try target.getRestoreJobValue(alloc, group, key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(initial, actual);
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.HASyncCommitWouldBlock, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = updated } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-        try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(io, root ++ "/checkpoint"));
+        try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(io, root ++ "/checkpoint"));
         try std.testing.expect(transition.tryLock());
         transition.unlock();
     }
     {
         var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
         defer source.deinit();
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
-        try source.flushHAOutbox();
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
+        try source.flushHotStandbyOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-        const checkpoint = try source.exportHACheckpoint(io, root ++ "/checkpoint");
+        const checkpoint = try source.exportHotStandbyCheckpoint(io, root ++ "/checkpoint");
         var restored = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/restored" });
         defer restored.deinit();
-        try restored.importHACheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes);
+        try restored.importHotStandbyCheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes);
         const actual = (try restored.getRestoreJobValue(alloc, group, key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(updated, actual);
         var second = (try primary.log.entryAt(alloc, 2)).?;
         defer second.deinit(alloc);
-        try restored.applyHARecord(second.record);
-        try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, restored.importHACheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes));
+        try restored.applyHotStandbyRecord(second.record);
+        try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, restored.importHotStandbyCheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes));
         // Catalog outcomes cross the separately compiled owner boundary too.
         // A stale bootstrap CAS is definitely rejected, while a failed remote
         // acknowledgement after the exact catalog commit is ambiguous.
@@ -3252,7 +3253,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         try std.testing.expect(revision > 0);
         try std.testing.expectError(error.TableLifecycleConflict, source.replaceStandaloneCatalog(group, revision - 1, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision, try source.standaloneRevision());
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision + 1, try source.standaloneRevision());
         const catalog = (try source.loadStandaloneCatalog(alloc)).?;
@@ -3293,26 +3294,25 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     var promote: Promote = .{ .gate = &gate, .transition = &transition };
     var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
     defer source.deinit();
-    try source.bindHA(.{ .shared = .{ .state = gate.storageWriteState() } }, .{
-        .publisher = hot_standby_publisher_adapter.bind(&primary),
+    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{
         .transition_mutex = &transition,
         .sync_policy = .{ .mode = .remote_apply, .standby_names = &.{"standby-a"} },
         .sync_wait_ctx = &promote,
         .sync_wait_fn = Promote.wait,
-    });
+    }));
     const group = @import("../common/group_ids.zig").main_metadata_group_id;
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{
         .key = "\x00\x00__api_restore_jobs__:000000000000002a",
         .value = "{\"job_id\":42,\"phase\":\"queued\"}",
     } }));
-    try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint"));
+    try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(std.testing.io, root ++ "/checkpoint"));
     try std.testing.expect(transition.tryLock());
     transition.unlock();
     const prior_lsn = primary.lastLsn();
-    try source.bindHA(.{ .shared = .{ .state = gate.storageWriteState() } }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
-    try source.flushHAOutbox();
+    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
+    try source.flushHotStandbyOutbox();
     try std.testing.expectEqual(prior_lsn, primary.lastLsn());
-    _ = try source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint");
+    _ = try source.exportHotStandbyCheckpoint(std.testing.io, root ++ "/checkpoint");
 }
 
 test "opaque metadata initial FK reservation preserves placement authority across snapshot" {

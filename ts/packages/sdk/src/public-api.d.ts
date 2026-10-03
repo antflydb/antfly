@@ -4883,7 +4883,7 @@ export interface components {
              * @description Stable machine-readable retry classification.
              * @enum {string}
              */
-            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "distributed_query_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable";
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "distributed_query_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable" | "decision_provider_unavailable";
             /** @description Human-readable error summary. */
             message: string;
             /**
@@ -4892,10 +4892,10 @@ export interface components {
              */
             retryable: true;
         };
-        /** @description A stable failure envelope for query embedding and reranking dependencies. */
+        /** @description A stable failure envelope for query embedding, reranking, and decision dependencies. */
         QueryDependencyError: {
             /** @enum {string} */
-            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "query_timeout";
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
             /** @description Legacy alias of code. Use code for programmatic handling. */
             error: string;
             message: string;
@@ -10001,7 +10001,65 @@ export interface components {
             namespace?: string;
             table: string;
         };
+        /**
+         * @description Evaluate expressions after global retrieval merging, before final
+         *     offset/limit. Candidates require candidate_count; matches require
+         *     max_rows and fail if the full qualifying population exceeds that budget.
+         *     Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+         *     be combined with evaluation. NULL inputs skip inference; errors fail.
+         */
+        QueryEvaluation: {
+            /** @description Evaluate completed bindings of this named graph MATCH instead of retrieval hits. Fields use alias.document.path or alias.key. Existing graph aggregates cannot be combined with this stage. */
+            graph_query?: string;
+            /** @enum {string} */
+            scope: "candidates" | "matches";
+            candidate_count?: number;
+            max_rows?: number;
+            compute: {
+                [key: string]: components["schemas"]["QueryExpression"];
+            };
+            /** @description Exactly one of eq, neq, lt, lte, gt, gte (two expressions), is_null (expression), not (predicate), and, or (predicate arrays). Comparisons propagate NULL. */
+            where?: {
+                [key: string]: unknown;
+            };
+            order_by?: {
+                expression: components["schemas"]["QueryExpression"];
+                descending?: boolean;
+            }[];
+            aggregations?: {
+                [key: string]: {
+                    /** @enum {string} */
+                    type: "terms" | "avg" | "sum" | "count";
+                    expression: components["schemas"]["QueryExpression"];
+                };
+            };
+        };
+        /**
+         * @description Exactly one of literal, field, ref, or call. A call requires input and
+         *     decider. ai_decide requires questions; ai_probability requires statement;
+         *     ai_choice and ai_score require instructions and criteria. Named refs may
+         *     select nested JSON members with dotted paths. Binding cycles are invalid.
+         */
+        QueryExpression: {
+            literal?: unknown;
+            field?: string;
+            ref?: string;
+            /** @enum {string} */
+            call?: "ai_decide" | "ai_choice" | "ai_score" | "ai_probability";
+            input?: components["schemas"]["QueryExpression"];
+            decider?: string;
+            questions?: {
+                [key: string]: unknown;
+            };
+            statement?: string;
+            instructions?: string;
+            /** @description Choice ID map or ordered score level array. */
+            criteria?: {
+                [key: string]: string;
+            } | string[];
+        };
         QueryRequest: {
+            evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
             /**
              * @description Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -11155,6 +11213,10 @@ export interface components {
         };
         /** @description A single query result hit */
         QueryHit: {
+            /** @description Named query-time computed values, separate from stored source. */
+            _computed?: {
+                [key: string]: unknown;
+            };
             /** @description ID of the record. */
             _id: string;
             /**
@@ -11288,6 +11350,10 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Function evaluation scope, population, usage, and scoped aggregations. */
+            evaluation?: {
+                [key: string]: unknown;
+            };
             hits?: components["schemas"]["QueryHits"];
             /**
              * @description Aggregation results keyed by the user-defined aggregation names from the request.
@@ -12748,7 +12814,7 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
             producer?: {
                 [key: string]: unknown;
             };
@@ -12757,7 +12823,7 @@ export interface components {
              * @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
              */
             producer_json?: string;
-            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
+            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
             neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
@@ -17402,6 +17468,10 @@ export interface components {
         };
         /** @description A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive. */
         GraphBindingsResult: {
+            /** @description Evaluated values parallel to returned rows, when decision evaluation was requested. */
+            computed?: {
+                [key: string]: unknown;
+            }[];
             /**
              * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
              * @enum {string}
@@ -17583,6 +17653,9 @@ export interface components {
          * @description Deprecated graph_searches pattern response row.
          */
         PatternMatch: {
+            _computed?: {
+                [key: string]: unknown;
+            };
             bindings?: {
                 [key: string]: components["schemas"]["LegacyGraphResultNode"];
             };

@@ -67,6 +67,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const public_api_parity_default_filters = [_][]const u8{
         "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",
+        "online merge private standalone rewrite port pins authority and never fabricates Raft coordinates",
         "online merge private port fences owners cancellation and deadlines before dispatch",
         "online merge private port preserves source recovery errors through foreign runtime dispatch",
         "join planning",
@@ -167,7 +168,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server prefers metadata-owned restore over inline write-source restore",
         "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
-        "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
@@ -222,6 +222,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "encode query request rejects invalid public phrase geo and ip values",
         "optional pure should preserves zero baseline and text scores",
         "remote query preserves optional should and named filter bindings",
+        "api query contract graph evaluation preserves base hit paging and shard windows",
         "distributed reranking widens retrieval and stays coordinator owned",
         "reranker candidate and output windows have distinct bounds",
         "reranker admission precedes candidate rendering",
@@ -269,7 +270,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "SQL JSON null metadata",
         "SQL session metadata",
         "SQL staged statements",
-        "relational row query statement",
         "relational row query coordinator",
         "httpx antfly schema update returns full table status after projection",
         "httpx antfly schema update owns self partial support and requires coordinated publication",
@@ -307,10 +307,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         // The macOS debug root includes the complete public transport,
-        // generated-contract, and native-index surface. ReleaseSafe test
-        // compilation currently peaks above 13 GiB; reserve the measured
+        // generated-contract, and native-index surface. Debug test
+        // compilation currently peaks at 15.09 GB; reserve the measured
         // envelope so the scheduler does not reject a successful compile.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -397,6 +397,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &lib_api_auth_default_filters,
     );
     const lib_api_auth_tests = b.addTest(.{
+        // macOS Debug measured 11.43 GB for the linked auth surface.
+        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
         .root_module = antfly_test_mod,
         .filters = lib_api_auth_runtime_filters,
         .test_runner = .{
@@ -1115,6 +1117,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "owner-local delayed statement scans",
             "relational row query retained owner holds admission and releases failed opens",
             "table reads translate request deadlines into the routing clock",
+            "api query contract graph evaluation preserves base hit paging and shard windows",
             "distributed reranking widens retrieval and stays coordinator owned",
             "reranker candidate and output windows have distinct bounds",
             "reranker paging preserves the underlying retrieval total",
@@ -1618,6 +1621,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     }, write_implementation_tests);
     b.step("antfly-api-aggregation-test", "Run captured aggregation collection, completeness and generation regressions").dependOn(&api_aggregation_tests.run(b).step);
+    const rewrite_admission_contract_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "distributed txn rewrite admission", "relational integrity restore staging rewrite intent" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-rewrite-admission-contract-test", "Verify scoped rewrite admission and durable intent binding")
+        .dependOn(&addFilteredTestRunArtifact(b, rewrite_admission_contract_tests).step);
+    const row_semantics_codec_tests = b.addTest(.{
+        .root_module = api_transactions_docid_test_mod,
+        .filters = &.{ "distributed txn prepare preserves JSON null", "distributed txn prepare JSON null", "internal batch JSON null", "distributed txn range guard wire" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("antfly-row-semantics-codec-test", "Verify fail-closed row semantics envelopes and allocation failure cleanup")
+        .dependOn(&addFilteredTestRunArtifact(b, row_semantics_codec_tests).step);
     const api_transaction_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn", "hosted participant", "stable distributed transaction retry", "internal batch parser owns binary staged restore controls", "merge page internal codec", "online merge private", "durable SQL session rejects duplicate savepoint ids" },
@@ -2398,7 +2415,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_api_table_reads_docid_tests = run_api_table_reads_docid_tests,
         .hosted_recovery_tests = hosted_recovery_tests,
         .hosted_recovery_step = hosted_recovery_step,
-        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
+        .linked_consumer_tests = b.allocator.dupe(*std.Build.Step.Compile, &.{ public_api_parity_tests, api_table_reads_linked_tests.executable, lib_api_distributed_query_availability_tests.executable, api_table_writes_docid_tests.executable, api_relational_topology_contract_tests.consumer.executable, api_table_writes_production_regression_tests.consumer.executable, hosted_batch_tests.consumer.executable, api_create_structural_retry_tests.consumer.executable, api_table_writes_restore_repeat_tests.consumer.executable, hosted_fk_placement_tests, sql_primary_key_rewrite_tests, hosted_initial_fk_tests, hosted_initial_fk_fault_tests, hosted_initial_fk_transfer_tests, hosted_initial_fk_offline_tests, hosted_initial_fk_recovery_tests, hosted_fk_drop_tests, hosted_graph_truncate_tests, hosted_truncate_fk_recovery_tests, hosted_self_fk_retry_tests, hosted_self_fk_diagnostic_tests, hosted_self_fk_fault_tests, hosted_self_fk_metadata_restart_tests, hosted_self_fk_leader_transfer_tests, hosted_self_fk_recovery_tests }) catch @panic("OOM"),
         .run_api_public_table_http_docid_tests = run_api_public_table_http_docid_tests,
         .run_raft_transition_runtime_docid_tests = run_raft_transition_runtime_docid_tests,
         .run_api_table_writes_production_regression_unit_tests = run_api_table_writes_production_regression_unit_tests,

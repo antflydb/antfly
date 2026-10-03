@@ -165,7 +165,15 @@ pub fn Adapter(comptime native: type) type {
             errdefer for (cursors[0..initialized]) |cursor| cursor.close(cursor.ptr);
             // All aliases share this handle's capture interval. Independent
             // cursors then retain their snapshots after writers are released.
-            var fence = (try self.db.tryStatementReadFence()) orelse return error.SqlStatementSnapshotRequired;
+            const io = self.db.backend_runtime.io() orelse return error.SqlStatementReadUnavailable;
+            const deadline = std.Io.Clock.awake.now(io).addDuration(.fromSeconds(5));
+            var fence = while (true) {
+                if (try self.db.tryStatementReadFence()) |captured| break captured;
+                if (std.Io.Clock.awake.now(io).nanoseconds >= deadline.nanoseconds) return error.SqlStatementReadUnavailable;
+                // No earlier owner fences are held: writers and intent
+                // resolution can finish while this statement parks.
+                try io.sleep(.fromMilliseconds(1), .awake);
+            };
             defer fence.release();
             for (requests, cursors) |request, *cursor| {
                 cursor.* = (try open(ptr, alloc, request.table, request.request)) orelse return error.SqlStatementSnapshotRequired;
@@ -200,7 +208,7 @@ pub fn Adapter(comptime native: type) type {
                         };
                     }
                 }
-                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .type = switch (column.column_type) {
+                out.* = .{ .name = try alloc.dupe(u8, column.name), .path = try alloc.dupe(u8, column.path), .nullable = !column.required or column.allows_null, .generated = generated, .type = dependencies.sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
                     .string => .string,
                     .integer => .integer,
                     .number => .number,
@@ -208,7 +216,7 @@ pub fn Adapter(comptime native: type) type {
                     .datetime => .datetime,
                     .json => .json,
                     else => return error.UnsupportedSqlExecution,
-                } };
+                }) };
             }
             return .{ .id = 1, .physical_name = self.table_name, .schema_version = schema.version, .columns = columns };
         }
@@ -270,7 +278,7 @@ pub fn Adapter(comptime native: type) type {
                     .inclusive_from = request.primary_key != null,
                     .exclusive_to = true,
                     .limit = request.limit,
-                    .relational_query = .{ .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version },
+                    .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version },
                 });
                 errdefer session.deinit();
                 const cursor = try alloc.create(DocumentCursor);
@@ -282,7 +290,7 @@ pub fn Adapter(comptime native: type) type {
                 .inclusive_from = request.primary_key != null,
                 .exclusive_to = true,
                 .limit = request.limit,
-                .relational_query = .{ .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order },
+                .relational_query = .{ .page_bytes = 256 * 1024, .fields = request.fields, .conditions = conditions, .schema_version = table.schema_version, .auto_index = request.primary_key == null and !request.primary_order },
             });
             errdefer session.deinit();
             const cursor = try alloc.create(Cursor);
@@ -320,14 +328,14 @@ pub fn Adapter(comptime native: type) type {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (self.read_only) return error.SqlReadOnlyTransaction;
             self.outcome_transaction_id = null;
-            var scratch = std.heap.ArenaAllocator.init(alloc);
-            defer scratch.deinit();
-            const temporary = scratch.allocator();
+            // The executor provides a commit-scoped arena. A second arena
+            // would retain superseded serialization buffers in its parent.
+            const temporary = alloc;
             var writes: std.ArrayList(types.BatchWrite) = .empty;
             var deletes: std.ArrayList([]const u8) = .empty;
             const predicates = try temporary.alloc(types.TransactionVersionPredicate, mutations.len);
             for (mutations, predicates) |mutation, *predicate| {
-                predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest };
+                predicate.* = .{ .key = mutation.key, .expected_version = mutation.expected_version, .expected_content_digest = mutation.expected_content_digest, .unique_absence = mutation.unique_absence };
                 if (mutation.predicate_only) continue;
                 if (mutation.row) |row| {
                     try writes.append(temporary, .{ .key = mutation.key, .value = try std.json.Stringify.valueAlloc(temporary, row, .{}), .json_null_fields = if (table.storage_mode == .document) &.{} else mutation.json_null_fields });

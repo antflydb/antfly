@@ -80,7 +80,7 @@ pub const ResultLimits = struct {
     fn forProducer(self: ResultLimits, producer_type: asset_producer.ProducerType) usize {
         return switch (producer_type) {
             .reader => self.reader_bytes_per_item,
-            .generator => self.generator_bytes_per_item,
+            .generator, .decision => self.generator_bytes_per_item,
             .extractor => self.extractor_bytes_per_item,
             .transcriber => self.transcriber_bytes_per_item,
             .copy => self.copy_bytes_per_item,
@@ -641,6 +641,10 @@ pub const Runtime = struct {
         var allocator_owner: inference_work.InvocationAllocatorOwner = .caller;
         const transport: inference_work.AttachmentTransport = switch (requests[0].producer_type) {
             .copy, .document_extraction => .borrowed_binary,
+            .decision => blk: {
+                remote = true;
+                break :blk .borrowed_binary;
+            },
             .reader => blk: {
                 var parsed = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
                     .allocate = .alloc_always,
@@ -840,7 +844,7 @@ pub const Runtime = struct {
         return switch (request.producer_type) {
             // These routes never enter an external callback. Unsupported
             // document extraction also fails synchronously in produceOne.
-            .copy, .document_extraction => true,
+            .copy, .document_extraction, .decision => true,
             .generator => blk: {
                 var parsed = try parseGeneratorProducerConfig(alloc, request.config_json);
                 defer parsed.deinit(alloc);
@@ -1072,7 +1076,7 @@ pub const Runtime = struct {
         }
         return switch (first.producer_type) {
             .copy => .native,
-            .document_extraction => .none,
+            .document_extraction, .decision => .none,
             .reader => blk: {
                 if (!try self.canReadBatch(alloc, requests)) break :blk .none;
                 var cfg = try std.json.parseFromSlice(readers.Config, alloc, requests[0].config_json, .{
@@ -1408,11 +1412,60 @@ pub const Runtime = struct {
         try self.capabilityCache().invalidate(cfg.resolvedUrl().?, cfg.model, .extract, headers);
     }
 
+    fn decide(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
+        const d = @import("functions/decisions.zig");
+        const materialization = @import("functions/materialization.zig");
+        const parsed = try materialization.parse(alloc, request.config_json);
+        defer parsed.deinit();
+        if (request.media.len > 0) return error.InvalidDecisionSpecification;
+        if (request.source_parts_json) |raw_parts| {
+            // Templates always carry content parts, including plain text.
+            // Validate the text-only contract without silently dropping an
+            // unsupported or malformed part. source_text is the enrichment
+            // runtime's canonical rendered text, including neighbor context.
+            const parts = std.json.parseFromSlice(std.json.Value, alloc, raw_parts, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidDecisionSpecification,
+            };
+            defer parts.deinit();
+            if (parts.value != .array) return error.InvalidDecisionSpecification;
+            for (parts.value.array.items) |part| {
+                if (part != .object) return error.InvalidDecisionSpecification;
+                const kind = part.object.get("type") orelse return error.InvalidDecisionSpecification;
+                const text = part.object.get("text") orelse return error.InvalidDecisionSpecification;
+                if (kind != .string or !std.mem.eql(u8, kind.string, "text") or text != .string) return error.InvalidDecisionSpecification;
+            }
+        }
+        var registry = @import("common/provider_registry.zig").Registry.init(alloc);
+        defer registry.deinit();
+        try registry.registerDeciderConfig("materialized", parsed.value.decider);
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        var execution: @import("functions/runtime.zig").Runtime = .{
+            .registry = &registry,
+            .http = self.http,
+            .io = self.http.io,
+            .limits = self.limits,
+            .context = self.requestContext(),
+            .secret_store = self.secret_store,
+            .antfly_provider = self.antfly_provider,
+            .antfly_url = self.inference_api_url,
+            .source_table = self.execution.routing.source_table,
+        };
+        const results = try execution.provider().evaluateBatch(arena.allocator(), &.{.{ .decider = "materialized", .questions = parsed.value.questions, .input = request.source_text }});
+        var response = results[0];
+        var info = try materialization.provenance(arena.allocator(), parsed.value, request.source_fingerprint);
+        try d.put(arena.allocator(), &info, "model", response.object.get("model").?);
+        try d.put(arena.allocator(), &response, "provenance", info);
+        return std.json.Stringify.valueAlloc(alloc, response, .{});
+    }
+
     fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) ![]u8 {
         return switch (request.producer_type) {
             .copy => try alloc.dupe(u8, request.source_text),
             .document_extraction => error.UnsupportedAssetProducer,
             .generator => try self.generate(alloc, request),
+            .decision => try self.decide(alloc, request),
             .reader => try self.read(alloc, request),
             .transcriber => try self.transcribe(alloc, request),
             .extractor => try self.extract(alloc, request),
@@ -1434,7 +1487,7 @@ pub const Runtime = struct {
             .generator => self.tryGenerateBatch(alloc, requests),
             .extractor => self.tryExtractBatch(alloc, requests),
             .transcriber => self.tryTranscribeBatch(alloc, requests),
-            .document_extraction => error.BatchIncompatible,
+            .document_extraction, .decision => error.BatchIncompatible,
         };
         if (batch_result) |items| {
             return items;
@@ -7713,4 +7766,34 @@ test "laya enrichment preserves typed decisions and rejects invalid probabilitie
     const invalid = try std.mem.replaceOwned(u8, a, payload, "\"probability\":0.75", "\"probability\":1.5");
     defer a.free(invalid);
     try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, invalid, expected, null, false));
+}
+
+test "decision functions materialized enrichment records version model and source provenance" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fn decide(_: *anyopaque, alloc: Allocator, _: []const u8, _: ?RequestContext) ![]u8 {
+            return alloc.dupe(u8, "{\"model\":\"resolved-model\",\"answers\":{\"refund\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}");
+        }
+    };
+    var client = httpx.Client.initWithConfig(a, std.testing.io, .{});
+    defer client.deinit();
+    var runtime = Runtime.initWithOptions(a, &client, .{ .antfly_provider = .{ .ptr = undefined, .embed_dense_texts = undefined, .embed_sparse_texts = undefined, .decide_json = Fake.decide } });
+    defer runtime.deinit();
+    const specification = "{\"version\":\"v1\",\"decider\":{\"provider\":\"antfly\",\"model\":\"mock\"},\"questions\":{\"refund\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}}";
+    for ([_]?[]const u8{ null, "[{\"type\":\"text\",\"text\":\"refund\"}]", "[{\"type\":\"text\",\"text\":\"ref\"},{\"type\":\"text\",\"text\":\"und\"}]" }) |parts| {
+        const output = try runtime.producer().produce(a, .{ .producer_type = .decision, .config_json = specification, .source_text = "refund", .source_parts_json = parts });
+        a.free(output);
+    }
+    for ([_][]const u8{ "[{\"type\":\"image_url\",\"image_url\":{\"url\":\"https://example.com/image\"}}]", "[{\"type\":\"text\",\"text\":42}]", "{}", "invalid", "[{\"type\":\"unknown\",\"text\":\"refund\"}]" }) |parts| {
+        try std.testing.expectError(error.InvalidDecisionSpecification, runtime.producer().produce(a, .{ .producer_type = .decision, .config_json = specification, .source_text = "refund", .source_parts_json = parts }));
+    }
+    const response = try runtime.producer().produce(a, .{ .producer_type = .decision, .config_json = specification, .source_text = "refund", .source_fingerprint = "revision-2" });
+    defer a.free(response);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, response, .{});
+    defer parsed.deinit();
+    const provenance = parsed.value.object.get("provenance").?.object;
+    try std.testing.expectEqualStrings("v1", provenance.get("version").?.string);
+    try std.testing.expectEqualStrings("resolved-model", provenance.get("model").?.string);
+    try std.testing.expectEqualStrings("revision-2", provenance.get("source_fingerprint").?.string);
+    try std.testing.expect(provenance.get("specification_hash").?.string.len > 0);
 }

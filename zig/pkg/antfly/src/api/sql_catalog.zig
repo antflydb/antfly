@@ -74,9 +74,9 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     }
     if (ddl.schema_change) |change| switch (change) {
         .add_column => |column| if (!column.nullable or column.default_value != null)
-            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated),
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, if (column.default_value != null) &.{column.name} else &.{}),
         .add_unique => |constraint| if (constraint.primary)
-            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated),
+            return rewriteSchema(server, identity, context, alloc, target, table.name, table.table_id, native.version, updated, &.{}),
         else => {},
     };
     const retirement = try requiresRetirement(a, definition.schema_json, schema);
@@ -113,7 +113,7 @@ fn alterSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
     return .{};
 }
 
-fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, physical: []const u8, table_id: u64, version: u32, schema: []const u8) !catalog.DdlOutcome {
+fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, alloc: std.mem.Allocator, target: domain.Target, physical: []const u8, table_id: u64, version: u32, schema: []const u8, default_columns: []const []const u8) !catalog.DdlOutcome {
     // Rewrite jobs and their staging plan must be committed by the metadata
     // owner. A data node's local restore history cannot admit this operation.
     if (server.restore_job_store.replicated == null) return error.SqlSchemaRewriteRequiresMetadataOwner;
@@ -143,7 +143,7 @@ fn rewriteSchema(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authen
     receipt.restore_job_id = try std.fmt.allocPrint(alloc, "{d}", .{job_id});
     // Shared native restore machinery reserves the entire dependency cohort,
     // transforms into unpublished storage, validates, and publishes atomically.
-    var response = server.handlePublicSchemaRewrite(table.*, schema, receipt.idempotency_key, identity, context) catch |err| return rewriteCallFailure(receipt, err);
+    var response = server.handleSchemaRewrite(table.*, schema, receipt.idempotency_key, identity, context, default_columns) catch |err| return rewriteCallFailure(receipt, err);
     defer response.deinit(server.alloc);
     return rewriteResponse(alloc, response.status, response.body, receipt);
 }
@@ -186,6 +186,7 @@ fn unknownRewriteOutcome(input: catalog.DdlReceipt) catalog.DdlOutcome {
 }
 
 fn rewriteCallFailure(receipt: catalog.DdlReceipt, err: anyerror) anyerror!catalog.DdlOutcome {
+    std.log.warn("SQL schema rewrite failure err={s}", .{@errorName(err)});
     // These errors are emitted before startRecoverable. Other errors may
     // occur after durable admission, including response-construction OOM.
     return switch (err) {
@@ -339,7 +340,8 @@ pub fn execute(server: *server_mod.ApiHttpServer, identity: ?server_mod.Authenti
                 return error.ForeignKeyPartialSupportIndexRequired;
             const schema_value = try std.json.parseFromSliceLeaky(std.json.Value, a, bound_schema, .{ .parse_numbers = false });
             const body = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_value, .indexes = std.json.Value{ .object = .empty } }, .{});
-            var parsed = try tables.parseCreateTableRequest(alloc, body);
+            var parsed = try tables.parseStoredCreateTableRequest(alloc, body);
+            parsed.storage = .{};
             defer parsed.deinit(alloc);
             if (create.tablespace) |tablespace| parsed.tablespace_name = try alloc.dupe(u8, tablespace);
             if (try @import("../metadata/fk_generation_publication.zig").schemaHasForeignKeys(a, bound_schema)) {
@@ -485,8 +487,9 @@ test "SQL catalog DDL schema validates through native public admission" {
     const schema_json = try @import("../sql/ddl_runtime.zig").createSchemaAlloc(a, compiled.statement.create_table);
     const value = try std.json.parseFromSliceLeaky(std.json.Value, a, schema_json, .{ .parse_numbers = false });
     const body = try std.json.Stringify.valueAlloc(a, .{ .schema = value, .indexes = std.json.Value{ .object = .empty } }, .{});
-    var request = try tables.parseCreateTableRequest(alloc, body);
+    var request = try tables.parseStoredCreateTableRequest(alloc, body);
     defer request.deinit(alloc);
+    try std.testing.expectEqualStrings("{}", request.indexes_json.?);
     var parsed = try @import("../schema/mod.zig").parseValidatedTableSchema(alloc, request.schema_json.?);
     defer parsed.deinit(alloc);
     const native = try @import("../schema/mod.zig").deriveRuntimeTableSchema(alloc, parsed);
@@ -612,6 +615,16 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
             try self.store.ensureDerivedCatalogIndexes(self.metadata_group_id);
             return self.store.captureTableCreateGeneration(alloc, self.metadata_group_id, table_id);
         }
+        pub fn captureTableDropAdmission(self: *@This(), allocator: std.mem.Allocator, name: []const u8) !@import("../metadata/service.zig").TableDropAdmission {
+            try self.store.ensureDerivedCatalogIndexes(self.metadata_group_id);
+            var projection = (try self.store.captureTableDropProjection(allocator, self.metadata_group_id, name)) orelse return error.TableNotFound;
+            defer projection.deinit(allocator);
+            if (projection.fence.active()) return error.TableTransitionActive;
+            const expected_name = try allocator.dupe(u8, projection.table.name);
+            const ids = projection.range_group_ids;
+            projection.range_group_ids = &.{};
+            return .{ .table_id = projection.table.table_id, .expected_name = expected_name, .expected_transition_generation = projection.fence.generation, .range_membership = projection.fence.membership(projection.table.table_id), .range_group_ids = ids };
+        }
         pub fn proposeTransitionCommandWithReceipt(self: *@This(), command: metadata_store.TransitionCommand) !u64 {
             const alloc = std.testing.allocator;
             const encoded = try metadata_store.encodeTransitionCommand(alloc, command);
@@ -624,6 +637,12 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
             return receipt;
         }
         pub fn waitForTransitionAppliedWithContext(_: *@This(), _: u64, _: operation.RequestContext) !void {}
+        pub fn verifyTableDropProjection(self: *@This(), alloc: std.mem.Allocator, table_id: u64) !void {
+            if (try self.store.getTable(alloc, self.metadata_group_id, table_id)) |table| {
+                table_manager.freeTable(alloc, table);
+                return error.TableTransitionActive;
+            }
+        }
         pub fn verifyTableCreateProjection(self: *@This(), alloc: std.mem.Allocator, table: table_manager.TableRecord, ranges: []const table_manager.RangeRecord) !void {
             try self.store.verifyTableCreateProjectionExact(alloc, self.metadata_group_id, table, ranges);
         }
@@ -774,4 +793,14 @@ test "SQL UUID prepared CREATE TABLE commits and replays catalog topology only o
         defer alloc.free(row);
         try std.testing.expect(std.mem.indexOf(u8, row, "550e8400-e29b-41d4-a716-446655440000") != null);
     }
+    // Exercise the generic proposal/receipt/post-commit verification path,
+    // including the DROP arm after CREATE has survived restart.
+    const dropped = try @import("../system_catalog/operations.zig").mutate(&source, alloc, .{}, .{
+        .mutation = .{ .action = .drop, .kind = .table, .name = "prepared_usage_records" },
+    });
+    defer alloc.free(dropped);
+    try std.testing.expect(try store.resolveSystemCatalogTable(alloc, 21, .{ .table = "prepared_usage_records" }) == null);
+    const remaining = try store.listRanges(alloc, 21);
+    defer store.freeRanges(alloc, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
 }

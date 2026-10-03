@@ -23,7 +23,7 @@ const table_writes = @import("table_write_source.zig");
 const restore_jobs = @import("restore_jobs.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const backend_erased = @import("../storage/backend_erased.zig");
-const ha_http_operation = @import("../storage/hot_standby/http_operation.zig");
+const hot_standby_http_operation = @import("../storage/hot_standby/http_operation.zig");
 const httpx = @import("httpx");
 const platform_sync = @import("antfly_platform").sync;
 const runtime_http_bridge = @import("antfly_runtime_abi").http_bridge;
@@ -235,9 +235,9 @@ pub fn setProvider(context: *const CallContext) callconv(.c) abi.Status {
     return .ok;
 }
 
-pub fn setHAExecutor(context: *const CallContext) callconv(.c) abi.Status {
-    if (validateCall(?ha_http_operation.Executor, void, context)) |failure| return failure;
-    serverState(context).server.setHAInternalExecutor(input(?ha_http_operation.Executor, context).*);
+pub fn setHotStandbyExecutor(context: *const CallContext) callconv(.c) abi.Status {
+    if (validateCall(?hot_standby_http_operation.Executor, void, context)) |failure| return failure;
+    serverState(context).server.setHotStandbyInternalExecutor(input(?hot_standby_http_operation.Executor, context).*);
     return .ok;
 }
 
@@ -549,7 +549,7 @@ const function_table: abi.FunctionTable = .{
     .query_admission_stats = &queryAdmissionStats,
     .write_admission_stats = &writeAdmissionStats,
     .set_provider = &setProvider,
-    .set_ha_executor = &setHAExecutor,
+    .set_ha_executor = &setHotStandbyExecutor,
     .attach_runtime_restore_store = &attachRuntimeRestoreStore,
     .attach_replicated_restore_store = &attachReplicatedRestoreStore,
     .resume_restore_jobs = &resumeRestoreJobs,
@@ -788,7 +788,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     api_server.* = server_mod.ApiHttpServer.init(
         alloc,
         .{
-            .ha_failover_safe_mutations_only = true,
+            .hot_standby_failover_safe_mutations_only = true,
             .internal_service_secret = "kernel-ingress-test-internal-secret-v1",
             .internal_service_issuer = "kernel-ingress-test",
         },
@@ -872,7 +872,7 @@ test "linked API dispatch preserves kernel-owned ingress policy" {
     // Linked dispatch starts the transaction deadline before policy work, but
     // malformed metadata must not let an unauthenticated caller distinguish
     // an internal route. Validation runs only after service authentication.
-    api_server.cfg.ha_failover_safe_mutations_only = false;
+    api_server.cfg.hot_standby_failover_safe_mutations_only = false;
     const invalid_deadline_headers = [_]abi.HeaderView{.{
         .name = abi.Bytes.init(distributed_txn_contract.pre_decision_remaining_ms_header),
         .value = abi.Bytes.init("5001"),

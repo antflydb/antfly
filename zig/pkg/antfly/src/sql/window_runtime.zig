@@ -479,7 +479,7 @@ fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: bi
             else => try tree.?.querySet(selected),
         };
         cells[row][column] = if (result.sql_null) result else .{
-            .value = try describe.coerce(result.value, spec.type),
+            .value = try describe.coerceAlloc(context.arena, result.value, spec.type),
             .sql_null = false,
         };
     }
@@ -508,7 +508,7 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
     for (input.rows, cells, 0..) |row, *values, index| {
         values.* = try alloc.alloc(Datum, row.len + bound.specs.len);
         @memset(values.*, .{});
-        for (row, bound.input.columns, values.*[0..row.len], 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerce(value, column.type), .sql_null = if (input.sql_nulls) |flags| flags[index][i] else value == .null };
+        for (row, bound.input.columns, values.*[0..row.len], 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerceAlloc(alloc, value, column.type), .sql_null = if (input.sql_nulls) |flags| flags[index][i] else value == .null };
     }
     for (bound.sorts, 0..) |sort, sort_index| {
         try context.checkpoint();
@@ -556,13 +556,35 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
     defer top.deinit();
     var eval = std.heap.ArenaAllocator.init(context.alloc);
     defer eval.deinit();
-    for (cells, 0..) |row, index| {
+    const decision = @import("decision_eval.zig");
+    if (decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders)) {
+        const projection = try decision.SortedProjection.init(context.arena, bound.outputs, bound.orders, bound.order_outputs);
+        var begin: usize = 0;
+        while (begin < cells.len) {
+            try context.checkpoint();
+            if (!eval.reset(.retain_capacity)) return error.OutOfMemory;
+            const a = eval.allocator();
+            var page: std.ArrayList([]const Datum) = .empty;
+            var bytes: usize = 0;
+            while (begin + page.items.len < cells.len and page.items.len < context.limits.page_rows) {
+                const row = cells[begin + page.items.len];
+                try page.append(a, row);
+                for (row) |cell| bytes +|= try operators.datumBytes(cell);
+                if (bytes >= context.limits.page_bytes) break;
+            }
+            const ordinals = try a.alloc(u64, page.items.len);
+            for (ordinals, begin..) |*ordinal, index| ordinal.* = index;
+            try projection.add(context, a, &top, page.items, ordinals);
+            begin += page.items.len;
+        }
+        return projection.finish(context, &top, offset, limit, statement.limit == null);
+    } else for (cells, 0..) |row, index| {
         try context.checkpoint();
         _ = eval.reset(.retain_capacity);
         const values = try eval.allocator().alloc(Datum, bound.outputs.len);
-        for (bound.outputs, values) |program, *out| out.* = try program.evaluate(eval.allocator(), row, context.parameters, .{});
+        for (bound.outputs, values) |program, *out| out.* = try context.evaluate(eval.allocator(), program, row);
         const keys = try eval.allocator().alloc(Datum, bound.orders.len);
-        for (bound.orders, keys) |program, *out| out.* = try program.evaluate(eval.allocator(), row, context.parameters, .{});
+        for (bound.orders, keys) |program, *out| out.* = try context.evaluate(eval.allocator(), program, row);
         try top.add(.{ .values = values, .keys = keys, .ordinal = index });
     }
     const ordered = try top.finish(alloc);

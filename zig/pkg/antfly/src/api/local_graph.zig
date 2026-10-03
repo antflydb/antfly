@@ -1694,6 +1694,7 @@ pub fn cloneGraphPatternMatch(
     }
 
     return .{
+        .computed_json = if (match.computed_json) |bytes| try alloc.dupe(u8, bytes) else null,
         .bindings = bindings,
         .path = path,
         .null_aliases = null_aliases,

@@ -24,6 +24,7 @@ pub const Diagnostic = struct {
     retryable: ?bool = null,
 
     pub fn httpStatus(self: Diagnostic) u16 {
+        if (std.mem.eql(u8, self.code, "38000")) return 502;
         if (std.mem.eql(u8, self.code, "0A000")) return 501;
         if (std.mem.eql(u8, self.code, "42501")) return 403;
         if (std.mem.eql(u8, self.code, "53300")) return 503;
@@ -35,6 +36,11 @@ pub const Diagnostic = struct {
 
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
+        error.InvalidDecisionSpecification, error.InvalidDeciderConfig => .{ .code = "22023", .message = "The decision specification is invalid.", .retryable = false },
+        error.UnknownDecider => .{ .code = "42704", .message = "The configured decider does not exist.", .retryable = false },
+        error.DecisionLimitExceeded => .{ .code = "54000", .message = "The decision evaluation budget was exceeded.", .retryable = false },
+        error.DecisionRateLimited, error.DecisionProviderUnavailable, error.MissingDecisionApiKey => .{ .code = "53300", .message = "The decision provider is unavailable or rate limited.", .retryable = false },
+        error.InvalidDecisionOutput, error.DecisionUpstreamFailure, error.DecisionUnauthorized => .{ .code = "38000", .message = "The decision provider failed.", .retryable = false },
         error.SqlPreparedNotFound => .{ .code = "26000", .message = "The prepared resource is unknown, expired or inaccessible.", .retryable = false },
         error.SqlConnectionNotFound => .{ .code = "08003", .message = "The SQL connection is unknown, expired or inaccessible.", .retryable = false },
         error.SqlConnectionWrongOwner => .{ .code = "55000", .message = "The SQL connection belongs to another API node.", .hint = "Send the request to the owner_node_id returned when the connection was opened.", .retryable = false },
@@ -89,7 +95,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlStatementSnapshotRequired => .{ .code = "0A000", .message = "This query requires a consistent statement snapshot that is not available.", .hint = "Narrow the query to one bounded page or use a runtime with statement snapshots." },
         error.SqlRangeTrackingRequired => .{ .code = "0A000", .message = "This transaction requires activated, owner-fenced range protection.", .hint = "Use a runtime that supports the requested isolation level; isolation was not downgraded.", .retryable = false },
         error.InvalidSqlSyntax => .{ .code = "42601", .message = "The SQL statement has invalid syntax.", .hint = "Check the reported position and submit one supported statement." },
-        error.TableNotFound, error.NotFound, error.CatalogNotFound => .{ .code = "42P01", .message = "The requested catalog object does not exist.", .hint = "Check the database, namespace, and object name." },
+        error.UndefinedTable, error.TableNotFound, error.NotFound, error.CatalogNotFound => .{ .code = "42P01", .message = "The requested catalog object does not exist.", .hint = "Check the database, namespace, and object name." },
         error.CatalogAlreadyExists, error.TableAlreadyExists => .{ .code = "42P07", .message = "The requested catalog object already exists.", .retryable = false },
         error.DatabaseNotFound => .{ .code = "3D000", .message = "The requested database does not exist.", .retryable = false },
         error.NamespaceNotFound => .{ .code = "3F000", .message = "The requested schema does not exist.", .retryable = false },

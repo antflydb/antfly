@@ -202,6 +202,7 @@ pub const StorageOwnerContext = struct {
 pub const SystemStoreHandle = struct {
     store: *antfly.storage_backend_erased.Store,
     context: *StorageOwnerContext,
+    refs: std.atomic.Value(usize) = .init(1),
 };
 
 pub const SystemReadTxnHandle = struct {
@@ -234,6 +235,7 @@ pub const MetadataApplyStoreHandle = struct {
     alloc: Allocator,
     store: metadata_raft_apply.RaftApplyStore,
     context: ?*StorageOwnerContext,
+    system_store: ?*SystemStoreHandle = null,
     listener_bridges: std.ArrayListUnmanaged(*MetadataListenerBridge) = .empty,
     listener_mutex: std.Io.Mutex = .init,
 };
@@ -973,6 +975,7 @@ pub fn storageContextSystemStoreOpen(
 
 pub fn storageSystemStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     const handle = asSystemStore(store_ptr) orelse return;
+    if (handle.refs.fetchSub(1, .acq_rel) != 1) return;
     const context = handle.context;
     context.alloc.destroy(handle);
     context.release();
@@ -1373,10 +1376,13 @@ pub fn metadataApplyStoreOpen(
         .root_dir = root_dir,
         .no_sync = request.no_sync != 0,
         .read_only = request.read_only != 0,
+        .borrowed_store = if (asSystemStore(request.system_store)) |system| system.store else null,
     }) catch |err| return storageOwnerStatusFromError(err);
     errdefer store.deinit();
     const handle = alloc.create(MetadataApplyStoreHandle) catch return .out_of_memory;
-    handle.* = .{ .alloc = alloc, .store = store, .context = context };
+    const system_store = asSystemStore(request.system_store);
+    if (system_store) |system| _ = system.refs.fetchAdd(1, .monotonic);
+    handle.* = .{ .alloc = alloc, .store = store, .context = context, .system_store = system_store };
     context_borrowed = false;
     out_store.* = handle;
     return .ok;
@@ -1387,6 +1393,7 @@ pub fn metadataApplyStoreClose(store_ptr: ?*anyopaque) callconv(.c) void {
     const alloc = handle.alloc;
     const context = handle.context;
     handle.store.deinit();
+    if (handle.system_store) |system| storageSystemStoreClose(system);
     for (handle.listener_bridges.items) |bridge| alloc.destroy(bridge);
     handle.listener_bridges.deinit(alloc);
     handle.* = undefined;
@@ -1554,14 +1561,14 @@ pub fn metadataApplyStoreRemoveListeners(store_ptr: ?*anyopaque, registration_id
     return 0;
 }
 
-pub fn metadataApplyStoreBindHA(
+pub fn metadataApplyStoreBindHotStandby(
     store_ptr: ?*anyopaque,
     request: *const kernel_owner_abi.MetadataHABindRequest,
 ) callconv(.c) kernel_owner_abi.Status {
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const handle = asMetadataApplyStore(store_ptr) orelse return .invalid_argument;
     const port: ?antfly.capi_dependencies.storage_metadata_hot_standby_port.Port = if (request.port) |ptr| @as(*const antfly.capi_dependencies.storage_metadata_hot_standby_port.Port, @ptrCast(@alignCast(ptr))).* else null;
-    handle.store.bindHAPort(port) catch |err| return storageOwnerStatusFromError(err);
+    handle.store.bindHotStandbyPort(port) catch |err| return storageOwnerStatusFromError(err);
     return .ok;
 }
 
@@ -1589,13 +1596,13 @@ pub fn metadataApplyStoreProjection(
             break :blk metadataProjectionJson(alloc, out_json, result);
         },
         .flush_ha_outbox => blk: {
-            handle.store.flushHAOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.flushHotStandbyOutbox() catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .apply_ha_record => blk: {
             if (request.key.len > 2 * 1024 * 1024) break :blk .invalid_argument;
             const record = antfly.capi_dependencies.storage_hot_standby_replication_record.decode(request.key.slice()) catch |err| break :blk storageOwnerStatusFromError(err);
-            handle.store.applyHARecord(record) catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.applyHotStandbyRecord(record) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .export_ha_checkpoint, .import_ha_checkpoint => blk: {
@@ -1603,10 +1610,10 @@ pub fn metadataApplyStoreProjection(
             if (path.len == 0 or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) break :blk .invalid_argument;
             const io = handle.store.io_impl.io();
             if (request.kind == .export_ha_checkpoint) {
-                const value = handle.store.exportHACheckpoint(io, path) catch |err| break :blk storageOwnerStatusFromError(err);
+                const value = handle.store.exportHotStandbyCheckpoint(io, path) catch |err| break :blk storageOwnerStatusFromError(err);
                 break :blk metadataProjectionJson(alloc, out_json, value);
             }
-            handle.store.importHACheckpoint(io, path, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
+            handle.store.importHotStandbyCheckpoint(io, path, request.arg0) catch |err| break :blk storageOwnerStatusFromError(err);
             break :blk metadataProjectionJson(alloc, out_json, true);
         },
         .migrate_standalone_restore_jobs => blk: {
@@ -3609,7 +3616,7 @@ pub fn storageOwnerOperationTableName(
     return storageOwnerTableName(handle, request.table_name);
 }
 
-pub fn storageHASeedFailure(
+pub fn storageHotStandbySeedFailure(
     err: anyerror,
     operation: kernel_owner_abi.HASeedOperation,
     out_failure: *kernel_owner_abi.FailureIdentity,
@@ -3623,7 +3630,7 @@ pub fn storageHASeedFailure(
     return out_failure.status;
 }
 
-pub fn validateHASeedRequest(
+pub fn validateHotStandbySeedRequest(
     request: *const kernel_owner_abi.HASeedJsonRequest,
     expected_operation: kernel_owner_abi.HASeedOperation,
 ) ![]const u8 {
@@ -3636,7 +3643,7 @@ pub fn validateHASeedRequest(
     return json;
 }
 
-pub fn storageHASeedActivateJson(
+pub fn storageHotStandbySeedActivateJson(
     request: *const kernel_owner_abi.HASeedJsonRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
     out_failure: *kernel_owner_abi.FailureIdentity,
@@ -3644,16 +3651,16 @@ pub fn storageHASeedActivateJson(
     out_response.* = .{};
     out_failure.* = .{};
     const operation = kernel_owner_abi.HASeedOperation.activate;
-    const request_json = validateHASeedRequest(request, operation) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+    const request_json = validateHotStandbySeedRequest(request, operation) catch |err|
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
     var parsed = std.json.parseFromSlice(hot_standby_seed_activation.ActivateRequest, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    }) catch return storageHotStandbySeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
     var result = hot_standby_seed_activation.activate(alloc, parsed.value) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     alloc.free(result.generation_path);
     const response = result.active_receipt_json;
     result = undefined;
@@ -3664,7 +3671,7 @@ pub fn storageHASeedActivateJson(
     return .ok;
 }
 
-pub fn storageHASeedValidateJson(
+pub fn storageHotStandbySeedValidateJson(
     request: *const kernel_owner_abi.HASeedJsonRequest,
     out_result: *kernel_owner_abi.HASeedValidationResult,
     out_failure: *kernel_owner_abi.FailureIdentity,
@@ -3672,20 +3679,20 @@ pub fn storageHASeedValidateJson(
     out_result.* = .{};
     out_failure.* = .{};
     const operation = kernel_owner_abi.HASeedOperation.validate_activated_generation;
-    const request_json = validateHASeedRequest(request, operation) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+    const request_json = validateHotStandbySeedRequest(request, operation) catch |err|
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
     var parsed = std.json.parseFromSlice(hot_standby_seed_activation.StartupExpectation, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    }) catch return storageHotStandbySeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
     out_result.checkpoint_lsn = hot_standby_seed_activation.validateActivatedGeneration(alloc, parsed.value) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     return .ok;
 }
 
-pub fn storageHASeedPruneJson(
+pub fn storageHotStandbySeedPruneJson(
     request: *const kernel_owner_abi.HASeedJsonRequest,
     out_response: *kernel_owner_abi.OwnedBytes,
     out_failure: *kernel_owner_abi.FailureIdentity,
@@ -3693,16 +3700,16 @@ pub fn storageHASeedPruneJson(
     out_response.* = .{};
     out_failure.* = .{};
     const operation = kernel_owner_abi.HASeedOperation.prune_activated_generations;
-    const request_json = validateHASeedRequest(request, operation) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+    const request_json = validateHotStandbySeedRequest(request, operation) catch |err|
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     const alloc = std.heap.c_allocator;
     var parsed = std.json.parseFromSlice(hot_standby_seed_activation.ActivatedGenerationGCRequest, alloc, request_json, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = false,
-    }) catch return storageHASeedFailure(error.InvalidArgument, operation, out_failure);
+    }) catch return storageHotStandbySeedFailure(error.InvalidArgument, operation, out_failure);
     defer parsed.deinit();
     var result = hot_standby_seed_activation.pruneActivatedGenerations(alloc, parsed.value) catch |err|
-        return storageHASeedFailure(err, operation, out_failure);
+        return storageHotStandbySeedFailure(err, operation, out_failure);
     const response = result.result_json;
     result = undefined;
     out_response.* = .{
@@ -4763,7 +4770,7 @@ pub fn replicatedBatchStorageKernelJson(
 pub fn replicatedBatchStorageKernelJsonAtRaftEntry(
     handle: *Handle,
     request_json: capi.Slice,
-    raft_entry: db_mod.RaftAppliedEntryIdentity,
+    raft_entry: db_mod.OrderedApplyReceipt,
     out_buf: *capi.Buffer,
 ) kernel_owner_abi.Status {
     var owned = batch_api.parseInternalBatchRequest(handle.alloc, request_json.bytes()) catch |err|

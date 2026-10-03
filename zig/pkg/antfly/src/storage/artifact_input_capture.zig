@@ -83,7 +83,7 @@ pub const Capture = struct {
             }
             return;
         }
-        if (std.mem.eql(u8, key, &keys.raft_document_applied_entry_key)) {
+        if (std.mem.eql(u8, key, &keys.ordered_document_applied_entry_key)) {
             self.raft_marker = if (value) |raw| if (raw.len == 16) raw[0..16].* else null else null;
             return;
         }
@@ -270,10 +270,10 @@ test "ordered artifact inventory input capture requires same transaction authori
             std.mem.writeInt(u64, marker[0..8], 2, .little);
             std.mem.writeInt(u64, marker[8..16], 9, .little);
             // An old persisted watermark alone must not grant authority.
-            try txn.put(&keys.raft_document_applied_entry_key, &marker);
+            try txn.put(&keys.ordered_document_applied_entry_key, &marker);
             try std.testing.expectError(error.RetainedEffectsFenceMismatch, capture.stage(&txn, false));
             capture.poisoned = false;
-            try capture.touch(alloc, &txn, &keys.raft_document_applied_entry_key, &marker);
+            try capture.touch(alloc, &txn, &keys.ordered_document_applied_entry_key, &marker);
         }
         try capture.stage(&txn, false);
         const position = (try publication.inputRevision(&txn, namespace, "doc")).?;
@@ -331,7 +331,7 @@ test "ordered artifact inventory input capture requires same transaction authori
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 2, .little);
             std.mem.writeInt(u64, marker[8..16], 11, .little);
-            try chunk_capture.touch(alloc, &txn, &keys.raft_document_applied_entry_key, &marker);
+            try chunk_capture.touch(alloc, &txn, &keys.ordered_document_applied_entry_key, &marker);
         }
         try chunk_capture.stage(&txn, false);
         try std.testing.expectEqual(@as(?u64, 41), (try publication.materializationState(&txn, namespace, "doc")).?.replay_sequence);
@@ -371,7 +371,7 @@ test "ordered artifact inventory input capture requires same transaction authori
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 2, .little);
             std.mem.writeInt(u64, marker[8..16], 10, .little);
-            try graph_capture.touch(alloc, &txn, &keys.raft_document_applied_entry_key, &marker);
+            try graph_capture.touch(alloc, &txn, &keys.ordered_document_applied_entry_key, &marker);
         }
         try graph_capture.stage(&txn, false);
         try std.testing.expectEqual(null, (try publication.materializationState(&txn, namespace, "doc")).?.replay_sequence);
@@ -390,7 +390,7 @@ test "ordered artifact inventory input capture requires same transaction authori
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 2, .little);
             std.mem.writeInt(u64, marker[8..16], 12, .little);
-            try other_capture.touch(alloc, &txn, &keys.raft_document_applied_entry_key, &marker);
+            try other_capture.touch(alloc, &txn, &keys.ordered_document_applied_entry_key, &marker);
         }
         try other_capture.stage(&txn, false);
         try std.testing.expectEqualDeep(before_other, try publication.materializationRevision(&txn, namespace, "doc"));

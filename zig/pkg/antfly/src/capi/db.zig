@@ -4733,6 +4733,7 @@ pub fn searchPublicQueryJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
+    query_api.validateStoragePublicQueryRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     // `linked_storage` says this compiled library links the full storage
     // internals -- true unconditionally for the default `libantfly` since
     // it is shared with the `antfly` executable -- not that `handle` is a
@@ -4809,6 +4810,7 @@ pub export fn antfly_db_sql_json(handle_ptr: ?*anyopaque, table_name: capi.Slice
     executeEmbeddedSql(handle, table_name.bytes(), request_json.bytes(), out_buf) catch |err| {
         if (err == error.RowPolicyAuthenticationRequired) return .unsupported;
         const diagnostic = antfly.capi_dependencies.sql_errors.describe(err);
+        if (std.mem.eql(u8, diagnostic.code, "XX000")) std.log.warn("Embedded SQL execution internal failure err={s}", .{@errorName(err)});
         if (out_buf.ptr == null) out_buf.* = stringifyJson(.{ .@"error" = diagnostic }) catch return .internal;
         if (std.mem.eql(u8, diagnostic.code, "40003")) return .outcome_unknown;
         if (std.mem.eql(u8, diagnostic.code, "0A000")) return .unsupported;

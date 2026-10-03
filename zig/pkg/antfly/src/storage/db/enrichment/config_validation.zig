@@ -77,7 +77,7 @@ pub fn validateUpstreamAssetProducer(alloc: Allocator, producer_json: []const u8
     };
     defer producer.deinit(alloc);
     switch (producer.type) {
-        .copy, .generator, .extractor => {},
+        .copy, .generator, .extractor, .decision => {},
         .document_extraction, .reader, .transcriber => return error.InvalidEnrichmentConfig,
     }
 }
@@ -112,7 +112,7 @@ fn validateNeighborContextConfig(
 /// locator. Shared by admission and the runtime injection guard.
 pub fn producerConsumesPromptText(producer_type: asset_producer.ProducerType) bool {
     return switch (producer_type) {
-        .generator, .extractor => true,
+        .generator, .extractor, .decision => true,
         .copy, .document_extraction, .reader, .transcriber => false,
     };
 }
@@ -125,6 +125,11 @@ pub fn validateAssetProducerConfig(alloc: Allocator, raw: []const u8) !void {
         else => return error.InvalidAssetProducerConfig,
     };
     defer producer.deinit(alloc);
+    if (producer.type == .decision) {
+        const specification = try @import("../../../functions/materialization.zig").parse(alloc, producer.config_json);
+        defer specification.deinit();
+        return;
+    }
     if (producer.type != .document_extraction) return;
 
     var extraction = try document_extraction.parseConfig(alloc, producer.config_json);

@@ -298,6 +298,7 @@ const OwnedRead = struct {
     identity: ?http.AuthenticatedIdentity,
     authority: Authority,
     native_adapter: execution.Adapter,
+    decision_runtime: ?@import("../functions/runtime.zig").Runtime = null,
     session_id: ?[]u8 = null,
     staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
     range_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
@@ -366,6 +367,8 @@ const OwnedRead = struct {
             self.native_adapter.staged = &self.staged;
             if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
         }
+        self.decision_runtime = try self.native_adapter.decisionRuntime();
+        if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();
@@ -796,7 +799,7 @@ const Job = struct {
             return;
         }
         const parameters = try normalizeParameters(self.alloc, self.request.parameters, self.request.parameter_types);
-        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit, .page_rows = 4096 }, guarded.backend()) catch |err| {
+        var result = native_adapter.execute(self.alloc, compiled, parameters, .{ .result_rows = self.request.limit }, guarded.backend()) catch |err| {
             if (self.request.diagnostics) |diagnostic| diagnostic.transaction_status = @enumFromInt(@intFromEnum(native_adapter.transaction_status));
             if (err == error.SqlMutationOutcomeUnknown or err == error.SqlTransactionOutcomeUnknown or err == error.SessionLeaseLost) if (self.request.diagnostics) |diagnostic|
                 diagnostic.set("40003", "transaction outcome is unknown; do not replay this statement", native_adapter.outcome_transaction_id, false);

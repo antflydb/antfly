@@ -156,6 +156,8 @@ pub const Mutation = struct {
     key: []const u8,
     expected_version: u64,
     expected_content_digest: ?[32]u8 = null,
+    /// A server-authored INSERT identity constraint, rather than an observed read.
+    unique_absence: bool = false,
     row: ?std.json.Value,
     json_null_fields: []const []const u8 = &.{},
     /// Owned preimage retained only for DELETE RETURNING. The observed version
@@ -201,6 +203,7 @@ pub const DdlReceipt = struct {
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
 pub const Backend = struct {
+    decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,
     vtable: *const VTable,
     /// Runtime captures a fresh owner-authorized view for each statement.
@@ -245,6 +248,8 @@ pub const Backend = struct {
         /// substitute a collection of independently refreshed shard pages.
         open_scan: ?*const fn (*anyopaque, std.mem.Allocator, Table, Scan) anyerror!?Cursor = null,
         open_statement: ?*const fn (*anyopaque, std.mem.Allocator, []const StatementScan) anyerror!StatementRead = null,
+        // The mutation allocator is a call-scoped arena. Providers must copy
+        // any data retained after return into their own durable/session owner.
         // Exactly one atomic commit, retaining all schema/row-version fences.
         // An ambiguous outcome is propagated, never replayed by SQL.
         mutate: *const fn (*anyopaque, std.mem.Allocator, Table, []const Mutation) anyerror!MutationOutcome,

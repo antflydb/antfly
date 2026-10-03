@@ -26,8 +26,17 @@ pub const Datum = struct {
 pub const Type = struct { kind: ?ast.ColumnType = null, nullable: bool = true };
 pub const Column = struct { name: []const u8, type: ast.ColumnType, nullable: bool = true };
 pub const BindLimits = struct { nodes: usize = 8192, depth: usize = 64, parameters: usize = 1024 };
-pub const EvalLimits = struct { steps: usize = 65_536, depth: usize = 64, output_bytes: usize = 1024 * 1024 };
-pub const Function = enum { abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified" };
+const decisions = @import("../functions/decisions.zig");
+pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
+pub const EvalLimits = struct {
+    steps: usize = 65_536,
+    pattern_steps: usize = 8 * 1024 * 1024,
+    depth: usize = 64,
+    output_bytes: usize = 1024 * 1024,
+    decision_values: ?[]const ?Datum = null,
+    decision_demand: ?*?DecisionDemand = null,
+};
+pub const Function = enum { ai_decide, ai_choice, ai_score, ai_probability, abs, lower, upper, length, octet_length, concat, coalesce, nullif, greatest, least, ceil, floor, round, sqrt, power, mod, substring, trim, ltrim, rtrim, replace, starts_with, date_part, date_trunc, to_timestamp, current_setting, @"$single", @"$pattern_quantified" };
 
 pub const Instruction = struct {
     type: Type,
@@ -62,6 +71,11 @@ pub const Program = struct {
     /// Cells use the ordinal order supplied to bind(), including unselected
     /// NULL placeholders. Borrowed scalar results remain valid while the
     /// program, cells and parameters live; computed strings use alloc.
+    pub fn evaluateInstruction(self: *const Program, alloc: Allocator, index: u32, parameters: []const Json) !Datum {
+        var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = parameters, .limits = .{} };
+        return context.runDatum(index, 0);
+    }
+
     pub fn evaluate(self: *const Program, alloc: Allocator, cells: []const Datum, parameters: []const Json, limits: EvalLimits) !Datum {
         var context: Evaluator = .{ .program = self, .alloc = alloc, .cells = cells, .parameters = parameters, .limits = limits };
         const result = try context.runDatum(self.root, 0);
@@ -158,6 +172,14 @@ fn literalType(value: ast.Value) Type {
         .string => .string,
     }, .nullable = value == .null or value == .parameter };
 }
+pub fn statementConstant(node: *const ast.Scalar) bool {
+    return switch (node.*) {
+        .literal => true,
+        .cast => |cast| statementConstant(cast.operand),
+        else => false,
+    };
+}
+
 fn functionId(name: []const u8) !Function {
     inline for (std.meta.fields(Function)) |field| if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
     if (std.mem.eql(u8, name, "char_length") or std.mem.eql(u8, name, "character_length")) return .length;
@@ -168,6 +190,8 @@ fn functionId(name: []const u8) !Function {
 }
 fn arity(function: Function, count: usize) !void {
     const valid = switch (function) {
+        .ai_decide, .ai_probability => count == 3,
+        .ai_choice, .ai_score => count == 4,
         .abs, .lower, .upper, .length, .octet_length, .ceil, .floor, .round, .sqrt, .to_timestamp, .current_setting => count == 1,
         .nullif, .power, .mod, .starts_with, .date_part, .date_trunc, .@"$single" => count == 2,
         .@"$pattern_quantified" => count == 5,
@@ -250,6 +274,20 @@ const Binder = struct {
                 }
                 const function = try functionId(call.name);
                 try arity(function, call.args.len);
+                if (decisions.descriptor(@tagName(function))) |desc| {
+                    for (call.args, 0..) |arg, i| {
+                        const actual = try self.infer(arg, depth + 1);
+                        if (i > 0 and !statementConstant(arg)) return error.UnsupportedSqlShape;
+                        const schema_arg = (function == .ai_decide and i == 1) or ((function == .ai_choice or function == .ai_score) and i == 2);
+                        if (actual.kind != null and actual.kind != .string and !(schema_arg and actual.kind == .json)) return error.SqlTypeMismatch;
+                    }
+                    break :blk .{ .kind = switch (desc.result) {
+                        .json => .json,
+                        .string => .string,
+                        .number => .number,
+                    }, .nullable = true };
+                }
+
                 if (function == .current_setting) {
                     const name = call.args[0];
                     if (name.* != .literal or name.literal != .string) return error.UnsupportedSqlShape;
@@ -386,6 +424,7 @@ const Binder = struct {
                 const args = try self.alloc.alloc(u32, call.args.len);
                 for (call.args, args, 0..) |arg, *out, i| {
                     const desired: ?ast.ColumnType = switch (function) {
+                        .ai_decide, .ai_choice, .ai_score, .ai_probability => if ((try self.infer(arg, depth + 1)).kind == .json) .json else .string,
                         .@"$single" => if (i == 0) kind.kind else .integer,
                         .@"$pattern_quantified" => if (i == 0) .string else if (i == 1) .json else .boolean,
                         .lower, .upper, .length, .octet_length, .trim, .ltrim, .rtrim, .replace, .starts_with => .string,
@@ -436,6 +475,7 @@ const Evaluator = struct {
     parameters: []const Json,
     limits: EvalLimits,
     steps: usize = 0,
+    pattern_steps: usize = 0,
     bytes: usize = 0,
 
     fn charge(self: *Evaluator, bytes: usize) !void {
@@ -521,6 +561,17 @@ const Evaluator = struct {
                 break :blk if (unknown) .{} else Datum.json(.{ .bool = list.negated });
             },
             .call => |call| blk: {
+                if (decisions.descriptor(@tagName(call.function))) |desc| {
+                    if (self.limits.decision_values) |values| if (index < values.len) if (values[index]) |value| break :blk value;
+                    const args = try self.alloc.alloc(Json, call.args.len);
+                    for (call.args, args) |arg, *out| {
+                        const value = try self.runDatum(arg, depth + 1);
+                        if (value.sql_null) break :blk .{};
+                        out.* = value.value;
+                    }
+                    if (self.limits.decision_demand) |demand| demand.* = .{ .instruction = index, .function = desc.function, .args = args };
+                    return error.DecisionNotEvaluated;
+                }
                 if (call.function == .current_setting) {
                     const view = self.program.settings orelse return error.SettingCatalogUnavailable;
                     const value = try view.resolveDependency(call.setting_identity orelse return error.InvalidSqlProgram);
@@ -852,6 +903,7 @@ const Evaluator = struct {
         if (first != .string) return error.SqlTypeMismatch;
         const text_value = first.string;
         return switch (function) {
+            .ai_decide, .ai_choice, .ai_score, .ai_probability => error.DecisionNotEvaluated,
             .length => .{ .integer = @intCast(std.unicode.utf8CountCodepoints(text_value) catch return error.SqlTypeMismatch) },
             .octet_length => .{ .integer = @intCast(text_value.len) },
             .lower, .upper => blk: {
@@ -938,9 +990,10 @@ const Evaluator = struct {
         var star: ?usize = null;
         var restart: usize = 0;
         while (i < text.len) {
-            if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
-            self.steps += 1;
+            if (self.pattern_steps >= self.limits.pattern_steps) return error.SqlProgramLimitExceeded;
+            self.pattern_steps += 1;
             if (j < glob.len and glob[j] == '%') {
+                if (j + 1 == glob.len) return true;
                 star = j + 1;
                 j += 1;
                 restart = i;
@@ -1229,4 +1282,20 @@ test "SQL scalar bound arithmetic hot loop does not allocate per row" {
     const elapsed = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
     try std.testing.expectEqual(@as(i64, 15000534143), checksum);
     std.debug.print("SQL scalar hot loop: rows=100000 instructions={} allocated_bytes=0 checksum={} elapsed_ns={}\n", .{ program.instructions.len, checksum, elapsed });
+}
+
+test "SQL LIKE admits large ordinary text with an independent bounded work budget" {
+    var compiled = try @import("compiler.zig").compileScalar(std.testing.allocator, "$1 ILIKE $2", .{});
+    defer compiled.deinit();
+    var program = try bind(std.testing.allocator, compiled.expression, &.{}, &.{ .string, .string }, .{});
+    defer program.deinit();
+    const text = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(text);
+    @memset(text, 'X');
+    @memcpy(text[text.len - 6 ..], "needle");
+    for ([_][]const u8{ "%NEEDLE", "%NEEDLE%", "%absent%" }, [_]bool{ true, true, false }) |pattern, expected| {
+        const actual = try program.evaluate(std.testing.allocator, &.{}, &.{ .{ .string = text }, .{ .string = pattern } }, .{});
+        try std.testing.expectEqual(expected, actual.value.bool);
+    }
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(std.testing.allocator, &.{}, &.{ .{ .string = text }, .{ .string = "%absent%" } }, .{ .pattern_steps = 32 }));
 }

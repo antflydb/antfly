@@ -38,6 +38,7 @@ pub const SemanticResolver = query_contract.SemanticResolver;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
 pub const parseGraphMetricRequestsAlloc = query_contract.parseGraphMetricRequestsAlloc;
+pub const validateStoragePublicQueryRequest = query_contract.validateStoragePublicQueryRequest;
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
 pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
 pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;
