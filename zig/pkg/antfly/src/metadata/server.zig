@@ -897,7 +897,7 @@ fn metadataRestoreJobPut(ptr: *anyopaque, key: []const u8, value: []const u8, le
 
 fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("antfly_local_sources").metadata_topology_protocol.restore_job_admission_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_admission_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
@@ -913,7 +913,7 @@ fn metadataRestoreJobCreate(ptr: *anyopaque, alloc: std.mem.Allocator, key: []co
 
 fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator, key: []const u8, value: []const u8, plan_json: []const u8, leadership_term: u64) ![]u8 {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("antfly_local_sources").metadata_topology_protocol.coordinated_lifecycle_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").coordinated_lifecycle_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);
@@ -924,7 +924,7 @@ fn metadataRestoreJobCreateWithStaging(ptr: *anyopaque, alloc: std.mem.Allocator
 
 fn metadataRestoreJobDeleteMatching(ptr: *anyopaque, key: []const u8, value_hash: []const u8, leadership_term: u64) !bool {
     const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("antfly_local_sources").metadata_topology_protocol.restore_job_expiry_version);
+    const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(.{}, @import("topology_protocol.zig").restore_job_expiry_version);
     svc.lockCatalogMutation();
     defer svc.unlockCatalogMutation();
     try svc.validateTableTopologyProtocolReadinessWithContext(.{}, readiness);

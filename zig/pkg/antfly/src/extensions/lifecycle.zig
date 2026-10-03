@@ -22,7 +22,7 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_service = @import("../metadata/service.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
-const metadata_topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
+const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 
 fn lockCatalogMutation(service: anytype) bool {
     const ServiceType = @TypeOf(service);

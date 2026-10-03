@@ -612,8 +612,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_portable_backup_test_step = b.step("antfly-storage-portable-backup-test", "Run bounded portable backup tests");
     lib_portable_backup_test_step.dependOn(&run_portable_backup_tests.step);
 
+    const generating_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/generating_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, generating_test_mod, true, true);
+    generating_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    generating_test_mod.addAnonymousImport("lmdb_vopr_source", .{
+        .root_source_file = b.path("lib/lmdb/src/lmdb_vopr.zig"),
+    });
     const lib_generating_runtime_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = generating_test_mod,
         .filters = &.{
             "generating backend",
             "generating backend factory executes fallback chain across providers",
@@ -6032,6 +6042,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_retirement_seal.",
             "storage.db.empty_generation_handoff.",
             "storage.db.receipt_position.",
+            "storage.db.graph_edge_types.",
             "storage.db.graph_edge_ttl_expiration.",
             "storage.db.graph_edge_ttl_tombstone.",
             "storage.db.graph_state_name.",
@@ -6138,6 +6149,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.retained_read_registry.",
             "storage.row_identity.",
             "storage.statement_read_fence.",
+            "storage.document_mutation_revision.",
             "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",

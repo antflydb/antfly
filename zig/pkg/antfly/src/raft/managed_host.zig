@@ -29,7 +29,7 @@ const metadata_table_provisioner = if (control_only_storage_sources)
     struct {}
 else
     @import("../metadata/table_provisioner.zig");
-const metadata_reallocation_request = @import("antfly_local_sources").metadata_reallocation_request;
+const metadata_reallocation_request = @import("../metadata/reallocation_request.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_view = @import("metadata_view.zig");
 const reconciler = @import("reconciler.zig");

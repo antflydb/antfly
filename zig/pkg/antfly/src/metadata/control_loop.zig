@@ -430,7 +430,7 @@ test "metadata control loop plans placement intents from desired topology and ca
             return try alloc.alloc(raft_reconciler.PlacementIntent, 0);
         }
 
-        pub fn getProjectedReallocationRequest(self: *@This()) !?@import("antfly_local_sources").metadata_reallocation_request.ReallocationRequestRecord {
+        pub fn getProjectedReallocationRequest(self: *@This()) !?@import("reallocation_request.zig").ReallocationRequestRecord {
             if (!self.catalog_locked) return error.CatalogSnapshotNotLocked;
             return null;
         }

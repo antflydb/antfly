@@ -1796,7 +1796,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
     try std.testing.expectEqual(abi.Status.lsm_root_writer_already_open, abi.antfly_storage_owner_open(&open_request, &duplicate));
     try std.testing.expect(duplicate == null);
 
-    const cleanup_contract = @import("antfly_local_sources").metadata_topology_protocol.DropCleanupContract{
+    const cleanup_contract = @import("../metadata/topology_protocol.zig").DropCleanupContract{
         .table_id = 7,
         .expected_transition_generation = 0,
         .group_ids = &.{7001},

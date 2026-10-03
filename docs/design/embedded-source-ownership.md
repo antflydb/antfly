@@ -24,6 +24,8 @@ Policy, waits, and telemetry stay in the server adapters; copied captures retain
 configuration by value while their pointer and slice targets remain borrowed.
 Backup artifact decoding and local restore staging are local operations;
 coordinated snapshot publication and cluster restore remain server operations.
+Table-drop cleanup fences are shared local contracts. Metadata protocol activation,
+membership barriers, and reallocation requests remain server coordination.
 Existing shared contracts and generated OpenAPI ownership remain in their existing
 embedded/shared-library/server-API packages. Authored YAML remains in `specs/openapi`.
 

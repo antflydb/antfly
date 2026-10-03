@@ -24,7 +24,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_service = @import("../raft/service.zig");
 const transition_state = @import("transition_state.zig");
 const metadata_incarnation = @import("antfly_local_sources").metadata_incarnation;
-const reallocation_request = @import("antfly_local_sources").metadata_reallocation_request;
+const reallocation_request = @import("reallocation_request.zig");
 
 pub const MetadataClusterIncarnation = @import("antfly_local_sources").metadata_catalog_mutation_stamp.MetadataClusterIncarnation;
 

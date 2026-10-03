@@ -19,7 +19,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const table_manager = @import("table_manager.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
-const reallocation_request = @import("antfly_local_sources").metadata_reallocation_request;
+const reallocation_request = @import("reallocation_request.zig");
 const transition_controller = @import("transition_controller.zig");
 const transition_state = @import("transition_state.zig");
 

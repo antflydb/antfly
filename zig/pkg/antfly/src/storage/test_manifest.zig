@@ -21,10 +21,11 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_document_mutation_revision;
+    _ = @import("antfly_local_sources").storage_db_graph_edge_types;
     _ = @import("antfly_local_sources").storage_db_apply_receipts;
     _ = @import("antfly_local_sources").storage_db_durable_outbox;
     _ = @import("antfly_local_sources").storage_db_durable_outbox_store;
-    _ = @import("antfly_local_sources").storage_db_primary_effect;
     _ = @import("antfly_local_sources").storage_db_replication_contract;
     _ = @import("antfly_local_sources").storage_db_replication_ingress;
     _ = @import("antfly_local_sources").storage_db_replication_effects;

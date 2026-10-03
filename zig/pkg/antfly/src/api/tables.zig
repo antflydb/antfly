@@ -18,7 +18,7 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_admin = @import("../metadata/admin.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
-const metadata_topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
+const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const indexes_openapi = @import("antfly_indexes_openapi");
@@ -110,7 +110,7 @@ test "table mutation names preserve the public contract" {
 }
 
 test "create table rejects unbounded initial shard fanout" {
-    const topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
+    const topology_protocol = @import("../metadata/topology_protocol.zig");
     const body = try std.fmt.allocPrint(
         std.testing.allocator,
         "{{\"num_shards\":{d}}}",

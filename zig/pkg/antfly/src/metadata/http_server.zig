@@ -117,7 +117,7 @@ fn systemCatalogIdentityCall(comptime Service: type) *const fn (*anyopaque) anye
 }
 
 fn storeRootReadinessCall(comptime Service: type) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreRootReadiness {
-    return storeRootCapabilityReadinessCall(Service, @import("antfly_local_sources").metadata_topology_protocol.store_root_uuid_decoder_version);
+    return storeRootCapabilityReadinessCall(Service, @import("topology_protocol.zig").store_root_uuid_decoder_version);
 }
 
 fn storeRootCapabilityReadinessCall(comptime Service: type, comptime required_version: u16) *const fn (*anyopaque, operation.RequestContext) anyerror!metadata_api.StoreRootReadiness {
@@ -140,7 +140,7 @@ fn storeRootCapabilityReadinessCall(comptime Service: type, comptime required_ve
 }
 
 test "store-root readiness returns only an exact durable v17 activation" {
-    const protocol = @import("antfly_local_sources").metadata_topology_protocol;
+    const protocol = @import("topology_protocol.zig");
     const incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     const proof: service.TableTopologyProtocolReadiness = .{
         .term = 7,
@@ -644,7 +644,7 @@ pub const AdminSource = struct {
                 .head = metadataServiceHead,
                 .linearizable_head = metadataServiceLinearizableHead,
                 .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataService),
-                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataService, @import("antfly_local_sources").metadata_topology_protocol.store_root_signing_decoder_version),
+                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataService, @import("topology_protocol.zig").store_root_signing_decoder_version),
                 .linearizable_snapshot = metadataServiceLinearizableSnapshot,
                 .runtime_topology = metadataServiceRuntimeTopology,
                 .status = metadataServiceStatus,
@@ -713,7 +713,7 @@ pub const AdminSource = struct {
                 .head = metadataHttpServiceHead,
                 .linearizable_head = metadataHttpServiceLinearizableHead,
                 .ensure_store_root_readiness = comptime storeRootReadinessCall(service.MetadataHttpService),
-                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataHttpService, @import("antfly_local_sources").metadata_topology_protocol.store_root_signing_decoder_version),
+                .ensure_store_root_signing_readiness = comptime storeRootCapabilityReadinessCall(service.MetadataHttpService, @import("topology_protocol.zig").store_root_signing_decoder_version),
                 .linearizable_snapshot = metadataHttpServiceLinearizableSnapshot,
                 .runtime_topology = metadataHttpServiceRuntimeTopology,
                 .status = metadataHttpServiceStatus,

@@ -25,7 +25,7 @@ const backend_types = @import("../storage/backend_types.zig");
 const table_create_contract = @import("table_create_contract.zig");
 const backup_contract = @import("backup_contract.zig");
 const distributed_txn = @import("distributed_txn_contract.zig");
-const metadata_topology_protocol = @import("../metadata/topology_protocol.zig");
+const table_drop_contract = @import("table_drop_contract.zig");
 const metadata_api = @import("../metadata/catalog_mutation_stamp.zig");
 const runtime_status = @import("runtime_status.zig");
 const runtime_callback_abi = @import("../runtime_callback_abi.zig");
@@ -171,7 +171,7 @@ pub const TableWriteSource = struct {
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,
-            contract: metadata_topology_protocol.DropCleanupContract,
+            contract: table_drop_contract.DropCleanupContract,
         ) anyerror!?void = null,
         backup_pin_control: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, request: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) anyerror!?[]u8 = null,
         backup_table: ?*const fn (
@@ -799,7 +799,7 @@ pub const TableWriteSource = struct {
         self: TableWriteSource,
         alloc: std.mem.Allocator,
         table_name: []const u8,
-        contract: metadata_topology_protocol.DropCleanupContract,
+        contract: table_drop_contract.DropCleanupContract,
     ) !?void {
         const fn_ptr = self.vtable.drop_table orelse return null;
         return try BoundaryAbi.call("drop_table", self.boundary_dispatch, fn_ptr, .{ self.ptr, alloc, table_name, contract });

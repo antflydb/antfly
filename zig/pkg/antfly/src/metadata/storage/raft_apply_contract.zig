@@ -20,7 +20,7 @@ const std = @import("std");
 const metadata = @import("../domain.zig");
 const metadata_incarnation = @import("antfly_local_sources").metadata_incarnation;
 const metadata_table_manager = @import("../table_manager.zig");
-const topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
+const topology_protocol = @import("../topology_protocol.zig");
 
 /// Result of an aborting owner-side initial-FK admission transaction. Keep
 /// expected CAS conflicts out of generic storage error statuses so the

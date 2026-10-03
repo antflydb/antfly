@@ -22,7 +22,7 @@ const group_ids = @import("antfly_local_sources").common_group_ids;
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const metadata_authority = @import("authority.zig");
 const metadata_table_manager = @import("table_manager.zig");
-const topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
+const topology_protocol = @import("topology_protocol.zig");
 
 fn afterAdmission(err: anyerror) anyerror {
     // Once mutation admission begins, a local failure cannot prove that none

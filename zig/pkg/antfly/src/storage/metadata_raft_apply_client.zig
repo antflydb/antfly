@@ -983,4 +983,4 @@ fn statusToError(status: abi.Status) !void {
 
 const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const store_report_update = @import("../metadata/store_report_update.zig");
-const topology_protocol = @import("antfly_local_sources").metadata_topology_protocol;
+const topology_protocol = @import("../metadata/topology_protocol.zig");
