@@ -9141,6 +9141,42 @@ pub const GraphIndex = struct {
         return self.deleteGraphDocuments(doc_keys, false);
     }
 
+    /// One bounded migration/owner-cleanup page. The caller owns the cursor
+    /// and resumes under the same index generation; ordinary replay may discard
+    /// this volatile state and restart safely from authoritative artifacts.
+    pub fn deleteOwnedEdgesForDocPage(self: *GraphIndex, doc: []const u8, phase: *u8, after: *?[]u8) !bool {
+        if (!try self.ensureLegacyOwnerDirectoryPage()) return false;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var prefix: []const u8 = undefined;
+        switch (phase.*) {
+            0 => prefix = try legacyProducerPrefixAlloc(scratch, doc),
+            1 => prefix = try graphIndexEdgePrefixAlloc(scratch, doc, self.index_name, ""),
+            2, 3 => {
+                var owner: std.ArrayListUnmanaged(u8) = .empty;
+                try internal_keys.appendDocumentPrefix(&owner, scratch, doc);
+                try owner.append(scratch, internal_keys.artifact_kind);
+                try internal_keys.appendEncodedComponent(&owner, scratch, "graph_index_owner");
+                try internal_keys.appendEncodedComponent(&owner, scratch, self.index_name);
+                try owner.append(scratch, internal_keys.graph_edge_record_kind);
+                prefix = if (phase.* == 2) owner.items else try std.mem.concat(scratch, u8, &.{ relationship_owner_prefix, owner.items });
+            },
+            4 => {
+                var intent: std.ArrayListUnmanaged(u8) = .empty;
+                try intent.appendSlice(scratch, doc_clear_intent_prefix);
+                try internal_keys.appendEncodedComponent(&intent, scratch, doc);
+                prefix = intent.items;
+            },
+            else => return true,
+        }
+        const page = try self.deleteGraphDocPrefixPageFromStore(self.alloc, prefix, .out, phase.* == 2 or phase.* == 3, after.*, phase.* == 0 or phase.* == 3 or phase.* == 4, doc, true);
+        if (after.*) |key| self.alloc.free(key);
+        after.* = page.next_cursor;
+        if (!page.pending) phase.* += 1;
+        return phase.* == 5;
+    }
+
     fn deleteGraphDocuments(self: *GraphIndex, doc_keys: []const []const u8, include_incoming: bool) !void {
         if (doc_keys.len == 0) return;
         try self.ensureLegacyOwnerDirectory();
@@ -9176,100 +9212,159 @@ pub const GraphIndex = struct {
     /// The metadata directory also holds recovery identities across store commits.
     /// Normal producer cleanup then seeks only that producer's key range.
     fn ensureLegacyOwnerDirectory(self: *GraphIndex) !void {
+        while (!try self.ensureLegacyOwnerDirectoryPage()) {}
+    }
+
+    fn ensureLegacyOwnerDirectoryPage(self: *GraphIndex) !bool {
         const progress_key = "meta:legacy_owner_directory:v1";
-        while (true) {
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const scratch = arena.allocator();
-            var rows: std.ArrayListUnmanaged(struct { key: []const u8, value: []const u8 }) = .empty;
-            var last: []const u8 = "";
-            var done = true;
-            {
-                var read = try self.beginReadReverseTxn();
-                defer read.abort();
-                const progress = read.get(progress_key) catch |err| switch (err) {
-                    error.NotFound => "",
-                    else => return err,
-                };
-                if (std.mem.eql(u8, progress, "ready")) return;
-                if (progress.len != 0 and !std.mem.startsWith(u8, progress, owner_member_prefix)) return error.InvalidGraphOwnerMember;
-                const start = if (progress.len == 0) owner_member_prefix else try std.mem.concat(scratch, u8, &.{ progress, &.{0} });
-                var cursor = try read.openCursor();
-                defer cursor.close();
-                var row = try cursor.seekAtOrAfter(start);
-                var bytes: usize = 0;
-                while (row) |entry| {
-                    if (!std.mem.startsWith(u8, entry.key, owner_member_prefix)) break;
-                    var pos: usize = owner_member_prefix.len;
-                    var components: [4][]const u8 = undefined;
-                    for (&components) |*component| {
-                        const end = internal_keys.findComponentTerminator(entry.key, pos) orelse return error.InvalidGraphOwnerMember;
-                        component.* = try internal_keys.decodeBodyAlloc(scratch, entry.key[pos..end]);
-                        pos = end + 2;
-                    }
-                    if (pos != entry.key.len) return error.InvalidGraphOwnerMember;
-                    const reverse_key = try legacyProducerKeyAlloc(scratch, components[3], self.index_name, components[0], components[1], components[2]);
-                    // Directory values are identities, never hydrated payloads.
-                    try rows.append(scratch, .{ .key = reverse_key, .value = "" });
-                    last = try scratch.dupe(u8, entry.key);
-                    bytes +|= entry.key.len + reverse_key.len;
-                    row = try cursor.next();
-                    if (rows.items.len >= 256 or bytes >= 256 * 1024) break;
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var rows: std.ArrayListUnmanaged(struct { key: []const u8, value: []const u8 }) = .empty;
+        var last: []const u8 = "";
+        var done = true;
+        {
+            var read = try self.beginReadReverseTxn();
+            defer read.abort();
+            const progress = read.get(progress_key) catch |err| switch (err) {
+                error.NotFound => "",
+                else => return err,
+            };
+            if (std.mem.eql(u8, progress, "ready")) return true;
+            if (progress.len != 0 and !std.mem.startsWith(u8, progress, owner_member_prefix)) return error.InvalidGraphOwnerMember;
+            const start = if (progress.len == 0) owner_member_prefix else try std.mem.concat(scratch, u8, &.{ progress, &.{0} });
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(start);
+            var bytes: usize = 0;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, owner_member_prefix)) break;
+                var pos: usize = owner_member_prefix.len;
+                var components: [4][]const u8 = undefined;
+                for (&components) |*component| {
+                    const end = internal_keys.findComponentTerminator(entry.key, pos) orelse return error.InvalidGraphOwnerMember;
+                    component.* = try internal_keys.decodeBodyAlloc(scratch, entry.key[pos..end]);
+                    pos = end + 2;
                 }
-                done = if (row) |entry| !std.mem.startsWith(u8, entry.key, owner_member_prefix) else true;
+                if (pos != entry.key.len) return error.InvalidGraphOwnerMember;
+                const reverse_key = try legacyProducerKeyAlloc(scratch, components[3], self.index_name, components[0], components[1], components[2]);
+                // Directory values are identities, never hydrated payloads.
+                try rows.append(scratch, .{ .key = reverse_key, .value = "" });
+                last = try scratch.dupe(u8, entry.key);
+                bytes +|= entry.key.len + reverse_key.len;
+                row = try cursor.next();
+                if (rows.items.len >= 256 or bytes >= 256 * 1024) break;
             }
-            var batch = try self.beginWriteReverseBatch();
-            errdefer batch.abort();
-            for (rows.items) |row| try batch.put(row.key, row.value);
-            try batch.put(progress_key, if (done) "ready" else last);
-            try batch.commit();
-            if (done) return;
+            done = if (row) |entry| !std.mem.startsWith(u8, entry.key, owner_member_prefix) else true;
         }
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        for (rows.items) |row| try batch.put(row.key, row.value);
+        try batch.put(progress_key, if (done) "ready" else last);
+        try batch.commit();
+        return done;
     }
 
     /// A producer may have a large contribution history for a single tuple.
     /// Delete it in bounded pages with expiration entries in the same commit.
     fn retireOwnerContributions(self: *GraphIndex, delete: BatchDelete, workspace: Allocator) !void {
+        while (!try self.retireOwnerContributionsPage(delete, workspace, null)) {}
+    }
+
+    fn retireOwnerContributionsPage(self: *GraphIndex, delete: BatchDelete, workspace: Allocator, remaining: ?*usize) !bool {
+        if (remaining) |budget| if (budget.* == 0) return false;
+        var complete = true;
         const prefix = try relationshipContributionOwnerPrefixAlloc(self.alloc, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document, delete.owner);
         defer self.alloc.free(prefix);
-        while (true) {
-            var arena = std.heap.ArenaAllocator.init(workspace);
-            defer arena.deinit();
-            const scratch = arena.allocator();
-            var keys: std.ArrayListUnmanaged([]const u8) = .empty;
-            var due: std.ArrayListUnmanaged([]const u8) = .empty;
-            {
-                var read = try self.beginReadReverseTxn();
-                defer read.abort();
-                var cursor = try read.openCursor();
-                defer cursor.close();
-                var row = try cursor.seekAtOrAfter(prefix);
-                var bytes: usize = 0;
-                while (row) |entry| : (row = try cursor.next()) {
-                    if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+        var arena = std.heap.ArenaAllocator.init(workspace);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        var due: std.ArrayListUnmanaged([]const u8) = .empty;
+        {
+            var read = try self.beginReadReverseTxn();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(prefix);
+            var bytes: usize = 0;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                if (entry.value.len < 8) return error.InvalidGraphEdgeValue;
+                const value = try decodeEdgeValue(entry.value[8..]);
+                const key = try scratch.dupe(u8, entry.key);
+                try keys.append(scratch, key);
+                bytes +|= key.len;
+                if (self.ttl_duration_ns != 0 and value.ttl_created_ns != 0) {
+                    const due_key = try contributionExpirationKeyAlloc(scratch, value.ttl_created_ns +| self.ttl_duration_ns, key);
+                    try due.append(scratch, due_key);
+                    bytes +|= due_key.len;
+                }
+                if (remaining) |budget| budget.* -= 1;
+                row = try cursor.next();
+                if (keys.items.len >= 256 or bytes >= 256 * 1024 or (if (remaining) |budget| budget.* == 0 else false)) break;
+            }
+            complete = if (row) |entry| !std.mem.startsWith(u8, entry.key, prefix) else true;
+        }
+        if (keys.items.len == 0) return true;
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        for (keys.items) |key| try batch.delete(key);
+        for (due.items) |key| try batch.delete(key);
+        try batch.commit();
+        return complete;
+    }
+
+    /// Retire independent relationship history before the final identity clear.
+    /// A relationship can have arbitrarily many past source revisions, so the
+    /// final batch must see an empty private range rather than draining it.
+    fn retirePrivateContributionsPage(self: *GraphIndex, delete: BatchDelete, alloc: Allocator, remaining: *usize) !bool {
+        if (remaining.* == 0) return false;
+        var complete = true;
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const prefix = try relationshipContributionPrefixAlloc(scratch, delete.source, delete.edge_type, delete.target, delete.edge_id, delete.owner_document);
+        var keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        var due: std.ArrayListUnmanaged([]const u8) = .empty;
+        {
+            var read = try self.beginReadReverseTxn();
+            defer read.abort();
+            var cursor = try read.openCursor();
+            defer cursor.close();
+            var row = try cursor.seekAtOrAfter(prefix);
+            var bytes: usize = 0;
+            while (row) |entry| {
+                if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+                const key = try scratch.dupe(u8, entry.key);
+                try keys.append(scratch, key);
+                bytes +|= key.len;
+                if (!(key.len == prefix.len + 1 and key[prefix.len] == 0)) {
                     if (entry.value.len < 8) return error.InvalidGraphEdgeValue;
                     const value = try decodeEdgeValue(entry.value[8..]);
-                    const key = try scratch.dupe(u8, entry.key);
-                    try keys.append(scratch, key);
-                    bytes +|= key.len;
                     if (self.ttl_duration_ns != 0 and value.ttl_created_ns != 0) {
-                        const due_key = try contributionExpirationKeyAlloc(scratch, value.ttl_created_ns +| self.ttl_duration_ns, key);
-                        try due.append(scratch, due_key);
-                        bytes +|= due_key.len;
+                        const expiration = try contributionExpirationKeyAlloc(scratch, value.ttl_created_ns +| self.ttl_duration_ns, key);
+                        try due.append(scratch, expiration);
+                        bytes +|= expiration.len;
                     }
-                    if (keys.items.len >= 256 or bytes >= 256 * 1024) break;
                 }
+                remaining.* -= 1;
+                row = try cursor.next();
+                if (keys.items.len == 256 or bytes >= 256 * 1024 or remaining.* == 0) break;
             }
-            if (keys.items.len == 0) return;
-            var batch = try self.beginWriteReverseBatch();
-            errdefer batch.abort();
-            for (keys.items) |key| try batch.delete(key);
-            for (due.items) |key| try batch.delete(key);
-            try batch.commit();
+            complete = if (row) |entry| !std.mem.startsWith(u8, entry.key, prefix) else true;
         }
+        if (keys.items.len == 0) return true;
+        var batch = try self.beginWriteReverseBatch();
+        errdefer batch.abort();
+        for (keys.items) |key| try batch.delete(key);
+        for (due.items) |key| try batch.delete(key);
+        try batch.commit();
+        return complete;
     }
 
     const GraphDocCleanupPage = struct {
+        pending: bool = false,
         next_cursor: ?[]u8,
         scanned: usize,
         selected: usize,
@@ -9283,18 +9378,18 @@ pub const GraphIndex = struct {
         var after: ?[]u8 = null;
         defer if (after) |key| self.alloc.free(key);
         while (true) {
-            const page = try self.deleteGraphDocPrefixPageFromStore(self.alloc, prefix, direction, owner_records, after, reverse_store, producer);
+            const page = try self.deleteGraphDocPrefixPageFromStore(self.alloc, prefix, direction, owner_records, after, reverse_store, producer, false);
             if (after) |key| self.alloc.free(key);
             after = page.next_cursor;
-            if (after == null) return;
+            if (!page.pending) return;
         }
     }
 
     fn deleteGraphDocPrefixPage(self: *GraphIndex, alloc: Allocator, prefix: []const u8, direction: EdgeDirection, owner_records: bool, after: ?[]const u8) !GraphDocCleanupPage {
-        return self.deleteGraphDocPrefixPageFromStore(alloc, prefix, direction, owner_records, after, direction == .in, null);
+        return self.deleteGraphDocPrefixPageFromStore(alloc, prefix, direction, owner_records, after, direction == .in, null, false);
     }
 
-    fn deleteGraphDocPrefixPageFromStore(self: *GraphIndex, alloc: Allocator, prefix: []const u8, direction: EdgeDirection, owner_records: bool, after: ?[]const u8, reverse_store: bool, producer: ?[]const u8) !GraphDocCleanupPage {
+    fn deleteGraphDocPrefixPageFromStore(self: *GraphIndex, alloc: Allocator, prefix: []const u8, direction: EdgeDirection, owner_records: bool, after: ?[]const u8, reverse_store: bool, producer: ?[]const u8, bounded_work: bool) !GraphDocCleanupPage {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -9356,10 +9451,24 @@ pub const GraphIndex = struct {
         errdefer if (next) |key| alloc.free(key);
         // Withdraw only this producer's private history. Query-time winner
         // selection continues to use surviving contributors and their TTLs.
-        for (deletes.items) |delete| if (delete.owner.len != 0)
-            try self.retireOwnerContributions(delete, alloc);
+        var private_rows_remaining: usize = 256;
+        for (deletes.items) |delete| {
+            const complete = if (delete.owner.len != 0) owner: {
+                if (bounded_work) break :owner try self.retireOwnerContributionsPage(delete, alloc, &private_rows_remaining);
+                try self.retireOwnerContributions(delete, alloc);
+                break :owner true;
+            } else if (bounded_work and producer != null and delete.clear_all_private_state)
+                try self.retirePrivateContributionsPage(delete, alloc, &private_rows_remaining)
+            else
+                true;
+            if (!complete) {
+                const continuation = if (after) |key| try alloc.dupe(u8, key) else null;
+                if (next) |key| alloc.free(key);
+                return .{ .next_cursor = continuation, .scanned = scanned, .selected = 0, .pending = true };
+            }
+        }
         try self.batchApply(&.{}, deletes.items);
-        return .{ .next_cursor = next, .scanned = scanned, .selected = deletes.items.len };
+        return .{ .next_cursor = next, .scanned = scanned, .selected = deletes.items.len, .pending = !done };
     }
 
     /// Read-only benchmark oracle for distinct-source tree ingestion. The
@@ -39096,4 +39205,43 @@ test "graph owned cleanup bounds workspace across large contributor histories an
     try std.testing.expectEqual(@as(?u64, 17), try graph.nextContributionExpirationAtOrAfter(0));
     try graph.deleteOwnedEdgesForDocs(&.{"fact"});
     try std.testing.expectEqual(@as(?u64, null), try graph.nextContributionExpirationAtOrAfter(0));
+}
+
+test "graph owned cleanup resumes independent relationship history across bounded turns" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "g", .{ .reverse_backend = .mem });
+    defer graph.close();
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const history = try scratch.alloc(EdgeContribution, 600);
+    for (history, 0..) |*item, i| item.* = .{ .state_key = try std.fmt.allocPrint(scratch, "state:{d}", .{i}), .source_priority = 0, .weight = 1, .created_at = 0, .updated_at = 0, .ttl_created_ns = 0, .metadata_json = "" };
+    try graph.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "fact" }}, &.{});
+    try graph.replaceContributionSnapshots(&.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "fact", .owner = "", .contributions = history }});
+    var phase: u8 = 0;
+    var cursor: ?[]u8 = null;
+    defer if (cursor) |key| alloc.free(key);
+    for (0..3) |_| try std.testing.expect(!try graph.deleteOwnedEdgesForDocPage("fact", &phase, &cursor));
+    try std.testing.expectEqual(@as(u8, 2), phase);
+    // The first history page cannot drain all 600 revisions.
+    {
+        const prefix = try relationshipContributionPrefixAlloc(alloc, "a", "R", "b", "f", "fact");
+        defer alloc.free(prefix);
+        var read = try graph.beginReadReverseTxn();
+        defer read.abort();
+        var scan = try read.openCursor();
+        defer scan.close();
+        var row = try scan.seekAtOrAfter(prefix);
+        var count: usize = 0;
+        while (row) |entry| : (row = try scan.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            count += 1;
+        }
+        try std.testing.expect(count > 0 and count <= 345);
+    }
+    var turns: usize = 0;
+    while (!try graph.deleteOwnedEdgesForDocPage("fact", &phase, &cursor)) : (turns += 1) try std.testing.expect(turns < 16);
+    const edges = try graph.getEdges(alloc, "a", "R", .out);
+    defer GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
 }

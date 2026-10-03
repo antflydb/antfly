@@ -5531,6 +5531,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db graph owner revival",
         "db graph qualified cleanup",
         "db graph fact",
+        "change journal graph refresh cursor",
+        "ordered artifact inventory graph publication",
         "db graph projected endpoint retirement",
         "graph replay node clears",
 

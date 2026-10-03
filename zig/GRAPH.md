@@ -1004,15 +1004,31 @@ scan ceiling.
 
 Neighbor-context sampling resolves root endpoint table tags with the same rules
 as traversal, including incoming relationships whose raw source and target keys
-are equal across tables. Direct document graph writes notify dependent producers
-for both added and removed endpoints; generated publication does not schedule its
-own producer. Neighbor-dependent producers run after primary commit even for
-synchronous writes, which wait for their generated coverage. Before sampling,
-committed graph effects catch up in at most four 64-record replay pages per turn. The source frontier advances independently of
-consumer coverage and includes skipped journal records. An unfinished turn
-releases its publication/index leases and remains dependency work without spending
-the provider retry budget. Reopen and graph mutation invalidate that volatile
-frontier, so it cannot certify recovery or retain the replay journal.
+are equal across tables. Direct and generated graph changes notify dependent
+producers for both added and removed endpoints, including arbitrary endpoints
+of fact documents and endpoints whose table routing changes. Generated graph
+publication and its endpoint work share a journal record. The asset dependency
+DAG includes neighbor sampling dependencies on graph artifact sources; catalog
+admission rejects direct or indirect feedback through the sampled graph.
+Neighbor-dependent producers and their transitive consumers run after primary
+commit even for synchronous writes, which wait for generated coverage. Runtime
+publishes nonleaf asset producers before consuming them; independent leaf
+producers retain provider batching.
+
+Before sampling, committed graph effects catch up in at most four 64-record
+replay pages per turn, with an additional limit of four mutation/cleanup pages
+and 1,024 scanned journal keys. Mutation pages contain at most 256 keys or
+256 KiB of primary key/value bytes (one oversized artifact may make progress). Owner cleanup and
+private contribution history retirement resume in separate bounded pages. A
+10 ms work interval yields at the next page boundary. Binary journal refresh
+retains only byte offsets and borrows key bytes, avoiding whole-record copies
+and repeated scans of already processed keys. Legacy JSON records are decoded
+for compatibility. The source frontier advances independently of consumer
+coverage and includes skipped journal records. An unfinished turn releases its
+publication/index leases and remains dependency work without spending the
+provider retry budget. Reopen, rebuild, and ordinary graph mutation invalidate
+both the volatile frontier and partial cursor, so neither can certify recovery
+or retain the replay journal.
 
 Distributed pattern edge RPCs carry a shard scan ceiling and report physical rows scanned, including
 expired rows. The coordinator charges those rows to the request-owned graph

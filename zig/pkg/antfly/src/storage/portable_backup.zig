@@ -721,6 +721,9 @@ fn nextPortableDataEntry(cursor: anytype, initial: anytype, stats: ?*ExportStats
         .{ relational_index_records.forward_namespace, "\x00\x00R\x03" },
         .{ relational_index_records.ownership_namespace, "\x00\x00R\x03" },
         .{ internal_keys.relational_columnar_prefix, "\x00\x00__columnar__;" },
+        .{ "\x00\x00__graph_incoming__:", "\x00\x00__graph_incoming__;" },
+        .{ "\x00\x00__graph_retirement__:", "\x00\x00__graph_retirement__;" },
+        .{ "\x00\x00__graph_stage__:", "\x00\x00__graph_stage__;" },
         .{ portable_metadata_prefix, "\x00\x00__metadata__;" },
         .{ &[_]u8{internal_keys.replay_namespace}, &[_]u8{internal_keys.replay_namespace + 1} },
     };
@@ -747,6 +750,16 @@ test "portable backup namespace seeks preserve adjacent binary and legacy keys" 
             internal_keys.relational_columnar_prefix ++ "blocks:a",
             internal_keys.relational_columnar_prefix ++ "dirty:z",
             "\x00\x00__columnar__;:i:x:out:t:y:o",
+            "\x00\x00__graph_incoming__9:legacy",
+            internal_keys.graph_incoming_ready_key,
+            internal_keys.graph_incoming_prefix ++ "edge:a",
+            internal_keys.graph_incoming_prefix ++ "edge:z",
+            "\x00\x00__graph_incoming__;adjacent",
+            "\x00\x00__graph_retirement__9:legacy",
+            internal_keys.graph_retirement_count_key,
+            internal_keys.graph_retirement_ref_prefix ++ "a",
+            internal_keys.graph_retirement_ref_prefix ++ "z",
+            "\x00\x00__graph_retirement__;adjacent",
             portable_metadata_prefix ++ "schema",
             "\x00\x00__metadata__;neighbor",
             "\x01row",
@@ -768,7 +781,7 @@ test "portable backup namespace seeks preserve adjacent binary and legacy keys" 
             return self.current();
         }
     };
-    const expected = [_]usize{ 0, 3, 5, 6, 9, 10 };
+    const expected = [_]usize{ 0, 3, 4, 8, 9, 13, 15, 16, 19, 20 };
     var cursor: Cursor = .{};
     var stats: ExportStats = .{};
     var entry = try nextPortableDataEntry(&cursor, cursor.current(), &stats);
@@ -777,8 +790,8 @@ test "portable backup namespace seeks preserve adjacent binary and legacy keys" 
         entry = try nextPortableDataEntry(&cursor, try cursor.next(), &stats);
     }
     try std.testing.expect(entry == null);
-    try std.testing.expectEqual(@as(u64, 3), stats.excluded_namespace_seeks);
-    try std.testing.expectEqual(@as(u64, 9), stats.data_cursor_entries);
+    try std.testing.expectEqual(@as(u64, 5), stats.excluded_namespace_seeks);
+    try std.testing.expectEqual(@as(u64, 15), stats.data_cursor_entries);
 }
 
 fn exportSourceProofs(alloc: Allocator, scan: *DocStore.Txn, out: *PortableOutput, range: @import("byte_range.zig").ByteRange, namespace: [24]u8) !void {
@@ -5281,8 +5294,8 @@ test "portable backup round trips relational rows and schema metadata" {
     try exportPortableToWriterWithOptions(alloc, &src, &measured_writer.writer, .{ .stats = &measured_stats });
     try std.testing.expectEqualSlices(u8, portable.items, measured_writer.written());
     try std.testing.expectEqual(@as(u64, 2), measured_stats.snapshot_passes);
-    try std.testing.expectEqual(@as(u64, 6), measured_stats.excluded_namespace_seeks);
-    try std.testing.expect(measured_stats.data_cursor_entries <= 12);
+    try std.testing.expectEqual(@as(u64, 10), measured_stats.excluded_namespace_seeks);
+    try std.testing.expect(measured_stats.data_cursor_entries <= 14);
 
     // The production file path stages encoded logical blocks on bounded disk,
     // avoiding a second store scan while preserving byte-for-byte output.
@@ -5304,8 +5317,8 @@ test "portable backup round trips relational rows and schema metadata" {
     });
     try std.testing.expectEqualSlices(u8, portable.items, spooled_writer.written());
     try std.testing.expectEqual(@as(u64, 1), spooled_stats.snapshot_passes);
-    try std.testing.expectEqual(@as(u64, 3), spooled_stats.excluded_namespace_seeks);
-    try std.testing.expect(spooled_stats.data_cursor_entries <= 6);
+    try std.testing.expectEqual(@as(u64, 5), spooled_stats.excluded_namespace_seeks);
+    try std.testing.expect(spooled_stats.data_cursor_entries <= 7);
 
     var tmp_dst = std.testing.tmpDir(.{});
     defer tmp_dst.cleanup();

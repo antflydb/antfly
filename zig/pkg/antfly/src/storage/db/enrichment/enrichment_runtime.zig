@@ -452,6 +452,23 @@ const CoverageOutcomeTransition = struct {
     failure_guards: std.ArrayListUnmanaged(FailureIdentity) = .empty,
 };
 
+const NeighborRefKey = struct {
+    document: []const u8,
+    artifact: []const u8,
+    const Context = struct {
+        pub fn hash(_: @This(), key: NeighborRefKey) u64 {
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(std.mem.asBytes(&key.document.len));
+            hasher.update(key.document);
+            hasher.update(key.artifact);
+            return hasher.final();
+        }
+        pub fn eql(_: @This(), a: NeighborRefKey, b: NeighborRefKey) bool {
+            return std.mem.eql(u8, a.document, b.document) and std.mem.eql(u8, a.artifact, b.artifact);
+        }
+    };
+};
+
 const GeneratedReplayWindow = struct {
     alloc: Allocator,
     documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
@@ -460,11 +477,14 @@ const GeneratedReplayWindow = struct {
     source_guards: std.ArrayListUnmanaged(GeneratedSourceGuard) = .empty,
     artifact_promotions: std.ArrayListUnmanaged(GeneratedArtifactPromotion) = .empty,
     changed_artifact_keys: std.ArrayListUnmanaged([]u8) = .empty,
+    neighbor_refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
+    neighbor_ref_keys: std.HashMapUnmanaged(NeighborRefKey, void, NeighborRefKey.Context, 80) = .empty,
     dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
     sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
     coverage_transitions: std.ArrayListUnmanaged(CoverageOutcomeTransition) = .empty,
     coverage_transition_keys: std.StringHashMapUnmanaged(void) = .empty,
     activity_runtime: ?*EnrichmentRuntime = null,
+    stage_cleanup_runtime: ?*EnrichmentRuntime = null,
     publishing_indexes: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn hasDerivedItems(self: *const @This()) bool {
@@ -473,6 +493,7 @@ const GeneratedReplayWindow = struct {
             self.artifact_delete_keys.items.len != 0 or
             self.artifact_promotions.items.len != 0 or
             self.changed_artifact_keys.items.len != 0 or
+            self.neighbor_refs.items.len != 0 or
             self.dense_embeddings.items.len != 0 or
             self.sparse_embeddings.items.len != 0;
     }
@@ -488,6 +509,7 @@ const GeneratedReplayWindow = struct {
             self.source_guards.items.len +
             self.artifact_promotions.items.len +
             self.changed_artifact_keys.items.len +
+            self.neighbor_refs.items.len +
             self.dense_embeddings.items.len +
             self.sparse_embeddings.items.len +
             self.coverage_transitions.items.len;
@@ -500,12 +522,15 @@ const GeneratedReplayWindow = struct {
         errdefer derived_types.deinitDerivedBatch(self.alloc, &batch);
         batch.deleted_keys = try self.deleted_keys.toOwnedSlice(self.alloc);
         batch.changed_artifact_keys = try self.changed_artifact_keys.toOwnedSlice(self.alloc);
+        batch.generated_enrichment_refs = try self.neighbor_refs.toOwnedSlice(self.alloc);
+        self.neighbor_ref_keys.clearRetainingCapacity();
         batch.dense_embeddings = try self.dense_embeddings.toOwnedSlice(self.alloc);
         batch.sparse_embeddings = try self.sparse_embeddings.toOwnedSlice(self.alloc);
         return batch;
     }
 
     fn deinit(self: *@This()) void {
+        if (self.stage_cleanup_runtime) |runtime| cleanupGeneratedArtifactStages(runtime, self.artifact_promotions.items) catch {};
         completeWindowPublishing(self);
         for (self.documents.items) |doc| {
             self.alloc.free(@constCast(doc.key));
@@ -532,6 +557,9 @@ const GeneratedReplayWindow = struct {
 
         for (self.changed_artifact_keys.items) |key| self.alloc.free(key);
         self.changed_artifact_keys.deinit(self.alloc);
+        for (self.neighbor_refs.items) |ref| enrichment_types.freeGeneratedRef(self.alloc, ref);
+        self.neighbor_refs.deinit(self.alloc);
+        self.neighbor_ref_keys.deinit(self.alloc);
 
         for (self.dense_embeddings.items) |embedding| freeDerivedDenseEmbedding(self.alloc, embedding);
         self.dense_embeddings.deinit(self.alloc);
@@ -2099,6 +2127,7 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidExtractorResponse,
         error.InvalidDocumentExtractionConfig,
         error.InvalidEnrichmentConfig,
+        error.ArtifactDependencyFailed,
         error.InvalidEmbeddingResponse,
         error.InvalidEmbeddingDimensions,
         error.ReadRequestFailed,
@@ -2484,7 +2513,7 @@ const WorkerRetryScope = enum {
 fn workerLoopRetryScopeIfAllowed(runtime: *EnrichmentRuntime, err: anyerror) ?WorkerRetryScope {
     // Queue admission is not a failed provider invocation. Keep the replay
     // cursor durable and pending until the replicated receipt arrives.
-    if (err == error.ArtifactPublicationPending) return .request;
+    if (err == error.ArtifactPublicationPending or err == error.GraphSourceRefreshPending) return .request;
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
 
@@ -2582,7 +2611,7 @@ test "provider retry guidance extends bounded worker backoff" {
 }
 
 fn isEnrichmentControlError(err: anyerror) bool {
-    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending;
+    return err == error.EnrichmentRetryAborted or err == error.ArtifactPublicationPending or err == error.GraphSourceRefreshPending;
 }
 
 test "enrichment distinguishes transient capacity from permanent resource limits" {
@@ -5342,6 +5371,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             }
             try guard.check();
             runForegroundCatchUpPassGuarded(self, io, sequence, guard) catch |err| {
+                if (err == error.GraphSourceRefreshPending) continue;
                 return switch (err) {
                     RuntimeError.EnrichmentWaitCanceled => RuntimeError.EnrichmentWaitCanceled,
                     RuntimeError.EnrichmentWaitTimeout => RuntimeError.EnrichmentWaitTimeout,
@@ -5541,7 +5571,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     fn recordRetryableError(self: *EnrichmentRuntime, io: Io, err: anyerror, scope: WorkerRetryScope) void {
-        const awaiting_publication = err == error.ArtifactPublicationPending;
+        const awaiting_publication = err == error.ArtifactPublicationPending or err == error.GraphSourceRefreshPending;
         if (!awaiting_publication) std.log.warn("enrichment {s} transient failure, will retry: {s}", .{ @tagName(scope), @errorName(err) });
         var status: enrichment_state.RuntimeStatus = .{};
         self.mutex.lockUncancelable(io);
@@ -7004,7 +7034,8 @@ fn runForegroundCatchUpPassGuarded(
         // outcomes, not provider or pipeline failures. Never persist them into
         // the durable worker retry budget.
         if (err == RuntimeError.EnrichmentWaitCanceled or
-            err == RuntimeError.EnrichmentWaitTimeout) return err;
+            err == RuntimeError.EnrichmentWaitTimeout or
+            err == error.GraphSourceRefreshPending) return err;
         handleWorkerLoopError(runtime, io, err);
         return err;
     };
@@ -11284,6 +11315,8 @@ fn processPendingDocumentGroup(
     const previous_shared_windows = runtime.shared_pdf_windows;
     runtime.shared_pdf_windows = &shared_windows;
     defer runtime.shared_pdf_windows = previous_shared_windows;
+    var failed_artifacts = std.StringHashMapUnmanaged(anyerror).empty;
+    defer failed_artifacts.deinit(runtime.alloc);
     for (planned, 0..) |planned_request, request_index| {
         shared_windows.current = request_index;
         try guard.check();
@@ -11293,11 +11326,24 @@ fn processPendingDocumentGroup(
         if (window.hasDerivedItems()) try flushGeneratedReplayWindow(runtime, window);
         try guard.check();
         processed_request_count.* += 1;
-        if (try skipPersistedRequestFailure(runtime, window, request)) continue;
+        const input_name = if (request.upstream_artifact_name.len != 0) request.upstream_artifact_name else if (request.input_kind != .document) request.artifact_name else "";
+        if (failed_artifacts.get(input_name)) |err| {
+            try recordIsolatedRequestError(runtime, window, request, err);
+            if (request.kind == .asset or request.kind == .chunk_text)
+                try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
+            continue;
+        }
+        if (try skipPersistedRequestFailure(runtime, window, request)) {
+            if (request.kind == .asset or request.kind == .chunk_text)
+                try failed_artifacts.put(runtime.alloc, requestArtifactName(request), error.ArtifactDependencyFailed);
+            continue;
+        }
         if (shared_windows.completed(request_index)) continue;
         if (shared_windows.failure(request_index)) |err| {
             setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
             if (shouldYieldRequestError(runtime, err)) return err;
+            if (request.kind == .asset or request.kind == .chunk_text)
+                try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
             try recordIsolatedRequestError(runtime, window, request, err);
             continue;
         }
@@ -11311,13 +11357,18 @@ fn processPendingDocumentGroup(
         }
         setActiveFailureFingerprint(runtime, requestFailureFingerprint(request));
         switch (request.kind) {
-            .asset => processAssetOrDefer(runtime, request, deferred_assets, &prepared_sources, window) catch |err| {
-                if (shouldYieldRequestError(runtime, err)) return err;
-                try recordIsolatedRequestError(runtime, window, request, err);
-                continue;
+            .asset => {
+                const succeeded = processPlannedAsset(runtime, request, planned[request_index + 1 ..], deferred_assets, &prepared_sources, window) catch |err| {
+                    if (shouldYieldRequestError(runtime, err)) return err;
+                    try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
+                    try recordIsolatedRequestError(runtime, window, request, err);
+                    continue;
+                };
+                if (!succeeded) try failed_artifacts.put(runtime.alloc, requestArtifactName(request), error.ArtifactDependencyFailed);
             },
             .chunk_text => processChunkText(runtime, request, chunk_cache, window) catch |err| {
                 if (shouldYieldRequestError(runtime, err)) return err;
+                try failed_artifacts.put(runtime.alloc, requestArtifactName(request), err);
                 try recordIsolatedRequestError(runtime, window, request, err);
                 continue;
             },
@@ -12069,7 +12120,8 @@ fn neighborContextBlockAlloc(
         source.acquire_fn(source.ptr, config.graph_index) catch |err| switch (err) {
             // Lifecycle/publication readiness is dependency debt, not a
             // failed provider invocation that can exhaust its retry budget.
-            error.GraphMaintenanceInProgress, error.ReplicationPublisherUnavailable, error.GraphSourceReplayPending => return error.ArtifactPublicationPending,
+            error.GraphSourceReplayPending => return error.GraphSourceRefreshPending,
+            error.GraphMaintenanceInProgress, error.ReplicationPublisherUnavailable => return error.ArtifactPublicationPending,
             else => return err,
         }
     else
@@ -12275,6 +12327,36 @@ fn assetProducerRetainedBytes(item: AssetProducerBatchItem) usize {
     for ([_][]const u8{ item.raw_doc, item.artifact_key, item.state_key, item.state_value }) |part|
         bytes = addUsizeSaturating(bytes, part.len);
     return bytes;
+}
+
+/// Publish nonleaf producers in dependency order. Only leaves enter the
+/// provider grouping lane, where reordering across documents is safe.
+fn processPlannedAsset(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    remaining: []const enrichment_types.GeneratedEnrichmentRequest,
+    deferred: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest),
+    prepared_sources: *PreparedDocumentSourceCache,
+    window: *GeneratedReplayWindow,
+) !bool {
+    const name = requestArtifactName(request);
+    const has_consumer = for (remaining) |consumer| {
+        if (std.mem.eql(u8, consumer.upstream_artifact_name, name) or
+            (consumer.input_kind != .document and std.mem.eql(u8, consumer.artifact_name, name))) break true;
+    } else false;
+    if (!has_consumer) {
+        try processAssetOrDefer(runtime, request, deferred, prepared_sources, window);
+        return true;
+    }
+    var scope = FailureScope{ .fingerprint = runtime.active_failure_fingerprint };
+    var batch = PreparedAssetBatch{};
+    defer batch.deinit(runtime.alloc);
+    try processAsset(runtime, request, &batch, prepared_sources, window, &scope);
+    try batch.flush(runtime, window, &scope);
+    if (batch.retry_error) |err| return err;
+    if (try skipPersistedRequestFailure(runtime, window, request)) return false;
+    try flushGeneratedReplayWindow(runtime, window);
+    return true;
 }
 
 fn processAssetOrDefer(
@@ -20362,6 +20444,11 @@ fn runtimeDocumentExtractionWindowBytes(window: *const GeneratedReplayWindow) us
     total = addUsizeSaturating(total, window.source_guards.capacity *| @sizeOf(GeneratedSourceGuard));
     total = addUsizeSaturating(total, window.artifact_promotions.capacity *| @sizeOf(GeneratedArtifactPromotion));
     total = addUsizeSaturating(total, window.changed_artifact_keys.capacity *| @sizeOf([]const u8));
+    total = addUsizeSaturating(total, window.neighbor_refs.capacity *| @sizeOf(enrichment_types.GeneratedEnrichmentRef));
+    total = addUsizeSaturating(total, window.neighbor_ref_keys.capacity() *| (@sizeOf(NeighborRefKey) + 1));
+    for (window.neighbor_refs.items) |ref| {
+        total = addUsizeSaturating(total, ref.doc_key.len +| ref.index_name.len +| ref.artifact_name.len);
+    }
     total = addUsizeSaturating(total, window.dense_embeddings.capacity *| @sizeOf(derived_types.DerivedDenseEmbeddingWrite));
     total = addUsizeSaturating(total, window.sparse_embeddings.capacity *| @sizeOf(derived_types.DerivedSparseEmbeddingWrite));
     total = addUsizeSaturating(total, window.coverage_transitions.capacity *| @sizeOf(CoverageOutcomeTransition));
@@ -21132,7 +21219,144 @@ fn publishOrderedGraphWithAllocator(runtime: *EnrichmentRuntime, alloc: Allocato
     return error.ArtifactPublicationPending;
 }
 
-fn materializeGraphAssetForRuntime(
+fn queueGraphNeighborMutation(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, key: []const u8, next: ?[]const u8) !void {
+    if (!runtime.index_manager.hasAssetNeighborContext()) return;
+    const identity = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(runtime.alloc, key)) orelse return;
+    defer {
+        runtime.alloc.free(identity.doc_key);
+        runtime.alloc.free(identity.index_name);
+        runtime.alloc.free(identity.edge_type);
+        runtime.alloc.free(identity.target_doc_key);
+        runtime.alloc.free(identity.edge_id);
+        runtime.alloc.free(identity.logical_source);
+    }
+    const previous = try storeGetOptionalAllocWithRetry(runtime, key);
+    defer if (previous) |raw| runtime.alloc.free(raw);
+    if (previous == null and next == null) return;
+    if (previous != null and next != null and std.mem.eql(u8, previous.?, next.?)) return;
+    const table = try storeGetOptionalAllocWithRetry(runtime, internal_keys.graph_owning_table_key);
+    defer if (table) |raw| runtime.alloc.free(raw);
+    var routing = graph_metadata_tables.Scratch.init(runtime.alloc, null);
+    defer routing.deinit();
+    var local_out = false;
+    var local_in = false;
+    for ([_]?[]const u8{ previous, next }) |maybe| {
+        const raw = maybe orelse continue;
+        const metadata = (try enrichment_artifact_codec.decodeGraphEdgeBorrowed(raw)).metadata_json;
+        local_out = local_out or graph_metadata_tables.inlineEndpointsAreLocal(try routing.table(metadata, "source_table"), null, table);
+        local_in = local_in or graph_metadata_tables.inlineEndpointsAreLocal(null, try routing.table(metadata, "target_table"), table);
+    }
+    for (runtime.index_manager.enrichments.items) |cfg| {
+        if (cfg.kind != .asset or cfg.neighbor_context_json.len == 0) continue;
+        var context = try enrichment_neighbor_context.parseConfigJson(runtime.alloc, cfg.neighbor_context_json);
+        defer context.deinit(runtime.alloc);
+        if (!std.mem.eql(u8, context.graph_index, identity.index_name)) continue;
+        const source = if (identity.logical_source.len != 0) identity.logical_source else identity.doc_key;
+        const endpoints = [_]?[]const u8{
+            if (local_out and context.direction != .in) source else null,
+            if (local_in and context.direction != .out) identity.target_doc_key else null,
+        };
+        for (endpoints) |endpoint| {
+            const doc = endpoint orelse continue;
+            if (!window.neighbor_ref_keys.contains(.{ .document = doc, .artifact = cfg.name })) {
+                const ref = try enrichment_types.cloneGeneratedRef(runtime.alloc, .{ .kind = .asset, .doc_key = doc, .index_name = cfg.name, .artifact_name = cfg.name });
+                errdefer enrichment_types.freeGeneratedRef(runtime.alloc, ref);
+                const ref_key: NeighborRefKey = .{ .document = ref.doc_key, .artifact = ref.artifact_name };
+                try window.neighbor_ref_keys.put(runtime.alloc, ref_key, {});
+                errdefer _ = window.neighbor_ref_keys.remove(ref_key);
+                try window.neighbor_refs.append(runtime.alloc, ref);
+            }
+        }
+    }
+}
+
+fn queueGraphNeighborMutations(runtime: anytype, window: *GeneratedReplayWindow, writes: []const KVPair, deletes: []const []const u8) !void {
+    if (comptime @TypeOf(runtime) != *EnrichmentRuntime) return;
+    for (writes) |write| try queueGraphNeighborMutation(runtime, window, write.key, write.value);
+    for (deletes) |key| if (!runtimeContainsKVKey(writes, key)) try queueGraphNeighborMutation(runtime, window, key, null);
+}
+
+/// Publish legacy runtime graph projections through the same guarded promotion
+/// transaction as their replay record. Private stages are never graph effects;
+/// graph artifacts, source guards, and endpoint notifications commit together.
+fn publishRuntimeGraphMutations(runtime: anytype, window: *GeneratedReplayWindow, writes: []const KVPair, deletes: []const []const u8) !void {
+    if (comptime @TypeOf(runtime) != *EnrichmentRuntime) {
+        return storePutBatchWithRetry(runtime, writes, deletes);
+    }
+    const promotion_start = window.artifact_promotions.items.len;
+    const guard_start = window.source_guards.items.len;
+    const ref_start = window.neighbor_refs.items.len;
+    const delete_start = window.artifact_delete_keys.items.len;
+    errdefer {
+        cleanupGeneratedArtifactStages(runtime, window.artifact_promotions.items[promotion_start..]) catch {};
+        for (window.artifact_promotions.items[promotion_start..]) |promotion| {
+            runtime.alloc.free(@constCast(promotion.staged_key));
+            runtime.alloc.free(@constCast(promotion.final_key));
+        }
+        window.artifact_promotions.shrinkRetainingCapacity(promotion_start);
+        for (window.source_guards.items[guard_start..]) |guard| {
+            runtime.alloc.free(@constCast(guard.key));
+            if (guard.document_key) |key| runtime.alloc.free(@constCast(key));
+        }
+        window.source_guards.shrinkRetainingCapacity(guard_start);
+        for (window.neighbor_refs.items[ref_start..]) |ref| {
+            _ = window.neighbor_ref_keys.remove(.{ .document = ref.doc_key, .artifact = ref.artifact_name });
+            enrichment_types.freeGeneratedRef(runtime.alloc, ref);
+        }
+        window.neighbor_refs.shrinkRetainingCapacity(ref_start);
+        for (window.artifact_delete_keys.items[delete_start..]) |key| runtime.alloc.free(key);
+        window.artifact_delete_keys.shrinkRetainingCapacity(delete_start);
+    }
+    window.stage_cleanup_runtime = runtime;
+    var stages: std.ArrayListUnmanaged(KVPair) = .empty;
+    defer stages.deinit(runtime.alloc);
+    try queueGraphNeighborMutations(runtime, window, writes, deletes);
+    const epoch = if (currentGeneratedWriteFence(runtime)) |fence| fence.epoch else 0;
+    for (writes) |write| {
+        const previous = try storeGetOptionalAllocWithRetry(runtime, write.key);
+        defer if (previous) |raw| runtime.alloc.free(raw);
+        if (previous) |raw| if (std.mem.eql(u8, raw, write.value)) continue;
+        try appendGeneratedSourceGuard(runtime, window, write.key, if (previous) |raw| sourceRecordDigest(raw) else null, null, 0);
+        var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+        hasher.update(std.mem.asBytes(&epoch));
+        hasher.update(std.mem.asBytes(&write.key.len));
+        hasher.update(write.key);
+        hasher.update(write.value);
+        var digest: [32]u8 = undefined;
+        hasher.final(&digest);
+        const stage_prefix = "\x00\x00__graph_stage__:v1:";
+        const stage = try runtime.alloc.alloc(u8, stage_prefix.len + digest.len);
+        errdefer runtime.alloc.free(stage);
+        @memcpy(stage[0..stage_prefix.len], stage_prefix);
+        @memcpy(stage[stage_prefix.len..], &digest);
+        const final = try runtime.alloc.dupe(u8, write.key);
+        errdefer runtime.alloc.free(final);
+        try stages.append(runtime.alloc, .{ .key = stage, .value = write.value });
+        try window.artifact_promotions.append(runtime.alloc, .{ .staged_key = stage, .final_key = final });
+    }
+    for (deletes) |key| {
+        if (runtimeContainsKVKey(writes, key)) continue;
+        const previous = try storeGetOptionalAllocWithRetry(runtime, key);
+        defer if (previous) |raw| runtime.alloc.free(raw);
+        const raw = previous orelse continue;
+        try appendGeneratedSourceGuard(runtime, window, key, sourceRecordDigest(raw), null, 0);
+        try appendUniqueDupeKey(runtime.alloc, &window.artifact_delete_keys, key);
+    }
+    if (stages.items.len != 0) try storePutBatchWithRetry(runtime, stages.items, &.{});
+}
+
+fn materializeGraphAssetForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, value: []const u8, raw_doc: []const u8, window: *GeneratedReplayWindow) !void {
+    const before = window.artifact_promotions.items.len;
+    const deletes_before = window.artifact_delete_keys.items.len;
+    try prepareGraphAssetForRuntime(runtime, request, value, raw_doc, window);
+    // Publish before another source on this document arbitrates contenders.
+    // Preparation releases primary/index leases before entering the writer.
+    if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
+        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before) try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
+    }
+}
+
+fn prepareGraphAssetForRuntime(
     runtime: anytype,
     request: enrichment_types.GeneratedEnrichmentRequest,
     value: []const u8,
@@ -21281,12 +21505,23 @@ fn materializeGraphAssetForRuntime(
         }
         try visible_writes.appendSlice(runtime.alloc, writes.items[graph_write_count..]);
         if (visible_writes.items.len > 0 or deletes.items.len > 0) {
-            try storePutBatchWithRetry(runtime, visible_writes.items, deletes.items);
+            try publishRuntimeGraphMutations(runtime, window, visible_writes.items, deletes.items);
         }
     }
 }
 
-fn materializeGraphAssetDeleteForRuntime(
+fn materializeGraphAssetDeleteForRuntime(runtime: anytype, request: enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
+    const before = window.artifact_promotions.items.len;
+    const deletes_before = window.artifact_delete_keys.items.len;
+    try prepareGraphAssetDeleteForRuntime(runtime, request, window);
+    // Publish before another source on this document arbitrates contenders.
+    // Preparation releases primary/index leases before entering the writer.
+    if (comptime @TypeOf(runtime) == *EnrichmentRuntime) {
+        if (window.artifact_promotions.items.len != before or window.artifact_delete_keys.items.len != deletes_before) try flushGeneratedReplayWindowWithIdentity(runtime, window, 0);
+    }
+}
+
+fn prepareGraphAssetDeleteForRuntime(
     runtime: anytype,
     request: enrichment_types.GeneratedEnrichmentRequest,
     window: *GeneratedReplayWindow,
@@ -21398,7 +21633,7 @@ fn materializeGraphAssetDeleteForRuntime(
             try deletes.append(runtime.alloc, try runtime.alloc.dupe(u8, key));
         }
         if (writes.items.len > 0 or deletes.items.len > 0) {
-            try storePutBatchWithRetry(runtime, writes.items, deletes.items);
+            try publishRuntimeGraphMutations(runtime, window, writes.items, deletes.items);
         }
     }
 }

@@ -686,6 +686,55 @@ fn decodeBinaryRecord(alloc: Allocator, raw: []const u8) !Record {
     return record;
 }
 
+/// Allocation-free, resumable key scan for adjacency refresh. Store only byte
+/// offsets across turns; payload bytes remain borrowed from the replay cursor.
+/// Skipped document keys consume work too, so a large unrelated list cannot
+/// hide unbounded decode work inside a mutation lease.
+pub const GraphRefreshCursor = struct {
+    offset: usize = 0,
+    field: u8 = 0,
+    remaining: ?u32 = null,
+    mask: u8 = 0,
+
+    pub const Item = union(enum) { skipped, deleted: []const u8, artifact: []const u8, done };
+
+    pub fn next(self: *@This(), raw: []const u8) !Item {
+        if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
+        var cursor = BinaryCursor{ .raw = raw, .index = self.offset };
+        if (self.offset == 0) {
+            cursor.index = binary_magic.len;
+            _ = try cursor.readInt(u16);
+            _ = try cursor.readInt(u64);
+            _ = try cursor.readInt(u8);
+            self.mask = try cursor.readInt(u8);
+            if (self.mask & 0xf0 != 0) return error.InvalidBinaryRecord;
+        }
+        while (self.field < 4) {
+            if (self.mask & (@as(u8, 1) << @intCast(self.field)) == 0) {
+                self.field += 1;
+                continue;
+            }
+            if (self.remaining == null) self.remaining = try cursor.readInt(u32);
+            if (self.remaining.? == 0) {
+                self.field += 1;
+                self.remaining = null;
+                continue;
+            }
+            const key = try cursor.readBytes(try cursor.readInt(u32));
+            self.remaining.? -= 1;
+            self.offset = cursor.index;
+            return switch (self.field) {
+                1 => .{ .deleted = key },
+                3 => .{ .artifact = key },
+                else => .skipped,
+            };
+        }
+        if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
+        self.offset = cursor.index;
+        return .done;
+    }
+};
+
 pub fn decodeBinaryRecordBorrowed(alloc: Allocator, raw: []const u8) !BorrowedBinaryRecord {
     if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
 
@@ -1321,4 +1370,25 @@ test "change journal emits resolution and graph hints for changed asset artifact
 
     try std.testing.expect(recordHasHint(record, .graph));
     try std.testing.expect(recordHasHint(record, .resolution));
+}
+
+test "change journal graph refresh cursor resumes every key without allocating bodies" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeRecord(alloc, .{ .sequence = 42, .changed_doc_keys = &.{"unrelated"}, .deleted_doc_keys = &.{ "a", "b" }, .overwritten_doc_keys = &.{"skip"}, .changed_artifact_keys = &.{ "edge1", "edge2" } });
+    defer alloc.free(payload);
+    var cursor: GraphRefreshCursor = .{};
+    try std.testing.expect(try cursor.next(payload) == .skipped);
+    try std.testing.expectEqualStrings("a", (try cursor.next(payload)).deleted);
+    const resumed = cursor;
+    try std.testing.expectEqualStrings("b", (try cursor.next(payload)).deleted);
+    cursor = resumed;
+    try std.testing.expectEqualStrings("b", (try cursor.next(payload)).deleted);
+    try std.testing.expect(try cursor.next(payload) == .skipped);
+    try std.testing.expectEqualStrings("edge1", (try cursor.next(payload)).artifact);
+    try std.testing.expectEqualStrings("edge2", (try cursor.next(payload)).artifact);
+    try std.testing.expect(try cursor.next(payload) == .done);
+    var truncated: GraphRefreshCursor = .{};
+    while (truncated.next(payload[0 .. payload.len - 1])) |item| {
+        try std.testing.expect(item != .done);
+    } else |err| try std.testing.expectEqual(error.UnexpectedEndOfInput, err);
 }

@@ -2890,6 +2890,14 @@ pub const IndexManager = struct {
         /// by apply_mutex; never certifies consumer completion or replay retention.
         /// A recreated/reopened generation starts from its durable checkpoint.
         neighbor_source_sequence: u64 = 0,
+        neighbor_refresh: struct {
+            sequence: u64 = 0,
+            cursor: @import("../derived/change_journal.zig").GraphRefreshCursor = .{},
+            cleanup_phase: u8 = 0,
+            cleanup_cursor: ?[]u8 = null,
+        } = .{},
+        neighbor_refresh_applying: bool = false,
+
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
@@ -2899,6 +2907,16 @@ pub const IndexManager = struct {
         ttl_duration_ns: u64 = 0,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
+
+        pub fn invalidateNeighborSource(self: *@This()) void {
+            self.neighbor_source_sequence = 0;
+            if (!self.neighbor_refresh_applying) self.clearNeighborRefresh();
+        }
+
+        pub fn clearNeighborRefresh(self: *@This()) void {
+            if (self.neighbor_refresh.cleanup_cursor) |key| self.index.alloc.free(key);
+            self.neighbor_refresh = .{};
+        }
     };
 
     const OpenedIndex = union(types.IndexKind) {
@@ -6578,7 +6596,7 @@ pub const IndexManager = struct {
 
         pub fn reset(self: *@This(), index_name: []const u8) !void {
             const entry = self.manager.graphIndex(index_name) orelse return error.IndexNotFound;
-            entry.neighbor_source_sequence = 0;
+            entry.invalidateNeighborSource();
             try entry.index.resetForArtifactRebuild();
             entry.index.reconcileOwnershipRange(self.manager.byte_range.start, self.manager.byte_range.end);
         }
@@ -6739,6 +6757,7 @@ pub const IndexManager = struct {
     }
 
     fn deinitGraphIndexEntry(self: *IndexManager, entry: *GraphIndex, abandon_after_crash: bool) void {
+        entry.clearNeighborRefresh();
         if (abandon_after_crash) {
             entry.index.abandonAfterCrash();
         } else {
@@ -11739,6 +11758,7 @@ pub const IndexManager = struct {
                 );
             }
         }
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
             try self.persistEnrichmentCatalog(store);
@@ -11813,6 +11833,7 @@ pub const IndexManager = struct {
             try opened.append(self.alloc, cfg.name);
         }
 
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
             try self.persistEnrichmentCatalog(store);
@@ -14001,6 +14022,17 @@ pub const IndexManager = struct {
         return out;
     }
 
+    fn artifactRequiresCommittedGraph(self: *const IndexManager, name: []const u8) bool {
+        var current = name;
+        var hops: usize = 0;
+        while (current.len != 0 and hops <= self.enrichments.items.len) : (hops += 1) {
+            const cfg = self.getEnrichmentByName(current) orelse return false;
+            if (cfg.neighbor_context_json.len != 0) return true;
+            current = cfg.source_artifact_name;
+        }
+        return false;
+    }
+
     pub fn planGeneratedEnrichments(
         self: *const IndexManager,
         alloc: Allocator,
@@ -14322,6 +14354,11 @@ pub const IndexManager = struct {
                     if (request.embedding_name.len > 0) request.embedding_name else request.index_name,
                 ),
             };
+        }
+        for (requests.items) |*request| {
+            request.requires_committed_graph = request.neighbor_context_json.len != 0 or
+                self.artifactRequiresCommittedGraph(request.upstream_artifact_name) or
+                (request.input_kind != .document and self.artifactRequiresCommittedGraph(request.artifact_name));
         }
         return try requests.toOwnedSlice(alloc);
     }
@@ -21882,6 +21919,37 @@ pub const IndexManager = struct {
                 }
             },
         }
+        try self.validateNeighborDependencyGraph(cfg);
+    }
+
+    /// Neighbor sampling adds graph-source dependencies to the ordinary asset
+    /// DAG. Reject feedback through generated graph sources, including indirect
+    /// asset/chunk chains, before publication can schedule endpoint producers.
+    fn validateNeighborDependencyGraph(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig) !void {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        try self.visitNeighborDependencies(root, root, &seen);
+    }
+
+    fn visitNeighborDependencies(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig, cfg: enrichment_catalog.EnrichmentConfig, seen: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (seen.contains(cfg.name)) return;
+        try seen.put(self.alloc, cfg.name, {});
+        if (cfg.source_artifact_name.len != 0)
+            try self.visitNeighborArtifact(root, cfg.source_artifact_name, seen);
+        if (cfg.neighbor_context_json.len != 0) {
+            var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
+            defer context.deinit(self.alloc);
+            for (self.graph_indexes.items) |entry| {
+                if (!std.mem.eql(u8, entry.config.name, context.graph_index)) continue;
+                for (entry.artifact_sources) |source|
+                    try self.visitNeighborArtifact(root, source.artifact_name, seen);
+            }
+        }
+    }
+
+    fn visitNeighborArtifact(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig, name: []const u8, seen: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (std.mem.eql(u8, root.name, name)) return error.InvalidEnrichmentConfig;
+        if (self.getEnrichmentByName(name)) |cfg| try self.visitNeighborDependencies(root, cfg.*, seen);
     }
 
     fn validateEnrichmentCatalogGraph(self: *const IndexManager) !void {
@@ -25162,7 +25230,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
-        if (keys.len > 0) entry.neighbor_source_sequence = 0;
+        if (keys.len > 0) entry.invalidateNeighborSource();
         // The graph index owns the relationship identity and ownership rules.
         // Reuse its cleanup path for both endpoint and fact-document deletion.
         try entry.index.deleteOwnedEdgesForDocs(keys);
@@ -25348,7 +25416,7 @@ pub const IndexManager = struct {
         // window before replaying its latest artifacts. A producer must refresh
         // again rather than treating that intermediate sidecar as current.
         if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
-            entry.neighbor_source_sequence = 0;
+            entry.invalidateNeighborSource();
         try entry.index.batchApply(batch_writes.items, batch_deletes.items);
         if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
             const primary = self.primary_store orelse return error.MissingPrimaryStore;
