@@ -45713,9 +45713,9 @@ pub const DB = struct {
         item.repair_degraded = true;
     }
 
-    fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !void {
+    fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !DerivedCoverageCounters {
         item.coverage_config_hash = config_hash;
-        const coverage_counts = try loadDerivedCoverageCounters(self.core.alloc, self.core.store, index_name, generation, null, null);
+        const coverage_counts = try loadDerivedCoverageCounters(self.core.alloc, self.core.store, index_name, generation, null, if (builtin.is_test) self.async_context else null);
         const produced = coverage_counts.produced;
         const skipped = coverage_counts.skipped;
         const terminal_failed = coverage_counts.terminal_failed;
@@ -45731,6 +45731,7 @@ pub const DB = struct {
         item.coverage_skipped_count = skipped orelse 0;
         item.coverage_terminal_failed_count = terminal_failed orelse 0;
         if (!item.coverage_summary_ready) item.repair_degraded = true;
+        return coverage_counts;
     }
 
     /// Whether producer-outcome coverage is meaningful for a graph or
@@ -45763,8 +45764,11 @@ pub const DB = struct {
             item.repair_degraded = true;
             return;
         }
-        try self.populateDerivedCoverageCounts(index_name, item.coverage_generation, item.coverage_config_hash, item);
-        try self.populateDensePublicationTarget(index_name, item);
+        const coverage_counts = try self.populateDerivedCoverageCounts(index_name, item.coverage_generation, item.coverage_config_hash, item);
+        // Publication cardinality and source outcomes belong to the same
+        // committed revision. Re-reading the artifact counter here could
+        // combine old source coverage with a newer publication target.
+        try self.populateDensePublicationTarget(index_name, coverage_counts, item);
     }
 
     /// Populate the exact physical cardinality expected from the current dense
@@ -45772,17 +45776,13 @@ pub const DB = struct {
     /// chunk-backed, and multi-source indexes use the write-maintained target
     /// counter because document outcomes cannot express their multiplicity.
     /// One-vector-per-document managed indexes use generation-scoped outcomes.
-    fn populateDensePublicationTarget(self: *DB, index_name: []const u8, item: *types.DBIndexStats) !void {
+    fn populateDensePublicationTarget(self: *DB, index_name: []const u8, coverage_counts: DerivedCoverageCounters, item: *types.DBIndexStats) !void {
         if (item.kind != .dense_vector) return;
         item.publication_target_count = 0;
         item.publication_target_ready = false;
         const entry = self.core.denseIndex(index_name) orelse return;
         if (densePublicationTargetUsesArtifactCounter(entry)) {
-            item.publication_target_count = (try loadDenseArtifactTargetCounter(
-                self.core.alloc,
-                self.core.store,
-                index_name,
-            )) orelse return;
+            item.publication_target_count = (try coverage_counts.artifactCount()) orelse return;
             item.publication_target_ready = true;
             return;
         }
@@ -45896,7 +45896,7 @@ pub const DB = struct {
             var item = types.DBIndexStats{ .name = index_ref.name, .kind = index_ref.kind };
             initializeDerivedCoverageIdentity(cfg.*, &item);
             if (item.coverage_identity_ready) {
-                try self.populateDerivedCoverageCounts(
+                _ = try self.populateDerivedCoverageCounts(
                     index_ref.name,
                     item.coverage_generation,
                     item.coverage_config_hash,
@@ -103780,85 +103780,118 @@ test "db document extraction skips stable unit local rewrites without text consu
 // "Two-Stream Execution Model" and DENSE_INDEXING_LIFECYCLE.md.
 test "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter" {
     const alloc = std.testing.allocator;
+    const Admission = enum { before_rows, after_chunks, after_embeddings };
+    for ([_]Admission{ .before_rows, .after_chunks, .after_embeddings }) |admission| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
+        const document = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdh\"}";
+        var counting = CountingDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = counting.interface(),
+            },
+        });
+        defer db.close();
 
-    var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
-        .enrichment = .{
-            .owner_id = "worker-a",
-            .dense_embedder = counting.interface(),
-        },
-    });
-    defer db.close();
+        try db.addEnrichment(.{
+            .name = "document_units_v1",
+            .kind = .asset,
+            .field = "url",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        });
+        try db.addEnrichment(.{
+            .name = "document_chunks_v1",
+            .kind = .chunk,
+            .field = "text",
+            .source_artifact_name = "document_units_v1",
+            .chunk_size = 8,
+        });
+        if (admission != .before_rows) {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
+            try db.runUntilIdle();
+        }
+        try db.addEnrichment(.{
+            .name = "document_chunk_dense_v1",
+            .kind = .embedding,
+            .field = "text",
+            .source_artifact_name = "document_chunks_v1",
+            .expected_dims = 3,
+        });
+        // Also exercise admission after the embeddings themselves are durable:
+        // the new consumer must bootstrap existing one-to-many artifacts.
+        if (admission == .after_embeddings) try db.runUntilIdle();
+        // Resolve the actual public config to storage config so the runtime and
+        // API observe precisely the same incarnation and config fingerprint.
+        const indexes_api = @import("../../api/indexes.zig");
+        var config = try std.json.parseFromSlice(std.json.Value, alloc,
+            \\{"name":"dv_document_chunks","type":"embeddings","dimension":3,"sources":[{"artifact":"document_chunk_dense_v1"}],"_index_incarnation":42}
+        , .{});
+        defer config.deinit();
+        const config_json = try @import("../../api/table_index_config.zig").extractIndexConfigJson(alloc, "dv_document_chunks", config.value);
+        defer alloc.free(config_json);
+        try db.addIndex(.{
+            .name = "dv_document_chunks",
+            .kind = .dense_vector,
+            .coverage_generation = 42,
+            .config_json = config_json,
+        });
+        if (admission == .before_rows) {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
+        }
+        try db.runUntilIdle();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
-    // Dogfood's `chunk_vectors` declares its consumed embedding artifact via
-    // the plural `sources` array (one entry), not `embedding_name`. Both
-    // forms populate the same durable dense-artifact-counter machinery, but
-    // only `embedding_names` (plural) hit the missing-match bug.
-    try db.addIndex(.{
-        .name = "dv_document_chunks",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}]}",
-    });
+        try std.testing.expect(counting.calls > 0);
 
-    try db.batch(.{
-        .writes = &.{.{
-            .key = "doc:a",
-            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
-        }},
-        .sync_level = .full_index,
-    });
-    try db.runUntilIdle();
+        const active_count = db.core.index_manager.denseIndex("dv_document_chunks").?.index.stats().active_count;
+        try std.testing.expect(active_count > 1);
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        const item = for (stats.indexes) |item| {
+            if (std.mem.eql(u8, item.name, "dv_document_chunks")) break item;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(item.publication_target_ready);
+        try std.testing.expectEqual(active_count, item.publication_target_count);
+        try std.testing.expect(item.coverage_summary_ready);
+        try std.testing.expectEqual(@as(u64, 1), item.coverage_produced_count);
+        const runtime_status = @import("../../api/runtime_status.zig");
+        var runtime_items = [_]runtime_status.LocalTableRuntimeStatus{.{
+            .group_id = 1,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = stats,
+        }};
+        var local_statuses = runtime_status.LocalTableRuntimeStatuses{ .items = &runtime_items };
+        const encoded = try indexes_api.encodeSingleIndexLookup(alloc, "dv_document_chunks", config.value, &local_statuses);
+        defer alloc.free(encoded);
+        try ant_json.testing.expectSubsetJsonText(alloc,
+            \\{"status":{"backfill_state":"ready","backfill_active":false,"backfill_progress":1.0,"rebuilding":false,"dense_publish_pending":false,"publication":{"complete":true},"coverage":{"complete":true,"healthy":true},"readiness":{"state":"ready","pending_reasons":[],"sources":[{"artifact":"document_chunk_dense_v1","state":"ready","pending_reasons":[]}]},"milestones":{"complete":{"reached":true}}}}
+        , encoded);
 
-    try std.testing.expect(counting.calls > 0);
+        // Before the fix this counter was permanently stuck at 0 (the guarded
+        // embedding-artifact write path never found a matching counter target),
+        // so `canAdvanceDerivedToTargetAsync` could never observe
+        // `denseCoverageMatchesTarget` and would defer to artifact maintenance
+        // forever.
+        try std.testing.expectEqual(
+            @as(?u64, active_count),
+            try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_document_chunks"),
+        );
 
-    const active_count = db.core.index_manager.denseIndex("dv_document_chunks").?.index.stats().active_count;
-    try std.testing.expect(active_count > 0);
-    // Before the fix this counter was permanently stuck at 0 (the guarded
-    // embedding-artifact write path never found a matching counter target),
-    // so `canAdvanceDerivedToTargetAsync` could never observe
-    // `denseCoverageMatchesTarget` and would defer to artifact maintenance
-    // forever.
-    try std.testing.expectEqual(
-        @as(?u64, active_count),
-        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_document_chunks"),
-    );
-
-    // The counter equality above proves the durable target watermark
-    // converges; also prove the index is actually searchable end to end.
-    var search_result = try db.search(alloc, .{
-        .index_name = "dv_document_chunks",
-        .query = .{ .dense_knn = .{ .vector = &.{ 0, 0, 0 }, .k = 5 } },
-        .limit = 5,
-        .search_effort = 1.0,
-    });
-    defer search_result.deinit();
-    try std.testing.expect(search_result.total_hits > 0);
+        // The counter equality above proves the durable target watermark
+        // converges; also prove the index is actually searchable end to end.
+        var search_result = try db.search(alloc, .{
+            .index_name = "dv_document_chunks",
+            .query = .{ .dense_knn = .{ .vector = &.{ 0, 0, 0 }, .k = 5 } },
+            .limit = 5,
+            .search_effort = 1.0,
+        });
+        defer search_result.deinit();
+        try std.testing.expect(search_result.total_hits > 0);
+    }
 }
 
 // `checkTargetAdvanceNoProgress` is `runUntilIdle`'s opt-in stall guard (task
@@ -131202,6 +131235,82 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
         try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
         try std.testing.expectEqual(@as(u64, 8), checkpoint.generation);
     }
+}
+
+test "db dense target reads atomic artifact and source coverage snapshot" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+        .coverage_generation = 42,
+    });
+    const Commit = struct {
+        fn counters(ctx: *AsyncContext, count: u64) !void {
+            const tags = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+            var keys: [4][]u8 = undefined;
+            var initialized: usize = 0;
+            defer for (keys[0..initialized]) |key| ctx.alloc.free(key);
+            var value: [8]u8 = undefined;
+            std.mem.writeInt(u64, &value, count, .little);
+            const zero = [_]u8{0} ** 8;
+            var writes: [4]docstore_mod.KVPair = undefined;
+            for (tags, 0..) |tag, i| {
+                keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(ctx.alloc, "dense_idx", 42, tag);
+                initialized += 1;
+                writes[i] = .{ .key = keys[i], .value = if (i == 0) &value else &zero };
+            }
+            keys[3] = try DB.denseArtifactTargetCounterKeyAlloc(ctx.alloc, "dense_idx");
+            initialized += 1;
+            writes[3] = .{ .key = keys[3], .value = &value };
+            try ctx.store.putBatch(&writes, &.{});
+        }
+        fn afterCapture(ctx: *AsyncContext) !void {
+            test_dense_target_after_coverage_capture = null;
+            try counters(ctx, 2);
+        }
+    };
+    try Commit.counters(db.async_context, 1);
+    var item: types.DBIndexStats = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .coverage_identity_ready = true,
+        .coverage_generation = 42,
+    };
+    // Commit a second source after status captures its coverage tuple. The
+    // publication target must still describe the first revision, rather than
+    // re-reading the new counter and reporting contradictory readiness facts.
+    test_dense_target_after_coverage_capture = Commit.afterCapture;
+    defer test_dense_target_after_coverage_capture = null;
+    try db.populateConfiguredDerivedCoverageCounts("dense_idx", &item);
+    try std.testing.expect(test_dense_target_after_coverage_capture == null);
+    try std.testing.expect(item.publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 1), item.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 1), item.publication_target_count);
+    try db.populateConfiguredDerivedCoverageCounts("dense_idx", &item);
+    try std.testing.expectEqual(@as(u64, 2), item.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 2), item.publication_target_count);
+
+    // Missing/corrupt bootstrap metadata cannot be replaced with the source
+    // count: a document may produce many vectors, or none.
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
+    defer alloc.free(counter_key);
+    try db.core.store.putBatch(&.{}, &.{counter_key});
+    try db.populateConfiguredDerivedCoverageCounts("dense_idx", &item);
+    try std.testing.expect(!item.publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 0), item.publication_target_count);
+    try db.core.store.put(counter_key, "invalid");
+    db.populateConfiguredDerivedCoverageCountsBestEffort("dense_idx", &item);
+    try std.testing.expect(!item.publication_target_ready);
+    try std.testing.expect(item.repair_degraded);
 }
 
 test "db dense target reads atomic outcome and source coverage snapshot" {
