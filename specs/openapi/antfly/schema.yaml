@@ -441,6 +441,66 @@ components:
         expression:
           $ref: "#/components/schemas/RelationalScalarExpression"
 
+    ExternalLakeTableSource:
+      type: object
+      additionalProperties: false
+      description: Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows.
+      required: [kind, table_id, format, uri, schema_fingerprint]
+      properties:
+        kind:
+          type: string
+          enum: [external]
+        table_id:
+          type: string
+          minLength: 1
+        format:
+          type: string
+          enum: [parquet, iceberg]
+        uri:
+          type: string
+          minLength: 1
+        schema_fingerprint:
+          type: string
+          minLength: 1
+        write_policy:
+          type: string
+          enum: [read_only]
+          default: read_only
+        credentials:
+          $ref: "#/components/schemas/ExternalLakeCredentialRef"
+        snapshot:
+          $ref: "#/components/schemas/ExternalLakeSnapshotSelector"
+
+    ExternalLakeCredentialRef:
+      type: object
+      additionalProperties: false
+      required: [ref]
+      properties:
+        ref:
+          type: string
+          minLength: 1
+          description: Name of a configured external_io connection with lake_read capability.
+        scope:
+          type: string
+          description: Allowed object prefix relative to the configured bucket or filesystem root.
+
+    ExternalLakeSnapshotSelector:
+      type: object
+      additionalProperties: false
+      required: [mode]
+      properties:
+        mode:
+          type: string
+          enum: [current, snapshot_id, object_version_digest]
+        id:
+          type: string
+          minLength: 1
+          description: Required for snapshot_id; selects an Iceberg snapshot.
+        digest:
+          type: string
+          minLength: 1
+          description: Required for object_version_digest; pins a Parquet object inventory.
+
     TableSchema:
       type: object
       description: Schema definition for a table with multiple document types
@@ -452,6 +512,9 @@ components:
           description: Backend-managed schema generation used for migrations. Omit it from create and update requests.
         storage_mode:
           $ref: "#/components/schemas/TableStorageMode"
+        base_source:
+          $ref: "#/components/schemas/ExternalLakeTableSource"
+          description: External tables require relational storage mode and are read-only. Omit for native tables.
         column_defaults:
           type: array
           maxItems: 256

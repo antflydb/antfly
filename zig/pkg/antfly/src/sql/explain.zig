@@ -19,6 +19,8 @@ const Plan = struct {
     relation: ?[]const u8 = null,
     join_kind: ?[]const u8 = null,
     index: ?[]const u8 = null,
+    source_format: ?[]const u8 = null,
+    snapshot_mode: ?[]const u8 = null,
     table_id: ?u64 = null,
     schema_version: ?u32 = null,
     fields: ?[]const []const u8 = null,
@@ -115,7 +117,9 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
             if (scan.index >= bound.scans.len) return error.InvalidSqlBackendResponse;
             const source = bound.scans[scan.index];
             break :blk .{
-                .node_type = if (source.request.index_equality != null) "Index Scan" else "Table Scan",
+                .node_type = if (source.table.external_base_source != null) "Lake Scan" else if (source.request.index_equality != null) "Index Scan" else "Table Scan",
+                .source_format = if (verbose) if (source.table.external_base_source) |lake| @tagName(lake.binding.format) else null else null,
+                .snapshot_mode = if (verbose) if (source.table.external_base_source) |lake| @tagName(lake.binding.snapshot_mode) else null else null,
                 .relation = try displayName(alloc, source.table),
                 .index = if (source.request.index_equality) |index| index.name else null,
                 .table_id = if (verbose) source.table.id else null,
@@ -162,7 +166,9 @@ fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.Bou
         try alloc.dupe(Plan, &.{try relationPlan(alloc, source, source.root, verbose, 0, &remaining)})
     else if (if (statement == .insert) null else bound.table) |table|
         try alloc.dupe(Plan, &.{.{
-            .node_type = "Native Table Access",
+            .node_type = if (table.external_base_source != null) "Lake Scan" else "Native Table Access",
+            .source_format = if (verbose) if (table.external_base_source) |lake| @tagName(lake.binding.format) else null else null,
+            .snapshot_mode = if (verbose) if (table.external_base_source) |lake| @tagName(lake.binding.snapshot_mode) else null else null,
             .relation = try displayName(alloc, table),
             .table_id = if (verbose) table.id else null,
             .schema_version = if (verbose) table.schema_version else null,
@@ -216,6 +222,8 @@ fn appendText(alloc: Allocator, out: *std.ArrayList(u8), plan: Plan, depth: usiz
     if (plan.relation) |name| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " on {s}", .{name}));
     if (plan.index) |name| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " using {s}", .{name}));
     if (plan.schema_version) |version| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [schema {d}]", .{version}));
+    if (plan.source_format) |format| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [format {s}]", .{format}));
+    if (plan.snapshot_mode) |mode| try out.appendSlice(alloc, try std.fmt.allocPrint(alloc, " [snapshot {s}]", .{mode}));
     try out.append(alloc, '\n');
     for (plan.plans) |child| try appendText(alloc, out, child, depth + 1);
 }

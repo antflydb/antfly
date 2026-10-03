@@ -289,6 +289,13 @@ from .extension_scope import ExtensionScope
 from .extension_scope_kind import ExtensionScopeKind
 from .external_io_connection import ExternalIoConnection
 from .external_io_protocol import ExternalIoProtocol
+from .external_lake_credential_ref import ExternalLakeCredentialRef
+from .external_lake_snapshot_selector import ExternalLakeSnapshotSelector
+from .external_lake_snapshot_selector_mode import ExternalLakeSnapshotSelectorMode
+from .external_lake_table_source import ExternalLakeTableSource
+from .external_lake_table_source_format import ExternalLakeTableSourceFormat
+from .external_lake_table_source_kind import ExternalLakeTableSourceKind
+from .external_lake_table_source_write_policy import ExternalLakeTableSourceWritePolicy
 from .extraction_attribute_group import ExtractionAttributeGroup
 from .extraction_attribute_label import ExtractionAttributeLabel
 from .extraction_classification import ExtractionClassification
@@ -1687,6 +1694,13 @@ __all__ = (
     "ExtensionScopeKind",
     "ExternalIoConnection",
     "ExternalIoProtocol",
+    "ExternalLakeCredentialRef",
+    "ExternalLakeSnapshotSelector",
+    "ExternalLakeSnapshotSelectorMode",
+    "ExternalLakeTableSource",
+    "ExternalLakeTableSourceFormat",
+    "ExternalLakeTableSourceKind",
+    "ExternalLakeTableSourceWritePolicy",
     "ExtractionAttributeGroup",
     "ExtractionAttributeLabel",
     "ExtractionClassification",

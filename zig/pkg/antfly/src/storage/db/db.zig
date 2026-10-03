@@ -11155,6 +11155,10 @@ pub const DB = struct {
     /// turning one request into unbounded CPU/provider work.
     fn batchInternal(self: *DB, req: types.BatchRequest, profile: ?*BatchProfile, opts: BatchExecutionOptions) anyerror!void {
         try types.validateGraphEndpointCleanupCommand(req);
+        var lake_schema_view = self.core.acquireSchemaView();
+        defer if (lake_schema_view) |*view| view.release();
+        if (lake_schema_view) |view| if (view.tableSchema().external_base_source != null and
+            (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.graph_writes.len != 0 or req.graph_deletes.len != 0)) return error.ExternalLakeReadOnly;
         if (self.local_execution.initial_child_hidden.load(.acquire) and
             (req.relational_topology == null or
                 (req.relational_topology.?.action != .provision_initial_child and
@@ -12373,6 +12377,8 @@ pub const DB = struct {
         else
             null;
         defer if (apply_schema_view) |*view| view.release();
+        if (apply_schema_view) |view| if (view.tableSchema().external_base_source != null and
+            (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0)) return error.ExternalLakeReadOnly;
         if (relationalColumns(self) == null) for (effective_req.writes) |write| if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
         if (!use_preprepared_rows and relationalColumns(self) != null and apply_schema_view == null)
             return error.InvalidSchemaUpdateRequest;
@@ -29358,11 +29364,15 @@ pub const DB = struct {
     fn validateStorageModeCompatibilityLocked(self: *DB, next_schema: schema_mod.TableSchema) !?u64 {
         if (self.core.schema) |current_schema| {
             if (current_schema.storage_mode != next_schema.storage_mode) return error.InvalidSchemaUpdateRequest;
+            // Attaching/detaching an external base must never hide or resurrect
+            // native rows under the same identity. Create a new table instead.
+            if ((current_schema.external_base_source == null) != (next_schema.external_base_source == null)) return error.InvalidSchemaUpdateRequest;
             return null;
         }
 
         const catalog = self.core.table_catalog;
         if (catalog.reconciled) {
+            if (next_schema.external_base_source != null and catalog.row_count != 0) return error.InvalidSchemaUpdateRequest;
             if (catalog.row_count != 0 and catalog.mode_initialized and
                 catalog.storage_mode != next_schema.storage_mode)
                 return error.InvalidSchemaUpdateRequest;
@@ -29374,6 +29384,7 @@ pub const DB = struct {
         // is known and never copy keys or values into an aggregate result.
         const State = struct {
             desired: schema_mod.StorageMode,
+            external: bool,
             incompatible: bool = false,
             row_count: u64 = 0,
 
@@ -29387,14 +29398,14 @@ pub const DB = struct {
                 else
                     return .@"continue";
                 state.row_count +|= 1;
-                if (mode == state.desired) return .@"continue";
+                if (!state.external and mode == state.desired) return .@"continue";
                 state.incompatible = true;
                 return .stop;
             }
         };
         const lower = [_]u8{internal_keys.user_namespace};
         const upper = [_]u8{internal_keys.user_namespace + 1};
-        var state = State{ .desired = next_schema.storage_mode };
+        var state = State{ .desired = next_schema.storage_mode, .external = next_schema.external_base_source != null };
         try self.core.store.scanWithContext(&lower, &upper, .{}, &state, State.visit);
         if (state.incompatible) return error.InvalidSchemaUpdateRequest;
         return state.row_count;
@@ -157972,4 +157983,18 @@ test "document collectors release text projections and materialized values on al
     };
     for ([_]bool{ false, true }) |inline_values|
         try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
+}
+test "db external lake rejects native mutations before and after cold reopen" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("lake-owner");
+    defer directory.cleanup();
+    const external_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"amount\":{\"type\":\"integer\"}},\"additionalProperties\":false}}},\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"table_id\":\"events\",\"uri\":\"s3://bucket/events\",\"schema_fingerprint\":\"v1\"}}";
+    for (0..2) |iteration| {
+        var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false });
+        defer db.close();
+        if (iteration == 0) try db.setSchemaJson(alloc, external_schema);
+        try std.testing.expect(db.core.schema.?.external_base_source != null);
+        try std.testing.expectError(error.ExternalLakeReadOnly, db.batch(.{ .writes = &.{.{ .key = "one", .value = "{\"amount\":1}" }} }));
+        try std.testing.expectError(error.ExternalLakeReadOnly, db.batch(.{ .deletes = &.{"one"} }));
+    }
 }

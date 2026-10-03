@@ -9,6 +9,55 @@ The implementation now includes scalar and aggregate execution, joins and CTEs,
 native catalog DDL, durable READ COMMITTED sessions/savepoints, and public SQL
 interfaces. It does not yet reproduce the mega branch's complete SQL behavior.
 
+### External lake SQL integration
+
+Relational table schemas can attach a read-only Parquet prefix or Iceberg table
+with `base_source`. The attachment persists with the native schema and is
+resolved through the catalog for public typed-row queries and SQL over HTTP or
+pgwire. For example, add this property to a relational table schema whose
+`document_schemas` declares the lake's columns:
+
+```json
+"base_source": {
+  "kind": "external",
+  "table_id": "events",
+  "format": "parquet",
+  "uri": "s3://analytics/events",
+  "schema_fingerprint": "events-v1",
+  "credentials": {"ref": "analytics-lake", "scope": "events"},
+  "snapshot": {"mode": "current"},
+  "write_policy": "read_only"
+}
+```
+
+Credential references use configured `external_io` connections with `lake_read`
+capability and enforce their bucket/prefix scope. Iceberg attachments use
+`format: "iceberg"` and the snapshot schema fingerprint (for example,
+`iceberg-schema:7`). A snapshot selector can instead pin an Iceberg snapshot ID
+or a Parquet object-version digest. Filesystem sources use the existing
+filesystem object-store layout under its `antfly` bucket.
+
+Each SQL statement pins source inventories and object versions. Repeated table
+aliases share the inventory, and mixed joins retain the native statement read.
+SQL applies its existing projections, predicates, aggregates, joins, CTEs, set
+operations and windows to lake cursors. Public row queries apply residual
+predicates before limits and emit snapshot-derived `_id` values. Iceberg reads
+apply the existing position/equality delete machinery. Provider reads receive
+the request's cancellation and deadline.
+
+Lake scans currently admit at most 100,000 materialized rows, 32 MiB of decoded
+materialized data and 1,000,000 examined rows per cursor, in addition to SQL's
+statement budget. `EXPLAIN` identifies `Lake Scan`; verbose plans include the
+source format and configured snapshot selector without opening the source.
+Unsupported Parquet encodings fail through the existing lake
+engine. Source attachments reject native write constraints, indexes, defaults,
+generated columns and TTL. SQL mutations and public batches reject writes;
+existing native tables cannot acquire or remove an attachment through a schema
+update. External scans reject native serializable range-proof requests and
+active row policies or row filters. Public secondary-index cursors and explicit
+collations are unsupported. Lake sidecar and operational engine APIs remain the
+existing standalone interfaces.
+
 ### Pre-merge activation work
 
 Standalone ordinary FK publication now uses the durable native owner-control

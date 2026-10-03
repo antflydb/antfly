@@ -311,6 +311,135 @@ pub const DynamicTemplate = struct {
     }
 };
 
+pub const ExternalLakeCredentialRef = struct {
+    /// Name of a configured external_io connection with lake_read capability.
+    ref: []const u8,
+    /// Allowed object prefix relative to the configured bucket or filesystem root.
+    scope: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "ref", "ref", false },
+        .{ "scope", "scope", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("ref");
+        try jw.write(self.ref);
+        if (self.scope) |value| {
+            try jw.objectField("scope");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const ExternalLakeSnapshotSelector = struct {
+    mode: []const u8,
+    /// Required for snapshot_id; selects an Iceberg snapshot.
+    id: ?[]const u8 = null,
+    /// Required for object_version_digest; pins a Parquet object inventory.
+    digest: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "mode", "mode", false },
+        .{ "id", "id", true },
+        .{ "digest", "digest", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("mode");
+        try jw.write(self.mode);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.digest) |value| {
+            try jw.objectField("digest");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows.
+pub const ExternalLakeTableSource = struct {
+    kind: []const u8,
+    table_id: []const u8,
+    format: []const u8,
+    uri: []const u8,
+    schema_fingerprint: []const u8,
+    write_policy: ?[]const u8 = null,
+    credentials: ?ExternalLakeCredentialRef = null,
+    snapshot: ?ExternalLakeSnapshotSelector = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "kind", "kind", false },
+        .{ "table_id", "table_id", false },
+        .{ "format", "format", false },
+        .{ "uri", "uri", false },
+        .{ "schema_fingerprint", "schema_fingerprint", false },
+        .{ "write_policy", "write_policy", true },
+        .{ "credentials", "credentials", true },
+        .{ "snapshot", "snapshot", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("table_id");
+        try jw.write(self.table_id);
+        try jw.objectField("format");
+        try jw.write(self.format);
+        try jw.objectField("uri");
+        try jw.write(self.uri);
+        try jw.objectField("schema_fingerprint");
+        try jw.write(self.schema_fingerprint);
+        if (self.write_policy) |value| {
+            try jw.objectField("write_policy");
+            try jw.write(value);
+        }
+        if (self.credentials) |value| {
+            try jw.objectField("credentials");
+            try jw.write(value);
+        }
+        if (self.snapshot) |value| {
+            try jw.objectField("snapshot");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Field types accepted by detailed `x-antfly-field` and dynamic-template mappings. JSON-schema-oriented aliases are normalized to Antfly's corresponding runtime type: number/integer to numeric, bool to boolean, date/timestamp to datetime, geo_point to geopoint, and geo_shape to geoshape.
 pub const FieldMappingType = enum {
     text,
@@ -1263,6 +1392,8 @@ pub const TableSchema = struct {
     /// Backend-managed schema generation used for migrations. Omit it from create and update requests.
     version: ?u32 = null,
     storage_mode: ?TableStorageMode = null,
+    /// External tables require relational storage mode and are read-only. Omit for native tables.
+    base_source: ?ExternalLakeTableSource = null,
     /// Immutable typed expressions applied only to absent columns on new writes, never explicit null. Defaults cannot reference columns. A column cannot have both a default and a generated expression. Omission or [] declares none. Relational tables only.
     column_defaults: ?[]const RelationalColumnExpression = null,
     /// Stored immutable generated columns, evaluated in dependency order on writes before validation and indexing. Cycles are rejected. Generated columns are output-only; submitted values are replaced by the computed value. Omission or [] declares none. Defaults and generated declarations together are limited to 256 columns, 4096 expression nodes, and 4 MiB of literal data. Evaluation has a shared 4 MiB allocation budget across all column expressions. Restore verifies stored results instead of silently recomputing them. Changing, adding, or removing generated semantics through an existing table's schema update requires explicit rewrite=true on the PUT or PATCH schema route. This returns a durable restore job and replaces the complete authorized dependency cohort only after distributed transformation and validation. Ordinary schema updates reject these changes, even when a table appears empty. Declaration reordering and default-only changes remain allowed. Relational tables only.
@@ -1294,6 +1425,7 @@ pub const TableSchema = struct {
     pub const openApiFieldMetadata = .{
         .{ "version", "version", true },
         .{ "storage_mode", "storage_mode", true },
+        .{ "base_source", "base_source", true },
         .{ "column_defaults", "column_defaults", true },
         .{ "generated_columns", "generated_columns", true },
         .{ "checks", "checks", true },
@@ -1325,6 +1457,10 @@ pub const TableSchema = struct {
         }
         if (self.storage_mode) |value| {
             try jw.objectField("storage_mode");
+            try jw.write(value);
+        }
+        if (self.base_source) |value| {
+            try jw.objectField("base_source");
             try jw.write(value);
         }
         if (self.column_defaults) |value| {

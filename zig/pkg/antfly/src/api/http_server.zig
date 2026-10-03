@@ -13577,6 +13577,7 @@ pub const ApiHttpServer = struct {
             // conservative do-not-retry signal if a legacy adapter reports a
             // partial outcome, without advertising a partial public commit.
             error.RaftBatchWritePartialOutcome => return error.WriteOutcomeUnknown,
+            error.ExternalLakeReadOnly => return error.ExternalLakeReadOnly,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
             error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
             error.HAFencedPrimary => return error.HAFencedPrimary,
