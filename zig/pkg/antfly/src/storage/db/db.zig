@@ -98459,6 +98459,7 @@ const TestAssetProducer = struct {
             .reader => self.reader_calls += 1,
             .transcriber => self.transcriber_calls += 1,
             .extractor => self.extractor_calls += 1,
+            .decision => return error.UnsupportedProducer,
         }
         if (request.producer_type == .extractor) {
             if (self.extractor_output) |output| return try alloc.dupe(u8, output);

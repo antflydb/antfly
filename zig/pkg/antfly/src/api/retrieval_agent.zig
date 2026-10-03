@@ -2888,7 +2888,7 @@ fn runQueryWithResults(
     // The arena owns the allocation and will free it.
 
     const tree_root = if (has_tree_search)
-        try extractTreeFallbackRootKey(arena, query_json)
+        try extractTreeFallbackRootKeyAlloc(arena, query_json)
     else
         null;
 
@@ -5607,7 +5607,7 @@ fn maybeProbeAgenticSelection(
         }) catch continue;
 
         const fallback_tree_root = if (retrieval_query.tree_search != null)
-            try extractTreeFallbackRootKey(arena, query_json)
+            try extractTreeFallbackRootKeyAlloc(arena, query_json)
         else
             null;
         const probe_query_text = queryTextForProbe(arena, classification_result, retrieval_query);
@@ -5768,7 +5768,7 @@ fn probeAgenticFallbackCandidates(
         }) catch continue;
 
         const fallback_tree_root = if (retrieval_query.tree_search != null)
-            try extractTreeFallbackRootKey(arena, query_json)
+            try extractTreeFallbackRootKeyAlloc(arena, query_json)
         else
             null;
         const probe_query_text = queryTextForProbe(arena, classification_result, retrieval_query);
@@ -7769,7 +7769,7 @@ fn treePathSegmentKey(segment: anytype) []const u8 {
     return segment;
 }
 
-fn extractTreeFallbackRootKey(
+fn extractTreeFallbackRootKeyAlloc(
     alloc: std.mem.Allocator,
     query_json: []const u8,
 ) !?[]const u8 {
@@ -7789,7 +7789,7 @@ fn extractTreeFallbackRootKey(
         else => return null,
     };
     if (keys.len != 1) return null;
-    return keys[0];
+    return try alloc.dupe(u8, keys[0]);
 }
 
 fn detectAggregateStrategy(strategies: []const RetrievalStrategy) ?RetrievalStrategy {
@@ -8061,7 +8061,8 @@ test "retrieval agent supports pipeline tree search from previous hits" {
                     ),
                 };
             }
-            const start_key = (try extractTreeFallbackRootKey(alloc, query_json)).?;
+            const start_key = (try extractTreeFallbackRootKeyAlloc(alloc, query_json)).?;
+            defer alloc.free(start_key);
             try std.testing.expectEqualStrings("doc:a", start_key);
             return .{
                 .json = try alloc.dupe(u8,
@@ -8143,7 +8144,8 @@ test "retrieval agent supports roots tree search" {
             defer parsed_query.deinit();
             try std.testing.expect(parsed_query.value.filter_query != null);
             try std.testing.expect(parsed_query.value.exclusion_query != null);
-            const start_key = (try extractTreeFallbackRootKey(alloc, query_json)).?;
+            const start_key = (try extractTreeFallbackRootKeyAlloc(alloc, query_json)).?;
+            defer alloc.free(start_key);
             try std.testing.expectEqualStrings("doc:root", start_key);
             return .{
                 .json = try alloc.dupe(u8,
