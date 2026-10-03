@@ -114,14 +114,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const fst_mod = options.antfly_imports.fst;
     const regex_mod = options.antfly_imports.regex;
     const json_mod = options.antfly_imports.json;
-    const matcher_mod = options.antfly_imports.matcher;
-    const resolver_mod = options.antfly_imports.resolver;
-    const chunking_mod = options.antfly_imports.chunking;
-    const scraping_mod = options.antfly_imports.scraping;
     const reranking_mod = options.antfly_imports.reranking;
-    const image_mod = options.antfly_imports.image;
     const pdf_mod = options.antfly_imports.pdf;
-    const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
     const vopr_mod = options.vopr;
@@ -5181,28 +5175,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     storage_workload_soak_step.dependOn(&run_persistent_soak_tests.step);
 
     const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
-    antfly_imports.configureRuntimeContracts(index_manager_test_mod);
-    addSnowballModule(b, index_manager_test_mod);
-    index_manager_test_mod.addImport("bloom", bloom_mod);
-    index_manager_test_mod.addImport("antfly_fst", fst_mod);
-    index_manager_test_mod.addImport("antfly_vector", vector_mod);
-    index_manager_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
-    index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
-    index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
-    index_manager_test_mod.addImport("antfly-json", json_mod);
-    index_manager_test_mod.addImport("antfly_schema_openapi", antfly_imports.schema_openapi);
-    index_manager_test_mod.addImport("antfly_scraping", scraping_mod);
-    index_manager_test_mod.addImport("antfly_image", image_mod);
-    index_manager_test_mod.addImport("antfly_pdf", pdf_mod);
-    index_manager_test_mod.addImport("httpx", httpx_mod);
-    index_manager_test_mod.addImport("antfly_regex", regex_mod);
-    index_manager_test_mod.addImport("antfly_reader_config", reader_config_mod);
-    index_manager_test_mod.addImport("structlog", structlog_mod);
+    // These implementation fixtures use the same dependency composition as
+    // the other DB test roots. A hand-maintained subset silently falls behind
+    // whenever production code gains a named import or changes source owners.
+    antfly_imports.configure(b, index_manager_test_mod, true);
+    antfly_imports.storage_boundary.configureSources(index_manager_test_mod, false, false);
     index_manager_test_mod.addImport("vopr", vopr_mod);
+    const index_manager_filters = [_][]const u8{
+        "storage.db.catalog.index_manager.",
+        "storage.index_manager_vopr.",
+    };
     const index_manager_unit_tests = b.addTest(.{
         .root_module = index_manager_test_mod,
-        .filters = selectTestFilters(b, &.{}),
+        .filters = selectTestFilters(b, &index_manager_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"),
             .mode = .simple,

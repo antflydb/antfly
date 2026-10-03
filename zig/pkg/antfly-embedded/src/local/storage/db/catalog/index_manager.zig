@@ -44271,11 +44271,26 @@ test "text merge failure quarantines source segments" {
     try std.testing.expectEqual(@as(u64, 1), stats.quarantined_merges);
     try std.testing.expectEqual(@as(u64, @intCast(task.source.len)), stats.quarantined_segments);
     try std.testing.expectEqualStrings("InvalidChunk", stats.last_merge_error.slice());
+    // Quarantine is scoped to the failed inputs, not the entire index.
+    // Force-drain debt may still schedule the remaining healthy segments.
+    var healthy_task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer healthy_task.deinit(alloc);
+    for (healthy_task.source) |healthy| {
+        for (task.source) |quarantined| {
+            try std.testing.expect(healthy.id != quarantined.id);
+        }
+    }
+    var healthy_result = try IndexManager.executeTextMergeTask(alloc, &healthy_task);
+    defer healthy_result.deinit(alloc);
+    try std.testing.expect(try manager.finishTextMergeTask(&healthy_task, &healthy_result));
+    // Only one healthy output remains, so no further merge can consume the
+    // failed inputs until their quarantine expires.
     var blocked_task = try manager.beginTextMergeTask();
     if (blocked_task) |*unexpected| {
         unexpected.deinit(alloc);
         return error.TestUnexpectedResult;
     }
+    try std.testing.expectEqual(stats.quarantined_segments, manager.textMergeStats().quarantined_segments);
 
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry.compaction_pending.load(.acquire));
