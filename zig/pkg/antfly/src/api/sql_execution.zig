@@ -113,6 +113,7 @@ pub const Adapter = struct {
     context: operation.RequestContext,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
+    decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
     /// mutable, freshly authorized lookup namespace. HTTP leaves this null.
     session_namespace: ?[]const u8 = null,
@@ -147,8 +148,31 @@ pub const Adapter = struct {
     /// exact serving generation, including a publication changed mid-read.
     policy_proofs: ?std.AutoHashMapUnmanaged(u64, ?[]u8) = null,
 
+    pub fn decisionRuntime(self: *Adapter) !?@import("../functions/runtime.zig").Runtime {
+        if (self.server.cfg.node_config) |config| {
+            if (config.registry.decider_configs.count() > 0) {
+                const normalized = try self.context.platformDeadline();
+                return .{
+                    .registry = &config.registry,
+                    .io = self.server.embedding_provider_runtime.io,
+                    .http = try self.server.embedding_provider_runtime.httpClient(),
+                    .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation },
+                    .secret_store = self.server.cfg.secret_store,
+                    .antfly_provider = self.server.antfly_provider,
+                    .antfly_url = config.inference.api_url,
+                };
+            }
+        }
+        return null;
+    }
+
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("../sql/compiler.zig").Compiled, parameters: []const std.json.Value, limits: @import("../sql/runtime.zig").Limits, guarded_backend: ?catalog.Backend) !@import("../sql/runtime.zig").Result {
         var zig017_return_error: ?anyerror = null;
+        var decision_runtime: ?@import("../functions/runtime.zig").Runtime = null;
+        const previous_provider = self.decision_provider;
+        defer self.decision_provider = previous_provider;
+        decision_runtime = try self.decisionRuntime();
+        if (decision_runtime) |*active| self.decision_provider = active.provider();
         if (self.policy_proofs != null) return zig017_failure: {
             zig017_return_error = error.InvalidSqlBackendResponse;
             break :zig017_failure error.InvalidSqlBackendResponse;
@@ -429,6 +453,7 @@ pub const Adapter = struct {
                     self.dynamic_table = table.physical_name;
                 }
                 var active_backend = guarded_backend orelse self.backend();
+                active_backend.decision_provider = self.decision_provider;
                 if (compiled.uses_current_setting and active_backend.setting_capture == null) active_backend.setting_capture = self.settingCapture();
                 if (guarded_backend != null) {
                     active_backend.atomic_statement_read_set = self.range_reads != null;
@@ -484,6 +509,7 @@ pub const Adapter = struct {
             return result;
         }
         var statement_backend = guarded_backend orelse self.backend();
+        statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
         return @import("../sql/runtime.zig").execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
             zig017_return_error = zig017_err;
@@ -492,7 +518,7 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .ptr = self, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {

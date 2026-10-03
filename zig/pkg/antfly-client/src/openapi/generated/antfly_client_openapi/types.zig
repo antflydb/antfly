@@ -10011,11 +10011,11 @@ pub const EnrichmentConfig = struct {
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
-    /// Write-only producer configuration. Cannot be combined with producer_json or transcriber.
+    /// Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle.
     producer: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
-    /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
+    /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
     neighbor_context: ?EnrichmentNeighborContextConfig = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
@@ -14943,6 +14943,7 @@ pub const GeoShapeQuery = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
+    evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
@@ -15020,6 +15021,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", false },
         .{ "query", "query", true },
@@ -15071,6 +15073,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluate) |value| {
+            try jw.objectField("evaluate");
+            try jw.write(value);
+        }
         if (self.table_target) |value| {
             try jw.objectField("table_target");
             try jw.write(value);
@@ -15746,10 +15752,43 @@ pub const GraphBindingNode = struct {
 
 /// A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
 pub const GraphBindingsResult = struct {
+    /// Evaluated values parallel to returned rows, when decision evaluation was requested.
+    computed: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
     rows: []const GraphResultRow,
     stats: GraphResultStats,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "computed", "computed", true },
+        .{ "kind", "kind", false },
+        .{ "rows", "rows", false },
+        .{ "stats", "stats", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.computed) |value| {
+            try jw.objectField("computed");
+            try jw.write(value);
+        }
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("rows");
+        try jw.write(self.rows);
+        try jw.objectField("stats");
+        try jw.write(self.stats);
+        try jw.endObject();
+    }
 };
 
 pub const GraphBindingsReturn = struct {
@@ -29005,11 +29044,13 @@ pub const PatternEdgeStep = struct {
 
 /// Deprecated graph_searches pattern response row.
 pub const PatternMatch = struct {
+    _computed: ?std.json.ArrayHashMap(std.json.Value) = null,
     bindings: ?std.json.ArrayHashMap(LegacyGraphResultNode) = null,
     path: ?[]const PathEdge = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "_computed", "_computed", true },
         .{ "bindings", "bindings", true },
         .{ "path", "path", true },
     };
@@ -29024,6 +29065,10 @@ pub const PatternMatch = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self._computed) |value| {
+            try jw.objectField("_computed");
+            try jw.write(value);
+        }
         if (self.bindings) |value| {
             try jw.objectField("bindings");
             try jw.write(value);
@@ -29911,7 +29956,7 @@ pub const QueryConflictError = union(enum) {
     }
 };
 
-/// A stable failure envelope for query embedding and reranking dependencies.
+/// A stable failure envelope for query embedding, reranking, and decision dependencies.
 pub const QueryDependencyError = struct {
     code: []const u8,
     /// Legacy alias of code. Use code for programmatic handling.
@@ -29919,6 +29964,76 @@ pub const QueryDependencyError = struct {
     message: []const u8,
     retryable: bool,
 };
+
+/// Evaluate expressions after global retrieval merging, before final offset/limit. Candidates require candidate_count; matches require max_rows and fail if the full qualifying population exceeds that budget. Cursor pagination, reranking, pruning, and ordinary aggregations cannot be combined with evaluation. NULL inputs skip inference; errors fail.
+pub const QueryEvaluation = struct {
+    /// Evaluate completed bindings of this named graph MATCH instead of retrieval hits. Fields use alias.document.path or alias.key. Existing graph aggregates cannot be combined with this stage.
+    graph_query: ?[]const u8 = null,
+    scope: []const u8,
+    candidate_count: ?i64 = null,
+    max_rows: ?i64 = null,
+    compute: std.json.ArrayHashMap(QueryExpression),
+    /// Exactly one of eq, neq, lt, lte, gt, gte (two expressions), is_null (expression), not (predicate), and, or (predicate arrays). Comparisons propagate NULL.
+    where: ?std.json.ArrayHashMap(std.json.Value) = null,
+    order_by: ?[]const std.json.Value = null,
+    aggregations: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "graph_query", "graph_query", true },
+        .{ "scope", "scope", false },
+        .{ "candidate_count", "candidate_count", true },
+        .{ "max_rows", "max_rows", true },
+        .{ "compute", "compute", false },
+        .{ "where", "where", true },
+        .{ "order_by", "order_by", true },
+        .{ "aggregations", "aggregations", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.graph_query) |value| {
+            try jw.objectField("graph_query");
+            try jw.write(value);
+        }
+        try jw.objectField("scope");
+        try jw.write(self.scope);
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.max_rows) |value| {
+            try jw.objectField("max_rows");
+            try jw.write(value);
+        }
+        try jw.objectField("compute");
+        try jw.write(self.compute);
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.aggregations) |value| {
+            try jw.objectField("aggregations");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Exactly one of literal, field, ref, or call. A call requires input and decider. ai_decide requires questions; ai_probability requires statement; ai_choice and ai_score require instructions and criteria. Named refs may select nested JSON members with dotted paths. Binding cycles are invalid.
+pub const QueryExpression = std.json.Value;
 
 /// A public filter or exclusion query contains an invalid or unsupported node.
 pub const QueryFilterError = struct {
@@ -30014,6 +30129,8 @@ pub const QueryHighlight = struct {
 
 /// A single query result hit
 pub const QueryHit = struct {
+    /// Named query-time computed values, separate from stored source.
+    _computed: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// ID of the record.
     _id: []const u8,
     /// Relevance score of the hit, normalized so higher values always rank first.
@@ -30034,6 +30151,7 @@ pub const QueryHit = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "_computed", "_computed", true },
         .{ "_id", "_id", false },
         .{ "_score", "_score", false },
         .{ "_distance", "_distance", true },
@@ -30055,6 +30173,10 @@ pub const QueryHit = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self._computed) |value| {
+            try jw.objectField("_computed");
+            try jw.write(value);
+        }
         try jw.objectField("_id");
         try jw.write(self._id);
         try jw.objectField("_score");
@@ -30365,6 +30487,7 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
+    evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
@@ -30438,6 +30561,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
@@ -30487,6 +30611,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluate) |value| {
+            try jw.objectField("evaluate");
+            try jw.write(value);
+        }
         if (self.table_target) |value| {
             try jw.objectField("table_target");
             try jw.write(value);
@@ -30668,6 +30796,8 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
+    /// Function evaluation scope, population, usage, and scoped aggregations.
+    evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
     /// Aggregation results keyed by the user-defined aggregation names from the request. Contains computed metrics or buckets depending on the aggregation type.
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
@@ -30689,6 +30819,7 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
@@ -30711,6 +30842,10 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluation) |value| {
+            try jw.objectField("evaluation");
+            try jw.write(value);
+        }
         if (self.hits) |value| {
             try jw.objectField("hits");
             try jw.write(value);
@@ -30753,6 +30888,8 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
+    /// Function evaluation scope, population, usage, and scoped aggregations.
+    evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
     /// Aggregation results keyed by the user-defined aggregation names from the request. Contains computed metrics or buckets depending on the aggregation type.
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
@@ -30773,6 +30910,7 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
@@ -30794,6 +30932,10 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluation) |value| {
+            try jw.objectField("evaluation");
+            try jw.write(value);
+        }
         if (self.hits) |value| {
             try jw.objectField("hits");
             try jw.write(value);
@@ -37665,9 +37807,9 @@ pub const StatefulGraphQueryResults = std.json.ArrayHashMap(StatefulGraphResult)
 
 /// Graph result emitted by the stateful compatibility transport. Canonical graph_queries produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the compatibility window.
 pub const StatefulGraphResult = union(enum) {
+    graph_bindings_result: *GraphBindingsResult,
     graph_nodes_result: *GraphNodesResult,
     graph_aggregates_result: *GraphAggregatesResult,
-    graph_bindings_result: *GraphBindingsResult,
     graph_paths_result: *GraphPathsResult,
     legacy_graph_search_result: *LegacyGraphSearchResult,
 
@@ -37709,9 +37851,9 @@ pub const StatefulGraphResult = union(enum) {
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
         switch (probe.kind) {
             .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
-                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "paths")) return .{ .graph_paths_result = try parseStructuralVariantFromSlice(GraphPathsResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_search_result = try parseStructuralVariantFromSlice(LegacyGraphSearchResult, allocator, input, options) };
                 return error.UnexpectedToken;
@@ -37737,6 +37879,10 @@ pub const StatefulGraphResult = union(enum) {
             .string => |value| value,
             else => return error.UnexpectedToken,
         };
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_bindings_result = parsed };
+        }
         if (std.mem.eql(u8, disc_str, "nodes")) {
             const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_nodes_result = parsed };
@@ -37744,10 +37890,6 @@ pub const StatefulGraphResult = union(enum) {
         if (std.mem.eql(u8, disc_str, "aggregates")) {
             const parsed = try parseStructuralVariant(GraphAggregatesResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_aggregates_result = parsed };
-        }
-        if (std.mem.eql(u8, disc_str, "bindings")) {
-            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .graph_bindings_result = parsed };
         }
         if (std.mem.eql(u8, disc_str, "paths")) {
             const parsed = try parseStructuralVariant(GraphPathsResult, allocator, source, options) orelse return error.UnexpectedToken;
@@ -37762,9 +37904,9 @@ pub const StatefulGraphResult = union(enum) {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
+            .graph_bindings_result => |v| try jw.write(v.*),
             .graph_nodes_result => |v| try jw.write(v.*),
             .graph_aggregates_result => |v| try jw.write(v.*),
-            .graph_bindings_result => |v| try jw.write(v.*),
             .graph_paths_result => |v| try jw.write(v.*),
             .legacy_graph_search_result => |v| try jw.write(v.*),
         }
@@ -37773,6 +37915,7 @@ pub const StatefulGraphResult = union(enum) {
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
+    evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
@@ -37850,6 +37993,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
@@ -37901,6 +38045,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluate) |value| {
+            try jw.objectField("evaluate");
+            try jw.write(value);
+        }
         if (self.table_target) |value| {
             try jw.objectField("table_target");
             try jw.write(value);
@@ -38090,6 +38238,8 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
+    /// Function evaluation scope, population, usage, and scoped aggregations.
+    evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
     /// Aggregation results keyed by the user-defined aggregation names from the request. Contains computed metrics or buckets depending on the aggregation type.
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
@@ -38111,6 +38261,7 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
@@ -38133,6 +38284,10 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluation) |value| {
+            try jw.objectField("evaluation");
+            try jw.write(value);
+        }
         if (self.hits) |value| {
             try jw.objectField("hits");
             try jw.write(value);

@@ -810,7 +810,7 @@ components:
           type: object
           additionalProperties: true
           writeOnly: true
-          description: "Write-only producer configuration. Cannot be combined with producer_json or transcriber."
+          description: "Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle."
         producer_json:
           x-go-type-skip-optional-pointer: true
           type: string
@@ -820,7 +820,7 @@ components:
           description: "Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded."
         neighbor_context:
           $ref: "#/components/schemas/EnrichmentNeighborContextConfig"
-          description: "Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission."
+          description: "Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission."
         execution:
           $ref: "#/components/schemas/ExecutionPolicy"
           description: "Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity."
@@ -4983,6 +4983,9 @@ components:
       deprecated: true
       description: Deprecated graph_searches pattern response row.
       properties:
+        _computed:
+          type: object
+          additionalProperties: true
         bindings:
           x-go-type-skip-optional-pointer: true
           type: object
@@ -5027,6 +5030,12 @@ components:
       required: [kind, rows, stats]
       description: A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
       properties:
+        computed:
+          type: array
+          description: Evaluated values parallel to returned rows, when decision evaluation was requested.
+          items:
+            type: object
+            additionalProperties: true
         kind:
           type: string
           enum: [bindings]

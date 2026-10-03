@@ -2443,7 +2443,7 @@ fn resolveSecretReferencesInValue(
                 if (context == .config_root) {
                     const key = entry.key_ptr.*;
                     if (std.mem.eql(u8, key, "secrets") or std.mem.eql(u8, key, "generators") or
-                        std.mem.eql(u8, key, "embedders") or std.mem.eql(u8, key, "rerankers") or
+                        std.mem.eql(u8, key, "embedders") or std.mem.eql(u8, key, "rerankers") or std.mem.eql(u8, key, "deciders") or
                         std.mem.eql(u8, key, "remote_content")) continue;
                 }
                 // External-I/O credentials are operational secrets: retain

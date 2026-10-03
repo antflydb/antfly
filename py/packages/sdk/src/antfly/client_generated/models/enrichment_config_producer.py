@@ -11,7 +11,12 @@ T = TypeVar("T", bound="EnrichmentConfigProducer")
 
 @_attrs_define
 class EnrichmentConfigProducer:
-    """Write-only producer configuration. Cannot be combined with producer_json or transcriber."""
+    """Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use
+    type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig.
+    Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version
+    or specification to rebuild through the enrichment lifecycle.
+
+    """
 
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 

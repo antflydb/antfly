@@ -353,12 +353,19 @@ pub const AntflyProvider = struct {
     /// Dense and raster responses use the owned numeric-row ABI, not JSON.
     typed_dense_results: bool = false,
     /// Canonical generation request/response on the admitted runtime route.
+    decide_json: ?*const fn (*anyopaque, std.mem.Allocator, []const u8, ?RequestContext) anyerror![]u8 = null,
+
     generate_json: ?*const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         request_json: []const u8,
         context: ?RequestContext,
     ) anyerror![]u8 = null,
+
+    pub fn decideJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
+        const callback = self.decide_json orelse return error.UnsupportedDecisionProvider;
+        return AntflyProviderBoundary.call("decide_json", self.boundary_dispatch, callback, .{ self.ptr, alloc, body, context });
+    }
 
     pub fn generateJson(self: AntflyProvider, alloc: std.mem.Allocator, body: []const u8, context: ?RequestContext) ![]u8 {
         const callback = self.generate_json orelse return error.UnsupportedGeneratorProvider;
@@ -452,7 +459,7 @@ pub const ProviderRuntime = struct {
     /// Lazily publish one service-scoped transport. Provider request objects
     /// retain per-request URLs, authentication, cancellation, and deadlines;
     /// the client owns only reusable DNS/TLS/connection state.
-    fn httpClient(self: *ProviderRuntime) !*httpx.Client {
+    pub fn httpClient(self: *ProviderRuntime) !*httpx.Client {
         if (self.http_client.load(.acquire)) |client| return client;
         lockAtomic(&self.http_mutex);
         defer self.http_mutex.unlock();

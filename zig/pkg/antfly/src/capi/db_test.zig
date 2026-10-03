@@ -3522,6 +3522,17 @@ test "capi search json returns stamped identity generation" {
         cleanupTestDir(path);
     }
 
+    // Evaluation must fail before either the Lite fallback or linked storage
+    // path can return an unfiltered public result.
+    const evaluated_query = "{\"full_text_search\":{\"match_all\":{}},\"evaluate\":{\"scope\":\"candidates\",\"candidate_count\":2,\"compute\":{\"x\":{\"literal\":1}},\"where\":{\"eq\":[{\"literal\":1},{\"literal\":0}]}}}";
+    var rejected: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.mapError(error.UnsupportedQueryRequest), antfly_db_search_json(
+        handle_id,
+        .{ .ptr = evaluated_query.ptr, .len = evaluated_query.len },
+        &rejected,
+    ));
+    try std.testing.expect(rejected.ptr == null);
+
     try handle.db.addIndex(.{
         .name = "dv_v1",
         .kind = .dense_vector,

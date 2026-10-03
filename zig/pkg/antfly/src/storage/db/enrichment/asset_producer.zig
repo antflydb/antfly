@@ -56,8 +56,10 @@ pub const ProducerType = enum {
     reader,
     transcriber,
     extractor,
+    decision,
 
     pub fn parse(text: []const u8) ?ProducerType {
+        if (std.mem.eql(u8, text, "decision")) return .decision;
         if (std.mem.eql(u8, text, "copy")) return .copy;
         if (std.mem.eql(u8, text, "document_extraction")) return .document_extraction;
         if (std.mem.eql(u8, text, "generator")) return .generator;
@@ -641,7 +643,7 @@ fn requestsRequireInvocationContract(requests: []const Request) bool {
     for (requests) |request| {
         if (request.media.len > 0 or request.source_parts_json != null or
             switch (request.producer_type) {
-                .reader, .generator, .extractor, .transcriber => true,
+                .reader, .generator, .extractor, .transcriber, .decision => true,
                 .copy, .document_extraction => false,
             }) return true;
     }

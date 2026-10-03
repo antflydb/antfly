@@ -19,6 +19,7 @@ pub const Bound = struct {
     sorts: []const Sort,
     outputs: []const scalar.Program,
     orders: []const scalar.Program,
+    order_outputs: []const ?usize = &.{},
     names: []const []const u8,
 };
 
@@ -39,6 +40,28 @@ pub fn contains(node: *const ast.Scalar) bool {
         .in_list => |part| blk: {
             if (contains(part.operand)) break :blk true;
             for (part.values) |value| if (contains(value)) break :blk true;
+            break :blk false;
+        },
+        else => false,
+    };
+}
+fn containsDecision(node: *const ast.Scalar) bool {
+    return switch (node.*) {
+        .call => |call| blk: {
+            if (@import("../functions/decisions.zig").descriptor(call.name) != null) break :blk true;
+            for (call.args) |arg| if (containsDecision(arg)) break :blk true;
+            break :blk if (call.filter) |filter| containsDecision(filter) else false;
+        },
+        .unary => |part| containsDecision(part.operand),
+        .binary => |part| containsDecision(part.left) or containsDecision(part.right),
+        .cast => |part| containsDecision(part.operand),
+        .case_when => |part| blk: {
+            for (part.branches) |branch| if (containsDecision(branch.condition) or containsDecision(branch.value)) break :blk true;
+            break :blk if (part.otherwise) |other| containsDecision(other) else false;
+        },
+        .in_list => |part| blk: {
+            if (containsDecision(part.operand)) break :blk true;
+            for (part.values) |value| if (containsDecision(value)) break :blk true;
             break :blk false;
         },
         else => false,
@@ -91,7 +114,10 @@ const Builder = struct {
         return index;
     }
     fn rewrite(self: *Builder, node_: *const ast.Scalar) anyerror!*const ast.Scalar {
-        if (!contains(node_)) return self.slot("input", try self.input(node_));
+        // Configuration literals and parameters must remain statement constants
+        // when scalar functions consume window results.
+        if (scalar.statementConstant(node_)) return node_;
+        if (!contains(node_) and !containsDecision(node_)) return self.slot("input", try self.input(node_));
         if (node_.* == .call and node_.call.window != null) {
             const call = node_.call;
             if (call.distinct) return error.UnsupportedSqlShape;
@@ -272,7 +298,15 @@ pub fn bind(alloc: Allocator, backend: catalog.Backend, compiled: *const compile
         program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{}, backend.settings_view);
         name.* = projection.alias orelse if (projection.field.len != 0) projection.field else if (projection.expression.?.* == .call) projection.expression.?.call.name else "?column?";
     }
+    const order_outputs = try alloc.alloc(?usize, orders.len);
+    for (orders, order_outputs) |node, *slot_| {
+        slot_.* = null;
+        for (outputs, 0..) |output, index| if (@import("aggregate_binding.zig").same(node, output)) {
+            slot_.* = index;
+            break;
+        };
+    }
     const order_programs = try alloc.alloc(scalar.Program, orders.len);
     for (orders, order_programs) |node_, *program| program.* = try scalar.bindWithSettings(alloc, node_, columns, parameters, .{}, backend.settings_view);
-    return .{ .input = input, .statement = input_statement, .specs = specs, .sorts = builder.sorts.items, .outputs = output_programs, .orders = order_programs, .names = names };
+    return .{ .input = input, .statement = input_statement, .specs = specs, .sorts = builder.sorts.items, .outputs = output_programs, .orders = order_programs, .order_outputs = order_outputs, .names = names };
 }

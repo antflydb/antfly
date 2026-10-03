@@ -6,6 +6,38 @@ info:
 
 components:
   schemas:
+    DeciderConfig:
+      type: object
+      additionalProperties: false
+      required: [provider]
+      properties:
+        provider:
+          type: string
+          enum: [antfly, jev]
+        model:
+          type: string
+          description: Required for Antfly; Jev defaults to jev-latest.
+        url:
+          type: string
+          description: Provider base URL; endpoint path is selected by provider.
+        api_key:
+          type: string
+          description: API key or secret reference. Defaults to the provider environment variable.
+        max_rows:
+          type: integer
+          minimum: 1
+          default: 10000
+        max_input_tokens:
+          type: integer
+          minimum: 1
+          default: 1000000
+        rate_limit:
+          $ref: "../shared/provider.yaml#/components/schemas/RateLimitConfig"
+        batch_size:
+          type: integer
+          minimum: 1
+          maximum: 256
+          default: 32
     SecretsConfig:
       type: object
       additionalProperties: false
@@ -426,6 +458,11 @@ components:
               - generator_config:
                   provider: openai
                   model: gpt-4.1
+        deciders:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/DeciderConfig"
+          description: Named decision providers for ai_decide and convenience functions.
         rerankers:
           type: object
           additionalProperties:

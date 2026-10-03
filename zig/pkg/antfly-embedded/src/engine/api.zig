@@ -158,6 +158,7 @@ pub const Api = struct {
     }
 
     pub fn searchJson(self: *Api, alloc: Allocator, body: []const u8) ![]u8 {
+        try query_api.validateStoragePublicQueryRequest(alloc, body);
         var owned = try query_api.parsePublicQueryRequest(
             alloc,
             self.semantic_resolver,
@@ -505,6 +506,8 @@ test "embedded api round-trips batch lookup scan and search over memory-backed d
     const idle_json = try api.runUntilIdleJson(alloc);
     defer alloc.free(idle_json);
     try std.testing.expect(std.mem.indexOf(u8, idle_json, "\"has_async_indexes\"") != null);
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, api.searchJson(alloc, "{\"full_text_search\":{\"match\":{\"field\":\"title\",\"text\":\"alpha\"}},\"evaluate\":{\"scope\":\"candidates\",\"candidate_count\":2,\"compute\":{\"x\":{\"literal\":1}},\"where\":{\"eq\":[{\"literal\":1},{\"literal\":0}]}}}"));
 
     const query_json = try api.searchJson(
         alloc,
