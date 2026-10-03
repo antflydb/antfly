@@ -178,7 +178,7 @@ const CacheWriteOwnerLease = struct {
     file: std.Io.File,
     transferred: bool = false,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.transferred) return;
         var io_impl = threadedIo();
         defer io_impl.deinit();
@@ -2632,11 +2632,11 @@ test "serverless query cache authenticates ranges before publication and self he
         corrupt_next: bool = false,
         range_calls: usize = 0,
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedPut;
         }
-        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+        pub fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
             return error.UnexpectedFullRead;
         }
         fn getRangeAlloc(ptr: *anyopaque, result_alloc: Allocator, _: []const u8, offset: u64, len: usize) ![]u8 {
@@ -3182,7 +3182,7 @@ test "serverless query cache rejects same-size corrupted range and block records
         .payload,
     );
     defer alloc.free(block_path);
-    const corrupt_record = [_]u8{'x'} ** (cache_record_header_len + 3);
+    const corrupt_record = @as([(cache_record_header_len + 3)]u8, @splat('x'));
     try overwriteFile(range_path, &corrupt_record);
     try overwriteFile(block_path, &corrupt_record);
     // Force the first corrupt read through shared reconciliation. Both records

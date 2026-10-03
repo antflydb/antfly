@@ -129,7 +129,7 @@ pub const Program = struct {
         hash.update("antfly.relational-row-transform.v2\x00");
         hash.update(&source_digest);
         hash.update(&target_digest);
-        hash.update(&.{ @intFromEnum(policies.dropped_columns), @intFromBool(mask != null) });
+        hash.update(&.{ @backingInt(policies.dropped_columns), @intFromBool(mask != null) });
         if (mask) |value| {
             hash.update("scoped-defaults-v1");
             for (value) |enabled| hash.update(&.{@intFromBool(enabled)});

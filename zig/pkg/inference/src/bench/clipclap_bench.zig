@@ -81,7 +81,7 @@ const Options = struct {
     audio_paths: std.ArrayListUnmanaged([]const u8) = .empty,
     order: std.ArrayListUnmanaged(InputRef) = .empty,
 
-    fn deinit(self: *Options, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
         self.image_paths.deinit(allocator);
         self.audio_paths.deinit(allocator);
@@ -94,7 +94,7 @@ const LoadedFiles = struct {
     bytes: usize,
     elapsed_ns: u64,
 
-    fn deinit(self: LoadedFiles, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: LoadedFiles, allocator: std.mem.Allocator) void {
         for (self.items) |bytes| allocator.free(bytes);
         allocator.free(self.items);
     }
@@ -108,7 +108,7 @@ const RunOutput = struct {
     values: usize,
     checksum: f64,
 
-    fn deinit(self: RunOutput, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: RunOutput, allocator: std.mem.Allocator) void {
         freeEmbeddings(allocator, self.text);
         freeEmbeddings(allocator, self.image);
         freeEmbeddings(allocator, self.audio);
@@ -258,7 +258,7 @@ const LoadedBundle = struct {
     model_manager: model_manager_mod.ModelManager,
     model: *model_manager_mod.LoadedModel,
 
-    fn deinit(self: *LoadedBundle) void {
+    pub fn deinit(self: *LoadedBundle) void {
         self.model_manager.deinit();
     }
 };
@@ -994,15 +994,17 @@ fn parseArgs(allocator: std.mem.Allocator, init: std.process.Init) !Options {
 }
 
 fn parseBackendChoice(value: []const u8) ?BackendChoice {
-    inline for (@typeInfo(BackendChoice).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(BackendChoice).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
 
 fn parseOutputFormat(value: []const u8) ?OutputFormat {
-    inline for (@typeInfo(OutputFormat).@"enum".fields) |field| {
-        if (std.ascii.eqlIgnoreCase(value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(OutputFormat).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.ascii.eqlIgnoreCase(value, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }

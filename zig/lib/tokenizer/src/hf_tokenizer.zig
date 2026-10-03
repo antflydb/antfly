@@ -27,6 +27,56 @@ const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
 const unicode_classes = @import("unicode_classes.zig");
 const unicode_normalizer = @import("unicode_normalizer.zig");
 
+/// Zig/WebAssembly supports atomics only up to the target's pointer width.
+/// The browser build is explicitly single-threaded, so keep 64-bit profiling
+/// counters non-atomic there while preserving native atomic behavior.
+const AtomicU64 = if (builtin.cpu.arch == .wasm32 and builtin.single_threaded)
+    SingleThreadedU64
+else
+    std.atomic.Value(u64);
+
+const SingleThreadedU64 = extern struct {
+    raw: u64,
+
+    const Self = @This();
+
+    fn init(value: u64) Self {
+        return .{ .raw = value };
+    }
+
+    fn load(self: *const Self, comptime _: std.builtin.AtomicOrder) u64 {
+        return self.raw;
+    }
+
+    fn store(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) void {
+        self.raw = value;
+    }
+
+    fn swap(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw = value;
+        return previous;
+    }
+
+    fn fetchAdd(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw +%= value;
+        return previous;
+    }
+
+    fn fetchSub(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw -%= value;
+        return previous;
+    }
+
+    fn fetchOr(self: *Self, value: u64, comptime _: std.builtin.AtomicOrder) u64 {
+        const previous = self.raw;
+        self.raw |= value;
+        return previous;
+    }
+};
+
 const ModelType = enum { word_piece, bpe, unigram };
 
 const PreTokenizerType = enum {
@@ -224,7 +274,7 @@ pub const HfTokenizer = struct {
         token_arena: std.ArrayListUnmanaged(i32) = .empty,
         frozen: std.atomic.Value(bool) = .init(false),
 
-        fn deinit(self: *WorkerBpeCache, owner: *HfTokenizer) void {
+        pub fn deinit(self: *WorkerBpeCache, owner: *HfTokenizer) void {
             self.token_arena.deinit(owner.allocator);
             switch (self.storage) {
                 .allocator => owner.allocator.free(self.entries),
@@ -379,7 +429,7 @@ pub const HfTokenizer = struct {
     const BpeCache = struct {
         owner: *HfTokenizer,
         shards: [bpe_cache_shard_count]BpeCacheShard =
-            [_]BpeCacheShard{.{}} ** bpe_cache_shard_count,
+            @as([bpe_cache_shard_count]BpeCacheShard, @splat(.{})),
         max_bytes: usize = default_bpe_cache_max_bytes,
         bulk_slots: ?[]std.atomic.Value(usize) = null,
         bulk_slots_per_shard: usize = 0,
@@ -575,7 +625,7 @@ pub const HfTokenizer = struct {
             return t;
         }
 
-        fn deinit(self: *AddedTokenTrie, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *AddedTokenTrie, allocator: std.mem.Allocator) void {
             for (self.nodes.items) |*n| n.children.deinit(allocator);
             self.nodes.deinit(allocator);
         }
@@ -714,7 +764,7 @@ pub const HfTokenizer = struct {
             return t;
         }
 
-        fn deinit(self: *VocabTrie, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *VocabTrie, allocator: std.mem.Allocator) void {
             for (self.nodes.items) |*n| n.children.deinit(allocator);
             self.nodes.deinit(allocator);
         }
@@ -896,7 +946,7 @@ pub const HfTokenizer = struct {
             .parallel_workspace_free_count = 0,
             .parallel_workspace_free_bytes = 0,
             .parallel_bpe_config = .{},
-            .worker_bpe_caches = [_]WorkerBpeCacheLease{.{}} ** max_worker_bpe_caches,
+            .worker_bpe_caches = @as([max_worker_bpe_caches]WorkerBpeCacheLease, @splat(.{})),
             .cache_resource_budget_mutex = .unlocked,
             .cache_resource_budget_observer_id = acquireCacheResourceBudgetObserverId(),
             .cache_resource_budget_bytes = 0,
@@ -2688,7 +2738,7 @@ pub const HfTokenizer = struct {
         stable_offset_learns: std.atomic.Value(usize) = .init(0),
         stable_offset_replays: std.atomic.Value(usize) = .init(0),
         workers: [max_parallel_bpe_chunks]ParallelBpeWorker =
-            [_]ParallelBpeWorker{.{}} ** max_parallel_bpe_chunks,
+            @as([max_parallel_bpe_chunks]ParallelBpeWorker, @splat(.{})),
 
         fn retainedBytes(self: *const ParallelBpeWorkspace) usize {
             var total: usize = @sizeOf(ParallelBpeWorkspace);
@@ -5497,7 +5547,7 @@ pub const HfTokenizer = struct {
             return &self.candidates.?;
         }
 
-        fn deinit(self: *BpeScratch, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *BpeScratch, allocator: std.mem.Allocator) void {
             self.symbols.deinit(allocator);
             self.transcode_ids.deinit(allocator);
             if (self.candidates) |*candidates| candidates.deinit();

@@ -397,7 +397,7 @@ pub const OpenedJoinJobStore = struct {
     docstore: *docstore_mod.DocStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedJoinJobStore {
-        const path_z = try alloc.dupeZ(u8, path);
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(path_z);
         const docstore = try alloc.create(docstore_mod.DocStore);
         errdefer alloc.destroy(docstore);
@@ -777,7 +777,7 @@ const DistributedRightJoinUnmatchedCandidates = struct {
     right_result: RightJoinQueryResult,
     matched_right_ids: std.StringHashMapUnmanaged(void) = .{},
 
-    fn deinit(self: *DistributedRightJoinUnmatchedCandidates, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DistributedRightJoinUnmatchedCandidates, alloc: std.mem.Allocator) void {
         self.right_result.deinit(alloc);
         self.matched_right_ids.deinit(alloc);
         self.* = undefined;
@@ -789,7 +789,7 @@ const DistributedRightJoinUnmatchedCompletion = struct {
     groups_queried: usize,
     right_rows_scanned: usize,
 
-    fn deinit(self: *DistributedRightJoinUnmatchedCompletion, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DistributedRightJoinUnmatchedCompletion, alloc: std.mem.Allocator) void {
         for (self.hits) |*item| deinitJsonValue(alloc, item);
         if (self.hits.len > 0) alloc.free(self.hits);
         self.* = undefined;
@@ -1953,7 +1953,7 @@ const StatefulShuffleFinalizerState = struct {
         };
     }
 
-    fn deinit(self: *StatefulShuffleFinalizerState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *StatefulShuffleFinalizerState, alloc: std.mem.Allocator) void {
         self.finalizer_attempts.deinit(alloc);
         self.* = undefined;
     }
@@ -2058,7 +2058,7 @@ const StatefulShufflePartitionState = struct {
         };
     }
 
-    fn deinit(self: *StatefulShufflePartitionState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *StatefulShufflePartitionState, alloc: std.mem.Allocator) void {
         for (self.joined_hits.items) |*item| deinitJsonValue(alloc, item);
         self.joined_hits.deinit();
         self.seen_groups.deinit(alloc);
@@ -2235,7 +2235,7 @@ const JoinReadBinding = struct {
         }
         return result;
     }
-    fn deinit(self: *JoinReadBinding) void {
+    pub fn deinit(self: *JoinReadBinding) void {
         if (self.view) |view| view.deinit();
         if (self.cancellation_scope) |scope| scope.alloc.destroy(scope);
     }
@@ -2276,7 +2276,7 @@ const DistributedRightJoinGroups = struct {
         return .{ .planning = planning, .table = table, .group_ids = table.group_ids };
     }
 
-    fn deinit(self: *DistributedRightJoinGroups) void {
+    pub fn deinit(self: *DistributedRightJoinGroups) void {
         if (self.planning) |planning| planning.release();
         if (self.alloc) |alloc| alloc.free(self.group_ids);
         self.* = undefined;
@@ -2327,7 +2327,7 @@ const StatefulShufflePreparedJob = union(enum) {
     resume_state: JoinShuffleResumeState,
     fresh: void,
 
-    fn deinit(self: *StatefulShufflePreparedJob, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *StatefulShufflePreparedJob, alloc: std.mem.Allocator) void {
         switch (self.*) {
             .cached_result => |*result| result.deinit(alloc),
             .resume_state => |*resume_state| resume_state.deinit(alloc),
@@ -5316,7 +5316,7 @@ const EqualityJoinIndex = struct {
         return out;
     }
 
-    fn deinit(self: *EqualityJoinIndex, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *EqualityJoinIndex, alloc: std.mem.Allocator) void {
         self.strings.deinit(alloc);
         self.number_strings.deinit(alloc);
         self.integers.deinit(alloc);

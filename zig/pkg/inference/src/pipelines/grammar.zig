@@ -1465,7 +1465,7 @@ const JsonSchemaGrammarBuilder = struct {
     rule_names: std.ArrayListUnmanaged([]const u8) = .empty,
     next_rule_id: usize = 0,
 
-    fn deinit(self: *JsonSchemaGrammarBuilder) void {
+    pub fn deinit(self: *JsonSchemaGrammarBuilder) void {
         self.deinitAux();
         self.out.deinit(self.allocator);
     }

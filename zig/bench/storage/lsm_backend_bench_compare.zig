@@ -84,7 +84,7 @@ const Config = struct {
 const MetricSeries = struct {
     values: std.ArrayListUnmanaged(f64) = .empty,
 
-    fn deinit(self: *MetricSeries, allocator: Allocator) void {
+    pub fn deinit(self: *MetricSeries, allocator: Allocator) void {
         self.values.deinit(allocator);
         self.* = .{};
     }
@@ -155,7 +155,7 @@ const GroupAgg = struct {
         };
     }
 
-    fn deinit(self: *GroupAgg, allocator: Allocator) void {
+    pub fn deinit(self: *GroupAgg, allocator: Allocator) void {
         allocator.free(self.scenario);
         allocator.free(self.workload);
         self.ns_per_op.deinit(allocator);
@@ -253,7 +253,7 @@ const BenchData = struct {
     allocator: Allocator,
     groups: std.ArrayListUnmanaged(GroupAgg) = .empty,
 
-    fn deinit(self: *BenchData) void {
+    pub fn deinit(self: *BenchData) void {
         for (self.groups.items) |*group| group.deinit(self.allocator);
         self.groups.deinit(self.allocator);
         self.* = undefined;

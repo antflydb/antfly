@@ -718,7 +718,7 @@ fn encodeRetirement(item: Retirement, raw: []u8) void {
     put64(raw, 8, item.epoch);
     put64(raw, 16, item.page);
     put64(raw, 24, item.length);
-    raw[32] = @intFromEnum(item.kind);
+    raw[32] = @backingInt(item.kind);
 }
 fn decodeRetirement(raw: []const u8) !Retirement {
     if (get64(raw, 0) == 0) return error.InvalidNativeAllocator;
@@ -743,7 +743,7 @@ const TestLedger = struct {
         try self.state.reserveTail(page);
         return page;
     }
-    fn read(context: *anyopaque, a: Allocator, page: u64) ![]u8 {
+    pub fn read(context: *anyopaque, a: Allocator, page: u64) ![]u8 {
         const self: *TestLedger = @ptrCast(@alignCast(context));
         return a.dupe(u8, self.pages.get(page) orelse return error.InvalidNativeAllocator);
     }
@@ -760,7 +760,7 @@ const TestLedger = struct {
         try self.state.preparePersist(epoch, 128);
         try self.state.persist(self.io(), root, &self.next);
     }
-    fn deinit(self: *TestLedger) void {
+    pub fn deinit(self: *TestLedger) void {
         var values = self.pages.valueIterator();
         while (values.next()) |bytes| std.testing.allocator.free(bytes.*);
         self.pages.deinit(std.testing.allocator);

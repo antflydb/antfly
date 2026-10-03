@@ -354,7 +354,7 @@ test "relational index system rewrite tail verifies once resumes exact boundarie
     std.mem.writeInt(u64, header[4..12], 1, .little);
     std.mem.writeInt(u32, header[12..16], count, .little);
     try bytes.appendSlice(alloc, &header);
-    const payload = [_]u8{'x'} ** 2048;
+    const payload = @as([2048]u8, @splat('x'));
     for (0..count) |i| {
         var name: [32]u8 = undefined;
         const key = try @import("internal_keys.zig").documentKeyAlloc(alloc, try std.fmt.bufPrint(&name, "row:{d:0>8}", .{i}));
@@ -381,7 +381,7 @@ test "relational index system rewrite tail verifies once resumes exact boundarie
         .identity_allocator = alloc,
         .memory_budget = .{ .hard_limit_bytes = 20 * 1024 * 1024 },
     };
-    resource_options.budgets[@intFromEnum(resources.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 16 * 1024 * 1024 };
+    resource_options.budgets[@backingInt(resources.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 16 * 1024 * 1024 };
     var manager = resources.ResourceManager.init(resource_options);
     defer manager.deinit(alloc);
     var cache: Cache = .{};
@@ -524,7 +524,7 @@ test "relational index system rewrite tail chunked spool resumes with bounded me
     defer alloc.free(descriptor);
     var cache: Cache = .{};
     var options: resources.Options = .{ .identity_allocator = alloc, .memory_budget = .{ .hard_limit_bytes = 2 * 1024 * 1024 } };
-    options.budgets[@intFromEnum(resources.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 2 * 1024 * 1024 };
+    options.budgets[@backingInt(resources.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 2 * 1024 * 1024 };
     var manager = resources.ResourceManager.init(options);
     defer manager.deinit(alloc);
     defer cache.deinit(io);

@@ -126,7 +126,7 @@ test "db enrichment executor starts and stops per-group runtimes" {
             self.stopped = true;
         }
 
-        fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+        pub fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             alloc.destroy(self);
         }
@@ -146,7 +146,7 @@ test "db enrichment executor starts and stops per-group runtimes" {
         alloc: std.mem.Allocator,
         started: std.ArrayListUnmanaged(u64) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.started.deinit(self.alloc);
             self.* = undefined;
         }

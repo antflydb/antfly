@@ -111,10 +111,10 @@ pub fn readPage(alloc: Allocator, store: *docstore.DocStore, manifest: Manifest,
     const initial_kind = if (progress.cursor.len != 0 and !resuming_retirements and !resuming_admissions) (try integrity.parseKey(progress.cursor)).kind else integrity.Kind.claim;
     outer: for ([_]integrity.Kind{ .claim, .reference, .job }) |kind| {
         if (resuming_retirements or resuming_admissions) break;
-        if (@intFromEnum(kind) < @intFromEnum(initial_kind)) continue;
+        if (@backingInt(kind) < @backingInt(initial_kind)) continue;
         var prefix: [integrity.namespace.len + 1]u8 = undefined;
         @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
-        prefix[integrity.namespace.len] = @intFromEnum(kind);
+        prefix[integrity.namespace.len] = @backingInt(kind);
         const first = try std.mem.concat(alloc, u8, &.{ &prefix, manifest.lower });
         defer alloc.free(first);
         const resuming = kind == initial_kind and progress.cursor.len != 0;

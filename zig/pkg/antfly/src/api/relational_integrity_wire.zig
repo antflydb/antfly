@@ -39,7 +39,7 @@ pub const max_bytes = 16 * 1024 * 1024;
 test "distributed txn HA preserves arbitrary binary coordinator generation evidence" {
     const effects = @import("../storage/hot_standby/effects.zig");
     const alloc = std.testing.allocator;
-    const digest = [_]u8{0xff} ** 32;
+    const digest = @as([32]u8, @splat(0xff));
     const encoded = try effects.encodeBatchMutationRequestAlloc(alloc, .{ .relational_schema_version = 3, .relational_integrity_generation_set = digest });
     defer alloc.free(encoded);
     var json = try std.json.parseFromSlice(std.json.Value, alloc, encoded, .{});
@@ -104,7 +104,7 @@ pub fn append(alloc: std.mem.Allocator, out: *std.ArrayList(u8), operations: []c
     try out.append(alloc, ']');
 }
 
-fn validate(operation: Operation) !void {
+pub fn validate(operation: Operation) !void {
     if (operation.routing_key.len == 0 or operation.key.len == 0) return error.InvalidTxnRequest;
     if ((operation.kind == .put) != (operation.value != null)) return error.InvalidTxnRequest;
 }

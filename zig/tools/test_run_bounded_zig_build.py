@@ -176,7 +176,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(
             "zig",
-            ["build", "antfly-unit-test", "-Doptimize=Debug"],
+            ["build", "antfly-unit-test", "-Doptimize=debug"],
             Path("/tmp/patched-runner.zig"),
             10_000,
         )
@@ -186,7 +186,7 @@ class BoundedZigBuildTest(unittest.TestCase):
                 "zig",
                 "build",
                 "antfly-unit-test",
-                "-Doptimize=Debug",
+                "-Doptimize=debug",
                 "--build-runner",
                 "/tmp/patched-runner.zig",
                 "--maxrss",

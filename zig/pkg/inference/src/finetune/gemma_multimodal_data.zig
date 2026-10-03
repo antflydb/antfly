@@ -115,7 +115,7 @@ pub fn resolveImagePath(allocator: std.mem.Allocator, dataset_root: []const u8, 
 
 fn loadExamplesFromFile(allocator: std.mem.Allocator, path: []const u8, out: *std.ArrayListUnmanaged(Example)) !void {
     const source_root = try deriveDatasetRoot(allocator, path);
-    const file_data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(64 * 1024 * 1024));
     var lines = std.mem.tokenizeScalar(u8, file_data, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -308,20 +308,20 @@ fn writeCsvCell(writer: *std.Io.Writer, value: []const u8) !void {
 }
 
 fn deriveDatasetRoot(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const stat = try compat.cwd().statFile(compat.io(), path, .{});
+    const stat = try std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{});
     if (stat.kind == .directory) return allocator.dupe(u8, path);
     const dir = std.fs.path.dirname(path) orelse ".";
     return allocator.dupe(u8, dir);
 }
 
 fn writeFilePath(path: []const u8, data: []const u8) !void {
-    const io_inst = compat.io();
+    const io_inst = compat.testingIo();
     if (std.fs.path.dirname(path)) |dir| {
         if (dir.len > 0) {
-            try compat.cwd().createDirPath(io_inst, dir);
+            try std.Io.Dir.cwd().createDirPath(io_inst, dir);
         }
     }
-    try compat.cwd().writeFile(io_inst, .{ .sub_path = path, .data = data });
+    try std.Io.Dir.cwd().writeFile(io_inst, .{ .sub_path = path, .data = data });
 }
 
 test "load multimodal prompt response example" {
@@ -396,7 +396,7 @@ test "write multimodal csv includes id and absolute image path" {
     };
     const summary = try writeCsv(allocator, csv_path, examples[0..], 0);
     try std.testing.expectEqualStrings("id", summary.id_column);
-    const raw = try compat.cwd().readFileAlloc(compat.io(), csv_path, allocator, .limited(1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), csv_path, allocator, .limited(1024));
     defer allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "id,image,prompt,response") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"row-0\"") != null);

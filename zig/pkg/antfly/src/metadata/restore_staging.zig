@@ -902,7 +902,7 @@ pub fn generationHandoffOldFenceDigest(fence: @import("../storage/db/relational_
     hash.update("antfly old owner graph and generation handoff v1");
     hash.update(&try fence.encode());
     hash.update(&handoff_seal_digest);
-    hash.update(if (graph_seal_digest) |digest| &digest else &([_]u8{0} ** 32));
+    hash.update(if (graph_seal_digest) |digest| &digest else &(@as([32]u8, @splat(0))));
     var result: Digest = undefined;
     hash.final(&result);
     return result;
@@ -1255,11 +1255,11 @@ pub const ParentActivationDecision = struct {
 
 fn writeAuthority(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
-    inline for (@typeInfo(@TypeOf(value)).@"struct".fields) |field| {
-        try stream.objectField(field.name);
-        if (comptime std.mem.eql(u8, field.name, "plan_id") or std.mem.eql(u8, field.name, "receipt")) {
-            try @import("../storage/db/relational_integrity_json.zig").write(@field(value, field.name), stream);
-        } else try stream.write(@field(value, field.name));
+    inline for (comptime std.meta.fieldNames(@TypeOf(value))) |reflected_name| {
+        try stream.objectField(reflected_name);
+        if (comptime std.mem.eql(u8, reflected_name, "plan_id") or std.mem.eql(u8, reflected_name, "receipt")) {
+            try @import("../storage/db/relational_integrity_json.zig").write(@field(value, reflected_name), stream);
+        } else try stream.write(@field(value, reflected_name));
     }
     try stream.endObject();
 }

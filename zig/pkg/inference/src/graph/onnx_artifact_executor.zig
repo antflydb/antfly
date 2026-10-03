@@ -97,7 +97,7 @@ pub const Executor = struct {
         return .{ .ptr = runtime_ctx, .vtable = &Runtime.runtime_vtable };
     }
 
-    fn deinit(ctx: *anyopaque) void {
+    pub fn deinit(ctx: *anyopaque) void {
         const self: *Executor = @ptrCast(@alignCast(ctx));
         const allocator = self.allocator;
         self.prefill_manifest.deinit();
@@ -328,7 +328,7 @@ const Runtime = struct {
         self.ort_kv_cache = backends.onnx.RetainedValueCache.init(self.allocator);
     }
 
-    fn deinit(ctx: *anyopaque) void {
+    pub fn deinit(ctx: *anyopaque) void {
         const self: *Runtime = @ptrCast(@alignCast(ctx));
         const allocator = self.allocator;
         self.kv_cache.deinit();

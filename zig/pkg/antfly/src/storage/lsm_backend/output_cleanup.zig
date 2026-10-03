@@ -293,7 +293,7 @@ test "output cleanup owns partial outputs after cancellation and wakes bulk main
 }
 
 test "output cleanup off-lock handoff scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Backend = @import("../lsm_backend.zig").Backend;
     const Run = @import("repository.zig").Run;
     const compaction = @import("compaction.zig");

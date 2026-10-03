@@ -17,7 +17,7 @@ pub const Cursor = struct {
     ordinal: u32 = 0,
     retirement_key: []const u8 = "",
 
-    fn validate(self: Cursor) !void {
+    pub fn validate(self: Cursor) !void {
         if (std.mem.allEqual(u8, &self.generation, 0) or self.retirement_key.len > max_cursor_bytes or
             (self.phase == .desired and self.retirement_key.len != 0) or
             (self.phase == .retiring and self.ordinal != 0)) return error.InvalidBatchRequest;
@@ -29,7 +29,7 @@ pub const Cursor = struct {
         @memcpy(raw[0..4], "AUD1");
         @memcpy(raw[4..36], &self.identity);
         @memcpy(raw[36..68], &self.generation);
-        raw[68] = @intFromEnum(self.phase);
+        raw[68] = @backingInt(self.phase);
         std.mem.writeInt(u32, raw[69..73], self.ordinal, .little);
         std.mem.writeInt(u32, raw[73..77], @intCast(self.retirement_key.len), .little);
         @memcpy(raw[77 .. raw.len - 32], self.retirement_key);

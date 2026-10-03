@@ -140,7 +140,7 @@ const DecodedChunkArtifactSource = struct {
     chunk_id: ?u32 = null,
     unit_id: ?[]u8 = null,
 
-    fn deinit(self: *DecodedChunkArtifactSource, alloc: Allocator) void {
+    pub fn deinit(self: *DecodedChunkArtifactSource, alloc: Allocator) void {
         alloc.free(self.name);
         if (self.unit_id) |unit_id| alloc.free(unit_id);
         self.* = undefined;

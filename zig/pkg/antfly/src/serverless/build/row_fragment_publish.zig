@@ -106,7 +106,7 @@ const MemoryArtifactStore = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *MemoryArtifactStore) void {
+    pub fn deinit(self: *MemoryArtifactStore) void {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -142,7 +142,7 @@ const MemoryArtifactStore = struct {
         };
     }
 
-    fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
+    pub fn getAlloc(self: *MemoryArtifactStore, alloc: Allocator, artifact_id: []const u8) ![]u8 {
         const value = self.entries.get(artifact_id) orelse return error.ArtifactNotFound;
         return try alloc.dupe(u8, value);
     }

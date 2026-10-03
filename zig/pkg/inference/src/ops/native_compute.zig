@@ -3006,7 +3006,7 @@ const BroadcastStepper = struct {
     operand_shape: []const i64,
     operand_strides: []const usize,
     rank_offset: usize,
-    coords: [8]usize = [_]usize{0} ** 8,
+    coords: [8]usize = @as([8]usize, @splat(0)),
     operand_offset: usize = 0,
 
     fn init(out_shape: []const i64, operand_shape: []const i64, operand_strides: []const usize) BroadcastStepper {
@@ -6273,7 +6273,7 @@ const DenseDequantForSgemm = struct {
     data: []const f32,
     owned: ?[]f32 = null,
 
-    fn deinit(self: *DenseDequantForSgemm, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *DenseDequantForSgemm, allocator: std.mem.Allocator) void {
         if (self.owned) |owned| allocator.free(owned);
         self.* = .{ .data = &.{} };
     }
@@ -15501,10 +15501,10 @@ fn linearQ8KQ8KActivationRange(
         }
         if (panel16_blocks) |panel16| {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-                var acc1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-                var acc2: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-                var acc3: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
+                var acc0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+                var acc1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+                var acc2: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+                var acc3: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const panel_off = ((o / prepared_k_panel16_nr) * row_blocks + block_idx) * prepared_q8_k_panel16_block_bytes;
@@ -15532,10 +15532,10 @@ fn linearQ8KQ8KActivationRange(
         }
         if (panel8_blocks) |panel8| {
             while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc0: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc1: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc2: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc3: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+                var acc0: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc1: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc2: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc3: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_q8_k_panel8_block_bytes;
@@ -15563,10 +15563,10 @@ fn linearQ8KQ8KActivationRange(
         }
         if (q8KRawNR8DirectEnabled()) {
             while (o + 8 <= out_end) : (o += 8) {
-                var acc0: [8]f32 = [_]f32{0.0} ** 8;
-                var acc1: [8]f32 = [_]f32{0.0} ** 8;
-                var acc2: [8]f32 = [_]f32{0.0} ** 8;
-                var acc3: [8]f32 = [_]f32{0.0} ** 8;
+                var acc0: [8]f32 = @as([8]f32, @splat(0.0));
+                var acc1: [8]f32 = @as([8]f32, @splat(0.0));
+                var acc2: [8]f32 = @as([8]f32, @splat(0.0));
+                var acc3: [8]f32 = @as([8]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const weights = q8KQ8KWeightBlock8(weight_raw, panel_blocks, row_blocks, row_stride, o, block_idx, true);
@@ -15597,7 +15597,7 @@ fn linearQ8KQ8KActivationRange(
             const w1_off = (o + 1) * row_stride;
             const w2_off = (o + 2) * row_stride;
             const w3_off = (o + 3) * row_stride;
-            var acc: [16]f32 = [_]f32{0.0} ** 16;
+            var acc: [16]f32 = @as([16]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const panel_off = ((o / prepared_q8_0_panel_nr) * row_blocks + block_idx) * prepared_q8_0_panel_nr * block_size;
@@ -15679,8 +15679,8 @@ fn linearQ8KQ8KActivationRange(
         }
         if (panel16_blocks) |panel16| {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-                var acc1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
+                var acc0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+                var acc1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const panel_off = ((o / prepared_k_panel16_nr) * row_blocks + block_idx) * prepared_q8_k_panel16_block_bytes;
@@ -15702,8 +15702,8 @@ fn linearQ8KQ8KActivationRange(
         }
         if (panel8_blocks) |panel8| {
             while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc0: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc1: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+                var acc0: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc1: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_q8_k_panel8_block_bytes;
@@ -15725,8 +15725,8 @@ fn linearQ8KQ8KActivationRange(
         }
         if (q8KRawNR8DirectEnabled()) {
             while (o + 8 <= out_end) : (o += 8) {
-                var acc0: [8]f32 = [_]f32{0.0} ** 8;
-                var acc1: [8]f32 = [_]f32{0.0} ** 8;
+                var acc0: [8]f32 = @as([8]f32, @splat(0.0));
+                var acc1: [8]f32 = @as([8]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const weights = q8KQ8KWeightBlock8(weight_raw, panel_blocks, row_blocks, row_stride, o, block_idx, true);
@@ -15833,7 +15833,7 @@ fn linearQ8KQ8KActivationRange(
         }
         if (panel16_blocks) |panel16| {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
+                var acc: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const panel_off = ((o / prepared_k_panel16_nr) * row_blocks + block_idx) * prepared_q8_k_panel16_block_bytes;
@@ -15845,7 +15845,7 @@ fn linearQ8KQ8KActivationRange(
         }
         if (panel8_blocks) |panel8| {
             while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+                var acc: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_q8_k_panel8_block_bytes;
@@ -15857,7 +15857,7 @@ fn linearQ8KQ8KActivationRange(
         }
         if (q8KRawNR8DirectEnabled()) {
             while (o + 8 <= out_end) : (o += 8) {
-                var acc: [8]f32 = [_]f32{0.0} ** 8;
+                var acc: [8]f32 = @as([8]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const weights = q8KQ8KWeightBlock8(weight_raw, panel_blocks, row_blocks, row_stride, o, block_idx, true);
@@ -15994,10 +15994,10 @@ fn linearQ6KPreparedQ8KActivationRange(
         }
         if (panel16_blocks) |panel16| {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-                var acc1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-                var acc2: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-                var acc3: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
+                var acc0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+                var acc1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+                var acc2: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+                var acc3: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const panel_off = ((o / prepared_k_panel16_nr) * row_blocks + block_idx) * prepared_k_panel16_block_bytes;
@@ -16025,10 +16025,10 @@ fn linearQ6KPreparedQ8KActivationRange(
         }
         if (panel8_blocks) |panel8| {
             while ((o % prepared_k_panel8_nr) == 0 and o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc0: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc1: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc2: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc3: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+                var acc0: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc1: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc2: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc3: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_q6_k_panel8_block_bytes;
@@ -16173,8 +16173,8 @@ fn linearQ6KPreparedQ8KActivationRange(
         }
         if (panel16_blocks) |panel16| {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-                var acc1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
+                var acc0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+                var acc1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const panel_off = ((o / prepared_k_panel16_nr) * row_blocks + block_idx) * prepared_k_panel16_block_bytes;
@@ -16196,8 +16196,8 @@ fn linearQ6KPreparedQ8KActivationRange(
         }
         if (panel8_blocks) |panel8| {
             while ((o % prepared_k_panel8_nr) == 0 and o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc0: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc1: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+                var acc0: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc1: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_q6_k_panel8_block_bytes;
@@ -16293,7 +16293,7 @@ fn linearQ6KPreparedQ8KActivationRange(
         }
         if (panel16_blocks) |panel16| {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
+                var acc: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const panel_off = ((o / prepared_k_panel16_nr) * row_blocks + block_idx) * prepared_k_panel16_block_bytes;
@@ -16308,7 +16308,7 @@ fn linearQ6KPreparedQ8KActivationRange(
         }
         if (panel8_blocks) |panel8| {
             while ((o % prepared_k_panel8_nr) == 0 and o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+                var acc: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_q6_k_panel8_block_bytes;
@@ -16400,10 +16400,10 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         const q_input_row3 = q_input[(r + 3) * input_row_stride ..][0..input_row_stride];
         var o: usize = out_start;
         while (o < out_end and (o % panel_align) != 0) : (o += 1) {
-            var acc0: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc1: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc2: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc3: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc0: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc1: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc2: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc3: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const prepared_off = block_idx * prepared_q4_k_block_bytes;
@@ -16425,10 +16425,10 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         }
         if (panel16_available) {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc0: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
-                var acc1: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
-                var acc2: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
-                var acc3: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
+                var acc0: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
+                var acc1: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
+                var acc2: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
+                var acc3: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const q0 = q_input_row0[q8_off..][0..q8_block_size];
@@ -16463,10 +16463,10 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         }
         if (panel8_available) {
             while ((o % prepared_k_panel8_nr) == 0 and o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc0: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
-                var acc1: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
-                var acc2: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
-                var acc3: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
+                var acc0: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
+                var acc1: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
+                var acc2: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
+                var acc3: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const q0 = q_input_row0[q8_off..][0..q8_block_size];
@@ -16500,10 +16500,10 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
             }
         }
         while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc0: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
-            var acc1: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
-            var acc2: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
-            var acc3: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
+            var acc0: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
+            var acc1: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
+            var acc2: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
+            var acc3: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const q0 = q_input_row0[q8_off..][0..q8_block_size];
@@ -16539,10 +16539,10 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
             }
         }
         while (o < out_end) : (o += 1) {
-            var acc0: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc1: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc2: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc3: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc0: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc1: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc2: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc3: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const prepared_off = block_idx * prepared_q4_k_block_bytes;
@@ -16569,8 +16569,8 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         const q_input_row1 = q_input[(r + 1) * input_row_stride ..][0..input_row_stride];
         var o: usize = out_start;
         while (o < out_end and (o % panel_align) != 0) : (o += 1) {
-            var acc0: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc1: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc0: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc1: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const prepared_off = block_idx * prepared_q4_k_block_bytes;
@@ -16588,8 +16588,8 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         }
         if (panel16_available) {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc0: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
-                var acc1: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
+                var acc0: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
+                var acc1: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const q0 = q_input_row0[q8_off..][0..q8_block_size];
@@ -16616,8 +16616,8 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         }
         if (panel8_available) {
             while ((o % prepared_k_panel8_nr) == 0 and o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc0: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
-                var acc1: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
+                var acc0: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
+                var acc1: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const q0 = q_input_row0[q8_off..][0..q8_block_size];
@@ -16644,8 +16644,8 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
             }
         }
         while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc0: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
-            var acc1: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
+            var acc0: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
+            var acc1: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const q0 = q_input_row0[q8_off..][0..q8_block_size];
@@ -16675,8 +16675,8 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
             }
         }
         while (o < out_end) : (o += 1) {
-            var acc0: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc1: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc0: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc1: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const prepared_off = block_idx * prepared_q4_k_block_bytes;
@@ -16698,7 +16698,7 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         const q_input_row = q_input[r * input_row_stride ..][0..input_row_stride];
         var o: usize = out_start;
         while (o < out_end and (o % panel_align) != 0) : (o += 1) {
-            var acc: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const prepared_off = block_idx * prepared_q4_k_block_bytes;
@@ -16716,7 +16716,7 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         }
         if (panel16_available) {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
+                var acc: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const q = q_input_row[q8_off..][0..q8_block_size];
@@ -16739,7 +16739,7 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
         }
         if (panel8_available) {
             while ((o % prepared_k_panel8_nr) == 0 and o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc: [projection_count][8]f32 = [_][8]f32{[_]f32{0.0} ** 8} ** projection_count;
+                var acc: [projection_count][8]f32 = @as([projection_count][8]f32, @splat(@as([8]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const q = q_input_row[q8_off..][0..q8_block_size];
@@ -16761,7 +16761,7 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
             }
         }
         while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
+            var acc: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const q = q_input_row[q8_off..][0..q8_block_size];
@@ -16786,7 +16786,7 @@ fn linearQ6KPreparedQ8KActivationGroupedRange(
             }
         }
         while (o < out_end) : (o += 1) {
-            var acc: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const prepared_off = block_idx * prepared_q4_k_block_bytes;
@@ -16853,7 +16853,7 @@ fn linearQ4Q5KPreparedQ8KActivationRange(
                 var o: usize = out_start;
                 while (o < out_end and (o % prepared_k_panel16_nr) != 0) : (o += 1) {
                     const prepared_row = prepared_blocks[o * prepared_row_stride ..][0..prepared_row_stride];
-                    var acc: [8]f32 = [_]f32{0.0} ** 8;
+                    var acc: [8]f32 = @as([8]f32, @splat(0.0));
                     for (0..row_blocks) |block_idx| {
                         const q8_off = block_idx * q8_block_size;
                         const prepared_off = block_idx * prepared_q4_k_block_bytes;
@@ -16867,8 +16867,8 @@ fn linearQ4Q5KPreparedQ8KActivationRange(
                     }
                 }
                 while (o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                    var acc_lo: [8]F32x8 = [_]F32x8{@splat(0.0)} ** 8;
-                    var acc_hi: [8]F32x8 = [_]F32x8{@splat(0.0)} ** 8;
+                    var acc_lo: [8]F32x8 = @as([8]F32x8, @splat(@splat(0.0)));
+                    var acc_hi: [8]F32x8 = @as([8]F32x8, @splat(@splat(0.0)));
                     if (row_blocks == 3) {
                         const panel_base = (o / prepared_k_panel16_nr) * 3 * prepared_k_panel16_block_bytes;
                         inline for (0..3) |block_idx| {
@@ -16919,7 +16919,7 @@ fn linearQ4Q5KPreparedQ8KActivationRange(
                 }
                 while (o < out_end) : (o += 1) {
                     const prepared_row = prepared_blocks[o * prepared_row_stride ..][0..prepared_row_stride];
-                    var acc: [8]f32 = [_]f32{0.0} ** 8;
+                    var acc: [8]f32 = @as([8]f32, @splat(0.0));
                     for (0..row_blocks) |block_idx| {
                         const q8_off = block_idx * q8_block_size;
                         const prepared_off = block_idx * prepared_q4_k_block_bytes;
@@ -17209,8 +17209,8 @@ fn linearQ4Q5KPreparedQ8KActivationRange(
         }
         if (panel8_blocks) |panel8| {
             while ((o % prepared_k_panel8_nr) == 0 and o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc_r0: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-                var acc_r1: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+                var acc_r0: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+                var acc_r1: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k_panel8_block_bytes;
@@ -17346,7 +17346,7 @@ fn linearQ4Q5KPreparedQ8KActivationRange(
         }
         if (panel8_blocks) |panel8| {
             while ((o % 8) == 0 and o + 8 <= out_end) : (o += 8) {
-                var acc: [8]f32 = [_]f32{0.0} ** 8;
+                var acc: [8]f32 = @as([8]f32, @splat(0.0));
                 for (0..row_blocks) |block_idx| {
                     const q8_off = block_idx * q8_block_size;
                     const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k_panel8_block_bytes;
@@ -17440,8 +17440,8 @@ fn linearQ4Q5KPreparedQ8KActivationPairPanel8Range(
             out_b[o] = acc_b;
         }
         while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-            var acc_a: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-            var acc_b: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+            var acc_a: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+            var acc_b: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k_panel8_block_bytes;
@@ -17526,9 +17526,9 @@ fn linearQ4Q5KPreparedQ8KActivationTriplePanel8Range(
             out_c[o] = acc_c;
         }
         while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-            var acc_a: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-            var acc_b: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
-            var acc_c: [prepared_k_panel8_nr]f32 = [_]f32{0.0} ** prepared_k_panel8_nr;
+            var acc_a: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+            var acc_b: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
+            var acc_c: [prepared_k_panel8_nr]f32 = @as([prepared_k_panel8_nr]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q8_off = block_idx * q8_block_size;
                 const panel_off = ((o / prepared_k_panel8_nr) * row_blocks + block_idx) * prepared_k_panel8_block_bytes;
@@ -17782,18 +17782,18 @@ inline fn writeQ4Q5KPreparedQ8KPanel16TripleMR4Projection(
     }
 
     const q8_block_size: usize = 292;
-    var acc_a0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_a1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_a2: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_a3: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_b0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_b1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_b2: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_b3: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_c0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_c1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_c2: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_c3: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
+    var acc_a0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_a1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_a2: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_a3: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_b0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_b1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_b2: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_b3: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_c0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_c1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_c2: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_c3: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
     for (0..row_blocks) |block_idx| {
         const q8_off = block_idx * q8_block_size;
         const panel_off = ((o / prepared_k_panel16_nr) * row_blocks + block_idx) * prepared_k_panel16_block_bytes;
@@ -17857,12 +17857,12 @@ inline fn writeQ4Q5KPreparedQ8KPanel16TripleMR2Projection(
     }
 
     const q8_block_size: usize = 292;
-    var acc_a0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_a1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_b0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_b1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_c0: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
-    var acc_c1: [prepared_k_panel16_nr]f32 = [_]f32{0.0} ** prepared_k_panel16_nr;
+    var acc_a0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_a1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_b0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_b1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_c0: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
+    var acc_c1: [prepared_k_panel16_nr]f32 = @as([prepared_k_panel16_nr]f32, @splat(0.0));
     for (0..row_blocks) |block_idx| {
         const q8_off = block_idx * q8_block_size;
         const panel_off = ((o / prepared_k_panel16_nr) * row_blocks + block_idx) * prepared_k_panel16_block_bytes;
@@ -18149,12 +18149,12 @@ inline fn writeQ4Q5KPreparedQ8KPackedQKVPanel16MR8ProjectionPreparedSums(
     noteNativeQuantDispatch(.q4_q5_k_q8k_triple_packed_qkv_panel16_mr8);
 
     const q8_block_size: usize = 292;
-    var acc_a_lo: [8]F32x8 = [_]F32x8{@splat(0.0)} ** 8;
-    var acc_a_hi: [8]F32x8 = [_]F32x8{@splat(0.0)} ** 8;
-    var acc_b_lo: [8]F32x8 = [_]F32x8{@splat(0.0)} ** 8;
-    var acc_b_hi: [8]F32x8 = [_]F32x8{@splat(0.0)} ** 8;
-    var acc_c_lo: [8]F32x8 = [_]F32x8{@splat(0.0)} ** 8;
-    var acc_c_hi: [8]F32x8 = [_]F32x8{@splat(0.0)} ** 8;
+    var acc_a_lo: [8]F32x8 = @as([8]F32x8, @splat(@splat(0.0)));
+    var acc_a_hi: [8]F32x8 = @as([8]F32x8, @splat(@splat(0.0)));
+    var acc_b_lo: [8]F32x8 = @as([8]F32x8, @splat(@splat(0.0)));
+    var acc_b_hi: [8]F32x8 = @as([8]F32x8, @splat(@splat(0.0)));
+    var acc_c_lo: [8]F32x8 = @as([8]F32x8, @splat(@splat(0.0)));
+    var acc_c_hi: [8]F32x8 = @as([8]F32x8, @splat(@splat(0.0)));
 
     const packed_panel_base = (o / prepared_k_panel16_nr) * row_blocks * prepared_k_qkv_panel16_block_bytes;
     for (0..row_blocks) |block_idx| {
@@ -21190,10 +21190,10 @@ fn linearQ8KQ8KActivationGroupedRange(
         const q_input_row3 = q_input[(r + 3) * row_stride ..][0..row_stride];
         var o: usize = out_start;
         while (o < out_end and (o % panel_align) != 0) : (o += 1) {
-            var acc0: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc1: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc2: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc3: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc0: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc1: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc2: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc3: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q0 = q_input_row0[off..][0..block_size];
@@ -21218,10 +21218,10 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (have_panel16) {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc0: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
-                var acc1: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
-                var acc2: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
-                var acc3: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
+                var acc0: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
+                var acc1: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
+                var acc2: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
+                var acc3: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q0 = q_input_row0[off..][0..block_size];
@@ -21256,10 +21256,10 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (have_panel8) {
             while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc0: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
-                var acc1: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
-                var acc2: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
-                var acc3: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
+                var acc0: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
+                var acc1: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
+                var acc2: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
+                var acc3: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q0 = q_input_row0[off..][0..block_size];
@@ -21294,10 +21294,10 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (q8KRawNR8DirectEnabled()) {
             while (o + 8 <= out_end) : (o += 8) {
-                var acc0: [projection_count][8]f32 = [_][8]f32{[_]f32{0.0} ** 8} ** projection_count;
-                var acc1: [projection_count][8]f32 = [_][8]f32{[_]f32{0.0} ** 8} ** projection_count;
-                var acc2: [projection_count][8]f32 = [_][8]f32{[_]f32{0.0} ** 8} ** projection_count;
-                var acc3: [projection_count][8]f32 = [_][8]f32{[_]f32{0.0} ** 8} ** projection_count;
+                var acc0: [projection_count][8]f32 = @as([projection_count][8]f32, @splat(@as([8]f32, @splat(0.0))));
+                var acc1: [projection_count][8]f32 = @as([projection_count][8]f32, @splat(@as([8]f32, @splat(0.0))));
+                var acc2: [projection_count][8]f32 = @as([projection_count][8]f32, @splat(@as([8]f32, @splat(0.0))));
+                var acc3: [projection_count][8]f32 = @as([projection_count][8]f32, @splat(@as([8]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q0 = q_input_row0[off..][0..block_size];
@@ -21331,7 +21331,7 @@ fn linearQ8KQ8KActivationGroupedRange(
             }
         }
         while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc: [projection_count][16]f32 = [_][16]f32{[_]f32{0.0} ** 16} ** projection_count;
+            var acc: [projection_count][16]f32 = @as([projection_count][16]f32, @splat(@as([16]f32, @splat(0.0))));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q0 = q_input_row0[off..][0..block_size];
@@ -21367,10 +21367,10 @@ fn linearQ8KQ8KActivationGroupedRange(
             }
         }
         while (o < out_end) : (o += 1) {
-            var acc0: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc1: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc2: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc3: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc0: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc1: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc2: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc3: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q0 = q_input_row0[off..][0..block_size];
@@ -21400,8 +21400,8 @@ fn linearQ8KQ8KActivationGroupedRange(
         const q_input_row1 = q_input[(r + 1) * row_stride ..][0..row_stride];
         var o: usize = out_start;
         while (o < out_end and (o % panel_align) != 0) : (o += 1) {
-            var acc0: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc1: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc0: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc1: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q0 = q_input_row0[off..][0..block_size];
@@ -21420,8 +21420,8 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (have_panel16) {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc0: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
-                var acc1: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
+                var acc0: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
+                var acc1: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q0 = q_input_row0[off..][0..block_size];
@@ -21448,8 +21448,8 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (have_panel8) {
             while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc0: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
-                var acc1: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
+                var acc0: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
+                var acc1: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q0 = q_input_row0[off..][0..block_size];
@@ -21476,8 +21476,8 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (q8KRawNR8DirectEnabled()) {
             while (o + 8 <= out_end) : (o += 8) {
-                var acc0: [projection_count][8]f32 = [_][8]f32{[_]f32{0.0} ** 8} ** projection_count;
-                var acc1: [projection_count][8]f32 = [_][8]f32{[_]f32{0.0} ** 8} ** projection_count;
+                var acc0: [projection_count][8]f32 = @as([projection_count][8]f32, @splat(@as([8]f32, @splat(0.0))));
+                var acc1: [projection_count][8]f32 = @as([projection_count][8]f32, @splat(@as([8]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q0 = q_input_row0[off..][0..block_size];
@@ -21503,8 +21503,8 @@ fn linearQ8KQ8KActivationGroupedRange(
             }
         }
         while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc0: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
-            var acc1: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
+            var acc0: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
+            var acc1: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q0 = q_input_row0[off..][0..block_size];
@@ -21537,8 +21537,8 @@ fn linearQ8KQ8KActivationGroupedRange(
             }
         }
         while (o < out_end) : (o += 1) {
-            var acc0: [projection_count]f32 = [_]f32{0.0} ** projection_count;
-            var acc1: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc0: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
+            var acc1: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q0 = q_input_row0[off..][0..block_size];
@@ -21561,7 +21561,7 @@ fn linearQ8KQ8KActivationGroupedRange(
         const q_input_row = q_input[r * row_stride ..][0..row_stride];
         var o: usize = out_start;
         while (o < out_end and (o % panel_align) != 0) : (o += 1) {
-            var acc: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q = q_input_row[off..][0..block_size];
@@ -21576,7 +21576,7 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (have_panel16) {
             while ((o % prepared_k_panel16_nr) == 0 and o + prepared_k_panel16_nr <= out_end) : (o += prepared_k_panel16_nr) {
-                var acc: [projection_count][prepared_k_panel16_nr]f32 = [_][prepared_k_panel16_nr]f32{[_]f32{0.0} ** prepared_k_panel16_nr} ** projection_count;
+                var acc: [projection_count][prepared_k_panel16_nr]f32 = @as([projection_count][prepared_k_panel16_nr]f32, @splat(@as([prepared_k_panel16_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q = q_input_row[off..][0..block_size];
@@ -21594,7 +21594,7 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (have_panel8) {
             while (o + prepared_k_panel8_nr <= out_end) : (o += prepared_k_panel8_nr) {
-                var acc: [projection_count][prepared_k_panel8_nr]f32 = [_][prepared_k_panel8_nr]f32{[_]f32{0.0} ** prepared_k_panel8_nr} ** projection_count;
+                var acc: [projection_count][prepared_k_panel8_nr]f32 = @as([projection_count][prepared_k_panel8_nr]f32, @splat(@as([prepared_k_panel8_nr]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q = q_input_row[off..][0..block_size];
@@ -21612,7 +21612,7 @@ fn linearQ8KQ8KActivationGroupedRange(
         }
         if (q8KRawNR8DirectEnabled()) {
             while (o + 8 <= out_end) : (o += 8) {
-                var acc: [projection_count][8]f32 = [_][8]f32{[_]f32{0.0} ** 8} ** projection_count;
+                var acc: [projection_count][8]f32 = @as([projection_count][8]f32, @splat(@as([8]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const off = block_idx * block_size;
                     const q = q_input_row[off..][0..block_size];
@@ -21629,7 +21629,7 @@ fn linearQ8KQ8KActivationGroupedRange(
             }
         }
         while (o + prepared_q8_0_panel_nr <= out_end) : (o += prepared_q8_0_panel_nr) {
-            var acc: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
+            var acc: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q = q_input_row[off..][0..block_size];
@@ -21657,7 +21657,7 @@ fn linearQ8KQ8KActivationGroupedRange(
             }
         }
         while (o < out_end) : (o += 1) {
-            var acc: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+            var acc: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const off = block_idx * block_size;
                 const q = q_input_row[off..][0..block_size];
@@ -24458,8 +24458,8 @@ fn legacyPreparedActivationPairApply(
             const input_sum_row3 = input_sums[(r + 3) * row_blocks ..][0..row_blocks];
             var o: usize = 0;
             while (o + prepared_q8_0_panel_nr <= out_dim) : (o += prepared_q8_0_panel_nr) {
-                var acc_a = [_][4]f32{[_]f32{0.0} ** 4} ** 4;
-                var acc_b = [_][4]f32{[_]f32{0.0} ** 4} ** 4;
+                var acc_a = @as([4][4]f32, @splat(@as([4]f32, @splat(0.0))));
+                var acc_b = @as([4][4]f32, @splat(@as([4]f32, @splat(0.0))));
                 for (0..row_blocks) |block_idx| {
                     const qx0: *const [32]u8 = input_q_row0[block_idx * values_per_block ..][0..values_per_block];
                     const qx1: *const [32]u8 = input_q_row1[block_idx * values_per_block ..][0..values_per_block];
@@ -25756,7 +25756,7 @@ inline fn dotQ1_0PreparedQ8_0GroupedBlock(
     inline for (0..projection_count) |projection_idx| {
         scales[projection_idx] = preparedQ1_0Scale(prepared_blocks[projection_idx]);
     }
-    var acc: [projection_count]f32 = [_]f32{0.0} ** projection_count;
+    var acc: [projection_count]f32 = @as([projection_count]f32, @splat(0.0));
     inline for (0..4) |sub| {
         const input_block_idx = block_idx * 4 + sub;
         const qx: *const [32]u8 = q_values_row[input_block_idx * 32 ..][0..32];
@@ -25782,7 +25782,7 @@ inline fn dotQ1_0PreparedQ8_0GroupedBlock4(
             scales[projection_idx][lane] = preparedQ1_0Scale(prepared_blocks[projection_idx][lane]);
         }
     }
-    var acc: [projection_count][4]f32 = [_][4]f32{[_]f32{0.0} ** 4} ** projection_count;
+    var acc: [projection_count][4]f32 = @as([projection_count][4]f32, @splat(@as([4]f32, @splat(0.0))));
     inline for (0..4) |sub| {
         const input_block_idx = block_idx * 4 + sub;
         const qx: *const [32]u8 = q_values_row[input_block_idx * 32 ..][0..32];
@@ -26931,7 +26931,7 @@ inline fn dotK16PreparedQ8KBlock4MR4WithSums(
     const qx1 = q8_block_r1[4..260];
     const qx2 = q8_block_r2[4..260];
     const qx3 = q8_block_r3[4..260];
-    var acc: [16]f32 = [_]f32{0.0} ** 16;
+    var acc: [16]f32 = @as([16]f32, @splat(0.0));
     for (0..16) |sub| {
         const q_off = sub * 16;
         const dots01 = dotI8I8Block4MR2_16(
@@ -27406,7 +27406,7 @@ fn k16PreparedQ8KActivationQ3NoDmnPanelApply(
             out_row3[o] = acc3;
         }
         while (o + prepared_q3_k_panel_nr <= out_end) : (o += prepared_q3_k_panel_nr) {
-            var acc: [16]f32 = [_]f32{0.0} ** 16;
+            var acc: [16]f32 = @as([16]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const q_off = block_idx * q8_block_size;
                 const panel_off = ((o / prepared_q3_k_panel_nr) * row_blocks + block_idx) * prepared_q3_k_panel_block_bytes;
@@ -27463,7 +27463,7 @@ fn k16PreparedQ8KActivationQ3NoDmnPanelApply(
             out_row1[o] = acc1;
         }
         while (o + prepared_q3_k_panel_nr <= out_end) : (o += prepared_q3_k_panel_nr) {
-            var acc: [8]f32 = [_]f32{0.0} ** 8;
+            var acc: [8]f32 = @as([8]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const panel_off = ((o / prepared_q3_k_panel_nr) * row_blocks + block_idx) * prepared_q3_k_panel_block_bytes;
                 const sums = dotQ3KNoDmnPanel4MR2(
@@ -27506,7 +27506,7 @@ fn k16PreparedQ8KActivationQ3NoDmnPanelApply(
             out_row[o] = acc;
         }
         while (o + prepared_q3_k_panel_nr <= out_end) : (o += prepared_q3_k_panel_nr) {
-            var acc: [prepared_q3_k_panel_nr]f32 = [_]f32{0.0} ** prepared_q3_k_panel_nr;
+            var acc: [prepared_q3_k_panel_nr]f32 = @as([prepared_q3_k_panel_nr]f32, @splat(0.0));
             for (0..row_blocks) |block_idx| {
                 const panel_off = ((o / prepared_q3_k_panel_nr) * row_blocks + block_idx) * prepared_q3_k_panel_block_bytes;
                 const sums = dotQ3KNoDmnPanel4(
@@ -31752,7 +31752,7 @@ fn dotQ8KQ8KBlock4MR4(
     const qw1 = q8_weight1[4..260];
     const qw2 = q8_weight2[4..260];
     const qw3 = q8_weight3[4..260];
-    var dot: [16]i32 = [_]i32{0} ** 16;
+    var dot: [16]i32 = @as([16]i32, @splat(0));
     inline for (0..8) |chunk| {
         const off = chunk * 32;
         const sums = dotI8I8Block4MR4(
@@ -31807,7 +31807,7 @@ inline fn dotQ8KQ8KPanel4(q8_input: []const u8, panel_block: []const u8) [4]f32 
 
     const input_scale = readF32Le(q8_input[0..4]);
     const qx = q8_input[4..260];
-    var dot: [4]i32 = [_]i32{0} ** 4;
+    var dot: [4]i32 = @as([4]i32, @splat(0));
     inline for (0..8) |chunk| {
         const off = chunk * 32;
         const values_base = prepared_q8_k_panel4_values_offset + chunk * prepared_q8_k_panel4_nr * 32;
@@ -31844,7 +31844,7 @@ inline fn dotQ8KQ8KPanel4MR2(
     const input_scale1 = readF32Le(q8_input1[0..4]);
     const qx0 = q8_input0[4..260];
     const qx1 = q8_input1[4..260];
-    var dot: [8]i32 = [_]i32{0} ** 8;
+    var dot: [8]i32 = @as([8]i32, @splat(0));
     inline for (0..8) |chunk| {
         const off = chunk * 32;
         const values_base = prepared_q8_k_panel4_values_offset + chunk * prepared_q8_k_panel4_nr * 32;
@@ -31895,7 +31895,7 @@ inline fn dotQ8KQ8KPanel4MR4(
     const qx1 = q8_input1[4..260];
     const qx2 = q8_input2[4..260];
     const qx3 = q8_input3[4..260];
-    var dot: [16]i32 = [_]i32{0} ** 16;
+    var dot: [16]i32 = @as([16]i32, @splat(0));
     inline for (0..8) |chunk| {
         const off = chunk * 32;
         const values_base = prepared_q8_k_panel4_values_offset + chunk * prepared_q8_k_panel4_nr * 32;
@@ -32975,7 +32975,7 @@ inline fn dotQ6KPreparedQ8KPanel8VecFusedSdot(q8_block: []const u8, panel_block:
 
     const qx = q8_block[4..260];
     const final_scale = @as(F32x8, @splat(readF32Le(q8_block[0..4]))) * q6KPanel8WeightScale(panel_block);
-    var weighted: [8]I32x4 = [_]I32x4{@splat(0)} ** 8;
+    var weighted: [8]I32x4 = @as([8]I32x4, @splat(@splat(0)));
     inline for (0..16) |sub| {
         const raw_x: U8x16 = qx[sub * 16 ..][0..16].*;
         const values_base = q6KPanel8ValuesBase(sub);
@@ -32998,8 +32998,8 @@ inline fn dotQ6KPreparedQ8KPanel8MR2VecFusedSdot(q8_block_r0: []const u8, q8_blo
     const weight_scale = q6KPanel8WeightScale(panel_block);
     const final_scale0 = @as(F32x8, @splat(readF32Le(q8_block_r0[0..4]))) * weight_scale;
     const final_scale1 = @as(F32x8, @splat(readF32Le(q8_block_r1[0..4]))) * weight_scale;
-    var weighted0: [8]I32x4 = [_]I32x4{@splat(0)} ** 8;
-    var weighted1: [8]I32x4 = [_]I32x4{@splat(0)} ** 8;
+    var weighted0: [8]I32x4 = @as([8]I32x4, @splat(@splat(0)));
+    var weighted1: [8]I32x4 = @as([8]I32x4, @splat(@splat(0)));
     inline for (0..16) |sub| {
         const q_off = sub * 16;
         const raw_x0: U8x16 = qx0[q_off..][0..16].*;
@@ -34800,7 +34800,7 @@ inline fn dotQ4Q5KPreparedQ8KBlock4MR4(
     const q_values2 = prepared_block2[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
     const q_values3 = prepared_block3[prepared_q4_k_header_bytes..prepared_q4_k_block_bytes];
 
-    var acc: [16]f32 = [_]f32{0.0} ** 16;
+    var acc: [16]f32 = @as([16]f32, @splat(0.0));
     for (0..8) |sub| {
         const q_off = sub * 32;
         const dots = dotI8I8Block4MR4(
@@ -35942,9 +35942,9 @@ test "native DeBERTa attention forwards request cancellation into bounded tiles"
     var backend = NativeCompute.init(allocator, &store, null);
     defer backend.deinit();
     var cb = backend.computeBackend();
-    const q = try cb.fromFloat32Shape(&(.{@as(f32, 0.1)} ** 20), &.{ 5, 4 });
+    const q = try cb.fromFloat32Shape(&@as([20]f32, @splat(0.1)), &.{ 5, 4 });
     defer cb.free(q);
-    const relative = try cb.fromFloat32Shape(&(.{@as(f32, 0.2)} ** 36), &.{ 9, 4 });
+    const relative = try cb.fromFloat32Shape(&@as([36]f32, @splat(0.2)), &.{ 9, 4 });
     defer cb.free(relative);
     const Cancel = struct {
         calls: usize = 0,
@@ -36757,13 +36757,13 @@ fn averagePoolOp(ctx: *anyopaque, input: CT, attrs: *const @import("ml").graph.n
     if (spatial == 0 or spatial > max_spatial or shape.len != @as(usize, spatial) + 2) return error.UnsupportedShape;
     if (shape[0] <= 0 or shape[1] <= 0) return error.InvalidInputShape;
     const planes = std.math.mul(usize, @intCast(shape[0]), @intCast(shape[1])) catch return error.InvalidInputShape;
-    var input_spatial: [max_spatial]usize = .{1} ** max_spatial;
-    var output_spatial: [max_spatial]usize = .{1} ** max_spatial;
-    var input_strides: [max_spatial]usize = .{1} ** max_spatial;
-    var output_strides: [max_spatial]usize = .{1} ** max_spatial;
-    var window_steps: [max_spatial]usize = .{1} ** max_spatial;
-    var pad_before: [max_spatial]usize = .{0} ** max_spatial;
-    var logical_shape: [max_spatial + 2]i64 = .{0} ** (max_spatial + 2);
+    var input_spatial: [max_spatial]usize = @splat(1);
+    var output_spatial: [max_spatial]usize = @splat(1);
+    var input_strides: [max_spatial]usize = @splat(1);
+    var output_strides: [max_spatial]usize = @splat(1);
+    var window_steps: [max_spatial]usize = @splat(1);
+    var pad_before: [max_spatial]usize = @splat(0);
+    var logical_shape: [max_spatial + 2]i64 = @splat(0);
     @memcpy(logical_shape[0..shape.len], shape);
     var input_area: usize = 1;
     var output_area: usize = 1;
@@ -36792,8 +36792,8 @@ fn averagePoolOp(ctx: *anyopaque, input: CT, attrs: *const @import("ml").graph.n
     const output = try self.allocator.alloc(f32, output_elems);
 
     for (0..output_area) |output_index| {
-        var valid_counts: [max_spatial]usize = .{1} ** max_spatial;
-        var first_positions: [max_spatial]i128 = .{0} ** max_spatial;
+        var valid_counts: [max_spatial]usize = @splat(1);
+        var first_positions: [max_spatial]i128 = @splat(0);
         var valid_count: usize = 1;
         for (0..spatial) |axis| {
             const coordinate = (output_index / output_strides[axis]) % output_spatial[axis];
@@ -38335,7 +38335,7 @@ fn primReduceOp(self: *NativeCompute, input: CT, axes: []const u8, input_shape: 
 
     // Compute output shape with keepdims semantics.
     var out_shape_buf: [8]i64 = resolved_input_shape_buf;
-    var is_reduced = [_]bool{false} ** 8;
+    var is_reduced = @as([8]bool, @splat(false));
     for (axes) |ax| is_reduced[ax] = true;
     for (0..rank) |d| {
         out_shape_buf[d] = if (is_reduced[d]) 1 else resolved_input_shape[d];
@@ -40201,7 +40201,7 @@ fn primGatherOp(ctx: *anyopaque, input: CT, indices: CT, axis: u8, input_shape: 
         const output = try self.allocator.alloc(f32, n * d);
         var raw_output: ?[]f32 = output;
         errdefer if (raw_output) |raw| self.allocator.free(raw);
-        var out_shape_buf: [8]i64 = .{0} ** 8;
+        var out_shape_buf: [8]i64 = @splat(0);
         var out_rank: usize = 0;
         if (indices_shape) |idx_shape| {
             for (idx_shape) |dim| {
@@ -41250,9 +41250,9 @@ fn argmaxRowsSuppressOp(
 }
 
 test "linear q8_0 kernel computes direct matmul" {
-    var input: [32]f32 = [_]f32{1.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [68]u8 = [_]u8{0} ** 68;
+    var weight_raw: [68]u8 = @as([68]u8, @splat(0));
 
     // Row 0: scale 1.0, all quantized values 1.
     weight_raw[0] = 0x00;
@@ -41280,7 +41280,7 @@ test "linear q8_0 ranged columns match full output" {
         value.* = @floatFromInt(signed - 5);
     }
 
-    var weight_raw: [out_dim * block_size]u8 = [_]u8{0} ** (out_dim * block_size);
+    var weight_raw: [out_dim * block_size]u8 = @as([(out_dim * block_size)]u8, @splat(0));
     for (0..out_dim) |row| {
         const base = row * block_size;
         weight_raw[base] = 0x00;
@@ -41291,8 +41291,8 @@ test "linear q8_0 ranged columns match full output" {
         }
     }
 
-    var full: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ranged: [rows * out_dim]f32 = [_]f32{-999.0} ** (rows * out_dim);
+    var full: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ranged: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(-999.0));
     linearQ8_0Range(&input, &weight_raw, &full, rows, in_dim, out_dim, 0, out_dim, null);
     linearQ8_0Range(&input, &weight_raw, &ranged, rows, in_dim, out_dim, 0, 2, null);
     linearQ8_0Range(&input, &weight_raw, &ranged, rows, in_dim, out_dim, 2, out_dim, null);
@@ -41314,7 +41314,7 @@ test "linear q8_0 mr=2 ranged rows match generic full output" {
         value.* = @floatFromInt(signed - 9);
     }
 
-    var weight_raw: [out_dim * row_blocks * block_size]u8 = [_]u8{0} ** (out_dim * row_blocks * block_size);
+    var weight_raw: [out_dim * row_blocks * block_size]u8 = @as([(out_dim * row_blocks * block_size)]u8, @splat(0));
     for (0..out_dim) |row| {
         for (0..row_blocks) |block_idx| {
             const base = row * row_blocks * block_size + block_idx * block_size;
@@ -41327,10 +41327,10 @@ test "linear q8_0 mr=2 ranged rows match generic full output" {
         }
     }
 
-    var full: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var full: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearNoBiasQuantizedGeneric(null, &input, &weight_raw, &full, rows, in_dim, out_dim, .{ .known = .Q8_0 }, &dotQ8_0Block);
 
-    var ranged: [rows * out_dim]f32 = [_]f32{-999.0} ** (rows * out_dim);
+    var ranged: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(-999.0));
     linearQ8_0Range(&input, &weight_raw, &ranged, rows, in_dim, out_dim, 0, 1, null);
     linearQ8_0Range(&input, &weight_raw, &ranged, rows, in_dim, out_dim, 1, 4, null);
     linearQ8_0Range(&input, &weight_raw, &ranged, rows, in_dim, out_dim, 4, out_dim, null);
@@ -41353,8 +41353,8 @@ test "linear q8_0 pair kernel matches separate sibling matmuls" {
         value.* = @floatFromInt(signed - 3);
     }
 
-    var weight_raw_a: [68]u8 = [_]u8{0} ** 68;
-    var weight_raw_b: [68]u8 = [_]u8{0} ** 68;
+    var weight_raw_a: [68]u8 = @as([68]u8, @splat(0));
+    var weight_raw_b: [68]u8 = @as([68]u8, @splat(0));
     for (0..out_dim) |row| {
         const base = row * block_size;
         weight_raw_a[base] = 0x00;
@@ -41385,12 +41385,12 @@ test "linear q8_0 pair kernel matches separate sibling matmuls" {
         .allocator = allocator,
     };
 
-    var output_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var output_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantizedPair(null, allocator, &storage_a, &storage_b, &input, &output_a, &output_b, rows, in_dim, out_dim));
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
 
@@ -41428,7 +41428,7 @@ test "q8_0 activation-quantized input path stays close to f32-input direct path"
         );
     }
 
-    var exact_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var exact_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     linearQ8_0Range(&input, weight_raw, &exact_output, rows, in_dim, out_dim, 0, out_dim, null);
 
     const q_values = try allocator.alloc(u8, rows * row_blocks * values_per_block);
@@ -41437,7 +41437,7 @@ test "q8_0 activation-quantized input path stays close to f32-input direct path"
     defer allocator.free(input_scales);
     quantizeQ8_0ActivationRows(&input, q_values, input_scales, rows, in_dim, row_blocks);
 
-    var quant_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var quant_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     linearQ8_0QuantizedInputRange(false, q_values, input_scales, weight_raw, &quant_output, rows, in_dim, out_dim, 0, out_dim, null);
 
     for (quant_output, exact_output) |actual, expected| {
@@ -41452,7 +41452,7 @@ test "q8_0 activation-quantized input path stays close to f32-input direct path"
             weight_raw[block_idx * block_size ..][0..block_size],
         );
     }
-    var prepared_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var prepared_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     linearQ8_0QuantizedInputRange(true, q_values, input_scales, prepared, &prepared_output, rows, in_dim, out_dim, 0, out_dim, null);
 
     for (prepared_output, quant_output) |actual, expected| {
@@ -41523,10 +41523,10 @@ test "q8_0 prepared panel-packed activation path matches row-major prepared path
     defer allocator.free(input_scales);
     quantizeQ8_0ActivationRows(&input, q_values, input_scales, rows, in_dim, row_blocks);
 
-    var row_major_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var row_major_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     linearQ8_0QuantizedInputRange(true, q_values, input_scales, storage.preparedBytes(.row_major_blocks).?, &row_major_output, rows, in_dim, out_dim, 0, out_dim, null);
 
-    var panel_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var panel_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     linearQ8_0QuantizedInputPreparedPanelRange(q_values, input_scales, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4).?, &panel_output, rows, in_dim, out_dim, 0, out_dim, null);
 
     for (panel_output, row_major_output) |actual, expected| {
@@ -41537,7 +41537,7 @@ test "q8_0 prepared panel-packed activation path matches row-major prepared path
     try std.testing.expect(storage.preparedBytes(.panel8) != null);
     try std.testing.expectEqual(preparedQ8_0Panel8ByteSize(out_dim, row_blocks), storage.preparedBytes(.panel8).?.len);
 
-    var panel8_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var panel8_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     linearQ8_0QuantizedInputGroupedPanel8Range(
         1,
         q_values,
@@ -41719,7 +41719,7 @@ test "legacy prepared activation panel path matches row-major prepared path" {
         const weight_raw = try allocator.alloc(u8, out_dim * row_blocks * block_size);
         var dense_weight: [out_dim * in_dim]f32 = undefined;
         for (&dense_weight, 0..) |*value, idx| {
-            const signed: i32 = @intCast((idx * 11 + @intFromEnum(known)) % 37);
+            const signed: i32 = @intCast((idx * 11 + @backingInt(known)) % 37);
             value.* = @as(f32, @floatFromInt(signed - 18)) / 23.0;
         }
         for (0..(out_dim * row_blocks)) |block_idx| {
@@ -41752,9 +41752,9 @@ test "legacy prepared activation panel path matches row-major prepared path" {
         defer allocator.free(q.q_values);
         defer allocator.free(q.input_scales);
         defer allocator.free(q.input_sums);
-        var row_major_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+        var row_major_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
         legacyPreparedActivationApply(q.q_values, q.input_scales, q.input_sums, storage.preparedBytes(.row_major_blocks).?, null, null, &row_major_output, rows, in_dim, out_dim, 0, out_dim, false);
-        var panel_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+        var panel_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
         legacyPreparedActivationApply(q.q_values, q.input_scales, q.input_sums, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), null, &panel_output, rows, in_dim, out_dim, 0, out_dim, false);
 
         for (panel_output, row_major_output) |actual, expected| {
@@ -41948,7 +41948,7 @@ test "q2_q3_k prepared q8_k activation paths are wired and panel-safe" {
         for (raws, seeds) |raw, seed| {
             for (0..(out_dim * row_blocks)) |block_idx| {
                 for (&dense_block, 0..) |*value, i| {
-                    const signed: i32 = @intCast((block_idx * 11 + i * 5 + seed + @intFromEnum(known)) % 41);
+                    const signed: i32 = @intCast((block_idx * 11 + i * 5 + seed + @backingInt(known)) % 41);
                     value.* = @as(f32, @floatFromInt(signed - 20)) / 23.0;
                 }
                 const dst = raw[block_idx * block_size ..][0..block_size];
@@ -42516,8 +42516,8 @@ test "linear q8_0 pair kernel applies bias during writeback" {
         value.* = @floatFromInt(signed - 3);
     }
 
-    var weight_raw_a: [68]u8 = [_]u8{0} ** 68;
-    var weight_raw_b: [68]u8 = [_]u8{0} ** 68;
+    var weight_raw_a: [68]u8 = @as([68]u8, @splat(0));
+    var weight_raw_b: [68]u8 = @as([68]u8, @splat(0));
     for (0..out_dim) |row| {
         const base = row * block_size;
         weight_raw_a[base] = 0x00;
@@ -42550,12 +42550,12 @@ test "linear q8_0 pair kernel applies bias during writeback" {
 
     const bias_a = [_]f32{ 0.25, -0.5 };
     const bias_b = [_]f32{ -0.75, 0.125 };
-    var output_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var output_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearQ8_0Pair(allocator, null, &input, &weight_raw_a, &weight_raw_b, null, null, null, null, null, null, &bias_a, &bias_b, &output_a, &output_b, rows, in_dim, out_dim);
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
     addLinearBiasRows(&ref_a, &bias_a, rows, out_dim);
@@ -42692,7 +42692,7 @@ test "quantized linearTriple propagates token-major shape into sdpa" {
     const weight_c = try compute.makeBufWithEntry(empty_f32[0..], false, "v_proj.weight", null, &storage_c, null);
     defer cb.free(weight_c);
 
-    var bias_data = [_]f32{0.0} ** hidden;
+    var bias_data = @as([hidden]f32, @splat(0.0));
     const bias_a = try compute.makeBuf(&bias_data, false);
     defer cb.free(bias_a);
     const bias_b = try compute.makeBuf(&bias_data, false);
@@ -42709,7 +42709,7 @@ test "quantized linearTriple propagates token-major shape into sdpa" {
     try std.testing.expectEqualSlices(i64, &token_shape, tensorStoredShape(triple.second).?);
     try std.testing.expectEqualSlices(i64, &token_shape, tensorStoredShape(triple.third).?);
 
-    const mask = [_]i64{1} ** seq_len;
+    const mask = @as([seq_len]i64, @splat(1));
     const attended = try cb.scaledDotProductAttention(triple.first, triple.second, triple.third, &mask, null, batch, seq_len, num_heads, head_dim);
     defer cb.free(attended);
     try std.testing.expectEqualSlices(i64, &token_shape, tensorStoredShape(attended).?);
@@ -42775,9 +42775,9 @@ test "linear q8_0 triple kernel matches separate sibling matmuls" {
         value.* = @floatFromInt(signed - 3);
     }
 
-    var weight_raw_a: [68]u8 = [_]u8{0} ** 68;
-    var weight_raw_b: [68]u8 = [_]u8{0} ** 68;
-    var weight_raw_c: [68]u8 = [_]u8{0} ** 68;
+    var weight_raw_a: [68]u8 = @as([68]u8, @splat(0));
+    var weight_raw_b: [68]u8 = @as([68]u8, @splat(0));
+    var weight_raw_c: [68]u8 = @as([68]u8, @splat(0));
     for (0..out_dim) |row| {
         const base = row * block_size;
         weight_raw_a[base] = 0x00;
@@ -42819,9 +42819,9 @@ test "linear q8_0 triple kernel matches separate sibling matmuls" {
         .allocator = allocator,
     };
 
-    var output_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_c: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var output_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_c: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     const bias_a = [_]f32{ 0.25, -0.5 };
     const bias_b = [_]f32{ -0.75, 0.125 };
     const bias_c = [_]f32{ 1.0, -1.25 };
@@ -42842,9 +42842,9 @@ test "linear q8_0 triple kernel matches separate sibling matmuls" {
         out_dim,
     ));
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_c: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_c: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_c, &input, &ref_c, rows, in_dim, out_dim));
@@ -42973,9 +42973,9 @@ test "q8_0 activation quant grouped pair and triple match separate matmuls" {
 }
 
 test "linear q8_1 kernel computes direct matmul" {
-    var input: [32]f32 = [_]f32{1.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [72]u8 = [_]u8{0} ** 72;
+    var weight_raw: [72]u8 = @as([72]u8, @splat(0));
 
     // Row 0: scale 1.0, all quantized values 1.
     weight_raw[0] = 0x00;
@@ -42993,9 +42993,9 @@ test "linear q8_1 kernel computes direct matmul" {
 }
 
 test "linear i2_s kernel computes direct matmul" {
-    var input: [128]f32 = [_]f32{1.0} ** 128;
+    var input: [128]f32 = @as([128]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [64]u8 = [_]u8{0} ** 64;
+    var weight_raw: [64]u8 = @as([64]u8, @splat(0));
 
     // Row 0: all packed ternary codes decode to +1.
     for (0..32) |i| weight_raw[i] = 0b10_10_10_10;
@@ -43018,12 +43018,12 @@ test "linear i2_s kernel computes direct matmul" {
 }
 
 test "linear i2_s applies per-row int8 activation quantization" {
-    var input: [128]f32 = [_]f32{0.0} ** 128;
+    var input: [128]f32 = @as([128]f32, @splat(0.0));
     input[0] = 0.51;
     input[1] = 1.0;
 
     var output: [1]f32 = .{0.0};
-    var weight_raw: [32]u8 = [_]u8{0} ** 32;
+    var weight_raw: [32]u8 = @as([32]u8, @splat(0));
     weight_raw[0] = 0b10_00_00_00;
     weight_raw[1] = 0b10_00_00_00;
 
@@ -43041,9 +43041,9 @@ test "linear i2_s applies per-row int8 activation quantization" {
 }
 
 test "linear i2_s ignores trailing bitnet tensor padding" {
-    var input: [128]f32 = [_]f32{1.0} ** 128;
+    var input: [128]f32 = @as([128]f32, @splat(1.0));
     var output: [1]f32 = .{0.0};
-    var weight_raw: [64]u8 = [_]u8{0} ** 64;
+    var weight_raw: [64]u8 = @as([64]u8, @splat(0));
     for (0..32) |i| weight_raw[i] = 0b10_10_10_10;
 
     const shape = [_]i64{ 1, 128 };
@@ -43060,11 +43060,11 @@ test "linear i2_s ignores trailing bitnet tensor padding" {
 }
 
 test "linear i2_s pair kernel computes sibling matmuls" {
-    var input: [128]f32 = [_]f32{1.0} ** 128;
+    var input: [128]f32 = @as([128]f32, @splat(1.0));
     var output_a: [1]f32 = .{0.0};
     var output_b: [1]f32 = .{0.0};
-    var weight_raw_a: [32]u8 = [_]u8{0} ** 32;
-    var weight_raw_b: [32]u8 = [_]u8{0} ** 32;
+    var weight_raw_a: [32]u8 = @as([32]u8, @splat(0));
+    var weight_raw_b: [32]u8 = @as([32]u8, @splat(0));
 
     for (0..32) |i| {
         weight_raw_a[i] = 0b10_10_10_10;
@@ -43349,9 +43349,9 @@ test "linear tl2 pair kernel matches separate sibling matmuls" {
 }
 
 test "linear q4_0 kernel computes direct matmul" {
-    var input: [32]f32 = [_]f32{1.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [36]u8 = [_]u8{0x88} ** 36;
+    var weight_raw: [36]u8 = @as([36]u8, @splat(0x88));
 
     // Row 0: scale 1.0, all quantized values decode to 0.
     weight_raw[0] = 0x00;
@@ -43368,13 +43368,13 @@ test "linear q4_0 kernel computes direct matmul" {
 }
 
 test "linear q4_0 kernel uses low-half then high-half nibble order" {
-    var input: [32]f32 = [_]f32{0.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(0.0));
     input[0] = 1.0;
     input[1] = 1.0;
     input[16] = 1.0;
     input[17] = 1.0;
     var output: [1]f32 = .{0.0};
-    var weight_raw: [18]u8 = [_]u8{0x88} ** 18;
+    var weight_raw: [18]u8 = @as([18]u8, @splat(0x88));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[2] = 0x10;
@@ -43385,9 +43385,9 @@ test "linear q4_0 kernel uses low-half then high-half nibble order" {
 }
 
 test "linear q4_1 kernel computes direct matmul" {
-    var input: [32]f32 = [_]f32{1.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [40]u8 = [_]u8{0x11} ** 40;
+    var weight_raw: [40]u8 = @as([40]u8, @splat(0x11));
 
     // Row 0: d=2.0, m=1.0, all quantized values decode to 3.
     weight_raw[0] = 0x00;
@@ -43407,13 +43407,13 @@ test "linear q4_1 kernel computes direct matmul" {
 }
 
 test "linear q4_1 kernel uses low-half then high-half nibble order" {
-    var input: [32]f32 = [_]f32{0.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(0.0));
     input[0] = 1.0;
     input[1] = 1.0;
     input[16] = 1.0;
     input[17] = 1.0;
     var output: [1]f32 = .{0.0};
-    var weight_raw: [20]u8 = [_]u8{0x11} ** 20;
+    var weight_raw: [20]u8 = @as([20]u8, @splat(0x11));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[2] = 0x00;
@@ -43426,9 +43426,9 @@ test "linear q4_1 kernel uses low-half then high-half nibble order" {
 }
 
 test "linear q5_1 kernel computes direct matmul" {
-    var input: [32]f32 = [_]f32{1.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [48]u8 = [_]u8{0x11} ** 48;
+    var weight_raw: [48]u8 = @as([48]u8, @splat(0x11));
 
     // Row 0: d=2.0, m=1.0, all low 4-bit values decode to 3.
     weight_raw[0] = 0x00;
@@ -43450,13 +43450,13 @@ test "linear q5_1 kernel computes direct matmul" {
 }
 
 test "linear iq4_nl kernel uses nonlinear lookup table" {
-    var input: [32]f32 = [_]f32{0.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(0.0));
     input[0] = 1.0;
     input[1] = 1.0;
     input[16] = 1.0;
     input[17] = 1.0;
     var output: [1]f32 = .{0.0};
-    var weight_raw: [18]u8 = [_]u8{0} ** 18;
+    var weight_raw: [18]u8 = @as([18]u8, @splat(0));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[2] = 0xF0;
@@ -43467,12 +43467,12 @@ test "linear iq4_nl kernel uses nonlinear lookup table" {
 }
 
 test "linear iq4_xs kernel applies per-group scale" {
-    var input: [256]f32 = [_]f32{0.0} ** 256;
+    var input: [256]f32 = @as([256]f32, @splat(0.0));
     input[0] = 1.0;
     input[16] = 1.0;
     input[32] = 1.0;
     var output: [1]f32 = .{0.0};
-    var weight_raw: [136]u8 = [_]u8{0} ** 136;
+    var weight_raw: [136]u8 = @as([136]u8, @splat(0));
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C; // d = 1.0
     weight_raw[2] = 0x01; // group 0 scale = -16; group 1 scale defaults to -32
@@ -43584,12 +43584,12 @@ test "linear q4_0 pair kernel matches separate sibling matmuls" {
         .allocator = allocator,
     };
 
-    var output_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var output_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantizedPair(null, allocator, &storage_a, &storage_b, &input, &output_a, &output_b, rows, in_dim, out_dim));
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
 
@@ -43598,9 +43598,9 @@ test "linear q4_0 pair kernel matches separate sibling matmuls" {
 }
 
 test "linear packed q8_0 kernel computes direct matmul" {
-    var input: [32]f32 = [_]f32{1.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [136]u8 = [_]u8{0} ** 136;
+    var weight_raw: [136]u8 = @as([136]u8, @splat(0));
 
     // Layout shape [2 rows, 2 experts, 32 in_dim] with expert axis = 1.
     // Row 0, expert 1 -> all quantized values 3.
@@ -43631,9 +43631,9 @@ test "linear packed q8_0 kernel computes direct matmul" {
 }
 
 test "linear packed q8_0 kernel supports ggml expert-last layout" {
-    var input: [32]f32 = [_]f32{1.0} ** 32;
+    var input: [32]f32 = @as([32]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [136]u8 = [_]u8{0} ** 136;
+    var weight_raw: [136]u8 = @as([136]u8, @splat(0));
     const block_size = gguf_tensor_types.bytesPerBlock(.{ .known = .Q8_0 }).?;
     const out_dim = 2;
     const expert = 1;
@@ -43681,7 +43681,7 @@ test "native mulMatId supports ggml expert-last dense layout" {
     const input_ct = try fromFloat32ShapeOp(&compute, &.{ 1.0, 2.0, 3.0, 4.0 }, &.{ 2, 2 });
     defer freeTensor(&compute, input_ct);
 
-    var weight: [8]f32 = [_]f32{0.0} ** 8;
+    var weight: [8]f32 = @as([8]f32, @splat(0.0));
     const experts = 2;
     const out_dim = 2;
     weight[(0 * out_dim + 0) * experts + 0] = 1.0;
@@ -43724,11 +43724,11 @@ test "native mulMatId keeps ggml expert-last q8_0 layout quantized" {
     defer compute.deinit();
     var cb = compute.computeBackend();
 
-    var input_data: [64]f32 = [_]f32{1.0} ** 64;
+    var input_data: [64]f32 = @as([64]f32, @splat(1.0));
     const input_ct = try compute.makeBuf(&input_data, false);
     defer freeTensor(&compute, input_ct);
 
-    var weight_raw: [136]u8 = [_]u8{0} ** 136;
+    var weight_raw: [136]u8 = @as([136]u8, @splat(0));
     const block_size = gguf_tensor_types.bytesPerBlock(.{ .known = .Q8_0 }).?;
     const out_dim = 2;
     for (0..2) |expert| {
@@ -43775,9 +43775,9 @@ test "native mulMatId keeps ggml expert-last q8_0 layout quantized" {
 }
 
 test "linear q2_k kernel computes direct matmul" {
-    var input: [256]f32 = [_]f32{1.0} ** 256;
+    var input: [256]f32 = @as([256]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [168]u8 = [_]u8{0} ** 168;
+    var weight_raw: [168]u8 = @as([168]u8, @splat(0));
 
     for (0..16) |i| weight_raw[i] = 0x22; // scale 2, min 2
     weight_raw[16] = 0x00;
@@ -43796,9 +43796,9 @@ test "linear q2_k kernel computes direct matmul" {
 }
 
 test "linear q3_k kernel computes direct matmul" {
-    var input: [256]f32 = [_]f32{1.0} ** 256;
+    var input: [256]f32 = @as([256]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [220]u8 = [_]u8{0} ** 220;
+    var weight_raw: [220]u8 = @as([220]u8, @splat(0));
 
     for (96..108) |i| weight_raw[i] = 0xAA; // scale 42 -> 10 after centering
     weight_raw[108] = 0x00;
@@ -43864,12 +43864,12 @@ test "linear q4_1 pair kernel matches separate sibling matmuls" {
         .allocator = allocator,
     };
 
-    var output_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var output_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantizedPair(null, allocator, &storage_a, &storage_b, &input, &output_a, &output_b, rows, in_dim, out_dim));
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
 
@@ -43878,9 +43878,9 @@ test "linear q4_1 pair kernel matches separate sibling matmuls" {
 }
 
 test "linear q4_k kernel computes direct matmul" {
-    var input: [256]f32 = [_]f32{1.0} ** 256;
+    var input: [256]f32 = @as([256]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [288]u8 = [_]u8{0} ** 288;
+    var weight_raw: [288]u8 = @as([288]u8, @splat(0));
 
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x3C;
@@ -43939,10 +43939,10 @@ test "prepared q4_k headers preserve quantized linear output" {
     try std.testing.expect(storage.preparedBytes(.row_major_blocks) != null);
     try std.testing.expectEqual(block_count * prepared_q4_k_block_bytes, storage.preparedBytes(.row_major_blocks).?.len);
 
-    var prepared_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var prepared_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage, &input, &prepared_output, rows, in_dim, out_dim));
 
-    var raw_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var raw_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearNoBiasQuantizedGeneric(null, &input, weight_raw, &raw_output, rows, in_dim, out_dim, tensor_type, &dotQ4_KBlock);
 
     for (prepared_output, raw_output) |actual, expected| {
@@ -43971,7 +43971,7 @@ test "q4_q5_k prepared panel f32 path matches row-major prepared path" {
         var dense_block: [256]f32 = undefined;
         for (0..(out_dim * row_blocks)) |block_idx| {
             for (&dense_block, 0..) |*value, i| {
-                const signed: i32 = @intCast((block_idx * 11 + i * 5 + @intFromEnum(known)) % 41);
+                const signed: i32 = @intCast((block_idx * 11 + i * 5 + @backingInt(known)) % 41);
                 value.* = @as(f32, @floatFromInt(signed - 20)) / 23.0;
             }
             const dst = weight_raw[block_idx * block_size ..][0..block_size];
@@ -43994,9 +43994,9 @@ test "q4_q5_k prepared panel f32 path matches row-major prepared path" {
         try std.testing.expect(storage.preparedBytes(.row_major_blocks) != null);
         try std.testing.expect(storage.preparedBytes(.panel4) != null);
 
-        var row_major: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+        var row_major: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
         try linearNoBiasQ4KPrepared(null, &input, storage.preparedBytes(.row_major_blocks).?, &row_major, rows, in_dim, out_dim);
-        var panel: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+        var panel: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
         try linearNoBiasQ4Q5KPreparedPanel(&input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4).?, &panel, rows, in_dim, out_dim);
         for (panel, row_major) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
     }
@@ -44027,7 +44027,7 @@ test "q4_q5_k small-row activation quant route is wired" {
         var dense_block: [256]f32 = undefined;
         for (0..(out_dim * row_blocks)) |block_idx| {
             for (&dense_block, 0..) |*value, i| {
-                const signed: i32 = @intCast((block_idx * 11 + i * 5 + @intFromEnum(known)) % 41);
+                const signed: i32 = @intCast((block_idx * 11 + i * 5 + @backingInt(known)) % 41);
                 value.* = @as(f32, @floatFromInt(signed - 20)) / 23.0;
             }
             const dst = weight_raw[block_idx * block_size ..][0..block_size];
@@ -44369,10 +44369,10 @@ test "q4_k mr=2 row tile matches scalar reference for odd rows + mixed col tile"
     defer storage.deinit();
     try prepareNativeQuantizedStorage(&storage);
 
-    var prepared_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var prepared_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage, &input, &prepared_output, rows, in_dim, out_dim));
 
-    var ref_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearNoBiasQuantizedGeneric(null, &input, weight_raw, &ref_output, rows, in_dim, out_dim, tensor_type, &dotQ4_KBlock);
 
     for (prepared_output, ref_output) |actual, expected| {
@@ -44556,10 +44556,10 @@ test "prepared q4_k tiled range matches full tiled output" {
     try prepareNativeQuantizedStorage(&storage);
     const prepared = storage.preparedBytes(.row_major_blocks).?;
 
-    var full_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var full_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearNoBiasQ4KPreparedTiled(&input, prepared, &full_output, rows, in_dim, out_dim);
 
-    var ranged_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ranged_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearQ4KPreparedTiledRange(&input, prepared, &ranged_output, rows, in_dim, out_dim, 1, 5);
     try linearQ4KPreparedTiledRange(&input, prepared, &ranged_output, rows, in_dim, out_dim, 0, 1);
     try linearQ4KPreparedTiledRange(&input, prepared, &ranged_output, rows, in_dim, out_dim, 5, out_dim);
@@ -44621,12 +44621,12 @@ test "prepared q4_k pair kernel matches separate sibling matmuls" {
     try prepareNativeQuantizedStorage(&storage_a);
     try prepareNativeQuantizedStorage(&storage_b);
 
-    var output_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var output_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantizedPair(null, allocator, &storage_a, &storage_b, &input, &output_a, &output_b, rows, in_dim, out_dim));
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
 
@@ -44705,9 +44705,9 @@ test "prepared q4_k fused triple kernel matches biased separate matmuls" {
     const bias_a = [_]f32{ 0.25, -0.5, 0.75, -1.0, 1.25, -1.5 };
     const bias_b = [_]f32{ -0.125, 0.375, -0.625, 0.875, -1.125, 1.375 };
     const bias_c = [_]f32{ 1.0, 0.5, 0.0, -0.5, -1.0, -1.5 };
-    var output_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_c: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var output_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_c: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearQuantizedTriple(
         null,
         &storage_a,
@@ -44725,9 +44725,9 @@ test "prepared q4_k fused triple kernel matches biased separate matmuls" {
         out_dim,
     ));
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_c: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_c: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_c, &input, &ref_c, rows, in_dim, out_dim));
@@ -44827,18 +44827,18 @@ test "prepared q4_k packed qkv panel16 triple kernel matches unpacked triple dot
         bias_c[idx] = @as(f32, @floatFromInt(@as(i32, @intCast(idx % 11)) - 5)) / 23.0;
     }
 
-    var unpacked_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var unpacked_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var unpacked_c: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var unpacked_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var unpacked_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var unpacked_c: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearQuantizedTriple(null, &storage_a, &storage_b, &storage_c, &input, &bias_a, &bias_b, &bias_c, &unpacked_a, &unpacked_b, &unpacked_c, rows, in_dim, out_dim));
 
     try prepareQ4Q5QKVPanel16PackedStorageForBench(&storage_a, &storage_b, &storage_c, "k.weight", "v.weight");
     try std.testing.expect(preparedQKVPanel16GroupPackedBytes(&storage_a, out_dim, in_dim / 256) != null);
     setQ4Q5PackedQKVPanel16AutoOverrideForBench();
 
-    var packed_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var packed_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var packed_c: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var packed_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var packed_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var packed_c: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearQuantizedTriple(null, &storage_a, &storage_b, &storage_c, &input, &bias_a, &bias_b, &bias_c, &packed_a, &packed_b, &packed_c, rows, in_dim, out_dim));
 
     for (packed_a, unpacked_a) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 5e-2);
@@ -45413,7 +45413,7 @@ fn expectAutoPackedQKVDispatchBucket(
 
     const input = try allocator.alloc(f32, rows * in_dim);
     defer allocator.free(input);
-    fillNativeQuantDispatchValues(input, rows + in_dim + @intFromEnum(known), 0.015);
+    fillNativeQuantDispatchValues(input, rows + in_dim + @backingInt(known), 0.015);
 
     const weight_a = try allocator.alloc(f32, out_dim * in_dim);
     defer allocator.free(weight_a);
@@ -45421,9 +45421,9 @@ fn expectAutoPackedQKVDispatchBucket(
     defer allocator.free(weight_b);
     const weight_c = try allocator.alloc(f32, out_dim * in_dim);
     defer allocator.free(weight_c);
-    fillNativeQuantDispatchValues(weight_a, out_dim + @intFromEnum(known), 0.0125);
-    fillNativeQuantDispatchValues(weight_b, out_dim + @intFromEnum(known) + 5, 0.0115);
-    fillNativeQuantDispatchValues(weight_c, out_dim + @intFromEnum(known) + 11, 0.0105);
+    fillNativeQuantDispatchValues(weight_a, out_dim + @backingInt(known), 0.0125);
+    fillNativeQuantDispatchValues(weight_b, out_dim + @backingInt(known) + 5, 0.0115);
+    fillNativeQuantDispatchValues(weight_c, out_dim + @backingInt(known) + 11, 0.0105);
 
     const raw_a = try quantizeNativeDispatchWeight(allocator, known, weight_a);
     var storage_a = QuantizedStorage{
@@ -45544,9 +45544,9 @@ test "auto packed qkv panel16 production dispatch follows selector buckets" {
 }
 
 test "linear q5_k kernel computes direct matmul" {
-    var input: [256]f32 = [_]f32{1.0} ** 256;
+    var input: [256]f32 = @as([256]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [352]u8 = [_]u8{0} ** 352;
+    var weight_raw: [352]u8 = @as([352]u8, @splat(0));
 
     // Row 0: all decoded values 1.
     weight_raw[0] = 0x00;
@@ -45604,10 +45604,10 @@ test "prepared q5_k headers preserve quantized linear output" {
     try prepareNativeQuantizedStorage(&storage);
     try std.testing.expect(storage.preparedBytes(.row_major_blocks) != null);
 
-    var prepared_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var prepared_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage, &input, &prepared_output, rows, in_dim, out_dim));
 
-    var ref_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearNoBiasQuantizedGeneric(null, &input, weight_raw, &ref_output, rows, in_dim, out_dim, tensor_type, &dotQ5_KBlock);
 
     for (prepared_output, ref_output) |actual, expected| {
@@ -45628,8 +45628,8 @@ test "linear q5_k pair kernel matches separate sibling matmuls" {
         value.* = @floatFromInt(signed - 4);
     }
 
-    var weight_raw_a: [352]u8 = [_]u8{0} ** 352;
-    var weight_raw_b: [352]u8 = [_]u8{0} ** 352;
+    var weight_raw_a: [352]u8 = @as([352]u8, @splat(0));
+    var weight_raw_b: [352]u8 = @as([352]u8, @splat(0));
     for (&weight_raw_a, 0..) |*byte, idx| byte.* = @truncate((idx * 23 + 7) & 0xFF);
     for (&weight_raw_b, 0..) |*byte, idx| byte.* = @truncate((idx * 31 + 9) & 0xFF);
     for (0..out_dim) |row| {
@@ -45656,12 +45656,12 @@ test "linear q5_k pair kernel matches separate sibling matmuls" {
         .allocator = allocator,
     };
 
-    var output_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var output_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var output_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var output_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantizedPair(null, allocator, &storage_a, &storage_b, &input, &output_a, &output_b, rows, in_dim, out_dim));
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
 
@@ -45670,9 +45670,9 @@ test "linear q5_k pair kernel matches separate sibling matmuls" {
 }
 
 test "linear q6_k kernel computes direct matmul" {
-    var input: [256]f32 = [_]f32{1.0} ** 256;
+    var input: [256]f32 = @as([256]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [420]u8 = [_]u8{0} ** 420;
+    var weight_raw: [420]u8 = @as([420]u8, @splat(0));
 
     // Row 0: scale 1.0, per-subblock scale 1, all decoded values -32.
     for (192..208) |i| weight_raw[i] = 1;
@@ -45724,10 +45724,10 @@ test "prepared q6_k headers preserve quantized linear output" {
     try prepareNativeQuantizedStorage(&storage);
     try std.testing.expect(storage.preparedBytes(.row_major_blocks) != null);
 
-    var prepared_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var prepared_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage, &input, &prepared_output, rows, in_dim, out_dim));
 
-    var ref_output: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_output: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearNoBiasQuantizedGeneric(null, &input, weight_raw, &ref_output, rows, in_dim, out_dim, tensor_type, &dotQ6_KBlock);
 
     for (prepared_output, ref_output) |actual, expected| {
@@ -45768,8 +45768,8 @@ test "q8_k activation quantization overwrites destination bytes" {
         value.* = @as(f32, @floatFromInt(signed - 15)) / 13.0;
     }
 
-    var expected: [292]u8 = [_]u8{0x00} ** 292;
-    var poisoned: [292]u8 = [_]u8{0xA5} ** 292;
+    var expected: [292]u8 = @as([292]u8, @splat(0x00));
+    var poisoned: [292]u8 = @as([292]u8, @splat(0xA5));
     quant_codec.quantizeQ8_KBlock(&input, &expected);
     quant_codec.quantizeQ8_KBlock(&input, &poisoned);
     try std.testing.expectEqualSlices(u8, &expected, &poisoned);
@@ -45836,10 +45836,10 @@ test "prepared q6_k q8_k activation linear output stays close to f32-input path"
     try std.testing.expect(storage.preparedBytes(.panel4) != null);
     try std.testing.expectEqual(preparedKPanelByteSize(out_dim, in_dim / 256), storage.preparedBytes(.panel4).?.len);
 
-    var expected: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var expected: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearNoBiasQ6KPrepared(null, &input, storage.preparedBytes(.row_major_blocks).?, &expected, rows, in_dim, out_dim);
 
-    var actual: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var actual: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try linearNoBiasQ6KPreparedQ8KActivation(allocator, null, &input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), storage.preparedBytes(.panel16), &actual, rows, in_dim, out_dim);
 
     for (actual, expected) |act, exp| {
@@ -45887,10 +45887,10 @@ test "prepared q4_q5_k q8_k activation linear output stays close to f32-input pa
         try std.testing.expect(storage.preparedBytes(.panel4) != null);
         try std.testing.expectEqual(preparedKPanelByteSize(out_dim, in_dim / 256), storage.preparedBytes(.panel4).?.len);
 
-        var expected: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+        var expected: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
         try linearNoBiasQ4KPreparedTiled(&input, storage.preparedBytes(.row_major_blocks).?, &expected, rows, in_dim, out_dim);
 
-        var actual: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+        var actual: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
         try linearNoBiasQ4Q5KPreparedQ8KActivation(allocator, null, &input, storage.preparedBytes(.row_major_blocks).?, storage.preparedBytes(.panel4), storage.preparedBytes(.panel8), storage.preparedBytes(.panel16), null, &actual, rows, in_dim, out_dim, kind);
 
         for (actual, expected) |act, exp| {
@@ -45948,11 +45948,11 @@ fn expectNativeQuantDispatchBucket(
 
     const input = try allocator.alloc(f32, rows * in_dim);
     defer allocator.free(input);
-    fillNativeQuantDispatchValues(input, rows + @intFromEnum(known), 0.015);
+    fillNativeQuantDispatchValues(input, rows + @backingInt(known), 0.015);
 
     const weight_f32 = try allocator.alloc(f32, out_dim * in_dim);
     defer allocator.free(weight_f32);
-    fillNativeQuantDispatchValues(weight_f32, in_dim + @intFromEnum(known), 0.0125);
+    fillNativeQuantDispatchValues(weight_f32, in_dim + @backingInt(known), 0.0125);
 
     const weight_raw = try quantizeNativeDispatchWeight(allocator, known, weight_f32);
     var storage = QuantizedStorage{
@@ -46061,11 +46061,11 @@ test "q4 q5 unmeasured extractor shapes use cached dense dequant sgemm" {
         const tensor_type: gguf_tensor_types.TensorType = .{ .known = known };
         const input = try allocator.alloc(f32, rows * in_dim);
         defer allocator.free(input);
-        fillNativeQuantDispatchValues(input, rows + @intFromEnum(known), 0.015);
+        fillNativeQuantDispatchValues(input, rows + @backingInt(known), 0.015);
 
         const weight_f32 = try allocator.alloc(f32, out_dim * in_dim);
         defer allocator.free(weight_f32);
-        fillNativeQuantDispatchValues(weight_f32, in_dim + @intFromEnum(known), 0.0125);
+        fillNativeQuantDispatchValues(weight_f32, in_dim + @backingInt(known), 0.0125);
 
         const weight_raw = try quantizeNativeDispatchWeight(allocator, known, weight_f32);
         var storage = QuantizedStorage{
@@ -46142,11 +46142,11 @@ test "q4 q5 gliner encoder shapes use cached dense dequant sgemm" {
         const tensor_type: gguf_tensor_types.TensorType = .{ .known = known };
         const input = try allocator.alloc(f32, rows * in_dim);
         defer allocator.free(input);
-        fillNativeQuantDispatchValues(input, rows + @intFromEnum(known), 0.015);
+        fillNativeQuantDispatchValues(input, rows + @backingInt(known), 0.015);
 
         const weight_f32 = try allocator.alloc(f32, out_dim * in_dim);
         defer allocator.free(weight_f32);
-        fillNativeQuantDispatchValues(weight_f32, in_dim + @intFromEnum(known), 0.0125);
+        fillNativeQuantDispatchValues(weight_f32, in_dim + @backingInt(known), 0.0125);
 
         const weight_raw = try quantizeNativeDispatchWeight(allocator, known, weight_f32);
         var storage = QuantizedStorage{
@@ -46304,7 +46304,7 @@ fn expectNativeQuantPairTripleDispatchBucket(
 
     const input = try allocator.alloc(f32, rows * in_dim);
     defer allocator.free(input);
-    fillNativeQuantDispatchValues(input, rows + @intFromEnum(known), 0.015);
+    fillNativeQuantDispatchValues(input, rows + @backingInt(known), 0.015);
 
     const weight_a = try allocator.alloc(f32, out_dim * in_dim);
     defer allocator.free(weight_a);
@@ -46312,9 +46312,9 @@ fn expectNativeQuantPairTripleDispatchBucket(
     defer allocator.free(weight_b);
     const weight_c = try allocator.alloc(f32, out_dim * in_dim);
     defer allocator.free(weight_c);
-    fillNativeQuantDispatchValues(weight_a, in_dim + @intFromEnum(known), 0.0125);
-    fillNativeQuantDispatchValues(weight_b, in_dim + @intFromEnum(known) + 3, 0.0115);
-    fillNativeQuantDispatchValues(weight_c, in_dim + @intFromEnum(known) + 7, 0.0105);
+    fillNativeQuantDispatchValues(weight_a, in_dim + @backingInt(known), 0.0125);
+    fillNativeQuantDispatchValues(weight_b, in_dim + @backingInt(known) + 3, 0.0115);
+    fillNativeQuantDispatchValues(weight_c, in_dim + @backingInt(known) + 7, 0.0105);
 
     const raw_a = try quantizeNativeDispatchWeight(allocator, known, weight_a);
     var storage_a = QuantizedStorage{
@@ -46710,7 +46710,7 @@ test "laya dequant sgemm predicate matches normalized runtime keys, not checkpoi
 test "laya q8_0 encoder linear uses dequant sgemm and skips native panel preparation" {
     const allocator = std.testing.allocator;
     const name = "model.layers.0.attn.Wo.weight";
-    var dense = [_]f32{0} ** 64; // out_dim=2, in_dim=32
+    var dense = @as([64]f32, @splat(0)); // out_dim=2, in_dim=32
     for (&dense, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index)) * 0.25 - 4.0;
     const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
     defer allocator.free(raw);
@@ -46747,7 +46747,7 @@ test "laya q8_0 encoder linear uses dequant sgemm and skips native panel prepara
     // never be built for it.
     try std.testing.expectEqual(@as(usize, 0), toBuf(weight).quantized_storage.?.prepared.ownedBytes());
 
-    var input_values = [_]f32{0} ** 96; // rows=3, in_dim=32
+    var input_values = @as([96]f32, @splat(0)); // rows=3, in_dim=32
     for (&input_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 7)) - 3.0;
     const input = try compute.makeBuf(&input_values, false);
     defer freeTensor(&compute, input);
@@ -46760,9 +46760,9 @@ test "laya q8_0 encoder linear uses dequant sgemm and skips native panel prepara
     defer freeTensor(&compute, result);
     try std.testing.expectEqual(@as(u64, 1), nativeQuantDispatchStatsForTest().dequant_sgemm);
 
-    var dense_weight = [_]f32{0} ** 64;
+    var dense_weight = @as([64]f32, @splat(0));
     try quant_codec.dequantizeToFloat32(.{ .known = .Q8_0 }, raw, &dense_weight);
-    var expected = [_]f32{0} ** 6;
+    var expected = @as([6]f32, @splat(0));
     for (0..3) |row| {
         for (0..2) |col| {
             var acc: f32 = bias_values[col];
@@ -46774,9 +46774,9 @@ test "laya q8_0 encoder linear uses dequant sgemm and skips native panel prepara
 }
 
 test "linear q8_k kernel computes direct matmul" {
-    var input: [256]f32 = [_]f32{1.0} ** 256;
+    var input: [256]f32 = @as([256]f32, @splat(1.0));
     var output: [2]f32 = [_]f32{ 0.0, 0.0 };
-    var weight_raw: [584]u8 = [_]u8{0} ** 584;
+    var weight_raw: [584]u8 = @as([584]u8, @splat(0));
 
     weight_raw[0] = 0x00;
     weight_raw[1] = 0x00;
@@ -47059,24 +47059,24 @@ test "q8_k activation grouped panel kernels match separate sibling matmuls" {
     try std.testing.expectEqual(preparedQ8_KPanel8ByteSize(out_dim, in_dim / 256), storage_a.preparedBytes(.panel8).?.len);
     try std.testing.expectEqual(preparedQ8_KPanel16ByteSize(out_dim, in_dim / 256), storage_a.preparedBytes(.panel16).?.len);
 
-    var pair_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var pair_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var pair_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var pair_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantizedPair(null, allocator, &storage_a, &storage_b, &input, &pair_a, &pair_b, rows, in_dim, out_dim));
 
-    var ref_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var ref_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var ref_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_a, &input, &ref_a, rows, in_dim, out_dim));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_b, &input, &ref_b, rows, in_dim, out_dim));
 
     for (pair_a, ref_a) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
     for (pair_b, ref_b) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
 
-    const bias_a = [_]f32{0.125} ** out_dim;
-    const bias_b = [_]f32{-0.25} ** out_dim;
-    const bias_c = [_]f32{0.5} ** out_dim;
-    var triple_a: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var triple_b: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
-    var triple_c: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    const bias_a = @as([out_dim]f32, @splat(0.125));
+    const bias_b = @as([out_dim]f32, @splat(-0.25));
+    const bias_c = @as([out_dim]f32, @splat(0.5));
+    var triple_a: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var triple_b: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
+    var triple_c: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearQuantizedTriple(
         null,
         &storage_a,
@@ -47094,7 +47094,7 @@ test "q8_k activation grouped panel kernels match separate sibling matmuls" {
         out_dim,
     ));
 
-    var ref_c: [rows * out_dim]f32 = [_]f32{0.0} ** (rows * out_dim);
+    var ref_c: [rows * out_dim]f32 = @as([(rows * out_dim)]f32, @splat(0.0));
     try std.testing.expect(try linearNoBiasQuantized(null, &storage_c, &input, &ref_c, rows, in_dim, out_dim));
     addLinearBiasRows(&ref_a, &bias_a, rows, out_dim);
     addLinearBiasRows(&ref_b, &bias_b, rows, out_dim);
@@ -47220,7 +47220,7 @@ test "ropePerItem leaves padded positions unchanged" {
     const original = input_data;
     var output = input_data;
 
-    var positions: [total_tokens]usize = [_]usize{0} ** total_tokens;
+    var positions: [total_tokens]usize = @as([total_tokens]usize, @splat(0));
     // Item 0: pos 0 and 1 active (pos 0 is identity rotation)
     positions[0 * max_seq_len * num_heads + 1] = 1;
     // Item 1: pos 0 active with offset 5
@@ -47709,7 +47709,7 @@ test "linearNoBias source tensor chunked matches dense f16 weight" {
     const got_ct = try linearNoBiasOp(&compute, input_ct, weight_ct, 2, 3, 4);
     defer freeTensor(&compute, got_ct);
 
-    var want = [_]f32{0} ** 8;
+    var want = @as([8]f32, @splat(0));
     native.sgemmTransBSync(2, 4, 3, 1.0, input[0..], weight_f32[0..], 0.0, want[0..]);
     const got = getData(got_ct);
     for (got, want) |actual, expected| {
@@ -47722,7 +47722,7 @@ test "native typed BF16 weights borrow source reserve bytes and preserve linear 
     const name = "model.layers.0.self_attn.q_proj.weight";
     // Include values outside f16 range and an unaligned source. Widening BF16
     // must preserve these exactly; an intermediate f16 cast would overflow.
-    var source = [_]u8{0} ** 13;
+    var source = @as([13]u8, @splat(0));
     const weight_bits = [_]u16{ 0x4980, 0x3f80, 0xbf80, 0xc980, 0x3f00, 0x4000 };
     for (weight_bits, 0..) |bits, index| std.mem.writeInt(u16, source[1 + index * 2 ..][0..2], bits, .little);
     const shape = [_]i64{ 2, 3 };
@@ -47825,7 +47825,7 @@ test "native typed BF16 weights borrow source reserve bytes and preserve linear 
 test "native Qwen3 quantized-only weight handle preserves shape and lookup without dense storage" {
     const allocator = std.testing.allocator;
     const name = "cls.output.weight";
-    var dense = [_]f32{0} ** 64;
+    var dense = @as([64]f32, @splat(0));
     for (&dense, 0..) |*value, index| value.* = @floatFromInt(index);
     const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
     defer allocator.free(raw);
@@ -47879,7 +47879,7 @@ test "native Qwen3 quantized-only weight handle preserves shape and lookup witho
     try std.testing.expectEqual(output_bytes, budget.host_scratch_bytes);
     const result = try embeddingLookup(&compute, weight, &.{ 1, 0 }, 2, 32);
     defer freeTensor(&compute, result);
-    var expected = [_]f32{0} ** 32;
+    var expected = @as([32]f32, @splat(0));
     for ([_]usize{ 1, 0 }, 0..) |source_row, output_row| {
         try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, source_row, &expected);
         try std.testing.expectEqualSlices(f32, &expected, getData(result)[output_row * 32 ..][0..32]);
@@ -47888,7 +47888,7 @@ test "native Qwen3 quantized-only weight handle preserves shape and lookup witho
 
 test "native gather matrix preparation failure preserves cache accounting and existing layouts" {
     const allocator = std.testing.allocator;
-    const dense = [_]f32{1} ** 128;
+    const dense = @as([128]f32, @splat(1));
     const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
     defer allocator.free(raw);
     const shape = [_]i64{ 4, 32 };
@@ -47966,7 +47966,7 @@ test "native gather reservation growth is deduplicated and fails without leaking
 test "native gather weight avoids matrix packing and reserves only raw storage" {
     const allocator = std.testing.allocator;
     const name = "cls.output.weight";
-    var dense = [_]f32{0} ** 64;
+    var dense = @as([64]f32, @splat(0));
     for (&dense, 0..) |*value, index| value.* = @floatFromInt(index);
     const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
     defer allocator.free(raw);
@@ -48019,7 +48019,7 @@ test "native gather weight avoids matrix packing and reserves only raw storage" 
     try std.testing.expectEqual(output_bytes, budget.host_scratch_bytes);
     const result = try embeddingLookup(&compute, weight, &.{ 1, 0 }, 2, 32);
     defer freeTensor(&compute, result);
-    var expected = [_]f32{0} ** 32;
+    var expected = @as([32]f32, @splat(0));
     for ([_]usize{ 1, 0 }, 0..) |source_row, output_row| {
         try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, source_row, &expected);
         try std.testing.expectEqualSlices(f32, &expected, getData(result)[output_row * 32 ..][0..32]);
@@ -48032,7 +48032,7 @@ test "native gather weight avoids matrix packing and reserves only raw storage" 
 test "native gather lazy handles retain pins and allow later matrix preparation" {
     const allocator = std.testing.allocator;
     const name = "embedding.weight";
-    const dense = [_]f32{1} ** 128;
+    const dense = @as([128]f32, @splat(1));
     const raw = try quant_codec.quantizeQ8_0FromF32(allocator, &dense);
     defer allocator.free(raw);
     const shape = [_]i64{ 4, 32 };
@@ -48171,7 +48171,7 @@ test "native typed BF16 linear panels preserve output tails" {
     input[in_dim - 1] = 0.5;
     input[in_dim] = -2;
     input[2 * in_dim - 1] = 0.25;
-    var output = [_]f32{99} ** (rows * out_dim + 2);
+    var output = @as([(rows * out_dim + 2)]f32, @splat(99));
     const shape = [_]i64{ out_dim, in_dim };
     const tensor = tensor_mod.Tensor{
         .data = std.mem.sliceAsBytes(bits),
@@ -48203,7 +48203,7 @@ test "native typed BF16 linear panels preserve output tails" {
 test "embeddingLookup dequantizes quantized GGUF rows" {
     const allocator = std.testing.allocator;
 
-    var dense = [_]f32{0} ** 64;
+    var dense = @as([64]f32, @splat(0));
     for (0..32) |i| dense[i] = @floatFromInt(i);
     for (0..32) |i| dense[32 + i] = @floatFromInt(100 + i);
 
@@ -48236,7 +48236,7 @@ test "embeddingLookup dequantizes quantized GGUF rows" {
     defer cb.free(out_ct);
 
     const out = getData(out_ct);
-    var expected_row = [_]f32{0} ** 32;
+    var expected_row = @as([32]f32, @splat(0));
     try quant_codec.dequantizeRow(.{ .known = .Q8_0 }, raw, 32, 1, &expected_row);
     for (out[0..32], expected_row) |actual, expected| {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
@@ -48246,7 +48246,7 @@ test "embeddingLookup dequantizes quantized GGUF rows" {
         try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
     }
 
-    var dense_q4 = [_]f32{0} ** 256;
+    var dense_q4 = @as([256]f32, @splat(0));
     for (&dense_q4, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i)) / 17.0 - 4.0;
     const raw_q4 = try quant_codec.quantizeQ4_KFromF32(allocator, &dense_q4);
     defer allocator.free(raw_q4);
@@ -48267,7 +48267,7 @@ test "embeddingLookup dequantizes quantized GGUF rows" {
     const q4_out_ct = try cb.embeddingLookup(q4_weight_ct, &q4_ids, q4_ids.len, 256);
     defer cb.free(q4_out_ct);
 
-    var expected_q4 = [_]f32{0} ** 256;
+    var expected_q4 = @as([256]f32, @splat(0));
     try quant_codec.dequantizeRow(.{ .known = .Q4_K }, raw_q4, 256, 0, &expected_q4);
     const q4_out = getData(q4_out_ct);
     for (q4_out[0..256], expected_q4) |actual, expected| {
@@ -49220,7 +49220,7 @@ test "reshape preserves symbolic target shape when dims remain unresolved" {
     var compute = NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
 
-    var data = [_]f32{0.0} ** (76 * 8 * 76 * 64);
+    var data = @as([(76 * 8 * 76 * 64)]f32, @splat(0.0));
     const in_ct = try compute.makeBuf(data[0..], false);
     defer freeTensor(&compute, in_ct);
 
@@ -49251,7 +49251,7 @@ test "reshape resolves symbolic source dims using data len" {
     var compute = NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
 
-    var data = [_]f32{0.0} ** (77 * 512);
+    var data = @as([(77 * 512)]f32, @splat(0.0));
     const raw = try compute.makeBuf(data[0..], false);
     defer freeTensor(&compute, raw);
     const symbolic = try compute.withLogicalShape(raw, &.{ -1, -1, 512 });
@@ -50396,7 +50396,7 @@ test "sdpa rejects mixed token-major and head-major layouts" {
     var compute = NativeCompute.init(allocator, &weight_store, null);
     defer compute.deinit();
 
-    var data = [_]f32{0} ** 8;
+    var data = @as([8]f32, @splat(0));
     const q_ct = try compute.withLogicalShape(try compute.makeBuf(&data, false), &.{ 2, 4 });
     defer freeTensor(&compute, q_ct);
     const k_ct = try compute.withLogicalShape(try compute.makeBuf(&data, false), &.{ 1, 2, 2, 2 });
@@ -50505,7 +50505,7 @@ test "ComputeBackend scaledDotProductAttention call site exercises flash layout"
     defer allocator.free(v_data);
     const bias_data = try allocator.alloc(f32, bh * seq_len * seq_len);
     defer allocator.free(bias_data);
-    var mask = [_]i64{1} ** (batch * seq_len);
+    var mask = @as([(batch * seq_len)]i64, @splat(1));
 
     for (0..total) |i| {
         q_data[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 23)) - 11)) * 0.07;

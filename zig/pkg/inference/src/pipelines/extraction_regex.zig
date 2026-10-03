@@ -200,7 +200,7 @@ pub const Program = struct {
         while (!matched) {
             const raw = properties.next() orelse break;
             try work.tick();
-            const property: Property = @enumFromInt(raw);
+            const property: Property = @fromBackingInt(@intCast(raw));
             const digit = if (self.flags.ascii) cp >= '0' and cp <= '9' else unicodeDigit(cp);
             matched = switch (property) {
                 .digit => digit,
@@ -536,8 +536,8 @@ const Parser = struct {
         return @intCast(value);
     }
     fn propertyNode(self: *Parser, property: Property) !u32 {
-        var properties = Properties.initEmpty();
-        properties.set(@intFromEnum(property));
+        var properties = Properties.empty;
+        properties.set(@backingInt(property));
         const index: u32 = @intCast(self.classes.items.len);
         try self.classes.append(self.allocator, .{ .ranges = &.{}, .properties = properties, .negated = false });
         return self.node(.{ .class = index });
@@ -554,7 +554,7 @@ const Parser = struct {
     }
     fn characterClass(self: *Parser) !u32 {
         var ranges = std.ArrayListUnmanaged(Range).empty;
-        var properties = Properties.initEmpty();
+        var properties = Properties.empty;
         const negated = self.peek() == '^';
         if (negated) self.position += 1;
         var first = true;
@@ -573,7 +573,7 @@ const Parser = struct {
                 try self.addRange(&ranges, left.literal, right.literal);
             } else switch (left) {
                 .literal => |cp| try self.addRange(&ranges, cp, cp),
-                .property => |property| properties.set(@intFromEnum(property)),
+                .property => |property| properties.set(@backingInt(property)),
                 .assertion => return error.InvalidExtractionRegex,
             }
         }
@@ -766,7 +766,7 @@ test "extraction regex compilation and nonlinear looking patterns have hard boun
     try std.testing.expectError(error.ExtractionRegexLimitExceeded, compile(allocator, "a", 2, .{ .max_steps = 0 }));
     var program = try compile(allocator, "(a+)+b", 0, .{});
     defer program.deinit();
-    const text = [_]u8{'a'} ** 4096;
+    const text = @as([4096]u8, @splat('a'));
     try std.testing.expectError(error.ExtractionRegexLimitExceeded, program.run(allocator, &text, .search, .{ .max_steps = 32 }));
     try std.testing.expect(!(try program.run(allocator, &text, .search, .{ .max_steps = 100000 })).matched);
     try std.testing.expectError(error.ExtractionRegexLimitExceeded, program.run(allocator, "long", .search, .{ .max_text_bytes = 1 }));
@@ -792,7 +792,7 @@ test "extraction regex cancellation propagates from compile and active simulatio
     var program = try compile(allocator, "a+b", 0, .{});
     defer program.deinit();
     var checks: usize = 0;
-    const text = [_]u8{'a'} ** 1024;
+    const text = @as([1024]u8, @splat('a'));
     try std.testing.expectError(error.Cancelled, program.run(allocator, &text, .search, .{ .control = .{ .ptr = &checks, .check_fn = Cancel.later } }));
     try std.testing.expectEqual(@as(usize, 3), checks);
 }

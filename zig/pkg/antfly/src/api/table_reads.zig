@@ -371,7 +371,7 @@ const AuthoritativePayloadLookup = struct {
     options: db_mod.types.LookupOptions,
     owned_fields: []const []const u8 = &.{},
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.owned_fields.len > 0) alloc.free(self.owned_fields);
         self.* = undefined;
     }
@@ -463,7 +463,7 @@ const ScanResponseCapture = struct {
         return .{ .alloc = alloc, .max_bytes = if (opts.isRelational()) 16 * 1024 * 1024 else std.math.maxInt(usize) };
     }
 
-    fn deinit(self: *ScanResponseCapture) void {
+    pub fn deinit(self: *ScanResponseCapture) void {
         self.bytes.deinit(self.alloc);
     }
 
@@ -640,7 +640,7 @@ const PhysicalProvisionedTableReadCache = struct {
         active_leases: usize = 0,
         retired: bool = false,
 
-        fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             self.db.close();
             alloc.free(self.table_name);
             self.* = undefined;
@@ -688,7 +688,7 @@ const PhysicalProvisionedTableReadCache = struct {
         identity_namespace: ?db_mod.DocIdentityNamespace = null,
         table_name: []u8,
 
-        fn deinit(self: *PendingOpen, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PendingOpen, alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             self.* = undefined;
         }
@@ -1805,7 +1805,7 @@ const PhysicalLocalQueryDbOwner = union(enum) {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         switch (self.*) {
             .resident => |*resident| resident.lease.release(resident.alloc),
             .cached => |*cached| cached.release(),
@@ -1823,7 +1823,7 @@ const LocalQueryDbOwner = if (control_only_storage_sources) struct {
         unreachable;
     }
 
-    fn deinit(_: *@This()) void {
+    pub fn deinit(_: *@This()) void {
         unreachable;
     }
 } else PhysicalLocalQueryDbOwner;
@@ -2181,14 +2181,14 @@ const FanoutIo = struct {
 };
 
 fn ioAsyncLimitWidth(io_impl: FanoutIo, group_count: usize) usize {
-    const raw = @intFromEnum(io_impl.async_limit);
+    const raw = @backingInt(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return @max(@as(usize, 1), group_count);
     return @max(@as(usize, 1), @min(group_count, raw));
 }
 
 fn ioAsyncLimitCap(io_impl: FanoutIo) usize {
-    const raw = @intFromEnum(io_impl.async_limit);
+    const raw = @backingInt(io_impl.async_limit);
     if (raw == 0) return 1;
     if (raw == std.math.maxInt(usize)) return std.math.maxInt(usize);
     return @max(@as(usize, 1), raw);
@@ -3315,7 +3315,7 @@ pub const ProvisionedTableReadSource = struct {
             self.activity = null;
         }
 
-        fn deinit(self: *PreparedKeyRead) void {
+        pub fn deinit(self: *PreparedKeyRead) void {
             self.releaseActivity();
         }
 
@@ -3356,7 +3356,7 @@ pub const ProvisionedTableReadSource = struct {
             self.activity = null;
         }
 
-        fn deinit(self: *PreparedSpanRead) void {
+        pub fn deinit(self: *PreparedSpanRead) void {
             self.releaseActivity();
             self.alloc.free(self.routes);
             self.routes = &.{};
@@ -8167,7 +8167,7 @@ const TextStatsFanoutSlot = struct {
         };
     }
 
-    fn deinit(self: *TextStatsFanoutSlot) void {
+    pub fn deinit(self: *TextStatsFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -8184,7 +8184,7 @@ const SearchFanoutSlot = struct {
         };
     }
 
-    fn deinit(self: *SearchFanoutSlot) void {
+    pub fn deinit(self: *SearchFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -8201,7 +8201,7 @@ const PreflightFanoutSlot = struct {
         };
     }
 
-    fn deinit(self: *PreflightFanoutSlot) void {
+    pub fn deinit(self: *PreflightFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -9749,7 +9749,7 @@ const HierarchyNavigationLookupSlot = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(alloc) };
     }
 
-    fn deinit(self: *HierarchyNavigationLookupSlot) void {
+    pub fn deinit(self: *HierarchyNavigationLookupSlot) void {
         if (self.response) |*response| response.deinit(self.arena.allocator());
         self.arena.deinit();
         self.* = undefined;
@@ -9880,7 +9880,7 @@ fn hydrateDistributedGroupedUnitHits(
             return .{ .arena = std.heap.ArenaAllocator.init(inner_alloc) };
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             const arena = self.arena.allocator();
             if (self.stored_response) |*response| response.deinit(arena);
             if (self.unit_response) |*response| response.deinit(arena);
@@ -13228,7 +13228,7 @@ const RangeCardinalityPlan = struct {
     ranges: []db_mod.algebraic.index.CardinalityRangeRequest,
     children: []db_mod.algebraic.index.CardinalityChildRequest,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.ranges) |range| {
             alloc.free(@constCast(range.name));
             if (range.start) |value| alloc.free(@constCast(value));
@@ -13246,7 +13246,7 @@ const HistogramCardinalityPlan = struct {
     date_bucket: []const u8 = "",
     children: []db_mod.algebraic.index.CardinalityChildRequest,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.date_bucket.len > 0) alloc.free(@constCast(self.date_bucket));
         if (self.children.len > 0) alloc.free(self.children);
         self.* = undefined;
@@ -15468,7 +15468,7 @@ const RerankerDocuments = struct {
         return .{ .alloc = alloc, .texts = texts, .owned_parts = owned_parts, .text_parts = text_parts, .parts_view = parts_view };
     }
 
-    fn deinit(self: *RerankerDocuments) void {
+    pub fn deinit(self: *RerankerDocuments) void {
         for (self.texts[0..self.initialized]) |text| self.alloc.free(text);
         for (self.owned_parts) |maybe_parts| if (maybe_parts) |parts| template_mod.freeContentParts(self.alloc, parts);
         self.alloc.free(self.texts);
@@ -16822,7 +16822,7 @@ fn consumerTests() type {
                     self.opens_since_capture = 0;
                     return .{ .ptr = self, .vtable = &.{ .validate = validate, .open = open, .release = release } };
                 }
-                fn validate(ptr: *anyopaque) !void {
+                pub fn validate(ptr: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(self.held);
                     if (self.fail_final_validation and self.opens_since_capture == 2) {
@@ -16955,7 +16955,7 @@ fn consumerTests() type {
                     fixture: *Self,
                     group: u64,
                     held: bool = false,
-                    fn validate(ptr: *anyopaque) !void {
+                    pub fn validate(ptr: *anyopaque) !void {
                         const self: *@This() = @ptrCast(@alignCast(ptr));
                         try std.testing.expect(self.held);
                     }
@@ -17447,7 +17447,7 @@ fn consumerTests() type {
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expect(std.mem.indexOf(u8, req.uri, "_primary_digest=true") != null);
-                    const digest = std.fmt.bytesToHex([_]u8{0xab} ** 32, .lower);
+                    const digest = std.fmt.bytesToHex(@as([32]u8, @splat(0xab)), .lower);
                     const headers = try allocator.alloc(http_common.Header, if (self.mode == .missing) 1 else 2);
                     headers[0] = .{ .name = try allocator.dupe(u8, "X-Antfly-Version"), .value = try allocator.dupe(u8, "77") };
                     if (headers.len == 2) headers[1] = .{
@@ -17462,7 +17462,7 @@ fn consumerTests() type {
             var response = (try lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index)).?;
             defer response.deinit(alloc);
             try std.testing.expectEqual(@as(u64, 77), response.version);
-            try std.testing.expectEqualSlices(u8, &([_]u8{0xab} ** 32), &response.expected_content_digest.?);
+            try std.testing.expectEqualSlices(u8, &(@as([32]u8, @splat(0xab))), &response.expected_content_digest.?);
             capture.mode = .missing;
             try std.testing.expectError(error.InvalidResponse, lookupRemote(executor, alloc, "http://worker", 7, "rows", "row", .{ .include_primary_digest = true }, .read_index));
             capture.mode = .invalid;
@@ -17713,7 +17713,7 @@ fn consumerTests() type {
                 starts: usize = 0,
                 bytes: std.ArrayListUnmanaged(u8) = .empty,
 
-                fn deinit(self: *@This()) void {
+                pub fn deinit(self: *@This()) void {
                     self.bytes.deinit(self.alloc);
                 }
 
@@ -21277,7 +21277,7 @@ fn consumerTests() type {
                     for (scores, 0..) |*score, i| score.* = @floatFromInt(i);
                     return scores;
                 }
-                fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const template_mod.ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
+                pub fn rerankDocuments(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const u8, documents: []const []const template_mod.ContentPart, _: inference_request_context.RequestContext) anyerror![]f32 {
                     const state: *@This() = @ptrCast(@alignCast(ptr));
                     state.document_calls += 1;
                     try std.testing.expectEqual(@as(usize, 2), documents.len);
@@ -21676,8 +21676,7 @@ fn consumerTests() type {
                 .path = &.{ .{ .key = "start" }, .{ .key = "node" } },
             }));
 
-            const too_many_path_nodes = [_]indexes_openapi.GraphPathEndpoint{.{ .key = "node" }} **
-                (graph_pattern_mod.max_pattern_hops + 2);
+            const too_many_path_nodes = @as([(graph_pattern_mod.max_pattern_hops + 2)]indexes_openapi.GraphPathEndpoint, @splat(.{ .key = "node" }));
             try std.testing.expectError(
                 error.InvalidRemoteResponse,
                 validateRemoteCanonicalGraphPathNodes(&too_many_path_nodes),
@@ -21753,7 +21752,7 @@ fn consumerTests() type {
                 error.InvalidRemoteResponse,
                 validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
             );
-            edges[0].type = "x" ** (graph_edge_type.max_bytes + 1);
+            edges[0].type = z17RepeatString("x", (graph_edge_type.max_bytes + 1));
             try std.testing.expectError(
                 error.InvalidRemoteResponse,
                 validateRemoteCanonicalGraphPathEdges(path.nodes, path.edges),
@@ -21890,11 +21889,11 @@ fn consumerTests() type {
 
             const receive_path_raw = try std.fmt.allocPrint(alloc, "{s}/received.wal", .{root});
             defer alloc.free(receive_path_raw);
-            const receive_path = try alloc.dupeZ(u8, receive_path_raw);
+            const receive_path = try alloc.dupeSentinel(u8, receive_path_raw, 0);
             defer alloc.free(receive_path);
             const progress_path_raw = try std.fmt.allocPrint(alloc, "{s}/progress.wal", .{root});
             defer alloc.free(progress_path_raw);
-            const progress_path = try alloc.dupeZ(u8, progress_path_raw);
+            const progress_path = try alloc.dupeSentinel(u8, progress_path_raw, 0);
             defer alloc.free(progress_path);
 
             var standby = try hot_standby_standby_mod.Standby.open(alloc, receive_path.ptr, progress_path.ptr, .{
@@ -23843,8 +23842,8 @@ fn consumerTests() type {
             var validates_generation_projection: usize = 0;
             var fail_closed_before_fanout: usize = 0;
 
-            inline for (std.meta.fields(DocIdentityInternalWorkerBoundary)) |field| {
-                const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, field.name);
+            inline for (comptime std.meta.fieldNames(DocIdentityInternalWorkerBoundary)) |reflected_name| {
+                const boundary: DocIdentityInternalWorkerBoundary = @field(DocIdentityInternalWorkerBoundary, reflected_name);
                 switch (docIdentityInternalWorkerPolicy(boundary)) {
                     .carries_shard_doc_set => carries_shard_doc_set += 1,
                     .validates_generation_projection => validates_generation_projection += 1,
@@ -29867,7 +29866,7 @@ fn implementationTests() type {
             // the caller's effort. Not the whole index, the page, or text alone.
             // Vector windows come from single-index searches on the same DB, so
             // approximate tail ordering cannot make the expectation flaky.
-            var in_domain = [_]bool{false} ** 2200;
+            var in_domain = @as([2200]bool, @splat(false));
             for (0..2200) |i| in_domain[i] = i % 50 == 0;
             for (req.dense_queries) |dense_query| {
                 var window = try db.search(alloc, .{ .dense_queries = &.{dense_query}, .limit = 30 });
@@ -34551,4 +34550,15 @@ fn expectGraphMetricJsonStatus(
         },
     }
     try ant_json.testing.expectSubsetJsonText(alloc, expected_out.written(), actual_json);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

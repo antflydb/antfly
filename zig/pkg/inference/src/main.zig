@@ -109,8 +109,8 @@ fn validateKnownObjectFields(comptime T: type, object: std.json.ObjectMap) !void
     var iterator = object.iterator();
     while (iterator.next()) |entry| {
         var known = false;
-        inline for (std.meta.fields(T)) |field| {
-            if (std.mem.eql(u8, entry.key_ptr.*, field.name)) known = true;
+        inline for (comptime std.meta.fieldNames(T)) |reflected_name| {
+            if (std.mem.eql(u8, entry.key_ptr.*, reflected_name)) known = true;
         }
         if (!known) return error.InvalidInferenceConfig;
     }
@@ -188,8 +188,9 @@ fn parseOptionalBackendType(value: ?[]const u8) !?inference.backends.BackendType
 }
 
 fn parsePreloadModelKind(value: []const u8) ?inference.server.WarmModelKind {
-    inline for (std.meta.fields(inference.server.WarmModelKind)) |field| {
-        if (std.mem.eql(u8, value, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(inference.server.WarmModelKind).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, value, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return null;
 }
@@ -677,7 +678,7 @@ test "run server option loop consumes max loaded models override" {
     try std.testing.expectEqual(@as(usize, 0), index);
 }
 
-fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
+pub fn listModels(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !void {
     var models_dir: []const u8 = defaultModelsDir(allocator);
     if (args.len > 0 and !std.mem.startsWith(u8, args[0], "--")) {
         models_dir = args[0];

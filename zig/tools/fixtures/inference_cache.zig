@@ -51,7 +51,7 @@ pub fn build(b: *std.Build) void {
                 else => {},
             };
             const run = b.addRunArtifact(artifact);
-            _ = run.addOutputFileArg("pilot.jsonl");
+            _ = run.addOutputFileArg2("pilot.jsonl", .{ .make_absolute = true });
             run.addArg("2");
             b.step("cache-pilot", "Generate actual pilot data").dependOn(&run.step);
             pilot_found = true;

@@ -167,7 +167,7 @@ const TraversalAncestry = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(alloc), .work_budget = work_budget };
     }
 
-    fn deinit(self: *TraversalAncestry) void {
+    pub fn deinit(self: *TraversalAncestry) void {
         self.work_budget.releaseStateBytes(self.retained_bytes);
         self.arena.deinit();
         self.* = undefined;

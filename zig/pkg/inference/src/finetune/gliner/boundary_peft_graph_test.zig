@@ -142,7 +142,7 @@ fn peftOracle(comptime resident: bool) !void {
         var session = try training.Session.init(a, &result.graph, &seeds, wrt.items, .{ .gradient = .{ .require_all_gradients = true }, .max_tape_bytes = 4 * 1024 * 1024 });
         defer session.deinit();
         try resident_fixture.validate(a, &session);
-        const identity = training.StepIdentity{ .binding = .{0x93} ** 32, .optimizer_step = case.replay.optimizer_step, .microbatch = case.replay.micro_batch };
+        const identity = training.StepIdentity{ .binding = @splat(0x93), .optimizer_step = case.replay.optimizer_step, .microbatch = case.replay.micro_batch };
         var tape = try session.forward(&cb, runtime.items, identity, null);
         defer tape.deinit();
         var cotangents = std.ArrayListUnmanaged(ops.CT).empty;
@@ -160,7 +160,7 @@ fn peftOracle(comptime resident: bool) !void {
                 return err;
             };
         }
-        const decisions = [_]u8{0x67} ** 32;
+        const decisions = @as([32]u8, @splat(0x67));
         try tape.sealDecisions(decisions);
         var backward = try tape.backward(identity, decisions, case.loss, cotangents.items, null);
         defer backward.deinit(&cb);
@@ -217,8 +217,8 @@ test "GLiNER2.5 PEFT admission targets replay and function preserving initializa
     try std.testing.expectEqualSlices(f32, &.{ 0, 0, 0, 0, 0, 0 }, initial.b);
     try std.testing.expectEqualSlices(f32, &.{ @sqrt(@as(f32, 30)), 3, 1 }, initial.magnitude.?);
     for (initial.a) |value| try std.testing.expect(value >= -0.5 and value < 0.5);
-    try std.testing.expectError(error.InvalidBoundaryPeftNorm, peft.initialize(a, adapter, &([_]f32{0} ** 12), 123));
-    try std.testing.expectError(error.NonFiniteBoundaryPeftWeight, peft.initialize(a, adapter, &([_]f32{std.math.inf(f32)} ** 12), 123));
+    try std.testing.expectError(error.InvalidBoundaryPeftNorm, peft.initialize(a, adapter, &(@as([12]f32, @splat(0))), 123));
+    try std.testing.expectError(error.NonFiniteBoundaryPeftWeight, peft.initialize(a, adapter, &(@as([12]f32, @splat(std.math.inf(f32)))), 123));
     var first: [8]f32 = undefined;
     var second: [8]f32 = undefined;
     const replay = peft.Replay{ .seed = 10, .optimizer_step = 20, .micro_batch = 30 };
@@ -235,7 +235,7 @@ test "GLiNER2.5 PEFT admission targets replay and function preserving initializa
 fn allocationFailure(a: Allocator, graph: *const ml.Graph) !void {
     var result = try peft.inject(a, graph, .{ .kind = .dora, .rank = 2, .alpha = 3, .dropout = 0.25, .targets = targets }, .{});
     defer result.deinit();
-    var initial = try peft.initialize(a, result.adapters[0], &([_]f32{1} ** 12), 1);
+    var initial = try peft.initialize(a, result.adapters[0], &(@as([12]f32, @splat(1))), 1);
     defer initial.deinit();
     var mask: [8]f32 = undefined;
     try peft.fillDropout(result.uses[0], .{ .seed = 1, .optimizer_step = 0, .micro_batch = 0 }, &mask);

@@ -274,7 +274,7 @@ const ServerlessHealthSource = struct {
 
     fn writeMetrics(ptr: *anyopaque, writer: *std.Io.Writer) anyerror!void {
         const self: *ServerlessHealthSource = @ptrCast(@alignCast(ptr));
-        try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(self.supervisor.currentState()));
+        try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(self.supervisor.currentState()));
         try antfly.common.prometheus.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
         const run_stats = self.srv.stack.runtime.metricsSnapshot();
         const query_metrics = self.srv.stack.query.metricsSnapshot();
@@ -511,7 +511,7 @@ const ConfiguredStorageUris = struct {
         return out;
     }
 
-    fn deinit(self: *ConfiguredStorageUris, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ConfiguredStorageUris, alloc: std.mem.Allocator) void {
         if (self.artifacts) |value| alloc.free(value);
         if (self.manifests) |value| alloc.free(value);
         if (self.wal) |value| alloc.free(value);

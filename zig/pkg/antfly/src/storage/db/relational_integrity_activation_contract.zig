@@ -102,8 +102,8 @@ pub const Progress = struct {
         @memcpy(out[4..36], &self.generation_set);
         @memcpy(out[36..68], &self.owner);
         std.mem.writeInt(u32, out[68..72], self.schema_version, .little);
-        out[72] = @intFromEnum(self.state);
-        out[73] = @intFromEnum(self.phase);
+        out[72] = @backingInt(self.state);
+        out[73] = @backingInt(self.phase);
         @memset(out[74..76], 0);
         std.mem.writeInt(u64, out[76..84], self.rows_scanned, .little);
         std.mem.writeInt(u32, out[84..88], @intCast(self.cursor.len), .little);
@@ -131,7 +131,7 @@ pub const Progress = struct {
                 2 => .invalid,
                 else => unreachable,
             },
-            .phase = @enumFromInt(bytes[73]),
+            .phase = @fromBackingInt(bytes[73]),
             .rows_scanned = std.mem.readInt(u64, bytes[76..84], .little),
             .cursor = payload[0..cursor_len],
             .failure = payload[cursor_len..],

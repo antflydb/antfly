@@ -41,7 +41,7 @@ pub const ReadAuthority = struct {
     fn selfFrom(ptr: *anyopaque) *@This() {
         return @ptrCast(@alignCast(ptr));
     }
-    fn deinit(_: Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: Allocator, _: *anyopaque) void {}
     fn make(_: *anyopaque, _: []const u8, _: storage.BucketOptions) !void {
         return error.ExternalTableReadOnly;
     }

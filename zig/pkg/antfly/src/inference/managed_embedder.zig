@@ -416,7 +416,7 @@ const BedrockCredentialPool = struct {
         return cache;
     }
 
-    fn deinit(self: *BedrockCredentialPool) void {
+    pub fn deinit(self: *BedrockCredentialPool) void {
         var iterator = self.by_region.iterator();
         while (iterator.next()) |entry| {
             entry.value_ptr.*.deinit(self.alloc);
@@ -662,7 +662,7 @@ pub const ManagedEmbeddingEntry = struct {
         return &fallback.*.?;
     }
 
-    fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ManagedEmbeddingEntry, alloc: std.mem.Allocator) void {
         std.debug.assert(self.alloc.ptr == alloc.ptr);
         if (self.quota) |*quota| quota.release();
         alloc.free(self.index_name);
@@ -4422,7 +4422,7 @@ const CatalogSemanticExecutionBinding = struct {
     project_id: []u8,
     embedded: bool,
 
-    fn deinit(self: *CatalogSemanticExecutionBinding, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CatalogSemanticExecutionBinding, alloc: std.mem.Allocator) void {
         alloc.free(self.endpoint);
         if (self.region.len > 0) alloc.free(self.region);
         if (self.project_id.len > 0) alloc.free(self.project_id);
@@ -5388,7 +5388,7 @@ pub fn testSingleMultimodalEmbeddingAdmission() !void {
     try std.testing.expectEqual(@as(u64, 6), shape.decoded_pixels);
     try std.testing.expectEqual(@as(usize, 1), shape.max_media_parts_per_item);
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
@@ -5869,7 +5869,7 @@ test "managed embedder metadata text-only windows respect the complete envelope 
 
 test "managed embedder metadata envelope sizing includes binary framing and payload" {
     const alloc = std.testing.allocator;
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
@@ -5894,7 +5894,7 @@ test "managed embedder metadata envelope sizing includes binary framing and payl
 
 test "managed embedder metadata ceiling splits mixed batches before dispatch" {
     const alloc = std.testing.allocator;
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
@@ -5934,7 +5934,7 @@ test "managed embedder metadata ceiling splits mixed batches before dispatch" {
 }
 
 test "managed embedder admission follows the selected attachment transport" {
-    var bytes = [_]u8{0} ** 24;
+    var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
@@ -6403,7 +6403,7 @@ fn resolveOptionalConfigString(
 }
 
 fn resolveOptionalEnv(alloc: std.mem.Allocator, env_name: []const u8) ?[]u8 {
-    const name_z = alloc.dupeZ(u8, env_name) catch return null;
+    const name_z = alloc.dupeSentinel(u8, env_name, 0) catch return null;
     defer alloc.free(name_z);
     const value_z = getenv(name_z.ptr) orelse return null;
     return alloc.dupe(u8, std.mem.span(value_z)) catch null;
@@ -8742,7 +8742,7 @@ pub fn testFileBackedApiKeyRotation() !void {
         headers: [2]?[]u8 = .{ null, null },
         count: usize = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (&self.headers) |*header| {
                 if (header.*) |value| self.alloc.free(value);
                 header.* = null;

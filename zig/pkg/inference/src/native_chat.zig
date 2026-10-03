@@ -166,7 +166,7 @@ const ChatHistory = struct {
         return self;
     }
 
-    fn deinit(self: *ChatHistory) void {
+    pub fn deinit(self: *ChatHistory) void {
         self.arena.deinit();
     }
 

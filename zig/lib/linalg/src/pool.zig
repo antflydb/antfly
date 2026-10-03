@@ -46,7 +46,7 @@ const SyncPool = struct {
         }
     }
 
-    fn deinit(self: *SyncPool) void {
+    pub fn deinit(self: *SyncPool) void {
         if (comptime supports_sync_parallelism) self.io_impl.deinit();
     }
 

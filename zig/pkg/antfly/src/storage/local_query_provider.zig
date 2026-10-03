@@ -339,7 +339,7 @@ fn fail(
         err,
         .local_query,
         abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }

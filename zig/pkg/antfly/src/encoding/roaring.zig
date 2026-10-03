@@ -38,7 +38,7 @@ const Container = union(enum) {
     array: std.ArrayListUnmanaged(u16),
     bitmap: []u64, // always bitmap_words long
 
-    fn deinit(self: *Container, alloc: Allocator) void {
+    pub fn deinit(self: *Container, alloc: Allocator) void {
         switch (self.*) {
             .array => |*a| a.deinit(alloc),
             .bitmap => |b| alloc.free(b),
@@ -498,7 +498,7 @@ fn andNotContainers(_: Allocator, self: *Container, other: *const Container) voi
 
 fn cloneContainer(alloc: Allocator, src: *const Container) !Container {
     return switch (src.*) {
-        .array => |*a| .{ .array = .{ .items = try alloc.dupe(u16, a.items), .capacity = a.items.len } },
+        .array => |*a| .{ .array = .{ .items = try alloc.dupe(u16, a.items), .capacity = a.items.len, .pointer_stability = .{} } },
         .bitmap => |b| .{ .bitmap = try alloc.dupe(u64, b) },
     };
 }
@@ -1039,6 +1039,7 @@ fn shiftArrayContainer(alloc: Allocator, items: []const u16, low_offset: u16) !S
                 .array = .{
                     .items = try alloc.dupe(u16, items),
                     .capacity = items.len,
+                    .pointer_stability = .{},
                 },
             },
         };

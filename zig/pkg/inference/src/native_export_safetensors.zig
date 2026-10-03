@@ -68,7 +68,7 @@ const TensorPlan = struct {
     dtype: tensor_mod.DType,
     byte_len: usize,
 
-    fn deinit(self: *TensorPlan, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TensorPlan, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         allocator.free(self.shape);
     }
@@ -78,7 +78,7 @@ const Plan = struct {
     tensors: []TensorPlan,
     data_bytes: u64,
 
-    fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Plan, allocator: std.mem.Allocator) void {
         for (self.tensors) |*tensor| tensor.deinit(allocator);
         allocator.free(self.tensors);
     }
@@ -166,11 +166,11 @@ fn writeSafetensorsControlled(allocator: std.mem.Allocator, access: tensor_acces
     while ((header.written().len % 8) != 0) try writer.writeByte(' ');
 
     if (std.fs.path.dirname(output_path)) |dir| {
-        if (dir.len > 0) try compat.cwd().createDirPath(compat.io(), dir);
+        if (dir.len > 0) try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir);
     }
 
-    const io = compat.io();
-    var file = try compat.cwd().createFile(io, output_path, .{ .truncate = true });
+    const io = compat.testingIo();
+    var file = try std.Io.Dir.cwd().createFile(io, output_path, .{ .truncate = true });
     defer file.close(io);
 
     var size_buf: [8]u8 = undefined;
@@ -280,9 +280,9 @@ test "writeSafetensors emits sorted header and tensor payloads" {
 
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/antfly-inference-safetensors-export-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
 
     const out_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors" });
     defer allocator.free(out_path);

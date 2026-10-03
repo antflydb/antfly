@@ -39,8 +39,6 @@ def policy_values(policy: dict) -> dict[str, str]:
         "go_version": policy["go"]["version"],
         "npm_version": policy["npm"]["version"],
         "zig_version": policy["zig"]["version"],
-        "zig_nix_attribute": policy["zig"]["nixAttribute"],
-        "zig_nixpkgs_revision": policy["zig"]["nixpkgsRevision"],
         "zig_x86_64_linux_sha256": policy["zig"]["x86_64LinuxSha256"],
         "zig_aarch64_linux_sha256": policy["zig"]["aarch64LinuxSha256"],
         "macos_cross_sdk_version": policy["macosCrossSdk"]["version"],
@@ -243,8 +241,6 @@ def validate(policy: dict) -> list[str]:
     for policy_output in (
         "steps.toolchain.outputs.python_build",
         "steps.toolchain.outputs.zig_version",
-        "steps.toolchain.outputs.zig_nix_attribute",
-        "steps.toolchain.outputs.zig_nixpkgs_revision",
         "steps.toolchain.outputs.zig_x86_64_linux_sha256",
         "steps.toolchain.outputs.macos_cross_sdk_version",
         "steps.toolchain.outputs.macos_cross_sdk_sha256",
@@ -316,7 +312,6 @@ def validate(policy: dict) -> list[str]:
     diagnose_workflow_path = ".github/workflows/diagnose-zig-arm64-bad-alloc.yml"
     diagnose_workflow = (REPO_ROOT / diagnose_workflow_path).read_text()
     for policy_output in (
-        "steps.toolchain.outputs.zig_nixpkgs_revision",
         "steps.toolchain.outputs.macos_cross_sdk_version",
         "steps.toolchain.outputs.macos_cross_sdk_sha256",
     ):
@@ -370,8 +365,6 @@ def main() -> int:
             "go",
             "npm",
             "zig",
-            "zig-nix-attribute",
-            "zig-nixpkgs-revision",
             "zig-x86_64-linux-sha256",
             "zig-aarch64-linux-sha256",
             "macos-cross-sdk-version",
@@ -397,8 +390,6 @@ def main() -> int:
             "go": values["go_version"],
             "npm": values["npm_version"],
             "zig": values["zig_version"],
-            "zig-nix-attribute": values["zig_nix_attribute"],
-            "zig-nixpkgs-revision": values["zig_nixpkgs_revision"],
             "zig-x86_64-linux-sha256": values["zig_x86_64_linux_sha256"],
             "zig-aarch64-linux-sha256": values["zig_aarch64_linux_sha256"],
             "macos-cross-sdk-version": values["macos_cross_sdk_version"],

@@ -524,7 +524,7 @@ test "encode and decode roundtrip - single value" {
 
 test "encode and decode roundtrip - all zeros" {
     const alloc = std.testing.allocator;
-    const values = [_]u32{0} ** 12;
+    const values = @as([12]u32, @splat(0));
 
     const encoded = try encode(alloc, &values);
     defer alloc.free(encoded.control);
@@ -577,7 +577,7 @@ test "historical short tail fixture decodes without zero-filled output" {
     const control = [_]u8{0xe4};
     const data = [_]u8{ 0x00, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03 };
     const expected = [_]u32{ 0, 256, 131072, 50331648 };
-    var destination = [_]u32{0xDEADBEEF} ** 4;
+    var destination = @as([4]u32, @splat(0xDEADBEEF));
 
     const result = decodeInto(&control, &data, &destination);
     try std.testing.expectEqual(@as(usize, 4), result.decoded);
@@ -597,8 +597,8 @@ test "decodeInto matches independent scalar reference across controls and short 
         var data: [16]u8 = undefined;
         for (&data) |*byte| byte.* = random.int(u8);
 
-        var production_storage = [_]u32{0xDEADBEEF} ** 6;
-        var reference_storage = [_]u32{0xDEADBEEF} ** 6;
+        var production_storage = @as([6]u32, @splat(0xDEADBEEF));
+        var reference_storage = @as([6]u32, @splat(0xDEADBEEF));
         const production = decodeInto(&control, data[0..data_len_table[control[0]]], production_storage[1..5]);
         const reference = try decodeScalarReference(&control, data[0..data_len_table[control[0]]], reference_storage[1..5]);
         try std.testing.expectEqual(reference.decoded, production.decoded);
@@ -674,7 +674,7 @@ test "SIMD group decoder handles every control byte" {
         try std.testing.expectEqual(ctrl, encoded.control[0]);
         try std.testing.expectEqual(@as(usize, data_len_table[ctrl]), encoded.data.len);
 
-        var padded: [16]u8 = .{0} ** 16;
+        var padded: [16]u8 = @splat(0);
         @memcpy(padded[0..encoded.data.len], encoded.data);
 
         var decoded: [4]u32 = undefined;

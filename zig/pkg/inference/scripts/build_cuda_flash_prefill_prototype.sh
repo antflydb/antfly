@@ -13,7 +13,7 @@ output_dir="${1:-/tmp/antfly-cuda-flash-prefill-stage1}"
 cuda_root="${CUDA_HOME:-/usr/local/cuda}"
 nvcc="${cuda_root}/bin/nvcc"
 cuobjdump="${cuda_root}/bin/cuobjdump"
-zig="${ANTFLY_ZIG:-${repo_dir}/.tools/zig-x86_64-linux-0.16.0/zig}"
+zig="${ANTFLY_ZIG:-${repo_dir}/.tools/zig-x86_64-linux-0.17.0/zig}"
 cuda_source="${inference_dir}/src/ops/cuda/prototypes/gqa_flash_prefill_f16_sm89.cu"
 harness_source="${inference_dir}/src/quant_kernel_cuda_flash_prefill_prototype.zig"
 cubin="${output_dir}/gqa_flash_prefill_f16_sm89.cubin"
@@ -58,14 +58,14 @@ fi
 "${zig}" test \
     -lc \
     "${harness_source}" \
-    -O ReleaseSafe \
+    -O safe \
     --cache-dir "${output_dir}/zig-cache" \
     --global-cache-dir "${output_dir}/zig-global-cache"
 
 "${zig}" build-exe \
     -lc \
     "${harness_source}" \
-    -O ReleaseSafe \
+    -O safe \
     -femit-bin="${harness}" \
     --cache-dir "${output_dir}/zig-cache" \
     --global-cache-dir "${output_dir}/zig-global-cache"

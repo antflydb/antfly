@@ -173,7 +173,7 @@ pub fn run(gpa: std.mem.Allocator, io: std.Io, options: Options) !Report {
     var by_kind: [3]?Metrics = .{ null, null, null };
     for (0..3) |kind| {
         var subset: std.ArrayListUnmanaged(Scored) = .empty;
-        for (scored) |item| if (@intFromEnum(item.kind) == kind) try subset.append(a, item);
+        for (scored) |item| if (@backingInt(item.kind) == kind) try subset.append(a, item);
         if (subset.items.len > 0) by_kind[kind] = metrics(subset.items);
     }
     _ = io;

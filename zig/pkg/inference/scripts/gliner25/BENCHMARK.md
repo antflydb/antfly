@@ -33,7 +33,7 @@ and source checkout. No model download is performed.
 Build from `zig/`, through the repository graph:
 
 ```sh
-zig build inference-bench-gliner25-cpu-build -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1
+zig build inference-bench-gliner25-cpu-build -Doptimize=fast -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false -j1
 ```
 
 Pass these flags explicitly: the modular repository build uses one shared

@@ -52,7 +52,7 @@ pub const HashState = struct {
     pub fn init() HashState {
         return .{ .words = Sha.init(.{}).s };
     }
-    fn restore(self: HashState) !Sha {
+    pub fn restore(self: HashState) !Sha {
         if (self.tail_len >= 64 or self.total % 64 != self.tail_len or !std.mem.allEqual(u8, self.tail[self.tail_len..], 0)) return error.SourceSnapshotCorrupt;
         return .{ .s = self.words, .buf = self.tail, .buf_len = self.tail_len, .total_len = self.total };
     }
@@ -207,7 +207,7 @@ fn initialize(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fil
     const trailer = try bundle.decodeTrailer(&trailer_bytes, state.size);
     var envelope: [6]u8 = undefined;
     try readExact(io, file, &envelope, codec.header_size);
-    if (envelope[0] != @intFromEnum(codec.BlockType.bundle_manifest) or envelope[1] != 0) return error.InvalidBackupManifest;
+    if (envelope[0] != @backingInt(codec.BlockType.bundle_manifest) or envelope[1] != 0) return error.InvalidBackupManifest;
     const manifest_length = std.mem.readInt(u32, envelope[2..6], .little);
     if (manifest_length > bundle.max_manifest_bytes) return error.BackupManifestTooLarge;
     const block = try raw.readBlock(alloc);
@@ -245,7 +245,7 @@ fn initialize(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fil
             else => return error.InvalidBackupManifest,
         }
         var bytes: [object_record_size]u8 = @splat(0);
-        bytes[0] = @intFromEnum(kind);
+        bytes[0] = @backingInt(kind);
         std.mem.writeInt(u32, bytes[4..8], @intCast(blob_index), .little);
         std.mem.writeInt(u64, bytes[8..16], object.size_bytes, .little);
         bytes[16..48].* = digest(bytes[0..16]);
@@ -260,7 +260,7 @@ fn initialize(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fil
     try index.sync(io);
     state.index_inode = (try index.stat(io)).inode;
     try readExact(io, file, &envelope, state.footer_offset);
-    if (envelope[0] != @intFromEnum(codec.BlockType.footer_index) or envelope[1] != 0 or std.mem.readInt(u32, envelope[2..6], .little) != state.footer_size) return error.InvalidBundleFooter;
+    if (envelope[0] != @backingInt(codec.BlockType.footer_index) or envelope[1] != 0 or std.mem.readInt(u32, envelope[2..6], .little) != state.footer_size) return error.InvalidBundleFooter;
     var count: [4]u8 = undefined;
     try readExact(io, file, &count, state.footer_offset + 6);
     if (std.mem.readInt(u32, &count, .little) != state.blobs) return error.InvalidBundleFooter;
@@ -315,7 +315,7 @@ fn beginObject(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fi
     raw.pos = @intCast(blob.offset);
     var envelope: [6]u8 = undefined;
     try readExact(io, file, &envelope, raw.pos);
-    if (envelope[0] != @intFromEnum(codec.BlockType.blob_header) or envelope[1] != 0 or std.mem.readInt(u32, envelope[2..6], .little) > 8192) return error.InvalidBackupManifest;
+    if (envelope[0] != @backingInt(codec.BlockType.blob_header) or envelope[1] != 0 or std.mem.readInt(u32, envelope[2..6], .little) > 8192) return error.InvalidBackupManifest;
     const block = try raw.readBlock(alloc);
     defer alloc.free(block.payload);
     var header = try bundle.decodeBlobHeader(alloc, block.payload);
@@ -460,7 +460,7 @@ fn objectsStep(alloc: Allocator, io: std.Io, file: std.Io.File, index: std.Io.Fi
             if (state.physical_offset + prefix.len + 4 > state.footer_offset) return error.InvalidBundleFooter;
             try readExact(io, file, &prefix, state.physical_offset);
             const size = std.mem.readInt(u32, prefix[2..6], .little);
-            if (prefix[0] != @intFromEnum(codec.BlockType.blob_chunk) or prefix[1] != 0 or size <= 12 or size > bundle.native_chunk_target_bytes + 12 or
+            if (prefix[0] != @backingInt(codec.BlockType.blob_chunk) or prefix[1] != 0 or size <= 12 or size > bundle.native_chunk_target_bytes + 12 or
                 std.mem.readInt(u32, prefix[6..10], .little) != state.blob_index or std.mem.readInt(u64, prefix[10..18], .little) != state.blob_offset or
                 size - 12 != @min(bundle.native_chunk_target_bytes, state.blob_size - state.blob_offset) or state.physical_offset + 10 + size > state.footer_offset) return error.InvalidNativeFileChunk;
             var crc = Crc.init();
@@ -595,7 +595,7 @@ pub const ObjectReader = struct {
         if (offset == entry.size or buffer.len == 0) return 0;
         var envelope: [6]u8 = undefined;
         try readExact(self.io, self.file, &envelope, entry.header_offset);
-        if (envelope[0] != @intFromEnum(codec.BlockType.blob_header) or envelope[1] != 0) return error.SourceSnapshotCorrupt;
+        if (envelope[0] != @backingInt(codec.BlockType.blob_header) or envelope[1] != 0) return error.SourceSnapshotCorrupt;
         const header_size = std.mem.readInt(u32, envelope[2..6], .little);
         if (header_size > 8192) return error.SourceSnapshotCorrupt;
         const chunk = offset / bundle.native_chunk_target_bytes;

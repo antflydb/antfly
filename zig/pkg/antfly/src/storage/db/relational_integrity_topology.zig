@@ -143,7 +143,7 @@ pub fn catalogForFence(txn: anytype, fence: Fence) ![]const u8 {
 fn abortedKey(fence: Fence) [abort_prefix.len + 9]u8 {
     var out: [abort_prefix.len + 9]u8 = undefined;
     @memcpy(out[0..abort_prefix.len], abort_prefix);
-    out[abort_prefix.len] = @intFromEnum(fence.role);
+    out[abort_prefix.len] = @backingInt(fence.role);
     std.mem.writeInt(u64, out[abort_prefix.len + 1 ..][0..8], fence.transition_id, .little);
     return out;
 }

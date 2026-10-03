@@ -37,9 +37,9 @@ pub const Node = struct {
     fn digest(self: Node) publication.Digest {
         var hash = std.crypto.hash.Blake3.init(.{});
         hash.update("antfly:required-artifact-stream:v1:");
-        hash.update(&.{ @intFromEnum(self.kind), @intFromEnum(self.scope) });
-        hash.update(&.{ if (self.index_kind) |kind| @as(u8, @intFromEnum(kind)) + 1 else 0, if (self.generated_kind) |kind| @as(u8, @intFromEnum(kind)) + 1 else 0 });
-        hash.update(&.{if (self.resolver_source_kind) |kind| @as(u8, @intFromEnum(kind)) + 1 else 0});
+        hash.update(&.{ @backingInt(self.kind), @backingInt(self.scope) });
+        hash.update(&.{ if (self.index_kind) |kind| @as(u8, @backingInt(kind)) + 1 else 0, if (self.generated_kind) |kind| @as(u8, @backingInt(kind)) + 1 else 0 });
+        hash.update(&.{if (self.resolver_source_kind) |kind| @as(u8, @backingInt(kind)) + 1 else 0});
         hash.update(&.{@intFromBool(self.neighbor_context)});
         var number: [8]u8 = undefined;
         std.mem.writeInt(u64, &number, self.generation, .little);
@@ -347,7 +347,7 @@ fn compileWithChildren(alloc: std.mem.Allocator, catalog: publication.Digest, te
         std.mem.writeInt(u64, &encoded_count, entry.name.len, .little);
         hash.update(&encoded_count);
         hash.update(entry.name);
-        hash.update(&.{@intFromEnum(entry.scope)});
+        hash.update(&.{@backingInt(entry.scope)});
     }
     var digest: publication.Digest = undefined;
     hash.final(&digest);
@@ -418,7 +418,7 @@ test "ordered artifact inventory completion plan retains non-provider requiremen
             try std.testing.expectEqual(@as(usize, 10), plan.nodes.len);
             var counts = [_]usize{ 0, 0, 0, 0, 0 };
             for (plan.nodes) |node| {
-                counts[@intFromEnum(node.kind)] += 1;
+                counts[@backingInt(node.kind)] += 1;
                 if (node.template) |ordinal| try std.testing.expectEqual(templates[ordinal].kind, node.generated_kind.?);
                 if (node.kind == .resolution) {
                     try std.testing.expectEqualStrings("resolved", node.artifact);

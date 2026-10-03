@@ -140,15 +140,15 @@ pub const ResolverConfig = struct {
     config_generation: u64 = 0,
 
     pub fn eql(self: ResolverConfig, other: ResolverConfig) bool {
-        inline for (std.meta.fields(ResolverConfig)) |field| {
-            if (field.type == []const u8) {
-                if (!std.mem.eql(u8, @field(self, field.name), @field(other, field.name))) return false;
-            } else if (field.type == []const []const u8) {
-                const a = @field(self, field.name);
-                const b = @field(other, field.name);
+        inline for (@typeInfo(ResolverConfig).@"struct".field_names, @typeInfo(ResolverConfig).@"struct".field_types) |reflected_name, field_type| {
+            if (field_type == []const u8) {
+                if (!std.mem.eql(u8, @field(self, reflected_name), @field(other, reflected_name))) return false;
+            } else if (field_type == []const []const u8) {
+                const a = @field(self, reflected_name);
+                const b = @field(other, reflected_name);
                 if (a.len != b.len) return false;
                 for (a, b) |as, bs| if (!std.mem.eql(u8, as, bs)) return false;
-            } else if (!std.meta.eql(@field(self, field.name), @field(other, field.name))) return false;
+            } else if (!std.meta.eql(@field(self, reflected_name), @field(other, reflected_name))) return false;
         }
         return true;
     }

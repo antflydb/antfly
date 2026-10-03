@@ -28,10 +28,10 @@ fn inspect(artifact: *std.Build.Step.Compile, module: *std.Build.Module, seen: *
             std.debug.panic("{s}: runtime dependency has a different target", .{artifact.name});
     }
     if (module.optimize) |optimize| {
-        if (optimize != (root.optimize orelse .Debug))
+        if (optimize != (root.optimize orelse .debug))
             std.debug.panic("{s}: runtime dependency uses {s}, expected {s}: {s}", .{
-                artifact.name,                                                                             @tagName(optimize), @tagName(root.optimize orelse .Debug),
-                if (module.root_source_file) |source| source.getPath(artifact.step.owner) else "C module",
+                artifact.name,                                                                                 @tagName(optimize), @tagName(root.optimize orelse .debug),
+                if (module.root_source_file) |source| sourcePath(artifact.step.owner, source) else "C module",
             });
     }
     for (module.link_objects.items) |object| switch (object) {
@@ -110,16 +110,16 @@ pub fn addDataToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step,
                 @panic("data tools depend on inference runtime settings");
         }
         const generate = b.addRunArtifact(generator);
-        const data = generate.addOutputFileArg(b.fmt("{s}-pilot.jsonl", .{kind}));
+        const data = generate.addOutputFileArg2(b.fmt("{s}-pilot.jsonl", .{kind}), .{ .make_absolute = true });
         generate.addArg("2");
-        if (index == 1) generate.addFileArg(b.addWriteFiles().add("image.ppm", "P3\n1 1\n255\n0 0 0\n"));
+        if (index == 1) generate.addFileArg2(b.addWriteFiles().add("image.ppm", "P3\n1 1\n255\n0 0 0\n"), .{ .make_absolute = true });
         const convert = b.addRunArtifact(converter);
         // The legacy text CSV converter accepts prompt/response records; the
         // chat pilot generator is used directly by the chat training workflow.
-        convert.addFileArg(if (index == 0) b.addWriteFiles().add("instructions.jsonl", "{\"prompt\":\"first\",\"response\":\"one\"}\n{\"prompt\":\"second\",\"response\":\"two\"}\n") else data);
+        convert.addFileArg2(if (index == 0) b.addWriteFiles().add("instructions.jsonl", "{\"prompt\":\"first\",\"response\":\"one\"}\n{\"prompt\":\"second\",\"response\":\"two\"}\n") else data, .{ .make_absolute = true });
         convert.addArg("train");
-        _ = convert.addOutputFileArg(b.fmt("{s}-pilot.csv", .{kind}));
-        _ = convert.addOutputFileArg(b.fmt("{s}-summary.json", .{kind}));
+        _ = convert.addOutputFileArg2(b.fmt("{s}-pilot.csv", .{kind}), .{ .make_absolute = true });
+        _ = convert.addOutputFileArg2(b.fmt("{s}-summary.json", .{kind}), .{ .make_absolute = true });
         data_check.dependOn(&convert.step);
         data_check.dependOn(&generate.step);
     }
@@ -149,13 +149,13 @@ pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step
     var asset_iterator = assets.valueIterator();
     while (asset_iterator.next()) |entry| {
         const artifact = entry.*;
-        const source = artifact.root_module.import_table.get("inference_finetune_assets").?.root_source_file.?.getPath(b);
+        const source = sourcePath(b, artifact.root_module.import_table.get("inference_finetune_assets").?.root_source_file.?);
         const owner = owners.getOrPut(source) catch @panic("OOM");
         if (!owner.found_existing or std.mem.lessThan(u8, artifact.name, owner.value_ptr.*.name)) owner.value_ptr.* = artifact;
     }
     for ([_][]const u8{ "compose-lora-adapters", "inspect-reranker-lora-bundle", "materialize-reranker-head" }) |name| {
         const artifact = assets.get(name).?;
-        const source = artifact.root_module.import_table.get("inference_finetune_assets").?.root_source_file.?.getPath(b);
+        const source = sourcePath(b, artifact.root_module.import_table.get("inference_finetune_assets").?.root_source_file.?);
         owners.put(source, artifact) catch @panic("OOM");
     }
     var checked = std.AutoHashMap(*std.Build.Step.Compile, void).init(b.allocator);
@@ -171,43 +171,43 @@ pub fn addAssetToolChecks(b: *std.Build, steps: *std.AutoHashMap(*std.Build.Step
     }
     const compose = b.addRunArtifact(assets.get("compose-lora-adapters").?);
     compose.addArg("--out");
-    _ = compose.addOutputFileArg("composed-adapter.safetensors");
-    compose.addFileArg(b.path("cache_asset_inputs/adapter/adapter_model.safetensors"));
+    _ = compose.addOutputFileArg2("composed-adapter.safetensors", .{ .make_absolute = true });
+    compose.addFileArg2(b.path("cache_asset_inputs/adapter/adapter_model.safetensors"), .{ .make_absolute = true });
     check_step.dependOn(&compose.step);
 
     const inspect_run = b.addRunArtifact(assets.get("inspect-reranker-lora-bundle").?);
-    inspect_run.addDirectoryArg(b.path("cache_asset_inputs/base"));
-    inspect_run.addDirectoryArg(b.path("cache_asset_inputs/adapter"));
+    inspect_run.addDirectoryArg2(b.path("cache_asset_inputs/base"), .{ .make_absolute = true });
+    inspect_run.addDirectoryArg2(b.path("cache_asset_inputs/adapter"), .{ .make_absolute = true });
     _ = inspect_run.captureStdOut(.{ .basename = "asset-inspection.json" });
     check_step.dependOn(&inspect_run.step);
 
     const materialize = b.addRunArtifact(assets.get("materialize-reranker-head").?);
-    materialize.addDirectoryArg(b.path("cache_asset_inputs/base"));
-    materialize.addFileArg(b.path("cache_asset_inputs/head.safetensors"));
-    _ = materialize.addOutputDirectoryArg("materialized-head");
+    materialize.addDirectoryArg2(b.path("cache_asset_inputs/base"), .{ .make_absolute = true });
+    materialize.addFileArg2(b.path("cache_asset_inputs/head.safetensors"), .{ .make_absolute = true });
+    _ = materialize.addOutputDirectoryArg2("materialized-head", .{ .make_absolute = true });
     check_step.dependOn(&materialize.step);
     const bundle_report = b.addRunArtifact(assets.get("inspect-layoutlmv3-bundle").?);
-    bundle_report.addDirectoryArg(b.path("cache_asset_inputs/base"));
+    bundle_report.addDirectoryArg2(b.path("cache_asset_inputs/base"), .{ .make_absolute = true });
     _ = bundle_report.captureStdOut(.{ .basename = "bundle-inspection.json" });
     check_step.dependOn(&bundle_report.step);
 
     var cleanup_inputs: [2]std.Build.LazyPath = undefined;
     for ([_][]const u8{ "train", "eval" }, &cleanup_inputs) |split, *input| {
         const prepare = b.addRunArtifact(assets.get("prepare-entity-cleanup-cache").?);
-        prepare.addFileArg(b.path("cache_asset_inputs/cleanup.jsonl"));
-        input.* = prepare.addOutputFileArg(b.fmt("cleanup-{s}.json", .{split}));
+        prepare.addFileArg2(b.path("cache_asset_inputs/cleanup.jsonl"), .{ .make_absolute = true });
+        input.* = prepare.addOutputFileArg2(b.fmt("cleanup-{s}.json", .{split}), .{ .make_absolute = true });
         prepare.addArgs(&.{ split, "16", "4" });
     }
     const train_cleanup = b.addRunArtifact(assets.get("train-eval-entity-cleanup-head").?);
-    for (cleanup_inputs) |input| train_cleanup.addFileArg(input);
-    _ = train_cleanup.addOutputDirectoryArg("cleanup-head");
+    for (cleanup_inputs) |input| train_cleanup.addFileArg2(input, .{ .make_absolute = true });
+    _ = train_cleanup.addOutputDirectoryArg2("cleanup-head", .{ .make_absolute = true });
     train_cleanup.addArgs(&.{ "--epochs", "1", "--embedding-dim", "4" });
     _ = train_cleanup.captureStdOut(.{ .basename = "cleanup-training.json" });
     check_step.dependOn(&train_cleanup.step);
 
     const rejected = b.addRunArtifact(assets.get("compose-lora-adapters").?);
     rejected.addArgs(&.{ "--out", "unused.safetensors" });
-    rejected.addFileArg(b.path("cache_asset_inputs/adapter/adapter_model.safetensors"));
+    rejected.addFileArg2(b.path("cache_asset_inputs/adapter/adapter_model.safetensors"), .{ .make_absolute = true });
     rejected.addArg("cache_asset_inputs/missing.safetensors");
     rejected.expectExitCode(1);
     _ = rejected.captureStdErr(.{});
@@ -224,7 +224,7 @@ fn checkAssetModule(b: *std.Build, module: *std.Build.Module, seen: *std.AutoHas
         if (std.mem.eql(u8, name, "ml") or std.mem.eql(u8, name, "onnx_graph"))
             @panic("offline assets import graph conversion or training");
         if (std.mem.eql(u8, name, "build_options")) {
-            const source = entry.value_ptr.*.root_source_file.?.getPath(b);
+            const source = sourcePath(b, entry.value_ptr.*.root_source_file.?);
             if (!std.mem.endsWith(u8, source, "/finetune/assets_options.zig"))
                 @panic("offline assets inherit product build options");
         }
@@ -273,7 +273,7 @@ pub fn collectSteps(step: *std.Build.Step, steps: *std.AutoHashMap(*std.Build.St
 fn collectModules(module: *std.Build.Module, steps: *std.AutoHashMap(*std.Build.Step, void), modules: *std.AutoHashMap(*std.Build.Module, void)) void {
     if ((modules.getOrPut(module) catch @panic("OOM")).found_existing) return;
     if (module.root_source_file) |source| switch (source) {
-        .generated => |generated| collectSteps(generated.file.step, steps, modules),
+        .generated => |generated| collectSteps(module.owner.graph.generated_files.items[@backingInt(generated.index)], steps, modules),
         else => {},
     };
     for (module.link_objects.items) |object| switch (object) {
@@ -296,7 +296,7 @@ pub fn addOnnxTestChecks(b: *std.Build) void {
         for (run.step.dependencies.items) |dependency| {
             const artifact = dependency.cast(std.Build.Step.Compile) orelse continue;
             const source = artifact.root_module.root_source_file orelse continue;
-            if (artifact.kind.isTest() and std.mem.endsWith(u8, source.getPath(b), "/onnx/src/data.zig")) data_run = run;
+            if (artifact.kind.isTest() and std.mem.endsWith(u8, sourcePath(b, source), "/onnx/src/data.zig")) data_run = run;
         }
     }
     const run = data_run orelse @panic("ONNX aggregate omits its data tests");
@@ -307,4 +307,13 @@ pub fn addOnnxTestChecks(b: *std.Build) void {
         if (!library_steps.contains(&run.step)) @panic("library aggregate omits ONNX data tests");
     }
     b.step("cache-onnx-tests", "Run the parser tests from the actual ONNX aggregate").dependOn(&run.step);
+}
+
+fn sourcePath(b: *std.Build, path: std.Build.LazyPath) []const u8 {
+    return switch (path) {
+        .src_path => |source| source.owner.root.joinString(b.allocator, source.sub_path) catch @panic("OOM"),
+        .dependency => |dependency| dependency.dependency.builder.root.joinString(b.allocator, dependency.sub_path) catch @panic("OOM"),
+        .cwd_relative => |relative| relative,
+        else => @panic("fixture expected a source file path"),
+    };
 }

@@ -120,9 +120,9 @@ pub const Config = struct {
     fn graphExecutionLimitsFromOpenApi(value: ?common_openapi.GraphExecutionConfig) !graph_work_budget.Limits {
         const config = value orelse return .{};
         var limits: graph_work_budget.Limits = .{};
-        inline for (std.meta.fields(graph_work_budget.Limits)) |field| {
-            if (@field(config, field.name)) |configured| {
-                @field(limits, field.name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
+        inline for (comptime std.meta.fieldNames(graph_work_budget.Limits)) |reflected_name| {
+            if (@field(config, reflected_name)) |configured| {
+                @field(limits, reflected_name) = std.math.cast(usize, configured) orelse return error.InvalidConfig;
             }
         }
         try limits.validate();
@@ -138,7 +138,7 @@ pub const Config = struct {
         orchestration_urls: []NodeUrl = &.{},
         raft_urls: []NodeUrl = &.{},
 
-        fn deinit(self: *MetadataConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *MetadataConfig, alloc: std.mem.Allocator) void {
             for (self.orchestration_urls) |entry| alloc.free(entry.url);
             if (self.orchestration_urls.len > 0) alloc.free(self.orchestration_urls);
             for (self.raft_urls) |entry| alloc.free(entry.url);
@@ -151,7 +151,7 @@ pub const Config = struct {
         cert: ?[]u8 = null,
         key: ?[]u8 = null,
 
-        fn deinit(self: *TlsConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *TlsConfig, alloc: std.mem.Allocator) void {
             if (self.cert) |value| alloc.free(value);
             if (self.key) |value| alloc.free(value);
             self.* = undefined;
@@ -175,7 +175,7 @@ pub const Config = struct {
         object_prefix: ?[]u8 = null,
         object_lanes: ObjectStorageLanes = .{},
 
-        fn deinit(self: *StorageConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *StorageConfig, alloc: std.mem.Allocator) void {
             if (self.lite_path) |value| alloc.free(value);
             if (self.local_base_dir) |value| alloc.free(value);
             if (self.object_connection) |value| alloc.free(value);
@@ -191,7 +191,7 @@ pub const Config = struct {
         bucket: ?[]u8 = null,
         prefix: ?[]u8 = null,
 
-        fn deinit(self: *ObjectStorageLocation, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ObjectStorageLocation, alloc: std.mem.Allocator) void {
             if (self.connection) |value| alloc.free(value);
             if (self.bucket) |value| alloc.free(value);
             if (self.prefix) |value| alloc.free(value);
@@ -206,7 +206,7 @@ pub const Config = struct {
         progress: ObjectStorageLocation = .{},
         catalog: ObjectStorageLocation = .{},
 
-        fn deinit(self: *ObjectStorageLanes, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ObjectStorageLanes, alloc: std.mem.Allocator) void {
             self.artifacts.deinit(alloc);
             self.manifests.deinit(alloc);
             self.wal.deinit(alloc);
@@ -268,7 +268,7 @@ pub const Config = struct {
             return self.standby_log != null or self.standby_progress != null;
         }
 
-        fn deinit(self: *HAConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *HAConfig, alloc: std.mem.Allocator) void {
             inline for (.{
                 "admin_url",       "admin_token_env",      "primary_log",  "primary_slots",
                 "primary_node_id", "seed_capture_root",    "standby_log",  "standby_progress",
@@ -308,7 +308,7 @@ pub const Config = struct {
                     return error.InvalidKernelJitCacheBudget;
             }
 
-            fn deinit(self: *KernelJitConfig, alloc: std.mem.Allocator) void {
+            pub fn deinit(self: *KernelJitConfig, alloc: std.mem.Allocator) void {
                 if (self.cache_dir) |value| alloc.free(value);
                 self.* = undefined;
             }
@@ -342,7 +342,7 @@ pub const Config = struct {
             residency_mode: ?ResidencyMode = null,
             memory_budget_mb: ?u32 = null,
 
-            fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
+            pub fn deinit(self: *WarmModelConfig, alloc: std.mem.Allocator) void {
                 alloc.free(self.kind);
                 alloc.free(self.name);
                 if (self.backend) |value| alloc.free(value);
@@ -380,7 +380,7 @@ pub const Config = struct {
         prompt_cache_configured: bool = false,
         max_loaded_models: ?i64 = null,
 
-        fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *InferenceConfig, alloc: std.mem.Allocator) void {
             if (self.api_url) |value| alloc.free(value);
             if (self.api_key) |value| alloc.free(value);
             if (self.models_dir) |value| alloc.free(value);
@@ -408,7 +408,7 @@ pub const Config = struct {
         allow_credentials: ?bool = null,
         max_age: ?u32 = null,
 
-        fn deinit(self: *CorsConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *CorsConfig, alloc: std.mem.Allocator) void {
             if (self.allowed_origins) |values| freeOwnedStringSlice(alloc, values);
             if (self.allowed_methods) |values| freeOwnedStringSlice(alloc, values);
             if (self.allowed_headers) |values| freeOwnedStringSlice(alloc, values);
@@ -454,7 +454,7 @@ pub const Config = struct {
         session_name: ?[]u8 = null,
         sts_endpoint: ?[]u8 = null,
 
-        fn deinit(self: *AwsCredentialConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *AwsCredentialConfig, alloc: std.mem.Allocator) void {
             if (self.access_key_id) |value| alloc.free(value);
             if (self.secret_access_key) |value| alloc.free(value);
             if (self.session_token) |value| alloc.free(value);
@@ -475,7 +475,7 @@ pub const Config = struct {
         credentials_path: ?[]u8 = null,
         scope: ?[]u8 = null,
 
-        fn deinit(self: *GcsCredentialConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *GcsCredentialConfig, alloc: std.mem.Allocator) void {
             if (self.bearer_token) |value| alloc.free(value);
             if (self.service_account_json) |value| alloc.free(value);
             if (self.credentials_path) |value| alloc.free(value);
@@ -494,7 +494,7 @@ pub const Config = struct {
         external_io: ?ExternalIoConnectionConfig = null,
         cdc: ?CdcConnectionConfig = null,
 
-        fn deinit(self: *ConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ConnectionConfig, alloc: std.mem.Allocator) void {
             if (self.display_name) |value| alloc.free(value);
             if (self.provider) |value| alloc.free(value);
             freeOwnedStringSlice(alloc, self.capabilities);
@@ -517,7 +517,7 @@ pub const Config = struct {
         names: []const []u8 = &.{},
         configured_model_types: []const []u8 = &.{},
 
-        fn deinit(self: *InferenceConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *InferenceConnectionConfig, alloc: std.mem.Allocator) void {
             alloc.free(self.provider);
             if (self.url) |value| alloc.free(value);
             if (self.api_key) |value| alloc.free(value);
@@ -550,7 +550,7 @@ pub const Config = struct {
         include_domains: []const []u8 = &.{},
         exclude_domains: []const []u8 = &.{},
 
-        fn deinit(self: *WebSearchConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *WebSearchConnectionConfig, alloc: std.mem.Allocator) void {
             if (self.service) |value| alloc.free(value);
             if (self.language) |value| alloc.free(value);
             if (self.region) |value| alloc.free(value);
@@ -584,7 +584,7 @@ pub const Config = struct {
         root: ?[]u8 = null,
         use_ssl: ?bool = null,
 
-        fn deinit(self: *ExternalIoConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ExternalIoConnectionConfig, alloc: std.mem.Allocator) void {
             if (self.endpoint) |value| alloc.free(value);
             if (self.region) |value| alloc.free(value);
             freeOwnedStringSlice(alloc, self.buckets);
@@ -664,7 +664,7 @@ pub const Config = struct {
         slot_name: ?[]u8 = null,
         publication_name: ?[]u8 = null,
 
-        fn deinit(self: *CdcConnectionConfig, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *CdcConnectionConfig, alloc: std.mem.Allocator) void {
             alloc.free(self.provider);
             if (self.dsn) |value| alloc.free(value);
             if (self.table_name) |value| alloc.free(value);
@@ -1340,9 +1340,10 @@ fn optionalBoolField(root: std.json.ObjectMap, field_name: []const u8) !?bool {
 fn deploymentModeFromObject(root: std.json.ObjectMap, expected: ?DeploymentMode) !DeploymentMode {
     if (root.get("deployment_mode")) |value| {
         if (value != .string) return error.InvalidConfig;
-        inline for (std.meta.fields(DeploymentMode)) |field| {
-            if (std.mem.eql(u8, value.string, field.name)) {
-                const configured: DeploymentMode = @enumFromInt(field.value);
+        const info = @typeInfo(DeploymentMode).@"enum";
+        inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+            if (std.mem.eql(u8, value.string, reflected_name)) {
+                const configured: DeploymentMode = @fromBackingInt(@intCast(field_value));
                 if (expected) |required| if (configured != required) return error.DeploymentModeMismatch;
                 return configured;
             }

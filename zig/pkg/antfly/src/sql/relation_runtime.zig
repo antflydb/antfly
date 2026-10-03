@@ -168,7 +168,7 @@ fn Engine(comptime Context: type) type {
             if (self.work > self.context.limits.scan_rows *| 64) return error.SqlProgramLimitExceeded;
         }
 
-        fn deinit(self: *Self) void {
+        pub fn deinit(self: *Self) void {
             for (self.recursions) |optional| if (optional) |worklist| worklist.deinit();
             var hashes = self.static_hashes.valueIterator();
             while (hashes.next()) |join| join.*.deinit();
@@ -306,7 +306,7 @@ fn Engine(comptime Context: type) type {
                 }
                 return self;
             }
-            fn deinit(self: *Iterator) void {
+            pub fn deinit(self: *Iterator) void {
                 if (self.page) |page| page.deinit();
                 if (self.left) |left| left.deinit();
                 if (self.right) |right| right.deinit();

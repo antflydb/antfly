@@ -7,9 +7,9 @@ const std = @import("std");
 const bridge = @import("antfly_inference_bridge");
 const diagnostics = @import("antfly_private_error_diagnostics");
 
-const operation_slots = @intFromEnum(bridge.ProviderOperation.classify_texts) + 1;
-var overflow_counts = [_]@import("antfly_platform").atomic.Value(u64){.init(0)} ** operation_slots;
-var failures = [_]diagnostics.Diagnostic{.{}} ** diagnostics.slots_count;
+const operation_slots = @backingInt(bridge.ProviderOperation.classify_texts) + 1;
+var overflow_counts = @as([operation_slots]@import("antfly_platform").atomic.Value(u64), @splat(.init(0)));
+var failures = @as([diagnostics.slots_count]diagnostics.Diagnostic, @splat(.{}));
 
 fn shouldLog(count: u64) bool {
     return count != 0 and (count <= 4 or std.math.isPowerOfTwo(count));
@@ -57,7 +57,7 @@ test "provider owner logs private cause before stable transport without double r
     };
     Probe.cause = null;
     Probe.calls = 0;
-    const owned = statusWithLogger(@intFromEnum(bridge.ProviderOperation.read_raster_images_reported), "{\"model\":\"diagnostic-probe\"}", true, error.PrivateProviderProbe, Probe.log);
+    const owned = statusWithLogger(@backingInt(bridge.ProviderOperation.read_raster_images_reported), "{\"model\":\"diagnostic-probe\"}", true, error.PrivateProviderProbe, Probe.log);
     try std.testing.expectEqual(error.PrivateProviderProbe, Probe.cause.?);
     try std.testing.expectEqual(@as(usize, 1), Probe.calls);
     // Simulate worker reply -> parent bridge -> caller, without extending the

@@ -127,7 +127,7 @@ const DbRuntimeHandle = struct {
         }
     }
 
-    fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+    pub fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         if (self.db) |db| {
             db.close();

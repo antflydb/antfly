@@ -13,6 +13,7 @@
 // limitations.
 
 const builtin = @import("builtin");
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 
 pub const Backend = enum {
     manual,
@@ -20,11 +21,11 @@ pub const Backend = enum {
 };
 
 pub fn defaultExecutorBackend() Backend {
-    return if (builtin.os.tag == .freestanding) .manual else .io_threaded;
+    return if (is_hostless) .manual else .io_threaded;
 }
 
 pub fn ensureExecutorBackendAvailable(backend: Backend) !void {
-    if (builtin.os.tag == .freestanding and backend != .manual) {
+    if (is_hostless and backend != .manual) {
         return error.UnsupportedPlatform;
     }
 }

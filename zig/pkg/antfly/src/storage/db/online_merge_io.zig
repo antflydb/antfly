@@ -641,7 +641,7 @@ test "relational index system native source admission resumes bounded footprint 
         aborted.abort();
         var read = try db.core.store.beginReadTxn();
         defer read.abort();
-        try std.testing.expectEqual(@as(u64, 0), (try footprint.load(&read)).epochs[@intFromEnum(footprint.Family.graph)]);
+        try std.testing.expectEqual(@as(u64, 0), (try footprint.load(&read)).epochs[@backingInt(footprint.Family.graph)]);
         try std.testing.expectError(error.NotFound, read.get(graph_key));
     }
     try db.core.store.put(graph_key, "malformed bytes still occupy graph family");

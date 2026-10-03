@@ -564,7 +564,7 @@ const Paths = struct {
         errdefer alloc.free(group_path);
         return .{ .journal_dir = journal_dir, .done_dir = done_dir, .trash_dir = trash_dir, .intent_path = intent_path, .done_path = done_path, .group_path = group_path, .trash_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ trash_dir, digest }) };
     }
-    fn deinit(self: *Paths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Paths, alloc: std.mem.Allocator) void {
         alloc.free(self.journal_dir);
         alloc.free(self.done_dir);
         alloc.free(self.trash_dir);

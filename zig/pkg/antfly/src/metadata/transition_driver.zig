@@ -112,7 +112,7 @@ test "metadata transition driver steps split and merge through runtime interface
         merge_phase: transition_state.TransitionPhase = .prepare,
         calls: std.ArrayListUnmanaged([]const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.calls.deinit(alloc);
             self.* = undefined;
         }

@@ -26,13 +26,13 @@ const Wire = struct {
     completion: ?publication.CompletionPage = null,
 };
 comptime {
-    if (@typeInfo(Wire).@"struct".fields.len != @typeInfo(publication.Command).@"struct".fields.len) @compileError("update publication wire projection");
+    if (@typeInfo(Wire).@"struct".field_names.len != @typeInfo(publication.Command).@"struct".field_names.len) @compileError("update publication wire projection");
 }
 pub fn write(command: publication.Command, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
-    inline for (@typeInfo(publication.Command).@"struct".fields) |field| {
-        try stream.objectField(field.name);
-        if (comptime std.mem.eql(u8, field.name, "mutations")) {
+    inline for (comptime std.meta.fieldNames(publication.Command)) |reflected_name| {
+        try stream.objectField(reflected_name);
+        if (comptime std.mem.eql(u8, reflected_name, "mutations")) {
             try stream.beginArray();
             for (command.mutations) |effect| {
                 try stream.beginObject();
@@ -59,7 +59,7 @@ pub fn write(command: publication.Command, stream: anytype) @TypeOf(stream.*).Er
                 try stream.endObject();
             }
             try stream.endArray();
-        } else try binary.write(@field(command, field.name), stream);
+        } else try binary.write(@field(command, reflected_name), stream);
     }
     try stream.endObject();
 }
@@ -97,8 +97,8 @@ fn fromWire(alloc: std.mem.Allocator, wire: Wire) std.json.ParseFromValueError!p
         }
     }
     var result: publication.Command = undefined;
-    inline for (@typeInfo(publication.Command).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "mutations")) result.mutations = effects else @field(result, field.name) = @field(wire, field.name);
+    inline for (comptime std.meta.fieldNames(publication.Command)) |reflected_name| {
+        if (comptime std.mem.eql(u8, reflected_name, "mutations")) result.mutations = effects else @field(result, reflected_name) = @field(wire, reflected_name);
     }
     return result;
 }

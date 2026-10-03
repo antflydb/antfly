@@ -310,7 +310,7 @@ test "memtable reclamation read-only maintenance drains memory without storage w
 }
 
 test "memtable reclamation last-reference latency benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Backend = @import("../lsm_backend.zig").Backend;
     const allocator = std.heap.smp_allocator;
     for ([_]usize{ 1000, 10000, 100000 }) |count| {

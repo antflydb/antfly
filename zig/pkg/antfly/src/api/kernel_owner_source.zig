@@ -369,7 +369,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return pending;
         }
 
-        fn deinit(self: *ApplyOpen, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ApplyOpen, alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             alloc.free(self.path);
             alloc.free(self.descriptor.schema_json);
@@ -524,7 +524,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.entry.transient_retirement_pending = false;
         }
 
-        fn deinit(self: *Lease) void {
+        pub fn deinit(self: *Lease) void {
             if (!self.active) return;
             self.source.release(self.entry, self.exclusive, self.apply_only);
             self.active = false;
@@ -1496,7 +1496,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.request.cancellation_fn = cancelled;
         }
 
-        fn deinit(self: *EncodedRestoreRequest) void {
+        pub fn deinit(self: *EncodedRestoreRequest) void {
             self.alloc.free(self.manifest_json);
             self.* = undefined;
         }
@@ -1721,8 +1721,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1883,8 +1883,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor.view());
         defer lease.deinit();
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1904,8 +1904,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         if (lease.entry.initial_child_bootstrap_json.len == 0 or lease.entry.identity.table_id != record.table_id or
             lease.entry.identity.shard_id != record.shard_id) return error.InitialChildPublicationChanged;
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1957,7 +1957,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_name = .fromSlice(table_name),
             .backup_root = .fromSlice(plan.backup_root),
             .backup_id = .fromSlice(plan.backup_id),
-            .format = @intFromEnum(switch (plan.format) {
+            .format = @backingInt(switch (plan.format) {
                 .native => abi.BackupFormat.native,
                 .portable => abi.BackupFormat.portable,
             }),
@@ -4072,7 +4072,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .initial_child_bootstrap_json = .fromSlice(descriptor.initial_child_bootstrap_json),
             .restore_cancel_recovery = @intFromBool(descriptor.restore_cancel_recovery),
             .restore_ha_replay = @intFromBool(descriptor.restore_ha_replay),
-            .online_source_authority = @intFromEnum(self.online_source_authority),
+            .online_source_authority = @backingInt(self.online_source_authority),
             .row_policy_authority_secret = .fromSlice(self.row_policy_authority_secret orelse ""),
             .row_policy_authority_issuer = .fromSlice(self.row_policy_authority_issuer orelse ""),
             .historical_raft_apply = @intFromBool(controls.historical_raft_apply),
@@ -4378,7 +4378,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         frozen_proof: ?read_gate.ReadSafetyBarrier.FrozenProof = null,
 
-        fn validate(ptr: *anyopaque) !void {
+        pub fn validate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try validateLocal(self);
             if (self.frozen_proof) |proof| {
@@ -6259,7 +6259,7 @@ test "compiled owner coordinated ttl admission preserves exact observations and 
             try std.testing.expectEqualStrings("\x00\xffkey", request.candidates[0].key);
             try std.testing.expectEqual(@as(u64, 99), request.candidates[0].row_version);
             try std.testing.expectEqual(@as(u64, 44), request.candidates[0].ttl_timestamp_ns);
-            try std.testing.expectEqual([_]u8{0xa7} ** 32, request.candidates[0].expected_content_digest);
+            try std.testing.expectEqual(@as([32]u8, @splat(0xa7)), request.candidates[0].expected_content_digest);
             self.calls += 1;
             return 0;
         }
@@ -6817,13 +6817,13 @@ test "hidden initial child descriptor requires exact private bootstrap" {
     defer source.deinit();
     const Bootstrap = @import("../storage/db/relational_initial_child_publication.zig").Bootstrap;
     const expected: Bootstrap = .{
-        .plan_id = .{1} ** 16,
-        .plan_digest = .{2} ** 32,
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
         .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
         .schema_version = 1,
-        .schema_digest = .{3} ** 32,
-        .public_schema_json_digest = .{4} ** 32,
-        .catalog_digest = .{5} ** 32,
+        .schema_digest = @splat(3),
+        .public_schema_json_digest = @splat(4),
+        .catalog_digest = @splat(5),
     };
     const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, expected, .{});
     defer alloc.free(bootstrap_json);
@@ -6839,7 +6839,7 @@ test "hidden initial child descriptor requires exact private bootstrap" {
     try std.testing.expectEqualStrings(bootstrap_json, loaded.view().initial_child_bootstrap_json);
     try std.testing.expect(loaded.view().identity.eql(.{ .table_id = 7, .shard_id = 8, .range_id = 9 }));
     var wrong = expected;
-    wrong.plan_id = .{6} ** 16;
+    wrong.plan_id = @splat(6);
     try std.testing.expectError(error.InitialChildPublicationChanged, source.loadInitialChildDescriptor(alloc, 1, "hidden", wrong));
 }
 
@@ -7538,7 +7538,7 @@ test "owner recovery bulk callback preserves bounded identities and uncertain st
         fn many(ptr: *anyopaque, txn: @import("../storage/db/types.zig").TxnId, owner: []const u8, participants: []const []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try std.testing.expectEqual([_]u8{4} ** 16, txn);
+            try std.testing.expectEqual(@as([16]u8, @splat(4)), txn);
             try std.testing.expectEqualStrings("owner", owner);
             try std.testing.expectEqual(@as(usize, 2), participants.len);
             try std.testing.expectEqualStrings("first", participants[0]);

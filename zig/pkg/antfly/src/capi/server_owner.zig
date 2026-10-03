@@ -2788,9 +2788,9 @@ pub fn localTransitionIdentity(
 pub fn localTransitionSplitResult(status: anytype) kernel_owner_abi.LocalTransitionResult {
     return .{
         .kind = .split,
-        .phase = @enumFromInt(@intFromEnum(status.phase)),
+        .phase = @fromBackingInt(@backingInt(status.phase)),
         .has_source_split_phase = @intFromBool(status.source_split_phase != null),
-        .source_split_phase = if (status.source_split_phase) |phase| @intFromEnum(phase) else 0,
+        .source_split_phase = if (status.source_split_phase) |phase| @backingInt(phase) else 0,
         .bootstrapped = @intFromBool(status.bootstrapped),
         .replay_required = @intFromBool(status.replay_required),
         .replay_caught_up = @intFromBool(status.replay_caught_up),
@@ -2804,7 +2804,7 @@ pub fn localTransitionSplitResult(status: anytype) kernel_owner_abi.LocalTransit
 pub fn localTransitionMergeResult(status: anytype) kernel_owner_abi.LocalTransitionResult {
     return .{
         .kind = .merge,
-        .phase = @enumFromInt(@intFromEnum(status.phase)),
+        .phase = @fromBackingInt(@backingInt(status.phase)),
         .bootstrapped = @intFromBool(status.bootstrapped),
         .replay_required = @intFromBool(status.replay_required),
         .replay_caught_up = @intFromBool(status.replay_caught_up),
@@ -3608,7 +3608,7 @@ pub fn storageHASeedFailure(
         err,
         .storage_owner,
         kernel_owner_abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }
@@ -3916,11 +3916,11 @@ pub fn storageOwnerWaitForSync(
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     const sync_level: db_mod.types.SyncLevel = switch (request.sync_level) {
-        @intFromEnum(kernel_owner_abi.SyncLevel.propose) => .propose,
-        @intFromEnum(kernel_owner_abi.SyncLevel.write) => .write,
-        @intFromEnum(kernel_owner_abi.SyncLevel.full_text) => .full_text,
-        @intFromEnum(kernel_owner_abi.SyncLevel.enrichments) => .enrichments,
-        @intFromEnum(kernel_owner_abi.SyncLevel.full_index) => .full_index,
+        @backingInt(kernel_owner_abi.SyncLevel.propose) => .propose,
+        @backingInt(kernel_owner_abi.SyncLevel.write) => .write,
+        @backingInt(kernel_owner_abi.SyncLevel.full_text) => .full_text,
+        @backingInt(kernel_owner_abi.SyncLevel.enrichments) => .enrichments,
+        @backingInt(kernel_owner_abi.SyncLevel.full_index) => .full_index,
         else => return .invalid_argument,
     };
     switch (sync_level) {
@@ -3946,8 +3946,8 @@ pub fn storageOwnerApplyHotStandbyReplicationRecord(
     const handle = asHandle(owner) orelse return .invalid_argument;
     _ = storageOwnerTableName(handle, request.table_name) orelse return .invalid_argument;
     replication_ingress.applyRecord(&handle.db, .{
-        .kind = @enumFromInt(request.record_kind),
-        .payload_codec = @enumFromInt(request.payload_codec),
+        .kind = @fromBackingInt(request.record_kind),
+        .payload_codec = @fromBackingInt(request.payload_codec),
         .flags = request.flags,
         .cluster_id = request.cluster_id,
         .shard_id = request.shard_id,
@@ -4079,8 +4079,8 @@ pub fn storageOwnerBackupJson(
     out_response.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const format: kernel_owner_abi.BackupFormat = switch (request.format) {
-        @intFromEnum(kernel_owner_abi.BackupFormat.native) => .native,
-        @intFromEnum(kernel_owner_abi.BackupFormat.portable) => .portable,
+        @backingInt(kernel_owner_abi.BackupFormat.native) => .native,
+        @backingInt(kernel_owner_abi.BackupFormat.portable) => .portable,
         else => return .invalid_argument,
     };
     const handle = asHandle(owner) orelse return .invalid_argument;
@@ -5516,7 +5516,7 @@ pub fn storageOwnerArtifactOperationJson(
     out_response.* = .{};
     if (request.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const operation: kernel_owner_abi.ArtifactOperation = switch (request.operation) {
-        0...@intFromEnum(kernel_owner_abi.ArtifactOperation.apply_child_range_batch) => @enumFromInt(request.operation),
+        0...@backingInt(kernel_owner_abi.ArtifactOperation.apply_child_range_batch) => @fromBackingInt(request.operation),
         else => return .invalid_argument,
     };
     const handle = asHandle(owner) orelse return .invalid_argument;
@@ -6009,7 +6009,7 @@ pub fn storageOwnerQueryFailure(
         err,
         .storage_owner,
         kernel_owner_abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }

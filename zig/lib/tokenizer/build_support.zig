@@ -23,7 +23,7 @@ pub const Modules = struct {
 pub fn create(b: *std.Build, options: struct {
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     protobuf: *std.Build.Module,
     platform: *std.Build.Module,
     sentencepiece_proto: *std.Build.Module,
@@ -60,21 +60,21 @@ pub fn create(b: *std.Build, options: struct {
 pub fn generateSentencePieceProto(b: *std.Build, compiler: *std.Build.Step.Compile, root: std.Build.LazyPath) std.Build.LazyPath {
     const codegen = b.addRunArtifact(compiler);
     codegen.addArg("--desc");
-    codegen.addFileArg(root.path(b, "proto/sentencepiece_model.desc"));
+    codegen.addFileArg2(root.path(b, "proto/sentencepiece_model.desc"), .{ .make_absolute = true });
     codegen.addArg("--output");
-    const raw_dir = codegen.addOutputDirectoryArg("sentencepiece_proto_raw");
+    const raw_dir = codegen.addOutputDirectoryArg2("sentencepiece_proto_raw", .{ .make_absolute = true });
     const fixup = b.addExecutable(.{
         .name = "patch_sentencepiece_proto",
         .root_module = b.createModule(.{
             .root_source_file = root.path(b, "tools/patch_sentencepiece_proto.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
         }),
     });
     const run = b.addRunArtifact(fixup);
-    run.addFileArg(raw_dir.path(b, "root.zig"));
-    run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    return run.addOutputDirectoryArg("sentencepiece_proto").path(b, "root.zig");
+    run.addFileArg2(raw_dir.path(b, "root.zig"), .{ .make_absolute = true });
+    run.addFileArg2(raw_dir.path(b, "sentencepiece.zig"), .{ .make_absolute = true });
+    return run.addOutputDirectoryArg2("sentencepiece_proto", .{ .make_absolute = true }).path(b, "root.zig");
 }
 
 /// Generated source is target-independent; each runtime gets its configured protobuf.

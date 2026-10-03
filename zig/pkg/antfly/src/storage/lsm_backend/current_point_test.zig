@@ -204,7 +204,7 @@ test "current writer directory wide batches keep only one owned allocation per r
 }
 
 test "current writer directory owned batch retention benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const alloc = std.heap.smp_allocator;
     var storage = storage_io.MemoryStorage.init(alloc);
     defer storage.deinit();
@@ -248,7 +248,7 @@ test "current writer directory owned batch retention benchmark" {
 }
 
 test "current writer directory point scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const alloc = std.heap.smp_allocator;
     for ([_]usize{ 1000, 10000, 100000 }) |count| {
         const keys = try alloc.alloc(u8, count * 8);

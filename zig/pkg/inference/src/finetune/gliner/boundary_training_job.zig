@@ -697,7 +697,7 @@ test "boundary training job forwards resource overrides without changing semanti
 test "boundary training job cooperative pause combines callback and invocation limit" {
     const Flag = struct {
         requested: bool = false,
-        fn read(raw: ?*const anyopaque) bool {
+        pub fn read(raw: ?*const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw.?));
             return self.requested;
         }

@@ -80,7 +80,7 @@ pub fn prepareCommand(alloc: Allocator, txn: anytype, catalog: catalog_mod.Catal
             !std.mem.eql(u8, std.mem.sliceAsBytes(before.generations), std.mem.sliceAsBytes(next.generations)) or next.rows_scanned < before.rows_scanned) return error.InvalidConstraintRetirementCommand;
         if (next.phase == before.phase) {
             if (before.phase == .fenced or before.phase == .ready or std.mem.order(u8, next.cursor, before.cursor) != .gt) return error.InvalidConstraintRetirementCommand;
-        } else if (@intFromEnum(next.phase) != @intFromEnum(before.phase) + 1 or next.cursor.len != 0) return error.InvalidConstraintRetirementCommand;
+        } else if (@backingInt(next.phase) != @backingInt(before.phase) + 1 or next.cursor.len != 0) return error.InvalidConstraintRetirementCommand;
     } else if (next.phase != .fenced or next.rows_scanned != 0 or next.cursor.len != 0) return error.InvalidConstraintRetirementCommand;
     return .{ .intent = .{ .key = key, .value = command.next }, .predicate = .{ .key = key, .comparison = .exact_value, .expected_value = command.expected } };
 }

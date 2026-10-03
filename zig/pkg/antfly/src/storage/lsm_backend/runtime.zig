@@ -160,11 +160,11 @@ fn releaseHeldValues(held_values: *std.ArrayListUnmanaged([]u8), allocator: Allo
     held_values.* = .empty;
 }
 
-fn recordCursorValueBorrow(backend: anytype) void {
+pub fn recordCursorValueBorrow(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorValueBorrow")) backend.recordCursorValueBorrow();
 }
 
-fn recordCursorValueCopy(backend: anytype) void {
+pub fn recordCursorValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorValueCopy")) backend.recordCursorValueCopy();
 }
 
@@ -184,19 +184,19 @@ fn restoreCursorScanValueStats(cursor: anytype, previous: ?bool) void {
     }
 }
 
-fn recordPointValueBorrow(backend: anytype) void {
+pub fn recordPointValueBorrow(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointValueBorrow")) backend.recordPointValueBorrow();
 }
 
-fn recordPointValueCopy(backend: anytype) void {
+pub fn recordPointValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointValueCopy")) backend.recordPointValueCopy();
 }
 
-fn recordPointRunPrecheck(backend: anytype) void {
+pub fn recordPointRunPrecheck(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointRunPrecheck")) backend.recordPointRunPrecheck();
 }
 
-fn recordPointRunPrecheckSurvivor(backend: anytype) void {
+pub fn recordPointRunPrecheckSurvivor(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointRunPrecheckSurvivor")) backend.recordPointRunPrecheckSurvivor();
 }
 
@@ -206,7 +206,7 @@ fn canBorrowReaderRetainedState(backend: anytype) bool {
     return @hasField(BackendType, "active_readers") and backend.active_readers > 0;
 }
 
-fn retainActiveMutableValueReader(backend: anytype) bool {
+pub fn retainActiveMutableValueReader(backend: anytype) bool {
     if (@hasDecl(@TypeOf(backend.*), "retainActiveMutableValueReader")) {
         backend.retainActiveMutableValueReader();
         return true;
@@ -214,12 +214,12 @@ fn retainActiveMutableValueReader(backend: anytype) bool {
     return false;
 }
 
-fn releaseActiveMutableValueReader(backend: anytype, retained: bool) void {
+pub fn releaseActiveMutableValueReader(backend: anytype, retained: bool) void {
     if (!retained) return;
     if (@hasDecl(@TypeOf(backend.*), "releaseActiveMutableValueReader")) backend.releaseActiveMutableValueReader();
 }
 
-fn canBorrowActiveMutableValues(backend: anytype) bool {
+pub fn canBorrowActiveMutableValues(backend: anytype) bool {
     if (@hasDecl(@TypeOf(backend.*), "canBorrowActiveMutableValues")) return backend.canBorrowActiveMutableValues();
     return false;
 }
@@ -229,7 +229,7 @@ fn shouldRetainActiveMutableValueReader(backend: anytype) bool {
     return true;
 }
 
-fn prepareMutableForWrite(backend: anytype) !void {
+pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
@@ -256,19 +256,19 @@ fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *Acti
     }
 }
 
-fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTable) !void {
+pub fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTable) !void {
     if (@hasDecl(@TypeOf(backend.*), "enforceMutableWriteAdmission")) {
         try backend.enforceMutableWriteAdmission(incoming);
     }
 }
 
-fn enforceSortedWriteAdmission(backend: anytype, incoming: *const State) !void {
+pub fn enforceSortedWriteAdmission(backend: anytype, incoming: *const State) !void {
     if (@hasDecl(@TypeOf(backend.*), "enforceSortedWriteAdmission")) {
         try backend.enforceSortedWriteAdmission(incoming);
     }
 }
 
-fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
+pub fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
     const BackendType = @TypeOf(backend.*);
     if (@hasDecl(BackendType, "noteWriteMutationLocked")) {
         backend.noteWriteMutationLocked();
@@ -279,25 +279,25 @@ fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
     }
 }
 
-fn finishCommittedWalAppend(backend: anytype) void {
+pub fn finishCommittedWalAppend(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "finishCommittedWalAppend")) {
         backend.finishCommittedWalAppend();
     }
 }
 
-fn recordCursorBlockReadahead(backend: anytype) void {
+pub fn recordCursorBlockReadahead(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorBlockReadahead")) backend.recordCursorBlockReadahead();
 }
 
-fn recordCursorTableIndexHit(backend: anytype) void {
+pub fn recordCursorTableIndexHit(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorTableIndexHit")) backend.recordCursorTableIndexHit();
 }
 
-fn recordCursorTableIndexMiss(backend: anytype) void {
+pub fn recordCursorTableIndexMiss(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorTableIndexMiss")) backend.recordCursorTableIndexMiss();
 }
 
-fn recordPrefixBloomNegative(backend: anytype) void {
+pub fn recordPrefixBloomNegative(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPrefixBloomNegative")) {
         backend.recordPrefixBloomNegative();
     } else if (@hasDecl(@TypeOf(backend.*), "recordBloomNegative")) {
@@ -305,7 +305,7 @@ fn recordPrefixBloomNegative(backend: anytype) void {
     }
 }
 
-fn recordBlockPrefixBloomNegative(backend: anytype) void {
+pub fn recordBlockPrefixBloomNegative(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordBlockPrefixBloomNegative")) {
         backend.recordBlockPrefixBloomNegative();
     } else if (@hasDecl(@TypeOf(backend.*), "recordBloomNegative")) {
@@ -341,7 +341,7 @@ fn runtimeScratchAllocator(fallback: Allocator) Allocator {
     return std.heap.smp_allocator;
 }
 
-fn localBlockCacheEnabled(backend: anytype) bool {
+pub fn localBlockCacheEnabled(backend: anytype) bool {
     if (@hasDecl(@TypeOf(backend.*), "localBlockCacheEnabled")) {
         return backend.localBlockCacheEnabled();
     }
@@ -384,7 +384,7 @@ const RunGroup = struct {
     largest_key: []const u8,
     run_indices: []usize,
 
-    fn deinit(self: *RunGroup, allocator: Allocator) void {
+    pub fn deinit(self: *RunGroup, allocator: Allocator) void {
         allocator.free(self.run_indices);
         self.* = undefined;
     }
@@ -2480,7 +2480,7 @@ const RunBatchIndexState = struct {
     // block cache so dense adjacent batches retain their amortized path.
     direct_prefix_block_index: ?usize = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.handle.release();
         if (self.block_handle) |*handle| handle.release();
         self.* = undefined;
@@ -2507,7 +2507,7 @@ const RunBatchIndexHandles = struct {
     allocator: Allocator,
     items: std.ArrayListUnmanaged(RunBatchIndexState) = .empty,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.items.items) |*item| item.deinit();
         self.items.deinit(self.allocator);
         self.* = undefined;
@@ -3194,7 +3194,7 @@ fn CurrentReadLayout(comptime BackendType: type) type {
             return layout;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.mutable_snapshot) |snapshot| snapshot.release(self.backend);
             self.read_view.release(self.backend);
             releaseImmutableMemtableSnapshotList(BackendType, self.backend, self.immutable_memtables);
@@ -3488,7 +3488,7 @@ fn releaseImmutableMemtableSnapshotList(
     }
 }
 
-fn releaseImmutableMemtablePins(
+pub fn releaseImmutableMemtablePins(
     comptime BackendType: type,
     backend: *BackendType,
     snapshot: []const *const State,
@@ -3501,7 +3501,7 @@ fn releaseImmutableMemtablePins(
 /// Release the exact shared mutable generation returned by
 /// `snapshotMutableStateWithReason`. Fallback backends return owned snapshots
 /// and do not implement this hook.
-fn releaseMutableReadSnapshot(
+pub fn releaseMutableReadSnapshot(
     comptime BackendType: type,
     backend: *BackendType,
     snapshot: *const State,
@@ -4029,7 +4029,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             };
         }
 
-        fn deinitOwned(self: *@This(), backend: *BackendType) void {
+        pub fn deinitOwned(self: *@This(), backend: *BackendType) void {
             switch (self.*) {
                 .owned => |state| {
                     if (@hasDecl(BackendType, "retireOwnedMutableSnapshot")) {
@@ -8155,11 +8155,11 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
         retained_readers: usize = 0,
         active_batches: usize = 0,
 
-        fn retainReader(self: *@This()) void {
+        pub fn retainReader(self: *@This()) void {
             self.retained_readers += 1;
         }
 
-        fn releaseReader(self: *@This()) void {
+        pub fn releaseReader(self: *@This()) void {
             std.debug.assert(self.retained_readers > 0);
             self.retained_readers -= 1;
         }
@@ -8179,7 +8179,7 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
 
         fn finalizeExitedBatchMode(_: *@This(), _: backend_types.BatchOptions) !void {}
 
-        fn finalizeWriteReaderRelease(_: *@This()) !void {}
+        pub fn finalizeWriteReaderRelease(_: *@This()) !void {}
 
         fn getMergedWithOverlay(
             _: *@This(),
@@ -8222,11 +8222,11 @@ test "lsm namespace write txn releases local mutable state when wal append fails
         retained_readers: usize = 0,
         active_batches: usize = 0,
 
-        fn retainReader(self: *@This()) void {
+        pub fn retainReader(self: *@This()) void {
             self.retained_readers += 1;
         }
 
-        fn releaseReader(self: *@This()) void {
+        pub fn releaseReader(self: *@This()) void {
             std.debug.assert(self.retained_readers > 0);
             self.retained_readers -= 1;
         }
@@ -8240,7 +8240,7 @@ test "lsm namespace write txn releases local mutable state when wal append fails
             self.active_batches -= 1;
         }
 
-        fn appendWalForState(_: *@This(), _: *const State) !void {
+        pub fn appendWalForState(_: *@This(), _: *const State) !void {
             return error.InjectedWalFailure;
         }
 
@@ -8248,7 +8248,7 @@ test "lsm namespace write txn releases local mutable state when wal append fails
 
         fn finalizeExitedBatchMode(_: *@This(), _: backend_types.BatchOptions) !void {}
 
-        fn finalizeWriteReaderRelease(_: *@This()) !void {}
+        pub fn finalizeWriteReaderRelease(_: *@This()) !void {}
     };
 
     var backend = TestBackend{

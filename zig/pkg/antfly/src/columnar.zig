@@ -65,7 +65,7 @@ pub const ColumnarWriter = struct {
             return .{ .chunks = .empty, .docs_in_current = 0 };
         }
 
-        fn deinit(self: *FieldData, alloc: Allocator) void {
+        pub fn deinit(self: *FieldData, alloc: Allocator) void {
             for (self.chunks.items) |*c| c.deinit(alloc);
             self.chunks.deinit(alloc);
         }

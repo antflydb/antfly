@@ -250,7 +250,7 @@ test "lite reclamation worker cancels post assessment status replay after foregr
         var owner: ?*Store = null;
         var owner_reads: u64 = 0;
         var checkpoint: native.CheckpointSlot = undefined;
-        fn read(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
+        pub fn read(userdata: ?*anyopaque, file: std.Io.File, data: []const []u8, offset: u64) std.Io.File.ReadPositionalError!usize {
             const n = try std.testing.io.vtable.fileReadPositional(userdata, file, data, offset);
             if (owner) |store| {
                 if (file.handle == store.file.file.handle and store.maintenance_cancel.requested.load(.acquire)) owner_reads += 1;
@@ -3044,7 +3044,7 @@ const replay_hints = [_]change_journal_mod.TargetHint{
 };
 
 fn replayHintOrdinal(hint: change_journal_mod.TargetHint) u8 {
-    return @intCast(@intFromEnum(hint));
+    return @intCast(@backingInt(hint));
 }
 
 fn encodeReplaySequence(sequence: u64) [8]u8 {
@@ -3203,7 +3203,7 @@ fn collectReplayEntries(store: *Store, prefix: []const u8, alloc: Allocator, fro
         allocator: Allocator,
         entries: std.ArrayListUnmanaged(backend_types.ReplayEntry) = .empty,
 
-        fn collect(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+        pub fn collect(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             // Reserve before acquiring the payload: insertion cannot fail
             // once the collector takes ownership of the duplicated bytes.
@@ -4183,7 +4183,7 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
         var armed: std.atomic.Value(bool) = .init(false);
         var started: std.atomic.Value(bool) = .init(false);
         var proceed: std.atomic.Value(bool) = .init(false);
-        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
             if (armed.load(.acquire) and file.handle != live_handle and armed.swap(false, .acq_rel)) {
                 started.store(true, .release);
                 while (!proceed.load(.acquire)) @import("antfly_platform").time.yieldNow();
@@ -4265,7 +4265,7 @@ test "lite online vacuum catches foreground commits while its copy is blocked" {
 test "lite grouped durability failures recover all roots at one checkpoint" {
     const Fault = struct {
         var remaining: usize = 0;
-        fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
             if (remaining != 0) {
                 remaining -= 1;
                 if (remaining == 0) return error.InputOutput;
@@ -4357,7 +4357,7 @@ test "lite maintenance snapshots release shared cache accounting on cancellation
     const path = try testPath(alloc, tmp, "maintenance-budget.aflite");
     defer alloc.free(path);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
+    budgets[@backingInt(resource_manager_mod.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     {
         var store = try Store.createWithOptions(alloc, path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io, .resource_manager = &manager });
@@ -4818,7 +4818,7 @@ test "lite transaction snapshot cache allocation failures release ownership and 
         var setup = try Txn.openWriteWithPrefix(&store, "scope\x00");
         errdefer setup.abort();
         try setup.put("a", "first");
-        try setup.put("b", &([_]u8{'v'} ** 8192));
+        try setup.put("b", &(@as([8192]u8, @splat('v'))));
         try setup.commit();
     }
     var exhausted = false;

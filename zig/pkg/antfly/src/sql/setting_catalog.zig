@@ -35,12 +35,12 @@ const Entries = struct {
         index: ?usize,
         value: Value,
 
-        fn deinit(self: *PreparedPut, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PreparedPut, alloc: std.mem.Allocator) void {
             if (self.value == .string) alloc.free(self.value.string);
         }
     };
 
-    fn deinit(self: *Entries, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Entries, alloc: std.mem.Allocator) void {
         for (self.items.items) |entry| if (entry.value == .string) alloc.free(entry.value.string);
         self.items.deinit(alloc);
         self.* = .{};

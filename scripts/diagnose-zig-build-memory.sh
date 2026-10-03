@@ -14,7 +14,7 @@ Options:
   --out-dir DIR          Directory for logs. Default: /tmp/antfly-zig-build-memory
   --prefix DIR           Zig install prefix. Default: /tmp/antfly-zig-build-memory-prefix
   --target TARGET        Zig target. Default: aarch64-linux-musl
-  --optimize MODE        Zig optimize mode. Default: ReleaseFast
+  --optimize MODE        Zig optimize mode. Default: fast
   --strip true|false     Omit debug information. Default: false
   --install-step STEP    Build step. Default: antfly
   --jobs N               Zig build jobs. Default: 1
@@ -30,7 +30,7 @@ Environment:
 
 Examples:
   scripts/diagnose-zig-build-memory.sh
-  scripts/diagnose-zig-build-memory.sh --optimize ReleaseSmall
+  scripts/diagnose-zig-build-memory.sh --optimize small
   scripts/diagnose-zig-build-memory.sh --target native -- --verbose
 EOF
 }
@@ -40,7 +40,7 @@ zig_dir="${repo_root}/zig"
 out_dir="/tmp/antfly-zig-build-memory"
 prefix="/tmp/antfly-zig-build-memory-prefix"
 target="aarch64-linux-musl"
-optimize="ReleaseFast"
+optimize="fast"
 strip="false"
 install_step="antfly"
 jobs="1"

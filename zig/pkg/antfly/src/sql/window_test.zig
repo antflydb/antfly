@@ -70,7 +70,7 @@ test "SQL named windows and exclusions release allocation failures" {
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "SQL unused named windows validate without evaluating discarded expressions" {
@@ -166,7 +166,7 @@ test "SQL window input preparation releases every allocation failure" {
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "SQL window shape infers frame value and offset parameters before execution" {

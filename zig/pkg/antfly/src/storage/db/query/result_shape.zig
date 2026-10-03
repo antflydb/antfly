@@ -325,12 +325,12 @@ fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResul
 fn hashArtifactRef(hasher: *std.hash.Wyhash, artifact_ref: types.ArtifactRef) void {
     hashLengthPrefixedBytes(hasher, artifact_ref.document_id);
     hashLengthPrefixedBytes(hasher, artifact_ref.name);
-    hasher.update(&.{@intFromEnum(artifact_ref.kind)});
+    hasher.update(&.{@backingInt(artifact_ref.kind)});
     hashOptionalU32(hasher, artifact_ref.chunk_id);
     hashOptionalBytes(hasher, artifact_ref.unit_id);
     if (artifact_ref.source) |source| {
         hasher.update(&.{1});
-        hasher.update(&.{@intFromEnum(source.kind)});
+        hasher.update(&.{@backingInt(source.kind)});
         hashLengthPrefixedBytes(hasher, source.name);
         hashOptionalU32(hasher, source.chunk_id);
         hashOptionalBytes(hasher, source.unit_id);
@@ -624,7 +624,7 @@ const ChunkUnitIdentity = struct {
     key: []u8,
     fingerprint: ?[]u8 = null,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.key);
         if (self.fingerprint) |fingerprint| alloc.free(fingerprint);
         self.* = undefined;
@@ -942,7 +942,7 @@ const ChunkAncestorInfo = struct {
     parent_doc_key: []u8,
     unit_key: ?[]u8 = null,
 
-    fn deinit(self: *ChunkAncestorInfo, alloc: Allocator) void {
+    pub fn deinit(self: *ChunkAncestorInfo, alloc: Allocator) void {
         alloc.free(self.parent_doc_key);
         if (self.unit_key) |key| alloc.free(key);
         self.* = undefined;
@@ -1321,7 +1321,7 @@ const ResolvedPatternDocIds = struct {
     all: bool = false,
     owned: bool = false,
 
-    fn deinit(self: *ResolvedPatternDocIds, alloc: Allocator) void {
+    pub fn deinit(self: *ResolvedPatternDocIds, alloc: Allocator) void {
         if (self.ordinal_set) |*set| set.deinit(alloc);
         if (self.owned) freeResolvedDocIds(alloc, self.ids);
         self.* = .{};

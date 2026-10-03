@@ -53,14 +53,14 @@ pub const TopologyRequirements = struct {
 
     pub fn merge(self: TopologyRequirements, other: TopologyRequirements) TopologyRequirements {
         return .{
-            .incoming = @enumFromInt(@max(@intFromEnum(self.incoming), @intFromEnum(other.incoming))),
-            .outgoing = @enumFromInt(@max(@intFromEnum(self.outgoing), @intFromEnum(other.outgoing))),
+            .incoming = @fromBackingInt(@max(@backingInt(self.incoming), @backingInt(other.incoming))),
+            .outgoing = @fromBackingInt(@max(@backingInt(self.outgoing), @backingInt(other.outgoing))),
         };
     }
 
     pub fn satisfies(self: TopologyRequirements, required: TopologyRequirements) bool {
-        return @intFromEnum(self.incoming) >= @intFromEnum(required.incoming) and
-            @intFromEnum(self.outgoing) >= @intFromEnum(required.outgoing);
+        return @backingInt(self.incoming) >= @backingInt(required.incoming) and
+            @backingInt(self.outgoing) >= @backingInt(required.outgoing);
     }
 };
 
@@ -1344,7 +1344,7 @@ test "serverless graph metric personalized pagerank is deterministic and rejects
     var bad_options = options;
     bad_options.teleport = &.{ 1, 0 };
     try std.testing.expectError(error.InvalidGraphMetricTeleport, pageRankTopologyAlloc(alloc, topology, bad_options));
-    const zero_mass = [_]f64{0} ** 8;
+    const zero_mass = @as([8]f64, @splat(0));
     bad_options.teleport = &zero_mass;
     try std.testing.expectError(error.InvalidGraphMetricTeleport, pageRankTopologyAlloc(alloc, topology, bad_options));
     const negative_mass = [_]f64{ 1, -1, 0, 0, 0, 0, 0, 0 };
@@ -1352,7 +1352,7 @@ test "serverless graph metric personalized pagerank is deterministic and rejects
     try std.testing.expectError(error.InvalidGraphMetricTeleport, pageRankTopologyAlloc(alloc, topology, bad_options));
     // A publication warm start is global by construction and cannot seed a
     // personalized fixed point.
-    const uniform = [_]f64{0.125} ** 8;
+    const uniform = @as([8]f64, @splat(0.125));
     var conflicting = options;
     conflicting.teleport = &uniform;
     conflicting.initial_scores = &uniform;
@@ -1361,7 +1361,7 @@ test "serverless graph metric personalized pagerank is deterministic and rejects
 
 test "serverless graph metric spectral kernels reject personalized teleports" {
     const alloc = std.testing.allocator;
-    const uniform = [_]f64{0.125} ** 8;
+    const uniform = @as([8]f64, @splat(0.125));
     var options = Options{ .max_iterations = 3 };
     options.teleport = &uniform;
     try std.testing.expectError(error.InvalidGraphMetricTeleport, eigenvectorAlloc(alloc, 8, &personalized_fixture_edges, options));

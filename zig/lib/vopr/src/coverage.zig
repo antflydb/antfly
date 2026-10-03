@@ -77,10 +77,10 @@ pub const Tracker = struct {
     }
 };
 
-fn collect(allocator: std.mem.Allocator, artifact: *const trace.Trace) !std.AutoHashMapUnmanaged(ids.StableId, void) {
+pub fn collect(allocator: std.mem.Allocator, artifact: *const trace.Trace) !std.AutoHashMapUnmanaged(ids.StableId, void) {
     var local: std.AutoHashMapUnmanaged(ids.StableId, void) = .empty;
     errdefer local.deinit(allocator);
-    for (artifact.transitions.items) |record| try local.put(allocator, ids.derive("coverage.transition", record.id, @intFromEnum(record.kind)), {});
+    for (artifact.transitions.items) |record| try local.put(allocator, ids.derive("coverage.transition", record.id, @backingInt(record.kind)), {});
     for (artifact.events.items) |record| try local.put(allocator, ids.derive("coverage.event", record.id, record.payload_digest), {});
     for (artifact.observations.items) |record| {
         for (record.features) |feature| {
@@ -90,7 +90,7 @@ fn collect(allocator: std.mem.Allocator, artifact: *const trace.Trace) !std.Auto
     for (artifact.properties.items) |record| {
         try local.put(allocator, ids.derive("coverage.property", record.property_id, @intFromBool(record.condition)), {});
     }
-    for (artifact.failures.items) |record| try local.put(allocator, ids.derive("coverage.failure", record.fingerprint, @intFromEnum(record.class)), {});
+    for (artifact.failures.items) |record| try local.put(allocator, ids.derive("coverage.failure", record.fingerprint, @backingInt(record.class)), {});
     return local;
 }
 

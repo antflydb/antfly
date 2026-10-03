@@ -158,7 +158,7 @@ const CompactionWork = struct {
     reservation: ?resource_manager_mod.Reservation = null,
     run_id_index: ?compaction_scheduler_mod.RunIdIndex = null,
 
-    fn deinit(self: *CompactionWork, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *CompactionWork, allocator: std.mem.Allocator) void {
         if (self.run_id_index) |*index| index.deinit(allocator);
         if (self.run_ids.len > 0) allocator.free(self.run_ids);
         if (self.reservation) |*lease| lease.release();
@@ -300,7 +300,7 @@ test "compaction admission retains prepared work and wakes all paused lanes" {
     const allocator = std.testing.allocator;
     for (0..3) |lane| {
         var budgets = resource_manager_mod.Options.defaultBudgets();
-        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1024 * 1024 };
+        budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1024 * 1024 };
         var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
         defer manager.deinit(allocator);
         var backend = Backend.init(allocator, .{ .resource_manager = &manager, .wal_enabled = false, .compaction_scheduler = .{ .max_in_flight_input_bytes = 1, .allow_oversized_single_job = false } });
@@ -565,7 +565,7 @@ const SelectedPlan = struct {
     objective_reservation: ?resource_manager_mod.Reservation = null,
     released_inputs: usize = 0,
     released_objectives: usize = 0,
-    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
         var owned = self;
         var credits: usize = std.math.maxInt(usize);
         std.debug.assert(owned.deinitStep(allocator, &credits));
@@ -707,7 +707,7 @@ test "compaction policy lanes isolate budgets retain progress and drain abandone
         try std.testing.expectEqual(background, backend.pending_directory_closure.?);
         try std.testing.expectEqual(visits, background.job.visits);
     }
-    if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM policy isolation runs=5001 rejected_foreground_ns={d}\n", .{(@import("antfly_platform").time.monotonicNs() - started) / 64});
+    if (@import("builtin").mode == .fast) std.debug.print("\nLSM policy isolation runs=5001 rejected_foreground_ns={d}\n", .{(@import("antfly_platform").time.monotonicNs() - started) / 64});
     try std.testing.expect(!try compactL0ToLimitScheduledWithinBudget(Backend, &backend, 0, 1, 0));
     try std.testing.expectEqual(@as(usize, 0), backend.compaction_stats.compactions);
 
@@ -834,11 +834,11 @@ test "compaction discovery receives turns under replenished foreground continuat
 
 test "compaction scratch admission scales with selected inputs not unrelated runs" {
     const Backend = @import("../lsm_backend.zig").Backend;
-    const counts = if (@import("builtin").mode == .ReleaseFast) [_]usize{ 10000, 100000 } else [_]usize{ 12000, 24000 };
+    const counts = if (@import("builtin").mode == .fast) [_]usize{ 10000, 100000 } else [_]usize{ 12000, 24000 };
     var peaks: [2]u64 = undefined;
     for (counts, &peaks) |count, *peak| {
         var budgets = resource_manager_mod.Options.defaultBudgets();
-        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 4 * 1024 * 1024 };
+        budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 4 * 1024 * 1024 };
         var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
         defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
         var backend = Backend.init(std.testing.allocator, .{ .level_target_runs_base = 1000000, .level_target_bytes_base = 0 });
@@ -873,7 +873,7 @@ test "compaction scratch admission scales with selected inputs not unrelated run
         // at continuation boundaries.
         peak.* = manager.sliceStats(.lsm_table_builder_working_set).peak_bytes;
         try std.testing.expect(peak.* < 2 * 1024 * 1024);
-        if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM admitted closure runs={d} selected=5001 lanes=2 peak_bytes={d} elapsed_ns={d}\n", .{ count, peak.*, @import("antfly_platform").time.monotonicNs() - started });
+        if (@import("builtin").mode == .fast) std.debug.print("\nLSM admitted closure runs={d} selected=5001 lanes=2 peak_bytes={d} elapsed_ns={d}\n", .{ count, peak.*, @import("antfly_platform").time.monotonicNs() - started });
 
         // Oversized discovery retires its arena before admitting the smaller
         // seed window, rather than retaining two attempts against the cap.
@@ -933,7 +933,7 @@ fn testCompactionPhaseHandoff(inputs: usize, count: usize, cap: u64, planning_bu
     const allocator = std.testing.allocator;
     for (0..3) |mode| {
         var budgets = resource_manager_mod.Options.defaultBudgets();
-        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
+        budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
         var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
         defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
         var backend = Backend.init(allocator, .{ .level_target_runs_base = 1000000, .level_target_bytes_base = 0 });
@@ -1011,7 +1011,7 @@ fn testCompactionPhaseHandoff(inputs: usize, count: usize, cap: u64, planning_bu
         try std.testing.expect(backend.pending_directory_closure == null);
         const peak = manager.sliceStats(.lsm_table_builder_working_set).peak_bytes;
         try std.testing.expect(peak <= cap);
-        if (@import("builtin").mode == .ReleaseFast and mode == 0) std.debug.print("\nLSM phase handoff inputs={d} retained_bytes={d} previous_overlap_bytes={d} peak_bytes={d} elapsed_ns={d}\n", .{ inputs, retained, used_before + validation_bytes, peak, @import("antfly_platform").time.monotonicNs() - started });
+        if (@import("builtin").mode == .fast and mode == 0) std.debug.print("\nLSM phase handoff inputs={d} retained_bytes={d} previous_overlap_bytes={d} peak_bytes={d} elapsed_ns={d}\n", .{ inputs, retained, used_before + validation_bytes, peak, @import("antfly_platform").time.monotonicNs() - started });
     }
 }
 
@@ -1774,7 +1774,7 @@ test "GC phase admission ignores unrelated runs and releases discovery before va
     for ([_]usize{ 10000, 30000 }) |count| {
         var budgets = resource_manager_mod.Options.defaultBudgets();
         const cap = 3 * 1024 * 1024;
-        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
+        budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
         var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
         defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
         var backend = Backend.init(allocator, .{});
@@ -1811,7 +1811,7 @@ test "GC phase admission ignores unrelated runs and releases discovery before va
         try std.testing.expect(accepted and saw_handoff);
         const peak = manager.sliceStats(.lsm_table_builder_working_set).peak_bytes;
         try std.testing.expect(peak < cap);
-        if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM GC phase inputs=1 runs={d} peak_bytes={d} elapsed_ns={d}\n", .{ count, peak, @import("antfly_platform").time.monotonicNs() - started });
+        if (@import("builtin").mode == .fast) std.debug.print("\nLSM GC phase inputs=1 runs={d} peak_bytes={d} elapsed_ns={d}\n", .{ count, peak, @import("antfly_platform").time.monotonicNs() - started });
     }
 }
 
@@ -1821,7 +1821,7 @@ test "GC phase handoff preserves epochs and drains partial cleanup or admission 
     for (0..4) |mode| {
         var budgets = resource_manager_mod.Options.defaultBudgets();
         const cap: u64 = if (mode == 3) @sizeOf(PendingGc) + @sizeOf(Directory) + 1 else 1024 * 1024;
-        budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
+        budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = cap };
         var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
         defer std.debug.assert(manager.sliceStats(.lsm_table_builder_working_set).used_bytes == 0);
         var backend = Backend.init(allocator, .{});
@@ -3569,7 +3569,7 @@ test "bulk publication summaries match the flat oracle across budgets fences and
 }
 
 test "bulk publication no-op scheduling scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const allocator = std.heap.smp_allocator;
     const Fixture = struct {
         allocator: std.mem.Allocator,
@@ -3615,7 +3615,7 @@ test "bulk publication no-op scheduling scaling benchmark" {
 }
 
 test "bulk publication large generation discovery is time sliced" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const allocator = std.heap.smp_allocator;
     const Fixture = struct {
         allocator: std.mem.Allocator,
@@ -4638,13 +4638,13 @@ fn compactPinnedPlanWithUnlockedBuild(backend: anytype, plan: CompactionPlan, dr
 }
 
 test "compaction admitted pinned execution handoff benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const lsm = @import("mod.zig");
     const alloc = std.testing.allocator;
     const now = @import("antfly_platform").time.monotonicNs;
     const Hooks = struct {
         var first_io: u64 = 0;
-        fn read(ptr: *anyopaque, a: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+        pub fn read(ptr: *anyopaque, a: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
             if (std.mem.eql(u8, path, "fake.sst")) {
                 if (first_io == 0) first_io = now();
                 return error.ReviewStop;
@@ -4719,7 +4719,7 @@ test "compaction suspended broad directory continuation retains a wake deadline"
         std.mem.writeInt(u64, key, i + 1, .big);
         try backend.runs.append(alloc, .{ .id = i + 1, .level = 1, .size_bytes = 1024, .path = @constCast("fake.sst"), .smallest_namespace_name = null, .smallest_key = key, .largest_namespace_name = null, .largest_key = key, .entry_count = 1, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
     }
-    try backend.runs.append(alloc, .{ .id = 5001, .level = 0, .size_bytes = 1024, .path = @constCast("fake.sst"), .smallest_namespace_name = null, .smallest_key = @constCast(&([_]u8{0} ** 8)), .largest_namespace_name = null, .largest_key = @constCast(&([_]u8{255} ** 8)), .entry_count = 2, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
+    try backend.runs.append(alloc, .{ .id = 5001, .level = 0, .size_bytes = 1024, .path = @constCast("fake.sst"), .smallest_namespace_name = null, .smallest_key = @constCast(&(@as([8]u8, @splat(0)))), .largest_namespace_name = null, .largest_key = @constCast(&(@as([8]u8, @splat(255)))), .entry_count = 2, .tombstone_count = 0, .bloom_filter = null, .owns_metadata = false, .owns_path = false, .state = null });
     backend.next_run_id = 5002;
     _ = try backend.planningDirectory();
     {
@@ -5936,7 +5936,7 @@ test "domain planner uses global lower level budgets and normalized pressure" {
         testRun(4, 1, "e", "e", 10),  testRun(3, 1, "f", "f", 10),
         testRun(2, 1, "g", "g", 10),  testRun(1, 1, "h", "h", 10),
     };
-    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
+    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0, .pointer_stability = .{} } };
     var stats: CompactionSelectionStats = .{};
     const selected = (try selectDomainPlan(&backend, 3, false, 0, false, &stats)).?;
     defer selected.release(backend);
@@ -5990,7 +5990,7 @@ test "tombstone GC density bounds garbage without stranding duplicate older vers
     for (&runs) |*run| run.entry_count = 100;
     runs[0].tombstone_count = 10;
     runs[0].oldest_tombstone_unix_ns = gcNowNs();
-    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
+    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0, .pointer_stability = .{} } };
     try std.testing.expect((try selectTombstoneGc(&backend, 0)) == null);
     // Sparse deletes eventually qualify independently of their key fraction.
     runs[0].oldest_tombstone_unix_ns = 1;
@@ -6041,7 +6041,7 @@ test "bounded GC carries aggregate eligibility across windows and retries indepe
         run.tombstone_count = 30;
         run.oldest_tombstone_unix_ns = gcNowNs();
     }
-    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
+    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0, .pointer_stability = .{} } };
     try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), nextTombstoneGcDelay(&backend));
     backend.options.tombstone_gc_max_age_ns = 0;
     try std.testing.expectEqual(@as(?u64, 250 * std.time.ns_per_ms), nextTombstoneGcDelay(&backend));
@@ -6083,7 +6083,7 @@ test "persistent planner ordering matches rebuilt domain and GC indexes after le
         pub fn releaseRunSnapshotRef(_: *@This(), _: *Run) void {}
     };
     var runs = [_]Run{ testRun(8, 0, "a0", "a9", 10), testRun(7, 0, "z0", "z9", 10), testRun(6, 1, "a0", "a9", 10), testRun(5, 1, "v0", "v9", 10), testRun(4, 2, "a0", "z9", 10) };
-    var fixture = Fixture{ .runs = .{ .items = &runs, .capacity = 0 } };
+    var fixture = Fixture{ .runs = .{ .items = &runs, .capacity = 0, .pointer_stability = .{} } };
     for (&runs) |*run| run.path = @constCast("/planner-oracle.tbl");
     const directory = try Directory.create(fixture.allocator);
     defer directory.destroy(fixture.allocator);
@@ -6165,7 +6165,7 @@ test "domain compaction maps interleaved inputs and revalidates concurrent publi
         testRun(6, 1, "a", "a", 1),  testRun(5, 1, "v", "v", 1024 * 1024),
         testRun(4, 1, "z", "z", 1),
     };
-    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0 } };
+    var backend = Fixture{ .allocator = std.testing.allocator, .runs = .{ .items = &runs, .capacity = 0, .pointer_stability = .{} } };
     var stats: CompactionSelectionStats = .{};
     const selected = (try selectDomainPlan(&backend, 2, true, 8, false, &stats)).?;
     defer selected.release(backend);
@@ -6757,7 +6757,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
 
         const Self = @This();
 
-        fn initInPlace(self: *Self, backend: *BackendType, output_level: u32, expected_entries: usize) !void {
+        pub fn initInPlace(self: *Self, backend: *BackendType, output_level: u32, expected_entries: usize) !void {
             const run_id = backend.next_run_id;
             backend.next_run_id += 1;
             self.* = .{
@@ -6789,7 +6789,7 @@ fn PersistedOutputRunBuilder(comptime BackendType: type) type {
             self.writer_active = true;
         }
 
-        fn deinit(self: *Self) void {
+        pub fn deinit(self: *Self) void {
             if (self.writer_active) {
                 self.writer.deinit();
                 self.writer_active = false;
@@ -7000,6 +7000,7 @@ pub const PendingTombstoneReconcile = struct {
 };
 
 pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
+    var zig017_return_error: ?anyerror = null;
     if (backend.tombstone_reconcile_in_flight) return false;
     if (backend.optionalMaintenanceDeferredLocked()) {
         backend.tombstone_reconcile_retry_ns = backend.nowNs() +| 100 * std.time.ns_per_ms;
@@ -7018,7 +7019,7 @@ pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
         pending.finish(backend);
         backend.releaseReaderKind(.other);
     };
-    errdefer |err| {
+    errdefer if (zig017_return_error) |err| {
         // Publication admission can recover without rereading an already
         // verified SST. Completed jobs retain only their small metadata pin.
         release = !(err == error.ResourceBudgetExceeded and backend.pending_tombstone_reconcile != null and backend.pending_tombstone_reconcile.?.complete);
@@ -7026,20 +7027,29 @@ pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
         backend.tombstone_reconcile_failure_streak +|= 1;
         const shift: u6 = @intCast(@min(backend.tombstone_reconcile_failure_streak - 1, 7));
         backend.tombstone_reconcile_retry_ns = backend.nowNs() +| @min(@as(u64, 250 * std.time.ns_per_ms) << shift, 30 * std.time.ns_per_s);
-    }
-    const directory = try backend.planningDirectory();
+    };
+    const directory = (backend.planningDirectory() catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     if (backend.pending_tombstone_reconcile == null) {
         const handle = directory.nextUnknownTombstone(backend.tombstone_reconcile_after_rank) orelse
             directory.nextUnknownTombstone(0) orelse return false;
         backend.tombstone_reconcile_after_rank = directory.rankOf(handle.run).? + 1;
-        backend.pending_tombstone_reconcile = try PendingTombstoneReconcile.create(backend, handle);
+        backend.pending_tombstone_reconcile = (PendingTombstoneReconcile.create(backend, handle) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
     }
     const pending = backend.pending_tombstone_reconcile.?;
     if (directory.resolve(pending.handle) == null) {
         release = true;
         return true;
     }
-    if (backend.manifestCoordinationIo()) |io| try io.checkCancel();
+    if (backend.manifestCoordinationIo()) |io| (io.checkCancel() catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     if (!backend.tryReserveMaintenanceIoBudget(pending.nextIoBytes())) {
         // Admission denial is not corruption and must neither discard the
         // verified prefix nor schedule a zero-delay retry loop.
@@ -7056,12 +7066,18 @@ pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
     backend.tombstone_reconcile_rows +|= pending.rows - before;
     backend.directory_planning_slices +|= 1;
     const done = result catch |err| {
-        if (pending.budget) |*budget| if (budget.denied()) return error.ResourceBudgetExceeded;
+        if (pending.budget) |*budget| if (budget.denied()) return zig017_failure: {
+            zig017_return_error = error.ResourceBudgetExceeded;
+            break :zig017_failure error.ResourceBudgetExceeded;
+        };
         return @as(anyerror!bool, err);
     };
     if (!done) return true;
     release = true;
-    const current = try backend.planningDirectory();
+    const current = (backend.planningDirectory() catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     if (current.resolve(pending.handle) == null) return true;
     const source = backend.runs.find(pending.handle.run).?;
     var metadata = run_store.Store.revision(source, source.*);
@@ -7070,16 +7086,31 @@ pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
     // never a new grace period that repeated restarts can extend indefinitely.
     metadata.oldest_tombstone_unix_ns = 0;
     const plan = CompactionPlan{ .source_level = source.level, .source_start = 0, .source_len = 1, .target_start = 1, .target_len = 0, .output_level = source.level, .input_handles = &.{pending.handle} };
-    var credit = try backend.admitCompactionMetadata(plan, &.{metadata});
+    var credit = (backend.admitCompactionMetadata(plan, &.{metadata}) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     defer credit.release();
     var publication_owned = true;
-    const retired = try backend.allocator.create(run_store.Store);
+    const retired = (backend.allocator.create(run_store.Store) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     errdefer if (publication_owned) backend.allocator.destroy(retired);
-    var candidate = try backend.runs.prepareReplace(backend.allocator, source, metadata);
+    var candidate = (backend.runs.prepareReplace(backend.allocator, source, metadata) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     errdefer if (publication_owned) candidate.deinit(backend.allocator);
-    const updated = try current.fork(backend.allocator);
+    const updated = (current.fork(backend.allocator) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     errdefer if (publication_owned) updated.destroy(backend.allocator);
-    try updated.put(backend, metadata);
+    (updated.put(backend, metadata) catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     backend.invalidateReadVersion();
     retired.* = backend.runs;
     backend.runs = candidate;
@@ -7093,7 +7124,10 @@ pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
     backend.tombstone_reconcile_completed +|= 1;
     backend.tombstone_reconcile_retry_ns = 0;
     backend.tombstone_reconcile_failure_streak = 0;
-    if (backend.root_dir != null) try backend.persistManifestLocked();
+    if (backend.root_dir != null) (backend.persistManifestLocked() catch |zig017_err| {
+        zig017_return_error = zig017_err;
+        return zig017_err;
+    });
     return true;
 }
 
@@ -7138,7 +7172,7 @@ const PersistedRunCursor = struct {
         };
     }
 
-    fn deinit(self: *PersistedRunCursor) void {
+    pub fn deinit(self: *PersistedRunCursor) void {
         if (self.loaded_bytes) |bytes| self.allocator.free(bytes);
         self.reader.deinit();
         self.index.deinit(self.allocator);
@@ -7265,7 +7299,7 @@ const StateMergeHeap = struct {
         return heap;
     }
 
-    fn deinit(self: *StateMergeHeap) void {
+    pub fn deinit(self: *StateMergeHeap) void {
         self.allocator.free(self.positions);
         self.allocator.free(self.sources);
         self.allocator.free(self.advanced_sources);
@@ -7375,7 +7409,7 @@ const PersistedRunMergeHeap = struct {
         return heap;
     }
 
-    fn deinit(self: *PersistedRunMergeHeap) void {
+    pub fn deinit(self: *PersistedRunMergeHeap) void {
         self.allocator.free(self.sources);
         self.allocator.free(self.advanced_sources);
         self.* = undefined;
@@ -8167,13 +8201,13 @@ test "unlocked compaction snapshots retain source file references until build cl
         retained: usize = 0,
         released: usize = 0,
 
-        fn retainRunSnapshotRef(self: *@This(), run: *Run) !void {
+        pub fn retainRunSnapshotRef(self: *@This(), run: *Run) !void {
             try std.testing.expect(!run.version_ref_pinned);
             run.version_ref_pinned = true;
             self.retained += 1;
         }
 
-        fn releaseRunSnapshotRef(self: *@This(), run: *Run) void {
+        pub fn releaseRunSnapshotRef(self: *@This(), run: *Run) void {
             if (!run.version_ref_pinned) return;
             run.version_ref_pinned = false;
             self.released += 1;
@@ -8234,7 +8268,7 @@ test "compaction publication OOM leaves the active run version intact" {
             self.obsolete_runs.appendAssumeCapacity(runs);
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             deinitRunList(self.allocator, &self.runs);
             for (self.obsolete_paths.items) |path| self.allocator.free(path);
             self.obsolete_paths.deinit(self.allocator);
@@ -8506,7 +8540,7 @@ test "persisted compaction bounds allocation failure preserves prior run bounds"
         const allocations_before = failing.alloc_index;
         const logical_bytes_before = output.logical_bytes;
         const tombstones_before = output.tombstone_count;
-        const larger_bounds = [_]u8{'z'} ** (std.ArrayListUnmanaged(u8).growCapacity(1) + 1);
+        const larger_bounds = @as([(std.ArrayListUnmanaged(u8).growCapacity(1) + 1)]u8, @splat('z'));
         failing.fail_index = allocations_before + failure_offset;
         failing.resize_fail_index = failing.resize_index;
         const next = lsm_table_file.Entry{

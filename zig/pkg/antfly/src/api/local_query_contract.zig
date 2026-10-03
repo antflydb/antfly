@@ -3501,11 +3501,11 @@ pub const StorageKernelLookupWireRequest = struct {
 
     pub fn jsonStringify(self: StorageKernelLookupWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
-        inline for (@typeInfo(StorageKernelLookupWireRequest).@"struct".fields) |field| {
-            try stream.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "key") or std.mem.eql(u8, field.name, "restore_staging_scope") or std.mem.eql(u8, field.name, "restore_staging_plan_id")) {
-                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
-            } else try stream.write(@field(self, field.name));
+        inline for (comptime std.meta.fieldNames(StorageKernelLookupWireRequest)) |reflected_name| {
+            try stream.objectField(reflected_name);
+            if (comptime std.mem.eql(u8, reflected_name, "key") or std.mem.eql(u8, reflected_name, "restore_staging_scope") or std.mem.eql(u8, reflected_name, "restore_staging_plan_id")) {
+                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, reflected_name), stream);
+            } else try stream.write(@field(self, reflected_name));
         }
         try stream.endObject();
     }
@@ -3661,11 +3661,11 @@ pub const StorageKernelScanWireRequest = struct {
 
     pub fn jsonStringify(self: StorageKernelScanWireRequest, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
-        inline for (@typeInfo(StorageKernelScanWireRequest).@"struct".fields) |field| {
-            try stream.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "from_key") or std.mem.eql(u8, field.name, "to_key")) {
-                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, field.name), stream);
-            } else try stream.write(@field(self, field.name));
+        inline for (comptime std.meta.fieldNames(StorageKernelScanWireRequest)) |reflected_name| {
+            try stream.objectField(reflected_name);
+            if (comptime std.mem.eql(u8, reflected_name, "from_key") or std.mem.eql(u8, reflected_name, "to_key")) {
+                try @import("../storage/db/relational_integrity_json.zig").write(@field(self, reflected_name), stream);
+            } else try stream.write(@field(self, reflected_name));
         }
         try stream.endObject();
     }
@@ -4789,18 +4789,18 @@ pub fn parseRemoteSearchResultInner(alloc: std.mem.Allocator, body: []const u8) 
 /// strings are cloned by SearchResult before the response arena is released.
 fn remoteSortProfile(wire: metadata_openapi.SortProfile) !db_mod.types.SortProfile {
     var profile: db_mod.types.SortProfile = .{};
-    inline for (@typeInfo(db_mod.types.SortProfile).@"struct".fields) |field| {
-        if (@hasField(metadata_openapi.SortProfile, field.name)) {
-            if (@field(wire, field.name)) |value| {
-                if (field.type == []const u8) {
-                    @field(profile, field.name) = if (@typeInfo(@TypeOf(value)) == .@"enum") @tagName(value) else value;
-                } else if (field.type == db_mod.types.SortProfileField) {
+    inline for (@typeInfo(db_mod.types.SortProfile).@"struct".field_names, @typeInfo(db_mod.types.SortProfile).@"struct".field_types) |reflected_name, field_type| {
+        if (@hasField(metadata_openapi.SortProfile, reflected_name)) {
+            if (@field(wire, reflected_name)) |value| {
+                if (field_type == []const u8) {
+                    @field(profile, reflected_name) = if (@typeInfo(@TypeOf(value)) == .@"enum") @tagName(value) else value;
+                } else if (field_type == db_mod.types.SortProfileField) {
                     if (value.len > profile.sort_rejection_field.bytes.len) return error.InvalidRemoteResponse;
-                    @field(profile, field.name) = .init(value);
-                } else if (@typeInfo(field.type) == .int) {
-                    @field(profile, field.name) = std.math.cast(field.type, value) orelse return error.InvalidRemoteResponse;
+                    @field(profile, reflected_name) = .init(value);
+                } else if (@typeInfo(field_type) == .int) {
+                    @field(profile, reflected_name) = std.math.cast(field_type, value) orelse return error.InvalidRemoteResponse;
                 } else {
-                    @field(profile, field.name) = value;
+                    @field(profile, reflected_name) = value;
                 }
             }
         }
@@ -6084,8 +6084,8 @@ pub fn remoteOptionalConfigFingerprint(value: ?[]const u8) !u64 {
 }
 
 pub fn graphMetricPhaseFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPhase {
-    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPhase).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPhase).@"enum".field_names, @typeInfo(graph_mod.GraphIndex.GraphMetricBuildPhase).@"enum".field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     }
     return null;
 }
@@ -6149,15 +6149,15 @@ pub fn parseRemoteGraphMetricBuildPages(
 }
 
 pub fn graphMetricBuildPageRangeKindFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPageRangeKind {
-    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageRangeKind).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageRangeKind).@"enum".field_names, @typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageRangeKind).@"enum".field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     }
     return null;
 }
 
 pub fn graphMetricBuildPageStateFromName(name: []const u8) ?graph_mod.GraphIndex.GraphMetricBuildPageState {
-    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageState).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageState).@"enum".field_names, @typeInfo(graph_mod.GraphIndex.GraphMetricBuildPageState).@"enum".field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     }
     return null;
 }

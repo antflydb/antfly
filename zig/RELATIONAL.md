@@ -603,7 +603,7 @@ somewhat more settled bytes; archived measurements are in
 Reproduce the narrow-write measurement with:
 
 ```sh
-zig build lsm-write-bench -Doptimize=ReleaseFast -- \
+zig build lsm-write-bench -Doptimize=fast -- \
   --samples 3 --keys 40000 --batch-size 1 --value-size 8 \
   --storage memory --mode default --workload-set ingest_compact \
   --flush-threshold 1000000 --flush-threshold-bytes 67108864
@@ -635,7 +635,7 @@ partitioning, at the cost of higher pinned peak disk usage and no measurable
 foreground-latency improvement in that fixture; archived measurements are in
 [work-log/completed/relational/benchmarks.md](../work-log/completed/relational/benchmarks.md).
 
-Reproduce with `zig build lib-storage-test -Doptimize=ReleaseFast --` and filters
+Reproduce with `zig build lib-storage-test -Doptimize=fast --` and filters
 `'relational columnar production LSM'`, `'lsm payload family isolation'`, and
 `'lsm point leases'`, plus `'lsm shared read version'` and
 `'lsm compaction domains'`. Timing is diagnostic; regression gates check ownership,

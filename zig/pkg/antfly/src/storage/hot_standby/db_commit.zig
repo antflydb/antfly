@@ -112,7 +112,7 @@ pub fn evaluateReplicationMirrorCommitGate(mirror: ReplicationAsyncEffectMirror,
 
 pub fn recordHAMirrorGate(mirror: ReplicationAsyncEffectMirror, gate: hot_standby_commit_gate_mod.GateResult) void {
     if (mirror.last_gate_lsn) |last_lsn| last_lsn.store(gate.target_lsn, .release);
-    if (mirror.last_gate_action) |last_action| last_action.store(@intFromEnum(gate.action), .release);
+    if (mirror.last_gate_action) |last_action| last_action.store(@backingInt(gate.action), .release);
     switch (gate.action) {
         .acknowledge => {},
         .acknowledge_degraded => {

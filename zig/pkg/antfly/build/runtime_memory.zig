@@ -33,7 +33,7 @@ pub const RuntimeLibraryUnit = enum {
 pub const CompileMemoryProfile = struct {
     host: std.Target,
     target: std.Target,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     strip: bool,
     cpu_inference: bool,
     sanitize_thread: bool = false,
@@ -45,7 +45,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
     if (profile.host.os.tag == .linux and profile.host.cpu.arch == .x86_64 and
         target.os.tag == .linux and target.cpu.arch == .x86_64 and target.abi == .gnu and
         target.cpu.model == baseline_cpu.model and target.cpu.features.eql(baseline_cpu.features) and
-        (profile.optimize == .ReleaseFast or profile.optimize == .ReleaseSafe) and
+        (profile.optimize == .fast or profile.optimize == .safe) and
         profile.strip and profile.cpu_inference and !profile.sanitize_thread)
     {
         // Cold Zig 0.16 x86_64 Linux CPU ReleaseFast, stripped, with empty
@@ -57,7 +57,7 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // serialized the build until the E2E job's 90-minute deadline.
         // Retain margins above rounded Zig MaxRSS and allow the two largest
         // units to overlap within the existing 22 GiB aggregate budget.
-        const gib: usize = if (profile.optimize == .ReleaseSafe) switch (unit) {
+        const gib: usize = if (profile.optimize == .safe) switch (unit) {
             .api_kernel => 7,
             .distributed => 8,
             .storage_kernel => 12,
@@ -120,12 +120,12 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
 test "measured release reservations admit storage with inference and preserve unmeasured profiles" {
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
     const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
-    const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .ReleaseFast, .strip = true, .cpu_inference = true };
+    const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .fast, .strip = true, .cpu_inference = true };
     const budget = 22 * 1024 * 1024 * 1024;
     try std.testing.expectEqual(@as(usize, 13) * 1024 * 1024 * 1024, runtimeCompileMaxRss(.distributed, .{
         .host = macos,
         .target = macos,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .strip = false,
         .cpu_inference = true,
     }));
@@ -138,13 +138,13 @@ test "measured release reservations admit storage with inference and preserve un
         var profile = measured;
         profile.host = macos;
         try std.testing.expectEqual(runtimeCompileMaxRss(unit, conservative), runtimeCompileMaxRss(unit, profile));
-        inline for (.{ .Debug, .ReleaseSmall }) |mode| {
+        inline for (.{ .debug, .small }) |mode| {
             profile = measured;
             profile.optimize = mode;
             try std.testing.expectEqual(runtimeCompileMaxRss(unit, conservative), runtimeCompileMaxRss(unit, profile));
         }
         profile = measured;
-        profile.target.cpu.features.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
+        profile.target.cpu.features.addFeature(@backingInt(std.Target.x86.Feature.avx2));
         try std.testing.expectEqual(runtimeCompileMaxRss(unit, conservative), runtimeCompileMaxRss(unit, profile));
         profile = measured;
         profile.strip = false;
@@ -168,7 +168,7 @@ test "measured release reservations admit storage with inference and preserve un
 
 test "measured ReleaseSafe CPU archives overlap within the E2E runner budget" {
     const linux = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .x86_64, .cpu_model = .baseline, .os_tag = .linux, .abi = .gnu });
-    const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .ReleaseSafe, .strip = true, .cpu_inference = true };
+    const measured: CompileMemoryProfile = .{ .host = linux, .target = linux, .optimize = .safe, .strip = true, .cpu_inference = true };
     const gib = 1024 * 1024 * 1024;
     // Zig's summary rounds MaxRSS. Add a whole GiB to each reported peak
     // before requiring headroom, rather than treating 8G as an exact sample.

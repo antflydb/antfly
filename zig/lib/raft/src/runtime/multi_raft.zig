@@ -283,7 +283,7 @@ const PendingApplyTask = struct {
     conf_state: ?core.types.ConfState,
     approx_bytes: usize,
 
-    fn deinit(self: *PendingApplyTask, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PendingApplyTask, alloc: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
         core.types.freeEntries(alloc, self.entries);
         for (self.read_states) |*read_state| read_state.deinit(alloc);
@@ -300,7 +300,7 @@ const SnapshotBuildRequest = struct {
     source: storage_iface.SnapshotSource,
     metadata: core.types.SnapshotMetadata,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.source.deinit();
         self.metadata.deinit(std.heap.page_allocator);
         self.* = undefined;
@@ -323,7 +323,7 @@ const SnapshotBuildResult = union(enum) {
         cause: anyerror,
     },
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         switch (self.*) {
             .success => |*result| {
                 result.metadata.deinit(std.heap.page_allocator);
@@ -359,7 +359,7 @@ const SnapshotBuildWorker = struct {
         self.future = try self.io_impl.io().concurrent(run, .{self});
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         const io = self.io_impl.io();
         self.mutex.lockUncancelable(io);
         self.stopping = true;
@@ -498,7 +498,7 @@ const SnapshotCandidate = struct {
     retry_attempt: u8 = 0,
     retry_after_ns: u64 = 0,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.conf_state.deinit(alloc);
         self.* = undefined;
     }
@@ -532,7 +532,7 @@ const PendingPersistence = struct {
     kind: enum { ready, maintenance, snapshot } = .ready,
     failure: ?anyerror = null,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.operation.deinit();
         self.ready.deinit(alloc);
     }
@@ -1334,6 +1334,7 @@ pub const MultiRaft = struct {
         var oversized_ready_groups = std.ArrayListUnmanaged(OversizedReadyGroup){
             .items = oversized_ready_group_buf[0..0],
             .capacity = oversized_ready_group_buf.len,
+            .pointer_stability = .{},
         };
         const batch = if (self.hooks.disk_batcher) |disk_batcher| try disk_batcher.beginBatch() else null;
         if (batch != null) self.metrics.persist_batches += 1;
@@ -3091,7 +3092,7 @@ const GroupBatchBuilder = struct {
     group_id: core.types.GroupId,
     messages: std.ArrayListUnmanaged(core.Message) = .empty,
 
-    fn deinit(self: *GroupBatchBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GroupBatchBuilder, alloc: std.mem.Allocator) void {
         self.messages.deinit(alloc);
         self.* = undefined;
     }
@@ -3102,7 +3103,7 @@ const PeerBatchBuilder = struct {
     groups: std.ArrayListUnmanaged(GroupBatchBuilder) = .empty,
     group_indexes: std.AutoHashMapUnmanaged(core.types.GroupId, usize) = .empty,
 
-    fn deinit(self: *PeerBatchBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PeerBatchBuilder, alloc: std.mem.Allocator) void {
         for (self.groups.items) |*group| group.deinit(alloc);
         self.groups.deinit(alloc);
         self.group_indexes.deinit(alloc);
@@ -3118,7 +3119,7 @@ const TransportOutbox = struct {
     snapshot_cursor: usize = 0,
     approx_bytes: usize = 0,
 
-    fn deinit(self: *TransportOutbox, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *TransportOutbox, alloc: std.mem.Allocator) void {
         for (self.items.items) |*item| item.message.deinit(alloc);
         for (self.snapshot_items.items) |*item| item.message.deinit(alloc);
         self.items.deinit(alloc);

@@ -159,7 +159,7 @@ pub fn sourceGenerationAdmissionSummaryDigest(namespace: doc_identity.Namespace,
         std.mem.writeInt(u64, &number, entry.constraint_name.len, .little);
         hash.update(&number);
         hash.update(entry.constraint_name);
-        hash.update(if (entry.active_generation) |generation| &generation else &([_]u8{0} ** 16));
+        hash.update(if (entry.active_generation) |generation| &generation else &(@as([16]u8, @splat(0))));
         hash.update(&entry.source_scope_digest);
     }
     var digest: [32]u8 = undefined;
@@ -252,7 +252,7 @@ const ResolutionArtifactRef = struct {
     doc_key: []u8,
     artifact_name: []u8,
 
-    fn deinit(self: *ResolutionArtifactRef, alloc: Allocator) void {
+    pub fn deinit(self: *ResolutionArtifactRef, alloc: Allocator) void {
         alloc.free(self.doc_key);
         alloc.free(self.artifact_name);
         self.* = undefined;
@@ -322,7 +322,7 @@ const PortableOutput = struct {
 
     fn writeBlock(self: *PortableOutput, block_type: backup_codec.BlockType, payload: []const u8) !void {
         try self.cancellation.check();
-        if (self.source_certificate) |builder| try builder.addBlock(@intFromEnum(block_type), payload);
+        if (self.source_certificate) |builder| try builder.addBlock(@backingInt(block_type), payload);
         self.bytes_written += backup_codec.block_envelope_overhead + payload.len;
         switch (self.mode) {
             .inventory => |objects| {
@@ -484,7 +484,7 @@ pub const ExportOptions = struct {
     source_copy: ?SourceCopyProof = null,
     cancellation: @import("antfly_cancellation").CancellationToken = .none,
     stats: ?*ExportStats = null,
-    header_backup_id: [16]u8 = [_]u8{0} ** 16,
+    header_backup_id: [16]u8 = @as([16]u8, @splat(0)),
     backup_id: []const u8 = "",
     table_name: []const u8 = "",
     created_at_unix_ns: i64 = 0,
@@ -918,7 +918,7 @@ fn exportPortableSnapshot(alloc: Allocator, scan: *DocStore.Txn, out: *PortableO
     };
     if (cohort == null and source_copy == null) try requireUncoordinatedIntegrityState(alloc, scan, integrity_catalog);
     if (out.stats) |stats| stats.snapshot_passes += 1;
-    const backup_id = [_]u8{0} ** 16; // zero UUID for now
+    const backup_id = @as([16]u8, @splat(0)); // zero UUID for now
     try out.writeHeader(.{
         .format_version = backup_codec.legacy_format_version,
         .flags = 0,
@@ -1424,7 +1424,7 @@ const EmbeddingBatch = struct {
         };
     }
 
-    fn deinit(self: *EmbeddingBatch, alloc: Allocator) void {
+    pub fn deinit(self: *EmbeddingBatch, alloc: Allocator) void {
         for (self.entries.items) |e| {
             alloc.free(e.doc_key);
             alloc.free(e.vector);
@@ -1440,7 +1440,7 @@ const SparseBatch = struct {
         return .{ .entries = .empty };
     }
 
-    fn deinit(self: *SparseBatch, alloc: Allocator) void {
+    pub fn deinit(self: *SparseBatch, alloc: Allocator) void {
         for (self.entries.items) |e| {
             alloc.free(e.doc_key);
             alloc.free(e.indices);
@@ -1457,7 +1457,7 @@ const EdgeBatch = struct {
         return .{ .entries = .empty };
     }
 
-    fn deinit(self: *EdgeBatch, alloc: Allocator) void {
+    pub fn deinit(self: *EdgeBatch, alloc: Allocator) void {
         for (self.entries.items) |e| {
             alloc.free(e.source_key);
             alloc.free(e.target_key);
@@ -1531,7 +1531,7 @@ const ParsedStandaloneGraphEdgeKey = struct {
     edge_type: []u8,
     target: []u8,
 
-    fn deinit(self: ParsedStandaloneGraphEdgeKey, alloc: Allocator) void {
+    pub fn deinit(self: ParsedStandaloneGraphEdgeKey, alloc: Allocator) void {
         alloc.free(self.source);
         alloc.free(self.index_name);
         alloc.free(self.edge_type);
@@ -2076,7 +2076,7 @@ fn PortableArchiveReader(comptime RawReader: type) type {
             return self;
         }
 
-        fn deinit(self: *Self, alloc: Allocator) void {
+        pub fn deinit(self: *Self, alloc: Allocator) void {
             if (self.manifest) |*manifest| manifest.deinit();
             if (self.blob_offsets.len > 0) alloc.free(self.blob_offsets);
             self.* = undefined;
@@ -2150,7 +2150,7 @@ fn PortableArchiveReader(comptime RawReader: type) type {
         }
 
         fn observeLogicalBlock(self: *Self, block_type: backup_codec.BlockType, payload: []const u8) void {
-            const tag = [_]u8{@intFromEnum(block_type)};
+            const tag = [_]u8{@backingInt(block_type)};
             var len: [8]u8 = undefined;
             std.mem.writeInt(u64, &len, @intCast(payload.len), .little);
             self.logical_hasher.update(&tag);
@@ -2905,7 +2905,7 @@ pub fn verifySourceCertificateFile(
         const block = try reader.readBlock(alloc);
         defer alloc.free(block.payload);
         if (block.block_type == .bundle_manifest) continue;
-        try builder.addBlock(@intFromEnum(block.block_type), block.payload);
+        try builder.addBlock(@backingInt(block.block_type), block.payload);
     }
     _ = try reader.verifiedFingerprint();
     const actual = try builder.finish();
@@ -3224,7 +3224,7 @@ const ArchiveSchemaLayout = struct {
         return .{ .schema = schema, .physical = try relational_row_codec.PhysicalLayout.init(alloc, schema) };
     }
 
-    fn deinit(self: *ArchiveSchemaLayout, alloc: Allocator) void {
+    pub fn deinit(self: *ArchiveSchemaLayout, alloc: Allocator) void {
         self.physical.deinit();
         storage_schema.freeSchema(alloc, self.schema);
         self.* = undefined;
@@ -3284,7 +3284,7 @@ const PortableArchiveValidation = struct {
         validator: ?public_table_schema.CompiledTableValidator,
         access: u64,
 
-        fn deinit(self: *DecodedEpoch, alloc: Allocator) void {
+        pub fn deinit(self: *DecodedEpoch, alloc: Allocator) void {
             self.arena.deinit();
             alloc.destroy(self.arena);
         }
@@ -3302,14 +3302,14 @@ const PortableArchiveValidation = struct {
             cover: ?@import("db/relational_index_cover.zig").Source = null,
             predicate: ?@import("db/relational_index_predicate.zig").Source = null,
 
-            fn deinit(self: *IndexSource) void {
+            pub fn deinit(self: *IndexSource) void {
                 if (self.tuple) |*tuple| tuple.deinit();
                 if (self.cover) |*cover| cover.deinit();
                 if (self.predicate) |*predicate| predicate.deinit();
             }
         };
 
-        fn deinit(self: *IndexProjection, alloc: Allocator) void {
+        pub fn deinit(self: *IndexProjection, alloc: Allocator) void {
             for (self.indexes) |*index| index.deinit();
             alloc.free(self.indexes);
             self.view.release();
@@ -3425,7 +3425,7 @@ const PortableArchiveValidation = struct {
         return self.decoded.getPtr(version).?;
     }
 
-    fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
+    pub fn deinit(self: *PortableArchiveValidation, alloc: Allocator) void {
         self.source_generation_admissions.deinit(alloc);
         if (self.source_integrity_catalog) |*catalog| catalog.deinit();
         if (self.index_projection) |*projection| projection.deinit(alloc);
@@ -3771,7 +3771,7 @@ test "ordered artifact inventory source proof export restores inert selected evi
     try std.testing.expectEqual(@as(usize, 1), objects.items.len);
     try std.testing.expectEqual(backup_codec.BlockType.source_proof_batch, objects.items[0].block_type);
     const bytes = block_writer.written();
-    try std.testing.expectEqual(@as(u8, @intFromEnum(backup_codec.BlockType.source_proof_batch)), bytes[0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(backup_codec.BlockType.source_proof_batch)), bytes[0]);
     const payload = bytes[6 .. bytes.len - 4];
     var archive: PortableArchiveValidation = .{ .format_version = 2, .min_afb_reader = backup_bundle.source_proof_reader_version };
     try std.testing.expectError(error.SourceCopyRestoreUnsupported, validateSourceProofBatch(alloc, payload, &archive, null));
@@ -5096,7 +5096,7 @@ fn openTestStore(alloc: Allocator, tmp: *std.testing.TmpDir) !DocStore {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buf);
     const path = path_buf[0..path_len];
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     return DocStore.open(alloc, path_z, .{});
 }
@@ -5482,7 +5482,7 @@ test "portable accepted-generation proof requires a sealed v3 reader and canonic
         .constraint_name = "parent_fk",
         .revision = 1,
         .phase = .active,
-        .active_generation = [_]u8{5} ** 16,
+        .active_generation = @as([16]u8, @splat(5)),
         .plan_id = @splat(6),
         .decision_digest = @splat(7),
     };
@@ -5569,7 +5569,7 @@ test "portable accepted-generation proof page reads only canonical sealed decode
         .constraint_name = "parent_fk",
         .revision = 1,
         .phase = .active,
-        .active_generation = [_]u8{5} ** 16,
+        .active_generation = @as([16]u8, @splat(5)),
         .plan_id = @splat(6),
         .decision_digest = @splat(7),
     };
@@ -6118,7 +6118,7 @@ test "file import rejects oversized portable blocks before allocation" {
         .shard_count = 1,
     });
     var env: [6]u8 = undefined;
-    env[0] = @intFromEnum(backup_codec.BlockType.document_batch);
+    env[0] = @backingInt(backup_codec.BlockType.document_batch);
     env[1] = 0;
     std.mem.writeInt(u32, env[2..6], backup_codec.max_block_payload_bytes + 1, .little);
     try encoded.appendSlice(alloc, &env);
@@ -6181,7 +6181,7 @@ test "import preflights logical block payloads before mutating destination" {
         .format_version = backup_codec.legacy_format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = [_]u8{0} ** 16,
+        .backup_id = @as([16]u8, @splat(0)),
         .table_count = 1,
         .shard_count = 1,
     });

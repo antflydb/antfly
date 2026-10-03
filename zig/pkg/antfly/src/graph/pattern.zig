@@ -511,7 +511,7 @@ const MatchState = struct {
     bindings: []PatternBinding,
     path: []paths_mod.PathEdge,
 
-    fn deinit(self: *MatchState, alloc: Allocator) void {
+    pub fn deinit(self: *MatchState, alloc: Allocator) void {
         for (self.bindings) |*binding| binding.deinit(alloc);
         if (self.bindings.len > 0) alloc.free(self.bindings);
         freePathEdges(alloc, self.path);
@@ -541,7 +541,7 @@ const ReachabilityAncestry = struct {
         };
     }
 
-    fn deinit(self: *ReachabilityAncestry) void {
+    pub fn deinit(self: *ReachabilityAncestry) void {
         self.work_budget.releaseStateBytes(self.retained_bytes);
         self.arena.deinit();
         self.* = undefined;
@@ -580,7 +580,7 @@ const Frontier = struct {
     ancestry: *const PathAncestry,
     hops: u32,
 
-    fn deinit(self: *Frontier, alloc: Allocator) void {
+    pub fn deinit(self: *Frontier, alloc: Allocator) void {
         freePathEdges(alloc, self.path);
         self.* = undefined;
     }
@@ -611,7 +611,7 @@ const ReachableNode = struct {
     depth: u32,
     path: []paths_mod.PathEdge,
 
-    fn deinit(self: *ReachableNode, alloc: Allocator) void {
+    pub fn deinit(self: *ReachableNode, alloc: Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         freePathEdges(alloc, self.path);
@@ -1736,7 +1736,7 @@ const ConjunctiveState = struct {
     bindings: []PatternBinding,
     null_aliases: [][]u8 = &.{},
 
-    fn deinit(self: *ConjunctiveState, alloc: Allocator) void {
+    pub fn deinit(self: *ConjunctiveState, alloc: Allocator) void {
         for (self.bindings) |*binding| binding.deinit(alloc);
         if (self.bindings.len > 0) alloc.free(self.bindings);
         for (self.null_aliases) |alias| alloc.free(alias);
@@ -2274,7 +2274,7 @@ const StreamingCountAccumulator = struct {
         return .{ .value = self.value, .distinct_values = values };
     }
 
-    fn deinit(self: *StreamingCountAccumulator, alloc: Allocator) void {
+    pub fn deinit(self: *StreamingCountAccumulator, alloc: Allocator) void {
         self.seen.deinit(alloc);
         for (self.distinct_values.items) |identity| {
             if (identity.table) |table| alloc.free(table);
@@ -2344,7 +2344,7 @@ const ConjunctiveBindingSink = struct {
         return matches;
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.matches.items) |*match| match.deinit(alloc);
         self.matches.deinit(alloc);
         self.projection.deinit(alloc);
@@ -3153,7 +3153,7 @@ const AliasProjection = struct {
         return self.all or self.selected.contains(alias);
     }
 
-    fn deinit(self: *AliasProjection, alloc: Allocator) void {
+    pub fn deinit(self: *AliasProjection, alloc: Allocator) void {
         self.selected.deinit(alloc);
         self.* = undefined;
     }
@@ -4173,10 +4173,10 @@ test "conjunctive validation rejects disconnected and unused aliases" {
         .optional = &optional,
     }));
 
-    const oversized_alias = "a" ** (max_identifier_bytes + 1);
-    const oversized_nodes = [_]MatchNode{.{ .alias = oversized_alias }};
+    const oversized_alias = @as([max_identifier_bytes + 1]u8, @splat('a'));
+    const oversized_nodes = [_]MatchNode{.{ .alias = &oversized_alias }};
     try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
-        .anchor_alias = oversized_alias,
+        .anchor_alias = &oversized_alias,
         .nodes = &oversized_nodes,
         .edges = &.{},
     }));
@@ -4185,7 +4185,7 @@ test "conjunctive validation rejects disconnected and unused aliases" {
 test "conjunctive validation bounds total recursive pattern shape" {
     const nodes = [_]MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
     const edge = MatchEdge{ .from = "a", .to = "b" };
-    const too_many_edges = [_]MatchEdge{edge} ** (max_conjunctive_edges + 1);
+    const too_many_edges = @as([max_conjunctive_edges + 1]MatchEdge, @splat(edge));
     try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
         .nodes = &nodes,
         .edges = &too_many_edges,
@@ -4195,7 +4195,7 @@ test "conjunctive validation bounds total recursive pattern shape" {
     const optional_node = [_]MatchNode{.{ .alias = "child" }};
     const optional_edge = [_]MatchEdge{.{ .from = "root", .to = "child" }};
     const optional_group = OptionalPattern{ .nodes = &optional_node, .edges = &optional_edge };
-    const too_many_optional = [_]OptionalPattern{optional_group} ** (max_optional_patterns + 1);
+    const too_many_optional = @as([max_optional_patterns + 1]OptionalPattern, @splat(optional_group));
     try std.testing.expectError(error.InvalidArgument, validateConjunctivePattern(.{
         .nodes = &base_nodes,
         .edges = &.{},
@@ -4248,7 +4248,7 @@ test "exact conjunctive aggregate does not inherit row expansion window" {
     }
     try std.testing.expectEqual(@as(u128, targets.len), aggregates[0].value);
 
-    const too_many_specs = [_]CountAggregateSpec{.{}} ** (max_count_aggregates + 1);
+    const too_many_specs = @as([max_count_aggregates + 1]CountAggregateSpec, @splat(.{}));
     try std.testing.expectError(error.InvalidArgument, aggregateConjunctivePatternWithEdgeReader(
         alloc,
         Reader{ .targets = &targets },
@@ -5419,14 +5419,14 @@ test "local pattern reader serves cross-table nodes only under a complete snapsh
 
     const dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-xtable", .{tmp.sub_path});
     defer alloc.free(dir_path);
-    const dir = try alloc.dupeZ(u8, dir_path);
+    const dir = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir);
     var doc_store = try @import("../storage/docstore.zig").DocStore.open(arena.allocator(), dir, .{});
     defer doc_store.close();
 
     const reverse_dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-xtable-rev", .{tmp.sub_path});
     defer alloc.free(reverse_dir_path);
-    const reverse_dir = try alloc.dupeZ(u8, reverse_dir_path);
+    const reverse_dir = try alloc.dupeSentinel(u8, reverse_dir_path, 0);
     defer alloc.free(reverse_dir);
     var graph_index = try graph_mod.GraphIndex.open(alloc, &doc_store, reverse_dir, "g", .{});
     defer graph_index.close();
@@ -5475,14 +5475,14 @@ test "pattern match supports linear alias bindings and cycles" {
 
     const dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-pattern", .{tmp.sub_path});
     defer alloc.free(dir_path);
-    const dir = try alloc.dupeZ(u8, dir_path);
+    const dir = try alloc.dupeSentinel(u8, dir_path, 0);
     defer alloc.free(dir);
     var doc_store = try @import("../storage/docstore.zig").DocStore.open(arena.allocator(), dir, .{});
     defer doc_store.close();
 
     const reverse_dir_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/graph-pattern-rev", .{tmp.sub_path});
     defer alloc.free(reverse_dir_path);
-    const reverse_dir = try alloc.dupeZ(u8, reverse_dir_path);
+    const reverse_dir = try alloc.dupeSentinel(u8, reverse_dir_path, 0);
     defer alloc.free(reverse_dir);
     var graph_index = try graph_mod.GraphIndex.open(alloc, &doc_store, reverse_dir, "g", .{});
     defer graph_index.close();

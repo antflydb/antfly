@@ -2545,7 +2545,7 @@ fn consumerTests() type {
                 .{ .status = 426, .body = "", .result = false, .err = null },
                 .{ .status = 200, .body = "{\"activated_version\":16}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
                 .{ .status = 200, .body = "not json", .result = null, .err = error.InvalidStoreRootReadinessResponse },
-                .{ .status = 200, .body = "{\"activated_version\":17,\"padding\":\"" ++ ("x" ** 1024) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 200, .body = "{\"activated_version\":17,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
                 .{ .status = 503, .body = "", .result = null, .err = error.StoreRootReadinessUnavailable },
             };
             for (cases) |case| {
@@ -2562,7 +2562,7 @@ fn consumerTests() type {
                 .{ .status = 200, .body = "{\"activated_version\":17}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
                 .{ .status = 404, .body = "", .result = false, .err = null },
                 .{ .status = 426, .body = "", .result = false, .err = null },
-                .{ .status = 200, .body = "{\"activated_version\":18,\"padding\":\"" ++ ("x" ** 1024) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
+                .{ .status = 200, .body = "{\"activated_version\":18,\"padding\":\"" ++ (z17RepeatString("x", 1024)) ++ "\"}", .result = null, .err = error.InvalidStoreRootReadinessResponse },
                 .{ .status = 503, .body = "", .result = null, .err = error.StoreRootReadinessUnavailable },
             };
             for (signing_cases) |case| {
@@ -4151,7 +4151,7 @@ fn consumerTests() type {
                     self.reallocate_count += 1;
                 }
 
-                fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
+                pub fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: @import("../api/tables.zig").CreateTableRequest) !void {
                     _ = alloc;
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
@@ -4165,7 +4165,7 @@ fn consumerTests() type {
                     try createTable(ptr, alloc, table_name, req);
                 }
 
-                fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+                pub fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     self.drop_count += 1;
@@ -4177,14 +4177,14 @@ fn consumerTests() type {
                     try dropTable(ptr, alloc, table_name);
                 }
 
-                fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+                pub fn updateSchema(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("{\"kind\":\"demo\"}", schema_json);
                     self.update_schema_count += 1;
                 }
 
-                fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+                pub fn createIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("embed_idx", index_name);
@@ -4192,14 +4192,14 @@ fn consumerTests() type {
                     self.create_index_count += 1;
                 }
 
-                fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+                pub fn dropIndex(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("embed_idx", index_name);
                     self.drop_index_count += 1;
                 }
 
-                fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
+                pub fn putArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8, enrichment_json: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
@@ -4207,7 +4207,7 @@ fn consumerTests() type {
                     self.put_artifact_enrichment_count += 1;
                 }
 
-                fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
+                pub fn deleteArtifactEnrichment(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, enrichment_name: []const u8) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try std.testing.expectEqualStrings("docs", table_name);
                     try std.testing.expectEqualStrings("document chunks/v2", enrichment_name);
@@ -4554,7 +4554,7 @@ test "system catalog FK decision preserves absent publication for initial-parent
     var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
     _ = client.withSettingAuthority("fk-decision-test-secret", "fk-decision-test");
     const decision: @import("../system_catalog/server_call.zig").Call = .{ .fk_generation_publication_decision = .{
-        .plan_id = .{1} ** 16,
+        .plan_id = @splat(1),
         .parent_table_id = 1,
         .parent_group_id = 2,
         .child_table_id = 3,
@@ -4628,4 +4628,15 @@ test "metadata mutation topology avoids diagnostics and owns parsed roles across
     var client = MetadataHttpClient.init(a, .{ .ptr = &unavailable, .vtable = &.{ .execute = Executor.execute } });
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchMutationTopologyWithBudget("http://metadata.invalid", .{ .deadline_ns = platform_time.monotonicNs() + std.time.ns_per_s }));
     try std.testing.expectEqual(@as(usize, 0), unavailable.diagnostic_calls);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

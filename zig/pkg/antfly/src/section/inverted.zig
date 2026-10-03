@@ -653,7 +653,7 @@ const StreamingTermDictionaryBuilder = struct {
         };
     }
 
-    fn deinit(self: *StreamingTermDictionaryBuilder) void {
+    pub fn deinit(self: *StreamingTermDictionaryBuilder) void {
         self.block_data.deinit(self.alloc);
         self.index_records.deinit(self.alloc);
         self.index_terms.deinit(self.alloc);
@@ -1211,7 +1211,7 @@ const PostingSerializeScratch = struct {
         self.impact_encoded.clearRetainingCapacity();
     }
 
-    fn deinit(self: *PostingSerializeScratch, alloc: Allocator) void {
+    pub fn deinit(self: *PostingSerializeScratch, alloc: Allocator) void {
         self.chunks.deinit(alloc);
         self.doc_deltas.deinit(alloc);
         self.freq_values.deinit(alloc);
@@ -1853,13 +1853,13 @@ const PostingAccumulator = struct {
         return .{};
     }
 
-    fn deinit(self: *PostingAccumulator, alloc: Allocator) void {
+    pub fn deinit(self: *PostingAccumulator, alloc: Allocator) void {
         self.doc_ids.deinit(alloc);
         self.metas.deinit(alloc);
         self.all_positions.deinit(alloc);
     }
 
-    fn estimatedMemoryBytes(self: *const PostingAccumulator) u64 {
+    pub fn estimatedMemoryBytes(self: *const PostingAccumulator) u64 {
         return (@as(u64, @intCast(self.doc_ids.capacity)) * @sizeOf(u32)) +
             (@as(u64, @intCast(self.metas.capacity)) * @sizeOf(PostingMeta)) +
             (@as(u64, @intCast(self.all_positions.capacity)) * @sizeOf(u32));
@@ -4861,7 +4861,7 @@ const MergeMemorySink = struct {
     alloc: Allocator,
     output: std.ArrayListUnmanaged(u8) = .empty,
 
-    fn deinit(self: *MergeMemorySink) void {
+    pub fn deinit(self: *MergeMemorySink) void {
         self.output.deinit(self.alloc);
     }
 

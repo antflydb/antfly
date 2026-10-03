@@ -27,9 +27,9 @@ test "FK publication progress and corrupt retirement proofs retain distinct boun
     const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
     const changed = statusFromError(error.GenerationRetirementChanged);
     const corrupted = statusFromError(error.InvalidRetirementSummary);
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), pending.code);
-    try std.testing.expectEqual(@intFromEnum(Code.conflict), changed.code);
-    try std.testing.expectEqual(@intFromEnum(Code.corrupt), corrupted.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), pending.code);
+    try std.testing.expectEqual(@backingInt(Code.conflict), changed.code);
+    try std.testing.expectEqual(@backingInt(Code.corrupt), corrupted.code);
     try std.testing.expect(pending.detail != changed.detail and changed.detail != corrupted.detail);
     const publication_changed = statusFromError(error.GenerationPublicationChanged);
     try std.testing.expectEqual(error.GenerationPublicationChanged, errorFromStatus(publication_changed));
@@ -707,13 +707,13 @@ pub const Detail = enum(c_int) {
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
     // rejected without constructing an invalid exhaustive Zig enum.
-    code: c_int = @intFromEnum(Code.ok),
-    detail: c_int = @intFromEnum(Detail.none),
+    code: c_int = @backingInt(Code.ok),
+    detail: c_int = @backingInt(Detail.none),
 
     pub const ok: Status = .{};
 
     pub fn isOk(self: Status) bool {
-        return self.code == @intFromEnum(Code.ok);
+        return self.code == @backingInt(Code.ok);
     }
 };
 
@@ -1361,18 +1361,18 @@ pub fn statusFromError(err: anyerror) Status {
 /// not an arbitrary error string across the stable ABI.
 pub fn statusFromErrorWithFallback(err: anyerror, fallback: anyerror) Status {
     const value = statusFromError(err);
-    if (value.detail != @intFromEnum(Detail.none)) return value;
+    if (value.detail != @backingInt(Detail.none)) return value;
     const fallback_value = statusFromError(fallback);
-    std.debug.assert(fallback_value.detail != @intFromEnum(Detail.none));
+    std.debug.assert(fallback_value.detail != @backingInt(Detail.none));
     return fallback_value;
 }
 
 pub fn errorHasStableDetail(err: anyerror) bool {
-    return statusFromError(err).detail != @intFromEnum(Detail.none);
+    return statusFromError(err).detail != @backingInt(Detail.none);
 }
 
 fn status(code: Code, detail: Detail) Status {
-    return .{ .code = @intFromEnum(code), .detail = @intFromEnum(detail) };
+    return .{ .code = @backingInt(code), .detail = @backingInt(detail) };
 }
 
 pub fn errorFromStatus(value: Status) anyerror {
@@ -2019,47 +2019,47 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 test "schema epoch conflicts retain a retryable public status" {
     // main published this value before the relational-only tail. Preserve it
     // when both branches append details independently.
-    try std.testing.expectEqual(@as(c_int, 297), @intFromEnum(Detail.unsupported_tensor_type));
-    try std.testing.expectEqual(@as(c_int, 306), @intFromEnum(Detail.vector_store_reference_format_required));
-    try std.testing.expectEqual(@as(c_int, 307), @intFromEnum(Detail.backup_outcome_ambiguous));
-    try std.testing.expectEqual(@as(c_int, 308), @intFromEnum(Detail.metadata_mutation_not_applied));
+    try std.testing.expectEqual(@as(c_int, 297), @backingInt(Detail.unsupported_tensor_type));
+    try std.testing.expectEqual(@as(c_int, 306), @backingInt(Detail.vector_store_reference_format_required));
+    try std.testing.expectEqual(@as(c_int, 307), @backingInt(Detail.backup_outcome_ambiguous));
+    try std.testing.expectEqual(@as(c_int, 308), @backingInt(Detail.metadata_mutation_not_applied));
     const value = statusFromError(error.SchemaInUse);
-    try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
+    try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
     try std.testing.expectEqual(error.SchemaInUse, errorFromStatus(value));
 }
 
 test "transaction capacity rejection retains a permanent public status" {
     const value = statusFromError(error.TransactionTooLarge);
-    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), value.code);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
     try std.testing.expectEqual(error.TransactionTooLarge, errorFromStatus(value));
 }
 
 test "stable status preserves deterministic raft rejection and malformed response identity" {
     inline for (.{ error.IntentConflict, error.VersionConflict, error.MergePageRequired }) |err| {
         const value = statusFromError(err);
-        try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
+        try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
         try std.testing.expectEqual(err, errorFromStatus(value));
     }
     // A malformed response is not proof that a mutation failed to commit.
     // Preserve its identity without granting automatic retry authority.
     const malformed = statusFromError(error.InvalidResponse);
     try std.testing.expectEqualDeep(malformed, statusFromError(error.UnexpectedEof));
-    try std.testing.expectEqual(@intFromEnum(Code.internal), malformed.code);
+    try std.testing.expectEqual(@backingInt(Code.internal), malformed.code);
     try std.testing.expectEqual(error.InvalidResponse, errorFromStatus(malformed));
 }
 
 test "stable status preserves public boundary semantics" {
     for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |err| {
         const readiness = statusFromError(err);
-        try std.testing.expectEqual(@intFromEnum(Code.retryable), readiness.code);
+        try std.testing.expectEqual(@backingInt(Code.retryable), readiness.code);
         try std.testing.expectEqual(err, errorFromStatus(readiness));
     }
     try std.testing.expectEqual(error.ReadIndexTimeout, errorFromStatus(statusFromError(error.ReadIndexTimeout)));
-    try std.testing.expectEqual(@intFromEnum(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
+    try std.testing.expectEqual(@backingInt(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
     try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
     try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.IndexGenerationMismatch).code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.IndexGenerationMismatch).code);
     try std.testing.expect(Status.ok.isOk());
     try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
     try std.testing.expectEqual(error.TableVisibilityTimeout, errorFromStatus(statusFromError(error.TableVisibilityTimeout)));
@@ -2096,8 +2096,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     const schema_history_status = statusFromError(error.BackupSchemaHistoryTooLarge);
-    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), schema_history_status.code);
-    try std.testing.expectEqual(@intFromEnum(Detail.backup_manifest_too_large), schema_history_status.detail);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), schema_history_status.code);
+    try std.testing.expectEqual(@backingInt(Detail.backup_manifest_too_large), schema_history_status.detail);
     try std.testing.expectEqual(error.BackupManifestTooLarge, errorFromStatus(schema_history_status));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
     try std.testing.expectEqual(error.PersistentDescriptorAdmissionExhausted, errorFromStatus(statusFromError(error.PersistentDescriptorAdmissionExhausted)));
@@ -2128,9 +2128,9 @@ test "stable detail detection distinguishes private errors" {
 }
 
 test "every classified boundary outcome retains its identity" {
-    @setEvalBranchQuota(32 * std.meta.fields(Detail).len);
+    @setEvalBranchQuota(@intCast(32 * (comptime std.meta.fieldNames(Detail)).len));
     const classified = comptime blk: {
-        @setEvalBranchQuota(@typeInfo(Detail).@"enum".fields.len * 8);
+        @setEvalBranchQuota(@typeInfo(Detail).@"enum".field_names.len * 8);
         const details = std.meta.tags(Detail)[1..];
         var errors: [details.len]anyerror = undefined;
         for (details, 0..) |detail, index| {
@@ -2150,20 +2150,20 @@ test "stable status has a C layout" {
 }
 
 test "scheduler admission detail appends without renumbering existing wire outcomes" {
-    try std.testing.expectEqual(@as(c_int, 559), @intFromEnum(Detail.http_connection_closing));
-    try std.testing.expectEqual(@as(c_int, 560), @intFromEnum(Detail.raft_batch_write_transport_outcome_unknown));
-    try std.testing.expectEqual(@as(c_int, 561), @intFromEnum(Detail.concurrency_unavailable));
+    try std.testing.expectEqual(@as(c_int, 559), @backingInt(Detail.http_connection_closing));
+    try std.testing.expectEqual(@as(c_int, 560), @backingInt(Detail.raft_batch_write_transport_outcome_unknown));
+    try std.testing.expectEqual(@as(c_int, 561), @backingInt(Detail.concurrency_unavailable));
     const wire = statusFromError(error.ConcurrencyUnavailable);
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
     try std.testing.expectEqual(error.ConcurrencyUnavailable, errorFromStatus(wire));
 }
 
 test "unknown wire values fail closed" {
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = 999, .detail = 999 }));
-    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @intFromEnum(Code.internal), .detail = 999 }));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = 999 }));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{
-        .code = @intFromEnum(Code.invalid_argument),
-        .detail = @intFromEnum(Detail.table_not_found),
+        .code = @backingInt(Code.invalid_argument),
+        .detail = @backingInt(Detail.table_not_found),
     }));
 }
 
@@ -2187,13 +2187,13 @@ test "provider quota errors retain stable boundary details" {
 
 test "generation capacity retains retryability across the runtime boundary" {
     const result = statusFromError(error.GenerationCapacityUnavailable);
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), result.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), result.code);
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
 }
 
 test "system catalog errors retain their stable runtime boundary classification" {
     const unavailable = statusFromError(error.SettingAuthorityUnavailable);
-    try std.testing.expectEqual(@intFromEnum(Code.unavailable), unavailable.code);
+    try std.testing.expectEqual(@backingInt(Code.unavailable), unavailable.code);
     try std.testing.expectEqual(error.SettingAuthorityUnavailable, errorFromStatus(unavailable));
     const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
@@ -2201,7 +2201,7 @@ test "system catalog errors retain their stable runtime boundary classification"
 
 test "ambiguous backup outcome survives runtime transport without rollback authorization" {
     const wire = statusFromError(error.BackupOutcomeAmbiguous);
-    try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
+    try std.testing.expectEqual(@backingInt(Code.conflict), wire.code);
     try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
 }
 
@@ -2213,7 +2213,7 @@ test "HA capture availability survives runtime callback transport" {
 
 test "storage owner contention retains retryability and exact identity" {
     const wire = statusFromError(error.StorageBusy);
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
     try std.testing.expect(errorHasStableDetail(error.StorageBusy));
     try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
 }
@@ -2222,11 +2222,11 @@ test "released main Detail identifiers retain their exact names and numeric valu
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
-    inline for (@typeInfo(Detail).@"enum".fields) |field| {
-        if (field.value <= 370) {
-            for (field.name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
+    inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |reflected_name, field_value| {
+        if (field_value <= 370) {
+            for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
-            std_test.mem.writeInt(u32, &encoded, @intCast(field.value), .little);
+            std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
             for (encoded) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             count += 1;
         }

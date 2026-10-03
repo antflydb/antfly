@@ -2142,7 +2142,7 @@ const NamedVectorQueries = struct {
     dense: []const db_mod.types.NamedDenseQuery = &.{},
     sparse: []const db_mod.types.NamedSparseQuery = &.{},
 
-    fn deinit(self: *const NamedVectorQueries, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *const NamedVectorQueries, alloc: std.mem.Allocator) void {
         freeNamedDenseQueries(alloc, self.dense);
         freeNamedSparseQueries(alloc, self.sparse);
     }
@@ -5019,7 +5019,7 @@ const GraphDocumentLookup = struct {
         return entry.document;
     }
 
-    fn deinit(self: *GraphDocumentLookup, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphDocumentLookup, alloc: std.mem.Allocator) void {
         self.entries.deinit(alloc);
         self.* = undefined;
     }
@@ -6197,7 +6197,7 @@ const NormalizedPublicQueryBuckets = struct {
     filter_query_json: []const u8 = "",
     exclusion_query_json: []const u8 = "",
 
-    fn deinit(self: *NormalizedPublicQueryBuckets, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *NormalizedPublicQueryBuckets, alloc: std.mem.Allocator) void {
         if (self.full_text) |query| freeTextQuery(alloc, query);
         if (self.filter_text) |query| freeTextQuery(alloc, query);
         if (self.exclusion_text) |query| freeTextQuery(alloc, query);
@@ -13882,7 +13882,7 @@ fn consumerTests() type {
             const edges: []const graph_query_mod.PathEdgeInfo = &.{.{
                 .source = "a",
                 .target = "b",
-                .edge_type = "x" ** (graph_edge_type.max_bytes + 1),
+                .edge_type = z17RepeatString("x", (graph_edge_type.max_bytes + 1)),
                 .weight = 1,
             }};
             try std.testing.expectError(
@@ -18217,4 +18217,15 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

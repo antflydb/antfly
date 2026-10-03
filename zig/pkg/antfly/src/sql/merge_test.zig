@@ -657,7 +657,7 @@ test "SQL MERGE prepares generated insert identity and document postimage before
     try Cell.put(update_plan, update_row, update_flags, "s\x00id", .{ .string = "a" });
     try Cell.put(update_plan, update_row, update_flags, "s\x00delta", .{ .integer = 5 });
     try Cell.put(update_plan, update_row, update_flags, "t\x00\x00mutation_version", .{ .string = "7" });
-    const digest = std.fmt.bytesToHex([_]u8{1} ** 32, .lower);
+    const digest = std.fmt.bytesToHex(@as([32]u8, @splat(1)), .lower);
     try Cell.put(update_plan, update_row, update_flags, "t\x00\x00mutation_digest", .{ .string = &digest });
     var previous: std.json.ObjectMap = .empty;
     try previous.put(alloc, "n", .{ .integer = 1 });

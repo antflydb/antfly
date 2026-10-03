@@ -152,7 +152,7 @@ pub const DataNodeStatus = struct {
     write_load: u32 = 0,
     active_backfills: u32 = 0,
 
-    fn deinit(self: *DataNodeStatus, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DataNodeStatus, alloc: std.mem.Allocator) void {
         alloc.free(self.api_url);
         alloc.free(self.raft_url);
         alloc.free(self.role);
@@ -179,7 +179,7 @@ pub const DataRangeStatus = struct {
     disk_bytes: u64 = 0,
     empty: bool = true,
 
-    fn deinit(self: *DataRangeStatus, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DataRangeStatus, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         alloc.free(self.start_key);
         if (self.end_key) |end_key| alloc.free(end_key);
@@ -195,7 +195,7 @@ pub const DataReplicaStatus = struct {
     replica_id: u64,
     peer_node_ids: []const u64 = &.{},
 
-    fn deinit(self: *DataReplicaStatus, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DataReplicaStatus, alloc: std.mem.Allocator) void {
         alloc.free(self.peer_node_ids);
         self.* = undefined;
     }
@@ -219,7 +219,7 @@ pub const DataGroupStatus = struct {
     disk_bytes: u64 = 0,
     empty: bool = true,
 
-    fn deinit(self: *DataGroupStatus, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DataGroupStatus, alloc: std.mem.Allocator) void {
         alloc.free(self.doc_identity_lifecycle);
         self.* = undefined;
     }
@@ -583,11 +583,11 @@ test "cluster status carries non-secret secret store health" {
     const alloc = std.testing.allocator;
     var status = ClusterStatus{ .health = .healthy };
     defer status.deinit(alloc);
-    var source_generation = [_]u8{0} ** 32;
+    var source_generation = @as([32]u8, @splat(0));
     source_generation[0] = 0xab;
     try applySecretStoreHealth(alloc, &status, .{
         .generation = 7,
-        .content_hash = [_]u8{0} ** 32,
+        .content_hash = @as([32]u8, @splat(0)),
         .supports_source_generation = true,
         .source_generation = source_generation,
         .entry_count = 3,
@@ -645,7 +645,7 @@ test "secret store status preserves unsupported source generation capability" {
     defer status.deinit(alloc);
     try applySecretStoreHealth(alloc, &status, .{
         .generation = 2,
-        .content_hash = [_]u8{0} ** 32,
+        .content_hash = @as([32]u8, @splat(0)),
         .supports_source_generation = false,
         .entry_count = 2,
         .last_reload_failed = false,
@@ -664,7 +664,7 @@ test "cluster status carries non-secret runtime config generation and hash" {
     const alloc = std.testing.allocator;
     var status = ClusterStatus{ .health = .healthy };
     defer status.deinit(alloc);
-    var hash = [_]u8{0} ** 32;
+    var hash = @as([32]u8, @splat(0));
     hash[0..8].* = .{ 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef };
     try applyRuntimeConfigHealth(alloc, &status, .{
         .generation = 4,

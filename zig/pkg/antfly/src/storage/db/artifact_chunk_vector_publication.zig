@@ -218,7 +218,7 @@ fn testPreparation(sparse_kind: bool) !void {
         std.mem.writeInt(u32, &length, @intCast(config.name.len), .little);
         try catalog.appendSlice(alloc, &length);
         try catalog.appendSlice(alloc, config.name);
-        try catalog.append(alloc, @intFromEnum(config.kind));
+        try catalog.append(alloc, @backingInt(config.kind));
         std.mem.writeInt(u32, &length, @intCast(config.config_json.len), .little);
         try catalog.appendSlice(alloc, &length);
         try catalog.appendSlice(alloc, config.config_json);

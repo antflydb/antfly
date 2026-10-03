@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 
 threadlocal var shared_barrier: ?*MutationBarrier = null;
 threadlocal var shared_depth: usize = 0;

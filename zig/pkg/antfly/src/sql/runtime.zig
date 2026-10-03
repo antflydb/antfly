@@ -2120,7 +2120,7 @@ test "SQL update reads only preserved columns and shares immutable assignments" 
         }
         fn checkpoint(_: *anyopaque) !void {}
     };
-    const payload = "v" ** 2048;
+    const payload = z17RepeatString("v", 2048);
     var fixture: Fixture = .{ .expected = payload };
     const backend: catalog.Backend = .{ .ptr = &fixture, .vtable = &.{ .resolve = Fixture.resolve, .scan = Fixture.scan, .mutate = Fixture.mutate, .checkpoint = Fixture.checkpoint } };
     var compiled = try compiler.compile(std.testing.allocator, "UPDATE wide SET payload = $1", .{});
@@ -2226,4 +2226,15 @@ test "SQL virtual relation byte pages preserve continuation and release exhauste
     try std.testing.expectEqualStrings("5000", result.output.rows[0][0].string);
     try std.testing.expectEqual(backend.statement_opens, backend.statement_closes);
     try std.testing.expect(result.peakMemoryBytes() < 512 * 1024);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

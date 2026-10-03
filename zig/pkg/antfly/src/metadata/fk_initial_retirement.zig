@@ -46,7 +46,7 @@ pub const Replica = struct {
         bytes[4] = if (self.retirement_authority == .canceled_plan) 1 else 2;
         bytes[5] = @intFromBool(self.canceled);
         bytes[6] = @intFromBool(self.acked);
-        bytes[7] = @intFromEnum(self.retirement_authority);
+        bytes[7] = @backingInt(self.retirement_authority);
         @memcpy(bytes[8..24], &self.plan_id);
         @memcpy(bytes[24..56], &self.plan_digest);
         inline for (.{ self.child_table_id, self.group_id, self.range_id, self.node_id, self.store_id, self.store_incarnation, self.replica_id, self.root_generation }, 0..) |value, index| {
@@ -80,7 +80,7 @@ pub const Replica = struct {
             .store_root_incarnation = std.mem.readInt(u128, bytes[120..136], .little),
             .canceled = bytes[5] == 1,
             .acked = bytes[6] == 1,
-            .retirement_authority = @enumFromInt(bytes[7]),
+            .retirement_authority = @fromBackingInt(bytes[7]),
         };
         try result.validate();
         return result;

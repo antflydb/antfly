@@ -167,7 +167,7 @@ test "laya forward preprocessing and batching match the PyTorch reference" {
     // A cancelled request must not poison the next use of the same session.
     _ = try pipeline.executeWithScratch(alloc, a, session, tok, config, tasks[0..1], null, null);
     // Repeated known tokens ensure this is token overflow, not one UNK token.
-    const long_text = "hello " ** 150;
+    const long_text = z17RepeatString("hello ", 150);
     try std.testing.expectError(error.ExtractionTextLimitExceeded, pipeline.prepare(alloc, tok, config, .{ .text = long_text, .question = questions[0] }));
     if (resident_before) |before| {
         const after = factory.layaResidentStats(session).?;
@@ -281,8 +281,8 @@ test "laya released checkpoint accuracy parity batching and performance" {
     var max_probability_error: f32 = 0;
     var max_action_error: f32 = 0;
     var disagreements: usize = 0;
-    var correct = [_]usize{0} ** 3;
-    var totals = [_]usize{0} ** 3;
+    var correct = @as([3]usize, @splat(0));
+    var totals = @as([3]usize, @splat(0));
     var ordinal_error: f64 = 0;
     var start: usize = 0;
     while (start < rows.len) : (start += 8) {
@@ -301,7 +301,7 @@ test "laya released checkpoint accuracy parity batching and performance" {
         for (chunk, result.decisions) |row, decision| {
             const actual = argmax(decision.probabilities);
             disagreements += @intFromBool(actual != argmax(row.probabilities));
-            const kind = @intFromEnum(row.task.question.kind);
+            const kind = @backingInt(row.task.question.kind);
             correct[kind] += @intFromBool(actual == row.target);
             totals[kind] += 1;
             if (decision.expected_value) |value| ordinal_error += @abs(value - @as(f64, @floatFromInt(row.target)));
@@ -430,7 +430,7 @@ fn benchmarkMatched(a: std.mem.Allocator, session: @import("../backends/session.
                 @memcpy(ids[i * seq ..][0..prepared.ids.len], prepared.ids);
                 @memset(mask[i * seq ..][0..prepared.ids.len], 1);
                 @memcpy(markers[i * count ..][0..prepared.markers.len], prepared.markers);
-                kinds[i] = @intFromEnum(task.question.kind);
+                kinds[i] = @backingInt(task.question.kind);
             }
             var inputs = [_]Tensor{
                 try Tensor.initInt64(pa, "input_ids", &.{ @intCast(batch), @intCast(seq) }, ids),
@@ -494,4 +494,15 @@ fn benchmarkMatched(a: std.mem.Allocator, session: @import("../backends/session.
             }
         }
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

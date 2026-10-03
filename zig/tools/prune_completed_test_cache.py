@@ -62,7 +62,7 @@ def prune(cache: Path, min_bytes: int = 64 * 1024 * 1024) -> int:
 def release_completed_phase(cache: Path) -> None:
     """Release a quiescent CI phase's complete, private compiler cache.
 
-    Self-hosted Debug emits only executables, so object-only pruning cannot
+    Self-hosted debug emits only executables, so object-only pruning cannot
     bound disk use across phases. Remove manifests with outputs: retaining a
     manifest after removing its executable produces a false Zig cache hit.
     Global dependency caches and installed zig-out artifacts are outside this

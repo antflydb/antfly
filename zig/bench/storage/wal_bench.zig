@@ -90,7 +90,7 @@ const Summary = struct {
     grouped_commits: u64 = 0,
     physical_commits: u64 = 0,
 
-    fn deinit(self: *Summary, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Summary, alloc: std.mem.Allocator) void {
         self.elapsed_samples.deinit(alloc);
         self.publish_samples.deinit(alloc);
         self.* = undefined;

@@ -59,7 +59,7 @@ pub const Catalog = struct {
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
             const entry = self.bindings[mid];
-            const order = if (entry.definition.kind == kind) std.mem.order(u8, entry.definition.name, name) else std.math.order(@intFromEnum(entry.definition.kind), @intFromEnum(kind));
+            const order = if (entry.definition.kind == kind) std.mem.order(u8, entry.definition.name, name) else std.math.order(@backingInt(entry.definition.kind), @backingInt(kind));
             switch (order) {
                 .lt => lo = mid + 1,
                 .gt => hi = mid,
@@ -141,7 +141,7 @@ pub fn decode(alloc: Allocator, bytes: []const u8) !Catalog {
 }
 
 fn lessThan(_: void, left: Binding, right: Binding) bool {
-    if (left.definition.kind != right.definition.kind) return @intFromEnum(left.definition.kind) < @intFromEnum(right.definition.kind);
+    if (left.definition.kind != right.definition.kind) return @backingInt(left.definition.kind) < @backingInt(right.definition.kind);
     switch (std.mem.order(u8, left.definition.name, right.definition.name)) {
         .lt => return true,
         .gt => return false,
@@ -165,7 +165,7 @@ fn encode(alloc: Allocator, catalog: Catalog) ![]u8 {
     @memcpy(bytes[68..100], &catalog.checks_digest);
     var offset: usize = header_len;
     for (catalog.bindings) |binding| {
-        bytes[offset] = @intFromEnum(binding.definition.kind);
+        bytes[offset] = @backingInt(binding.definition.kind);
         std.mem.writeInt(u16, bytes[offset + 1 ..][0..2], @intCast(binding.definition.name.len), .little);
         std.mem.writeInt(u64, bytes[offset + 3 ..][0..8], binding.allocation, .little);
         @memcpy(bytes[offset + 11 ..][0..16], &binding.generation);

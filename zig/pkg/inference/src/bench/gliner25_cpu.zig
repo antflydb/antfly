@@ -20,7 +20,7 @@ const scope = if (on_cuda) "gliner25_direct_core_cuda_comparison_v1" else "gline
 const timing_boundary = "schema_parse_compile+processor+encoder+heads+decode+temporary_cleanup";
 
 comptime {
-    if (builtin.mode != .ReleaseFast) @compileError("GLiNER2.5 benchmark requires -Doptimize=ReleaseFast for the complete dependency graph");
+    if (builtin.mode != .fast) @compileError("GLiNER2.5 benchmark requires -Doptimize=fast for the complete dependency graph");
     if (build_options.enable_metal or build_options.enable_onnx or build_options.enable_pjrt)
         @compileError("GLiNER2.5 CPU benchmark requires -Dmetal=false -Dcuda=false -Donnx=false -Dpjrt=false");
 }
@@ -41,7 +41,7 @@ const Extraction = struct {
     output: pipeline.Result,
     input_ids: ?[]i64 = null,
     encoder_shape: [2]usize,
-    fn deinit(self: *Extraction, a: Allocator) void {
+    pub fn deinit(self: *Extraction, a: Allocator) void {
         self.output.deinit();
         if (self.input_ids) |ids| a.free(ids);
     }
@@ -93,7 +93,7 @@ fn loadWeights(a: Allocator, reader: *const inference.models.safetensors.MMapRea
     }
     return store;
 }
-fn extract(a: Allocator, cb: *const inference.ops.ComputeBackend, config: *const model.Config, tokenizer: inference.tokenizer.Tokenizer, text: []const u8, schema_json: []const u8, capture_tokens: bool, timeout_ms: u64, batch_size: usize) !Extraction {
+pub fn extract(a: Allocator, cb: *const inference.ops.ComputeBackend, config: *const model.Config, tokenizer: inference.tokenizer.Tokenizer, text: []const u8, schema_json: []const u8, capture_tokens: bool, timeout_ms: u64, batch_size: usize) !Extraction {
     const deadline = try std.math.add(u64, try nowNs(), try std.math.mul(u64, timeout_ms, std.time.ns_per_ms));
     const control = inference.InferenceExecutionControl{ .deadline_ns = deadline };
     var schema = try schema_mod.compile(a, schema_json, .{});

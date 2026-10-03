@@ -260,7 +260,7 @@ const CatalogDeleteBatch = struct {
         self.key_bytes = 0;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.clear();
         self.mutations.deinit(self.allocator);
     }
@@ -420,7 +420,7 @@ const NativeAtomicWriteSink = struct {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    fn deinit(self: *NativeAtomicWriteSink) void {
+    pub fn deinit(self: *NativeAtomicWriteSink) void {
         const io = self.storage.docs.file.runtime();
         if (self.file) |file| file.close(io);
         if (self.tmp_path) |path| {
@@ -471,27 +471,45 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
+        var zig017_return_error: ?anyerror = null;
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (self.failure) |err| return err;
-        if (bytes.len > std.math.maxInt(u32) - len(ptr)) return error.RecordTooLarge;
-        errdefer |err| self.failure = err;
+        if (bytes.len > std.math.maxInt(u32) - len(ptr)) return zig017_failure: {
+            zig017_return_error = error.RecordTooLarge;
+            break :zig017_failure error.RecordTooLarge;
+        };
+        errdefer {
+            if (zig017_return_error) |err| self.failure = err;
+        }
         var offset: usize = 0;
         while (offset < bytes.len) {
             const n = @min(self.buffer.len - self.buffered, bytes.len - offset);
             @memcpy(self.buffer[self.buffered..][0..n], bytes[offset..][0..n]);
             self.buffered += n;
             offset += n;
-            if (self.buffered == self.buffer.len) try self.flush();
+            if (self.buffered == self.buffer.len) (self.flush() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
+        var zig017_return_error: ?anyerror = null;
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (self.failure) |err| return err;
-        if (offset > len(ptr) or bytes.len > len(ptr) - offset) return error.InvalidAtomicWriteOffset;
-        errdefer |err| self.failure = err;
+        if (offset > len(ptr) or bytes.len > len(ptr) - offset) return zig017_failure: {
+            zig017_return_error = error.InvalidAtomicWriteOffset;
+            break :zig017_failure error.InvalidAtomicWriteOffset;
+        };
+        errdefer {
+            if (zig017_return_error) |err| self.failure = err;
+        }
         const on_disk = if (offset < self.persisted) @min(bytes.len, self.persisted - offset) else 0;
-        if (on_disk > 0) try self.file.?.writePositionalAll(self.storage.docs.file.runtime(), bytes[0..on_disk], offset);
+        if (on_disk > 0) (self.file.?.writePositionalAll(self.storage.docs.file.runtime(), bytes[0..on_disk], offset) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         if (on_disk < bytes.len) @memcpy(self.buffer[offset + on_disk - self.persisted ..][0 .. bytes.len - on_disk], bytes[on_disk..]);
     }
 
@@ -500,18 +518,30 @@ const NativeAtomicWriteSink = struct {
     }
 
     fn crc32Range(ptr: *anyopaque, offset: usize, range_len: usize) !u32 {
+        var zig017_return_error: ?anyerror = null;
         const self: *NativeAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (self.failure) |err| return err;
-        if (offset > len(ptr) or range_len > len(ptr) - offset) return error.InvalidAtomicWriteOffset;
-        errdefer |err| self.failure = err;
+        if (offset > len(ptr) or range_len > len(ptr) - offset) return zig017_failure: {
+            zig017_return_error = error.InvalidAtomicWriteOffset;
+            break :zig017_failure error.InvalidAtomicWriteOffset;
+        };
+        errdefer {
+            if (zig017_return_error) |err| self.failure = err;
+        }
         var crc = Crc32.init();
         var scratch: [buffer_size]u8 = undefined;
         var pos = offset;
         const end = offset + range_len;
         while (pos < @min(end, self.persisted)) {
             const n = @min(scratch.len, @min(end, self.persisted) - pos);
-            if (try self.file.?.readPositionalAll(self.storage.docs.file.runtime(), scratch[0..n], pos) != n)
-                return error.EndOfStream;
+            if ((self.file.?.readPositionalAll(self.storage.docs.file.runtime(), scratch[0..n], pos) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            }) != n)
+                return zig017_failure: {
+                    zig017_return_error = error.EndOfStream;
+                    break :zig017_failure error.EndOfStream;
+                };
             crc.update(scratch[0..n]);
             pos += n;
         }
@@ -1157,7 +1187,7 @@ test "lite native atomic writes spill with long database basenames" {
     defer tmp.cleanup();
     // Valid under NAME_MAX=255, including the writer lock's .lock suffix.
     // Appending the former 50-byte staging suffix would exceed that limit.
-    const name = "x" ** 213 ++ ".aflite";
+    const name = z17RepeatString("x", 213) ++ ".aflite";
     const path = try testPath(alloc, tmp, name);
     defer alloc.free(path);
     const bytes: [128 * 1024 + 17]u8 = @splat('s');
@@ -1210,7 +1240,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         defer hot_pages.deinit(alloc);
         var cached = docs.file.page_cache.pages.iterator();
         while (cached.next()) |entry| {
-            if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
+            if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) try hot_pages.append(alloc, entry.key_ptr.*);
         }
         try std.testing.expect(hot_pages.items.len > 0);
 
@@ -1229,7 +1259,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
             cached = docs.file.page_cache.pages.iterator();
             var payload_pages: usize = 0;
             while (cached.next()) |entry| {
-                if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+                if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
             }
             try std.testing.expectEqual(hot_pages.items.len, payload_pages);
             try std.testing.expect(docs.file.page_cache.pages.contains(docs.file.activeCheckpoint().index_catalog_root_page));
@@ -1247,7 +1277,7 @@ test "lite native cold atomic writes preserve hot pages with bounded cache admis
         var payload_pages: usize = 0;
         cached = docs.file.page_cache.pages.iterator();
         while (cached.next()) |entry| {
-            if (entry.value_ptr.bytes[4] == @intFromEnum(native.PageKind.value)) payload_pages += 1;
+            if (entry.value_ptr.bytes[4] == @backingInt(native.PageKind.value)) payload_pages += 1;
         }
         try std.testing.expect(payload_pages > hot_pages.items.len);
         for (hot_pages.items) |id| try std.testing.expect(docs.file.page_cache.pages.contains(id));
@@ -1596,4 +1626,15 @@ test "lite subtree deletion rolls back earlier private batches on failure" {
     defer cursor.deinit();
     try std.testing.expect((try cursor.next()) == null);
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

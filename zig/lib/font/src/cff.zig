@@ -113,7 +113,7 @@ pub const Font = struct {
     bytes: []const u8,
     charstrings: Index,
     charset: []u16,
-    encoding: [256]u16 = [_]u16{missing_glyph} ** 256,
+    encoding: [256]u16 = @as([256]u16, @splat(missing_glyph)),
     string_index: Index = .{ .count = 0, .off_size = 0, .data_offset = 0, .offsets_offset = 0 },
     global_subrs: Index,
     local_subrs: ?Index,
@@ -208,7 +208,7 @@ pub const Font = struct {
         var y: f64 = 0;
         var width_seen = false;
         var hint_count: usize = 0;
-        var transient: [32]f64 = [_]f64{0} ** 32;
+        var transient: [32]f64 = @as([32]f64, @splat(0));
         const shared_limit = if (limits.remaining_operations) |remaining| remaining.* else std.math.maxInt(usize);
         var remaining_operations = @min(limits.max_operations, shared_limit);
         const initial_operations = remaining_operations;
@@ -1153,7 +1153,7 @@ fn parseCharsetAlloc(alloc: std.mem.Allocator, bytes: []const u8, charset_offset
 }
 
 fn parseEncoding(bytes: []const u8, encoding_offset: usize, charset: []const u16, glyph_count: u16) ParseError![256]u16 {
-    var out = [_]u16{missing_glyph} ** 256;
+    var out = @as([256]u16, @splat(missing_glyph));
     if (encoding_offset <= 1) {
         const predefined = if (encoding_offset == 0) &cff_data.standard_encoding else &cff_data.expert_encoding;
         for (predefined, 0..) |sid, code| {
@@ -1494,7 +1494,7 @@ test "cff executes local and global subroutines with arithmetic operators" {
     var y: f64 = 0;
     var width_seen = false;
     var hint_count: usize = 0;
-    var transient: [32]f64 = [_]f64{0} ** 32;
+    var transient: [32]f64 = @as([32]f64, @splat(0));
     try font.executeCharStringAlloc(alloc, &program, font.local_subrs, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
 
     try std.testing.expectEqual(@as(usize, 1), contours.items.len);
@@ -1541,7 +1541,7 @@ test "cff accepts legacy dotsection and continues after hintmask" {
     var y: f64 = 0;
     var width_seen = false;
     var hint_count: usize = 0;
-    var transient: [32]f64 = [_]f64{0} ** 32;
+    var transient: [32]f64 = @as([32]f64, @splat(0));
     try font.executeCharStringAlloc(alloc, &program, font.local_subrs, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
 
     try std.testing.expectEqual(@as(usize, 1), hint_count);
@@ -1576,7 +1576,7 @@ test "cff consumes an explicit width before the first moveto" {
     var y: f64 = 0;
     var width_seen = false;
     var hint_count: usize = 0;
-    var transient: [32]f64 = [_]f64{0} ** 32;
+    var transient: [32]f64 = @as([32]f64, @splat(0));
     try font.executeCharStringAlloc(alloc, &program, null, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
 
     try std.testing.expectEqual(@as(usize, 1), contours.items.len);
@@ -1610,7 +1610,7 @@ test "cff enforces a shared charstring operation limit" {
     var y: f64 = 0;
     var width_seen = false;
     var hint_count: usize = 0;
-    var transient: [32]f64 = [_]f64{0} ** 32;
+    var transient: [32]f64 = @as([32]f64, @splat(0));
     var remaining_operations: usize = 2;
     try std.testing.expectError(error.GlyphOutlineTooComplex, font.executeCharStringAllocLimited(alloc, &program, null, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, &remaining_operations, 0));
 }
@@ -1656,7 +1656,7 @@ test "cff supports transient and logical Type2 operators" {
     var y: f64 = 0;
     var width_seen = false;
     var hint_count: usize = 0;
-    var transient: [32]f64 = [_]f64{0} ** 32;
+    var transient: [32]f64 = @as([32]f64, @splat(0));
     try font.executeCharStringAlloc(alloc, &program, font.local_subrs, &stack, &current, &contours, &x, &y, &width_seen, &hint_count, &transient, 0);
 
     try std.testing.expectEqual(@as(usize, 1), contours.items.len);

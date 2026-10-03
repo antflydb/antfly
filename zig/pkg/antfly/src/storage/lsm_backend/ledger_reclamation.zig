@@ -319,7 +319,7 @@ test "ledger reclamation services oldest snapshot while new retirements arrive o
 }
 
 test "ledger reclamation checkpoint churn benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Backend = @import("../lsm_backend.zig").Backend;
     // Measure production-style allocation, not debug allocator bookkeeping.
     // The correctness tests above separately retain leak/OOM instrumentation.

@@ -47,7 +47,7 @@ pub const Progress = struct {
         const out = try alloc.alloc(u8, 136 + self.generations.len * 16 + self.cursor.len + 32);
         @memset(out[0..136], 0);
         @memcpy(out[0..4], "AIR1");
-        out[4] = @intFromEnum(self.phase);
+        out[4] = @backingInt(self.phase);
         @memcpy(out[8..24], &self.job_id);
         @memcpy(out[24..56], &self.generation_set);
         @memcpy(out[56..88], &self.owner);

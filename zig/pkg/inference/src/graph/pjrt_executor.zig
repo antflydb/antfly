@@ -815,7 +815,7 @@ pub const PjrtModelExecutor = struct {
         return .{ .ptr = runtime_ctx, .vtable = &PjrtModelRuntime.runtime_vtable };
     }
 
-    fn deinit(ctx: *anyopaque) void {
+    pub fn deinit(ctx: *anyopaque) void {
         const self: *PjrtModelExecutor = @ptrCast(@alignCast(ctx));
         const allocator = self.allocator;
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor deinit begin", .{});
@@ -1034,7 +1034,7 @@ const PjrtModelRuntime = struct {
         self.retained_buffers.clear();
     }
 
-    fn deinit(ctx: *anyopaque) void {
+    pub fn deinit(ctx: *anyopaque) void {
         const self: *PjrtModelRuntime = @ptrCast(@alignCast(ctx));
         const allocator = self.allocator;
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit begin", .{});

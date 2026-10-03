@@ -44,7 +44,7 @@ CONSUMERS = {
     "api-table-write-lifecycle-tests",
     "data-runtime-tests",
 }
-COMPILES = re.compile(r"compile (lib|test_obj|exe) (\S+) Debug \S+ (cached|success)\b")
+COMPILES = re.compile(r"compile (lib|test_obj|exe) (\S+) debug \S+ (cached|success)\b")
 
 
 def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:
@@ -287,7 +287,7 @@ def main() -> None:
             arguments = [
                 "build",
                 "check-storage-compilation",
-                "-Doptimize=Debug",
+                "-Doptimize=debug",
                 "-Dmetal=false",
                 "-Dsystem-blas=false",
                 "-Donnx=false",

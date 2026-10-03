@@ -599,7 +599,7 @@ Build both the executable and canonical C API:
 ```sh
 zig build antfly capi \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -619,7 +619,7 @@ zig build antfly capi \
   --cache-dir /tmp/antfly-candidate-local-cache \
   --global-cache-dir /tmp/antfly-candidate-global-cache \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -634,20 +634,20 @@ Do not compare a cold candidate with a warm baseline.
 
 ```sh
 zig build antfly capi \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true
 
 zig build capi-test capi-smoke antfly-standalone-runtime-test \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false
 
 zig build \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Dproduction-lsm-only=false
 
 zig build lmdb-test antfly-storage-lmdb-test
@@ -683,7 +683,7 @@ zig build antfly capi \
   --cache-dir /tmp/antfly-report-local-cache \
   --global-cache-dir /tmp/antfly-report-global-cache \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \

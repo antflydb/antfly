@@ -62,7 +62,7 @@ pub const EvaluationScratch = struct {
 };
 
 pub const Gate = struct {
-    phase: std.atomic.Value(u8) = .init(@intFromEnum(catalog.RowPolicyPhase.disabled)),
+    phase: std.atomic.Value(u8) = .init(@backingInt(catalog.RowPolicyPhase.disabled)),
     generation: AtomicU64 = .init(0),
     catalog_epoch: AtomicU64 = .init(0),
     schema_version: std.atomic.Value(u32) = .init(0),
@@ -70,7 +70,7 @@ pub const Gate = struct {
 
     pub fn init(state: catalog.Catalog) Gate {
         return .{
-            .phase = .init(@intFromEnum(state.row_policy_phase)),
+            .phase = .init(@backingInt(state.row_policy_phase)),
             .generation = .init(state.row_policy_generation),
             .catalog_epoch = .init(state.row_policy_catalog_epoch),
             .schema_version = .init(state.active_schema_version),
@@ -78,7 +78,7 @@ pub const Gate = struct {
     }
 
     pub fn currentPhase(self: *const Gate) catalog.RowPolicyPhase {
-        return @enumFromInt(self.phase.load(.acquire));
+        return @fromBackingInt(self.phase.load(.acquire));
     }
 
     pub const Lease = struct {
@@ -230,7 +230,7 @@ pub const Gate = struct {
     /// fail closed while the coordinator waits for quiescence.
     pub fn beginPreparing(self: *Gate, previous: catalog.RowPolicyPhase) !void {
         if (previous == .preparing) return error.RowPolicyCatalogChanged;
-        if (self.phase.cmpxchgStrong(@intFromEnum(previous), @intFromEnum(catalog.RowPolicyPhase.preparing), .acq_rel, .acquire) != null)
+        if (self.phase.cmpxchgStrong(@backingInt(previous), @backingInt(catalog.RowPolicyPhase.preparing), .acq_rel, .acquire) != null)
             return error.RowPolicyCatalogChanged;
     }
 
@@ -255,7 +255,7 @@ pub const Gate = struct {
             self.generation.store(state.row_policy_generation, .monotonic);
             self.catalog_epoch.store(state.row_policy_catalog_epoch, .monotonic);
             self.schema_version.store(state.active_schema_version, .monotonic);
-            self.phase.store(@intFromEnum(state.row_policy_phase), .release);
+            self.phase.store(@backingInt(state.row_policy_phase), .release);
             return;
         }
         return error.RowPolicyCatalogChanged;

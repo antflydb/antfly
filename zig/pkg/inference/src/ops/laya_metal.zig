@@ -235,7 +235,7 @@ pub const Owner = struct {
         try owner.constantValues("zero", zeros);
         var scales: [12]f32 = undefined;
         for (0..3) |kind| for ([_]usize{ 2, 3, 6, 11 }, 0..) |count, bucket| {
-            scales[kind * 4 + bucket] = laya.scale(@enumFromInt(kind), count);
+            scales[kind * 4 + bucket] = laya.scale(@fromBackingInt(@intCast(kind)), count);
         };
         try owner.constantValues("scales", &scales);
         for ([_][]const u8{ "encoder.embeddings.tok_embeddings.weight", "encoder.embeddings.norm.weight", "encoder.final_norm.weight", "type_emb.weight" }) |name| try owner.constant(compute, name, control);
@@ -592,12 +592,12 @@ test "laya resident decision kernel calibration padding ties and nonfinite rejec
     };
     var scales: [12]f32 = undefined;
     for (0..3) |kind| for ([_]usize{ 2, 3, 6, 11 }, 0..) |count, bucket| {
-        scales[kind * 4 + bucket] = cfg.scale(@enumFromInt(kind), count);
+        scales[kind * 4 + bucket] = cfg.scale(@fromBackingInt(@intCast(kind)), count);
     };
     var gs = try upload(a, &owner, std.mem.sliceAsBytes(&scales), scales.len);
     defer gs.deinit();
     const labels = [_][]const u8{ "false", "true", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16", "17", "18", "19" };
-    const descriptions = [_][]const u8{""} ** 20;
+    const descriptions = @as([20][]const u8, @splat(""));
     for ([_]usize{ 2, 3, 5, 6, 10, 11, 20 }) |count| {
         for (0..3) |kind| {
             if (kind == 2 and count != 2) continue;
@@ -621,7 +621,7 @@ test "laya resident decision kernel calibration padding ties and nonfinite rejec
                 const result = try exec.kernel(.laya_decisions, &.{ gz, ga, gp, gt, gs }, &.{ 1, 20, 2 }, &.{});
                 var host: [26]f32 = undefined;
                 try result.downloadF32Into(&host);
-                const question = pipeline.Question{ .name = "test", .kind = @enumFromInt(kind), .instruction = "test", .labels = labels[0..count], .descriptions = descriptions[0..count] };
+                const question = pipeline.Question{ .name = "test", .kind = @fromBackingInt(@intCast(kind)), .instruction = "test", .labels = labels[0..count], .descriptions = descriptions[0..count] };
                 const want = try pipeline.decode(a, cfg, question, logits[0..count], &acts);
                 defer a.free(want.probabilities);
                 for (want.probabilities, host[0..count]) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 2e-6);

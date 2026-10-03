@@ -511,7 +511,7 @@ pub const SegmentWriter = struct {
             try appendU16BE(self.alloc, out, @intCast(field.sections.items.len));
 
             for (field.sections.items) |*section| {
-                try appendU16BE(self.alloc, out, @intFromEnum(section.section_type));
+                try appendU16BE(self.alloc, out, @backingInt(section.section_type));
                 try appendU64BE(self.alloc, out, @intCast(section.offset));
                 try appendU64BE(self.alloc, out, @intCast(section.length));
                 try appendU32BE(self.alloc, out, section.checksum);
@@ -527,7 +527,7 @@ pub const SegmentWriter = struct {
             try sinkAppendU16BE(sink, @intCast(field.sections.items.len));
 
             for (field.sections.items) |*section| {
-                try sinkAppendU16BE(sink, @intFromEnum(section.section_type));
+                try sinkAppendU16BE(sink, @backingInt(section.section_type));
                 try sinkAppendU64BE(sink, @intCast(section.offset));
                 try sinkAppendU64BE(sink, @intCast(section.length));
                 try sinkAppendU32BE(sink, section.checksum);
@@ -580,7 +580,7 @@ pub const SegmentWriter = struct {
         length: usize = 0,
         checksum: u32 = 0,
 
-        fn deinit(self: *SectionData, alloc: Allocator) void {
+        pub fn deinit(self: *SectionData, alloc: Allocator) void {
             alloc.free(self.data);
         }
     };
@@ -589,7 +589,7 @@ pub const SegmentWriter = struct {
         name: []u8,
         sections: std.ArrayListUnmanaged(SectionData),
 
-        fn deinit(self: *FieldBuilder, alloc: Allocator) void {
+        pub fn deinit(self: *FieldBuilder, alloc: Allocator) void {
             alloc.free(self.name);
             for (self.sections.items) |*s| s.deinit(alloc);
             self.sections.deinit(alloc);
@@ -1241,7 +1241,7 @@ const SegmentSortValue = union(enum) {
     id: []const u8,
     numeric_val: typed_dv.NumericValue,
 
-    fn deinit(self: *SegmentSortValue, alloc: Allocator) void {
+    pub fn deinit(self: *SegmentSortValue, alloc: Allocator) void {
         switch (self.*) {
             .bytes_val => |bytes| alloc.free(bytes),
             else => {},
@@ -1276,7 +1276,7 @@ const SortedMergeRecord = struct {
     ref: MergeDocRef,
     keys: []SegmentSortValue,
 
-    fn deinit(self: *SortedMergeRecord, alloc: Allocator) void {
+    pub fn deinit(self: *SortedMergeRecord, alloc: Allocator) void {
         for (self.keys) |*key| key.deinit(alloc);
         alloc.free(self.keys);
         self.* = undefined;
@@ -1287,7 +1287,7 @@ const SortedMergePlan = struct {
     records: []SortedMergeRecord,
     doc_maps: [][]u32,
 
-    fn deinit(self: *SortedMergePlan, alloc: Allocator) void {
+    pub fn deinit(self: *SortedMergePlan, alloc: Allocator) void {
         for (self.records) |*record| record.deinit(alloc);
         alloc.free(self.records);
         for (self.doc_maps) |map| alloc.free(map);
@@ -1307,7 +1307,7 @@ const BuiltField = struct {
     name: []const u8,
     sections: std.ArrayListUnmanaged(BuiltSection) = .empty,
 
-    fn deinit(self: *BuiltField, alloc: Allocator) void {
+    pub fn deinit(self: *BuiltField, alloc: Allocator) void {
         self.sections.deinit(alloc);
     }
 };
@@ -2020,7 +2020,7 @@ fn writeMergedSectionIndex(alloc: Allocator, sink: *SegmentSink, fields: []const
         try sink.appendSlice(field.name);
         try sinkAppendU16BE(sink, @intCast(field.sections.items.len));
         for (field.sections.items) |section| {
-            try sinkAppendU16BE(sink, @intFromEnum(section.section_type));
+            try sinkAppendU16BE(sink, @backingInt(section.section_type));
             try sinkAppendU64BE(sink, section.offset);
             try sinkAppendU64BE(sink, section.length);
             try sinkAppendU32BE(sink, section.checksum);
@@ -2996,7 +2996,7 @@ test "segment layout stats ignores invalid inverted section slice" {
         .name = "content",
         .sections = sections[0..],
     }};
-    const data = [_]u8{0} ** 64;
+    const data = @as([64]u8, @splat(0));
     const reader = SegmentReader{
         .alloc = std.testing.allocator,
         .data = &data,
@@ -3604,7 +3604,7 @@ fn buildLegacyF64DocValuesSectionAlloc(alloc: Allocator, doc_id: u32, value: f64
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
-    try out.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
+    try out.append(alloc, @backingInt(typed_dv.ValueType.f64_val));
     try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
     const offset_pos = out.items.len;
     try out.appendNTimes(alloc, 0, 8);

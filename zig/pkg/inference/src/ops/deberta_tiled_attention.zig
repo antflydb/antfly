@@ -437,7 +437,7 @@ test "tiled DeBERTa SIMD softmax preserves amplified subnormal probabilities" {
     // Accumulate the oracle in f64 so this tests exponential preservation
     // independently of the platform BLAS policy for subnormal operands.
     const width = primitives.vec_len;
-    var scores = [_]f32{-std.math.inf(f32)} ** (width + 1);
+    var scores = @as([(width + 1)]f32, @splat(-std.math.inf(f32)));
     scores[0] = 0;
     scores[1] = -90;
     scores[width] = -92;

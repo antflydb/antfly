@@ -40,9 +40,9 @@ pub fn decodeHeader(payload: []const u8) !Header {
     const metric_raw = std.mem.readInt(u32, payload[0..4], .little);
     return .{
         .metric = switch (metric_raw) {
-            @intFromEnum(shared_vector.DistanceMetric.l2_squared) => .l2_squared,
-            @intFromEnum(shared_vector.DistanceMetric.inner_product) => .inner_product,
-            @intFromEnum(shared_vector.DistanceMetric.cosine) => .cosine,
+            @backingInt(shared_vector.DistanceMetric.l2_squared) => .l2_squared,
+            @backingInt(shared_vector.DistanceMetric.inner_product) => .inner_product,
+            @backingInt(shared_vector.DistanceMetric.cosine) => .cosine,
             else => return error.InvalidVectorSegmentPayload,
         },
         .dims = std.mem.readInt(u32, payload[4..8], .little),
@@ -59,7 +59,7 @@ pub fn encodeAlloc(alloc: Allocator, segment: vector_types.Segment) ![]u8 {
 
     const buf = try alloc.alloc(u8, total_len);
     var pos: usize = 0;
-    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(@intFromEnum(segment.metric)), .little);
+    std.mem.writeInt(u32, buf[pos..][0..4], @intCast(@backingInt(segment.metric)), .little);
     pos += 4;
     std.mem.writeInt(u32, buf[pos..][0..4], segment.dims, .little);
     pos += 4;
@@ -141,8 +141,8 @@ pub fn encodedSize(segment: vector_types.Segment) !usize {
 }
 
 test "lake vector segment codec rejects forged entry counts before allocation" {
-    var payload = [_]u8{0} ** header_len;
-    std.mem.writeInt(u32, payload[0..4], @intFromEnum(shared_vector.DistanceMetric.l2_squared), .little);
+    var payload = @as([header_len]u8, @splat(0));
+    std.mem.writeInt(u32, payload[0..4], @backingInt(shared_vector.DistanceMetric.l2_squared), .little);
     std.mem.writeInt(u32, payload[4..8], 2, .little);
     std.mem.writeInt(u32, payload[12..16], std.math.maxInt(u32), .little);
     try std.testing.expectError(error.DecodedArtifactTooLarge, decodeAlloc(std.testing.allocator, &payload));

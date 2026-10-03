@@ -398,7 +398,7 @@ test "fixed text overlap advances bounded chunks through mixed source text" {
     var tokenizer = try HfTokenizer.loadFromBytes(alloc, tokenizer_json);
     defer tokenizer.deinitSelf();
     const paragraph = "Korean HISTORY: Major Events (1950–1953), Seoul! Café, 日本語. Repeated WORDS; punctuation changes.\n\n";
-    const text = paragraph ** 80;
+    const text = z17RepeatString(paragraph, 80);
     const chunks = try chunkText(alloc, text, .{ .target_tokens = 200, .overlap_tokens = 25, .max_chunks = 200 });
     defer alloc.free(chunks);
     try std.testing.expect(chunks.len > 1 and chunks.len < 200);
@@ -519,4 +519,15 @@ test "fixed text chunker omits tokenizer empty sections" {
             try std.testing.expectEqualStrings(text[chunk.start_char.?..chunk.end_char.?], chunk.text.?);
         }
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

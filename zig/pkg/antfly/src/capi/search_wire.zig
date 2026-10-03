@@ -196,7 +196,7 @@ pub fn encodeDenseResponseAtGeneration(
     var cursor: usize = 0;
     writeInt(out, &cursor, u32, magic);
     writeInt(out, &cursor, u16, version);
-    writeInt(out, &cursor, u16, @intFromEnum(Op.dense_search));
+    writeInt(out, &cursor, u16, @backingInt(Op.dense_search));
     writeInt(out, &cursor, u32, total_hits);
     writeInt(out, &cursor, u32, @intCast(ids.len));
     writeInt(out, &cursor, u32, @intCast(ids_len));
@@ -253,7 +253,7 @@ test "packed dense response exposes public ids not doc ordinals" {
     cursor += 4;
     try std.testing.expectEqual(version, std.mem.readInt(u16, out.ptr.?[cursor..][0..2], .little));
     cursor += 2;
-    try std.testing.expectEqual(@intFromEnum(Op.dense_search), std.mem.readInt(u16, out.ptr.?[cursor..][0..2], .little));
+    try std.testing.expectEqual(@backingInt(Op.dense_search), std.mem.readInt(u16, out.ptr.?[cursor..][0..2], .little));
     cursor += 2;
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, out.ptr.?[cursor..][0..4], .little));
     cursor += 4;
@@ -299,7 +299,7 @@ const Reader = struct {
         if (found_magic != magic) return error.InvalidArgument;
         const found_version = try self.readInt(u16);
         if (found_version != version) return error.InvalidArgument;
-        const found_op: Op = @enumFromInt(try self.readInt(u16));
+        const found_op: Op = @fromBackingInt(@intCast(try self.readInt(u16)));
         if (found_op != expected_op) return error.InvalidArgument;
     }
 
@@ -362,7 +362,7 @@ test "decode text match request" {
     var cursor: usize = 0;
     writeInt(buf, &cursor, u32, magic);
     writeInt(buf, &cursor, u16, version);
-    writeInt(buf, &cursor, u16, @intFromEnum(Op.text_match_search));
+    writeInt(buf, &cursor, u16, @backingInt(Op.text_match_search));
     writeInt(buf, &cursor, u32, 0);
     writeInt(buf, &cursor, u32, 10);
     writeInt(buf, &cursor, u32, 3);
@@ -407,7 +407,7 @@ test "decode text term request" {
     var cursor: usize = 0;
     writeInt(buf, &cursor, u32, magic);
     writeInt(buf, &cursor, u16, version);
-    writeInt(buf, &cursor, u16, @intFromEnum(Op.text_term_search));
+    writeInt(buf, &cursor, u16, @backingInt(Op.text_term_search));
     writeInt(buf, &cursor, u32, 0);
     writeInt(buf, &cursor, u32, 10);
     writeInt(buf, &cursor, u32, 3);
@@ -450,7 +450,7 @@ test "decode text match phrase request" {
     var cursor: usize = 0;
     writeInt(buf, &cursor, u32, magic);
     writeInt(buf, &cursor, u16, version);
-    writeInt(buf, &cursor, u16, @intFromEnum(Op.text_match_phrase_search));
+    writeInt(buf, &cursor, u16, @backingInt(Op.text_match_phrase_search));
     writeInt(buf, &cursor, u32, 0);
     writeInt(buf, &cursor, u32, 5);
     writeInt(buf, &cursor, u32, 1);

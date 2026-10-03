@@ -49,7 +49,7 @@ fn header(record: Record) ![303]u8 {
     std.mem.writeInt(u64, raw[149..157], p.observation.validation_epoch, .little);
     raw[157] = @intFromBool(p.observation.foreign_inputs);
     @memcpy(raw[158..190], &p.generation);
-    raw[190] = @intFromEnum(p.phase);
+    raw[190] = @backingInt(p.phase);
     std.mem.writeInt(u32, raw[191..195], p.desired_ordinal, .little);
     std.mem.writeInt(u64, raw[195..203], p.verified_units, .little);
     @memcpy(raw[203..235], &p.chain);
@@ -95,13 +95,13 @@ fn encodeAlloc(alloc: std.mem.Allocator, selected: *const Key, record: Record) !
 
 fn decode(selected: *const Key, raw: []const u8) !Loaded {
     if (raw.len < 335 or raw.len > 335 + checkpoints.max_cursor_bytes or !std.mem.eql(u8, raw[0..4], "AUP1") or
-        raw[157] > 1 or raw[190] > @intFromEnum(Phase.complete) or
+        raw[157] > 1 or raw[190] > @backingInt(Phase.complete) or
         std.mem.readInt(u32, raw[299..303], .little) != raw.len - 335 or
         !std.mem.eql(u8, raw[raw.len - 32 ..], &checksum(selected, raw[0 .. raw.len - 32]))) return error.ArtifactCatalogCorrupt;
     const p: Progress = .{
         .observation = .{ .authority = .{ .namespace = raw[20..44].*, .epoch = std.mem.readInt(u64, raw[44..52], .little), .catalog_digest = raw[52..84].* }, .document_digest = raw[84..116].*, .revision = if (std.mem.allEqual(u8, raw[116..149], 0)) null else publication.Position.decode(raw[116..149]) catch return error.ArtifactCatalogCorrupt, .validation_epoch = std.mem.readInt(u64, raw[149..157], .little), .foreign_inputs = raw[157] == 1 },
         .generation = raw[158..190].*,
-        .phase = @enumFromInt(raw[190]),
+        .phase = @fromBackingInt(raw[190]),
         .desired_ordinal = std.mem.readInt(u32, raw[191..195], .little),
         .verified_units = std.mem.readInt(u64, raw[195..203], .little),
         .chain = raw[203..235].*,

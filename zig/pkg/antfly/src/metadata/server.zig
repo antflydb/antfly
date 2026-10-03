@@ -760,7 +760,7 @@ const MetadataAdminHttpRuntime = struct {
         };
     }
 
-    fn deinit(self: *MetadataAdminHttpRuntime) void {
+    pub fn deinit(self: *MetadataAdminHttpRuntime) void {
         self.deinitWithDeadline(runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
     }
 
@@ -1237,7 +1237,7 @@ const MetadataRoutingSnapshot = struct {
     stores: []metadata_mod.StoreRecord,
     placements: []raft_reconciler.PlacementIntent,
 
-    fn deinit(self: *MetadataRoutingSnapshot, svc: *service.MetadataHttpService, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *MetadataRoutingSnapshot, svc: *service.MetadataHttpService, alloc: std.mem.Allocator) void {
         svc.freeProjectedPlacementIntents(alloc, self.placements);
         svc.freeProjectedStores(alloc, self.stores);
         self.* = undefined;

@@ -208,7 +208,7 @@ const Memory = struct {
     fn init() Memory {
         return .{ .map = std.StringHashMap([]u8).init(std.testing.allocator) };
     }
-    fn deinit(self: *Memory) void {
+    pub fn deinit(self: *Memory) void {
         var iterator = self.map.iterator();
         while (iterator.next()) |entry| {
             self.map.allocator.free(entry.key_ptr.*);

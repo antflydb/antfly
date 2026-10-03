@@ -80,7 +80,7 @@ const ConfigOwner = struct {
             else => |mapped| mapped,
         };
     }
-    fn deinit(self: *ConfigOwner) void {
+    pub fn deinit(self: *ConfigOwner) void {
         const a = self.backing;
         self.scratch.deinit();
         a.destroy(self);
@@ -146,7 +146,7 @@ fn strictTypes(comptime T: type, value: std.json.Value) !void {
         .optional => |info| if (value != .null) try strictTypes(info.child, value),
         .@"struct" => {
             if (value != .object) return error.InvalidBoundaryMergeJob;
-            inline for (std.meta.fields(T)) |field| if (value.object.get(field.name)) |child| try strictTypes(field.type, child);
+            inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |reflected_name, field_type| if (value.object.get(reflected_name)) |child| try strictTypes(field_type, child);
         },
         .array => |info| {
             if (value == .string and info.child == u8) return;
@@ -281,7 +281,7 @@ fn executeOwned(a: Allocator, io: std.Io, config: Config, configuration: bundle.
 }
 
 const OpenedAdapter = struct {
-    descriptors: [3]?std.Io.File = .{null} ** 3,
+    descriptors: [3]?std.Io.File = @splat(null),
     pins: [3]?bundle.Digest,
 
     fn open(io: std.Io, path: []const u8, pins: merge.AdapterFiles, control: ?Control) !OpenedAdapter {
@@ -302,7 +302,7 @@ const OpenedAdapter = struct {
         return self;
     }
     fn load(self: *OpenedAdapter, a: Allocator, io: std.Io, config: Config, control: ?Control) !adapter.Loaded {
-        var bytes: [3]?[]u8 = .{null} ** 3;
+        var bytes: [3]?[]u8 = @splat(null);
         defer for (bytes) |raw| if (raw) |value| a.free(value);
         for (self.descriptors, self.pins, &bytes) |file, pin, *raw| if (file) |actual| {
             raw.* = try files.readOpened(a, io, actual, @intCast(pin.?.size_bytes), control);
@@ -312,7 +312,7 @@ const OpenedAdapter = struct {
         _ = try std.fmt.hexToBytes(&frozen, &config.expected_source.weight.sha256);
         return adapter.importBytes(a, bytes[0].?, bytes[1].?, bytes[2], .{ .source = config.expected_source, .schema_sha256 = config.schema_sha256, .frozen_weight_sha256 = frozen }, config.merge_limits.adapter, control);
     }
-    fn deinit(self: *OpenedAdapter, io: std.Io) void {
+    pub fn deinit(self: *OpenedAdapter, io: std.Io) void {
         for (self.descriptors) |file| if (file) |actual| actual.close(io);
         self.* = undefined;
     }
@@ -336,7 +336,7 @@ fn testConfig() Config {
         .source_dir = "/tmp/immutable-source",
         .adapter_dir = "/tmp/adapter",
         .output_dir = "/tmp/new-merged-model",
-        .expected_source = .{ .backbone = .small, .precision = .fp32, .weight = bundle.Digest.of("source snapshot"), .sidecars = .{bundle.Digest.of("{}")} ** 4 },
+        .expected_source = .{ .backbone = .small, .precision = .fp32, .weight = bundle.Digest.of("source snapshot"), .sidecars = @splat(bundle.Digest.of("{}")) },
         .expected_adapter = .{ .config = bundle.Digest.of("config"), .weights = bundle.Digest.of("weights"), .receipt = null },
         .schema_sha256 = @splat(9),
     };

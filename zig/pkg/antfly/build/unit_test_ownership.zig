@@ -20,9 +20,8 @@ const rules = @import("unit_test_ownership_rules.zig").rules;
 /// run nodes, arguments, and transitive prerequisites. Compiler artifacts are
 /// shared; cloning a run never creates another compiler invocation.
 pub fn apply(b: *std.Build, aggregate: *Step) *Step {
-    const before = b.allocator.create(Step) catch @panic("OOM");
-    before.* = Step.init(.{ .id = .top_level, .name = "unit ownership baseline", .owner = b });
-    before.dependencies.appendSlice(aggregate.dependencies.items) catch @panic("OOM");
+    const before = privateTopLevel(b, "unit ownership baseline");
+    before.dependencies.appendSlice(b.allocator, aggregate.dependencies.items) catch @panic("OOM");
     var copies = std.AutoHashMap(*Step, *Step).init(b.allocator);
     for (aggregate.dependencies.items) |*dependency| dependency.* = copySelected(b, dependency.*, &copies);
     return before;
@@ -80,7 +79,7 @@ test "ownership anchors respect runtime scope and exact filter identity" {
 fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, *Step)) *Step {
     if (copies.get(original)) |copy| return copy;
     // Compilation/code generation is shared with focused targets.
-    if (original.id != .run and original.id != .top_level) return original;
+    if (original.tag != .run and original.tag != .top_level) return original;
     const original_run = original.cast(Step.Run);
     var skips: []const []const u8 = &.{};
     if (original_run) |run| blk: {
@@ -140,12 +139,17 @@ fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, 
         }
         break :blk &cloned.step;
     } else blk: {
-        const cloned = b.allocator.create(Step) catch @panic("OOM");
-        cloned.* = Step.init(.{ .id = .top_level, .name = original.name, .owner = b });
+        const cloned = privateTopLevel(b, original.name);
         break :blk cloned;
     };
     copy.max_rss = original.max_rss;
-    copy.dependencies = dependencies;
+    copy.dependencies = dependencies.moveToUnmanaged();
     copies.put(original, copy) catch @panic("OOM");
     return copy;
+}
+
+fn privateTopLevel(b: *std.Build, name: []const u8) *Step {
+    const node = b.allocator.create(Step.TopLevel) catch @panic("OOM");
+    node.* = .{ .step = Step.init(.{ .tag = .top_level, .name = name, .owner = b }), .description = "" };
+    return &node.step;
 }

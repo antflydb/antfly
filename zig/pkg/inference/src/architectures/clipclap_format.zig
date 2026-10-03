@@ -441,7 +441,7 @@ const TestTensors = struct {
     allocator: std.mem.Allocator,
     items: std.ArrayListUnmanaged(gguf_format.TensorInfo) = .empty,
 
-    fn deinit(self: *TestTensors) void {
+    pub fn deinit(self: *TestTensors) void {
         for (self.items.items) |tensor| {
             self.allocator.free(tensor.name);
             self.allocator.free(tensor.dimensions);

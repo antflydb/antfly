@@ -23,7 +23,7 @@ const OwnedVectorSet = struct {
     count: usize,
     data: []f32,
 
-    fn deinit(self: *OwnedVectorSet, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *OwnedVectorSet, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.* = undefined;
     }
@@ -86,7 +86,7 @@ const TruthCache = struct {
         return .{ .alloc = alloc };
     }
 
-    fn deinit(self: *TruthCache) void {
+    pub fn deinit(self: *TruthCache) void {
         for (self.entries.items) |entry| self.alloc.free(entry.ids);
         self.entries.deinit(self.alloc);
         self.* = undefined;

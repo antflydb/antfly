@@ -34,6 +34,7 @@ const roaring = @import("encoding/roaring.zig");
 const scorer_mod = @import("search/scorer.zig");
 const query_mod = @import("search/query.zig");
 const distributed_stats_mod = @import("search/distributed_stats.zig");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const platform_time = @import("antfly_platform").time;
 const resource_manager_mod = @import("storage/resource_manager.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
@@ -230,7 +231,7 @@ pub const TypedDocValuesFieldCoverage = struct {
         if (comptime builtin.os.tag == .freestanding) {
             self.initialization_mutex.lockUncancelable(.failing);
         } else {
-            std.Io.Threaded.mutexLock(&self.initialization_mutex);
+            std.Io.Threaded.mutexLockUncancelable(&self.initialization_mutex);
         }
     }
 
@@ -247,7 +248,7 @@ pub const TypedDocValuesFieldCoverage = struct {
         return if (self.missing_live_count.load(.acquire) == 0) .covered else .sparse_live_doc_values;
     }
 
-    fn deinit(self: *TypedDocValuesFieldCoverage) void {
+    pub fn deinit(self: *TypedDocValuesFieldCoverage) void {
         if (self.membership_doc_ids) |*membership| membership.deinit();
         self.* = undefined;
     }
@@ -1841,7 +1842,7 @@ pub const IndexWriter = struct {
             .name = "content",
             .sections = sections[0..],
         }};
-        const data = [_]u8{0} ** 64;
+        const data = @as([64]u8, @splat(0));
         const reader = segment_mod.SegmentReader{
             .alloc = std.testing.allocator,
             .data = &data,
@@ -2504,7 +2505,7 @@ test "typed doc values corruption is classified lazily without rejecting segment
 }
 
 fn mapTestSegment(segment_bytes: []const u8) !SegmentData {
-    if (builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .windows or builtin.os.tag == .wasi) {
         return error.SkipZigTest;
     }
     const mapped = try std.heap.page_allocator.alignedAlloc(
@@ -2524,7 +2525,7 @@ test "resource-managed mapped residency evicts cold segments and preserves hot m
     defer alloc.free(seg_bytes);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_segment_residency)] = .{
         .soft_limit_bytes = @intCast(seg_bytes.len),
         .hard_limit_bytes = @intCast(seg_bytes.len * 8),
     };

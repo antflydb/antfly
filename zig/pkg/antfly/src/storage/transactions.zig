@@ -831,7 +831,7 @@ pub const TxnManager = struct {
         defer range_reservations.deinit(self.alloc);
         try range_reservations.appendSlice(self.alloc, predicates);
         var writer_keys: [range_protection.bucket_count][range_protection.writer_prefix.len + 2]u8 = undefined;
-        var writer_buckets: std.StaticBitSet(range_protection.bucket_count) = .initEmpty();
+        var writer_buckets: std.StaticBitSet(range_protection.bucket_count) = .empty;
         const index_writer_keys = try self.alloc.alloc([range_protection.index_writer_prefix.len + range_protection.index_span_digest_bytes]u8, extra_batch.index_span_digests.len);
         defer self.alloc.free(index_writer_keys);
         {
@@ -2011,7 +2011,7 @@ pub const TxnManager = struct {
             defer scan.abort();
             var cursor = try scan.openCursor();
             defer cursor.close();
-            var buckets: std.StaticBitSet(range_protection.bucket_count) = .initEmpty();
+            var buckets: std.StaticBitSet(range_protection.bucket_count) = .empty;
             for (intents) |intent| {
                 try self.checkReadGuardCursor(&cursor, intent.key, exclude_txn);
                 if (std.mem.startsWith(u8, intent.key, "\x00\x00")) continue;
@@ -2094,7 +2094,7 @@ pub const TxnManager = struct {
             defer scan.abort();
             var cursor = try scan.openCursor();
             defer cursor.close();
-            var buckets: std.StaticBitSet(range_protection.bucket_count) = .initEmpty();
+            var buckets: std.StaticBitSet(range_protection.bucket_count) = .empty;
             for (user_keys) |key| {
                 try self.checkReadGuardCursor(&cursor, key, null);
                 if (std.mem.startsWith(u8, key, "\x00\x00")) continue;
@@ -2288,7 +2288,7 @@ pub const TxnManager = struct {
 
     fn encodeRecord(self: *TxnManager, record: TxnRecord) ![]u8 {
         const buf = try self.alloc.alloc(u8, txn_record_v6_size);
-        buf[0] = @intFromEnum(record.status);
+        buf[0] = @backingInt(record.status);
         std.mem.writeInt(u64, buf[1..9], record.begin_timestamp, .little);
         std.mem.writeInt(u64, buf[9..17], record.commit_version, .little);
         std.mem.writeInt(u64, buf[17..25], record.created_at, .little);
@@ -2570,7 +2570,7 @@ pub const TxnManager = struct {
         return try decodeParticipantList(alloc, raw);
     }
 
-    fn getAlloc(self: *TxnManager, alloc: Allocator, key: []const u8) ![]u8 {
+    pub fn getAlloc(self: *TxnManager, alloc: Allocator, key: []const u8) ![]u8 {
         // These helpers copy one value and release it immediately; none of
         // their callers retain a multi-operation snapshot. On the runtime LSM
         // a bound read clones the mutable memtable, while a probe reads the
@@ -2963,7 +2963,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == txn_record_v6_size) {
         if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1 or raw[52] > 1) return TxnError.InvalidTxnRecord;
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -2980,7 +2980,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == txn_record_v5_size) {
         if (raw[49] > 1 or raw[50] > 1 or raw[51] > 1) return TxnError.InvalidTxnRecord;
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -2995,7 +2995,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == txn_record_v4_size) {
         if (raw[49] > 1 or raw[50] > 1) return TxnError.InvalidTxnRecord;
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -3010,7 +3010,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     if (raw.len == txn_record_v3_size) {
         if (raw[49] > 1) return TxnError.InvalidTxnRecord;
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -3024,7 +3024,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     }
     if (raw.len == txn_record_v2_size) {
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -3038,7 +3038,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
     }
     if (raw.len == txn_record_v1_size) {
         return .{
-            .status = @enumFromInt(raw[0]),
+            .status = @fromBackingInt(@intCast(raw[0])),
             .begin_timestamp = std.mem.readInt(u64, raw[1..9], .little),
             .commit_version = std.mem.readInt(u64, raw[9..17], .little),
             .created_at = std.mem.readInt(u64, raw[17..25], .little),
@@ -3049,7 +3049,7 @@ fn decodeRecord(raw: []const u8) !TxnRecord {
         };
     }
     if (raw.len == txn_record_v0_size) {
-        const status: TxnStatus = @enumFromInt(raw[0]);
+        const status: TxnStatus = @fromBackingInt(@intCast(raw[0]));
         const ts = std.mem.readInt(u64, raw[1..9], .little);
         return .{
             .status = status,
@@ -3174,7 +3174,7 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
         nonce,
     });
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 // ============================================================================
@@ -3393,7 +3393,7 @@ test "transaction cumulative admission is atomic and membership metadata is incr
     defer store.close();
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
-    const txn: TxnId = .{19} ** 16;
+    const txn: TxnId = @splat(19);
     try mgr.initTransaction(txn, 100);
     const first: WriteIntent = .{ .key = "a", .value = "value" };
     const cost = try intentAdmissionBytes(first);
@@ -3435,7 +3435,7 @@ test "transaction admission rejects before copying payloads and coalesces duplic
     defer runtime.deinit();
     var manager = try TxnManager.init(alloc, &runtime);
     defer manager.deinit();
-    const txn: TxnId = .{29} ** 16;
+    const txn: TxnId = @splat(29);
     try manager.initTransaction(txn, 100);
     const payload = try alloc.alloc(u8, 1024 * 1024);
     defer alloc.free(payload);
@@ -3463,7 +3463,7 @@ test "transaction intent admission releases failed allocations before voting" {
             defer runtime.deinit();
             var mgr = try TxnManager.init(alloc, &runtime);
             defer mgr.deinit();
-            const txn: TxnId = .{31} ** 16;
+            const txn: TxnId = @splat(31);
             try mgr.initTransaction(txn, 100);
             mgr.alloc = failing;
             defer mgr.alloc = alloc;
@@ -3481,7 +3481,7 @@ test "transaction journal refuses to lose unprepared JSON null typing" {
     defer runtime.deinit();
     var mgr = try TxnManager.init(alloc, &runtime);
     defer mgr.deinit();
-    const txn: TxnId = .{32} ** 16;
+    const txn: TxnId = @splat(32);
     try mgr.initTransaction(txn, 100);
     try std.testing.expectError(error.PreparedIntentRequiresMaterialization, mgr.writeIntents(txn, &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }}, &.{}));
     // Once the native AROW exists, its bitmap is the durable authority.
@@ -3496,7 +3496,7 @@ test "transaction abort retires large intents without loading their payloads" {
     defer runtime.deinit();
     var mgr = try TxnManager.init(alloc, &runtime);
     defer mgr.deinit();
-    const txn: TxnId = .{32} ** 16;
+    const txn: TxnId = @splat(32);
     try mgr.initTransaction(txn, 100);
     const payload = try alloc.alloc(u8, 1024 * 1024);
     defer alloc.free(payload);
@@ -3518,7 +3518,7 @@ test "transaction admission converts released document manifests once" {
     defer runtime.deinit();
     var mgr = try TxnManager.init(alloc, &runtime);
     defer mgr.deinit();
-    const txn: TxnId = .{33} ** 16;
+    const txn: TxnId = @splat(33);
     try mgr.initTransaction(txn, 100);
     try mgr.writeIntents(txn, &.{.{ .key = "old", .value = "first" }}, &.{});
     const header_key = makeSidecarKey(intent_admission_prefix, txn);
@@ -3844,12 +3844,12 @@ test "idempotent begin upgrades a legacy transaction coordinator role" {
 
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
-    const txn_id: TxnId = .{6} ** 16;
+    const txn_id: TxnId = @splat(6);
     const participants = [_][]const u8{ "table2:4:docs:group:7", "table2:4:docs:group:8" };
     try mgr.initTransactionWithParticipantsCreatedAtAndRole(txn_id, 1_000, 900, &participants, false);
 
     var legacy: [txn_record_v3_size]u8 = @splat(0);
-    legacy[0] = @intFromEnum(TxnStatus.pending);
+    legacy[0] = @backingInt(TxnStatus.pending);
     std.mem.writeInt(u64, legacy[1..9], 1_000, .little);
     std.mem.writeInt(u64, legacy[17..25], 900, .little);
     const record_key = makeRecordKey(txn_id);
@@ -3862,8 +3862,8 @@ test "idempotent begin upgrades a legacy transaction coordinator role" {
     try std.testing.expect(txns[0].coordinator_known);
     try std.testing.expect(txns[0].coordinator);
 
-    const txn_id_2: TxnId = .{7} ** 16;
-    const txn_id_3: TxnId = .{8} ** 16;
+    const txn_id_2: TxnId = @splat(7);
+    const txn_id_3: TxnId = @splat(8);
     try mgr.initTransaction(txn_id_2, 1_001);
     try mgr.initTransaction(txn_id_3, 1_002);
     const first_page = try mgr.listTransactionsPage(alloc, null, 2);
@@ -3965,9 +3965,9 @@ test "transaction shared read guards fence writes and survive restart until reso
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const first: TxnId = .{71} ** 16;
-    const second: TxnId = .{72} ** 16;
-    const writer: TxnId = .{73} ** 16;
+    const first: TxnId = @splat(71);
+    const second: TxnId = @splat(72);
+    const writer: TxnId = @splat(73);
     {
         var backend = try lsm_backend.Backend.open(alloc, path, .{ .flush_threshold = 2 });
         defer backend.close();
@@ -3997,8 +3997,8 @@ test "transaction shared read guards fence writes and survive restart until reso
         // This cold-key shared-lock probe must not clone the LSM memtable.
         const after = backend.snapshotMaintenanceStats();
         try std.testing.expectEqual(
-            before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
-            after.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+            before.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+            after.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
         );
         try manager.writeIntents(first, &.{}, &parent);
         try std.testing.expectEqual(@as(u64, 2), try manager.readGuardCount());
@@ -4201,8 +4201,8 @@ test "transaction read guards protect absence and reject write skew" {
     defer runtime.deinit();
     var manager = try TxnManager.init(alloc, &runtime);
     defer manager.deinit();
-    const a: TxnId = .{81} ** 16;
-    const b: TxnId = .{82} ** 16;
+    const a: TxnId = @splat(81);
+    const b: TxnId = @splat(82);
     try manager.initTransaction(a, 100);
     try manager.initTransaction(b, 100);
     try manager.writeIntents(a, &.{.{ .key = "a", .value = "a" }}, &.{.{ .key = "b", .expected_version = 0 }});
@@ -4223,7 +4223,7 @@ test "transaction read guard admission is cumulative retry safe and atomic on al
             defer runtime.deinit();
             var manager = try TxnManager.init(alloc, &runtime);
             defer manager.deinit();
-            const id: TxnId = .{83} ** 16;
+            const id: TxnId = @splat(83);
             try manager.initTransaction(id, 100);
             manager.alloc = failing;
             defer manager.alloc = alloc;
@@ -4294,7 +4294,7 @@ test "transaction point reads do not clone runtime lsm mutable state" {
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
 
-    const txn_id: TxnId = .{3} ** 16;
+    const txn_id: TxnId = @splat(3);
     try mgr.initTransaction(txn_id, 1000);
     try mgr.writeIntents(txn_id, &.{.{ .key = "shared", .value = "pending" }}, &.{});
     const before = backend.snapshotMaintenanceStats();
@@ -4314,8 +4314,8 @@ test "transaction point reads do not clone runtime lsm mutable state" {
     try std.testing.expectEqual(TxnStatus.pending, try mgr.getTransactionStatus(txn_id));
     const after_point_reads = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(
-        before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
-        after_point_reads.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        before.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        after_point_reads.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
     );
 
     try std.testing.expect(try mgr.hasIntents(txn_id));
@@ -4326,8 +4326,8 @@ test "transaction point reads do not clone runtime lsm mutable state" {
     try std.testing.expect(!try mgr.hasIntents(txn_id));
     const after_lifecycle = backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(
-        before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
-        after_lifecycle.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        before.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
+        after_lifecycle.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bound_read_txn)].calls,
     );
 }
 
@@ -4341,7 +4341,7 @@ test "transaction intent manifest rolls forward legacy in-flight intents" {
     var mgr = try TxnManager.init(alloc, &runtime);
     defer mgr.deinit();
 
-    const txn_id: TxnId = .{5} ** 16;
+    const txn_id: TxnId = @splat(5);
     try mgr.initTransaction(txn_id, 1000);
     try mgr.writeIntents(txn_id, &.{.{ .key = "doc:a", .value = "a" }}, &.{});
 
@@ -4503,7 +4503,7 @@ test "coordinator recovery durably aborts a stale prepared transaction" {
 
     var mgr = try TxnManager.init(alloc, &store);
     defer mgr.deinit();
-    const txn_id: TxnId = .{9} ** 16;
+    const txn_id: TxnId = @splat(9);
     try mgr.initTransactionWithParticipantsCreatedAtAndRole(
         txn_id,
         10_000,
@@ -4910,7 +4910,7 @@ test "retained terminal transactions honor the extended retry cutoff" {
 
     var mgr = try TxnManager.init(alloc, &runtime_store);
     defer mgr.deinit();
-    const txn_id: TxnId = .{5} ** 16;
+    const txn_id: TxnId = @splat(5);
     try mgr.initTransactionWithParticipantsCreatedAtRoleAndRetention(
         txn_id,
         1_000,

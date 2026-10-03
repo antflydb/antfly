@@ -45,7 +45,7 @@ const Stream = struct {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.clear();
         self.units.deinit(self.alloc);
     }
@@ -233,7 +233,7 @@ fn fail(
         err,
         .enrichment_compute,
         abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }

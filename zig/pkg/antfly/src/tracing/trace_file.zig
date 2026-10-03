@@ -9,7 +9,7 @@ pub fn openProcessFile(directory: []const u8, pid: std.c.pid_t) !std.c.fd_t {
     var path: [std.fs.max_path_bytes]u8 = undefined;
     var sequence: u32 = 0;
     while (true) : (sequence = try std.math.add(u32, sequence, 1)) {
-        const name = try std.fmt.bufPrintZ(&path, "{s}/trace-{d}-{d}.ndjson", .{ directory, pid, sequence });
+        const name = try std.fmt.bufPrintSentinel(&path, "{s}/trace-{d}-{d}.ndjson", .{ directory, pid, sequence }, 0);
         const fd = std.c.open(name, .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, @as(std.c.mode_t, 0o644));
         switch (std.posix.errno(fd)) {
             .SUCCESS => return fd,

@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const ascii_compat = @import("../common/ascii_compat.zig");
 const connections_api = @import("connections.zig");
 const agent_tools = @import("agent_tools.zig");
 const web_search = @import("web_search.zig");
@@ -1719,7 +1720,7 @@ test "model-directed retrieval delegates full DSL refinement with a shared gener
                 .runtime_query_request_validator = .{ .ptr = ptr, .vtable = &.{ .validate_query_request = validate } },
             }, generator);
         }
-        fn validate(ptr: *anyopaque, _: std.mem.Allocator, candidate: QueryRequest) !?[]const u8 {
+        pub fn validate(ptr: *anyopaque, _: std.mem.Allocator, candidate: QueryRequest) !?[]const u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqualStrings("docs", candidate.table.?);
             try std.testing.expectEqual(@as(?i64, 3), candidate.limit);
@@ -1808,7 +1809,7 @@ test "model-directed nested planning reserves pending siblings within the shared
             }, generator);
         }
 
-        fn validate(_: *anyopaque, _: std.mem.Allocator, request: QueryRequest) !?[]const u8 {
+        pub fn validate(_: *anyopaque, _: std.mem.Allocator, request: QueryRequest) !?[]const u8 {
             try std.testing.expectEqualStrings("docs", request.table.?);
             try std.testing.expect(request.full_text_search != null);
             return null;
@@ -2253,7 +2254,7 @@ fn executeModelTools(
                     continue;
                 }
                 var planned = scope;
-                inline for (std.meta.fields(QueryRequest)) |field| @field(planned, field.name) = @field(built.query_request.?, field.name);
+                inline for (comptime std.meta.fieldNames(QueryRequest)) |reflected_name| @field(planned, reflected_name) = @field(built.query_request.?, reflected_name);
                 if (planned.table == null or scope.table == null or !std.mem.eql(u8, planned.table.?, scope.table.?) or !try toolPolicyAllowsRetrievalQuery(arena, policy, planned)) {
                     try rejectModelToolCall(arena, steps, live, &history, call, "{\"error\":\"Plan exceeds the authorized table or tool policy\"}");
                     continue;
@@ -5379,7 +5380,7 @@ fn queryCoverageScore(query: []const u8, text: []const u8) f32 {
     while (it.next()) |token| {
         if (token.len < 4) continue;
         total += 1;
-        if (std.ascii.indexOfIgnoreCase(text, token) != null) matched += 1;
+        if (ascii_compat.indexOfIgnoreCase(text, token) != null) matched += 1;
     }
     return if (total == 0) 0.0 else @as(f32, @floatFromInt(matched)) / @as(f32, @floatFromInt(total));
 }
@@ -6620,7 +6621,7 @@ fn detectSelectedAgenticStrategy(
 
 fn containsAnyIgnoreCase(haystack: []const u8, needles: []const []const u8) bool {
     for (needles) |needle| {
-        if (std.ascii.indexOfIgnoreCase(haystack, needle) != null) return true;
+        if (ascii_compat.indexOfIgnoreCase(haystack, needle) != null) return true;
     }
     return false;
 }
@@ -6930,14 +6931,15 @@ fn injectSeedNodesIntoEncodedQuery(
 
 fn canonicalQueryRequestFromRetrieval(request: RetrievalQueryRequest) QueryRequest {
     var canonical: QueryRequest = .{};
-    inline for (std.meta.fields(QueryRequest)) |field| {
-        if (!@hasField(RetrievalQueryRequest, field.name)) {
-            @compileError("RetrievalQueryRequest must extend QueryRequest; missing field " ++ field.name);
+    const query_info = @typeInfo(QueryRequest).@"struct";
+    inline for (query_info.field_names, query_info.field_types) |reflected_name, Field| {
+        if (!@hasField(RetrievalQueryRequest, reflected_name)) {
+            @compileError("RetrievalQueryRequest must extend QueryRequest; missing field " ++ reflected_name);
         }
-        if (@TypeOf(@field(request, field.name)) != field.type) {
-            @compileError("RetrievalQueryRequest field type diverged from QueryRequest: " ++ field.name);
+        if (@TypeOf(@field(request, reflected_name)) != Field) {
+            @compileError("RetrievalQueryRequest field type diverged from QueryRequest: " ++ reflected_name);
         }
-        @field(canonical, field.name) = @field(request, field.name);
+        @field(canonical, reflected_name) = @field(request, reflected_name);
     }
     return canonical;
 }
@@ -10654,7 +10656,7 @@ test "retrieval agent event sink receives live milestones" {
             return total;
         }
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             for (self.names.items) |event_name| alloc.free(event_name);
             self.names.deinit(alloc);
         }
@@ -11913,7 +11915,7 @@ test "retrieval graph navigation pruning uses memory proportional to candidates"
             defer scratch.deinit();
             const a = scratch.allocator();
             var document = JsonObject{};
-            try document.map.put(a, "body", .{ .string = "x" ** 1024 });
+            try document.map.put(a, "body", .{ .string = z17RepeatString("x", 1024) });
             const nodes = try a.alloc(indexes_openapi.GraphResultNode, 256);
             for (nodes, 0..) |*node, i| node.* = .{ .key = try std.fmt.allocPrint(a, "node-{d}", .{i}), .depth = 1, .document = document };
             return .{ .json = try std.json.Stringify.valueAlloc(alloc, .{ .responses = .{.{ .status = 200, .took = 1, .graph_results = .{ .navigation = .{ .kind = "nodes", .nodes = nodes, .stats = .{ .returned_items = 256, .truncated = false } } } }} }, .{ .emit_null_optional_fields = false }) };
@@ -12423,7 +12425,7 @@ test "retrieval agent fetch shrinks non-ASCII pages to the context budget" {
         fn fetchUrl(_: *anyopaque, arena: std.mem.Allocator, _: web_fetch.Config, _: []const u8) !web_fetch.Download {
             // Every code point is three bytes: a byte-halving loop that
             // counted code points would never shrink this page.
-            return .{ .content_type = "text/plain", .data = try arena.dupe(u8, "\u{4e2d}" ** 4000) };
+            return .{ .content_type = "text/plain", .data = try arena.dupe(u8, z17RepeatString("\u{4e2d}", 4000)) };
         }
         fn generate(_: *anyopaque, a: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
             if (messages[messages.len - 1].role != .tool) {
@@ -12561,4 +12563,15 @@ test "retrieval refinement preserves query syntax and only edits native match te
     try std.testing.expectEqualStrings("or", parsed.object.get("operator").?.string);
     try std.testing.expectEqual(@as(i64, 2), parsed.object.get("boost").?.integer);
     try std.testing.expect(parsed.object.get("query") == null);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

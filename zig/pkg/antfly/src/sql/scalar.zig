@@ -159,7 +159,7 @@ fn literalType(value: ast.Value) Type {
     }, .nullable = value == .null or value == .parameter };
 }
 fn functionId(name: []const u8) !Function {
-    inline for (std.meta.fields(Function)) |field| if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Function).@"enum".field_names, @typeInfo(Function).@"enum".field_values) |reflected_name, field_value| if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     if (std.mem.eql(u8, name, "char_length") or std.mem.eql(u8, name, "character_length")) return .length;
     if (std.mem.eql(u8, name, "ceiling")) return .ceil;
     if (std.mem.eql(u8, name, "substr")) return .substring;

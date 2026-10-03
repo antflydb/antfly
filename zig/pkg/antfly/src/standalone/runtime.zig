@@ -199,7 +199,7 @@ const CliConfig = struct {
     ha_epoch: ?u64 = null,
     help: bool = false,
 
-    fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.secret_store_paths.deinit(alloc);
         self.ha_sync_standby_names.deinit(alloc);
         self.inference_preload_models.deinit(alloc);
@@ -417,7 +417,7 @@ const RuntimeLeaseWatchdog = struct {
         };
     }
 
-    fn deinit(self: *RuntimeLeaseWatchdog, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *RuntimeLeaseWatchdog, alloc: std.mem.Allocator) void {
         self.executor.deinit();
         alloc.free(self.uri);
         if (self.owned_data_generation) |generation| alloc.free(generation);
@@ -607,7 +607,7 @@ const ResolvedPaths = struct {
     secret_store_path: []u8,
     auth_store_root_dir: []u8,
 
-    fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.local_metadata_catalog_path);
@@ -669,7 +669,7 @@ const StandaloneHealthSource = struct {
         const self: *StandaloneHealthSource = @ptrCast(@alignCast(ptr));
         var data_health = antfly.data.runtime.HealthSource{ .data_server = self.data_server };
         try data_health.metricsWriter().writeMetrics(writer);
-        try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(self.supervisor.currentState()));
+        try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(self.supervisor.currentState()));
         try antfly.common.health_server.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(self.supervisor.token().isCancelled()));
 
         const handler = antfly.public_api.kernel_bridge.handlerStats(self.handler);
@@ -882,7 +882,7 @@ const LocalStandaloneMetadata = struct {
         fn commit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) !void {
             try metadata.persistMutationLocked(self);
         }
-        fn deinit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) void {
+        pub fn deinit(self: *CatalogMutation, metadata: *LocalStandaloneMetadata) void {
             if (self.catalog_change) |*change| change.finish(&metadata.system_catalog_state.?, self.committed);
             if (self.changed_settings) {
                 const catalog = &metadata.system_catalog_state.?;
@@ -1003,7 +1003,7 @@ const LocalStandaloneMetadata = struct {
         return self;
     }
 
-    fn deinit(self: *LocalStandaloneMetadata) void {
+    pub fn deinit(self: *LocalStandaloneMetadata) void {
         var initial_owners = self.initial_fk_primed.valueIterator();
         while (initial_owners.next()) |owner| self.alloc.free(owner.table_name);
         self.initial_fk_primed.deinit(self.alloc);
@@ -1202,7 +1202,7 @@ const LocalStandaloneMetadata = struct {
     const MutationLock = struct {
         owner: *LocalStandaloneMetadata,
         lease: ?antfly.db.MutationBarrier.SharedLease,
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.owner.mutex.unlock();
             if (self.lease) |*lease| lease.release();
         }
@@ -2867,7 +2867,7 @@ const LocalStandaloneMetadata = struct {
         return table;
     }
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
+    pub fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
@@ -3104,7 +3104,7 @@ const LocalStandaloneMetadata = struct {
         self.vector_migration_commands.end(self.alloc, table_name);
     }
 
-    fn restoreTable(
+    pub fn restoreTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -3154,7 +3154,7 @@ const LocalStandaloneMetadata = struct {
         try mutation.commit(self);
     }
 
-    fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
+    pub fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
         var result = try dropTableExact(ptr, std.heap.page_allocator, table_name);
         result.deinit(std.heap.page_allocator);
     }
@@ -3194,7 +3194,7 @@ const LocalStandaloneMetadata = struct {
         };
     }
 
-    fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+    pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         _ = try updateSchemaVersioned(ptr, alloc, table_name, schema_json);
     }
 
@@ -3248,7 +3248,7 @@ const LocalStandaloneMetadata = struct {
         return result;
     }
 
-    fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
+    pub fn createIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8, index_json: []const u8) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
@@ -3265,7 +3265,7 @@ const LocalStandaloneMetadata = struct {
         try mutation.commit(self);
     }
 
-    fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
+    pub fn dropIndex(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, index_name: []const u8) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
@@ -3283,7 +3283,7 @@ const LocalStandaloneMetadata = struct {
         try mutation.commit(self);
     }
 
-    fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
+    pub fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
@@ -3300,7 +3300,7 @@ const LocalStandaloneMetadata = struct {
         try mutation.commit(self);
     }
 
-    fn deleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
+    pub fn deleteArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8) !void {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         var locked = try self.lockMutation();
         defer locked.deinit();
@@ -5534,12 +5534,12 @@ pub fn runLite(
     fsync: bool,
     extra_args: []const []const u8,
 ) !void {
-    const path_z = try init.gpa.dupeZ(u8, path);
+    const path_z = try init.gpa.dupeSentinel(u8, path, 0);
     defer init.gpa.free(path_z);
-    const host_z = try init.gpa.dupeZ(u8, host);
+    const host_z = try init.gpa.dupeSentinel(u8, host, 0);
     defer init.gpa.free(host_z);
     var port_buf: [16]u8 = undefined;
-    const port_z = try std.fmt.bufPrintZ(&port_buf, "{d}", .{port});
+    const port_z = try std.fmt.bufPrintSentinel(&port_buf, "{d}", .{port}, 0);
     var argv = std.ArrayListUnmanaged([*:0]const u8).empty;
     defer argv.deinit(init.gpa);
     try argv.appendSlice(init.gpa, &.{
@@ -5560,7 +5560,7 @@ pub fn runLite(
         init.gpa.free(owned_extra);
     }
     for (extra_args, 0..) |arg, i| {
-        owned_extra[i] = try init.gpa.dupeZ(u8, arg);
+        owned_extra[i] = try init.gpa.dupeSentinel(u8, arg, 0);
         owned_extra_count += 1;
         try argv.append(init.gpa, owned_extra[i].ptr);
     }
@@ -7085,7 +7085,7 @@ fn resolveExtensionPackageStoreDir(
     cli_path: ?[]const u8,
     local_base: []const u8,
 ) ![]u8 {
-    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    const env_var_z = try alloc.dupeSentinel(u8, antfly.extensions.wasmtime_runtime.package_store_env, 0);
     defer alloc.free(env_var_z);
     return try resolveExtensionPackageStoreDirWithEnv(
         alloc,
@@ -7525,7 +7525,7 @@ const OwnedHASyncPolicy = struct {
     policy: antfly.hot_standby.primary.SyncPolicy = .{},
     standby_names: []const []const u8 = &.{},
 
-    fn deinit(self: *OwnedHASyncPolicy, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *OwnedHASyncPolicy, alloc: std.mem.Allocator) void {
         if (self.standby_names.len > 0) alloc.free(self.standby_names);
         self.* = undefined;
     }
@@ -7634,9 +7634,9 @@ fn openHAPrimaryFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     try ensureParent(io, log_path);
     try ensureParent(io, slots_path);
 
-    const log_z = try alloc.dupeZ(u8, log_path);
+    const log_z = try alloc.dupeSentinel(u8, log_path, 0);
     defer alloc.free(log_z);
-    const slots_z = try alloc.dupeZ(u8, slots_path);
+    const slots_z = try alloc.dupeSentinel(u8, slots_path, 0);
     defer alloc.free(slots_z);
 
     return try antfly.hot_standby.primary.Primary.open(alloc, log_z.ptr, slots_z.ptr, try haPrimaryIdentity(cli), .{});
@@ -7661,9 +7661,9 @@ fn openHAStandbyFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig) !?
     try ensureParent(io, log_path);
     try ensureParent(io, progress_path);
 
-    const log_z = try alloc.dupeZ(u8, log_path);
+    const log_z = try alloc.dupeSentinel(u8, log_path, 0);
     defer alloc.free(log_z);
-    const progress_z = try alloc.dupeZ(u8, progress_path);
+    const progress_z = try alloc.dupeSentinel(u8, progress_path, 0);
     defer alloc.free(progress_z);
 
     return try antfly.hot_standby.standby.Standby.open(alloc, log_z.ptr, progress_z.ptr, try haStandbyIdentity(cli), .{});
@@ -7710,7 +7710,7 @@ fn openHAFenceStoreFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliConfig)
 
     try ensureParent(io, fence_wal_path);
 
-    const fence_wal_z = try alloc.dupeZ(u8, fence_wal_path);
+    const fence_wal_z = try alloc.dupeSentinel(u8, fence_wal_path, 0);
     defer alloc.free(fence_wal_z);
 
     return try antfly.hot_standby.fencing.Store.open(alloc, fence_wal_z.ptr, .{});
@@ -7728,7 +7728,7 @@ fn openHAFormerPrimaryLogFromCli(alloc: std.mem.Allocator, io: std.Io, cli: CliC
 
     try ensureParent(io, former_primary_log_path);
 
-    const former_primary_log_z = try alloc.dupeZ(u8, former_primary_log_path);
+    const former_primary_log_z = try alloc.dupeSentinel(u8, former_primary_log_path, 0);
     defer alloc.free(former_primary_log_z);
 
     return try antfly.hot_standby.replication_log.ReplicationLog.open(former_primary_log_z.ptr, .{});
@@ -7740,7 +7740,7 @@ fn resolveAdminBearerTokenFromCli(alloc: std.mem.Allocator, cli: CliConfig) !?[]
     if (env_var.len == 0) return error.AdminTokenEnvMissing;
     if (!antfly.hot_standby.validation.isEnvVarName(env_var)) return error.AdminTokenEnvInvalid;
 
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
 
     const raw_token_z = std.c.getenv(env_var_z.ptr) orelse return error.AdminTokenMissing;
@@ -8106,7 +8106,7 @@ const InferenceResourceBudgetOwner = struct {
     closing: std.atomic.Value(bool) = .init(false),
     lifetime_mutex: std.atomic.Mutex = .unlocked,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         lockAtomic(&self.lifetime_mutex);
         defer self.lifetime_mutex.unlock();
         if (self.closing.swap(true, .acq_rel))
@@ -8562,7 +8562,7 @@ const RecordingServer = struct {
     allocator: std.mem.Allocator,
     routes: std.ArrayListUnmanaged(RecordingRoute) = .empty,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.routes.items) |route| self.allocator.free(route.path);
         self.routes.deinit(self.allocator);
     }
@@ -8767,7 +8767,7 @@ test "standalone runtime local generator accepts media url data uris" {
     const message = converted.messages[0];
     try std.testing.expectEqualStrings("describe", message.content);
     try std.testing.expectEqual(@as(usize, 1), message.image_bytes.?.len);
-    var expected = [_]u8{0} ** 24;
+    var expected = @as([24]u8, @splat(0));
     @memcpy(expected[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, expected[16..20], 2, .big);
     std.mem.writeInt(u32, expected[20..24], 3, .big);
@@ -8814,7 +8814,7 @@ test "standalone encoded reader ABI round trips borrowed payloads" {
         second_ptr: [*]const u8,
         calls: usize = 0,
 
-        fn read(
+        pub fn read(
             ptr: *anyopaque,
             result_alloc: std.mem.Allocator,
             model: []const u8,
@@ -8935,7 +8935,7 @@ test "standalone raster reader ABI preserves borrowed strided pages and identity
         observed_addresses: [2]usize = .{ 0, 0 },
         calls: usize = 0,
 
-        fn read(
+        pub fn read(
             ptr: *anyopaque,
             result_alloc: std.mem.Allocator,
             model: []const u8,
@@ -11018,7 +11018,7 @@ test "inference config falls back to common config" {
 
 test "inference admission bridge charges combined native residency to resource manager" {
     var budgets = antfly.resource_manager.Options.defaultBudgets();
-    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_model_residency)] =
+    budgets[@backingInt(antfly.resource_manager.Slice.inference_model_residency)] =
         .{ .hard_limit_bytes = 100 };
     var manager = antfly.resource_manager.ResourceManager.init(.{ .budgets = budgets });
     var owner = InferenceResourceBudgetOwner{
@@ -11143,7 +11143,7 @@ test "inference admission bridge charges combined native residency to resource m
 
 test "standalone tokenizer bridge enforces growth and permits exact teardown" {
     var budgets = antfly.resource_manager.Options.defaultBudgets();
-    budgets[@intFromEnum(antfly.resource_manager.Slice.inference_tokenizer_cache)] =
+    budgets[@backingInt(antfly.resource_manager.Slice.inference_tokenizer_cache)] =
         .{ .hard_limit_bytes = 16 };
     var manager = antfly.resource_manager.ResourceManager.init(.{
         .memory_budget = .{ .hard_limit_bytes = 20 },
@@ -12504,7 +12504,7 @@ test "standalone catalog remote apply outage preserves committed creation and re
     const committed_lsn = primary.lastLsn();
     try std.testing.expect(committed_lsn != 0);
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
-    try std.testing.expectError(error.ProposalDropped, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("not_committed") == null);
     try std.testing.expectEqual(committed_lsn, primary.lastLsn());
     metadata.deinit();
@@ -13209,7 +13209,7 @@ test "standalone metadata finalizes schema migration from resident runtime evide
     });
 
     const Provider = struct {
-        fn collect(
+        pub fn collect(
             _: *anyopaque,
             provider_alloc: std.mem.Allocator,
             _: []const antfly.metadata.TableRecord,
@@ -13272,7 +13272,7 @@ test "standalone schema finalizer defers fenced tables independently and resumes
         try txn.commit();
     }
     const Provider = struct {
-        fn collect(_: *anyopaque, a: std.mem.Allocator, _: []const antfly.metadata.TableRecord, _: []const antfly.metadata.RangeRecord) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
+        pub fn collect(_: *anyopaque, a: std.mem.Allocator, _: []const antfly.metadata.TableRecord, _: []const antfly.metadata.RangeRecord) !antfly.data.runtime.DataServer.LocalSchemaProgressSnapshot {
             const records = try a.alloc(antfly.metadata.SchemaProgressRecord, 2);
             records[0] = .{ .table_id = 7, .node_id = 1, .schema_version = 1 };
             records[1] = .{ .table_id = 8, .node_id = 1, .schema_version = 1 };
@@ -13336,7 +13336,7 @@ test "standalone metadata finalizes schema migration through split shard adapter
     });
 
     const Provider = struct {
-        fn collect(
+        pub fn collect(
             _: *anyopaque,
             provider_alloc: std.mem.Allocator,
             _: []const antfly.metadata.TableRecord,
@@ -13432,7 +13432,7 @@ test "runtime lease watchdog publishes active self-fenced proof from exact expir
         .stable_topology_id = "topology-7",
         .node_id = "standby-a",
         .pod_uid = "standby-pod-uid",
-        .process_boot_id = [_]u8{'a'} ** 64,
+        .process_boot_id = @as([64]u8, @splat('a')),
     };
     const observed_monotonic_ns = platform_time.authorityNs();
     const decision = try runtime_watchdog.watchdog.observe(
@@ -13513,7 +13513,7 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
             .stable_topology_id = "topology-7",
             .node_id = "primary-a",
             .pod_uid = "primary-pod-uid",
-            .process_boot_id = [_]u8{'a'} ** 64,
+            .process_boot_id = @as([64]u8, @splat('a')),
         };
         platform_sync.lockYielding(&runtime_watchdog.proof_mutex);
         const transition = runtime_watchdog.transitionObservationFailureLocked(stage, 1);
@@ -13554,12 +13554,12 @@ test "runtime lease watchdog fetch and validation failures publish no bootstrap 
         .stable_topology_id = "topology-7",
         .node_id = "primary-a",
         .pod_uid = "primary-pod-uid",
-        .process_boot_id = [_]u8{'a'} ** 64,
+        .process_boot_id = @as([64]u8, @splat('a')),
     };
     source.watchdog.cfg.scope.process_boot_id = &source.process_boot_id;
 
     var placed = source;
-    placed.process_boot_id = [_]u8{'b'} ** 64;
+    placed.process_boot_id = @as([64]u8, @splat('b'));
     placed.bindOwnedProcessBootID();
 
     try std.testing.expectEqualStrings(&placed.process_boot_id, placed.watchdog.cfg.scope.process_boot_id);
@@ -13773,14 +13773,14 @@ test "standalone catalog journal preserves imported policy publication as fail c
         metadata.system_catalog_state = replacement;
         const result = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "policy_import" } } });
         alloc.free(result);
-        try std.testing.expectError(error.RowPolicyUnsupported, metadata.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
+        try std.testing.expectError(error.RowPolicyCatalogChanged, metadata.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
     }
     var reopened = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, backend.ptr(), &store, .local);
     defer reopened.deinit();
     try std.testing.expectEqual(@as(usize, 1), reopened.systemCatalogState().policy_publications.len);
     try std.testing.expectEqual(@as(u64, 11), reopened.systemCatalogState().policy_publications[0].required_owners[0].group_id);
-    try std.testing.expectError(error.RowPolicyUnsupported, reopened.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
-    try std.testing.expectError(error.RowPolicyUnsupported, reopened.statusSource().systemCatalog(alloc, .{}, .export_snapshot));
+    try std.testing.expectError(error.RowPolicyCatalogChanged, reopened.statusSource().systemCatalog(alloc, .{ .row_policy_install_authority = true }, .{ .policy_publication_status = 7 }));
+    try std.testing.expectError(error.RowPolicyPublicationInProgress, reopened.statusSource().systemCatalog(alloc, .{}, .export_snapshot));
 }
 
 fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
@@ -14213,7 +14213,7 @@ test "system catalog borrowed journal writes bounded deltas and recovers an ambi
     try std.testing.expect(metadata.system_catalog_state.?.index.find(.database, 0, "renamed") != null);
 
     const Failure = struct {
-        fn sync(_: *anyopaque, _: bool) !void {
+        pub fn sync(_: *anyopaque, _: bool) !void {
             return error.InjectedSyncFailure;
         }
     };
@@ -14299,7 +14299,8 @@ test "system catalog standalone imports main checkpoints and current logical see
                 } else try writeFileAtomically(alloc, runtime.ptr().io().?, path, input);
                 var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", ".", path, runtime.ptr(), store, engine);
                 defer metadata.deinit();
-                try std.testing.expectEqual(engine == .local, metadata.catalog_rows_initialized);
+                // Both storage engines eagerly import the checkpoint into native authority.
+                try std.testing.expect(metadata.catalog_rows_initialized);
                 const renamed = try metadata.statusSource().systemCatalog(alloc, .{}, .{ .mutate = .{ .mutation = if (from_main) .{ .action = .create, .kind = .database, .name = "warehouse" } else .{ .action = .rename, .kind = .database, .name = "analytics", .new_name = "warehouse" } } });
                 alloc.free(renamed);
                 try std.testing.expect(metadata.catalog_rows_initialized);

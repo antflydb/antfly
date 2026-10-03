@@ -8,7 +8,7 @@ const std = @import("std");
 /// compile filters, suite filters and runtime exclusions all affect ownership.
 pub fn add(b: *std.Build, aggregate: *std.Build.Step, baseline: ?*std.Build.Step, other_roots: []const *std.Build.Step) void {
     const audit = b.addSystemCommand(&.{"python3"});
-    audit.addFileArg(b.path("tools/audit_unit_test_ownership.py"));
+    audit.addFileArg2(b.path("tools/audit_unit_test_ownership.py"), .{ .make_absolute = true });
     const ownership_tests = b.addTest(.{
         .name = "unit-test-ownership-rule-tests",
         .root_module = b.createModule(.{
@@ -30,7 +30,7 @@ pub fn add(b: *std.Build, aggregate: *std.Build.Step, baseline: ?*std.Build.Step
         for (other_roots) |root| collect(b, root, audit, &visited, &count, "--baseline-inventory");
     }
     audit.addArg("--report");
-    const report = audit.addOutputFileArg("unit-test-inventory.json");
+    const report = audit.addOutputFileArg2("unit-test-inventory.json", .{ .make_absolute = true });
     const step = b.step("unit-test-inventory", "Audit unique ownership across all four CI unit gates");
     step.dependOn(&b.addInstallFile(report, "unit-test-inventory.json").step);
 }
@@ -44,7 +44,7 @@ pub fn testObject(artifact: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     return null;
 }
 
-fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, visited: *std.AutoHashMap(*std.Build.Step, void), count: *usize, inventory_arg: []const u8) void {
+pub fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, visited: *std.AutoHashMap(*std.Build.Step, void), count: *usize, inventory_arg: []const u8) void {
     if ((visited.getOrPut(step) catch @panic("OOM")).found_existing) return;
     if (step.cast(std.Build.Step.Run)) |run| blk: {
         for (run.argv.items) |arg| {
@@ -67,12 +67,13 @@ fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, vis
             const protocol_runner = object.test_runner == null or object.test_runner.?.mode != .simple;
             if (protocol_runner or inference_runner) {
                 list.addArg("python3");
-                list.addFileArg(b.path("tools/audit_unit_test_ownership.py"));
+                list.addFileArg2(b.path("tools/audit_unit_test_ownership.py"), .{ .make_absolute = true });
                 list.addArg(if (protocol_runner) "--protocol-executable" else "--inference-executable");
-                list.addArtifactArg(arg.artifact.artifact);
+                list.addArtifactArg2(arg.artifact.artifact, .{ .make_absolute = true });
                 if (inference_runner) {
                     list.addArg("--");
                     for (run.argv.items[1..]) |value| {
+                        if (value == .passthru) continue;
                         if (value != .bytes) @panic("unexpected inference test argument");
                         list.addArg(value.bytes);
                     }
@@ -84,6 +85,7 @@ fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, vis
                     .bytes => |bytes| list.addArg(bytes),
                     .artifact => |a| list.addPrefixedArtifactArg(a.prefix, a.artifact),
                     .lazy_path => |p| list.addPrefixedFileArg(p.prefix, p.lazy_path),
+                    .passthru => {},
                     else => @panic("unexpected unit test inventory argument"),
                 };
                 if (run.producer == null) {
@@ -98,7 +100,7 @@ fn collect(b: *std.Build, step: *std.Build.Step, audit: *std.Build.Step.Run, vis
             list.cwd = run.cwd;
             const selection = @import("unit_test_ownership.zig").selection(run, object);
             audit.addArgs(&.{ inventory_arg, b.fmt("{s} [{s}] #{d}", .{ path, selection, count.* }) });
-            audit.addFileArg(list.captureStdErr(.{}));
+            audit.addFileArg2(list.captureStdErr(.{}), .{ .make_absolute = true });
             count.* += 1;
             break;
         }

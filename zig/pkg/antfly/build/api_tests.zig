@@ -23,7 +23,7 @@ pub const AddTestsOptions = struct {
     api_http_runtime_test_mod: *std.Build.Module,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     openapi_root_check: *std.Build.Step.Run,
     antfly_imports: AntflyRootImports,
     antfly_test_mod: *std.Build.Module,

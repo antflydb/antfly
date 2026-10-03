@@ -224,7 +224,7 @@ test "derived backlog tracker accounts payload and sequence ownership" {
     const first_charge = Tracker.retainedCharge(8);
     const second_charge = Tracker.retainedCharge(15);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = first_charge,
         .hard_limit_bytes = first_charge + second_charge - 1,
     };
@@ -235,23 +235,23 @@ test "derived backlog tracker accounts payload and sequence ownership" {
     try tracker.track(std.testing.allocator, 1, 8);
     try tracker.track(std.testing.allocator, 2, 15);
     var stats = manager.snapshot();
-    try std.testing.expectEqual(first_charge + second_charge, stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes);
-    try std.testing.expectEqual(@as(u64, 1), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].soft_limit_events);
-    try std.testing.expectEqual(@as(u64, 1), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].hard_limit_rejections);
+    try std.testing.expectEqual(first_charge + second_charge, stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 1), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].soft_limit_events);
+    try std.testing.expectEqual(@as(u64, 1), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].hard_limit_rejections);
 
     tracker.releaseThrough(1);
     stats = manager.snapshot();
-    try std.testing.expectEqual(second_charge, stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes);
+    try std.testing.expectEqual(second_charge, stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].used_bytes);
 
     tracker.releaseThrough(2);
     stats = manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)].used_bytes);
 }
 
 test "derived backlog tracker reports throttle pressure" {
     const charge = Tracker.retainedCharge(11);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = charge - 1,
         .hard_limit_bytes = charge * 2,
     };
@@ -269,7 +269,7 @@ test "derived backlog tracker reports throttle pressure" {
 test "derived backlog admission transfers exact precommit capacity" {
     const admitted_charge = Tracker.retainedCharge(9);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = admitted_charge - 1,
         .hard_limit_bytes = admitted_charge + Tracker.retainedCharge(4) - 1,
     };
@@ -293,7 +293,7 @@ test "derived backlog admission transfers exact precommit capacity" {
 test "derived backlog admission bounds empty record cardinality" {
     const record_charge = Tracker.retainedCharge(0);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .hard_limit_bytes = record_charge,
     };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
@@ -312,7 +312,7 @@ test "derived backlog tracker fails closed when sequence accounting allocation f
     const first_charge = Tracker.retainedCharge(12);
     const second_charge = Tracker.retainedCharge(13);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = first_charge - 1,
         .hard_limit_bytes = first_charge + second_charge - 1,
     };
@@ -367,7 +367,7 @@ test "derived backlog tracker bounds sequence-only admission drain window" {
 
 test "derived backlog tracker reacts to aggregate lsm state pressure" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
         .soft_limit_bytes = 10,
         .hard_limit_bytes = 20,
     };

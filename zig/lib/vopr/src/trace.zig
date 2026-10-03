@@ -700,8 +700,8 @@ fn canonicalValueEqual(expected: anytype, actual: @TypeOf(expected)) bool {
     const T = @TypeOf(expected);
     return switch (@typeInfo(T)) {
         .@"struct" => |info| blk: {
-            inline for (info.fields) |field| {
-                if (!canonicalValueEqual(@field(expected, field.name), @field(actual, field.name))) break :blk false;
+            inline for (info.field_names) |reflected_name| {
+                if (!canonicalValueEqual(@field(expected, reflected_name), @field(actual, reflected_name))) break :blk false;
             }
             break :blk true;
         },

@@ -901,7 +901,7 @@ fn encoderLayer(
             .head_dim = head_dim,
             .relative_rows = config.max_position_embeddings,
             .dropout_probability = replay.probability,
-            .dropout_stream_id = (@as(u64, layer) << 32) | (@as(u64, @intFromEnum(DropoutKind.attention_probabilities)) + 1),
+            .dropout_stream_id = (@as(u64, layer) << 32) | (@as(u64, @backingInt(DropoutKind.attention_probabilities)) + 1),
         });
     } else if (use_fused_attention) blk: {
         // Single fused kernel over the [batch*seq, H] content projections and

@@ -264,7 +264,7 @@ the actual gate under the ledger's `gates` object:
 ```json
 {
   "sql-runtime": {
-    "command": ["zig", "build", "sql-test", "-Doptimize=ReleaseSafe"],
+    "command": ["zig", "build", "sql-test", "-Doptimize=safe"],
     "cwd": "zig",
     "timeout_seconds": 600
   }

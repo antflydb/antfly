@@ -280,7 +280,7 @@ test "relational columnar partial reuse bounds byte amplification and fragments"
 fn appendPage(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, end: usize, ref: ?payloads.Ref) !void {
     try appendInt(list, alloc, u16, @intCast(end));
     try appendInt(list, alloc, u64, if (ref) |r| r.bytes else 0);
-    try list.appendSlice(alloc, if (ref) |r| &r.digest else &([_]u8{0} ** 32));
+    try list.appendSlice(alloc, if (ref) |r| &r.digest else &(@as([32]u8, @splat(0))));
     try appendInt(list, alloc, u16, if (ref) |r| r.source_first else 0);
     try appendInt(list, alloc, u16, if (ref) |r| r.source_rows else 0);
 }
@@ -517,7 +517,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                             existing.source_rows = @intCast(row_end - row_first);
                             try references.append(scratch, .{ .digest = digest, .bytes = existing.bytes, .retains = 1 });
                         } else {
-                            writer.entries = .{ .items = local, .capacity = local.len };
+                            writer.entries = .{ .items = local, .capacity = local.len, .pointer_stability = .{} };
                             _ = self.db.relational_column_maintenance.payload_encoding_bytes.fetchAdd(raw_bytes, .monotonic);
                             const values = try writer.build();
                             const encoded = try checked(scratch, values);
@@ -872,7 +872,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             }
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.known_payloads.deinit(self.alloc);
             if (self.view) |*view| view.release();
             self.arena.deinit();
@@ -1100,7 +1100,7 @@ const Cleanup = struct {
     pages: usize = 0,
     inline_page: ?[]u8 = null,
 
-    fn deinit(self: @This(), alloc: alloc_type) void {
+    pub fn deinit(self: @This(), alloc: alloc_type) void {
         if (self.inline_page) |page| alloc.free(page);
     }
 
@@ -1536,7 +1536,7 @@ const Directory = struct {
         }
         return .{ .alloc = alloc, .cursor = cursor, .prefix = dir, .pending = if (entry) |kv| .{ .key = kv.key, .value = kv.value } else null };
     }
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.cursor.close();
         self.alloc.free(self.prefix);
     }
@@ -1561,7 +1561,7 @@ const DirtyRanges = struct {
     cursor: store_mod.DocStore.Txn.CursorAdapter,
     pending: ?[]const u8,
     pending_bytes: ?u64 = 0,
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.plans.deinit();
         self.cursor.close();
     }
@@ -2319,7 +2319,7 @@ const Block = struct {
     scan_options: ?types.ScanOptions = null,
     stop: ?*const std.atomic.Value(bool) = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         var it = self.decoded_payloads.valueIterator();
         while (it.next()) |payload| payload.*.release();
         self.decoded_payloads.deinit(self.alloc);
@@ -2339,7 +2339,7 @@ const Block = struct {
         bitmaps: []const u8 = &.{},
         cells: ?[]?codec.Cell = null,
         pages: ?ColumnPages = null,
-        loaded_pages: std.StaticBitSet(max_rows) = .initEmpty(),
+        loaded_pages: std.StaticBitSet(max_rows) = .empty,
         read_payload: bool = false,
         logical: ?[]?std.json.Value = null,
         json_views: ?[]?*JsonView = null,
@@ -2675,7 +2675,7 @@ const Block = struct {
         return logical;
     }
 
-    fn evaluate(self: *@This(), filter: scan_plan.Filter, candidates: []const bool, out: []bool) !void {
+    pub fn evaluate(self: *@This(), filter: scan_plan.Filter, candidates: []const bool, out: []bool) !void {
         try self.checkWork();
         @memset(out, false);
         if (std.mem.indexOfScalar(bool, candidates, true) == null) return;

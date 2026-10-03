@@ -989,7 +989,7 @@ def main() -> int:
             "max_merge_at_once": args.merge_max_at_once,
         },
         "build": {
-            "optimization": "ReleaseFast",
+            "optimization": "fast",
             "python": sys.version,
             "argv": sys.argv,
         },

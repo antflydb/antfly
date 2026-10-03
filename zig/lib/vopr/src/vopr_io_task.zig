@@ -1360,7 +1360,7 @@ test "task kernel parks future await and exposes each resume" {
     };
     const Shared = struct {
         kernel: *Kernel,
-        order: [4]u8 = [_]u8{0} ** 4,
+        order: [4]u8 = @as([4]u8, @splat(0)),
         len: usize = 0,
 
         fn push(self: *@This(), value: u8) void {

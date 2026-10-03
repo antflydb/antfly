@@ -943,7 +943,7 @@ test "relational index system restore receipts require local coverage through fa
     try std.testing.expectError(error.RestoreProjectionCorrupt, target.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
     try resetRestoreIndexCoverage(&target, false);
     var standby_gate: @import("../hot_standby/public_gate_state.zig").State = .{};
-    standby_gate.role.store(@intFromEnum(@import("../hot_standby/public_gate_state.zig").Role.standby), .release);
+    standby_gate.role.store(@backingInt(@import("../hot_standby/public_gate_state.zig").Role.standby), .release);
     var raft_index: u64 = 2;
     for ([_]staging.Phase{ .validated, .published }) |phase| {
         // Also exercise same-phase receipt retries: a durable validated or
@@ -1016,8 +1016,8 @@ test "relational index system restore receipts require local coverage through fa
 test "relational index system historical expression failures persist and recover after row correction" {
     const jobs = @import("relational_index_jobs.zig");
     const expressions = @import("../../schema/relational_expression_errors.zig");
-    inline for (@typeInfo(expressions.Error).error_set.?) |field| {
-        const err = @field(expressions.Error, field.name);
+    inline for (@typeInfo(expressions.Error).error_set.error_names.?) |field| {
+        const err = @field(expressions.Error, field);
         try std.testing.expectEqual(if (expressions.isInvalidInput(err)) @as(?jobs.Failure, .invalid_row) else null, jobs.classifyRowFailure(err));
     }
     try std.testing.expectEqual(null, jobs.classifyRowFailure(error.OutOfMemory));

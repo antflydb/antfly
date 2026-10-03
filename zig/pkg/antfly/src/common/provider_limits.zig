@@ -75,7 +75,7 @@ pub const Policy = struct {
         return policy;
     }
 
-    fn validate(self: Policy) !void {
+    pub fn validate(self: Policy) !void {
         if (self.burst == 0) return error.InvalidRateLimitPolicy;
         if (self.pacing == .completion and (self.requests_per_minute == 0 or self.burst != 1))
             return error.InvalidRateLimitPolicy;

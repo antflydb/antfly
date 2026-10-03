@@ -278,7 +278,7 @@ pub const ReaderPinKind = enum(u8) {
     other,
 };
 
-pub const reader_pin_kind_count = @typeInfo(ReaderPinKind).@"enum".fields.len;
+pub const reader_pin_kind_count = @typeInfo(ReaderPinKind).@"enum".field_names.len;
 
 pub fn readerPinKindName(kind: ReaderPinKind) []const u8 {
     return switch (kind) {
@@ -293,7 +293,7 @@ pub fn readerPinKindName(kind: ReaderPinKind) []const u8 {
 }
 
 fn readerPinKindIndex(kind: ReaderPinKind) usize {
-    return @intFromEnum(kind);
+    return @backingInt(kind);
 }
 
 pub const MutableSnapshotCloneReasonStats = background_runtime_mod.LsmMutableSnapshotCloneReasonStats;
@@ -323,11 +323,11 @@ pub fn mutableSnapshotReasonName(reason: MutableSnapshotReason) []const u8 {
 }
 
 fn mutableSnapshotReasonIndex(reason: MutableSnapshotReason) usize {
-    return @intFromEnum(reason);
+    return @backingInt(reason);
 }
 
 fn activeReaderKindStats(active_readers_by_kind: [reader_pin_kind_count]usize) [reader_pin_kind_count]u64 {
-    var stats: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count;
+    var stats: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0));
     for (active_readers_by_kind, 0..) |active, i| stats[i] = @intCast(active);
     return stats;
 }
@@ -710,7 +710,7 @@ pub const Backend = struct {
     };
 
     pub fn accumulateOpenStats(dst: *OpenStats, src: OpenStats) void {
-        if (@intFromEnum(src.phase) > @intFromEnum(dst.phase)) dst.phase = src.phase;
+        if (@backingInt(src.phase) > @backingInt(dst.phase)) dst.phase = src.phase;
         dst.started +|= src.started;
         dst.completed +|= src.completed;
         dst.failed +|= src.failed;
@@ -862,7 +862,7 @@ pub const Backend = struct {
         mutable_snapshot_clone_calls: u64 = 0,
         mutable_snapshot_clone_bytes_total: u64 = 0,
         mutable_snapshot_clone_peak_bytes: u64 = 0,
-        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+        mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = @as([mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats, @splat(.{})),
         bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
         bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
         bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
@@ -920,8 +920,8 @@ pub const Backend = struct {
         memtable_reclaim_units: u64 = 0,
         memtable_reclaim_max_slice_ns: u64 = 0,
         active_readers: u64 = 0,
-        active_readers_by_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
-        obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = [_]u64{0} ** reader_pin_kind_count,
+        active_readers_by_kind: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0)),
+        obsolete_paths_pinned_by_reader_kind: [reader_pin_kind_count]u64 = @as([reader_pin_kind_count]u64, @splat(0)),
         active_bulk_ingest_batches: u64 = 0,
         wal_retained_segments: u64 = 0,
         wal_retained_bytes: u64 = 0,
@@ -1079,7 +1079,7 @@ pub const Backend = struct {
             (!dst_wal_checkpoint_pending or
                 src.wal_checkpoint_retry_delay_ns < dst.wal_checkpoint_retry_delay_ns or
                 (src.wal_checkpoint_retry_delay_ns == dst.wal_checkpoint_retry_delay_ns and
-                    (@intFromEnum(src.wal_checkpoint_retry_reason) > @intFromEnum(dst.wal_checkpoint_retry_reason) or
+                    (@backingInt(src.wal_checkpoint_retry_reason) > @backingInt(dst.wal_checkpoint_retry_reason) or
                         (src.wal_checkpoint_retry_reason == dst.wal_checkpoint_retry_reason and
                             src.wal_checkpoint_retry_attempts > dst.wal_checkpoint_retry_attempts))));
         if (src_retry_precedes) {
@@ -1122,16 +1122,16 @@ pub const Backend = struct {
     }
 
     pub fn accumulateWriteStats(dst: *WriteStats, src: WriteStats) void {
-        inline for (@typeInfo(WriteStats).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, "table_file_compression_codec_mask")) {
-                @field(dst, field.name) |= @field(src, field.name);
-            } else if (comptime std.mem.eql(u8, field.name, "compaction_max_input_bytes") or
-                std.mem.eql(u8, field.name, "compaction_max_output_bytes") or
-                std.mem.eql(u8, field.name, "compaction_max_ns"))
+        inline for (comptime std.meta.fieldNames(WriteStats)) |reflected_name| {
+            if (comptime std.mem.eql(u8, reflected_name, "table_file_compression_codec_mask")) {
+                @field(dst, reflected_name) |= @field(src, reflected_name);
+            } else if (comptime std.mem.eql(u8, reflected_name, "compaction_max_input_bytes") or
+                std.mem.eql(u8, reflected_name, "compaction_max_output_bytes") or
+                std.mem.eql(u8, reflected_name, "compaction_max_ns"))
             {
-                @field(dst, field.name) = @max(@field(dst, field.name), @field(src, field.name));
+                @field(dst, reflected_name) = @max(@field(dst, reflected_name), @field(src, reflected_name));
             } else {
-                @field(dst, field.name) +|= @field(src, field.name);
+                @field(dst, reflected_name) +|= @field(src, reflected_name);
             }
         }
     }
@@ -1603,7 +1603,7 @@ pub const Backend = struct {
     current_manifest_bytes: u64 = 0,
     next_run_id: u64 = 1,
     active_readers: usize = 0,
-    active_readers_by_kind: [reader_pin_kind_count]usize = [_]usize{0} ** reader_pin_kind_count,
+    active_readers_by_kind: [reader_pin_kind_count]usize = @as([reader_pin_kind_count]usize, @splat(0)),
     manifest_dirty: bool = false,
     obsolete_paths: repository_mod.ObsoleteLedger = .empty,
     active_ledger_reclamations: ?*@import("lsm_backend/ledger_reclamation.zig").Job = null,
@@ -1699,7 +1699,7 @@ pub const Backend = struct {
     mutable_snapshot_clone_calls: u64 = 0,
     mutable_snapshot_clone_bytes_total: u64 = 0,
     mutable_snapshot_clone_peak_bytes: u64 = 0,
-    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = [_]MutableSnapshotCloneReasonStats{.{}} ** mutable_snapshot_reason_count,
+    mutable_snapshot_clone_by_reason: [mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats = @as([mutable_snapshot_reason_count]MutableSnapshotCloneReasonStats, @splat(.{})),
     bulk_ingest_current_scan_clone_active_bytes: u64 = 0,
     bulk_ingest_current_scan_clone_peak_active_bytes: u64 = 0,
     bulk_ingest_current_scan_clone_budget_denials: u64 = 0,
@@ -6477,7 +6477,7 @@ pub const Backend = struct {
                 if (self.read_version != version) return error.CompactionPlanningStale;
                 if (self.options.resource_manager) |manager| reservation = try manager.reserve(.lsm_in_memory_state, compaction_mod.DomainIndex.buildMemoryBound(version.runs.len));
                 self.retainReaderKind(.compaction);
-                var snapshot = .{ .allocator = self.allocator, .options = self.options, .planning_directory = version.directory, .runs = std.ArrayListUnmanaged(Run){ .items = version.runs, .capacity = 0 } };
+                var snapshot = .{ .allocator = self.allocator, .options = self.options, .planning_directory = version.directory, .runs = std.ArrayListUnmanaged(Run){ .items = version.runs, .capacity = 0, .pointer_stability = .{} } };
                 runtime_mod.unlockBackend(Backend, self, true);
                 const built = compaction_mod.DomainIndex.create(&snapshot);
                 _ = runtime_mod.lockBackend(Backend, self);
@@ -7385,7 +7385,7 @@ pub const Backend = struct {
                     self.wal_checkpoint_retry_deadline_ns,
                     candidate_deadline_ns,
                 );
-                if (@intFromEnum(reason) > @intFromEnum(self.wal_checkpoint_retry_reason)) {
+                if (@backingInt(reason) > @backingInt(self.wal_checkpoint_retry_reason)) {
                     self.wal_checkpoint_retry_reason = reason;
                 }
             }
@@ -10109,7 +10109,7 @@ fn implementationTests() type {
             try std.testing.expect(one_memtable_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = one_memtable_bytes + one_memtable_bytes / 2,
                 .hard_limit_bytes = one_memtable_bytes * 3,
             };
@@ -10160,7 +10160,7 @@ fn implementationTests() type {
             try std.testing.expect(one_memtable_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = one_memtable_bytes * 10,
             };
@@ -10205,7 +10205,7 @@ fn implementationTests() type {
             try std.testing.expect(one_memtable_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = one_memtable_bytes * 10,
             };
@@ -10245,7 +10245,7 @@ fn implementationTests() type {
 
         test "lsm backend direct bulk admission rejects before wal append" {
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = 1,
             };
@@ -10283,7 +10283,7 @@ fn implementationTests() type {
             try std.testing.expect(incoming_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = incoming_bytes + incoming_bytes / 2,
                 .hard_limit_bytes = incoming_bytes * 4,
             };
@@ -10319,7 +10319,7 @@ fn implementationTests() type {
             try std.testing.expect(incoming_bytes > 0);
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = incoming_bytes,
                 .hard_limit_bytes = incoming_bytes + incoming_bytes / 2,
             };
@@ -10347,7 +10347,7 @@ fn implementationTests() type {
         }
 
         test "lsm backend resource manager reclaims local durable state before rejecting" {
-            const payload = [_]u8{'a'} ** (16 * 1024);
+            const payload = @as([(16 * 1024)]u8, @splat('a'));
             var sample: ActiveMemTable = .{ .ordered_enabled = false };
             defer sample.deinit(std.testing.allocator);
             try sample.upsert(std.testing.allocator, .{}, "key:a", &payload, false);
@@ -10355,12 +10355,12 @@ fn implementationTests() type {
             const admission_bytes = one_memtable_bytes * 16;
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{
                 .soft_limit_bytes = admission_bytes,
                 .hard_limit_bytes = admission_bytes + one_memtable_bytes / 2,
             };
             var policies = resource_manager_mod.Options.defaultPolicies();
-            policies[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].hard_action = .reject_work;
+            policies[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)].hard_action = .reject_work;
             var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets, .policies = policies });
             var storage = storage_io.MemoryStorage.init(std.testing.allocator);
             defer storage.deinit();
@@ -10381,7 +10381,7 @@ fn implementationTests() type {
             }
             // The current payload fills the slice. Reclaiming this durable immutable
             // leaves enough space for run metadata and the next small transaction.
-            manager.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)].budget.hard_limit_bytes = manager.sliceStats(.lsm_in_memory_state).used_bytes;
+            manager.slices[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)].budget.hard_limit_bytes = manager.sliceStats(.lsm_in_memory_state).used_bytes;
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{}, "key:b", "b");
@@ -12640,7 +12640,7 @@ fn implementationTests() type {
                     var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
                     var pad_key_buf: [32]u8 = undefined;
                     const pad_key = try std.fmt.bufPrint(&pad_key_buf, "pad:{d}", .{generation});
-                    const padding = [_]u8{'p'} ** 256;
+                    const padding = @as([256]u8, @splat('p'));
                     try txn.put(.{ .name = "docs" }, pad_key, &padding);
                     switch (generation) {
                         1 => {
@@ -12766,7 +12766,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             var txn = try backend.beginWrite();
             try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
             try txn.commit();
@@ -12781,7 +12781,7 @@ fn implementationTests() type {
             var mutable: ActiveMemTable = .{};
             defer mutable.deinit(std.testing.allocator);
 
-            const value = [_]u8{'x'} ** (256 * 1024);
+            const value = @as([(256 * 1024)]u8, @splat('x'));
             for (0..8) |i| {
                 // Unpinned replacements reclaim the superseded allocation immediately.
                 const value_len: usize = if (i % 2 == 0) 64 * 1024 else value.len;
@@ -12810,7 +12810,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -12852,7 +12852,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value_a = [_]u8{'a'} ** 300;
+            const value_a = @as([300]u8, @splat('a'));
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{ .name = "docs" }, "doc:a", value_a[0..]);
@@ -12872,7 +12872,7 @@ fn implementationTests() type {
             try std.testing.expectEqual(retired_bytes, retired_stats.retired_immutable_bytes);
             try std.testing.expectEqual(@as(u64, 1), retired_stats.immutable_pinned_generations);
 
-            const value_b = [_]u8{'b'} ** 300;
+            const value_b = @as([300]u8, @splat('b'));
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{ .name = "docs" }, "doc:b", value_b[0..]);
@@ -12994,8 +12994,8 @@ fn implementationTests() type {
 
             var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
             defer runtime.deinit();
-            const value_a = [_]u8{'a'} ** 4096;
-            const value_b = [_]u8{'b'} ** 4096;
+            const value_a = @as([4096]u8, @splat('a'));
+            const value_b = @as([4096]u8, @splat('b'));
             {
                 var write = try runtime.beginWrite();
                 try write.put("doc:a", &value_a);
@@ -13330,7 +13330,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             {
                 var txn = try backend.beginWrite();
                 try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -13364,7 +13364,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             {
                 var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
                 try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
@@ -13397,7 +13397,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 300;
+            const value = @as([300]u8, @splat('x'));
             var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
             try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
             try txn.commit();
@@ -13416,7 +13416,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 100;
+            const value = @as([100]u8, @splat('x'));
             var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
             try txn.put(.{ .name = "docs" }, "doc:a", value[0..]);
             try txn.commit();
@@ -13555,7 +13555,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             for (0..10) |i| {
                 var key_buf: [16]u8 = undefined;
                 const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
@@ -13592,7 +13592,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             for (0..10) |i| {
                 var key_buf: [16]u8 = undefined;
                 const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
@@ -14147,7 +14147,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             var i: usize = 0;
             while (i < 3) : (i += 1) {
                 var key_buf: [16]u8 = undefined;
@@ -14227,7 +14227,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             var i: usize = 0;
             while (i < 3) : (i += 1) {
                 var key_buf: [16]u8 = undefined;
@@ -14268,7 +14268,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             var i: usize = 0;
             while (i < 3) : (i += 1) {
                 var key_buf: [16]u8 = undefined;
@@ -14304,7 +14304,7 @@ fn implementationTests() type {
             });
             defer backend.close();
 
-            const value = [_]u8{'x'} ** 64;
+            const value = @as([64]u8, @splat('x'));
             var i: usize = 0;
             while (i < 3) : (i += 1) {
                 var key_buf: [16]u8 = undefined;
@@ -14325,7 +14325,7 @@ fn implementationTests() type {
 
         test "lsm backend compaction scheduler reserves resource-manager work budget" {
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = 1,
             };
@@ -16702,7 +16702,7 @@ fn implementationTests() type {
 
             var key_storage: [count][64]u8 = undefined;
             var keys: [count][]const u8 = undefined;
-            var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+            var values: [count]?[]const u8 = @as([count]?[]const u8, @splat(null));
             for (&keys, 0..) |*key, i| {
                 key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
             }
@@ -17389,7 +17389,7 @@ fn implementationTests() type {
             defer runtime.deinit();
 
             const lane: u8 = 7;
-            const payload = "x" ** 1024;
+            const payload = z17RepeatString("x", 1024);
             {
                 var write = try runtime.beginWrite();
                 for (1..97) |sequence| {
@@ -18007,7 +18007,7 @@ fn implementationTests() type {
 
             var selected_keys: [selected_count][]const u8 = undefined;
             for (&selected_keys, 0..) |*key, i| key.* = keys[i * stride];
-            var values: [selected_count]?[]const u8 = [_]?[]const u8{null} ** selected_count;
+            var values: [selected_count]?[]const u8 = @as([selected_count]?[]const u8, @splat(null));
 
             var read = try backend.beginRead();
             defer read.abort();
@@ -18063,7 +18063,7 @@ fn implementationTests() type {
             var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
             defer runtime.deinit();
 
-            var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+            var values: [count]?[]const u8 = @as([count]?[]const u8, @splat(null));
             var probe = try runtime.beginProbe();
             defer probe.abort();
             try probe.getManySortedWithBlockCacheAdmission(&key_views, &values, .transient);
@@ -21454,7 +21454,7 @@ fn implementationTests() type {
                 defer runtime.deinit();
                 var txn = try runtime.beginRead();
                 defer txn.abort();
-                try std.testing.expectEqualStrings(&([_]u8{'v'} ** 48), try txn.get("doc:079"));
+                try std.testing.expectEqualStrings(&(@as([48]u8, @splat('v'))), try txn.get("doc:079"));
                 try std.testing.expectError(error.NotFound, txn.get("doc:000"));
             }
 
@@ -21467,7 +21467,7 @@ fn implementationTests() type {
             defer runtime.deinit();
             var txn = try runtime.beginRead();
             defer txn.abort();
-            try std.testing.expectEqualStrings(&([_]u8{'v'} ** 48), try txn.get("doc:000"));
+            try std.testing.expectEqualStrings(&(@as([48]u8, @splat('v'))), try txn.get("doc:000"));
             try std.testing.expectError(error.NotFound, txn.get("doc:079"));
         }
 
@@ -21820,7 +21820,7 @@ fn implementationTests() type {
         }
 
         test "lsm overlap scoring aggregate scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const time = @import("antfly_platform").time;
             for ([_]usize{ 1000, 10000, 100000 }) |count| {
                 var backend = Backend.init(std.heap.smp_allocator, .{ .l0_hard_limit_runs = 16 });
@@ -21956,7 +21956,7 @@ fn implementationTests() type {
         }
 
         test "lsm dependency continuation slice scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const Validation = @import("lsm_backend/dependency_validation.zig").Validation;
             const time = @import("antfly_platform").time;
             const allocator = std.heap.smp_allocator;
@@ -22362,7 +22362,7 @@ fn implementationTests() type {
                 .defer_flush_on_commit = true,
             });
             defer backend.close();
-            const payload = [_]u8{'x'} ** 1024;
+            const payload = @as([1024]u8, @splat('x'));
             {
                 var write = try backend.beginWrite();
                 errdefer write.abort();
@@ -22408,7 +22408,7 @@ fn implementationTests() type {
                     .cache = if (cached) &cache else null,
                 });
                 defer backend.close();
-                const payload = [_]u8{'x'} ** (1024 * 1024);
+                const payload = @as([(1024 * 1024)]u8, @splat('x'));
                 {
                     var write = try backend.beginWrite();
                     errdefer write.abort();
@@ -22457,7 +22457,7 @@ fn implementationTests() type {
             const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
             var backend = try Backend.open(alloc, path, .{ .flush_threshold = 1 });
             defer backend.close();
-            const payload = [_]u8{'v'} ** 8192;
+            const payload = @as([8192]u8, @splat('v'));
             {
                 var write = try backend.beginWrite();
                 errdefer write.abort();
@@ -22575,7 +22575,7 @@ fn implementationTests() type {
             defer backend.close();
             var runtime = try backend.runtimeStore(alloc, .{ .name = "graph" });
             defer runtime.deinit();
-            const payload = [_]u8{'x'} ** (64 * 1024);
+            const payload = @as([(64 * 1024)]u8, @splat('x'));
             {
                 var write = try runtime.beginWrite();
                 errdefer write.abort();
@@ -23327,7 +23327,7 @@ fn implementationTests() type {
             defer runtime_mod.unlockBackend(Backend, &backend, locked);
             _ = try backend.planningDirectory();
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1 };
+            budgets[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)] = .{ .hard_limit_bytes = 1 };
             var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
             backend.options.resource_manager = &manager;
             defer backend.options.resource_manager = null;
@@ -23432,7 +23432,7 @@ fn implementationTests() type {
         test "lsm planning metadata is admitted before allocation" {
             for ([_]usize{ 16, 128 }) |run_count| {
                 var budgets = resource_manager_mod.Options.defaultBudgets();
-                budgets[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)] = .{ .hard_limit_bytes = 1 };
+                budgets[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)] = .{ .hard_limit_bytes = 1 };
                 var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
                 var backend = Backend.init(std.testing.allocator, .{});
                 defer backend.close();
@@ -23573,7 +23573,7 @@ fn implementationTests() type {
                 var storage = storage_io.MemoryStorage.init(alloc);
                 defer storage.deinit();
                 var budgets = resource_manager_mod.Options.defaultBudgets();
-                budgets[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 1024 };
+                budgets[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)] = .{ .soft_limit_bytes = 1024, .hard_limit_bytes = 1024 };
                 var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
                 defer manager.deinit(alloc);
                 var backend = try Backend.open(alloc, "/bulk-admission-scheduler", .{ .storage = storage.storage(), .resource_manager = &manager, .flush_threshold = 1, .direct_bulk_ingest_min_bytes = 1, .bulk_ingest_tiered_l0_fan_in = 4, .compact_threshold_runs = 4, .l0_soft_limit_runs = 4, .l0_hard_limit_runs = 128, .compaction_scheduler = .{ .max_in_flight_input_bytes = if (memory_denial) 1024 * 1024 else 1, .allow_oversized_single_job = false, .resource_reservation_bytes = if (memory_denial) 2048 else 0 } });
@@ -23612,7 +23612,7 @@ fn implementationTests() type {
         }
 
         test "lsm bulk admission prepared work scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const alloc = std.heap.smp_allocator;
             for ([_]usize{ 1000, 10000, 50000 }) |count| {
                 const keys = try alloc.alloc(u8, count * 8);
@@ -23776,7 +23776,7 @@ fn implementationTests() type {
         }
 
         test "lsm maintenance score aggregate scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const alloc = std.heap.smp_allocator;
             for ([_]usize{ 1000, 10000, 50000 }) |count| {
                 const keys = try alloc.alloc(u8, count * 8);
@@ -24290,7 +24290,7 @@ fn implementationTests() type {
         }
 
         test "lsm persistent directory and lazy cursor scaling benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const Fixture = struct {
                 allocator: Allocator = std.heap.smp_allocator,
                 retained: usize = 0,
@@ -24327,7 +24327,7 @@ fn implementationTests() type {
                         return self.planning_directory.?;
                     }
                 };
-                var planner = Planner{ .allocator = alloc, .runs = .{ .items = runs, .capacity = 0 } };
+                var planner = Planner{ .allocator = alloc, .runs = .{ .items = runs, .capacity = 0, .pointer_stability = .{} } };
                 var planning_ns: [2][3]u64 = undefined;
                 for (0..3) |sample| for (0..2) |turn| {
                     const mode = (sample + turn) % 2;
@@ -24460,7 +24460,7 @@ fn implementationTests() type {
         }
 
         test "lsm native durability lane contention benchmark" {
-            if (builtin.mode != .ReleaseFast or builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+            if (builtin.mode != .fast or builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
             const alloc = std.heap.smp_allocator;
             var io_impl = std.Io.Threaded.init(alloc, .{ .async_limit = .limited(8) });
             defer io_impl.deinit();
@@ -24569,7 +24569,7 @@ fn implementationTests() type {
         }
 
         test "lsm incremental manifest publication benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);
             defer storage.deinit();
@@ -24600,7 +24600,7 @@ fn implementationTests() type {
         }
 
         test "lsm shared scan epoch setup benchmark" {
-            if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+            if (builtin.mode != .fast) return error.SkipZigTest;
             const alloc = std.testing.allocator;
             var storage = storage_io.MemoryStorage.init(alloc);
             defer storage.deinit();
@@ -25041,7 +25041,7 @@ test "lsm backend source vector payloads write batches pipeline reads with overl
 
     var key_storage: [count][64]u8 = undefined;
     var keys: [count][]const u8 = undefined;
-    var values: [count]?[]const u8 = [_]?[]const u8{null} ** count;
+    var values: [count]?[]const u8 = @as([count]?[]const u8, @splat(null));
     for (&keys, 0..) |*key, i| {
         key.* = try std.fmt.bufPrint(&key_storage[i], "artifact:{d:0>8}:dense", .{i});
     }
@@ -25080,4 +25080,15 @@ test "lsm backend source vector payloads write batches pipeline reads with overl
     try std.testing.expectEqualSlices(u8, large_value, values[0].?);
     try std.testing.expectEqualStrings("committed", values[12].?);
     try std.testing.expectEqualStrings("overlay", values[13].?);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

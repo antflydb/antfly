@@ -428,7 +428,7 @@ test "SQL window wide moving frames retain bounded indexed aggregate state" {
     std.debug.print("SQL window frames: rows={d} frame_width=8193 peak_bytes={d} elapsed_ns={d}\n", .{ count, budget.peak, std.Io.Clock.awake.now(std.testing.io).nanoseconds - started });
 }
 
-fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: binding.Sort, spec: binding.Spec, column: usize, peers_start: []const usize, peers_end: []const usize, groups: []const usize) !void {
+pub fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: binding.Sort, spec: binding.Spec, column: usize, peers_start: []const usize, peers_end: []const usize, groups: []const usize) !void {
     const aggregate = switch (spec.kind) {
         .count, .sum, .avg, .min, .max, .bool_and, .bool_or => true,
         else => false,

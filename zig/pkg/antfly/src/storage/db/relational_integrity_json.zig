@@ -19,10 +19,10 @@ pub fn write(value: anytype, stream: anytype) @TypeOf(stream.*).Error!void {
         .@"struct" => |info| {
             if (@hasDecl(T, "nativeJsonProjection")) return write(value.nativeJsonProjection(), stream);
             try stream.beginObject();
-            inline for (info.fields) |field| {
-                if (!@hasDecl(T, "nativeJsonSkipField") or !value.nativeJsonSkipField(field.name)) {
-                    try stream.objectField(field.name);
-                    try write(@field(value, field.name), stream);
+            inline for (info.field_names) |reflected_name| {
+                if (!@hasDecl(T, "nativeJsonSkipField") or !value.nativeJsonSkipField(reflected_name)) {
+                    try stream.objectField(reflected_name);
+                    try write(@field(value, reflected_name), stream);
                 }
             }
             try stream.endObject();

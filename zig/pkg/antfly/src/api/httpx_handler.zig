@@ -120,7 +120,7 @@ const ParsedGlobalQueryTable = struct {
     parsed: std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest),
     table_name: []const u8,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.parsed.deinit();
     }
 };
@@ -206,7 +206,7 @@ const DecodedRequestBody = struct {
     body: []u8,
     allocation: []u8,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.allocation);
         self.* = undefined;
     }
@@ -641,7 +641,7 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
             if (!self.json_request) try std.testing.expect(std.mem.indexOf(u8, self.bytes.items, "event: hit\n") != null);
             try std.testing.expectEqual(@as(i64, 128), chain[0].generator.max_tokens);
             if (self.fail_generation) return error.TestGenerationFailure;
-            return .{ .allocator = alloc, .content = try alloc.dupe(u8, ("x" ** 79) ++ "한국어 answer") };
+            return .{ .allocator = alloc, .content = try alloc.dupe(u8, (z17RepeatString("x", 79)) ++ "한국어 answer") };
         }
     };
     const alloc = std.testing.allocator;
@@ -2076,11 +2076,11 @@ pub const AntflyApiHandler = struct {
         return storageMaintenanceJobResponse(ctx, if (cancel) 202 else 200, snapshot);
     }
 
-    fn getStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+    pub fn getStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.readStorageMaintenanceJob(ctx, false);
     }
 
-    fn cancelStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+    pub fn cancelStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.readStorageMaintenanceJob(ctx, true);
     }
 
@@ -2691,7 +2691,7 @@ pub const AntflyApiHandler = struct {
         group_id: u64,
         table_name: []u8,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
         }
     };
@@ -2836,7 +2836,7 @@ pub const AntflyApiHandler = struct {
         key: []u8,
         artifact_name: []u8,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             alloc.free(self.key);
             alloc.free(self.artifact_name);
@@ -4695,7 +4695,7 @@ pub const AntflyApiHandler = struct {
         fn port(self: *@This()) transactions_api.SessionRegistry.StageValidator {
             return .{ .ptr = self, .validate = validate };
         }
-        fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, previous: ?*const transactions_api.OwnedTransactionCommitRequest, candidate: *transactions_api.OwnedTransactionCommitRequest, statement: *const transactions_api.OwnedTransactionCommitRequest) !void {
+        pub fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, previous: ?*const transactions_api.OwnedTransactionCommitRequest, candidate: *transactions_api.OwnedTransactionCommitRequest, statement: *const transactions_api.OwnedTransactionCommitRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try @import("relational_session_statement.zig").validate(self.server, alloc, previous, candidate, statement, self.context);
         }
@@ -6506,7 +6506,7 @@ pub const AntflyApiHandler = struct {
         logical: ?[]u8 = null,
         table_id: ?u64 = null,
 
-        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
             alloc.free(self.physical);
             if (self.logical) |logical| alloc.free(logical);
         }
@@ -9403,7 +9403,7 @@ const HttpxE2eServer = struct {
         self.thread = try std.testing.io.concurrent(listenHttpxE2eServer, .{&self.server});
     }
 
-    fn deinit(self: *HttpxE2eServer) void {
+    pub fn deinit(self: *HttpxE2eServer) void {
         if (self.thread) |*thread| {
             self.server.stop();
             thread.await(std.testing.io);
@@ -9820,7 +9820,7 @@ pub const SchemaUpdateStatusSource = struct {
 
     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-    fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+    pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqualStrings("docs", table_name);
         try self.replaceSchemaJson(alloc, schema_json);
@@ -9890,7 +9890,7 @@ const SchemaReconcileWriteSource = struct {
         return {};
     }
 
-    fn updateSchema(
+    pub fn updateSchema(
         ptr: *anyopaque,
         _: std.mem.Allocator,
         _: []const u8,
@@ -10058,7 +10058,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
         .{ .name = "group_id", .value = "7" },
         .{ .name = "table_name", .value = "docs" },
     };
-    const txn_id = [_]u8{0x42} ** 16;
+    const txn_id = @as([16]u8, @splat(0x42));
 
     const begin_body = try distributed_txn.encodeTxnBeginRequest(std.testing.allocator, .{
         .txn_id = txn_id,
@@ -10344,7 +10344,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             return error.TestUnexpectedResult;
         }
 
-        fn commitTransaction(
+        pub fn commitTransaction(
             ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const distributed_txn.TableCommitRequest,
@@ -12054,7 +12054,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
 
     const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
     const client_io = std.Io.Threaded.global_single_threaded.io();
-    var clients = [_]?httpx.Socket{null} ** 128;
+    var clients = @as([128]?httpx.Socket, @splat(null));
     defer for (&clients) |*slot| {
         if (slot.*) |*client| client.close();
         slot.* = null;
@@ -12144,12 +12144,16 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     for (&clients) |*slot| {
         if (slot.*) |*client| {
             var linger = std.posix.linger{ .onoff = 1, .linger = 0 };
-            std.posix.setsockopt(
+            // This is best-effort test cleanup: the peer may have already
+            // invalidated the socket, and Zig 0.17 treats EINVAL as
+            // unreachable in the checked wrapper.
+            _ = std.posix.system.setsockopt(
                 client.handle,
                 std.posix.SOL.SOCKET,
                 std.posix.SO.LINGER,
-                std.mem.asBytes(&linger),
-            ) catch {};
+                std.mem.asBytes(&linger).ptr,
+                @sizeOf(std.posix.linger),
+            );
             client.close();
         }
         slot.* = null;
@@ -12715,7 +12719,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         const Reply = struct {
             status: u16,
             body: []u8,
-            fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
                 allocator.free(self.body);
             }
         };
@@ -13809,7 +13813,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = wire_output.written() };
         const expected_ids = [_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" };
         var row_index: usize = 0;
-        var prepared_seen = [_]bool{false} ** 3;
+        var prepared_seen = @as([3]bool, @splat(false));
         var fetched_one = false;
         var fetched_eight = false;
         while (frames.offset < frames.bytes.len) {
@@ -14023,7 +14027,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (opts.relational_integrity_catalog) return .{ .json = try a.dupe(u8, self.envelope), .version = 0 };
             if (opts.relational_activation_json.len != 0) {
-                const coverage = .{ .schema_version = @as(u32, 1), .schema_digest = self.digest, .generation_set = self.generation_set, .owner = [_]u8{1} ** 32, .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = true, .state = activation.State.enforced, .phase = activation.Phase.unique, .rows_scanned = @as(u64, 0), .failure = @as([]const u8, "") };
+                const coverage = .{ .schema_version = @as(u32, 1), .schema_digest = self.digest, .generation_set = self.generation_set, .owner = @as([32]u8, @splat(1)), .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = true, .state = activation.State.enforced, .phase = activation.Phase.unique, .rows_scanned = @as(u64, 0), .failure = @as([]const u8, "") };
                 return .{ .json = try std.json.Stringify.valueAlloc(a, coverage, .{}), .version = 0 };
             }
             if (opts.relational_integrity_jobs_json.len != 0) {
@@ -14949,7 +14953,7 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
         admissions: std.atomic.Value(u32) = .init(0),
         creates: std.atomic.Value(u32) = .init(0),
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.key) |value| self.alloc.free(value);
             if (self.row) |value| self.alloc.free(value);
             if (self.plan) |value| self.alloc.free(value);
@@ -15335,4 +15339,15 @@ test "httpx antfly cluster restore preserves backup location validation" {
         "{\"error\":\"unsupported backup location\"}",
         resp.body.?,
     );
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

@@ -851,7 +851,7 @@ const Builder = struct {
         }
     }
 
-    fn deinit(self: *Builder) void {
+    pub fn deinit(self: *Builder) void {
         if (self.read_view) |view| view.deinit();
         for (self.loaded.items) |table| {
             if (table.plan) |*plan| plan.deinit();
@@ -2052,7 +2052,7 @@ test "distributed txn global unique coverage checks every owner and rejects stal
                 .schema_version = @as(u32, if (self.stale) 2 else 1),
                 .schema_digest = self.digest,
                 .generation_set = self.generation_set,
-                .owner = [_]u8{1} ** 32,
+                .owner = @as([32]u8, @splat(1)),
                 .range_start = @as([]const u8, if (first) "" else "m"),
                 .range_end = @as([]const u8, if (first) "m" else ""),
                 .unique_covered = first or self.ready,

@@ -31,7 +31,7 @@ const Device = struct {
         backend.* = try metal.MetalCompute.init(a, store, null);
         return .{ .allocator = a, .store = store, .backend = backend };
     }
-    fn deinit(self: *Device) void {
+    pub fn deinit(self: *Device) void {
         self.backend.deinit();
         self.allocator.destroy(self.backend);
         metal.deinitSharedNativeProvider(self.store);

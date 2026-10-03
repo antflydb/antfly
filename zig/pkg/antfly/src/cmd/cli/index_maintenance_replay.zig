@@ -98,7 +98,7 @@ pub const Plan = struct {
 
 test "maintenance recovery validates the entire immutable selection before replay" {
     const alloc = std.testing.allocator;
-    const request: types.IndexMaintenanceRequest = .{ .table_id = "7", .schema_version = 0, .owners = &.{.{ .group_id = "9", .generation = "1", .slot = 0, .owner = "aa" ** 32, .comparison = "bb" ** 32, .progress_digest = "cc" ** 32, .maintenance_epoch = "0" }} };
+    const request: types.IndexMaintenanceRequest = .{ .table_id = "7", .schema_version = 0, .owners = &.{.{ .group_id = "9", .generation = "1", .slot = 0, .owner = z17RepeatString("aa", 32), .comparison = z17RepeatString("bb", 32), .progress_digest = z17RepeatString("cc", 32), .maintenance_epoch = "0" }} };
     const encoded = try std.json.Stringify.valueAlloc(alloc, Envelope{ .table = "rows", .index = "by_id", .action = .retry, .request = request }, .{});
     defer alloc.free(encoded);
     const log = try std.fmt.allocPrint(alloc, "{s}\n{{\"torn", .{encoded});
@@ -117,4 +117,15 @@ test "maintenance recovery validates the entire immutable selection before repla
     try std.testing.expectError(error.InvalidMaintenanceRecovery, Plan.parse(alloc, duplicate, "rows", "by_id"));
     try validateAcknowledgement(request, .{ .acknowledged_groups = &.{"9"} });
     try std.testing.expectError(error.InvalidMaintenanceResponse, validateAcknowledgement(request, .{ .acknowledged_groups = &.{"10"} }));
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

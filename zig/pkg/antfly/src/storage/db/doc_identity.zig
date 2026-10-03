@@ -114,7 +114,7 @@ const VisibilityChunkEntry = struct {
 const VisibilityChunk = struct {
     entries: std.AutoHashMapUnmanaged(u16, OrdinalState) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.entries.deinit(alloc);
         self.* = .{};
     }
@@ -1298,7 +1298,7 @@ fn validateVisibilityChunksAlloc(alloc: Allocator, store: *docstore_mod.DocStore
         seen_chunks: std.AutoHashMapUnmanaged(u32, void) = .empty,
         chunk_count: u64 = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.seen_ordinals.deinit(self.alloc);
             self.seen_chunks.deinit(self.alloc);
         }
@@ -1723,7 +1723,7 @@ const DocOrdinalRow = struct {
 const DocOrdinalRows = struct {
     items: std.ArrayListUnmanaged(DocOrdinalRow) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items.items) |row| alloc.free(row.doc_id);
         self.items.deinit(alloc);
         self.* = .{};
@@ -1738,7 +1738,7 @@ const OrdinalDocRow = struct {
 const OrdinalDocRows = struct {
     items: std.ArrayListUnmanaged(OrdinalDocRow) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items.items) |row| alloc.free(row.doc_id);
         self.items.deinit(alloc);
         self.* = .{};
@@ -1753,7 +1753,7 @@ const CanonicalOrdinalRow = struct {
 const CanonicalOrdinalRows = struct {
     items: std.ArrayListUnmanaged(CanonicalOrdinalRow) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.items.deinit(alloc);
         self.* = .{};
     }

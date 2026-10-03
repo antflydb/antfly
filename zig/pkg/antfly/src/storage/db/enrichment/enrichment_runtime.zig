@@ -62,7 +62,7 @@ else
     struct {};
 const document_unit_fingerprint = @import("document_unit_fingerprint.zig");
 const artifact_ids = @import("../artifact_ids.zig");
-const chunker_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const chunker_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("chunker_stub.zig")
 else
     @import("chunker.zig");
@@ -76,15 +76,15 @@ const types = @import("../types.zig");
 const platform_clock = @import("antfly_platform").clock;
 const platform_time = @import("antfly_platform").time;
 const background_runtime_mod = @import("../../background_runtime.zig");
-const template = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
 else
     @import("../../../template.zig");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_remote_stub.zig")
 else
     @import("../../../template_remote.zig");
-const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("../scraping_stub.zig")
 else
     @import("antfly_scraping");
@@ -423,7 +423,7 @@ const ForegroundCatchUpGuard = struct {
 };
 
 const CoverageOutcome = enum { produced, skipped, terminal_failed };
-const coverage_outcome_count = std.meta.fields(CoverageOutcome).len;
+const coverage_outcome_count = @typeInfo(CoverageOutcome).@"enum".field_names.len;
 
 const CoverageOutcomeTransition = struct {
     index_name: []u8,
@@ -488,7 +488,7 @@ const GeneratedReplayWindow = struct {
         return batch;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         completeWindowPublishing(self);
         for (self.documents.items) |doc| {
             self.alloc.free(@constCast(doc.key));
@@ -2188,9 +2188,9 @@ fn updateFailureFingerprintBytes(hasher: *std.hash.Wyhash, value: []const u8) vo
 }
 
 fn updateFailureFingerprintForRequest(hasher: *std.hash.Wyhash, request: enrichment_types.GeneratedEnrichmentRequest) void {
-    const kind: u8 = @intFromEnum(request.kind);
-    const embedding_input: u8 = @intFromEnum(request.embedding_input);
-    const input_kind: u8 = @intFromEnum(request.input_kind);
+    const kind: u8 = @backingInt(request.kind);
+    const embedding_input: u8 = @backingInt(request.embedding_input);
+    const input_kind: u8 = @backingInt(request.input_kind);
     var sequence_bytes: [8]u8 = undefined;
     std.mem.writeInt(u64, &sequence_bytes, request.sequence, .little);
     hasher.update(&.{kind});
@@ -3691,7 +3691,7 @@ const ChunkEmbeddingSourceSet = struct {
     desired_chunk_keys: [][]u8 = &.{},
     source_record_digest: ?[32]u8 = null,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         freeChunkEmbeddingSources(alloc, self.sources);
         freeKeyList(alloc, self.desired_chunk_keys);
         self.* = .{};
@@ -3705,7 +3705,7 @@ fn requestUsesMaterializedChunkArtifact(request: enrichment_types.GeneratedEnric
 const StaleEmbeddingDeletes = struct {
     artifact_delete_keys: [][]u8 = &.{},
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.artifact_delete_keys.len > 0) freeKeyList(alloc, self.artifact_delete_keys);
         self.* = .{};
     }
@@ -6812,7 +6812,7 @@ test "rejected chunk embedding publication records its request for stale cleanup
         .artifact_name = "dense_v1",
         .chunk_key = try alloc.dupe(u8, chunk_key),
         .source_hash = 1,
-        .source_record_digest = [_]u8{0} ** 32,
+        .source_record_digest = @as([32]u8, @splat(0)),
     });
     var window = GeneratedReplayWindow{ .alloc = alloc };
     defer window.deinit();
@@ -7296,7 +7296,7 @@ const SharedPdfWindowScheduler = struct {
         return .{ .runtime = runtime, .requests = requests, .sequence = sequence };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.spool_root) |root| {
             if (self.spool_dirty and self.precommit == null) self.cleanupSpool() catch |err|
                 std.log.warn("shared PDF result cleanup failed: {s}", .{@errorName(err)});
@@ -7602,7 +7602,7 @@ const SharedPdfWindowScheduler = struct {
     const WindowJobs = struct {
         scheduler: *SharedPdfWindowScheduler,
         lane: ?background_runtime_mod.BackendRuntime.InferenceLaneLease = null,
-        jobs: [4]?*Job = .{null} ** 4,
+        jobs: [4]?*Job = @splat(null),
         count: usize = 0,
         completed: Io.Event = .unset,
         serial: bool = false,
@@ -7642,7 +7642,7 @@ const SharedPdfWindowScheduler = struct {
                 started_ns: u64 = 0,
                 request_bytes: usize = 0,
 
-                fn deinit(self: *@This(), alloc: Allocator) void {
+                pub fn deinit(self: *@This(), alloc: Allocator) void {
                     if (self.batch) |*batch| batch.deinit(alloc);
                     for (self.units[0..self.initialized_units]) |*unit| unit.deinit(alloc);
                     for (self.requests) |request| if (request.source_parts_json) |parts| alloc.free(parts);
@@ -7697,7 +7697,7 @@ const SharedPdfWindowScheduler = struct {
                 };
             }
 
-            fn deinit(self: *@This(), alloc: Allocator) void {
+            pub fn deinit(self: *@This(), alloc: Allocator) void {
                 if (self.text) |*text| text.deinit(self.invocation.allocator());
                 if (self.output) |*output| output.deinit(self.invocation.allocator());
                 switch (self.rendered) {
@@ -7978,7 +7978,7 @@ const SharedPdfWindowScheduler = struct {
             // Release every model permit before retrying an admission-denied
             // sibling. A one-slot node therefore makes progress without a new
             // render traversal or an external retry storm.
-            var joined = [_]bool{false} ** 4;
+            var joined = @as([4]bool, @splat(false));
             var remaining = self.count;
             while (remaining != 0) {
                 self.completed.reset();
@@ -8016,7 +8016,7 @@ const SharedPdfWindowScheduler = struct {
             if (first_fatal) |err| return err;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.jobs) |entry| if (entry) |job| {
                 job.canceled.store(true, .release);
             };
@@ -8447,7 +8447,7 @@ const SharedPdfWindowScheduler = struct {
     fn textStageExists(self: *@This(), key: []const u8) !bool {
         if (self.precommit) |execution| return execution.results.contains(key);
         const Reader = struct {
-            fn read(runtime: *EnrichmentRuntime, k: []const u8) ![]u8 {
+            pub fn read(runtime: *EnrichmentRuntime, k: []const u8) ![]u8 {
                 var txn = try runtime.store.beginRead();
                 defer txn.abort();
                 _ = try txn.get(k);
@@ -8782,7 +8782,7 @@ const RuntimePdfPageTextSpool = struct {
         const Reader = struct {
             runtime: *EnrichmentRuntime,
             alloc: Allocator,
-            fn read(reader: *@This(), k: []const u8) ![]u8 {
+            pub fn read(reader: *@This(), k: []const u8) ![]u8 {
                 var txn = try reader.runtime.store.beginRead();
                 defer txn.abort();
                 return reader.alloc.dupe(u8, try txn.get(k));
@@ -8862,7 +8862,7 @@ const RuntimePdfPageTextSpool = struct {
         self.pending_bytes = 0;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         // Retire callbacks before taking the buffer lock or releasing their
         // stack-owned context. Reclaimers never perform durable writes.
         if (self.reclaimer_manager) |m| m.unregisterReclaimer(self.reclaimer_id);
@@ -8883,7 +8883,7 @@ test "shared PDF transform identity includes decoder and spatial limits" {
     try std.testing.expect(!std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, null, null, 100, true)));
     config.pdf_decode_limits.max_working_set_bytes -= 1;
     try std.testing.expect(!std.meta.eql(baseline, SharedPdfTransform.init(config, 1_000_000, null, null, 100, false)));
-    const digest = [_]u8{0} ** 32;
+    const digest = @as([32]u8, @splat(0));
     var spatial = inference_work.ImageTransform{ .target_width = 224, .target_height = 224, .resize_mode = .stretch, .resample = .bilinear };
     const hash = pdfPageEmbeddingSourceHash(&digest, 1, "model", config, 1_000_000, 100, false, 2, spatial);
     spatial.target_width = 256;
@@ -9216,7 +9216,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     };
     const Request = enrichment_types.GeneratedEnrichmentRequest;
     const base = Request{ .kind = .asset, .index_name = "reader", .artifact_name = "reader", .doc_key = "source", .source_field = "url", .sequence = 7 };
-    var requests = [_]Request{base} ** 6;
+    var requests = @as([6]Request, @splat(base));
     requests[2].index_name = "generator";
     requests[2].artifact_name = "generator";
     requests[3].kind = .dense_embedding;
@@ -9277,7 +9277,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
     const source = SharedPdfWindowScheduler.TextSource{ .config = config, .content_type = "application/pdf", .fingerprint = "content-identity", .units = &units, .indices = &.{ 0, 1 } };
     try std.testing.expectEqual(@as(usize, 1), try pdfEmbeddingWindowBatchEnd(.{ .encoded = batch }, 0, 1, 64 * 1024 * 1024, std.math.maxInt(u64), .borrowed_binary));
     try std.testing.expectEqual(@as(usize, 2), try pdfEmbeddingWindowBatchEnd(.{ .encoded = batch }, 1, 1, 64 * 1024 * 1024, std.math.maxInt(u64), .borrowed_binary));
-    const digest = [_]u8{7} ** 32;
+    const digest = @as([32]u8, @splat(7));
     const resources = runtime.config.resource_manager orelse manager.resource_manager.?;
     const before = resources.sliceStats(.document_extraction_working_set).used_bytes;
     {
@@ -9409,7 +9409,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         };
         defer for (&parallel_units) |*unit| unit.deinit(alloc);
         parallel_source.units = &parallel_units;
-        const parallel_digest = [_]u8{8} ** 32;
+        const parallel_digest = @as([32]u8, @splat(8));
         try scheduler.emit(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &parallel_digest, "{}", 2, transform, .{ .encoded = batch }, "", parallel_source, window_lease);
         try std.testing.expect(harness.admission_denied.load(.acquire));
         try std.testing.expect(scheduler.failure(4) == null);
@@ -9422,7 +9422,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         scheduler.consumers.?[2].enabled = false;
         defer scheduler.consumers.?[1].enabled = true;
         defer scheduler.consumers.?[2].enabled = true;
-        const owner_digest = [_]u8{10} ** 32;
+        const owner_digest = @as([32]u8, @splat(10));
         var owner_work = try scheduler.begin(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &owner_digest, "{}", 2, transform, .{ .encoded = batch }, "", parallel_source, window_lease, null);
         defer SharedPdfWindowScheduler.WindowWork.cancel(&owner_work);
         try std.testing.expect(owner_work != null);
@@ -9445,7 +9445,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         const calls_before_cancel = harness.embed_calls;
         harness.wait_for_cancel = true;
         defer harness.wait_for_cancel = false;
-        const canceled_digest = [_]u8{9} ** 32;
+        const canceled_digest = @as([32]u8, @splat(9));
         {
             var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler };
             defer jobs.deinit();
@@ -9504,7 +9504,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             // wait for inference grants, preserving already borrowed PNGs.
             var budgets = resource_manager_mod.Options.defaultBudgets();
             const limit = 4 << 20;
-            budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = limit };
+            budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = limit };
             var tight = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
             defer tight.deinit(alloc);
             const previous_manager = runtime.config.resource_manager;
@@ -9518,7 +9518,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             jobs.lane = try backend_handle.ptr().acquireInferenceLane();
             var png = SharedPdfPngWindow{};
             defer png.deinit();
-            var pixels = [_]u8{255} ** 64;
+            var pixels = @as([64]u8, @splat(255));
             const RasterPage = std.meta.Elem(@FieldType(document_extraction_mod.RenderedPdfPageRasterBatch, "results"));
             var raster_pages = [_]RasterPage{
                 .{ .page_number = 1, .rendered = .{ .bytes = &pixels, .width = 4, .height = 4, .stride = 16, .pixel_format = .rgba8, .requested_dpi = 72, .effective_dpi = 72 } },
@@ -9563,7 +9563,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             defer harness.worker_failure = null;
             var jobs = SharedPdfWindowScheduler.WindowJobs{ .scheduler = &scheduler, .serial = true };
             defer jobs.deinit();
-            const failed_digest = [_]u8{11} ** 32;
+            const failed_digest = @as([32]u8, @splat(11));
             try std.testing.expectError(error.Canceled, scheduler.consumeEmbedding(&scheduler.consumers.?[4], requests[4], &failed_digest, .{ .encoded = batch }, 2, window_lease, null, &jobs));
             try std.testing.expectEqual(@as(usize, 0), jobs.count);
             try std.testing.expectEqual(before, resources.sliceStats(.document_extraction_working_set).used_bytes);
@@ -9572,7 +9572,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             // Admission must drain grants, and final flush must release a
             // completed sibling while another invocation is still running.
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 120 };
+            budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 120 };
             var tight = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
             defer tight.deinit(alloc);
             const previous_manager = runtime.config.resource_manager;
@@ -9651,7 +9651,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
             harness.single_slot = false;
             harness.prefetch_started = &started;
             defer harness.prefetch_started = null;
-            const prefetch_digest = [_]u8{12} ** 32;
+            const prefetch_digest = @as([32]u8, @splat(12));
             var work = try scheduler.begin(PreparedDocumentSourceCache.sourceIdentity("https://example.test/source.pdf"), &prefetch_digest, "{}", 2, transform, .{ .encoded = batch }, "", null, window_lease, &prefetch);
             defer SharedPdfWindowScheduler.WindowWork.cancel(&work);
             try std.testing.expect(started.load(.acquire));
@@ -9711,7 +9711,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
                 harness.owner_released.store(false, .release);
                 const text_before = harness.text_calls;
                 const embed_before = harness.embed_calls;
-                const fresh_digest = [_]u8{@intCast(20 + text_index * 2 + @intFromBool(failure != null))} ** 32;
+                const fresh_digest = @as([32]u8, @splat(@intCast(20 + text_index * 2 + @intFromBool(failure != null))));
                 var fresh_units = [_]document_extraction_mod.Unit{
                     try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000001"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 1, .extraction_status = @constCast("pending_ocr") }),
                     try cloneDocumentExtractionUnit(alloc, .{ .unit_id = @constCast("page:000002"), .unit_type = @constCast("page"), .text = @constCast(""), .method = @constCast("pdf_text"), .page_number = 2, .extraction_status = @constCast("pending_ocr") }),
@@ -9850,7 +9850,7 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         // segment, and its optional storage must yield to mandatory admission.
         var budgets = resource_manager_mod.Options.defaultBudgets();
         const limit = 1024 * 1024;
-        budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = limit };
+        budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = limit };
         var cache_resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
         defer cache_resources.deinit(alloc);
         const previous_manager = runtime.config.resource_manager;
@@ -10126,7 +10126,7 @@ const PreparedDocumentSourceCache = struct {
             return self.entry_ptr.?;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             const owned = self.entry_ptr orelse return;
             self.entry_ptr = null;
             self.cache.releaseBorrow(owned, null);
@@ -10141,7 +10141,7 @@ const PreparedDocumentSourceCache = struct {
             return &self.variant.?.session.?;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             const owned = self.variant orelse return;
             self.variant = null;
             self.cache.releaseBorrow(owned.entry, owned);
@@ -10289,7 +10289,7 @@ const PreparedDocumentSourceCache = struct {
         self.allocator_mutex.unlock();
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.mutex.lockUncancelable(self.io);
         self.shutting_down = true;
         self.mutex.unlock(self.io);
@@ -10852,7 +10852,7 @@ fn sourceContentFingerprint(source_bytes: []const u8) [16]u8 {
 test "shared PDF cache reclaims idle sources but never live source or parse leases" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var cache = PreparedDocumentSourceCache{ .backing_alloc = alloc, .budgeted = resource_manager_mod.BudgetedAllocator.init(&manager, .document_extraction_working_set, alloc, 1), .io = std.testing.io };
@@ -10887,7 +10887,7 @@ test "shared PDF cache reclaims idle sources but never live source or parse leas
 test "shared PDF render admission reclaims idle sources without invalidating live leases" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     {
@@ -10915,7 +10915,7 @@ test "shared PDF render admission reclaims idle sources without invalidating liv
 test "shared PDF coordinator state is admitted separately from render windows" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     const coordinator = try alloc.create(RuntimePdfOcrCoordinator);
@@ -11359,7 +11359,7 @@ const AssetExecutionLane = struct {
         if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .assets, self.applied_sequence, group);
     }
 
-    fn deinitOwned(self: *AssetExecutionLane) void {
+    pub fn deinitOwned(self: *AssetExecutionLane) void {
         self.window.deinit();
         enrichment_types.deinitGeneratedRequests(self.runtime.alloc, self.requests);
     }
@@ -11410,7 +11410,7 @@ const DenseExecutionLane = struct {
         if (self.group) |group| try saveReplayCursorForGroup(self.runtime, .dense, self.applied_sequence, group);
     }
 
-    fn deinitOwned(self: *DenseExecutionLane) void {
+    pub fn deinitOwned(self: *DenseExecutionLane) void {
         self.window.deinit();
         enrichment_types.deinitGeneratedRequests(self.runtime.alloc, self.plain_dense);
         enrichment_types.deinitGeneratedRequests(self.runtime.alloc, self.chunked_dense);
@@ -12190,7 +12190,7 @@ const PreparedAssetBatch = struct {
     retry_error: ?anyerror = null,
     retry_fingerprint: u64 = 0,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         clearAssetProducerBatchItems(alloc, &self.items);
         self.items.deinit(alloc);
     }
@@ -13464,7 +13464,7 @@ const PrecommitResultCache = struct {
         }
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         // Never wait for a callback while holding its owner lock.
         if (self.budgeted) |*budget| budget.reservation.manager.unregisterReclaimer(self.reclaimer_id);
         self.clear();
@@ -13612,7 +13612,7 @@ test "shared PDF precommit cache yields to larger render windows and downloads" 
     const alloc = std.testing.allocator;
     for ([_]bool{ false, true }) |aggregate_pressure| {
         var budgets = resource_manager_mod.Options.defaultBudgets();
-        budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+        budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
             .hard_limit_bytes = if (aggregate_pressure) 0 else 64 * 1024,
         };
         var manager = resource_manager_mod.ResourceManager.init(.{
@@ -13624,7 +13624,7 @@ test "shared PDF precommit cache yields to larger render windows and downloads" 
             var cache: PrecommitResultCache = .{};
             try cache.init(alloc, &manager);
             defer cache.deinit();
-            const text = [_]u8{'t'} ** (8 * 1024);
+            const text = @as([(8 * 1024)]u8, @splat('t'));
             const writes = [_]KVPair{ .{ .key = "reader/page1", .value = &text }, .{ .key = "generator/page1", .value = &text } };
             try cache.stage(&writes);
             const small = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 4 * 1024, 4 * 1024, 1);
@@ -13659,13 +13659,13 @@ test "shared PDF precommit cache yields to larger render windows and downloads" 
 test "shared PDF precommit cache reclamation skips locked borrowers and preserves useful peers" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 64 * 1024 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var cache: PrecommitResultCache = .{};
     try cache.init(alloc, &manager);
     defer cache.deinit();
-    const text = [_]u8{'t'} ** (8 * 1024);
+    const text = @as([(8 * 1024)]u8, @splat('t'));
     try cache.stage(&.{ .{ .key = "reader/page1", .value = &text }, .{ .key = "generator/page1", .value = &text } });
     cache.lock();
     {
@@ -14178,7 +14178,7 @@ pub fn runNativePdfOcrCoordinatorIntegration(
         requested.scratch_bytes = @max(requested.scratch_bytes, 32 * 1024 * 1024);
         const output_bytes = try pdfRgbaBytesForPixels(plan.geometry().pixels) + 4096;
         var budgets = resource_manager_mod.Options.defaultBudgets();
-        budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = requested.scratch_bytes - 1 + output_bytes };
+        budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = requested.scratch_bytes - 1 + output_bytes };
         var limited_resources = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
         defer limited_resources.deinit(alloc);
         const partial_lease = try PdfWindowCompositeLease.create(alloc, alloc, &limited_resources, requested.scratch_bytes, output_bytes, 1);
@@ -14522,7 +14522,7 @@ const PdfEmbeddingRenderedWindow = union(enum) {
     encoded: document_extraction_mod.RenderedPdfPageBatch,
     raster: document_extraction_mod.RenderedPdfPageRasterBatch,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         switch (self.*) {
             inline else => |*batch| batch.deinit(alloc),
         }
@@ -14546,7 +14546,7 @@ const SharedPdfPngPage = struct {
     lease: ?PdfWindowConsumerLease = null,
     batch: ?document_extraction_mod.RenderedPdfPageBatch = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.batch) |*batch| batch.deinit(self.lease.?.allocator());
         if (self.lease) |*lease| lease.deinit();
         self.* = .{};
@@ -14729,7 +14729,7 @@ const SharedPdfPngWindow = struct {
         }
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.pages) |*page| page.deinit();
         if (self.metadata) |*lease| {
             lease.allocator().free(self.batch.?.results);
@@ -15097,7 +15097,7 @@ const RuntimePdfRenderWindow = struct {
     page_output_bytes_cap: usize,
     deferred_render: ?PdfDeferredRenderRetry = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.deferred_render) |*retry| retry.deinit(self.metadata_alloc);
         switch (self.batch) {
             inline else => |*batch| batch.deinit(self.lease.allocator()),
@@ -15496,7 +15496,7 @@ const PdfWindowConsumerLease = struct {
         self.limit.max_live_bytes = retained;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         std.debug.assert(self.limit.live_bytes == 0);
         if (self.parent) |window| {
             std.debug.assert(window.output_limit.liveBytes() == self.retained_bytes);
@@ -15879,12 +15879,12 @@ test "PDF window output allocator enforces one ceiling across concurrent workers
         }
     };
 
-    var workers = [_]Worker{.{
+    var workers = @as([worker_count]Worker, @splat(.{
         .alloc = output_alloc,
         .start = &start,
         .release = &release,
         .attempted = &attempted,
-    }} ** worker_count;
+    }));
     var threads: [worker_count]std.Thread = undefined;
     var spawned: usize = 0;
     errdefer {
@@ -15915,7 +15915,7 @@ test "PDF window output allocator enforces one ceiling across concurrent workers
 
 test "PDF composite lease releases admission between invocation windows" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -15971,7 +15971,7 @@ test "PDF composite lease releases admission between invocation windows" {
 test "shared PDF phase leases reuse idle credit and admit only nested consumer excess" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .soft_limit_bytes = 0, .hard_limit_bytes = 100 };
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .soft_limit_bytes = 0, .hard_limit_bytes = 100 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     const lease = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 70, 30, 1);
@@ -16033,7 +16033,7 @@ test "shared PDF phase leases reuse idle credit and admit only nested consumer e
 test "shared PDF independent grants never freeze the owner allocator" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .soft_limit_bytes = 0, .hard_limit_bytes = 100 };
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{ .soft_limit_bytes = 0, .hard_limit_bytes = 100 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     const owner = try PdfWindowCompositeLease.create(alloc, alloc, &manager, 50, 40, 1);
@@ -16057,7 +16057,7 @@ test "shared PDF independent grants never freeze the owner allocator" {
 
 test "PDF composite lease admits two future overlap windows atomically" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 120,
     };
@@ -16227,7 +16227,7 @@ const PdfDeferredRenderRetry = struct {
         return .{ .plans = selected, .indices = indices, .options = saved_options, .maximum = maximum };
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.plans);
         alloc.free(self.indices);
         self.* = undefined;
@@ -16374,7 +16374,7 @@ test "PDF render scratch retry admits delta and preserves completed results" {
     for ([_]bool{ false, true }) |raster| {
         for (0..6) |scenario| {
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
                 .soft_limit_bytes = 0,
                 .hard_limit_bytes = if (scenario == 2 or scenario == 5) 4196 else if (scenario == 4) 4246 else 4296,
             };
@@ -18164,7 +18164,7 @@ const RuntimeParsedGeneratedUnitText = struct {
     /// Phrase timing when the producer returned transcript segments.
     spans: []document_extraction_mod.TranscriptSpan = &.{},
 
-    fn deinit(self: *RuntimeParsedGeneratedUnitText, alloc: Allocator) void {
+    pub fn deinit(self: *RuntimeParsedGeneratedUnitText, alloc: Allocator) void {
         if (self.text.len > 0) alloc.free(self.text);
         if (self.warning) |value| alloc.free(value);
         for (self.regions) |region| {
@@ -18456,7 +18456,7 @@ const RuntimeDocumentExtractionStreamInfo = struct {
         };
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.content_type.len > 0) alloc.free(self.content_type);
         if (self.route_type.len > 0) alloc.free(self.route_type);
         if (self.unsupported_reason.len > 0) alloc.free(self.unsupported_reason);
@@ -18468,7 +18468,7 @@ const RuntimeGeneratedUnitCacheEntry = struct {
     unit_id: []u8,
     unit: document_extraction_mod.Unit,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.unit_id);
         self.unit.deinit(alloc);
         self.* = undefined;
@@ -18511,7 +18511,7 @@ const RuntimeGeneratedUnitCache = struct {
         return &self.entries.items[index].unit;
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.indexes.deinit(alloc);
         for (self.entries.items) |*entry| entry.deinit(alloc);
         self.entries.deinit(alloc);
@@ -18557,7 +18557,7 @@ const RuntimeOcrFailureSummary = struct {
         };
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(@constCast(self.unit_id));
         alloc.free(@constCast(self.retained_method));
         alloc.free(@constCast(self.error_message));
@@ -18752,7 +18752,7 @@ const RuntimeDocumentExtractionCollectContext = struct {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.releasePdfCoordinator();
         self.info.deinit(self.alloc);
         self.clearPendingGeneratedUnits();
@@ -19187,7 +19187,7 @@ const RuntimeDocumentUnitSpool = struct {
         self.cleanup_pending = false;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.cleanup() catch |err| std.log.warn(
             "deferred document extraction spool cleanup failed err={s}",
             .{@errorName(err)},
@@ -19235,7 +19235,7 @@ const RuntimeDocumentPublicationSpool = struct {
         record: std.json.Parsed(RuntimeDocumentPublicationRecord),
         payload: ?[]u8 = null,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.payload) |payload| alloc.free(payload);
             self.record.deinit();
             self.* = undefined;
@@ -19247,7 +19247,7 @@ const RuntimeDocumentPublicationSpool = struct {
         next_record_index: u64,
         lease: *RuntimeDocumentReplaySegmentLease,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             const alloc = self.lease.allocator();
             for (self.items) |*item| item.deinit(alloc);
             alloc.free(self.items);
@@ -19543,7 +19543,7 @@ const RuntimeDocumentPublicationSpool = struct {
         self.cleanup_pending = false;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.cleanup() catch |err| std.log.warn(
             "deferred document publication spool cleanup failed err={s}",
             .{@errorName(err)},
@@ -19689,7 +19689,7 @@ test "resolved document unit spool replays in order and cleans its attempt prefi
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.ended = true;
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.text.items) |value| self.alloc.free(value);
             self.text.deinit(self.alloc);
         }
@@ -19771,7 +19771,7 @@ test "storage.db.db.test.document unit spool admits replay memory before opening
     try spool.flush();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = runtime_document_replay_segment_memory_bytes - 1,
     };
@@ -19968,7 +19968,7 @@ test "storage.db.db.test.document publication spool admits replay memory before 
     try spool.seal();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = runtime_document_replay_segment_memory_bytes - 1,
     };
@@ -20186,7 +20186,7 @@ const RuntimeDocumentExtractionResourceTracker = struct {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.manager) |manager| {
             manager.observeUsage(.document_extraction_working_set, &self.current_bytes, 0);
         }
@@ -20195,7 +20195,7 @@ const RuntimeDocumentExtractionResourceTracker = struct {
 
 test "document extraction working set accounts generated unit cache bytes" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -20217,7 +20217,7 @@ test "document extraction working set accounts generated unit cache bytes" {
 
 test "budgeted document download composes with materialization accounting" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -20248,7 +20248,7 @@ test "budgeted document download composes with materialization accounting" {
 
 test "retained document collection allocations compose with the hard working-set cap" {
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 100,
     };
@@ -20276,7 +20276,7 @@ test "retained document collection allocations compose with the hard working-set
 test "document replay payloads are admitted before persistent allocation" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)] = .{
         .soft_limit_bytes = 0,
         .hard_limit_bytes = 1024,
     };
@@ -21415,7 +21415,7 @@ const RuntimeGraphEdgeWinner = struct {
 const RuntimeGraphEdgeWinners = struct {
     map: std.StringHashMapUnmanaged(RuntimeGraphEdgeWinner) = .empty,
 
-    fn deinit(self: *RuntimeGraphEdgeWinners, alloc: Allocator) void {
+    pub fn deinit(self: *RuntimeGraphEdgeWinners, alloc: Allocator) void {
         var it = self.map.iterator();
         while (it.next()) |entry| {
             alloc.free(@constCast(entry.key_ptr.*));
@@ -21455,7 +21455,7 @@ const RuntimeGraphContenderResult = struct {
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     visible_count: usize = 0,
 
-    fn deinit(self: *RuntimeGraphContenderResult, alloc: Allocator) void {
+    pub fn deinit(self: *RuntimeGraphContenderResult, alloc: Allocator) void {
         self.winners.deinit(alloc);
         for (self.writes.items) |write| {
             alloc.free(@constCast(write.key));
@@ -24326,7 +24326,7 @@ fn pdfPageEmbeddingSourceHash(
     hasher.update(content_sha256);
     updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(page_number));
     updatePdfPageEmbeddingHashInt(&hasher, u16, render_config.ocr_render_dpi);
-    updatePdfPageEmbeddingHashInt(&hasher, u8, @intFromEnum(render_config.ocr_render_resolution));
+    updatePdfPageEmbeddingHashInt(&hasher, u8, @backingInt(render_config.ocr_render_resolution));
     updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.ocr_max_rendered_pixels);
     updatePdfPageEmbeddingHashInt(&hasher, u32, render_config.ocr_max_rendered_dimension);
     updatePdfPageEmbeddingHashInt(&hasher, u64, render_config.pdf_render_max_inflight_pixels);
@@ -24344,8 +24344,8 @@ fn pdfPageEmbeddingSourceHash(
     if (image_transform) |transform| {
         updatePdfPageEmbeddingHashInt(&hasher, u32, transform.target_width);
         updatePdfPageEmbeddingHashInt(&hasher, u32, transform.target_height);
-        updatePdfPageEmbeddingHashInt(&hasher, u8, @intCast(@intFromEnum(transform.resize_mode)));
-        updatePdfPageEmbeddingHashInt(&hasher, u8, @intCast(@intFromEnum(transform.resample)));
+        updatePdfPageEmbeddingHashInt(&hasher, u8, @intCast(@backingInt(transform.resize_mode)));
+        updatePdfPageEmbeddingHashInt(&hasher, u8, @intCast(@backingInt(transform.resample)));
     }
     updatePdfPageEmbeddingHashInt(&hasher, u64, @intCast(semantic_producer.len));
     hasher.update(semantic_producer);
@@ -24523,7 +24523,7 @@ const PdfEmbeddingPreparedWindow = struct {
     rendered: PdfEmbeddingRenderedWindow,
     deferred_render: ?PdfDeferredRenderRetry = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.deferred_render) |*retry| retry.deinit(self.lease.owner_alloc);
         self.rendered.deinit(self.lease.allocator());
         self.lease.destroy();
@@ -25983,8 +25983,8 @@ test "durable enrichment PDF page embedding rejects partial and missing results"
 }
 
 test "PDF page embedding identity covers source page transform and transport" {
-    const digest_a = [_]u8{0x11} ** std.crypto.hash.sha2.Sha256.digest_length;
-    const digest_b = [_]u8{0x22} ** std.crypto.hash.sha2.Sha256.digest_length;
+    const digest_a = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x11));
+    const digest_b = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0x22));
     const config = document_extraction_mod.Config{};
     const baseline = pdfPageEmbeddingSourceHash(&digest_a, 1, "model-a", config, 10_000_000, 4 * 1024 * 1024, true, 768, null);
     for (0..4) |limit| {
@@ -27058,7 +27058,7 @@ const RuntimeDocumentExtractionPreviousState = struct {
     navigation_block_keys: []const []const u8 = &.{},
     recovered_from_store_scan: bool = false,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         freeOwnedConstKeySlice(alloc, self.unit_keys);
         freeDocumentExtractionUnitDescriptors(alloc, self.unit_descriptors);
         freeOwnedConstKeySlice(alloc, self.chunk_keys);
@@ -28937,8 +28937,8 @@ fn keyInList(key: []const u8, keys: []const []const u8) bool {
 }
 
 fn enrichmentConfigLessThan(_: void, lhs: types.EnrichmentConfig, rhs: types.EnrichmentConfig) bool {
-    const lhs_kind = @intFromEnum(lhs.kind);
-    const rhs_kind = @intFromEnum(rhs.kind);
+    const lhs_kind = @backingInt(lhs.kind);
+    const rhs_kind = @backingInt(rhs.kind);
     if (lhs_kind != rhs_kind) return lhs_kind < rhs_kind;
     return std.mem.lessThan(u8, lhs.name, rhs.name);
 }
@@ -29775,7 +29775,7 @@ fn applyCoverageOutcomeTransitionsForIndex(runtime: *EnrichmentRuntime, transiti
             transition: CoverageOutcomeTransition,
             outcome: CoverageOutcome,
         ) !usize {
-            const outcome_index = @intFromEnum(outcome);
+            const outcome_index = @backingInt(outcome);
             const counter_key = transition.counter_keys[outcome_index];
             if (indexes.get(counter_key)) |index| return index;
             const current_count = (try loadDerivedCoverageOutcomeCounter(runtime_value, counter_key)) orelse
@@ -29960,32 +29960,32 @@ test "derived coverage outcome transitions are exclusive and idempotent" {
     const stored_outcome = try storeGetAlloc(&runtime, transition.marker_key);
     defer runtime.alloc.free(stored_outcome);
     try std.testing.expectEqualStrings("skipped", stored_outcome);
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
-    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.skipped)]));
     try std.testing.expectEqual(@as(u64, 1), runtime.skipped_source_count);
 
     transition.outcome = .produced;
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{ transition, transition });
-    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.skipped)]));
     try std.testing.expectEqual(@as(u64, 0), runtime.skipped_source_count);
 
     transition.outcome = .terminal_failed;
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
-    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.terminal_failed)]));
 
     transition.outcome = .skipped;
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
     const terminal_outcome = try storeGetAlloc(&runtime, transition.marker_key);
     defer runtime.alloc.free(terminal_outcome);
     try std.testing.expectEqualStrings("terminal_failed", terminal_outcome);
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.skipped)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.skipped)]));
 
     transition.outcome = .produced;
     try applyCoverageOutcomeTransitionsForIndex(&runtime, &.{transition});
-    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.produced)]));
-    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@intFromEnum(CoverageOutcome.terminal_failed)]));
+    try std.testing.expectEqual(@as(?u64, 1), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.produced)]));
+    try std.testing.expectEqual(@as(?u64, 0), try loadDerivedCoverageOutcomeCounter(&runtime, transition.counter_keys[@backingInt(CoverageOutcome.terminal_failed)]));
 }
 
 test "enrichment applied checkpoint stays degraded until runtime status clears" {
@@ -30330,7 +30330,7 @@ const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.owned) self.store.deinit();
     }
 };
@@ -30369,7 +30369,7 @@ const AllocatedStoreReader = struct {
     runtime: *EnrichmentRuntime,
     alloc: Allocator,
 
-    fn read(self: *@This(), key: []const u8) ![]u8 {
+    pub fn read(self: *@This(), key: []const u8) ![]u8 {
         var txn = try self.runtime.store.beginRead();
         defer txn.abort();
         return self.alloc.dupe(u8, try txn.get(key));

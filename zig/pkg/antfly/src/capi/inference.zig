@@ -338,7 +338,7 @@ const PullReport = struct {
     file: []u8,
     progress: capi.InferencePullProgress,
 
-    fn deinit(self: *PullReport) void {
+    pub fn deinit(self: *PullReport) void {
         alloc.free(self.model);
         alloc.free(self.file);
     }
@@ -480,7 +480,7 @@ pub export fn antfly_inference_pull_json(
 const StreamEvent = struct {
     data: []u8,
 
-    fn deinit(self: *StreamEvent) void {
+    pub fn deinit(self: *StreamEvent) void {
         alloc.free(self.data);
     }
 };
@@ -578,7 +578,7 @@ const StreamCall = struct {
 
     fn cancel(_: *StreamCall) void {}
 
-    fn deinit(self: *StreamCall) void {
+    pub fn deinit(self: *StreamCall) void {
         self.pending.deinit(alloc);
         if (self.stream_error) |message| alloc.free(message);
         if (self.response) |response| alloc.free(response.body);

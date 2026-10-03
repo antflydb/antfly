@@ -377,7 +377,7 @@ const PinnedLsmOwnerEntries = struct {
         return self.storage[0..self.count];
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.cache.releaseEntries(self.entries());
         alloc.free(self.storage);
         self.* = undefined;
@@ -1277,7 +1277,7 @@ const DroppedTableDeleteWork = struct {
             source.dropped_table_recovery_retry_failures.store(0, .release);
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         std.heap.page_allocator.free(self.path);
         std.heap.page_allocator.destroy(self);
@@ -1364,7 +1364,7 @@ const PersistedReplicaRetirementIntent = struct {
     path: []u8,
     created: bool,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.table_name) |table_name| alloc.free(table_name);
         alloc.free(self.path);
         self.* = undefined;
@@ -1522,7 +1522,7 @@ const LoadedReplicaRetirementIntent = struct {
     legacy: bool = false,
     table_name: ?[]u8 = null,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.table_name) |table_name| alloc.free(table_name);
         self.* = undefined;
     }
@@ -1532,7 +1532,7 @@ const LoadedReplicaRetirementBatch = struct {
     phase: ReplicaRetirementIntentPhase,
     intents: []PersistedReplicaRetirementIntent,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.intents) |*intent| intent.deinit(alloc);
         alloc.free(self.intents);
         self.* = undefined;
@@ -1613,7 +1613,7 @@ fn writeReplicaRetirementBatch(
         var buffer: [16 * 1024]u8 = undefined;
         var writer = file.writer(io, &buffer);
         var checksum = std.crypto.hash.sha2.Sha256.init(.{});
-        const encoded_phase = [_]u8{@intFromEnum(phase)};
+        const encoded_phase = [_]u8{@backingInt(phase)};
         var encoded_count: [4]u8 = undefined;
         std.mem.writeInt(u32, &encoded_count, @intCast(intents.len), .little);
         checksum.update(magic);
@@ -1667,8 +1667,8 @@ fn loadReplicaRetirementBatch(alloc: std.mem.Allocator, io: std.Io, path: []cons
     if (!version_two and !std.mem.eql(u8, encoded[0..replica_retirement_batch_magic.len], replica_retirement_batch_magic))
         return error.InvalidReplicaRetirementIntent;
     const phase: ReplicaRetirementIntentPhase = switch (encoded[replica_retirement_batch_magic.len]) {
-        @intFromEnum(ReplicaRetirementIntentPhase.prepared) => .prepared,
-        @intFromEnum(ReplicaRetirementIntentPhase.committed) => .committed,
+        @backingInt(ReplicaRetirementIntentPhase.prepared) => .prepared,
+        @backingInt(ReplicaRetirementIntentPhase.committed) => .committed,
         else => return error.InvalidReplicaRetirementIntent,
     };
     var encoded_count: [4]u8 = undefined;
@@ -1758,7 +1758,7 @@ fn writeReplicaRetirementIntent(
         var writer = file.writer(io, &buffer);
         var encoded_group_id: [8]u8 = undefined;
         std.mem.writeInt(u64, &encoded_group_id, group_id, .little);
-        const encoded_phase = [_]u8{@intFromEnum(phase)};
+        const encoded_phase = [_]u8{@backingInt(phase)};
         var encoded_table_name_len: [4]u8 = undefined;
         std.mem.writeInt(u32, &encoded_table_name_len, @intCast(if (table_name) |name| name.len else 0), .little);
         var checksum = std.crypto.hash.sha2.Sha256.init(.{});
@@ -1901,8 +1901,8 @@ fn loadReplicaRetirementIntent(alloc: std.mem.Allocator, io: std.Io, path: []con
     const phase: ReplicaRetirementIntentPhase = if (v1)
         .prepared
     else switch (encoded[group_id_end]) {
-        @intFromEnum(ReplicaRetirementIntentPhase.prepared) => .prepared,
-        @intFromEnum(ReplicaRetirementIntentPhase.committed) => .committed,
+        @backingInt(ReplicaRetirementIntentPhase.prepared) => .prepared,
+        @backingInt(ReplicaRetirementIntentPhase.committed) => .committed,
         else => return error.InvalidReplicaRetirementIntent,
     };
     var encoded_group_id: [@sizeOf(u64)]u8 = undefined;
@@ -1952,7 +1952,7 @@ const DroppedTableRepairIntent = struct {
     expected_transition_generation: u64,
     group_ids: []u64,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         alloc.free(self.group_ids);
         self.* = undefined;
@@ -2314,7 +2314,7 @@ pub const ProvisionedTableWriteCache = struct {
         indexes_json: ?[]u8 = null,
         schema_json: ?[]u8 = null,
 
-        fn deinit(self: *PreparedOpen, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PreparedOpen, alloc: std.mem.Allocator) void {
             if (self.indexes_json) |value| alloc.free(value);
             if (self.schema_json) |value| alloc.free(value);
             self.* = undefined;
@@ -2403,7 +2403,7 @@ pub const ProvisionedTableWriteCache = struct {
             }
         }
 
-        fn deinit(
+        pub fn deinit(
             self: *Entry,
             alloc: std.mem.Allocator,
             backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
@@ -2794,7 +2794,7 @@ pub const ProvisionedTableWriteCache = struct {
         state: State = .active,
         abort_requested: bool = false,
 
-        fn deinit(self: *ActiveBulkIngestSession, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ActiveBulkIngestSession, alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             self.* = undefined;
         }
@@ -2805,7 +2805,7 @@ pub const ProvisionedTableWriteCache = struct {
         indexes_json: ?[]u8,
         schema_json: ?[]u8,
 
-        fn deinit(self: *TableMetadata, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *TableMetadata, alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             if (self.indexes_json) |value| alloc.free(value);
             if (self.schema_json) |value| alloc.free(value);
@@ -2818,7 +2818,7 @@ pub const ProvisionedTableWriteCache = struct {
         entry_schema_json: []?[]u8,
         managed_config_fingerprint: [32]u8,
 
-        fn deinit(self: *PreparedStructuralPublication, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PreparedStructuralPublication, alloc: std.mem.Allocator) void {
             if (self.table_metadata) |*metadata| metadata.deinit(alloc);
             for (self.entry_schema_json) |value| {
                 if (value) |owned| alloc.free(owned);
@@ -6477,7 +6477,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
         }
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.indexes_json);
             self.* = undefined;
         }
@@ -6570,7 +6570,7 @@ pub const ProvisionedTableWriteSource = struct {
             return key;
         }
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.buffer);
             self.* = .{};
         }
@@ -6652,7 +6652,7 @@ pub const ProvisionedTableWriteSource = struct {
     };
 
     const StructuralReconcileRequest = struct {
-        scheduler_key: IndexActivationKey = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length,
+        scheduler_key: IndexActivationKey = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0)),
         enqueue_sequence: u64 = 0,
         table_name: []u8,
         index_name: ?[]u8 = null,
@@ -6671,7 +6671,7 @@ pub const ProvisionedTableWriteSource = struct {
         deferred_repair_group_ids: std.ArrayListUnmanaged(u64) = .empty,
         deferred_repair_group_set: std.AutoHashMapUnmanaged(u64, void) = .empty,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             if (self.index_name) |name| alloc.free(name);
             if (self.activation_target) |*target| target.deinit(alloc);
@@ -6754,7 +6754,7 @@ pub const ProvisionedTableWriteSource = struct {
             };
         }
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             metadata_table_manager.freeRange(alloc, self.range);
             self.* = undefined;
         }
@@ -6778,7 +6778,7 @@ pub const ProvisionedTableWriteSource = struct {
         pending_group_indexes: std.ArrayListUnmanaged(usize),
         cursor: usize = 0,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             for (self.groups) |*group| group.deinit(alloc);
             alloc.free(self.groups);
             alloc.free(self.catalog_group_ids);
@@ -6825,7 +6825,7 @@ pub const ProvisionedTableWriteSource = struct {
         status: runtime_status.LocalTableRuntimeStatus,
         opened_root_generation: u64,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.status.deinit(alloc);
             self.* = undefined;
         }
@@ -6852,7 +6852,7 @@ pub const ProvisionedTableWriteSource = struct {
         state: State = .opening,
         abort_requested: bool = false,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             alloc.free(self.pending_group_ids);
             self.* = undefined;
@@ -6965,7 +6965,7 @@ pub const ProvisionedTableWriteSource = struct {
     // Journal I/O is serialized only for the same deterministic batch stripe;
     // unrelated topology changes never hold the ownership mutex across disk
     // access or fsync.
-    replica_retirement_journal_locks: [256]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 256,
+    replica_retirement_journal_locks: [256]std.atomic.Mutex = @as([256]std.atomic.Mutex, @splat(.unlocked)),
     active_replica_retirement_intents: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     // A recovery lease is group-scoped. Directory scans and ownership probes
     // never hold the intent mutex, so a slow replica cannot convoy unrelated
@@ -7186,7 +7186,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.structural_reconcile_waiters > 0;
         }
 
-        fn deinit(self: *TableActivity) void {
+        pub fn deinit(self: *TableActivity) void {
             for (self.targeted_structural_reconcile_indexes.items) |*target| target.deinit();
             self.targeted_structural_reconcile_indexes.deinit(std.heap.page_allocator);
             for (self.publication_handoffs.items) |*handoff| handoff.deinit();
@@ -7201,7 +7201,7 @@ pub const ProvisionedTableWriteSource = struct {
         authority_token: ?runtime_status.TableRuntimeSnapshotCache.TargetedIndexTransitionToken,
         count: usize = 1,
 
-        fn deinit(self: *TargetedStatusFence) void {
+        pub fn deinit(self: *TargetedStatusFence) void {
             std.heap.page_allocator.free(self.index_name);
             self.* = undefined;
         }
@@ -7214,7 +7214,7 @@ pub const ProvisionedTableWriteSource = struct {
         producer_target_sequence: u64,
         requires_blocking: bool,
 
-        fn deinit(self: *PublicationHandoff) void {
+        pub fn deinit(self: *PublicationHandoff) void {
             std.heap.page_allocator.free(self.index_name);
             self.* = undefined;
         }
@@ -7334,7 +7334,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.open_locked = false;
         }
 
-        fn deinit(self: *WriteCacheTransitionLocks) void {
+        pub fn deinit(self: *WriteCacheTransitionLocks) void {
             self.releaseStateLocks();
             self.releaseOpenLocks();
         }
@@ -9379,7 +9379,7 @@ pub const ProvisionedTableWriteSource = struct {
                 work.source.maintainDroppedTableRecovery();
             }
 
-            fn deinit(ptr: *anyopaque) void {
+            pub fn deinit(ptr: *anyopaque) void {
                 const work: *@This() = @ptrCast(@alignCast(ptr));
                 std.heap.page_allocator.destroy(work);
             }
@@ -9432,7 +9432,7 @@ pub const ProvisionedTableWriteSource = struct {
                 work.source.drainDroppedTableRecoveryRequests();
             }
 
-            fn deinit(ptr: *anyopaque) void {
+            pub fn deinit(ptr: *anyopaque) void {
                 const work: *@This() = @ptrCast(@alignCast(ptr));
                 std.heap.page_allocator.destroy(work);
             }
@@ -11959,7 +11959,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.releaseReadExclusive();
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.preparation_open) {
                 self.source.endGroupGenerationPreparation(self.table_name, self.group_id);
                 self.preparation_open = false;
@@ -12002,7 +12002,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.releaseReadExclusive();
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.mutation_open) {
                 self.source.abortLocalTableGenerationTransitionMutation(self.table_name);
                 self.mutation_open = false;
@@ -17652,7 +17652,7 @@ pub const ProvisionedTableWriteSource = struct {
             return try db.restoreRuntimeRepairNeeded();
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const work: *@This() = @ptrCast(@alignCast(ptr));
             const alloc = work.alloc;
             alloc.free(work.table_name);
@@ -18323,7 +18323,7 @@ pub const ProvisionedTableWriteSource = struct {
                 };
             }
 
-            fn deinit(ptr: *anyopaque) void {
+            pub fn deinit(ptr: *anyopaque) void {
                 const work: *@This() = @ptrCast(@alignCast(ptr));
                 std.heap.page_allocator.destroy(work);
             }
@@ -20323,7 +20323,7 @@ pub const ProvisionedTableWriteSource = struct {
         return aggregate;
     }
 
-    fn putArtifactEnrichment(
+    pub fn putArtifactEnrichment(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -20351,7 +20351,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .structural);
     }
 
-    fn deleteArtifactEnrichment(
+    pub fn deleteArtifactEnrichment(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -20378,7 +20378,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .structural);
     }
 
-    fn createTable(
+    pub fn createTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -20661,7 +20661,7 @@ pub const ProvisionedTableWriteSource = struct {
         std.log.info("provisioned create table local done table={s}", .{table_name});
     }
 
-    fn updateSchema(
+    pub fn updateSchema(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -20843,7 +20843,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
     }
 
-    fn createIndex(
+    pub fn createIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -20866,7 +20866,7 @@ pub const ProvisionedTableWriteSource = struct {
         return {};
     }
 
-    fn dropIndex(
+    pub fn dropIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -21094,7 +21094,7 @@ pub const ProvisionedTableWriteSource = struct {
         self.notifyLocalChange(table_name, .structural);
     }
 
-    fn dropTable(
+    pub fn dropTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -21749,7 +21749,7 @@ pub const ProvisionedTableWriteSource = struct {
         return try executeBackupPinControl(alloc, &db, group_id, request, control);
     }
 
-    fn backupTable(
+    pub fn backupTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -21855,7 +21855,7 @@ pub const ProvisionedTableWriteSource = struct {
         return try copyPreparedNativeBackupShardSnapshot(alloc, &native_snapshot);
     }
 
-    fn restoreTable(
+    pub fn restoreTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -22177,7 +22177,7 @@ pub const ProvisionedTableWriteSource = struct {
         return {};
     }
 
-    fn commitTransaction(
+    pub fn commitTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
@@ -24174,7 +24174,7 @@ pub const ProvisionedTableWriteSource = struct {
         return {};
     }
 
-    fn reprocessDocumentArtifact(
+    pub fn reprocessDocumentArtifact(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -24187,7 +24187,7 @@ pub const ProvisionedTableWriteSource = struct {
         return try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name);
     }
 
-    fn reprocessDocumentArtifactRange(
+    pub fn reprocessDocumentArtifactRange(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -25913,7 +25913,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return cache.index_control_source.?;
     }
 
-    fn dropTable(
+    pub fn dropTable(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -25933,7 +25933,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return try cleanup.source().dropTable(alloc, table_name, contract);
     }
 
-    fn createIndex(
+    pub fn createIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -25976,7 +25976,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return {};
     }
 
-    fn putArtifactEnrichment(
+    pub fn putArtifactEnrichment(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -25996,7 +25996,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         self.invalidateManagedCache(table_name);
     }
 
-    fn deleteArtifactEnrichment(
+    pub fn deleteArtifactEnrichment(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -26012,7 +26012,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         self.invalidateManagedCache(table_name);
     }
 
-    fn dropIndex(
+    pub fn dropIndex(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -26166,7 +26166,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         }
     }
 
-    fn commitTransaction(
+    pub fn commitTransaction(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         tables: []const distributed_txn.TableCommitRequest,
@@ -26330,7 +26330,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return .{ .remote = .{ .node_id = node_id, .base_uri = uri } };
     }
 
-    fn backupTable(
+    pub fn backupTable(
         _: *anyopaque,
         _: std.mem.Allocator,
         _: []const u8,
@@ -26538,7 +26538,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 }
             };
 
-            const async_limit = @intFromEnum(io_impl.?.async_limit);
+            const async_limit = @backingInt(io_impl.?.async_limit);
             const scheduler_width = if (async_limit == 0)
                 @as(usize, 1)
             else if (async_limit == std.math.maxInt(usize))
@@ -26602,7 +26602,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return shards;
     }
 
-    fn restoreTable(
+    pub fn restoreTable(
         _: *anyopaque,
         _: std.mem.Allocator,
         _: []const u8,
@@ -26965,7 +26965,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return error.NotFound;
     }
 
-    fn reprocessDocumentArtifact(
+    pub fn reprocessDocumentArtifact(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -26993,7 +26993,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         return try reprocessDocumentArtifactGroupLocal(ptr, alloc, group_id, table_name, doc_key, artifact_name);
     }
 
-    fn reprocessDocumentArtifactRange(
+    pub fn reprocessDocumentArtifactRange(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -27584,7 +27584,7 @@ const GroupBatch = struct {
     deletes: std.ArrayListUnmanaged([]const u8) = .empty,
     transforms: std.ArrayListUnmanaged(db_mod.types.DocumentTransform) = .empty,
 
-    fn deinit(self: *GroupBatch, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GroupBatch, alloc: std.mem.Allocator) void {
         self.writes.deinit(alloc);
         self.deletes.deinit(alloc);
         self.transforms.deinit(alloc);
@@ -30336,7 +30336,7 @@ const StartupConfiguredIndex = struct {
     algebraic_skipped_complex_fields: u32 = 0,
     algebraic_skipped_unbounded_fields: u32 = 0,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         if (self.algebraic_capability_fingerprint) |value| alloc.free(value);
         if (self.algebraic_capability_lifecycle_status) |value| alloc.free(value);
@@ -30365,7 +30365,7 @@ const StartupConfiguredIndexes = struct {
     items: []StartupConfiguredIndex,
     has_generated_producers: bool = false,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.items) |*item| item.deinit(alloc);
         alloc.free(self.items);
         self.* = undefined;
@@ -32126,7 +32126,7 @@ const RaftSnapshotCatalogContract = struct {
     indexes_json: []u8,
     range: metadata_table_manager.RangeRecord,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         alloc.free(self.schema_json);
         alloc.free(self.indexes_json);
@@ -33345,7 +33345,7 @@ fn consumerTests() type {
                 .bytes_total = 4096,
                 .peak_bytes = 3072,
             };
-            archived.by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bulk_current_scan)] = .{
+            archived.by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bulk_current_scan)] = .{
                 .calls = 2,
                 .bytes_total = 4096,
                 .peak_bytes = 3072,
@@ -33378,7 +33378,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 4096), owners[0].maintenance.mutable_snapshot_clone_bytes_total);
             try std.testing.expectEqual(
                 @as(u64, 2),
-                owners[0].maintenance.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend.MutableSnapshotReason.bulk_current_scan)].calls,
+                owners[0].maintenance.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend.MutableSnapshotReason.bulk_current_scan)].calls,
             );
 
             const AllocationRunner = struct {
@@ -33624,7 +33624,7 @@ fn consumerTests() type {
                 defer store.deinit();
                 var manager = try transactions_mod.TxnManager.init(alloc, &store);
                 defer manager.deinit();
-                const txn_id: transactions_mod.TxnId = .{7} ** 16;
+                const txn_id: transactions_mod.TxnId = @splat(7);
                 try manager.initTransactionWithParticipantsCreatedAtAndRole(txn_id, now_ns, now_ns, &.{}, true);
 
                 const fresh = try @import("../storage/server_transaction_recovery.zig").recoverOnce(alloc, &store, config);
@@ -35407,7 +35407,7 @@ fn consumerTests() type {
                     self.finish_count += 1;
                 }
 
-                fn restoreTable(
+                pub fn restoreTable(
                     ptr: *anyopaque,
                     _: std.mem.Allocator,
                     _: []const u8,
@@ -36225,7 +36225,7 @@ fn consumerTests() type {
                 ProvisionedTableWriteSource.max_structural_reconcile_requests,
             );
             for (0..ProvisionedTableWriteSource.max_structural_reconcile_requests) |offset| {
-                var key = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+                var key = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
                 std.mem.writeInt(u64, key[0..@sizeOf(u64)], offset, .little);
                 source.structural_reconcile_keys.putAssumeCapacity(key, .active);
             }
@@ -36259,7 +36259,7 @@ fn consumerTests() type {
                 source.structural_reconcile_committed_watermark.?.state,
             );
 
-            var retired_key = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+            var retired_key = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
             std.mem.writeInt(u64, retired_key[0..@sizeOf(u64)], 0, .little);
             try std.testing.expect(source.structural_reconcile_keys.remove(retired_key));
             try std.testing.expect(try source.enqueueCommittedTableIndexStructuralReconcile(
@@ -36490,7 +36490,7 @@ fn consumerTests() type {
             var ring: ProvisionedTableWriteSource.CompletedIndexActivationRing = .{};
             defer ring.deinit(alloc);
             try ring.ensureTotalCapacity(alloc, 3);
-            var first = [_]u8{0} ** std.crypto.hash.sha2.Sha256.digest_length;
+            var first = @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
             var second = first;
             var third = first;
             var fourth = first;
@@ -38852,7 +38852,7 @@ fn consumerTests() type {
                     std.testing.allocator,
                     7001,
                     "entities",
-                    [_]u8{1} ** 16,
+                    @as([16]u8, @splat(1)),
                     .committed,
                     1,
                     0,
@@ -38887,7 +38887,7 @@ fn consumerTests() type {
                     while (!self.release.load(.acquire)) std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
                 }
 
-                fn deinit(ptr: *anyopaque) void {
+                pub fn deinit(ptr: *anyopaque) void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     _ = self.deinits.fetchAdd(1, .acq_rel);
                 }
@@ -59593,7 +59593,7 @@ fn implementationTests() type {
             // Corrupt that selected root rather than the now-unused canonical path.
             const dense_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ path, active_relative_path.? });
             defer alloc.free(dense_path);
-            const dense_path_z = try alloc.dupeZ(u8, dense_path);
+            const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
             defer alloc.free(dense_path_z);
             {
                 var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -60146,11 +60146,11 @@ fn implementationTests() type {
 
             const ha_log_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-clear-drain-log", .{tmp.sub_path});
             defer alloc.free(ha_log_path_raw);
-            const replication_log_path = try alloc.dupeZ(u8, ha_log_path_raw);
+            const replication_log_path = try alloc.dupeSentinel(u8, ha_log_path_raw, 0);
             defer alloc.free(replication_log_path);
             const ha_slots_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-clear-drain-slots", .{tmp.sub_path});
             defer alloc.free(ha_slots_path_raw);
-            const replication_slots_path = try alloc.dupeZ(u8, ha_slots_path_raw);
+            const replication_slots_path = try alloc.dupeSentinel(u8, ha_slots_path_raw, 0);
             defer alloc.free(replication_slots_path);
             var primary = try hot_standby_primary_mod.Primary.open(alloc, replication_log_path.ptr, replication_slots_path.ptr, .{
                 .cluster_id = 700,
@@ -60225,11 +60225,11 @@ fn implementationTests() type {
             });
             const primary_log_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-generation-primary-log", .{tmp.sub_path});
             defer alloc.free(primary_log_path_raw);
-            const primary_log_path = try alloc.dupeZ(u8, primary_log_path_raw);
+            const primary_log_path = try alloc.dupeSentinel(u8, primary_log_path_raw, 0);
             defer alloc.free(primary_log_path);
             const primary_slots_path_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/write-cache-ha-generation-primary-slots", .{tmp.sub_path});
             defer alloc.free(primary_slots_path_raw);
-            const primary_slots_path = try alloc.dupeZ(u8, primary_slots_path_raw);
+            const primary_slots_path = try alloc.dupeSentinel(u8, primary_slots_path_raw, 0);
             defer alloc.free(primary_slots_path);
             var promoted_primary = try hot_standby_primary_mod.Primary.open(alloc, primary_log_path.ptr, primary_slots_path.ptr, .{
                 .cluster_id = 700,
@@ -61351,11 +61351,11 @@ fn implementationTests() type {
 
             const primary_log_path_raw = try std.fmt.allocPrint(alloc, "{s}/primary-log", .{replica_root_dir});
             defer alloc.free(primary_log_path_raw);
-            const primary_log_path = try alloc.dupeZ(u8, primary_log_path_raw);
+            const primary_log_path = try alloc.dupeSentinel(u8, primary_log_path_raw, 0);
             defer alloc.free(primary_log_path);
             const primary_slots_path_raw = try std.fmt.allocPrint(alloc, "{s}/primary-slots", .{replica_root_dir});
             defer alloc.free(primary_slots_path_raw);
-            const primary_slots_path = try alloc.dupeZ(u8, primary_slots_path_raw);
+            const primary_slots_path = try alloc.dupeSentinel(u8, primary_slots_path_raw, 0);
             defer alloc.free(primary_slots_path);
             var primary = try hot_standby_primary_mod.Primary.open(alloc, primary_log_path.ptr, primary_slots_path.ptr, .{
                 .cluster_id = 700,
@@ -62238,7 +62238,7 @@ fn implementationTests() type {
             };
 
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+            budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
                 .soft_limit_bytes = 1,
                 .hard_limit_bytes = 1,
             };

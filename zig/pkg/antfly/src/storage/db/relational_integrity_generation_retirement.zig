@@ -679,7 +679,7 @@ pub fn prepareGcPage(alloc: std.mem.Allocator, txn: anytype, max_records: usize,
     var deletions: std.ArrayList(GcRecord) = .empty;
     var prefix: [integrity.namespace.len + 1]u8 = undefined;
     @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
-    prefix[integrity.namespace.len] = @intFromEnum(integrity.Kind.reference);
+    prefix[integrity.namespace.len] = @backingInt(integrity.Kind.reference);
     var cursor = try txn.openCursor();
     defer cursor.close();
     const scan_prefix: []const u8 = if (progress.tombstones) active_prefix else &prefix;
@@ -739,7 +739,7 @@ pub fn applyGcPage(txn: anytype, page: anytype) !void {
     }
     var prefix: [integrity.namespace.len + 1]u8 = undefined;
     @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
-    prefix[integrity.namespace.len] = @intFromEnum(integrity.Kind.reference);
+    prefix[integrity.namespace.len] = @backingInt(integrity.Kind.reference);
     var cursor = try txn.openCursor();
     defer cursor.close();
     const scan_prefix: []const u8 = if (before.tombstones) active_prefix else &prefix;

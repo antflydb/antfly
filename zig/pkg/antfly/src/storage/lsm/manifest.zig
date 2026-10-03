@@ -417,7 +417,7 @@ pub fn decodeBorrowedOwnedAlloc(allocator: std.mem.Allocator, raw: []u8) anyerro
 
 pub fn borrowedRunMeta(run: BorrowedRunMeta) RunMeta {
     var out: RunMeta = undefined;
-    inline for (@typeInfo(RunMeta).@"struct".fields) |field| @field(out, field.name) = @field(run, field.name);
+    inline for (comptime std.meta.fieldNames(RunMeta)) |reflected_name| @field(out, reflected_name) = @field(run, reflected_name);
     return out;
 }
 

@@ -640,7 +640,7 @@ fn tempTestAflitePath(alloc: Allocator, root: []const u8, label: []const u8) ![:
     defer alloc.free(base);
     const path = try std.fmt.allocPrint(alloc, "{s}.aflite", .{base});
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 const lite_restore_options = capi.OpenOptions{ .storage_kind = capi.storage_kind_lite };
@@ -686,7 +686,7 @@ const JsonWritePair = struct {
         };
     }
 
-    fn deinit(self: *JsonWritePair, alloc: Allocator) void {
+    pub fn deinit(self: *JsonWritePair, alloc: Allocator) void {
         alloc.free(self.key_b64);
         alloc.free(self.value_b64);
         self.* = undefined;
@@ -1132,7 +1132,7 @@ test "storage HA seed boundary preserves status and exact failure identity" {
     try std.testing.expectEqual(kernel_owner_abi.Status.invalid_abi, status);
     try std.testing.expectEqual(status, failure.status);
     try std.testing.expectEqual(kernel_owner_abi.FailureBoundary.storage_owner, failure.boundary);
-    try std.testing.expectEqual(@intFromEnum(kernel_owner_abi.HASeedOperation.activate), failure.operation);
+    try std.testing.expectEqual(@backingInt(kernel_owner_abi.HASeedOperation.activate), failure.operation);
     try std.testing.expectEqualStrings("InvalidAbiVersion", failure.errorName());
     try kernel_error_identity.validateFailureEnvelope(status, &failure, kernel_owner_abi.abi_version);
     try std.testing.expectEqual(@as(u64, 0), response.len);
@@ -1397,7 +1397,7 @@ test "capi transaction lifecycle" {
     const txn_id: [16]u8 = .{ 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_begin_transaction_with_id(handle_ptr, null, 1_000, null, 0));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_write_transaction(handle_ptr, null, null, 0, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_resolve_intents(handle_ptr, null, @intFromEnum(transactions_mod.TxnStatus.committed), 2_000));
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_resolve_intents(handle_ptr, null, @backingInt(transactions_mod.TxnStatus.committed), 2_000));
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, &txn_id, null));
     var reset_status: u8 = 99;
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_get_transaction_status(handle_ptr, null, &reset_status));
@@ -1417,11 +1417,11 @@ test "capi transaction lifecycle" {
         },
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_write_transaction(handle_ptr, &txn_id, &writes, writes.len, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(handle_ptr, &txn_id, @intFromEnum(transactions_mod.TxnStatus.committed), 2_000));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(handle_ptr, &txn_id, @backingInt(transactions_mod.TxnStatus.committed), 2_000));
 
     var status: u8 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_transaction_status(handle_ptr, &txn_id, &status));
-    try std.testing.expectEqual(@as(u8, @intFromEnum(transactions_mod.TxnStatus.committed)), status);
+    try std.testing.expectEqual(@as(u8, @backingInt(transactions_mod.TxnStatus.committed)), status);
 
     var commit_version: u64 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(handle_ptr, &txn_id, &commit_version));
@@ -1957,12 +1957,12 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     defer cleanupTestFile(invalid_snapshot_file_path);
 
     try std.testing.expectEqual(@as(u32, 2), antfly_abi_version());
-    try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.ok))));
-    try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.invalid_argument))));
-    try std.testing.expectEqualStrings("ANTFLY_OUTCOME_UNKNOWN", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.outcome_unknown))));
-    try std.testing.expectEqualStrings("ANTFLY_UNSUPPORTED", std.mem.span(antfly_error_code_name(@intFromEnum(capi.ErrorCode.unsupported))));
+    try std.testing.expectEqualStrings("ANTFLY_OK", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.ok))));
+    try std.testing.expectEqualStrings("ANTFLY_INVALID_ARGUMENT", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.invalid_argument))));
+    try std.testing.expectEqualStrings("ANTFLY_OUTCOME_UNKNOWN", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.outcome_unknown))));
+    try std.testing.expectEqualStrings("ANTFLY_UNSUPPORTED", std.mem.span(antfly_error_code_name(@backingInt(capi.ErrorCode.unsupported))));
     try std.testing.expectEqualStrings("ANTFLY_UNKNOWN_ERROR", std.mem.span(antfly_error_code_name(12345)));
-    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@intFromEnum(capi.ErrorCode.busy))), "retry") != null);
+    try std.testing.expect(std.mem.indexOf(u8, std.mem.span(antfly_error_code_description(@backingInt(capi.ErrorCode.busy))), "retry") != null);
     try std.testing.expectEqualStrings("unknown Antfly error code", std.mem.span(antfly_error_code_description(12345)));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.FileBusy));
     try std.testing.expectEqual(capi.ErrorCode.busy, capi.mapError(error.WriterLocked));
@@ -2335,10 +2335,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .is_delete = false,
     }};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_write_transaction(src_handle, &lite_txn_id, &txn_writes, txn_writes.len, null, 0));
-    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(src_handle, &lite_txn_id, @intFromEnum(transactions_mod.TxnStatus.committed), 4_000));
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_resolve_intents(src_handle, &lite_txn_id, @backingInt(transactions_mod.TxnStatus.committed), 4_000));
     var lite_txn_status: u8 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_transaction_status(src_handle, &lite_txn_id, &lite_txn_status));
-    try std.testing.expectEqual(@as(u8, @intFromEnum(transactions_mod.TxnStatus.committed)), lite_txn_status);
+    try std.testing.expectEqual(@as(u8, @backingInt(transactions_mod.TxnStatus.committed)), lite_txn_status);
     var lite_txn_commit_version: u64 = 0;
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_commit_version(src_handle, &lite_txn_id, &lite_txn_commit_version));
     try std.testing.expectEqual(@as(u64, 4_000), lite_txn_commit_version);
@@ -2576,7 +2576,7 @@ test "capi lite opens exports imports checks and vacuums aflite" {
         .format_version = backup_codec.format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = [_]u8{0} ** 16,
+        .backup_id = @as([16]u8, @splat(0)),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -3195,7 +3195,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .reserved0 = 1,
         .inference_host_budget_mb = 1,
         .busy_timeout_ms = 1,
-        .reserved = .{1} ** 8,
+        .reserved = @splat(1),
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_open_options_init(&generic_defaults));
     try std.testing.expectEqual(@as(u32, @sizeOf(capi.OpenOptions)), generic_defaults.abi_size);
@@ -3228,7 +3228,7 @@ test "capi lite open options validate and configure ttl cleanup" {
         .open_mode = capi.open_mode_readonly,
         .profile = capi.profile_native,
         .flags = std.math.maxInt(u32),
-        .reserved = .{1} ** 8,
+        .reserved = @splat(1),
     };
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_create_with_options(path, &defaults, &default_handle));
     antfly_db_close(default_handle);
@@ -3668,7 +3668,7 @@ test "capi request paths trigger readable lease hook" {
     cleanupTestDir(path);
 
     const Recorder = struct {
-        contexts: [9][32]u8 = [_][32]u8{[_]u8{0} ** 32} ** 9,
+        contexts: [9][32]u8 = @as([9][32]u8, @splat(@as([32]u8, @splat(0)))),
         context_lens: [9]usize = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         group_ids: [9]u64 = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         count: usize = 0,
@@ -3856,8 +3856,8 @@ test "capi relational expression errors preserve public status semantics" {
     // Keep the public C error mapping aligned without importing schema source
     // across the standalone C ABI module's directory boundary.
     const expression_errors = antfly.capi_dependencies.relational_expression_errors;
-    inline for (@typeInfo(expression_errors.Error).error_set.?) |field| {
-        const err = @field(expression_errors.Error, field.name);
+    inline for (@typeInfo(expression_errors.Error).error_set.error_names.?) |field| {
+        const err = @field(expression_errors.Error, field);
         try std.testing.expectEqual(if (expression_errors.isInvalidInput(err)) capi.ErrorCode.invalid_argument else capi.ErrorCode.intent_conflict, capi.mapError(err));
     }
 }
@@ -4262,7 +4262,7 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
         fn acknowledge(ptr: ?*anyopaque, txn: *const kernel_owner_abi.TxnId, owner: kernel_owner_abi.BorrowedBytes, items: ?[*]const kernel_owner_abi.BorrowedBytes, len: usize) callconv(.c) kernel_owner_abi.Status {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
             self.calls += 1;
-            std.testing.expectEqual([_]u8{5} ** 16, txn.bytes) catch return .internal;
+            std.testing.expectEqual(@as([16]u8, @splat(5)), txn.bytes) catch return .internal;
             std.testing.expectEqualStrings("owner", owner.slice()) catch return .internal;
             std.testing.expectEqual(@as(usize, 2), len) catch return .internal;
             std.testing.expectEqualStrings("first", items.?[0].slice()) catch return .internal;

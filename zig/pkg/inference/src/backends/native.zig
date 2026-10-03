@@ -158,7 +158,7 @@ pub fn sgemmTransBStrided(
 test "sgemmTransBStrided preserves padding offsets and beta" {
     const a = [_]f32{ 1, -2, 3, 4, 5, -6 };
     const b = [_]f32{ 1, 2, 3, -4, 5, 6, 7, 8, -9 };
-    var output = [_]f32{17} ** 13;
+    var output = @as([13]f32, @splat(17));
     try sgemmTransBStrided(null, 2, 3, 3, 0.5, &a, &b, 0.25, output[1..], 6);
     for (0..2) |row| {
         for (0..3) |column| {

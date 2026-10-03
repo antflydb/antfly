@@ -186,7 +186,7 @@ pub const Fence = struct {
             return error.InvalidIntegrityTopologyFence;
         var bytes: [136]u8 = @splat(0);
         @memcpy(bytes[0..4], "AIT1");
-        bytes[4] = @intFromEnum(self.role);
+        bytes[4] = @backingInt(self.role);
         std.mem.writeInt(u64, bytes[8..16], self.transition_id, .little);
         std.mem.writeInt(u64, bytes[16..24], self.attempt, .little);
         std.mem.writeInt(u64, bytes[24..32], self.peer_group_id, .little);

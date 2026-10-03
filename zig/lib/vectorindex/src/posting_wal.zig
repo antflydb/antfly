@@ -249,7 +249,7 @@ fn finishReplacementPatchHeader(
     std.debug.assert(header.len == replacement_patch_header_len);
     @memcpy(header[0..4], &replacement_patch_magic);
     header[4] = replacement_patch_version;
-    header[5] = @intFromEnum(target);
+    header[5] = @backingInt(target);
     @memset(header[6..8], 0);
     std.mem.writeInt(u32, header[8..12], @intCast(base.len), .big);
     std.mem.writeInt(u32, header[12..16], @intCast(replacement.len), .big);
@@ -283,13 +283,13 @@ pub fn applyReplacementPatchAlloc(
     if (payload[4] != replacement_patch_version) return error.UnsupportedPostingPatchVersion;
     if (payload[6] != 0 or payload[7] != 0) return error.UnsupportedPostingPatchFlags;
     const target: RecordKind = switch (payload[5]) {
-        @intFromEnum(RecordKind.base) => .base,
-        @intFromEnum(RecordKind.quantized_checkpoint) => .quantized_checkpoint,
-        @intFromEnum(RecordKind.posting_state) => .posting_state,
-        @intFromEnum(RecordKind.node_range) => .node_range,
-        @intFromEnum(RecordKind.vector_leaf) => .vector_leaf,
-        @intFromEnum(RecordKind.vector_metadata) => .vector_metadata,
-        @intFromEnum(RecordKind.index_metadata) => .index_metadata,
+        @backingInt(RecordKind.base) => .base,
+        @backingInt(RecordKind.quantized_checkpoint) => .quantized_checkpoint,
+        @backingInt(RecordKind.posting_state) => .posting_state,
+        @backingInt(RecordKind.node_range) => .node_range,
+        @backingInt(RecordKind.vector_leaf) => .vector_leaf,
+        @backingInt(RecordKind.vector_metadata) => .vector_metadata,
+        @backingInt(RecordKind.index_metadata) => .index_metadata,
         else => return error.InvalidPostingPatchTarget,
     };
     const base_len: usize = @intCast(std.mem.readInt(u32, payload[8..12], .big));
@@ -608,7 +608,7 @@ fn isLookupValueKind(kind: RecordKind) bool {
 }
 
 fn postingKindKey(posting_id: PostingId, kind: RecordKind) u128 {
-    return (@as(u128, posting_id) << 8) | @intFromEnum(kind);
+    return (@as(u128, posting_id) << 8) | @backingInt(kind);
 }
 
 fn tombstoneTarget(kind: RecordKind) ?RecordKind {
@@ -665,7 +665,7 @@ fn appendFrame(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), record: Recor
     std.mem.writeInt(u16, frame[6..8], frame_header_len, .big);
     std.mem.writeInt(u32, frame[8..12], @intCast(total_len), .big);
     @memset(frame[checksum_offset..checksum_body_offset], 0);
-    frame[16] = @intFromEnum(record.kind);
+    frame[16] = @backingInt(record.kind);
     @memset(frame[17..24], 0);
     std.mem.writeInt(u64, frame[24..32], record.batch_id, .big);
     std.mem.writeInt(u64, frame[32..40], record.posting_id, .big);
@@ -690,26 +690,26 @@ fn decodeFrame(bytes: []const u8) !?DecodedFrame {
     }
     for (frame[17..24]) |reserved| if (reserved != 0) return error.UnsupportedPostingWalFlags;
     const kind: RecordKind = switch (frame[16]) {
-        @intFromEnum(RecordKind.base) => .base,
-        @intFromEnum(RecordKind.mutation) => .mutation,
-        @intFromEnum(RecordKind.centroid_directory) => .centroid_directory,
-        @intFromEnum(RecordKind.quantized_checkpoint) => .quantized_checkpoint,
-        @intFromEnum(RecordKind.tombstone) => .tombstone,
-        @intFromEnum(RecordKind.posting_state) => .posting_state,
-        @intFromEnum(RecordKind.base_tombstone) => .base_tombstone,
-        @intFromEnum(RecordKind.quantized_checkpoint_tombstone) => .quantized_checkpoint_tombstone,
-        @intFromEnum(RecordKind.posting_state_tombstone) => .posting_state_tombstone,
-        @intFromEnum(RecordKind.coverage) => .coverage,
-        @intFromEnum(RecordKind.node_range) => .node_range,
-        @intFromEnum(RecordKind.vector_leaf) => .vector_leaf,
-        @intFromEnum(RecordKind.vector_metadata) => .vector_metadata,
-        @intFromEnum(RecordKind.index_metadata) => .index_metadata,
-        @intFromEnum(RecordKind.node_range_tombstone) => .node_range_tombstone,
-        @intFromEnum(RecordKind.vector_leaf_tombstone) => .vector_leaf_tombstone,
-        @intFromEnum(RecordKind.vector_metadata_tombstone) => .vector_metadata_tombstone,
-        @intFromEnum(RecordKind.index_metadata_tombstone) => .index_metadata_tombstone,
-        @intFromEnum(RecordKind.row_chunk) => .row_chunk,
-        @intFromEnum(RecordKind.commit) => .commit,
+        @backingInt(RecordKind.base) => .base,
+        @backingInt(RecordKind.mutation) => .mutation,
+        @backingInt(RecordKind.centroid_directory) => .centroid_directory,
+        @backingInt(RecordKind.quantized_checkpoint) => .quantized_checkpoint,
+        @backingInt(RecordKind.tombstone) => .tombstone,
+        @backingInt(RecordKind.posting_state) => .posting_state,
+        @backingInt(RecordKind.base_tombstone) => .base_tombstone,
+        @backingInt(RecordKind.quantized_checkpoint_tombstone) => .quantized_checkpoint_tombstone,
+        @backingInt(RecordKind.posting_state_tombstone) => .posting_state_tombstone,
+        @backingInt(RecordKind.coverage) => .coverage,
+        @backingInt(RecordKind.node_range) => .node_range,
+        @backingInt(RecordKind.vector_leaf) => .vector_leaf,
+        @backingInt(RecordKind.vector_metadata) => .vector_metadata,
+        @backingInt(RecordKind.index_metadata) => .index_metadata,
+        @backingInt(RecordKind.node_range_tombstone) => .node_range_tombstone,
+        @backingInt(RecordKind.vector_leaf_tombstone) => .vector_leaf_tombstone,
+        @backingInt(RecordKind.vector_metadata_tombstone) => .vector_metadata_tombstone,
+        @backingInt(RecordKind.index_metadata_tombstone) => .index_metadata_tombstone,
+        @backingInt(RecordKind.row_chunk) => .row_chunk,
+        @backingInt(RecordKind.commit) => .commit,
         else => return error.InvalidPostingWalRecord,
     };
     return .{
@@ -752,9 +752,9 @@ pub const Checkpoint = struct {
     wal_committed_bytes: u64,
     covered_source_sequence: u64,
     delta_segment_count: u8 = 0,
-    delta_segments: [max_delta_segments]Segment = [_]Segment{.{}} ** max_delta_segments,
+    delta_segments: [max_delta_segments]Segment = @as([max_delta_segments]Segment, @splat(.{})),
     sealed_wal_count: u8 = 0,
-    sealed_wals: [max_sealed_wals]SealedWal = [_]SealedWal{.{}} ** max_sealed_wals,
+    sealed_wals: [max_sealed_wals]SealedWal = @as([max_sealed_wals]SealedWal, @splat(.{})),
 
     pub fn sealedWalBytes(self: Checkpoint) u64 {
         var bytes: u64 = 0;

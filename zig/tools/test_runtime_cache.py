@@ -151,7 +151,7 @@ class RuntimeCacheTest(unittest.TestCase):
             if unit == "storage_kernel"
             else f"antfly-runtime-{unit}"
         )
-        self.assertRegex(output, rf"compile lib {name} Debug \S+ {status}")
+        self.assertRegex(output, rf"compile lib {name} debug \S+ {status}")
 
     def assert_archives(self, output, rebuilt=()):
         for unit in UNITS:
@@ -311,9 +311,9 @@ class RuntimeCacheTest(unittest.TestCase):
         )
         changed = self.build(*targets)
         self.assert_archives(changed)
-        self.assertRegex(changed, r"compile test Debug \S+ success")
+        self.assertRegex(changed, r"compile test debug \S+ success")
         self.assertIn("VOPR_REVISION 2", changed)
-        self.assertRegex(self.build(*targets), r"compile test Debug \S+ cached")
+        self.assertRegex(self.build(*targets), r"compile test debug \S+ cached")
         # The package can still configure its test artifacts without reading
         # their source; only building the simulation consumer needs that file.
         source.unlink()
@@ -336,7 +336,7 @@ class RuntimeCacheTest(unittest.TestCase):
             with self.subTest(settings=settings):
                 changed = self.build(*targets, settings=settings)
                 self.assert_archives(changed)
-                self.assertRegex(changed, r"compile test Debug \S+ success")
+                self.assertRegex(changed, r"compile test debug \S+ success")
                 self.assertIn(expected, changed)
         self.assert_archives(self.build(*targets))
         source.write_bytes(
@@ -347,9 +347,9 @@ class RuntimeCacheTest(unittest.TestCase):
         )
         changed = self.build(*targets)
         self.assert_archives(changed)
-        self.assertRegex(changed, r"compile test Debug \S+ success")
+        self.assertRegex(changed, r"compile test debug \S+ success")
         self.assertIn("LMDB_PROBE zig false 2", changed)
-        self.assertRegex(self.build(*targets), r"compile test Debug \S+ cached")
+        self.assertRegex(self.build(*targets), r"compile test debug \S+ cached")
         source.unlink()
         self.assert_archives(self.build("cache-probe"))
         self.assertIn("FileNotFound", self.build("cache-lmdb-tests", succeeds=False))
@@ -369,7 +369,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     if standalone:
                         status = "success" if rebuilt else "cached"
                         self.assertRegex(
-                            output, rf"compile exe antfly-inference Debug \S+ {status}"
+                            output, rf"compile exe antfly-inference debug \S+ {status}"
                         )
                     else:
                         self.assert_archives(
@@ -383,7 +383,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 changed = self.build(*targets)
                 assert_product(changed)
-                self.assertRegex(changed, r"compile test Debug \S+ success")
+                self.assertRegex(changed, r"compile test debug \S+ success")
                 self.assertIn("PJRT_REVISION 2", changed)
                 enabled = ("-Dpjrt=true",)
                 assert_product(self.build(*targets, settings=enabled), rebuilt=True)
@@ -469,7 +469,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 self.build(target)
                 self.assertRegex(
-                    self.build(target), rf"compile {artifact} Debug \S+ cached"
+                    self.build(target), rf"compile {artifact} debug \S+ cached"
                 )
 
                 # Compatibility sources are available for an explicit caller to
@@ -480,7 +480,7 @@ class RuntimeCacheTest(unittest.TestCase):
                         compat.read_bytes() + b"\n// unused compatibility edit\n"
                     )
                 self.assertRegex(
-                    self.build(target), rf"compile {artifact} Debug \S+ cached"
+                    self.build(target), rf"compile {artifact} debug \S+ cached"
                 )
 
                 for name in ("prometheus", "structlog"):
@@ -492,12 +492,12 @@ class RuntimeCacheTest(unittest.TestCase):
                         )
                         source.write_bytes(contents)
                         self.assertRegex(
-                            self.build(target), rf"compile {artifact} Debug \S+ success"
+                            self.build(target), rf"compile {artifact} debug \S+ success"
                         )
                         source.unlink()
                         self.build("--help")
                         self.assertIn(
-                            "BENCH_PROFILE Debug Debug",
+                            "BENCH_PROFILE debug debug",
                             self.build("cache-antfly-inference-audio-bench"),
                         )
                         failure = self.build(target, succeeds=False)
@@ -505,7 +505,7 @@ class RuntimeCacheTest(unittest.TestCase):
                         self.assertNotIn("panic:", failure)
                         source.write_bytes(contents)
                         self.assertRegex(
-                            self.build(target), rf"compile {artifact} Debug \S+ cached"
+                            self.build(target), rf"compile {artifact} debug \S+ cached"
                         )
 
     def test_optional_onnx_dependencies(self):
@@ -521,7 +521,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.use_standalone()
                 self.build("--help", settings=settings)
                 self.assertIn(
-                    "BENCH_PROFILE Debug Debug",
+                    "BENCH_PROFILE debug debug",
                     self.build("cache-antfly-inference-audio-bench", settings=settings),
                 )
                 if not standalone:
@@ -548,7 +548,7 @@ class RuntimeCacheTest(unittest.TestCase):
         for standalone in (False, True):
             if standalone:
                 self.use_standalone()
-            for mode in ("Debug", "ReleaseFast"):
+            for mode in ("debug", "fast"):
                 with self.subTest(standalone=standalone, mode=mode):
                     settings = (f"-Doptimize={mode}",)
                     output = self.build(*targets, settings=settings)
@@ -563,9 +563,9 @@ class RuntimeCacheTest(unittest.TestCase):
                         )
             # All import graphs are inspected, including foreign artifacts and
             # explicit profiles such as the isolated PDF build and WASM.
-            settings = ("-Doptimize=ReleaseSafe", "-Dtarget=x86_64-linux-musl")
+            settings = ("-Doptimize=safe", "-Dtarget=x86_64-linux-musl")
             if not standalone:
-                settings += ("-Dpdf-optimize=Debug",)
+                settings += ("-Dpdf-optimize=debug",)
             self.build("--help", settings=settings)
 
     def test_native_compute_benchmark_contracts(self):
@@ -576,7 +576,7 @@ class RuntimeCacheTest(unittest.TestCase):
             for name in names:
                 self.assertRegex(
                     output,
-                    rf"compile exe antfly-inference-{name}-bench Debug \S+ {status}",
+                    rf"compile exe antfly-inference-{name}-bench debug \S+ {status}",
                 )
             self.assertIn("backend=native", output)
             self.assertIn("optimizer_len=64", output)
@@ -637,15 +637,15 @@ class RuntimeCacheTest(unittest.TestCase):
         changed = self.build(*targets, version="cache-after")
         self.assertIn("TRAINING_VERSION cache-after", changed)
         self.assertRegex(
-            changed, r"compile exe generate-gemma4-pilot-dataset Debug \S+ cached"
+            changed, r"compile exe generate-gemma4-pilot-dataset debug \S+ cached"
         )
         self.assertRegex(
-            changed, r"compile exe train-gliner2-autodiff Debug \S+ success"
+            changed, r"compile exe train-gliner2-autodiff debug \S+ success"
         )
         self.assertEqual(files[0].read_bytes(), before)
         self.assertRegex(
             self.build(*targets, version="cache-after"),
-            r"compile exe train-gliner2-autodiff Debug \S+ cached",
+            r"compile exe train-gliner2-autodiff debug \S+ cached",
         )
 
     def test_finetune_data_dependencies(self):
@@ -659,7 +659,7 @@ class RuntimeCacheTest(unittest.TestCase):
         def check(output, rebuilt=()):
             for name in names:
                 status = "success" if name in rebuilt else "cached"
-                self.assertRegex(output, rf"compile exe {name} Debug \S+ {status}")
+                self.assertRegex(output, rf"compile exe {name} debug \S+ {status}")
 
         for standalone in (False, True):
             with self.subTest(standalone=standalone):
@@ -715,7 +715,7 @@ class RuntimeCacheTest(unittest.TestCase):
             self.assertEqual(len(names), len(set(names)))
             for name in names:
                 status = "success" if cold or name in rebuilt else "cached"
-                self.assertRegex(output, rf"compile exe {name} Debug \S+ {status}")
+                self.assertRegex(output, rf"compile exe {name} debug \S+ {status}")
 
         def write_tensors(path, tensors):
             header, data = {}, b""
@@ -1183,7 +1183,7 @@ class RuntimeCacheTest(unittest.TestCase):
         )
         self.build(
             "cache-vopr-memory",
-            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=safe"),
         )
         project = self.root / "zig/project_build.zig"
         contents = project.read_text()
@@ -1193,7 +1193,7 @@ class RuntimeCacheTest(unittest.TestCase):
         project.write_text(contents.replace(anchor, injection + "\n" + anchor))
         failure = self.build(
             "cache-vopr-memory",
-            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=safe"),
             succeeds=False,
         )
         self.assertIn("unbudgeted VOPR work", failure)
@@ -1205,7 +1205,7 @@ class RuntimeCacheTest(unittest.TestCase):
         tests.write_text(source.replace(selection, ".filters = &.{},"))
         failure = self.build(
             "cache-vopr-memory",
-            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=ReleaseSafe"),
+            settings=("-Dtarget=x86_64-linux-gnu", "-Doptimize=safe"),
             succeeds=False,
         )
         self.assertIn("VOPR command build includes unrelated unit tests", failure)
@@ -1220,11 +1220,11 @@ class RuntimeCacheTest(unittest.TestCase):
         self.build("cache-wasm")
         for settings in (
             (),
-            ("-Doptimize=ReleaseFast",),
+            ("-Doptimize=fast",),
             ("-Dlite-local-inference-runtime=true",),
             (
                 "-Dtarget=x86_64-linux-musl",
-                "-Doptimize=ReleaseFast",
+                "-Doptimize=fast",
                 "-Dlmdb_evented_async_io=true",
             ),
         ):
@@ -1232,7 +1232,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 result = self.build("cache-wasm", settings=settings)
                 self.assertRegex(
                     result,
-                    r"compile exe antfly_wasm ReleaseSafe wasm32-freestanding cached",
+                    r"compile exe antfly_wasm safe wasm32-freestanding cached",
                 )
 
     def test_inference_wasm_dependencies(self):
@@ -1242,7 +1242,7 @@ class RuntimeCacheTest(unittest.TestCase):
                     self.use_standalone()
                 base = ("-Dwasm=true",) if standalone else ()
                 self.build("cache-inference-wasm", settings=base)
-                settings_to_check = [(), ("-Doptimize=ReleaseFast",)]
+                settings_to_check = [(), ("-Doptimize=fast",)]
                 if standalone:
                     settings_to_check += [
                         ("-Denable-native-quant-dispatch-stats=true",),
@@ -1256,14 +1256,14 @@ class RuntimeCacheTest(unittest.TestCase):
                     )
                     self.assertRegex(
                         output,
-                        r"compile exe antfly-inference-wasm32 ReleaseSafe wasm32-freestanding cached",
+                        r"compile exe antfly-inference-wasm32 safe wasm32-freestanding cached",
                     )
                 output = self.build(
                     "cache-inference-wasm", version="unrelated-version", settings=base
                 )
                 self.assertRegex(
                     output,
-                    r"compile exe antfly-inference-wasm32 ReleaseSafe wasm32-freestanding cached",
+                    r"compile exe antfly-inference-wasm32 safe wasm32-freestanding cached",
                 )
                 # Positive controls: supported browser settings still rebuild.
                 output = self.build(
@@ -1271,7 +1271,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 self.assertRegex(
                     output,
-                    r"compile exe antfly-inference-wasm32 ReleaseSafe wasm32-freestanding success",
+                    r"compile exe antfly-inference-wasm32 safe wasm32-freestanding success",
                 )
                 output = self.build(
                     "cache-inference-wasm",
@@ -1279,7 +1279,7 @@ class RuntimeCacheTest(unittest.TestCase):
                 )
                 self.assertRegex(
                     output,
-                    r"compile exe antfly-inference-wasm64 ReleaseSafe wasm64-freestanding success",
+                    r"compile exe antfly-inference-wasm64 safe wasm64-freestanding success",
                 )
 
     def assert_join(self, output, kind, status):
@@ -1315,8 +1315,8 @@ class RuntimeCacheTest(unittest.TestCase):
             )
             changed = self.build("cache-probe", settings=settings)
             self.assertRegex(changed, r"run uv \(inference_api.json\) success")
-        # The same production graph checks also cover non-Debug configuration.
-        self.build("--help", settings=("-Doptimize=ReleaseFast",))
+        # The same production graph checks also cover non-debug configuration.
+        self.build("--help", settings=("-Doptimize=fast",))
 
     def test_cpu_cache_contracts(self):
         # Missing disabled-backend sources must not affect graph configuration,
@@ -1333,7 +1333,7 @@ class RuntimeCacheTest(unittest.TestCase):
         self.assert_archives(warm)
         self.assertIn("WriteFile tokenizer.json cached", warm)
         self.assertRegex(warm, r"run exe patch_sentencepiece_proto .* cached")
-        self.assertRegex(warm, r"compile obj antfly-build-info Debug \S+ cached")
+        self.assertRegex(warm, r"compile obj antfly-build-info debug \S+ cached")
         before = self.probe(warm)
         tokenizer_before = self.probe(warm, "TOKENIZER_PROBE")
 
@@ -1376,8 +1376,8 @@ class RuntimeCacheTest(unittest.TestCase):
         # The real test module graph must stay cached when release metadata changes.
         self.build("cache-unit-tests")
         unit_versioned = self.build("cache-unit-tests", version="cache-after")
-        self.assertRegex(unit_versioned, r"compile test Debug \S+ cached")
-        self.assertNotRegex(unit_versioned, r"compile test Debug \S+ success")
+        self.assertRegex(unit_versioned, r"compile test debug \S+ cached")
+        self.assertNotRegex(unit_versioned, r"compile test debug \S+ success")
         self.assertNotIn("antfly-build-info", unit_versioned)
 
         for schema in SCHEMAS:
@@ -1422,8 +1422,8 @@ class RuntimeCacheTest(unittest.TestCase):
 
         versioned = self.build("cache-probe", version="cache-after")
         self.assert_archives(versioned)
-        self.assertRegex(versioned, r"compile obj antfly-build-info Debug \S+ success")
-        self.assertRegex(versioned, r"compile exe antfly Debug \S+ success")
+        self.assertRegex(versioned, r"compile obj antfly-build-info debug \S+ success")
+        self.assertRegex(versioned, r"compile exe antfly debug \S+ success")
         self.assertEqual(self.probe(versioned).split()[0], "cache-after")
         self.assertEqual(self.probe(versioned).split()[1:], before.split()[1:])
 
@@ -1464,23 +1464,21 @@ class RuntimeCacheTest(unittest.TestCase):
         names = ("openapi-zig", "antfly-quant-kernel-codegen", "protoc-zig", "yacc-zig")
         self.build("cache-host-tools")
         for settings in (
-            ("-Doptimize=ReleaseFast",),
-            ("-Doptimize=ReleaseSafe", "-Dcuda-artifacts=portable", "-Dwebgpu=true"),
-            ("-Dtarget=x86_64-linux-musl", "-Doptimize=ReleaseFast"),
+            ("-Doptimize=fast",),
+            ("-Doptimize=safe", "-Dcuda-artifacts=portable", "-Dwebgpu=true"),
+            ("-Dtarget=x86_64-linux-musl", "-Doptimize=fast"),
         ):
             with self.subTest(settings=settings):
                 output = self.build("cache-host-tools", settings=settings)
                 for name in names:
-                    self.assertRegex(
-                        output, rf"compile exe {name} ReleaseSafe \S+ cached"
-                    )
+                    self.assertRegex(output, rf"compile exe {name} safe \S+ cached")
 
         # HTTPX is a dependency of generated consumers, not of the host compiler.
         httpx = self.own("zig/lib/httpx/src/httpx.zig")
         httpx.write_bytes(httpx.read_bytes() + b"\n// unrelated HTTP runtime edit\n")
         output = self.build("cache-host-tools")
         for name in names:
-            self.assertRegex(output, rf"compile exe {name} ReleaseSafe \S+ cached")
+            self.assertRegex(output, rf"compile exe {name} safe \S+ cached")
 
         # Real generator source remains an input despite independence from the
         # product profile, target, and inactive backend settings.
@@ -1488,11 +1486,11 @@ class RuntimeCacheTest(unittest.TestCase):
         source.write_bytes(source.read_bytes() + b"\n// generator cache regression\n")
         output = self.build("cache-host-tools")
         self.assertRegex(
-            output, r"compile exe antfly-quant-kernel-codegen ReleaseSafe \S+ success"
+            output, r"compile exe antfly-quant-kernel-codegen safe \S+ success"
         )
         for name in names:
             if name != "antfly-quant-kernel-codegen":
-                self.assertRegex(output, rf"compile exe {name} ReleaseSafe \S+ cached")
+                self.assertRegex(output, rf"compile exe {name} safe \S+ cached")
 
     def test_sql_and_snowball_generation_contracts(self):
         sql = self.own("zig/lib/sql/grammar/generated/root.zig")

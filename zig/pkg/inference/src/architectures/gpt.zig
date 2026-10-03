@@ -59,7 +59,7 @@ pub const Qwen35LinearLayerState = struct {
     recurrent: []f32 = &.{},
     initialized: bool = false,
 
-    fn deinit(self: *Qwen35LinearLayerState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Qwen35LinearLayerState, allocator: std.mem.Allocator) void {
         if (self.conv.len > 0) allocator.free(self.conv);
         if (self.recurrent.len > 0) allocator.free(self.recurrent);
         self.* = .{};
@@ -247,7 +247,7 @@ const ReservedHiddenCarrier = struct {
         self.active_front = !self.active_front;
     }
 
-    fn deinit(self: *ReservedHiddenCarrier, cb: *const ComputeBackend, keep_active: bool) void {
+    pub fn deinit(self: *ReservedHiddenCarrier, cb: *const ComputeBackend, keep_active: bool) void {
         if (keep_active) {
             cb.free(self.inactive());
         } else {
@@ -282,20 +282,20 @@ pub const Layer0DecoderOverrides = struct {
     q: ?CT = null,
     k: ?CT = null,
     v: ?CT = null,
-    attn_norm_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    attn_q_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    attn_k_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    attn_v_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    fused_qkv_linear_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    attn_out_proj_linear_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    attn_sub_norm_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    ffn_norm_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    mlp_fc1_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    mlp_fc2_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    mlp_gate_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    mlp_up_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    mlp_sub_norm_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
-    mlp_down_slots: [decoder_override_layer_capacity]?usize = [_]?usize{null} ** decoder_override_layer_capacity,
+    attn_norm_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    attn_q_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    attn_k_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    attn_v_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    fused_qkv_linear_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    attn_out_proj_linear_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    attn_sub_norm_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    ffn_norm_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    mlp_fc1_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    mlp_fc2_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    mlp_gate_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    mlp_up_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    mlp_sub_norm_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
+    mlp_down_slots: [decoder_override_layer_capacity]?usize = @as([decoder_override_layer_capacity]?usize, @splat(null)),
 };
 
 fn cudaPreparedDecoderSlotsEnabled() bool {
@@ -4099,7 +4099,7 @@ const DeepSeekV4CompressedPool = struct {
     data: []f32,
     positions: []u32,
 
-    fn deinit(self: DeepSeekV4CompressedPool, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: DeepSeekV4CompressedPool, allocator: std.mem.Allocator) void {
         allocator.free(self.data);
         allocator.free(self.positions);
     }
@@ -5326,7 +5326,7 @@ const DeepSeekV4DeviceFastPathTestBackend = struct {
 
         const out_len = request.query_rows * request.num_heads * request.head_dim;
         if (out_len > 16) return error.TestOutputTooLarge;
-        var out = [_]f32{0} ** 16;
+        var out = @as([16]f32, @splat(0));
         for (out[0..out_len], 0..) |*value, idx| value.* = 100.0 + @as(f32, @floatFromInt(idx));
         const shape = [_]i32{ @intCast(request.query_rows), @intCast(request.num_heads * request.head_dim) };
         return native_compute_mod.vtable_impl.fromFloat32Shape(ctx, out[0..out_len], &shape);
@@ -7675,8 +7675,8 @@ fn maybeDebugTopLogits(logits: []const f32, vocab_size: usize) void {
 
 fn debugTopLogitsRow(label: []const u8, row: []const f32) void {
     if (is_freestanding) return;
-    var top_ids = [_]usize{0} ** 8;
-    var top_vals = [_]f32{-std.math.inf(f32)} ** 8;
+    var top_ids = @as([8]usize, @splat(0));
+    var top_vals = @as([8]f32, @splat(-std.math.inf(f32)));
     for (row, 0..) |logit, idx| {
         var insert_at: ?usize = null;
         for (top_vals, 0..) |current, slot| {
@@ -8253,7 +8253,7 @@ test "qwen3.5 causal depthwise conv updates rolling state" {
     const input = [_]f32{ 1, 2, 3 };
     const weight = [_]f32{ 1, 10 };
     var state = [_]f32{ 0, 0 };
-    var output = [_]f32{0} ** 3;
+    var output = @as([3]f32, @splat(0));
     try qwen35CausalDepthwiseConv1d(&input, &weight, &state, false, &output, 3, 1, 2);
 
     const expected_raw = [_]f32{ 10, 21, 32 };
@@ -8284,7 +8284,7 @@ test "qwen3.5 recurrent gated delta rule updates state" {
     const a_log = [_]f32{0};
     const dt_bias = [_]f32{0};
     var state = [_]f32{0};
-    var output = [_]f32{0} ** 2;
+    var output = @as([2]f32, @splat(0));
 
     try qwen35RecurrentGatedDeltaRuleHost(
         &conv_out,
@@ -9330,7 +9330,7 @@ const GroupedExpertTiles = struct {
     tile_row_starts: []u32,
     tile_row_counts: []u32,
 
-    fn deinit(self: GroupedExpertTiles, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: GroupedExpertTiles, allocator: std.mem.Allocator) void {
         allocator.free(self.expert_tile_ids);
         allocator.free(self.tile_row_starts);
         allocator.free(self.tile_row_counts);
@@ -10008,8 +10008,8 @@ fn selectTopExperts(allocator: std.mem.Allocator, router_logits: []const f32, to
 
     var selection = MoeSelection{
         .count = top_k,
-        .indices = [_]u32{0} ** 8,
-        .weights = [_]f32{0.0} ** 8,
+        .indices = @as([8]u32, @splat(0)),
+        .weights = @as([8]f32, @splat(0.0)),
     };
     const used = try allocator.alloc(bool, num_experts);
     defer allocator.free(used);
@@ -10043,8 +10043,8 @@ fn selectTopExperts(allocator: std.mem.Allocator, router_logits: []const f32, to
 fn selectionFromFlatRoutes(routes: ops.MoeRouteSelection, row: usize) MoeSelection {
     var selection = MoeSelection{
         .count = routes.top_k,
-        .indices = [_]u32{0} ** 8,
-        .weights = [_]f32{0.0} ** 8,
+        .indices = @as([8]u32, @splat(0)),
+        .weights = @as([8]f32, @splat(0.0)),
     };
     const base = row * routes.top_k;
     for (0..routes.top_k) |i| {
@@ -12113,7 +12113,7 @@ test "selectTopExperts handles 128 experts with top_k=8" {
 const DenseQwen3PrefillProbe = struct {
     const Failure = enum { none, decline_execute, decline_gather, tail_oom, submit_error, cancel_prepare, cancel_execute };
     tokens: [5]u8 = .{ 0, 1, 2, 3, 4 },
-    freed: [5]bool = .{false} ** 5,
+    freed: [5]bool = @splat(false),
     active: bool = false,
     cancelled: bool = false,
     cancels: usize = 0,

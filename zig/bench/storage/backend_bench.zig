@@ -60,7 +60,7 @@ const Result = struct {
 const KeySet = struct {
     keys: [][]u8,
 
-    fn deinit(self: *const KeySet, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *const KeySet, allocator: std.mem.Allocator) void {
         for (self.keys) |key| allocator.free(key);
         allocator.free(self.keys);
     }
@@ -121,7 +121,7 @@ const OpenedStore = union(enum) {
         }
     }
 
-    fn deinit(self: *OpenedStore, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *OpenedStore, allocator: std.mem.Allocator) void {
         switch (self.*) {
             .lsm => |*opened| {
                 if (opened.runtime) |*store_runtime| store_runtime.deinit();
