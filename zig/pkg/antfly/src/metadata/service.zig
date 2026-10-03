@@ -21768,7 +21768,7 @@ test "metadata http projected clone helpers clean up on allocation failure" {
         }
     };
 
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
 test "metadata service local replica root reconcile permit hook defers reconcile work" {
@@ -22180,7 +22180,7 @@ test "metadata service sparse leases preserve pinned groups through allocation f
             try std.testing.expect(!removed.capabilities.flags.contains(.repair));
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
 test "metadata service projection journal keeps group bursts sparse and isolates overflow" {

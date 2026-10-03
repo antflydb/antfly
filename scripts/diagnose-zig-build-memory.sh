@@ -195,7 +195,7 @@ max_cmd=""
 
 (
     cd "${zig_dir}"
-    "${zig_bin}" build "-j${jobs}" "-Dtarget=${target}" "-Doptimize=${optimize}" "-Dstrip=${strip}" "${install_step}" --prefix "${prefix}" "${extra_args[@]}"
+    "${zig_bin}" build "-j${jobs}" "-Dtarget=${target}" "-Doptimize=${optimize}" "-Dstrip=${strip}" "${install_step}" --prefix "${prefix}" ${extra_args[@]+"${extra_args[@]}"}
 ) >"${build_log}" 2>&1 &
 build_pid="$!"
 
