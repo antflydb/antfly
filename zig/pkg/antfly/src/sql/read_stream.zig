@@ -6,11 +6,11 @@
 //! one memory budget and are reclaimed before the next pull. Blocking plans
 //! explicitly decline this path, never pretend that LIMIT is a continuation.
 const std = @import("std");
-const catalog = @import("catalog.zig");
-const compiler = @import("compiler.zig");
-const runtime = @import("runtime.zig");
-const describe = @import("describe.zig");
-const Budget = @import("memory_budget.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
+const compiler = @import("antfly_local_sources").sql_compiler;
+const runtime = @import("antfly_local_sources").sql_runtime;
+const describe = @import("antfly_local_sources").sql_describe;
+const Budget = @import("antfly_local_sources").sql_memory_budget;
 const Json = std.json.Value;
 
 pub const Page = struct {
@@ -36,7 +36,7 @@ const Fixture = struct {
     fn backend(self: *Fixture) catalog.Backend {
         return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .mutate = mutate, .checkpoint = checkpoint } };
     }
-    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
+    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: @import("antfly_local_sources").sql_ast.Name, _: catalog.Action) !catalog.Table {
         return .{ .id = 1, .physical_name = "docs", .schema_version = 1, .columns = &.{.{ .name = "n", .path = "n", .type = .integer }} };
     }
     fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
@@ -103,7 +103,7 @@ test "SQL pull stream releases pages and streams beyond materialized result limi
 }
 
 test "SQL pull stream keeps one pinned policy setting across pages" {
-    const settings = @import("setting_catalog.zig");
+    const settings = @import("antfly_local_sources").sql_setting_catalog;
     const Owner = struct {
         value: []const u8 = "tenant-a",
         definition: settings.Definition = .{ .identity = .{ .id = 10, .generation = 1 }, .name = "app.tenant", .kind = .string, .policy_sensitive = true, .default = .{ .string = "tenant-a" } },
@@ -199,7 +199,7 @@ test "SQL pull stream unwinds every allocation failure" {
 pub const Stream = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
-    settings: ?*@import("setting_catalog.zig").View = null,
+    settings: ?*@import("antfly_local_sources").sql_setting_catalog.View = null,
     context: runtime.Context,
     cursor: ?catalog.Cursor = null,
     fields: []const []const u8,
@@ -230,8 +230,8 @@ pub const Stream = struct {
         const arena = self.arena.allocator();
         var statement_backend = backend;
         if (backend.setting_capture) |capture| {
-            const view = try arena.create(@import("setting_catalog.zig").View);
-            view.* = try @import("setting_catalog.zig").View.capture(self.budget.allocator(), capture.owner, capture.scope, capture.overlay);
+            const view = try arena.create(@import("antfly_local_sources").sql_setting_catalog.View);
+            view.* = try @import("antfly_local_sources").sql_setting_catalog.View.capture(self.budget.allocator(), capture.owner, capture.scope, capture.overlay);
             self.settings = view;
             statement_backend.settings_view = view;
         }
@@ -245,11 +245,11 @@ pub const Stream = struct {
             alloc.destroy(self);
             return null;
         }
-        self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
+        self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("antfly_local_sources").sql_decision_eval.scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
         const params = try arena.alloc(Json, parameters.len);
         for (parameters, params) |value, *out| out.* = try self.context.outputValue(value);
         self.context.parameters = params;
-        try @import("decision_eval.zig").validateStatement(arena, statement_backend.decision_provider, binding, params);
+        try @import("antfly_local_sources").sql_decision_eval.validateStatement(arena, statement_backend.decision_provider, binding, params);
         const table = binding.table.?;
         const predicates = try self.context.conditions(table, statement.predicate);
         var fields: std.ArrayList([]const u8) = .empty;
@@ -284,7 +284,7 @@ pub const Stream = struct {
         self.cursor = null;
         if (!self.exhausted) {
             if (binding.relation != null) {
-                self.cursor = try @import("relation_runtime.zig").openCursor(self.context);
+                self.cursor = try @import("antfly_local_sources").sql_relation_runtime.openCursor(self.context);
             } else {
                 const open_scan = backend.vtable.open_scan orelse return error.SqlStatementSnapshotRequired;
                 self.cursor = (try open_scan(backend.ptr, self.budget.allocator(), table, .{
@@ -349,16 +349,16 @@ pub const Stream = struct {
                 var decision_page = std.heap.ArenaAllocator.init(self.budget.allocator());
                 defer decision_page.deinit();
                 const scratch = decision_page.allocator();
-                const chunk_cells = try @import("decision_eval.zig").rowPage(scratch, self.context.binding.scalars, page.rows[first..], self.context.limits.page_rows, self.context.limits.page_bytes);
+                const chunk_cells = try @import("antfly_local_sources").sql_decision_eval.rowPage(scratch, self.context.binding.scalars, page.rows[first..], self.context.limits.page_rows, self.context.limits.page_bytes);
                 const chunk_rows = page.rows[first..][0..chunk_cells.len];
-                const decisions = @import("decision_eval.zig");
+                const decisions = @import("antfly_local_sources").sql_decision_eval;
                 var external = if (self.context.binding.scalars.predicate) |*p| decisions.hasExternal(p) else false;
                 for (self.context.binding.scalars.projections) |optional| if (optional) |*p| {
                     external = external or decisions.hasExternal(p);
                 };
                 const page_cells = if (external) chunk_cells else null;
                 const predicate_values = if (page_cells) |values| if (self.context.binding.scalars.predicate) |*p| try decisions.evaluateBatch(scratch, self.context.backend.decision_provider, p, values, self.context.parameters) else null else null;
-                var selected_cells: std.ArrayList([]const @import("scalar.zig").Datum) = .empty;
+                var selected_cells: std.ArrayList([]const @import("antfly_local_sources").sql_scalar.Datum) = .empty;
                 const positions: []?usize = if (external) try scratch.alloc(?usize, chunk_rows.len) else @constCast(&.{});
                 if (external) {
                     @memset(positions, null);
@@ -378,7 +378,7 @@ pub const Stream = struct {
                     }
                 }
                 const projection_values = if (external) blk: {
-                    const values = try scratch.alloc(?[]const @import("scalar.zig").Datum, self.context.binding.scalars.projections.len);
+                    const values = try scratch.alloc(?[]const @import("antfly_local_sources").sql_scalar.Datum, self.context.binding.scalars.projections.len);
                     for (self.context.binding.scalars.projections, values) |optional, *value| value.* = if (optional) |*p| try decisions.evaluateBatch(scratch, self.context.backend.decision_provider, p, selected_cells.items, self.context.parameters) else null;
                     break :blk values;
                 } else null;
@@ -398,7 +398,7 @@ pub const Stream = struct {
                         continue;
                     }
                     const projected = if (projection_values) |projections| blk: {
-                        const fields = try eval.allocator().alloc(@import("scalar.zig").Datum, self.fields.len);
+                        const fields = try eval.allocator().alloc(@import("antfly_local_sources").sql_scalar.Datum, self.fields.len);
                         for (self.fields, fields, 0..) |field, *cell, index| cell.* = if (index < projections.len and projections[index] != null)
                             projections[index].?[positions[row_index].?]
                         else typed: {
@@ -446,7 +446,7 @@ pub const Stream = struct {
 };
 
 test "SQL decisions pull streaming batches predicates before offset and projections after offset" {
-    const d = @import("../functions/decisions.zig");
+    const d = @import("antfly_local_sources").functions_decisions;
     const Fake = struct {
         calls: usize = 0,
         max_batch: usize = 0,
@@ -488,7 +488,7 @@ test "SQL decision streams validate nested specifications before opening reads" 
         var compiled = try compiler.compile(a, sql, .{});
         defer compiled.deinit();
         var fixture: Fixture = .{};
-        var mock: @import("decision_eval.zig").testing.Provider = .{};
+        var mock: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
         var backend = fixture.backend();
         backend.decision_provider = mock.provider();
         const parameters: []const Json = if (i == 0) &.{} else &.{.{ .object = .empty }};
@@ -501,7 +501,7 @@ test "SQL decision streams validate nested specifications before opening reads" 
 test "SQL decision pull pages honor byte limits without losing cursor rows" {
     const a = std.testing.allocator;
     var fixture: Fixture = .{ .count = 8 };
-    var provider: @import("decision_eval.zig").testing.Provider = .{};
+    var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{};
     var backend = fixture.backend();
     backend.decision_provider = provider.provider();
     var compiled = try compiler.compile(a, "SELECT ai_probability(CAST(n AS TEXT),'Refund?','local') FROM docs LIMIT 5 OFFSET 1", .{});
@@ -521,7 +521,7 @@ test "SQL decision pull pages honor byte limits without losing cursor rows" {
 test "SQL decision pull streams carry trusted source routing" {
     const a = std.testing.allocator;
     var fixture: Fixture = .{ .count = 2 };
-    var provider: @import("decision_eval.zig").testing.Provider = .{ .expected_source = "docs" };
+    var provider: @import("antfly_local_sources").sql_decision_eval.testing.Provider = .{ .expected_source = "docs" };
     var backend = fixture.backend();
     backend.decision_provider = provider.provider();
     var compiled = try compiler.compile(a, "SELECT ai_probability(CAST(n AS TEXT),'Refund?','local') FROM docs LIMIT 1", .{});

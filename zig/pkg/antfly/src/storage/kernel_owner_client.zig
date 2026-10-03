@@ -18,7 +18,7 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const error_identity = @import("kernel_error_identity");
-const maintenance = @import("maintenance.zig");
+const maintenance = @import("antfly_local_sources").storage_maintenance;
 const system_store_client = @import("kernel_system_store_client.zig");
 
 pub const LocalTransitionAction = abi.LocalTransitionAction;
@@ -102,7 +102,7 @@ pub const Context = struct {
         self: *Context,
         allocator: std.mem.Allocator,
         namespace: []const u8,
-    ) !@import("backend_erased.zig").Store {
+    ) !@import("antfly_local_sources").storage_backend_erased.Store {
         try self.ensure();
         return try system_store_client.open(allocator, self.handle, namespace);
     }
@@ -710,13 +710,13 @@ pub const Owner = struct {
         return response;
     }
 
-    pub fn scanStream(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("../runtime_scan_sink.zig").ScanStreamSink) !void {
+    pub fn scanStream(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink) !void {
         return self.scanStreamWithOptions(table_name, request_json, sink, .{});
     }
 
-    pub fn scanStreamWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("../runtime_scan_sink.zig").ScanStreamSink, options: QueryOptions) !void {
+    pub fn scanStreamWithOptions(self: *Owner, table_name: []const u8, request_json: []const u8, sink: @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink, options: QueryOptions) !void {
         const Bridge = struct {
-            sink: @import("../runtime_scan_sink.zig").ScanStreamSink,
+            sink: @import("antfly_local_sources").runtime_scan_sink.ScanStreamSink,
             failure: ?anyerror = null,
             fn start(ptr: ?*anyopaque) callconv(.c) u8 {
                 const bridge: *@This() = @ptrCast(@alignCast(ptr.?));

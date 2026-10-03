@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Elastic-2.0
 
 const std = @import("std");
-const docstore_mod = @import("../storage/docstore.zig");
-const backend_erased = @import("../storage/backend_erased.zig");
-const mem_backend = @import("../storage/mem_backend.zig");
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const runtime_error_abi = @import("antfly_runtime_abi").error_abi;

@@ -23,7 +23,7 @@
 const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
-const snappy = @import("../../encoding/snappy.zig");
+const snappy = @import("antfly_local_sources").encoding_snappy;
 
 /// Iceberg writers normally keep Avro OCF blocks modest. This ceiling bounds
 /// both ordinary parsing work and decompression of user-owned manifest files.

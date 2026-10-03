@@ -11,12 +11,12 @@ const vopr = @import("vopr");
 const primary_mod = @import("primary.zig");
 const standby_mod = @import("standby.zig");
 const replication_log = @import("replication_log.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const fencing = @import("fencing.zig");
 const rejoin = @import("rejoin.zig");
-const storage_io = @import("../lsm_backend/storage_io.zig");
-const wal_mod = @import("../wal.zig");
-const storage_clock = @import("../sim_runtime.zig");
+const storage_io = @import("antfly_local_sources").storage_lsm_backend_storage_io;
+const wal_mod = @import("antfly_local_sources").storage_wal;
+const storage_clock = @import("antfly_local_sources").storage_sim_runtime;
 
 const stream_slot = "standby-a";
 const seed_slot = "seed-b";

@@ -12,7 +12,7 @@ ZIG_ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestRunnerSelection(unittest.TestCase):
-    runner_path = ZIG_ROOT / "pkg/antfly/src/test_runner.zig"
+    runner_path = ZIG_ROOT / "pkg/antfly-embedded/src/local/test_runner.zig"
     progress_prefix = "test"
 
     @classmethod
@@ -39,8 +39,11 @@ class TestRunnerSelection(unittest.TestCase):
                 "test",
                 "--dep",
                 "antfly_platform",
+                "--dep",
+                "antfly_test_error_logs",
                 f"-Mroot={source}",
                 f"-Mantfly_platform={ZIG_ROOT / 'lib/platform/src/root.zig'}",
+                f"-Mantfly_test_error_logs={ZIG_ROOT / 'pkg/antfly-embedded/src/local/test_error_logs.zig'}",
                 "--test-runner",
                 str(cls.runner_path),
                 "--test-no-exec",
@@ -66,10 +69,16 @@ class TestRunnerSelection(unittest.TestCase):
         )
 
     def test_required_execution_rejects_skips_but_inventory_still_lists(self):
-        for required, expected in ((False, 0), (True, 1)):
+        for required, owner, expected in (
+            (False, False, 0),
+            (True, False, 1),
+            (True, True, 1),
+        ):
             args = [str(self.binary), "--test-filter", "environment unavailable"]
             if required:
                 args.append("--require-no-skips")
+            if owner:
+                args.extend(("--allow-empty-test-filter", "--allow-empty-owner"))
             result = subprocess.run(args, text=True, capture_output=True, timeout=5)
             self.assertEqual(result.returncode, expected, result.stderr)
             self.assertIn("1 skipped", result.stderr)

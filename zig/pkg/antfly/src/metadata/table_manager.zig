@@ -20,10 +20,10 @@ pub const artifact_sources_protocol_version: u16 = 1;
 pub const dense_native_storage_protocol_version: u16 = 1;
 pub const relational_topology_protocol_version: u16 = 2;
 pub const embedding_activity_protocol_version: u16 = 2;
-const group_ids = @import("../common/group_ids.zig");
-const topology_records = @import("../common/topology_records.zig");
-const index_repair_status = @import("../common/index_repair_status.zig");
-const dense_native_storage_phase = @import("../common/dense_native_storage_phase.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
+const topology_records = @import("antfly_local_sources").common_topology_records;
+const index_repair_status = @import("antfly_local_sources").common_index_repair_status;
+const dense_native_storage_phase = @import("antfly_local_sources").common_dense_native_storage_phase;
 const transition_state = @import("transition_state.zig");
 
 pub const IndexRepairStatus = index_repair_status.IndexRepairStatus;
@@ -38,12 +38,12 @@ pub const PlacementClass = enum {
     archive,
 };
 
-pub const TableRecord = @import("local_catalog.zig").TableRecord;
+pub const TableRecord = @import("antfly_local_sources").metadata_local_catalog.TableRecord;
 
 pub const TableDefinition = TableRecord;
 
 pub fn tableDefinitionsEqual(lhs: TableDefinition, rhs: TableDefinition) bool {
-    return @import("../common/vector_migration.zig").admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
+    return @import("antfly_local_sources").common_vector_migration.admissionsEqual(lhs.storage_migration, rhs.storage_migration) and
         lhs.storage.dense_embeddings == rhs.storage.dense_embeddings and
         lhs.table_id == rhs.table_id and
         std.mem.eql(u8, lhs.name, rhs.name) and
@@ -114,9 +114,9 @@ pub const RangeRecord = topology_records.RangeRecord;
 /// Canonical ordering for every complete table keyspace projection. Keeping
 /// this in the metadata domain lets backup admission, restore planning, and
 /// Raft apply enforce exactly the same bytewise routing contract.
-pub const sortKeyspaceRanges = @import("local_catalog.zig").sortKeyspaceRanges;
+pub const sortKeyspaceRanges = @import("antfly_local_sources").metadata_local_catalog.sortKeyspaceRanges;
 
-pub const validateCompleteKeyspaceRanges = @import("local_catalog.zig").validateCompleteKeyspaceRanges;
+pub const validateCompleteKeyspaceRanges = @import("antfly_local_sources").metadata_local_catalog.validateCompleteKeyspaceRanges;
 
 test "complete keyspace range validation requires both routing sentinels" {
     const complete = [_]RangeRecord{
@@ -2169,7 +2169,7 @@ fn freeOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) void {
     if (value) |bytes| alloc.free(bytes);
 }
 
-pub const cloneTable = @import("local_catalog.zig").cloneTable;
+pub const cloneTable = @import("antfly_local_sources").metadata_local_catalog.cloneTable;
 
 pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     const name = try alloc.dupe(u8, record.name);
@@ -2206,7 +2206,7 @@ pub fn cloneRoutingTable(alloc: std.mem.Allocator, record: TableRecord) !TableRe
     };
 }
 
-pub const freeTable = @import("local_catalog.zig").freeTable;
+pub const freeTable = @import("antfly_local_sources").metadata_local_catalog.freeTable;
 
 pub fn cloneRange(alloc: std.mem.Allocator, record: RangeRecord) !RangeRecord {
     const start_key = try alloc.dupe(u8, record.start_key);
@@ -2304,7 +2304,7 @@ fn rangeMatchesTransitionIdentity(
 }
 
 pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
-    @import("restore_provisioning_contract.zig").freeRange(alloc, record);
+    @import("antfly_local_sources").metadata_restore_provisioning_contract.freeRange(alloc, record);
 }
 
 test "routing clones exclude operational and schema payloads" {

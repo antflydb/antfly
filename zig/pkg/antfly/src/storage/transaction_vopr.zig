@@ -7,10 +7,10 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const backend_erased = @import("backend_erased.zig");
-const mem_backend = @import("mem_backend.zig");
-const transactions = @import("transactions.zig");
-const tracing = @import("../tracing/antfly_trace_writer.zig");
+const backend_erased = @import("antfly_local_sources").storage_backend_erased;
+const mem_backend = @import("antfly_local_sources").storage_mem_backend;
+const transactions = @import("antfly_local_sources").storage_transactions;
+const tracing = @import("antfly_local_sources").tracing_antfly_trace_writer;
 
 const Allocator = std.mem.Allocator;
 const txn_id: transactions.TxnId = .{ 0xa1, 0x7f, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 };

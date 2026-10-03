@@ -15,7 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objectstore = @import("objectstore");
-const common_secrets = @import("../../common/secrets.zig");
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const artifacts_object_store = @import("../artifacts/object_store.zig");
 const manifest_object_store = @import("../manifest/object_store.zig");
 const wal_object_store = @import("../wal/object_store.zig");
@@ -23,7 +23,7 @@ const catalog_object_store = @import("../catalog/object_store.zig");
 const progress_object_store = @import("../catalog/object_progress_store.zig");
 const configured_object_store_support = @import("../configured_object_store_support.zig");
 const external_binding = @import("../external_source/catalog_binding.zig");
-const remote_uri = @import("../remote_uri.zig");
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 const artifacts_mod = @import("../artifacts/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
@@ -34,13 +34,13 @@ const api_mod = @import("../api/mod.zig");
 const enrichment_mod = @import("../enrichment/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const runtime_manager = @import("manager.zig");
-const managed_embedder = @import("../../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const bedrock = @import("antfly_inference_bedrock");
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
 const object_store_support = @import("../object_store_support.zig");
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
-const common_config = @import("../../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 
 pub const BootstrapConfig = struct {
     pub const S3Options = object_store_support.S3Options;
@@ -76,7 +76,7 @@ pub const BootstrapConfig = struct {
     node_config: ?*const common_config.Config = null,
     secret_store: ?*common_secrets.FileStore = null,
     query_max_concurrent_requests: u32 = common_config.default_query_max_concurrent_requests,
-    graph_execution_limits: @import("../../graph/work_budget.zig").Limits = .{},
+    graph_execution_limits: @import("antfly_local_sources").graph_work_budget.Limits = .{},
     write_max_concurrent_requests: u32 = common_config.default_write_max_concurrent_requests,
     /// CPU fanout available to one graph-metric kernel. Work is scheduled on
     /// the shared std.Io backend, so deployments can align this with their

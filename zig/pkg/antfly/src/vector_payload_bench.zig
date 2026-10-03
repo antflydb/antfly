@@ -1,11 +1,11 @@
 //! Source-store benchmark on real files. References are a harness sidecar;
 //! only Session preparation, resolution and Store checkpointing are timed.
 const std = @import("std");
-const source = @import("storage/vector_payload_store.zig");
-const payload = @import("storage/artifact_payload.zig");
-const codec = @import("storage/db/enrichment/artifact_codec.zig");
-const keys = @import("storage/internal_keys.zig");
-const lsm = @import("storage/lsm_backend/mod.zig");
+const source = @import("antfly_local_sources").storage_vector_payload_store;
+const payload = @import("antfly_local_sources").storage_artifact_payload;
+const codec = @import("antfly_local_sources").storage_db_enrichment_artifact_codec;
+const keys = @import("antfly_local_sources").storage_internal_keys;
+const lsm = @import("antfly_local_sources").storage_lsm_backend_mod;
 const time = @import("antfly_platform").time;
 
 pub fn main(init: std.process.Init) !void {
@@ -35,9 +35,9 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     const started = time.monotonicNs();
-    var budgets = @import("storage/resource_manager.zig").Options.defaultBudgets();
-    budgets[@intFromEnum(@import("storage/resource_manager.zig").Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 320 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 };
-    var manager = @import("storage/resource_manager.zig").ResourceManager.init(.{ .budgets = budgets });
+    var budgets = @import("antfly_local_sources").storage_resource_manager.Options.defaultBudgets();
+    budgets[@intFromEnum(@import("antfly_local_sources").storage_resource_manager.Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 320 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 };
+    var manager = @import("antfly_local_sources").storage_resource_manager.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var store = try source.Store.openManaged(alloc, &manager, storage, root, !writing);
     defer store.deinit();
@@ -129,3 +129,6 @@ const Maintenance = struct {
         }
     }
 };
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

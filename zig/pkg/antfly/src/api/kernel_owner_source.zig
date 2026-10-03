@@ -17,7 +17,7 @@
 //! and lifecycle; this source owns only coarse physical operations.
 
 const std = @import("std");
-const request_operation = @import("operation.zig");
+const request_operation = @import("antfly_local_sources").api_operation;
 const platform_sync = @import("antfly_platform").sync;
 const platform_time = @import("antfly_platform").time;
 const abi = @import("kernel_owner_abi");
@@ -25,33 +25,33 @@ const kernel_error_identity = @import("kernel_error_identity");
 const client = @import("../storage/kernel_owner_client.zig");
 const data_apply_client = @import("../storage/data_raft_apply_client.zig");
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
-const backend_types = @import("../storage/backend_types.zig");
-const db_types = @import("../storage/db/types.zig");
-const runtime_callbacks = @import("../storage/db/runtime_callbacks.zig");
-const replication_contract = @import("../storage/db/replication_contract.zig");
-const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
-const text_memory = @import("../storage/db/text_memory_stats.zig");
-const replication_effects = @import("../storage/db/replication_effects.zig");
-const hot_standby_replication_record = @import("../storage/db/replication_record.zig");
-const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
+const backend_types = @import("antfly_local_sources").storage_backend_types;
+const db_types = @import("antfly_local_sources").storage_db_types;
+const runtime_callbacks = @import("antfly_local_sources").storage_db_runtime_callbacks;
+const replication_contract = @import("antfly_local_sources").storage_db_replication_contract;
+const document_artifact_child_range = @import("antfly_local_sources").storage_db_document_artifact_child_range;
+const text_memory = @import("antfly_local_sources").storage_db_text_memory_stats;
+const replication_effects = @import("antfly_local_sources").storage_db_replication_effects;
+const hot_standby_replication_record = @import("antfly_local_sources").storage_db_replication_record;
+const runtime_preflight = @import("antfly_local_sources").storage_db_runtime_preflight;
 const metadata_api = @import("../metadata/api.zig");
 const metadata_domain = @import("../metadata/domain.zig");
-const backup_contract = @import("backup_contract.zig");
+const backup_contract = @import("antfly_local_sources").api_backup_contract;
 const distributed_graph = @import("distributed_graph.zig");
-const query_response = @import("query_response.zig");
-const runtime_status = @import("runtime_status.zig");
+const query_response = @import("antfly_local_sources").api_query_response;
+const runtime_status = @import("antfly_local_sources").api_runtime_status;
 const restore_state_contract = @import("../storage/restore_state_contract.zig");
 const read_gate = @import("../raft/read_gate.zig");
 const feature_reads = @import("../raft/feature_reads.zig");
 const table_catalog = @import("table_catalog.zig");
-const table_read_source = @import("table_read_source.zig");
-const table_reads = @import("local_query_contract.zig");
+const table_read_source = @import("antfly_local_sources").api_table_read_source;
+const table_reads = @import("antfly_local_sources").api_local_query_contract;
 const storage_snapshot_source = @import("storage_snapshot_source.zig");
 const storage_maintenance_source = @import("storage_maintenance_source.zig");
-const table_write_source = @import("table_write_source.zig");
+const table_write_source = @import("antfly_local_sources").api_table_write_source;
 const table_writes = @import("antfly_source_root").antfly_sources.table_writes;
 const transaction_recovery_source = @import("transaction_recovery_source.zig");
-const common_config = @import("../common/config.zig");
+const common_config = @import("antfly_local_sources").common_config;
 const scraping = @import("antfly_scraping");
 
 /// Native owner controls use the platform monotonic clock. In particular on
@@ -264,7 +264,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     catalog: table_catalog.CatalogSource,
     read_safety_barrier: read_gate.ReadSafetyBarrier,
     /// Selected once by the hosting runtime before any owner is opened.
-    online_source_authority: @import("../storage/db/online_source_contract.zig").Authority = .raft,
+    online_source_authority: @import("antfly_local_sources").storage_db_online_source_contract.Authority = .raft,
     row_policy_authority_secret: ?[]const u8 = null,
     row_policy_authority_issuer: ?[]const u8 = null,
     group_visible_root_generation: ?table_reads.GroupVisibleRootGenerationSource = null,
@@ -272,7 +272,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
-    coordinated_ttl: ?@import("../storage/coordinated_ttl.zig").Port = null,
+    coordinated_ttl: ?@import("antfly_local_sources").storage_coordinated_ttl.Port = null,
     artifact_publications: ?@import("../storage/artifact_publication_dispatch.zig").Port = null,
     entity_sink: ?runtime_callbacks.EntitySink = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
@@ -398,7 +398,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         path: []u8,
         schema_json: []u8,
         indexes_json: []u8,
-        table_storage: ?@import("../common/table_storage.zig").Settings = null,
+        table_storage: ?@import("antfly_local_sources").common_table_storage.Settings = null,
         generation: u64,
         initial_range: ?db_types.ByteRange = null,
         identity: descriptor_contract.Identity,
@@ -443,7 +443,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         initial_range: ?db_types.ByteRange = null,
         restore_cancel_recovery: bool = false,
         restore_ha_replay: bool = false,
-        table_storage: ?@import("../common/table_storage.zig").Settings = null,
+        table_storage: ?@import("antfly_local_sources").common_table_storage.Settings = null,
         restore: ?@import("../storage/restore_identity.zig").Identity = null,
         owner: client.Owner,
         /// A Raft entry's pinned descriptor did not authorize current-catalog
@@ -1077,11 +1077,11 @@ pub const ProvisionedKernelOwnerSource = struct {
             return rows;
         }
 
-        fn relationalRead(self: *TransitionLease, comptime T: type, alloc: std.mem.Allocator, request: @import("../storage/db/relational_transition_contract.zig").Request) !T {
+        fn relationalRead(self: *TransitionLease, comptime T: type, alloc: std.mem.Allocator, request: @import("antfly_local_sources").storage_db_relational_transition_contract.Request) !T {
             var encoded: std.Io.Writer.Allocating = .init(alloc);
             defer encoded.deinit();
             var json: std.json.Stringify = .{ .writer = &encoded.writer };
-            try @import("../storage/db/relational_integrity_json.zig").write(request, &json);
+            try @import("antfly_local_sources").storage_db_relational_integrity_json.write(request, &json);
             var response: abi.OwnedBytes = .{};
             try kernel_error_identity.statusToError(abi.antfly_storage_owner_relational_transition_read(self.lease.owner().handle, &.{
                 .table_name = .fromSlice(self.lease.entry.table_name),
@@ -1110,18 +1110,18 @@ pub const ProvisionedKernelOwnerSource = struct {
             return alloc.dupe(u8, response.bytes());
         }
 
-        pub fn relationalTopologyStatus(self: *TransitionLease) !@import("../storage/db/relational_integrity_topology_contract.zig").Status {
+        pub fn relationalTopologyStatus(self: *TransitionLease) !@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Status {
             var arena = std.heap.ArenaAllocator.init(self.lease.source.alloc);
             defer arena.deinit();
-            return self.relationalRead(@import("../storage/db/relational_integrity_topology_contract.zig").Status, arena.allocator(), .{ .status = {} });
+            return self.relationalRead(@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Status, arena.allocator(), .{ .status = {} });
         }
 
-        pub fn relationalHandoffManifest(self: *TransitionLease, alloc: std.mem.Allocator, source: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, destination: @import("../storage/db/relational_integrity_topology_contract.zig").Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) !@import("../storage/db/relational_integrity_handoff_contract.zig").Manifest {
-            return self.relationalRead(@import("../storage/db/relational_integrity_handoff_contract.zig").Manifest, alloc, .{ .manifest = .{ .source = source, .destination = destination, .lower = lower, .upper = upper, .primary_sequence = primary_sequence } });
+        pub fn relationalHandoffManifest(self: *TransitionLease, alloc: std.mem.Allocator, source: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, destination: @import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence, lower: []const u8, upper: []const u8, primary_sequence: u64) !@import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Manifest {
+            return self.relationalRead(@import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Manifest, alloc, .{ .manifest = .{ .source = source, .destination = destination, .lower = lower, .upper = upper, .primary_sequence = primary_sequence } });
         }
 
-        pub fn relationalHandoffPage(self: *TransitionLease, alloc: std.mem.Allocator, manifest: @import("../storage/db/relational_integrity_handoff_contract.zig").Manifest, progress: @import("../storage/db/relational_integrity_handoff_contract.zig").Progress) !@import("../storage/db/relational_integrity_handoff_contract.zig").Page {
-            return self.relationalRead(@import("../storage/db/relational_integrity_handoff_contract.zig").Page, alloc, .{ .page = .{ .manifest = manifest, .progress = progress } });
+        pub fn relationalHandoffPage(self: *TransitionLease, alloc: std.mem.Allocator, manifest: @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Manifest, progress: @import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Progress) !@import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Page {
+            return self.relationalRead(@import("antfly_local_sources").storage_db_relational_integrity_handoff_contract.Page, alloc, .{ .page = .{ .manifest = manifest, .progress = progress } });
         }
     };
 
@@ -1739,7 +1739,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Read the persisted private bootstrap without asking the public catalog
     /// to invent a route for an unpublished owner. Warm reads pin the exact
     /// current generation; cold reads stay inside the compiled storage owner.
-    pub fn readHotStandbyHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap) {
+    pub fn readHotStandbyHiddenOwnerBootstrap(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_id: u64) !?std.json.Parsed(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap) {
         try self.ensureContextConfigured();
         const generation = self.visibleRootGeneration(group_id);
         var resident: ?Lease = blk: {
@@ -1760,7 +1760,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
         if (generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
         if (output.len == 0) return null;
-        return try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
+        return try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, output.slice(), .{ .allocate = .alloc_always });
     }
 
     pub fn readHiddenInitialChildRecord(
@@ -1768,7 +1768,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_id: u64,
-    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+    ) !?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record {
         try self.ensureContextConfigured();
         const generation = self.visibleRootGeneration(group_id);
         var resident: ?Lease = blk: {
@@ -1789,7 +1789,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
         if (output.len == 0) return null;
         if (generation != self.visibleRootGeneration(group_id)) return error.InitialChildPublicationChanged;
-        var parsed = try std.json.parseFromSlice(@import("../storage/db/relational_initial_child_publication.zig").Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
         defer parsed.deinit();
         try parsed.value.validate();
         return parsed.value;
@@ -1802,11 +1802,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
         group_id: u64,
-    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+    ) !?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record {
         return self.readHiddenInitialChildRecord(alloc, group_id, 0);
     }
 
-    pub fn cancelColdInitialChildRetirementAtPath(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_path: []const u8, expected: @import("../storage/db/relational_initial_child_publication.zig").Record, cancel_revision: u64) !void {
+    pub fn cancelColdInitialChildRetirementAtPath(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_path: []const u8, expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Record, cancel_revision: u64) !void {
         try self.ensureContextConfigured();
         const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
         defer alloc.free(path);
@@ -1824,7 +1824,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         alloc: std.mem.Allocator,
         group_path: []const u8,
-    ) !?@import("../storage/db/relational_initial_child_publication.zig").Record {
+    ) !?@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record {
         try self.ensureContextConfigured();
         const path = try std.fs.path.join(alloc, &.{ group_path, "table-db" });
         defer alloc.free(path);
@@ -1837,7 +1837,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         }, &output));
         defer abi.antfly_storage_owner_buffer_destroy(&output);
         if (output.len == 0) return null;
-        var parsed = try std.json.parseFromSlice(@import("../storage/db/relational_initial_child_publication.zig").Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_relational_initial_child_publication.Record, alloc, output.slice(), .{ .ignore_unknown_fields = false });
         defer parsed.deinit();
         try parsed.value.validate();
         return parsed.value;
@@ -2030,7 +2030,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return shards;
     }
 
-    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: @import("../storage/db/native_backup_seal_contract.zig").Request, control: backup_contract.BackupOperationControl) !?[]u8 {
+    fn backupPinControl(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, group_id: u64, input: @import("antfly_local_sources").storage_db_native_backup_seal_contract.Request, control: backup_contract.BackupOperationControl) !?[]u8 {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         try control.ensureActive();
         const json = try std.json.Stringify.valueAlloc(alloc, input, .{});
@@ -2059,7 +2059,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
     /// Private lifecycle bridge: materialize from the admitted durable pin,
     /// then return its certificate for a separate replicated publication CAS.
-    pub fn prepareOnlineSourcePublication(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: @import("../storage/db/online_source_contract.zig").Scope, context: @import("operation.zig").RequestContext) !@import("../storage/source_snapshot.zig").Certificate {
+    pub fn prepareOnlineSourcePublication(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: @import("antfly_local_sources").storage_db_online_source_contract.Scope, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("antfly_local_sources").storage_source_snapshot.Certificate {
         try context.ensureActive();
         try scope.validate();
         if (scope.fence.owner_group_id != group_id) return error.OnlineSourceScopeChanged;
@@ -2072,7 +2072,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         try context.ensureActive();
         var response = try lease.owner().prepareSourcePinPublicationJson(.{ .table_name = .fromSlice(table_name), .request_json = .fromSlice(json), .execution_deadline_ns = native_context.deadline_ns orelse 0, .has_execution_deadline = @intFromBool(native_context.deadline_ns != null), .cancellation_ctx = &cancellation, .cancellation_fn = cancellationTokenRequested });
         defer response.deinit();
-        var parsed = try std.json.parseFromSlice(@import("../storage/source_snapshot.zig").Certificate, alloc, response.bytes(), .{});
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_source_snapshot.Certificate, alloc, response.bytes(), .{});
         defer parsed.deinit();
         _ = try parsed.value.encode();
         if (!parsed.value.cut.namespace.eql(scope.fence.namespace)) return error.SourceSnapshotCutMismatch;
@@ -2080,7 +2080,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return parsed.value;
     }
 
-    pub fn onlineSourceArtifact(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/source_artifact_transfer.zig").Request, context: @import("operation.zig").RequestContext) ![]u8 {
+    pub fn onlineSourceArtifact(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_source_artifact_transfer.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.scope().validate();
         if (request.scope().fence.owner_group_id != group_id) return error.OnlineSourceScopeChanged;
@@ -2098,7 +2098,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         return alloc.dupe(u8, response.bytes());
     }
 
-    pub fn onlineMergeIo(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("../storage/db/online_merge_io_contract.zig").Request, context: @import("operation.zig").RequestContext) ![]u8 {
+    pub fn onlineMergeIo(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, request: @import("antfly_local_sources").storage_db_online_merge_io_contract.Request, context: @import("antfly_local_sources").api_operation.RequestContext) ![]u8 {
         try context.ensureActive();
         try request.validate();
         if (request.ownerGroup() != group_id) return error.OnlineSourceScopeChanged;
@@ -2912,7 +2912,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
     ) !LoadedDescriptor {
         try expected.validate();
         var lease = try self.acquirePreparedOwner(group_id, table_name);
@@ -3213,7 +3213,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
-    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: @import("../storage/coordinated_ttl.zig").Port) *ProvisionedKernelOwnerSource {
+    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: @import("antfly_local_sources").storage_coordinated_ttl.Port) *ProvisionedKernelOwnerSource {
         std.debug.assert(self.entries.items.len == 0);
         self.coordinated_ttl = port;
         return self;
@@ -3238,7 +3238,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const port = self.coordinated_ttl orelse return 1;
         if (request.candidate_count > abi.coordinated_ttl_page_capacity or
             (request.candidate_count != 0 and request.candidates == null)) return 1;
-        var candidates: [abi.coordinated_ttl_page_capacity]@import("../storage/coordinated_ttl.zig").Candidate = undefined;
+        var candidates: [abi.coordinated_ttl_page_capacity]@import("antfly_local_sources").storage_coordinated_ttl.Candidate = undefined;
         for (candidates[0..request.candidate_count], 0..) |*dest, index| {
             const source = request.candidates.?[index];
             if (source.key.len != 0 and source.key.ptr == null) return 1;
@@ -3380,12 +3380,12 @@ pub const ProvisionedKernelOwnerSource = struct {
     pub const RestoreDescriptorUse = enum { read, mutate, resolve };
     pub const RestoreDescriptorRecovery = struct {
         const VTable = struct { recover: @FieldType(RestoreDescriptorRecovery, "recover_fn") };
-        const Boundary = @import("../runtime_callback_abi.zig").Boundary(VTable);
+        const Boundary = @import("antfly_local_sources").runtime_callback_abi.Boundary(VTable);
         ptr: *anyopaque,
-        recover_fn: *const fn (*anyopaque, std.mem.Allocator, u64, []const u8, [32]u8, [16]u8, RestoreDescriptorUse, @import("operation.zig").RequestContext) anyerror!OwnedRestoreDescriptor,
+        recover_fn: *const fn (*anyopaque, std.mem.Allocator, u64, []const u8, [32]u8, [16]u8, RestoreDescriptorUse, @import("antfly_local_sources").api_operation.RequestContext) anyerror!OwnedRestoreDescriptor,
         boundary_dispatch: Boundary.Dispatch = Boundary.local_dispatch,
 
-        fn recover(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: RestoreDescriptorUse, context: @import("operation.zig").RequestContext) !OwnedRestoreDescriptor {
+        fn recover(self: @This(), alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: [16]u8, use: RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !OwnedRestoreDescriptor {
             return Boundary.call("recover", self.boundary_dispatch, self.recover_fn, .{ self.ptr, alloc, group_id, table_name, scope, plan_id, use, context });
         }
     };
@@ -3398,7 +3398,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     /// Cold hidden-owner recovery is bounded by its explicit plan identity.
     /// Only the host's authoritative restore-plan callback can supply a missing
     /// descriptor; ordinary named-table discovery is never an alternative.
-    pub fn resolveRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: ?[16]u8, use: RestoreDescriptorUse, context: @import("operation.zig").RequestContext) !OwnedRestoreDescriptor {
+    pub fn resolveRestoreDescriptor(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, plan_id: ?[16]u8, use: RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !OwnedRestoreDescriptor {
         try context.ensureActive();
         var descriptor = if (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) |cached| cached else blk: {
             const plan = plan_id orelse return error.RestoreStagingScopeChanged;
@@ -3407,7 +3407,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             break :blk try recovery.recover(alloc, group_id, table_name, scope, plan, use, context);
         };
         errdefer descriptor.deinit(alloc);
-        var parsed = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
+        var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
         defer parsed.deinit();
         try parsed.value.validate();
         const namespace = parsed.value.scope.target_namespace;
@@ -3438,7 +3438,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer pinned.deinit();
         const entry = pinned.entry;
         {
-            var bootstrap = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, entry.restore_bootstrap_json, .{});
+            var bootstrap = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, entry.restore_bootstrap_json, .{});
             defer bootstrap.deinit();
             if (!std.mem.eql(u8, &scope, &bootstrap.value.scope.digest())) return error.RestoreStagingScopeChanged;
             const schema_json = try alloc.dupe(u8, entry.schema_json);
@@ -3490,7 +3490,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
     ) !bool {
         try expected.validate();
         lock(&self.mutex);
@@ -3522,7 +3522,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
         opts: db_types.LookupOptions,
     ) !?table_read_source.LookupResponse {
         try expected.validate();
@@ -3575,7 +3575,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        expected: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        expected: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
         req: db_types.BatchRequest,
         operation_index: u64,
     ) !void {
@@ -3605,26 +3605,26 @@ pub const ProvisionedKernelOwnerSource = struct {
         input: @import("restore_owner.zig").Request,
         proposer: ?@import("restore_owner.zig").Proposer,
         options: RestoreOwnerOptions,
-        request: @import("operation.zig").RequestContext,
+        request: @import("antfly_local_sources").api_operation.RequestContext,
     ) !@import("restore_owner.zig").Response {
         try request.ensureActive();
         try input.validate(group_id);
         if (descriptor.restore_bootstrap_json.len == 0) return error.RestoreStagingScopeChanged;
         if (descriptor.lsm_root_generation != self.visibleRootGeneration(group_id)) return error.StorageKernelOwnerTransitionRequired;
-        var bootstrap = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.restore_bootstrap_json, .{});
+        var bootstrap = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, descriptor.restore_bootstrap_json, .{});
         defer bootstrap.deinit();
         if (!std.mem.eql(u8, &bootstrap.value.scope.digest(), &input.scope.digest())) return error.RestoreStagingScopeChanged;
         if (input.action == .install_generation_admissions) {
             const expected = bootstrap.value.generation_admission orelse return error.RestoreSourceProofMissing;
             const command = input.generation_admissions.?;
             if (!std.mem.eql(u8, &expected.source_summary_digest, &command.source_summary_digest) or
-                !std.mem.eql(u8, &expected.expected_receipt_digest, &try @import("../storage/db/restore_staging_contract.zig").admissionReceiptDigest(command)))
+                !std.mem.eql(u8, &expected.expected_receipt_digest, &try @import("antfly_local_sources").storage_db_restore_staging_contract.admissionReceiptDigest(command)))
                 return error.RestoreStagingScopeChanged;
         }
         var prepared = try self.prepareRestoreOwnerControl(alloc, group_id, table_name, descriptor, input, options, request);
         defer prepared.deinit();
         const encoded = prepared.value.batch_json orelse return prepared.value.response;
-        var batch = try @import("batch.zig").parseInternalBatchRequest(alloc, encoded);
+        var batch = try @import("antfly_local_sources").api_batch.parseInternalBatchRequest(alloc, encoded);
         defer batch.deinit(alloc);
         const scope = batch.req.restore_staging_scope orelse return error.RestoreStagingScopeChanged;
         if (!std.mem.eql(u8, &scope, &input.scope.digest()) or batch.req.restore_staging == null) return error.RestoreStagingScopeChanged;
@@ -3651,7 +3651,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: descriptor_contract.Descriptor,
         input: @import("restore_owner.zig").Request,
         options: RestoreOwnerOptions,
-        request: @import("operation.zig").RequestContext,
+        request: @import("antfly_local_sources").api_operation.RequestContext,
     ) !std.json.Parsed(@import("restore_owner.zig").Prepared) {
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
         defer alloc.free(path);
@@ -4220,7 +4220,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer lease.deinit();
         try table_reads.checkQueryDeadline(req);
         var cancellation = req.cancellation;
-        var execution = @import("../storage/local_query_controls.zig").executionOptions(req);
+        var execution = @import("antfly_local_sources").storage_local_query_controls.executionOptions(req);
         execution.raw_search_result = @intFromBool(raw_search_result);
         var response = try lease.owner().queryJsonWithOptions(table_name, request_json, .{
             .execution_deadline_ns = req.execution_deadline_ns,
@@ -4355,7 +4355,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.normalize(alloc, writes);
         }
-        fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("../storage/range_protection.zig").Proof {
+        fn rangeProofs(ptr: *anyopaque, alloc: std.mem.Allocator) ![]@import("antfly_local_sources").storage_range_protection.Proof {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.view.rangeProofs(alloc);
         }
@@ -4411,7 +4411,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return .{ .ptr = retained, .vtable = &.{ .next = RetainedRelationalRead.next, .close = RetainedRelationalRead.close, .normalize = RetainedRelationalRead.normalize, .range_proofs = RetainedRelationalRead.rangeProofs } };
         }
 
-        fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("../storage/statement_read_fence.zig").Snapshot {
+        fn captureSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator) !@import("antfly_local_sources").storage_statement_read_fence.Snapshot {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const frozen_proof = self.frozen_proof orelse return error.SqlStatementSnapshotRequired;
             try validate(self);
@@ -4439,7 +4439,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         source: *ProvisionedKernelOwnerSource,
         owner: Lease,
-        native: @import("../storage/statement_read_fence.zig").Snapshot,
+        native: @import("antfly_local_sources").storage_statement_read_fence.Snapshot,
         route: metadata_api.CatalogRouteFence,
         group: u64,
         table: []u8,
@@ -4482,7 +4482,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             const proofs = try view.rangeProofs(alloc);
             errdefer alloc.free(proofs);
             if (proofs.len == 0) return error.SqlRangeTrackingRequired;
-            const owners = try alloc.alloc(@import("range_read_guards.zig").OwnerRangeProof, 1);
+            const owners = try alloc.alloc(@import("antfly_local_sources").api_range_read_guards.OwnerRangeProof, 1);
             owners[0] = .{ .fence = self.route, .proofs = proofs };
             return .{ .view = view, .owner_proofs = owners };
         }
@@ -4804,7 +4804,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         var descriptor = try self.resolveRestoreDescriptor(alloc, group_id, table_name, scope, opts.restore_staging_plan_id, if (handoff_receipt) .resolve else .read, .{ .deadline_ns = opts.execution_deadline_ns, .deadline_io = opts.execution_io, .cancellation = opts.cancellation orelse .none });
         defer descriptor.deinit(alloc);
         if (handoff_receipt) {
-            var parsed = try std.json.parseFromSlice(@import("../storage/db/restore_staging_contract.zig").OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
+            var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_restore_staging_contract.OwnerBootstrap, alloc, descriptor.descriptor.restore_bootstrap_json, .{});
             defer parsed.deinit();
             try parsed.value.validate();
             if (parsed.value.empty_generation_handoff == null)
@@ -5620,7 +5620,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         topology_epoch: u64,
         retain_terminal: bool,
         participants: []const []const u8,
-        context: @import("distributed_txn_contract.zig").PreDecisionContext,
+        context: @import("antfly_local_sources").api_distributed_txn_contract.PreDecisionContext,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         const active: request_operation.RequestContext = .{ .deadline_ns = context.deadline_ns, .deadline_io = context.deadline_io, .cancellation = context.cancellation };
@@ -5725,7 +5725,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         alloc: std.mem.Allocator,
         group_id: u64,
         table_name: []const u8,
-        req: @import("distributed_txn_contract.zig").TxnStatusRequest,
+        req: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest,
         context: request_operation.RequestContext,
     ) !?db_types.TxnStatus {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
@@ -6244,7 +6244,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 };
 
 test "compiled owner coordinated ttl admission preserves exact observations and pressure" {
-    const ttl = @import("../storage/coordinated_ttl.zig");
+    const ttl = @import("antfly_local_sources").storage_coordinated_ttl;
     const Fake = struct {
         calls: usize = 0,
         pressure: bool = false,
@@ -6283,7 +6283,7 @@ test "compiled owner coordinated ttl admission preserves exact observations and 
 
 test "storage owner quiesce drains leases and promotion callbacks before context destruction" {
     const alloc = std.testing.allocator;
-    var directory = try @import("../common/test_directory.zig").TestDirectory.init("owner-quiesce");
+    var directory = try @import("antfly_local_sources").common_test_directory.TestDirectory.init("owner-quiesce");
     defer directory.cleanup();
     const path = std.mem.span(directory.path().ptr);
     var source = ProvisionedKernelOwnerSource.init(alloc, path, table_catalog.emptyCatalogSource(), read_gate.unavailableReadSafetyBarrier());
@@ -6841,7 +6841,7 @@ test "hidden initial child descriptor requires exact private bootstrap" {
     defer alloc.free(root);
     var source = ProvisionedKernelOwnerSource.init(alloc, root, table_catalog.emptyCatalogSource(), read_gate.alreadyReadSafeBarrier());
     defer source.deinit();
-    const Bootstrap = @import("../storage/db/relational_initial_child_publication.zig").Bootstrap;
+    const Bootstrap = @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap;
     const expected: Bootstrap = .{
         .plan_id = .{1} ** 16,
         .plan_digest = .{2} ** 32,
@@ -7556,12 +7556,12 @@ test "owner recovery bulk callback preserves bounded identities and uncertain st
         fn owns(_: *anyopaque, _: []const u8) bool {
             return true;
         }
-        fn resolve(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: @import("../storage/db/types.zig").TxnStatus, _: u64) !void {}
-        fn single(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: []const u8) !void {
+        fn resolve(_: *anyopaque, _: @import("antfly_local_sources").storage_db_types.TxnId, _: []const u8, _: @import("antfly_local_sources").storage_db_types.TxnStatus, _: u64) !void {}
+        fn single(_: *anyopaque, _: @import("antfly_local_sources").storage_db_types.TxnId, _: []const u8, _: []const u8) !void {
             return error.TestUnexpectedSingle;
         }
-        fn cleanup(_: *anyopaque, _: @import("../storage/db/types.zig").TxnId, _: []const u8, _: u64, _: u64) !void {}
-        fn many(ptr: *anyopaque, txn: @import("../storage/db/types.zig").TxnId, owner: []const u8, participants: []const []const u8) !void {
+        fn cleanup(_: *anyopaque, _: @import("antfly_local_sources").storage_db_types.TxnId, _: []const u8, _: u64, _: u64) !void {}
+        fn many(ptr: *anyopaque, txn: @import("antfly_local_sources").storage_db_types.TxnId, owner: []const u8, participants: []const []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
             try std.testing.expectEqual([_]u8{4} ** 16, txn);

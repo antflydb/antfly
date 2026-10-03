@@ -19,9 +19,9 @@
 //! after a failed request without an in-memory cleanup receipt.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const schema = @import("../schema/mod.zig");
-const support = @import("../schema/relational_witness_indexes.zig");
-const records = @import("../common/topology_records.zig");
+const schema = @import("antfly_local_sources").schema_mod;
+const support = @import("antfly_local_sources").schema_relational_witness_indexes;
+const records = @import("antfly_local_sources").common_topology_records;
 const tables_api = @import("tables.zig");
 const wire = @import("antfly_schema_openapi");
 
@@ -140,7 +140,7 @@ pub fn prepare(alloc: Allocator, tables: []const records.TableRecord, child_name
             for (tables) |table| if (std.mem.eql(u8, table.name, fk.parent_table)) break :blk table.schema_json;
             return error.ForeignKeyParentTableNotFound;
         };
-        try @import("../schema/relational_foreign_key_target.zig").validate(owned, child_json, fk.parent_table, parent_json);
+        try @import("antfly_local_sources").schema_relational_foreign_key_target.validate(owned, child_json, fk.parent_table, parent_json);
     }
     return .{ .arena = arena, .schema_json = child_json, .parents = try parents.toOwnedSlice(owned) };
 }
@@ -261,7 +261,7 @@ test "distributed txn owned witness DDL resumes parent preparation and cleans fa
     try std.testing.expect((try cleanup(alloc, &.{ published_parent, child }, published_parent)) == null);
     // A child winning after the collector's snapshot causes authoritative
     // metadata admission to reject the stale support-drop candidate.
-    try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, @import("../schema/relational_foreign_key_target.zig").validate(alloc, child.schema_json, "parents", collected.schema_json));
+    try std.testing.expectError(error.ForeignKeyPartialSupportIndexRequired, @import("antfly_local_sources").schema_relational_foreign_key_target.validate(alloc, child.schema_json, "parents", collected.schema_json));
     child.read_schema_json = child.schema_json;
     child.schema_json = "{}";
     try std.testing.expect((try cleanup(alloc, &.{ published_parent, child }, published_parent)) == null);

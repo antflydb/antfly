@@ -14,9 +14,9 @@
 
 //! Pure, private shared-restore owner request and response contract.
 const std = @import("std");
-const staging = @import("../storage/db/restore_staging_contract.zig");
-const metadata_staging = @import("../metadata/restore_provisioning_contract.zig");
-const backups = @import("backup_contract.zig");
+const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
+const metadata_staging = @import("antfly_local_sources").metadata_restore_provisioning_contract;
+const backups = @import("antfly_local_sources").api_backup_contract;
 /// Includes the 4 MiB rewrite program, a base64-encoded 1 MiB source
 /// chunk, and their binary-safe JSON byte-array expansion (at most four
 /// bytes per input byte). Fixed scope/certificate overhead fits in the
@@ -33,20 +33,20 @@ pub const Source = struct {
     artifact: metadata_staging.SourceArtifact,
     /// Private rewrite transport. Its artifact digest is the immutable logical
     /// certificate digest, not a repository object's byte checksum.
-    peer_descriptor: ?@import("../storage/db/source_artifact_transfer.zig").Descriptor = null,
+    peer_descriptor: ?@import("antfly_local_sources").storage_db_source_artifact_transfer.Descriptor = null,
 };
 pub const Request = struct {
     scope: staging.Scope,
     action: enum { begin, import_page, status, validate, install_generation_admissions, publish, cancel },
     generation_admissions: ?staging.InstallGenerationAdmissions = null,
     source: ?Source = null,
-    source_chunk: ?@import("../storage/db/source_artifact_transfer.zig").ReadResponse = null,
-    rewrite: ?@import("../storage/db/relational_rewrite_contract.zig").Intent = null,
-    rewrite_tail: ?@import("../storage/db/relational_rewrite_contract.zig").TailChunk = null,
-    rewrite_finish: ?@import("../storage/db/relational_rewrite_contract.zig").FinalReceipt = null,
+    source_chunk: ?@import("antfly_local_sources").storage_db_source_artifact_transfer.ReadResponse = null,
+    rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Intent = null,
+    rewrite_tail: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.TailChunk = null,
+    rewrite_finish: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.FinalReceipt = null,
     max_rows: u16 = 128,
     pub fn jsonStringify(self: @This(), jw: anytype) @TypeOf(jw.*).Error!void {
-        try @import("../storage/db/relational_integrity_json.zig").write(self, jw);
+        try @import("antfly_local_sources").storage_db_relational_integrity_json.write(self, jw);
     }
     /// A post-proposal receipt read must not replay import-only data or final
     /// cut commands. Its exact scope is all the authority a status read needs.
@@ -97,12 +97,12 @@ pub const Response = struct {
     rows: u64,
     receipt: staging.Digest,
     generation_admission_receipt: ?staging.Digest = null,
-    rewrite: ?@import("../storage/db/relational_rewrite_contract.zig").Progress = null,
+    rewrite: ?@import("antfly_local_sources").storage_db_relational_rewrite_contract.Progress = null,
     tail_next: u32 = 0,
     source_next_offset: u64 = 0,
 };
 
-pub fn validatePeerSource(source: Source, scope: staging.Scope, descriptor: @import("../storage/db/source_artifact_transfer.zig").Descriptor) !void {
+pub fn validatePeerSource(source: Source, scope: staging.Scope, descriptor: @import("antfly_local_sources").storage_db_source_artifact_transfer.Descriptor) !void {
     const binding = scope.rewrite orelse return error.RestoreSourceProofMissing;
     try binding.validate();
     const source_scope = binding.source_scope orelse return error.RestoreSourceProofMissing;

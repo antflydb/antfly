@@ -19,7 +19,7 @@ const digest_b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
 const digest_c = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
 const digest_d = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
-fn walOptions() @import("../wal.zig").WalOptions {
+fn walOptions() @import("antfly_local_sources").storage_wal.WalOptions {
     return .{ .backend = .lsm };
 }
 

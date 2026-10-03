@@ -15,11 +15,11 @@
 //! authenticated forwarding endpoint.
 
 const std = @import("std");
-const operation = @import("../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const indexes_api = @import("../api/indexes.zig");
 const tables_api = @import("../api/tables.zig");
-const group_ids = @import("../common/group_ids.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const metadata_authority = @import("authority.zig");
 const metadata_table_manager = @import("table_manager.zig");
 const topology_protocol = @import("topology_protocol.zig");
@@ -236,7 +236,7 @@ pub fn restore(
             return error.InvalidTableTopologyMutation;
         unique_groups.putAssumeCapacity(range.group_id, {});
     }
-    if (try @import("../system_catalog/domain.zig").restoreTarget(alloc, table.name)) |owned_target| {
+    if (try @import("antfly_local_sources").system_catalog_domain.restoreTarget(alloc, table.name)) |owned_target| {
         defer owned_target.deinit(alloc);
         const target = owned_target.value;
         return @import("../system_catalog/operations.zig").restore(svc, alloc, request, target, table, ranges);

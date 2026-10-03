@@ -13,8 +13,8 @@ const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const table_catalog = @import("../api/table_catalog.zig");
-const db_types = @import("../storage/db/types.zig");
-const graph_query = @import("../graph/query.zig");
+const db_types = @import("antfly_local_sources").storage_db_types;
+const graph_query = @import("antfly_local_sources").graph_query;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });

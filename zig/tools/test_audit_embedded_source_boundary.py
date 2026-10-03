@@ -33,7 +33,7 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             repository = Path(directory) / "repo"
             stage = Path(directory) / "stage"
             files = {
-                "zig/pkg/antfly/src/storage/db/db.zig": "local working change",
+                "zig/pkg/antfly-embedded/src/local/storage/db/db.zig": "local working change",
                 "zig/pkg/antfly/src/storage/server_db_adapter.zig": "server",
                 "zig/pkg/antfly/src/storage/server_transaction_dispatch.zig": "server dispatch",
                 "zig/pkg/antfly/src/storage/server_transaction_recovery.zig": "server recovery",
@@ -56,15 +56,14 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             ):
                 self.assertEqual(stage_sources(repository, stage), 7)
             self.assertEqual(
-                (stage / "zig/pkg/antfly/src/storage/db/db.zig").read_text(),
+                (
+                    stage / "zig/pkg/antfly-embedded/src/local/storage/db/db.zig"
+                ).read_text(),
                 "local working change",
             )
             self.assertTrue((stage / "specs/openapi/public.yaml").is_file())
             self.assertTrue((stage / "scripts/codegen.py").is_file())
-            self.assertIn(
-                '@compileError("server implementation unavailable',
-                (stage / "zig/pkg/antfly/src/capi/server_owner.zig").read_text(),
-            )
+            self.assertFalse((stage / "zig/pkg/antfly").exists())
             self.assertFalse((stage / "docs/plan.md").exists())
 
     def test_local_ports_reject_policy_even_without_server_imports(self):
@@ -97,6 +96,22 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             "storage/db/replication_contract.zig",
             '// standby_names\nconst note = "sync_policy";',
         )
+
+    def test_module_graph_checks_policy_in_moved_local_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            contract = (
+                project
+                / "pkg/antfly-embedded/src/local/storage/db/replication_contract.zig"
+            )
+            contract.parent.mkdir(parents=True)
+            contract.write_text("pub const sync_policy = 0;")
+            with self.assertRaisesRegex(ValueError, "server replication policy"):
+                audit_modules(project, {"local": contract}, {}, "local")
+            contract.write_text("pub const CommitRequirements = struct {};")
+            self.assertEqual(
+                1, audit_modules(project, {"local": contract}, {}, "local")
+            )
 
     def test_dynamic_imports_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "literal source owner"):

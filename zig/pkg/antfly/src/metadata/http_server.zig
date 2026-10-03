@@ -16,11 +16,11 @@ const std = @import("std");
 const store_report_baseline = @import("store_report_baseline.zig");
 const snapshot_transfer = @import("snapshot_transfer.zig");
 const store_report_update = @import("store_report_update.zig");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const system_catalog_operations = @import("../system_catalog/operations.zig");
 const ant_json = @import("antfly-json");
 const httpx = @import("httpx");
-const group_ids = @import("../common/group_ids.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
 const metadata_api = @import("api.zig");
 const metadata_authority = @import("authority.zig");
 const metadata_admin = @import("admin.zig");
@@ -29,7 +29,7 @@ const admin_mutation_operations = @import("admin_mutation_operations.zig");
 const extension_operations = @import("extension_operations.zig");
 const node_operations = @import("node_operations.zig");
 const table_operations = @import("table_operations.zig");
-const operation = @import("../api/operation.zig");
+const operation = @import("antfly_local_sources").api_operation;
 const raft_mutation_forwarding = @import("../api/raft_mutation_forwarding.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const extension_lifecycle = @import("../extensions/lifecycle.zig");
@@ -43,7 +43,7 @@ const http_common = @import("../raft/transport/http_common.zig");
 const backups_api = @import("../api/backups.zig");
 const http_route_helpers = @import("../api/http_route_helpers.zig");
 const indexes_api = @import("../api/indexes.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const tables_api = @import("../api/tables.zig");
 const api_table_catalog = @import("../api/table_catalog.zig");
 const platform_clock = @import("antfly_platform").clock;
@@ -66,7 +66,7 @@ pub const MetadataHttpServerConfig = struct {
     /// that every upgraded metadata process is actually enforcing the
     /// configured internal-service authentication rollout mode.
     internal_service_auth_capability: ?[]const u8 = null,
-    secret_store: ?*@import("../common/secrets.zig").FileStore = null,
+    secret_store: ?*@import("antfly_local_sources").common_secrets.FileStore = null,
 };
 
 pub const SplitRequest = table_operations.SplitRequest;
@@ -141,7 +141,7 @@ fn storeRootCapabilityReadinessCall(comptime Service: type, comptime required_ve
 
 test "store-root readiness returns only an exact durable v17 activation" {
     const protocol = @import("topology_protocol.zig");
-    const incarnation: @import("incarnation.zig").MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
+    const incarnation: @import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation = "0123456789abcdef0123456789abcdef".*;
     const proof: service.TableTopologyProtocolReadiness = .{
         .term = 7,
         .required_version = protocol.store_root_uuid_decoder_version,
@@ -1936,7 +1936,7 @@ pub const MetadataHttpServer = struct {
     internal_service_auth_capability: ?[]const u8 = null,
     setting_authority_secret: ?[]const u8 = null,
     setting_authority_issuer: ?[]const u8 = null,
-    secret_store: ?*@import("../common/secrets.zig").FileStore = null,
+    secret_store: ?*@import("antfly_local_sources").common_secrets.FileStore = null,
 
     pub fn init(alloc: std.mem.Allocator, cfg: MetadataHttpServerConfig, source: AdminSource) MetadataHttpServer {
         return .{

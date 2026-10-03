@@ -316,7 +316,7 @@ fn awaitRetirementState(alloc: std.mem.Allocator, io: std.Io, data: *data_runtim
         };
         if (response) |*value| {
             defer value.deinit(alloc);
-            var parsed = try std.json.parseFromSlice(?@import("../storage/db/relational_integrity_generation_retirement.zig").OwnerStatus, alloc, value.json, .{});
+            var parsed = try std.json.parseFromSlice(?@import("antfly_local_sources").storage_db_relational_integrity_generation_retirement.OwnerStatus, alloc, value.json, .{});
             defer parsed.deinit();
             if (parsed.value) |status| {
                 try std.testing.expectEqual(route.group_id, status.fence.owner_group_id);

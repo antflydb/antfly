@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const TestDirectory = @import("../common/test_directory.zig").TestDirectory;
+const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
 const platform_time = @import("antfly_platform").time;
 const ant_json = @import("antfly-json");
 const cluster = @import("cluster.zig");
@@ -21,22 +21,22 @@ const metadata_mod = @import("../metadata/domain.zig");
 const route_metadata_api = @import("../metadata/api.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
 const db_api = @import("antfly_source_root").antfly_sources.physical_db;
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const http_common = @import("../raft/transport/http_common.zig");
 const http_route_helpers = @import("http_route_helpers.zig");
 const internal_batch_forwarding = @import("internal_batch_forwarding.zig");
 const algebraic_partials_wire = @import("algebraic_partials_wire.zig");
-const distributed_stats_mod = @import("../search/distributed_stats.zig");
+const distributed_stats_mod = @import("antfly_local_sources").search_distributed_stats;
 const routes = @import("http_routes.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const txn_api = @import("distributed_txn.zig");
-const txn_contract = @import("distributed_txn_contract.zig");
-const table_writes_api = @import("table_write_source.zig");
+const txn_contract = @import("antfly_local_sources").api_distributed_txn_contract;
+const table_writes_api = @import("antfly_local_sources").api_table_write_source;
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const transactions_api = @import("transactions.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
-const query_response = @import("query_response.zig");
-const backup_contract = @import("backup_contract.zig");
+const query_response = @import("antfly_local_sources").api_query_response;
+const backup_contract = @import("antfly_local_sources").api_backup_contract;
 const internal_service_auth = @import("internal_service_auth.zig");
 
 const transition_control_rpc_timeout_ms: u32 = 5_000;
@@ -739,7 +739,7 @@ pub const ApiHttpClient = struct {
         };
     }
 
-    pub fn fetchRestoreOwner(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_owner.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("restore_owner.zig").Response {
+    pub fn fetchRestoreOwner(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_owner.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !@import("restore_owner.zig").Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
         const encoded_name = try percentEncodePathComponent(self.alloc, table_name);
@@ -769,7 +769,7 @@ pub const ApiHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn fetchRestoreParentActivation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_parent_activation.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("restore_parent_activation.zig").Response {
+    pub fn fetchRestoreParentActivation(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("restore_parent_activation.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !@import("restore_parent_activation.zig").Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
         try request.validate(group_id);
@@ -798,7 +798,7 @@ pub const ApiHttpClient = struct {
         return parsed.value;
     }
 
-    fn fetchFkGenerationControl(self: *ApiHttpClient, comptime Response: type, suffix: []const u8, base_uri: []const u8, group_id: u64, table_name: []const u8, request: anytype, input_context: @import("operation.zig").RequestContext) !Response {
+    fn fetchFkGenerationControl(self: *ApiHttpClient, comptime Response: type, suffix: []const u8, base_uri: []const u8, group_id: u64, table_name: []const u8, request: anytype, input_context: @import("antfly_local_sources").api_operation.RequestContext) !Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
         try request.validate(group_id);
@@ -828,19 +828,19 @@ pub const ApiHttpClient = struct {
         return parsed.value;
     }
 
-    pub fn fetchFkGenerationParent(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").Request, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
+    pub fn fetchFkGenerationParent(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").Request, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").Receipt {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").Receipt, routes.Routes.fk_generation_parent_suffix, base_uri, group_id, table_name, request, context);
     }
 
-    pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
+    pub fn fetchFkGenerationSource(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").SourceRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").SourceReceipt {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").SourceReceipt, routes.Routes.fk_generation_source_suffix, base_uri, group_id, table_name, request, context);
     }
 
-    pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("operation.zig").RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
+    pub fn fetchFkInitialChild(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("relational_fk_generation_publication.zig").InitialChildRequest, context: @import("antfly_local_sources").api_operation.RequestContext) !@import("relational_fk_generation_publication.zig").InitialChildReceipt {
         return self.fetchFkGenerationControl(@import("relational_fk_generation_publication.zig").InitialChildReceipt, routes.Routes.fk_initial_child_suffix, base_uri, group_id, table_name, request, context);
     }
 
-    pub fn fetchRowPolicyInstall(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("row_policy_install.zig").Request, input_context: @import("operation.zig").RequestContext) !@import("row_policy_install.zig").Response {
+    pub fn fetchRowPolicyInstall(self: *ApiHttpClient, base_uri: []const u8, group_id: u64, table_name: []const u8, request: @import("row_policy_install.zig").Request, input_context: @import("antfly_local_sources").api_operation.RequestContext) !@import("row_policy_install.zig").Response {
         const context = try input_context.platformDeadline();
         try context.ensureActive();
         try @import("row_policy_install.zig").validate(request, group_id);
@@ -877,7 +877,7 @@ pub const ApiHttpClient = struct {
         body: []const u8,
         fence: backup_contract.TableBackupFence,
         control: backup_contract.BackupOperationControl,
-        cohort: ?@import("../storage/db/relational_integrity_topology_contract.zig").Fence,
+        cohort: ?@import("antfly_local_sources").storage_db_relational_integrity_topology_contract.Fence,
     ) !TablesResponse {
         if (cohort) |value| if (value.owner_group_id != group_id or value.namespace.table_id != fence.table_id or value.role != .backup_snapshot)
             return error.InvalidBackupFence;
@@ -4099,8 +4099,8 @@ test "relational row query remote transaction prepare preserves scalar validatio
     };
     var executor: Executor = .{ .status = 400, .body = "" };
     var client = ApiHttpClient.init(std.testing.allocator, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
-    inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-        const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+    inline for (@typeInfo(@import("antfly_local_sources").schema_relational_expression_errors.Error).error_set.?) |field| {
+        const reason = @field(@import("antfly_local_sources").schema_relational_expression_errors.Error, field.name);
         executor.status = @import("relational_row_errors.zig").status(reason);
         executor.body = field.name;
         try std.testing.expectError(reason, client.fetchGroupTxnPrepare("http://127.0.0.1:1", 7, "rows", "{}"));
@@ -4315,7 +4315,7 @@ fn consumerTests() type {
     if (@hasDecl(test_owner_root, "implementation_tests_only") and test_owner_root.implementation_tests_only) return struct {};
     const Suite = struct {
         test "relational backup cohort remote capture carries exact binary owner authority" {
-            const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+            const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
             const expected: topology.Fence = .{
                 .transition_id = std.math.maxInt(u64),
                 .attempt = 7,

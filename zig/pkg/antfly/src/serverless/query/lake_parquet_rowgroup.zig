@@ -30,9 +30,9 @@ const range_io = @import("lake_range_io.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const rowsource = @import("../../storage/rowsource/types.zig");
 const rowsource_external = @import("../../storage/rowsource/external.zig");
-const resource_manager_mod = @import("../../storage/resource_manager.zig");
+const resource_manager_mod = @import("antfly_local_sources").storage_resource_manager;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const snappy = @import("../../encoding/snappy.zig");
+const snappy = @import("antfly_local_sources").encoding_snappy;
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 pub const MaterializationLimits = struct {

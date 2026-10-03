@@ -5,9 +5,9 @@
 //! TLS-terminating proxy. Replies authenticate the complete randomized request,
 //! preventing replay of an old value/absence against a fresh lookup. No cache.
 const std = @import("std");
-const contract = @import("secret_contract.zig");
-const secrets = @import("secrets.zig");
-const http = @import("http/http_common.zig");
+const contract = @import("antfly_local_sources").common_secret_contract;
+const secrets = @import("antfly_local_sources").common_secrets;
+const http = @import("antfly_local_sources").common_http_http_common;
 const auth = @import("../api/internal_service_auth.zig");
 const Aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 pub const path = "/internal/v1/secrets:read";

@@ -4,10 +4,10 @@
 //! are resolved for every request. Content addressing naturally invalidates on
 //! schema changes, including table-name reuse. No cached authorization exists.
 const std = @import("std");
-const catalog = @import("../sql/catalog.zig");
-const schema = @import("../schema/mod.zig");
-const native_schema = @import("../storage/schema.zig");
-const Budget = @import("../sql/memory_budget.zig");
+const catalog = @import("antfly_local_sources").sql_catalog;
+const schema = @import("antfly_local_sources").schema_mod;
+const native_schema = @import("antfly_local_sources").storage_schema;
+const Budget = @import("antfly_local_sources").sql_memory_budget;
 
 const Entry = struct {
     digest: [32]u8,
@@ -150,7 +150,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
     if (parsed.storage_mode == .document) {
         entry.storage_mode = .document;
         entry.version = parsed.version;
-        entry.columns = try @import("../sql/document_row.zig").deriveColumns(owned, parsed);
+        entry.columns = try @import("antfly_local_sources").sql_document_row.deriveColumns(owned, parsed);
         return;
     }
     const native = try schema.deriveRuntimeTableSchema(alloc, parsed);
@@ -172,7 +172,7 @@ fn derive(entry: *Entry, json: []const u8) !void {
         .path = try owned.dupe(u8, column.path),
         .nullable = !column.required or column.allows_null,
         .generated = generated.contains(column.name),
-        .type = @import("../sql/document_row.zig").relationalType(parsed, column.name, switch (column.column_type) {
+        .type = @import("antfly_local_sources").sql_document_row.relationalType(parsed, column.name, switch (column.column_type) {
             .string => .string,
             .integer => .integer,
             .number => .number,
@@ -226,7 +226,7 @@ test "SQL schema cache reuses immutable layouts without caching table identity" 
     const newer = try cache.resolve(std.testing.io, arena.allocator(), changed, 1, "one");
     try std.testing.expectEqual(@as(u32, 2), newer.schema_version);
     try std.testing.expectEqual(@as(u32, 1), first.schema_version);
-    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.string, newer.columns[0].type);
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.string, newer.columns[0].type);
     const padding: [40]u8 = @splat(' ');
     for (1..40) |count| {
         const variant = try std.fmt.allocPrint(arena.allocator(), "{s}{s}", .{ json, padding[0..count] });
@@ -234,7 +234,7 @@ test "SQL schema cache reuses immutable layouts without caching table identity" 
     }
     // Copies remain valid after the corresponding immutable entry is evicted.
     try std.testing.expectEqualStrings("id", first.columns[0].name);
-    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.integer, first.columns[0].type);
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.integer, first.columns[0].type);
     const schemaless = try cache.resolve(std.testing.io, arena.allocator(), "{}", 3, "three");
     try std.testing.expectEqual(.document, schemaless.storage_mode);
     try std.testing.expectEqual(@as(usize, 0), schemaless.columns.len);
@@ -270,11 +270,11 @@ test "SQL schema cache document shapes are declared stable unions" {
     try std.testing.expectEqual(.document, table.storage_mode);
     try std.testing.expectEqual(@as(u32, 3), table.schema_version);
     try std.testing.expectEqual(@as(usize, 4), table.columns.len);
-    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.integer, (try table.column("id")).type);
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.integer, (try table.column("id")).type);
     try std.testing.expect(!(try table.column("id")).nullable);
-    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.json, (try table.column("mixed")).type);
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.json, (try table.column("mixed")).type);
     try std.testing.expect((try table.column("only_a")).nullable);
-    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.json, (try table.column("nested")).type);
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.json, (try table.column("nested")).type);
     try std.testing.expectError(error.UndefinedColumn, table.column("sampled_from_a_row"));
 }
 
@@ -287,6 +287,6 @@ test "SQL schema cache preserves logical UUID over physical keywords" {
     const table = try cache.resolve(std.testing.io, arena.allocator(),
         \\{"version":0,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"u":{"type":"keyword","format":"uuid"},"label":{"type":"keyword"}},"additionalProperties":false}}}}
     , 7, "items");
-    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.uuid, (try table.column("u")).type);
-    try std.testing.expectEqual(@import("../sql/ast.zig").ColumnType.string, (try table.column("label")).type);
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.uuid, (try table.column("u")).type);
+    try std.testing.expectEqual(@import("antfly_local_sources").sql_ast.ColumnType.string, (try table.column("label")).type);
 }

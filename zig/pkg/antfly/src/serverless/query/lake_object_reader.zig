@@ -20,7 +20,7 @@ const Crc32c = @import("antfly_hash").Crc32c;
 const Crc64Nvme = @import("antfly_hash").Crc64Nvme;
 const lake_range_io = @import("lake_range_io.zig");
 const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
-const object_storage = @import("../../storage/object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 
 const Allocator = std.mem.Allocator;
 

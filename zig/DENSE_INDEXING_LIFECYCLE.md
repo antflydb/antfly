@@ -280,17 +280,17 @@ The relevant paths are:
 
 - `pkg/antfly/src/api/table_writes.zig`
   - ordinary API uploads do not automatically start explicit table bulk windows
-- `pkg/antfly/src/storage/db/derived/catch_up_policy.zig`
+- `pkg/antfly-embedded/src/local/storage/db/derived/catch_up_policy.zig`
   - dense replay coalescing, session reuse, and window limits
-- `pkg/antfly/src/storage/db/derived/runtime_types.zig`
+- `pkg/antfly-embedded/src/local/storage/db/derived/runtime_types.zig`
   - opens and closes per-index catch-up state
-- `pkg/antfly/src/storage/db/db.zig`
+- `pkg/antfly-embedded/src/local/storage/db/db.zig`
   - `beginDerivedCatchUpSessionAsync`
   - `finishDerivedCatchUpSessionAsync`
   - `applyDerivedBatchToIndexContextProfiled`
-- `pkg/antfly/src/storage/db/catalog/index_manager.zig`
+- `pkg/antfly-embedded/src/local/storage/db/catalog/index_manager.zig`
   - maps storage batch mode to HBC batch options
-- `pkg/antfly/src/storage/hbc_adapter.zig`
+- `pkg/antfly-embedded/src/local/storage/hbc_adapter.zig`
   - owns the HBC session depth, deferred state, and
     `__bulk_publish_state`
 

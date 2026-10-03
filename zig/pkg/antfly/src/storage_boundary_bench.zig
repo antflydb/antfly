@@ -6,9 +6,9 @@
 //! treating local timings as a throughput or release-runner guarantee.
 const std = @import("std");
 const time = @import("antfly_platform").time;
-const batch = @import("api/batch.zig");
-const types = @import("storage/db/types.zig");
-const query_contract = @import("api/local_query_contract.zig");
+const batch = @import("antfly_local_sources").api_batch;
+const types = @import("antfly_local_sources").storage_db_types;
+const query_contract = @import("antfly_local_sources").api_local_query_contract;
 const client = @import("storage/kernel_owner_client.zig");
 
 pub fn main(init: std.process.Init) !void {
@@ -95,3 +95,6 @@ pub fn main(init: std.process.Init) !void {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_common.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

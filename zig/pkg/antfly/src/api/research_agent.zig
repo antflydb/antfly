@@ -1750,7 +1750,7 @@ pub fn execute(
 // Tests
 // ---------------------------------------------------------------------------
 
-const query_api = @import("query.zig");
+const query_api = @import("antfly_local_sources").api_query;
 
 const TestFake = struct {
     plan: []const u8 =

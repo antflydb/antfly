@@ -19,7 +19,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const snappy = @import("../../encoding/snappy.zig");
+const snappy = @import("antfly_local_sources").encoding_snappy;
 
 /// Parquet pages are normally around 1 MiB. Keep enough headroom for existing
 /// writers while preventing an external page header or compressed payload from

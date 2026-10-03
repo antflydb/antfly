@@ -15,14 +15,14 @@
 const std = @import("std");
 const abi = @import("kernel_owner_abi");
 const kernel_owner_source = @import("../api/kernel_owner_source.zig");
-const backup_contract = @import("../api/backup_contract.zig");
+const backup_contract = @import("antfly_local_sources").api_backup_contract;
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const distributed_graph = @import("../api/distributed_graph.zig");
 const indexes_api = @import("../api/indexes.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
-const query_api = @import("../api/query.zig");
+const query_api = @import("antfly_local_sources").api_query;
 const raft_reconciler = @import("../raft/reconciler.zig");
 const read_gate = @import("../raft/read_gate.zig");
 const table_catalog = @import("../api/table_catalog.zig");
@@ -160,7 +160,7 @@ test "replica retirement drains active compiled owners before deleting physical 
         var source = table_writes.ProvisionedTableWriteSource.init(root, table_catalog.emptyCatalogSource());
         defer source.deinit();
         const Drain = struct {
-            owner: @import("../api/table_write_source.zig").TableWriteSource,
+            owner: @import("antfly_local_sources").api_table_write_source.TableWriteSource,
             io: std.Io,
             entered: std.Io.Event = .unset,
             fn run(ptr: *anyopaque, group_id: u64, name: []const u8) !?void {
@@ -321,14 +321,14 @@ test "concurrent cold hidden bootstrap reads share one configured context" {
 test "hidden constrained lookup recovers cold compiled owner from exact plan authority" {
     const alloc = std.testing.allocator;
     const Source = kernel_owner_source.ProvisionedKernelOwnerSource;
-    const staging = @import("db/restore_staging_contract.zig");
+    const staging = @import("antfly_local_sources").storage_db_restore_staging_contract;
     const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"unique_constraints\":[{\"name\":\"pk\",\"columns\":[\"id\"]}],\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
     const tables = @import("../api/tables.zig");
     var parsed = try tables.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     const schema = try tables.deriveRuntimeTableSchema(alloc, parsed);
-    defer @import("schema.zig").freeSchema(alloc, schema);
-    const encoded_schema = try @import("schema.zig").serializeSchema(alloc, schema);
+    defer @import("antfly_local_sources").storage_schema.freeSchema(alloc, schema);
+    const encoded_schema = try @import("antfly_local_sources").storage_schema.serializeSchema(alloc, schema);
     defer alloc.free(encoded_schema);
     const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 70, .shard_id = 7001, .range_id = 7001 }, .target_namespace = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .target_schema_digest = staging.digest(encoded_schema) };
     const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = "{}", .byte_range = .{ .start = "a", .end = "m" } };
@@ -347,7 +347,7 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
         reads: usize = 0,
         barrier_blocked: bool = false,
         barriers: usize = 0,
-        fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("../api/operation.zig").RequestContext) !Source.OwnedRestoreDescriptor {
+        fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("antfly_local_sources").api_operation.RequestContext) !Source.OwnedRestoreDescriptor {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try context.ensureActive();
             try std.testing.expectEqual(@as(u64, 7196), group_id);
@@ -431,7 +431,7 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
     owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
     _ = owners.withRestoreDescriptorRecovery(.{ .ptr = &authority, .recover_fn = Authority.recover });
     authority.expected_use = .resolve;
-    const status_request: @import("../api/distributed_txn_contract.zig").TxnStatusRequest = .{ .txn_id = txn, .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id };
+    const status_request: @import("antfly_local_sources").api_distributed_txn_contract.TxnStatusRequest = .{ .txn_id = txn, .restore_staging_scope = scope.digest(), .restore_staging_plan_id = scope.plan_id };
     authority.barrier_blocked = true;
     try std.testing.expectError(error.NotLeader, owners.writeSource().txnStatusGroupLocalWithRequest(alloc, 7196, "hidden", status_request, .{}));
     try std.testing.expectEqual(@as(usize, 0), owners.ownerCountForTest());
@@ -499,7 +499,7 @@ test "transition lease reads unpublished owner metadata without admitting docume
         .identity = .{ .table_id = 71, .shard_id = 7199, .range_id = 7199 },
     });
     defer lease.deinit();
-    const topology = @import("db/relational_integrity_topology_contract.zig");
+    const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
     const identity_json = try lease.readRelationalTopologyJson(alloc, "identity");
     defer alloc.free(identity_json);
     var identity = try std.json.parseFromSlice(topology.Identity, alloc, identity_json, .{});
@@ -515,7 +515,7 @@ test "transition lease reads unpublished owner metadata without admitting docume
     // lifecycle allowlist must accept the same receipt mode as the wire.
     const receipt_json = try lease.readRelationalTopologyJson(alloc, "merge_copy_receipt");
     defer alloc.free(receipt_json);
-    var receipt = try std.json.parseFromSlice(@import("db/merge_contract.zig").CopyReceipt, alloc, receipt_json, .{});
+    var receipt = try std.json.parseFromSlice(@import("antfly_local_sources").storage_db_merge_contract.CopyReceipt, alloc, receipt_json, .{});
     defer receipt.deinit();
     try std.testing.expectEqual(identity.value.namespace, receipt.value.namespace);
     try std.testing.expect(receipt.value.state == null);
@@ -730,7 +730,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         }
     };
 
-    var snapshot_cache = @import("../api/runtime_status.zig").TableRuntimeSnapshotCache.init(alloc);
+    var snapshot_cache = @import("antfly_local_sources").api_runtime_status.TableRuntimeSnapshotCache.init(alloc);
     defer snapshot_cache.deinit();
     var catalog = Catalog{};
     var lease_capture = LeaseCapture{};
@@ -844,7 +844,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         defer published.deinit(alloc);
         try std.testing.expectEqual(@as(usize, 1), published.items.len);
         try std.testing.expectEqual(@as(u64, 7001), published.items[0].group_id);
-        try std.testing.expectEqual(@import("../api/runtime_status.zig").RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
+        try std.testing.expectEqual(@import("antfly_local_sources").api_runtime_status.RuntimeStatusFreshness.fresh, published.items[0].metadata.freshness);
     }
 
     try std.testing.expectEqual(@as(usize, 1), owner_source.ownerCountForTest());

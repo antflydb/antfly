@@ -24,7 +24,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const backup_manifest = @import("backup_manifest.zig");
 const primary_mod = @import("primary.zig");
-const replication_record = @import("../db/replication_record.zig");
+const replication_record = @import("antfly_local_sources").storage_db_replication_record;
 const session = @import("session.zig");
 const standby_mod = @import("standby.zig");
 

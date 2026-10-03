@@ -15,8 +15,8 @@
 //! Validate immutable row-policy programs before staging a portable owner.
 const std = @import("std");
 
-pub fn validatePolicyPrograms(alloc: std.mem.Allocator, publications: []const @import("policies.zig").Publication, programs: []const @import("policies.zig").InstallSnapshot) !void {
-    const policies = @import("policies.zig");
+pub fn validatePolicyPrograms(alloc: std.mem.Allocator, publications: []const @import("antfly_local_sources").system_catalog_policies.Publication, programs: []const @import("antfly_local_sources").system_catalog_policies.InstallSnapshot) !void {
+    const policies = @import("antfly_local_sources").system_catalog_policies;
     if (programs.len > publications.len) return error.RowPolicyCatalogChanged;
     var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
     defer seen.deinit(alloc);

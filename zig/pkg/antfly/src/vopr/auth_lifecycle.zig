@@ -8,7 +8,7 @@
 const std = @import("std");
 const casbin = @import("antfly_casbin");
 const vopr = @import("vopr");
-const usermgr = @import("../usermgr/user_manager.zig");
+const usermgr = @import("antfly_local_sources").usermgr_user_manager;
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 
 pub const Hook = struct {

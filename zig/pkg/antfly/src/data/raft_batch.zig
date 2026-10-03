@@ -13,8 +13,8 @@
 // limitations.
 
 const std = @import("std");
-const batch_api = @import("../api/batch.zig");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const batch_api = @import("antfly_local_sources").api_batch;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const descriptor_contract = @import("../storage/kernel_owner_descriptor.zig");
 const internal_batch_forwarding = @import("../api/internal_batch_forwarding.zig");
 
@@ -447,7 +447,7 @@ fn consumerTests() type {
 
         test "raft batch round trips merge artifacts and rejects public or unscoped payloads" {
             const alloc = std.testing.allocator;
-            const keys = @import("../storage/internal_keys.zig");
+            const keys = @import("antfly_local_sources").storage_internal_keys;
             const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense");
             defer alloc.free(key);
             const artifacts = [_]db_mod.types.BatchWrite{.{ .key = key, .value = "\x00\xff\x01opaque" }};
@@ -573,7 +573,7 @@ comptime {
 
 test "raft batch round trips guarded graph owner replay afterimages" {
     const alloc = std.testing.allocator;
-    const contract = @import("../storage/graph_cleanup_contract.zig");
+    const contract = @import("antfly_local_sources").storage_graph_cleanup_contract;
     const key = try contract.ownerJobKeyAlloc(alloc, "owner\x00\xff");
     defer alloc.free(key);
     const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7 });

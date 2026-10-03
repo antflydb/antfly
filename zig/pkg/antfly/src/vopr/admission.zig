@@ -7,8 +7,8 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const resource_manager = @import("../storage/resource_manager.zig");
-const request_admission = @import("../common/request_admission.zig");
+const resource_manager = @import("antfly_local_sources").storage_resource_manager;
+const request_admission = @import("antfly_local_sources").common_request_admission;
 
 fn drive(
     sim: *vopr.vopr_io.VoprIo,

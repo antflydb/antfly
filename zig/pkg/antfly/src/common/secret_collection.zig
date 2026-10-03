@@ -4,8 +4,8 @@
 //! Bounded per-scope ciphertext snapshots shared by Raft and object storage.
 //! Storage is trusted for freshness and absence; AFSE authenticates each value.
 const std = @import("std");
-const contract = @import("secret_contract.zig");
-const record = @import("secret_record.zig");
+const contract = @import("antfly_local_sources").common_secret_contract;
+const record = @import("antfly_local_sources").common_secret_record;
 const Allocator = std.mem.Allocator;
 
 pub const max_bytes = 8 * 1024 * 1024;

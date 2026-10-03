@@ -27,9 +27,9 @@
 //! declares a `candidate_search` mode; storage never imports the api layer.
 
 const std = @import("std");
-const db_mod = @import("../storage/db/selected_root.zig").db;
+const db_mod = @import("antfly_local_sources").storage_db_selected_root.db;
 const raft_mod = @import("../raft/mod.zig");
-const table_reads = @import("table_read_source.zig");
+const table_reads = @import("antfly_local_sources").api_table_read_source;
 
 const CandidateSource = db_mod.CandidateSource;
 
@@ -38,7 +38,7 @@ const CandidateSource = db_mod.CandidateSource;
 /// it must not outlive the read source it wraps.
 pub const DistributedCandidateSource = struct {
     reads: table_reads.TableReadSource,
-    catalog_binding: ?@import("../system_catalog/domain.zig").BindingSource = null,
+    catalog_binding: ?@import("antfly_local_sources").system_catalog_domain.BindingSource = null,
     /// Read consistency for blocking queries. Resolution runs leader-only, so
     /// `read_index` keeps candidates consistent with committed writes; callers
     /// can relax this to `stale` to trade freshness for latency.
@@ -59,7 +59,7 @@ pub const DistributedCandidateSource = struct {
     const BoundBatch = struct {
         arena: std.heap.ArenaAllocator,
         raw: DistributedCandidateSource,
-        binding: @import("../system_catalog/domain.zig").BindingSource,
+        binding: @import("antfly_local_sources").system_catalog_domain.BindingSource,
         names: []const []const u8,
         physical: ?[][]u8 = null,
         external_physical: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
@@ -385,7 +385,7 @@ const FakeTableReadSource = struct {
         table_name: []const u8,
         req: db_mod.types.SearchRequest,
         consistency: raft_mod.ReadConsistency,
-    ) !?@import("query.zig").QueryResponse {
+    ) !?@import("antfly_local_sources").api_query.QueryResponse {
         _ = consistency;
         const self: *FakeTableReadSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, table_name, self.table)) return null;

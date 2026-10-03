@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const CancellationToken = @import("../../api/operation.zig").CancellationToken;
+const CancellationToken = @import("antfly_local_sources").api_operation.CancellationToken;
 
 pub fn blockKey(artifact_id: []const u8, artifact_checksum: []const u8, offset: u64, len: usize, checksum: *const [32]u8) [32]u8 {
     var hash = std.crypto.hash.sha2.Sha256.init(.{});

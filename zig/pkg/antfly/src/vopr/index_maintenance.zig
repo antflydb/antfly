@@ -6,7 +6,7 @@
 //! filesystem durability remain integration-test responsibilities.
 const std = @import("std");
 const vopr = @import("vopr");
-const graph_mod = @import("../graph/graph.zig");
+const graph_mod = @import("antfly_local_sources").graph_graph;
 const Graph = graph_mod.GraphIndex;
 const clock_mod = @import("antfly_platform").clock;
 
@@ -417,7 +417,7 @@ pub const OwnerScenario = struct {
         .{ .id = owner_done, .name = name ++ ".complete", .kind = .reachable },
     };
     const Fixture = @import("db_index_races.zig").Fixture;
-    const Runtime = @import("../storage/db/maintenance/graph_metric_runtime.zig").GraphMetricRuntime;
+    const Runtime = @import("antfly_local_sources").storage_db_maintenance_graph_metric_runtime.GraphMetricRuntime;
     const State = struct {
         fixture: Fixture,
         clock: clock_mod.ManualClock = .{},
@@ -496,8 +496,8 @@ pub const OwnerScenario = struct {
             5 => {
                 state.owners[1].?.deinit();
                 state.owners[1] = null;
-                const runtime_mod = @import("../storage/db/maintenance/graph_metric_runtime.zig");
-                const lease_mod = @import("../storage/db/lease.zig");
+                const runtime_mod = @import("antfly_local_sources").storage_db_maintenance_graph_metric_runtime;
+                const lease_mod = @import("antfly_local_sources").storage_db_lease;
                 var lease = try lease_mod.Lease.init(state.fixture.allocator, state.fixture.db.core.asyncResources().store, runtime_mod.default_coordinator_lease_key);
                 defer lease.deinit();
                 if (try lease.load(state.fixture.allocator)) |record_value| {
@@ -529,8 +529,8 @@ pub const OwnerScenario = struct {
                 try sink.add(owner_name, encoded);
             } else try sink.add(owner_name, "closed");
         }
-        const lease_mod = @import("../storage/db/lease.zig");
-        var lease = try lease_mod.Lease.init(state.fixture.allocator, state.fixture.db.core.asyncResources().store, @import("../storage/db/maintenance/graph_metric_runtime.zig").default_coordinator_lease_key);
+        const lease_mod = @import("antfly_local_sources").storage_db_lease;
+        var lease = try lease_mod.Lease.init(state.fixture.allocator, state.fixture.db.core.asyncResources().store, @import("antfly_local_sources").storage_db_maintenance_graph_metric_runtime.default_coordinator_lease_key);
         defer lease.deinit();
         if (try lease.load(state.fixture.allocator)) |value| {
             var record = value;

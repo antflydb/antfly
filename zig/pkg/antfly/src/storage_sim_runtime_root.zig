@@ -12,10 +12,13 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const sim_runtime = @import("storage/sim_runtime.zig");
-pub const background_runtime = @import("storage/background_runtime.zig");
+pub const sim_runtime = @import("antfly_local_sources").storage_sim_runtime;
+pub const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 
 test {
     _ = sim_runtime;
     _ = background_runtime;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

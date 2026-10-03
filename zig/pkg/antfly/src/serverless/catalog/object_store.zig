@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
-const object_storage = @import("../../storage/object_storage.zig");
+const object_storage = @import("antfly_local_sources").storage_object_storage;
 const catalog_types = @import("types.zig");
 const catalog_store = @import("store.zig");
 const object_store_support = @import("../object_store_support.zig");

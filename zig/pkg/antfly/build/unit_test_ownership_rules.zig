@@ -133,7 +133,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "metadata.http_server.test.",
             "sql.ddl_runtime.test.",
             "metadata.storage.raft_apply_store.test.",
-            // The generating lane owns conversation and backend contracts,
+            // The explicit generating server owner owns conversation contracts,
             // even when this HTTP root imports them through agent tools.
             "api.agent_tools.test.agent conversation",
             "generating.mod.test.generating backend",
@@ -271,7 +271,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         },
     },
     .{
-        .source = "pkg/antfly/src/introducer.zig",
+        .source = "pkg/antfly-embedded/src/local/introducer.zig",
         .artifact = "test",
         .selection = "all",
         .skip = &.{

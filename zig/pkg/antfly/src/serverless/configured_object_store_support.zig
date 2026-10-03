@@ -19,11 +19,11 @@
 //! graph. API query routing and serverless publication both use this policy.
 
 const std = @import("std");
-const common_config = @import("../common/config.zig");
-const common_secrets = @import("../common/secrets.zig");
+const common_config = @import("antfly_local_sources").common_config;
+const common_secrets = @import("antfly_local_sources").common_secrets;
 const catalog_binding = @import("external_source/catalog_binding.zig");
 const object_store_support = @import("object_store_support.zig");
-const remote_uri = @import("remote_uri.zig");
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 
 const Allocator = std.mem.Allocator;
 

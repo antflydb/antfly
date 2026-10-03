@@ -1,18 +1,18 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 const std = @import("std");
-const engine = @import("../db/db.zig");
+const engine = @import("antfly_local_sources").storage_db_db;
 const DB = engine.DB;
 const OpenOptions = engine.OpenOptions;
-const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
-const internal_keys = @import("../internal_keys.zig");
-const docstore_mod = @import("../docstore.zig");
+const TestDirectory = @import("antfly_local_sources").common_test_directory.TestDirectory;
+const internal_keys = @import("antfly_local_sources").storage_internal_keys;
+const docstore_mod = @import("antfly_local_sources").storage_docstore;
 const ha_primary_mod = @import("primary.zig");
 const ha_public_gate_state_mod = @import("public_gate_state.zig");
-const ha_effects_mod = @import("../db/replication_effects.zig");
+const ha_effects_mod = @import("antfly_local_sources").storage_db_replication_effects;
 const replication_effects_mod = ha_effects_mod;
-const ha_replication_record_mod = @import("../db/replication_record.zig");
-const replication_ingress = @import("../db/replication_ingress.zig");
+const ha_replication_record_mod = @import("antfly_local_sources").storage_db_replication_record;
+const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
 const publisher_adapter = @import("db_commit.zig");
 test "db graph endpoint cleanup pages HA mirrors exact effects across directory progress" {
     const alloc = std.testing.allocator;
@@ -187,7 +187,7 @@ test "db graph owner revival HA mirrors bounded checkpoints across restart and d
     defer primary.close();
     var replica = try DB.open(alloc, replica_dir.path(), options);
     defer replica.close();
-    const contract = @import("../graph_cleanup_contract.zig");
+    const contract = @import("antfly_local_sources").storage_graph_cleanup_contract;
     const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "owner", "g", "R", "b", "owner", "id");
     defer alloc.free(artifact);
     const marker = try internal_keys.graphRetirementKeyAlloc(alloc, artifact);

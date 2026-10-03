@@ -9,14 +9,14 @@
 
 const std = @import("std");
 const vopr = @import("vopr");
-const request_admission = @import("../common/request_admission.zig");
-const resource_manager = @import("../storage/resource_manager.zig");
-const background_runtime = @import("../storage/background_runtime.zig");
+const request_admission = @import("antfly_local_sources").common_request_admission;
+const resource_manager = @import("antfly_local_sources").storage_resource_manager;
+const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 const vopr_durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-const lite_backend = @import("../storage/lite/backend.zig");
-const managed_embedder = @import("../inference/managed_embedder.zig");
-const db_embedder = @import("../storage/db/enrichment/embedder.zig");
+const lite_backend = @import("antfly_local_sources").storage_lite_backend;
+const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
+const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
 const lake = @import("../serverless/query/lake_parquet_rowgroup.zig");
 const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
 

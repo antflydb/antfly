@@ -5,9 +5,9 @@
 //! The receiving leader must fetch its own read-index authority before it
 //! proposes the irreversible generation tombstones.
 const std = @import("std");
-const operation = @import("operation.zig");
-const callback_abi = @import("../runtime_callback_abi.zig");
-const topology = @import("../storage/db/relational_integrity_topology_contract.zig");
+const operation = @import("antfly_local_sources").api_operation;
+const callback_abi = @import("antfly_local_sources").runtime_callback_abi;
+const topology = @import("antfly_local_sources").storage_db_relational_integrity_topology_contract;
 
 pub const Request = struct {
     plan_id: [16]u8,

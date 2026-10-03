@@ -79,7 +79,7 @@ pub const Key = struct {
     }
 
     pub fn edge(alloc: Allocator, value: Edge, direction: Direction) !Key {
-        try @import("../../graph/edge_type.zig").validateStored(value.kind);
+        try @import("antfly_local_sources").graph_edge_type.validateStored(value.kind);
         if (value.table) |table| if (table.len == 0) return error.InvalidGraphPageKey;
         if (direction == .member or value.source.len == 0 or value.target.len == 0 or
             !std.math.isFinite(value.weight) or (direction == .incoming and value.table != null))
@@ -99,7 +99,7 @@ pub const Key = struct {
     }
 
     pub fn topologyEdge(alloc: Allocator, value: Edge) !Key {
-        try @import("../../graph/edge_type.zig").validateStored(value.kind);
+        try @import("antfly_local_sources").graph_edge_type.validateStored(value.kind);
         if (value.table != null or value.source.len == 0 or value.target.len == 0 or !std.math.isFinite(value.weight))
             return error.InvalidGraphPageKey;
         var key = try topology(alloc, value.kind);
@@ -198,7 +198,7 @@ pub fn decode(bytes: []const u8, scratch: []u8) !Decoded {
         }
         kind = try parser.component();
     }
-    @import("../../graph/edge_type.zig").validateStored(kind) catch return error.InvalidGraphPageKey;
+    @import("antfly_local_sources").graph_edge_type.validateStored(kind) catch return error.InvalidGraphPageKey;
     const neighbor = try parser.component();
     if (node.len == 0 or neighbor.len == 0 or bytes.len - parser.pos < 4) return error.InvalidGraphPageKey;
     const ordered = std.mem.readInt(u32, bytes[parser.pos..][0..4], .big);
@@ -278,7 +278,7 @@ test "serverless graph page key prefixes route exact nodes and preserve numeric 
 
 test "serverless graph page keys admit the stored edge type byte limit" {
     const alloc = std.testing.allocator;
-    const kind = [_]u8{'k'} ** @import("../../graph/edge_type.zig").max_bytes;
+    const kind = [_]u8{'k'} ** @import("antfly_local_sources").graph_edge_type.max_bytes;
     var key = try Key.edge(alloc, .{ .source = "source", .target = "target", .kind = &kind }, .outgoing);
     defer key.deinit(alloc);
     var scratch: [tree.max_key_bytes]u8 = undefined;

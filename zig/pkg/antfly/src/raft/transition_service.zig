@@ -1260,7 +1260,7 @@ test "metadata transition driver online service never invokes ordinary merge fal
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (state.phase != .publish) return error.UnexpectedOnlineStep;
             if (self.recovery_published) {
-                const certificate: @import("../storage/source_snapshot.zig").Certificate = .{ .cut = .{ .namespace = state.scope.fence.namespace, .applied_index = 19, .retained_start = 11 }, .objects = 1, .content_bytes = 100, .schema_manifest_digest = @splat(2), .ordered_content_digest = @splat(3) };
+                const certificate: @import("antfly_local_sources").storage_source_snapshot.Certificate = .{ .cut = .{ .namespace = state.scope.fence.namespace, .applied_index = 19, .retained_start = 11 }, .objects = 1, .content_bytes = 100, .schema_manifest_digest = @splat(2), .ordered_content_digest = @splat(3) };
                 return .{ .scope = state.scope, .certificate = certificate, .source_progress = .{ .namespace = state.scope.namespace(), .consumer_epoch = state.scope.consumer_epoch, .pin = state.scope.pin(), .start = 11, .acknowledged = 11, .admitted_applied_index = 19, .snapshot_phase = .published, .snapshot_certificate = try certificate.digest() } };
             }
             return .{ .scope = state.scope, .source_progress = .{ .namespace = state.scope.namespace(), .consumer_epoch = state.scope.consumer_epoch, .pin = state.scope.pin(), .start = 11, .acknowledged = 11, .admitted_applied_index = 19, .snapshot_phase = .pinned } };

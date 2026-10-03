@@ -3,13 +3,13 @@
 const std = @import("std");
 pub const antfly_sources = @import("source_owner_physical.zig");
 const collection = @import("common/secret_collection.zig");
-const contract = @import("common/secret_contract.zig");
-const record = @import("common/secret_record.zig");
+const contract = @import("antfly_local_sources").common_secret_contract;
+const record = @import("antfly_local_sources").common_secret_record;
 const serverless = @import("serverless/secret_store.zig");
 const distributed = @import("metadata/secret_store.zig");
 const raft_store = @import("metadata/storage/raft_apply_store.zig");
 const raft_sm = @import("raft/state_machine/mod.zig");
-const objects = @import("storage/object_storage.zig");
+const objects = @import("antfly_local_sources").storage_object_storage;
 const alloc = std.testing.allocator;
 const Aead = std.crypto.aead.chacha_poly.XChaCha20Poly1305;
 const DataKey = record.DataKey;
@@ -188,9 +188,9 @@ test "secret backend raft atomic CAS durable reopen snapshot and stale command r
     try std.testing.expectEqualStrings("recreated", found.value.?.secret.bytes);
 }
 
-const secrets = @import("common/secrets.zig");
+const secrets = @import("antfly_local_sources").common_secrets;
 const delivery = @import("common/secret_delivery.zig");
-const http = @import("common/http/http_common.zig");
+const http = @import("antfly_local_sources").common_http_http_common;
 const DeliveryExecutor = struct {
     store: *secrets.FileStore,
     replay: ?[]const u8 = null,
@@ -494,7 +494,7 @@ test "secret backend retries known CAS races and never replays uncertain publica
 }
 
 test "secret backend startup keeps operational references before native attachment" {
-    const config = @import("common/config.zig");
+    const config = @import("antfly_local_sources").common_config;
     var facade = try secrets.FileStore.initConfiguredWithIo(alloc, std.testing.io, .{ .native = .{ .backend = .distributed, .keyring_path = "bootstrap-keyring" }, .environment = false });
     defer facade.deinit();
     var cfg = try config.Config.parseFromSliceWithSecrets(alloc,
@@ -711,7 +711,7 @@ fn expectSecretMutationResponse(response: @import("raft/transport/http_common.zi
     try std.testing.expectEqualStrings("secret write outcome unknown; inspect the committed revision before retrying", response.body);
 }
 
-fn awaitSecretRevision(source: @import("common/secret_contract.zig").Source, revision: u64) !@import("common/secret_contract.zig").Lookup {
+fn awaitSecretRevision(source: @import("antfly_local_sources").common_secret_contract.Source, revision: u64) !@import("antfly_local_sources").common_secret_contract.Lookup {
     const time = @import("antfly_platform").time;
     const deadline = time.monotonicNs() + 10 * std.time.ns_per_s;
     while (time.monotonicNs() < deadline) {
@@ -731,3 +731,6 @@ fn awaitSecretRevision(source: @import("common/secret_contract.zig").Source, rev
     }
     return error.SecretRevisionNotConfirmed;
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

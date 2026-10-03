@@ -15,7 +15,7 @@
 const std = @import("std");
 const objectstore = @import("objectstore");
 const artifact_store = @import("store.zig");
-const remote_uri = @import("../remote_uri.zig");
+const remote_uri = @import("antfly_local_sources").serverless_remote_uri;
 const object_store_support = @import("../object_store_support.zig");
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 

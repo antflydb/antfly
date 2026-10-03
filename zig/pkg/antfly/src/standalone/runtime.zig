@@ -14,9 +14,9 @@
 
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
-const replication_ingress = @import("../storage/db/replication_ingress.zig");
+const replication_ingress = @import("antfly_local_sources").storage_db_replication_ingress;
 const std = @import("std");
-const system_catalog = @import("../system_catalog/domain.zig");
+const system_catalog = @import("antfly_local_sources").system_catalog_domain;
 const hot_standby_wal = @import("../storage/wal_runtime.zig");
 const inference_provider = @import("inference_provider.zig");
 const lease_executor = @import("lease_executor.zig");
@@ -25,15 +25,15 @@ const platform_sync = @import("antfly_platform").sync;
 const platform_clock = @import("antfly_platform").clock;
 const httpx = @import("httpx");
 const antfly = @import("runtime_root.zig");
-const group_ids = @import("../common/group_ids.zig");
+const group_ids = @import("antfly_local_sources").common_group_ids;
 const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const process_memory_budget = @import("../common/process_memory_budget.zig");
+const process_memory_budget = @import("antfly_local_sources").common_process_memory_budget;
 const preload_model_spec = @import("../common/preload_model_spec.zig");
 const platform_time = @import("antfly_platform").time;
 const platform = @import("antfly_platform");
 const inference_bridge = @import("antfly_inference_bridge");
-const inference_connection_abi = @import("../inference_connection_abi.zig");
+const inference_connection_abi = @import("antfly_local_sources").inference_connection_abi;
 const internal_service_auth = @import("../api/internal_service_auth.zig");
 const runtime_http_abi = @import("antfly_runtime_abi").http_abi;
 const kernel_owner_client = @import("../storage/kernel_owner_client.zig");
@@ -45,7 +45,7 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const inline_inference_codegen = builtin.is_test;
 const inference_host = if (inline_inference_codegen) @import("antfly_inference_host") else struct {};
 const inference_chunker = @import("inference_chunker");
-const chunking_types = @import("../chunking/types.zig");
+const chunking_types = @import("antfly_local_sources").chunking_types;
 
 const ApiHttpServer = antfly.public_api.ApiHttpServer;
 const ApiKernelHandler = antfly.public_api.kernel_bridge.HttpxHandler;
@@ -738,11 +738,11 @@ const LocalStandaloneMetadata = struct {
     const TrackedInitialOwner = struct {
         child_table_id: u64,
         table_name: []u8,
-        bootstrap: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap,
+        bootstrap: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
     };
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
-    vector_migration_commands: @import("../common/vector_migration.zig").CommandAdmissions = .{},
+    vector_migration_commands: @import("antfly_local_sources").common_vector_migration.CommandAdmissions = .{},
     manager: antfly.metadata.TableManager,
     extension_catalog: antfly.extensions.ExtensionCatalog,
     local_node_id: u64,
@@ -758,7 +758,7 @@ const LocalStandaloneMetadata = struct {
     /// Only private owners actually primed in this process need resident
     /// retirement. Durable terminal metadata remains the authority.
     initial_fk_primed: std.AutoHashMapUnmanaged(u64, TrackedInitialOwner) = .empty,
-    metadata_incarnation: ?@import("../metadata/incarnation.zig").MetadataClusterIncarnation = null,
+    metadata_incarnation: ?@import("antfly_local_sources").metadata_incarnation.MetadataClusterIncarnation = null,
     native_owner_binding: ?@import("../metadata/standalone_native_owner.zig").Binding = null,
     coordinated_lifecycle_allowed: bool = true,
     hot_standby_gate: ?antfly.db.ReplicationWriteGate = null,
@@ -816,7 +816,7 @@ const LocalStandaloneMetadata = struct {
         previous_extensions: ?antfly.extensions.ExtensionCatalog = null,
         compare_and_replace_table: ?u64 = null,
         catalog_change: ?system_catalog.MutableState.Change = null,
-        setting_command: ?@import("../system_catalog/settings.zig").Command = null,
+        setting_command: ?@import("antfly_local_sources").system_catalog_settings.Command = null,
         previous_settings: ?system_catalog.MutableState.OwnedSettings = null,
         changed_settings: bool = false,
         native_owner_proof: ?@import("../metadata/standalone_native_owner.zig").Binding = null,
@@ -863,7 +863,7 @@ const LocalStandaloneMetadata = struct {
             if (metadata.system_catalog_state == null) metadata.system_catalog_state = try system_catalog.MutableState.clone(metadata.alloc, .{});
             self.catalog_change = try metadata.system_catalog_state.?.apply(delta);
         }
-        fn applySettings(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, records: []const @import("../system_catalog/settings.zig").Record, command: @import("../system_catalog/settings.zig").Command) !void {
+        fn applySettings(self: *CatalogMutation, metadata: *LocalStandaloneMetadata, records: []const @import("antfly_local_sources").system_catalog_settings.Record, command: @import("antfly_local_sources").system_catalog_settings.Command) !void {
             std.debug.assert(!self.changed_settings and self.catalog_change == null);
             if (metadata.system_catalog_state == null) metadata.system_catalog_state = try system_catalog.MutableState.clone(metadata.alloc, .{});
             const catalog = &metadata.system_catalog_state.?;
@@ -984,7 +984,7 @@ const LocalStandaloneMetadata = struct {
             };
             self.lifecycle_store = lifecycle;
             if (try lifecycle.getMetadataIncarnation(group_ids.main_metadata_group_id) == null) {
-                const incarnation = try @import("../metadata/incarnation.zig").generate(backend_runtime.io() orelse std.Options.debug_io);
+                const incarnation = try @import("antfly_local_sources").metadata_incarnation.generate(backend_runtime.io() orelse std.Options.debug_io);
                 try lifecycle.applyStandaloneCommand(group_ids.main_metadata_group_id, .{ .initialize_metadata_incarnation = incarnation });
             }
             self.metadata_incarnation = try lifecycle.getMetadataIncarnation(group_ids.main_metadata_group_id);
@@ -1396,7 +1396,7 @@ const LocalStandaloneMetadata = struct {
         return false;
     }
 
-    fn listBackupCohorts(ptr: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: LifecycleRequest) ![]@import("../storage/docstore.zig").OwnedKVPair {
+    fn listBackupCohorts(ptr: *anyopaque, alloc: std.mem.Allocator, after: ?[]const u8, limit: usize, request: LifecycleRequest) ![]@import("antfly_local_sources").storage_docstore.OwnedKVPair {
         try request.ensureActive();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         lockAtomic(&self.mutex);
@@ -1411,7 +1411,7 @@ const LocalStandaloneMetadata = struct {
         var locked = try self.lockMutation();
         defer locked.deinit();
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
-        const Cohort = @import("../metadata/backup_cohort.zig");
+        const Cohort = @import("antfly_local_sources").metadata_backup_cohort;
         const canonical = if (write.expected_revision == 0) blk: {
             var parsed = try std.json.parseFromSlice(Cohort.Job, alloc, write.value, .{});
             defer parsed.deinit();
@@ -1635,7 +1635,7 @@ const LocalStandaloneMetadata = struct {
             .canceled => {},
             else => return .retained,
         }
-        const hidden = @import("../storage/db/relational_initial_child_publication.zig");
+        const hidden = @import("antfly_local_sources").storage_db_relational_initial_child_publication;
         const table_manager = @import("../metadata/table_manager.zig");
         const expected: hidden.Bootstrap = .{
             .plan_id = proof.plan_id,
@@ -2111,7 +2111,7 @@ const LocalStandaloneMetadata = struct {
     }
 
     fn physicalNativeOwnerBinding(self: *LocalStandaloneMetadata) !@import("../metadata/standalone_native_owner.zig").Binding {
-        const identity = @import("../storage/db/root_identity.zig");
+        const identity = @import("antfly_local_sources").storage_db_root_identity;
         const io = self.backend_runtime.filesystemIo() orelse return error.MissingBackendRuntimeIo;
         const root = if (self.native_owner_binding == null)
             try identity.loadOrCreate(self.alloc, io, self.replica_root_dir)
@@ -2603,7 +2603,7 @@ const LocalStandaloneMetadata = struct {
                 var encoded: std.Io.Writer.Allocating = .init(alloc);
                 defer encoded.deinit();
                 var stream: std.json.Stringify = .{ .writer = &encoded.writer, .options = .{} };
-                try @import("../storage/db/relational_integrity_json.zig").write(command, &stream);
+                try @import("antfly_local_sources").storage_db_relational_integrity_json.write(command, &stream);
                 const bytes = encoded.written();
                 if (bytes.len > system_catalog.max_command_bytes) return error.CatalogCommandTooLarge;
                 try context.ensureActive();
@@ -2645,7 +2645,7 @@ const LocalStandaloneMetadata = struct {
                 }, .{});
             },
             .setting_snapshot => |scope| {
-                const settings = @import("../system_catalog/settings.zig");
+                const settings = @import("antfly_local_sources").system_catalog_settings;
                 if (scope.principal.len == 0 or scope.database.len == 0) return error.InvalidSettingRecord;
                 if (context.principal != null) if (!std.mem.eql(u8, context.setting_read_principal orelse return error.Forbidden, scope.principal)) return error.Forbidden;
                 const state = self.systemCatalogState();
@@ -2662,7 +2662,7 @@ const LocalStandaloneMetadata = struct {
                 return store.sqlPolicySnapshotJson(alloc, group_ids.main_metadata_group_id, request.table_id, request.principal, request.database, request.roles);
             },
             .setting_mutate => |request| {
-                const settings = @import("../system_catalog/settings.zig");
+                const settings = @import("antfly_local_sources").system_catalog_settings;
                 if (!context.setting_admin) return error.Forbidden;
                 const state = self.systemCatalogState();
                 var command: settings.Command = .{ .expected_revision = state.revision, .change = undefined };
@@ -3437,7 +3437,7 @@ const LocalStandaloneMetadata = struct {
 
     fn trackInitialOwner(self: *LocalStandaloneMetadata, owner: @import("../data/private_provisioning.zig").InitialOwner) !void {
         const descriptor = owner.descriptor;
-        const bootstrap: @import("../storage/db/relational_initial_child_publication.zig").Bootstrap = .{
+        const bootstrap: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap = .{
             .plan_id = descriptor.plan_id,
             .plan_digest = descriptor.plan_digest,
             .namespace = descriptor.namespace,
@@ -3465,7 +3465,7 @@ const LocalStandaloneMetadata = struct {
         self: *LocalStandaloneMetadata,
         server: *antfly.data.runtime.DataServer,
         store: *antfly.metadata.RaftApplyStore,
-        active: []const @import("../metadata/restore_provisioning_contract.zig").ProvisioningProjection.InitialFkOwner,
+        active: []const @import("antfly_local_sources").metadata_restore_provisioning_contract.ProvisioningProjection.InitialFkOwner,
     ) !void {
         const publication = @import("../metadata/fk_generation_publication.zig");
         const table_manager = @import("../metadata/table_manager.zig");
@@ -3825,9 +3825,9 @@ const LocalStandaloneMetadata = struct {
         table: antfly.metadata.TableRecord,
         range: antfly.metadata.RangeRecord,
         resource: system_catalog.Resource,
-        setting: @import("../system_catalog/settings.zig").Record,
-        policy: @import("../system_catalog/policies.zig").Record,
-        policy_publication: @import("../system_catalog/policies.zig").Publication,
+        setting: @import("antfly_local_sources").system_catalog_settings.Record,
+        policy: @import("antfly_local_sources").system_catalog_policies.Record,
+        policy_publication: @import("antfly_local_sources").system_catalog_policies.Publication,
         extensions: PersistedCatalog,
     };
     const catalog_head_key = @import("catalog_format.zig").head_key;
@@ -3886,9 +3886,9 @@ const LocalStandaloneMetadata = struct {
         var tables: std.ArrayListUnmanaged(antfly.metadata.TableRecord) = .empty;
         var ranges: std.ArrayListUnmanaged(antfly.metadata.RangeRecord) = .empty;
         var resources: std.ArrayListUnmanaged(system_catalog.Resource) = .empty;
-        var settings: std.ArrayListUnmanaged(@import("../system_catalog/settings.zig").Record) = .empty;
-        var policies: std.ArrayListUnmanaged(@import("../system_catalog/policies.zig").Record) = .empty;
-        var policy_publications: std.ArrayListUnmanaged(@import("../system_catalog/policies.zig").Publication) = .empty;
+        var settings: std.ArrayListUnmanaged(@import("antfly_local_sources").system_catalog_settings.Record) = .empty;
+        var policies: std.ArrayListUnmanaged(@import("antfly_local_sources").system_catalog_policies.Record) = .empty;
+        var policy_publications: std.ArrayListUnmanaged(@import("antfly_local_sources").system_catalog_policies.Publication) = .empty;
         var extensions: PersistedCatalog = .{};
         var cursor = try txn.openCursor();
         defer cursor.close();
@@ -11912,7 +11912,7 @@ fn exerciseStandaloneFkPublicationMode(ordinary: bool, truncate_after: bool) !vo
                 const replay = try server.initialChildControlPort().execute(alloc, value.child_table_name, target.group_id, request, context);
                 try std.testing.expect(std.meta.eql(receipt, replay));
                 if (receipts == 0) {
-                    const hidden = @import("../storage/db/relational_initial_child_publication.zig");
+                    const hidden = @import("antfly_local_sources").storage_db_relational_initial_child_publication;
                     const exact: hidden.Bootstrap = .{
                         .plan_id = receipt.plan_id,
                         .plan_digest = receipt.plan_digest,
@@ -13797,7 +13797,7 @@ test "standalone catalog journal preserves imported policy publication as fail c
     defer rows.close();
     var store = try rows.backend.runtimeStore(alloc, .{ .name = "system/metadata" });
     defer store.deinit();
-    const publications = [_]@import("../system_catalog/policies.zig").Publication{.{
+    const publications = [_]@import("antfly_local_sources").system_catalog_policies.Publication{.{
         .table_id = 7,
         .schema_version = 1,
         .schema_digest = @splat(0x5a),
@@ -13840,7 +13840,7 @@ test "standalone catalog journal preserves imported policy publication as fail c
 fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
     if (comptime control_only_storage_sources) return error.SkipZigTest;
     const alloc = std.testing.allocator;
-    const policies = @import("../system_catalog/policies.zig");
+    const policies = @import("antfly_local_sources").system_catalog_policies;
     const coordinator = @import("../api/row_policy_publication_coordinator.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -13912,10 +13912,10 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
     var schema_arena = std.heap.ArenaAllocator.init(alloc);
     defer schema_arena.deinit();
     const a = schema_arena.allocator();
-    var parsed_schema = try @import("../schema/mod.zig").parseValidatedTableSchema(a, table.schema_json);
+    var parsed_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, table.schema_json);
     defer parsed_schema.deinit(a);
-    const native = try @import("../schema/mod.zig").deriveRuntimeTableSchema(a, parsed_schema);
-    const layout = try @import("../storage/schema.zig").serializeSchema(a, native);
+    const native = try @import("antfly_local_sources").schema_mod.deriveRuntimeTableSchema(a, parsed_schema);
+    const layout = try @import("antfly_local_sources").storage_schema.serializeSchema(a, native);
     var digest: [32]u8 = undefined;
     std.crypto.hash.Blake3.hash(layout, &digest, .{});
     const record: policies.Record = .{
@@ -13948,7 +13948,7 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.metadata.statusSource().systemCatalog(allocator, self.context, .{ .policy_install_snapshot = request });
         }
-        fn install(ptr: *anyopaque, allocator: std.mem.Allocator, name: []const u8, group: u64, request: policies.InstallRequest) !@import("../storage/db/row_policy_bundle.zig").Receipt {
+        fn install(ptr: *anyopaque, allocator: std.mem.Allocator, name: []const u8, group: u64, request: policies.InstallRequest) !@import("antfly_local_sources").storage_db_row_policy_bundle.Receipt {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.server.executeRowPolicyInstall(allocator, name, group, request, self.context);
         }
@@ -13976,7 +13976,7 @@ fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
     const owner_group = metadata.systemCatalogState().policy_publications[0].required_owners[0].group_id;
     const reads = server.read_source.source();
     try std.testing.expectError(error.RowPolicyAuthenticationRequired, reads.lookupGroupLocal(alloc, owner_group, table_name, "absent", .{}, .read_index));
-    const authority = @import("../usermgr/row_policy_authority.zig");
+    const authority = @import("antfly_local_sources").usermgr_row_policy_authority;
     const roles: authority.PinnedRoles = .{ .principal = "alice", .roles = &.{}, .auth_revision = 1 };
     const scope: authority.Scope = .{
         .table_id = table_id,
@@ -14204,7 +14204,7 @@ test "system catalog standalone setting publication survives native restart and 
     try std.testing.expectEqual(@as(usize, 1), reopened.systemCatalogState().settings.len);
     const snapshot = try reopened.statusSource().systemCatalog(alloc, .{}, .{ .setting_snapshot = .{ .principal = "alice", .database = "main" } });
     defer alloc.free(snapshot);
-    var parsed = try std.json.parseFromSlice(@import("../system_catalog/settings.zig").Snapshot, alloc, snapshot, .{});
+    var parsed = try std.json.parseFromSlice(@import("antfly_local_sources").system_catalog_settings.Snapshot, alloc, snapshot, .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("tenant-a", parsed.value.definitions[0].role_default.?.string);
 }

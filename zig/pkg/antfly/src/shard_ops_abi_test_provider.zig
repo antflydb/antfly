@@ -66,7 +66,7 @@ export fn shard_adapter_test_error_ordinal(failure: errors.Status) callconv(.c) 
 
 export fn routed_batch_test_provider(out: *@import("api/internal_group_operations.zig").RoutedRaftBatchWriter, failure: *errors.Status) callconv(.c) void {
     const Fixture = struct {
-        fn write(ptr: *anyopaque, _: std.mem.Allocator, authority: @import("api/internal_group_operations.zig").RoutedBatchAuthority, group_id: u64, table: []const u8, request: @import("antfly_source_root").antfly_sources.selected_db.types.BatchRequest, forwarding: @import("api/internal_batch_forwarding.zig").Context, context: @import("api/operation.zig").RequestContext) !?void {
+        fn write(ptr: *anyopaque, _: std.mem.Allocator, authority: @import("api/internal_group_operations.zig").RoutedBatchAuthority, group_id: u64, table: []const u8, request: @import("antfly_source_root").antfly_sources.selected_db.types.BatchRequest, forwarding: @import("api/internal_batch_forwarding.zig").Context, context: @import("antfly_local_sources").api_operation.RequestContext) !?void {
             try context.ensureActive();
             try check(ptr, 42);
             if (authority != .transaction or !std.mem.eql(u8, table, "rows") or request.writes.len != 1 or
@@ -147,3 +147,6 @@ export fn restore_persistence_test_provider(out: *@import("api/restore_jobs.zig"
     };
     out.* = Jobs.ReplicatedPersistence.fromLocal(&Fixture.marker, .{ .load = Fixture.load, .get = Fixture.get, .put = Fixture.put, .delete = Fixture.delete, .delete_many = Fixture.deleteMany, .create_with_staging = Fixture.create });
 }
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};

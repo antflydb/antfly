@@ -7,8 +7,8 @@
 const api_integration_tests = @import("api/integration_test.zig");
 const sql_catalog = @import("api/sql_catalog.zig");
 const httpx_handler = @import("api/httpx_handler.zig");
-const schema_ddl = @import("sql/schema_ddl.zig");
-const table_schema_impl = @import("schema/table_schema_impl.zig");
+const schema_ddl = @import("antfly_local_sources").sql_schema_ddl;
+const table_schema_impl = @import("antfly_local_sources").schema_table_schema_impl;
 const backups = @import("api/backups.zig");
 const http_server = @import("api/http_server.zig");
 const db = @import("antfly_source_root").antfly_sources.physical_db;
@@ -26,3 +26,6 @@ test {
 
 /// Implementation source choices for this compilation root.
 pub const antfly_sources = @import("source_owner_physical.zig");
+
+/// Server fixtures retain this compilation root's source and type identity.
+pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
