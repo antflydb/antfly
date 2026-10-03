@@ -9256,6 +9256,7 @@ components:
                   - required: [graph_queries]
                   - required: [document_renderer]
                   - required: [pruner]
+                  - required: [evaluate]
                   - required: [join]
                   - required: [foreign_sources]
       properties:

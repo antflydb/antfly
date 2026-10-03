@@ -13379,7 +13379,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .{ .key = "b", .value = "{\"id\":\"u2\",\"status\":\"closed\",\"quantity\":7}" },
         }, .timestamp_ns = 42 });
         var text_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &text_db, raft_mod.read_gate.alreadyReadSafeBarrier());
-        var text_writes = @import("table_writes.zig").BoundTableWriteSource.init("usage_records", &text_db);
+        var text_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &text_db);
         var text_source: Source = .{ .schema = text_schema_json, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = text_schema_json }} };
         var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
         defer text_server.deinit();
@@ -13709,7 +13709,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer timestamp_db.close();
             try timestamp_db.setSchemaJson(alloc, timestamp_schema_json);
             var timestamp_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &timestamp_db, raft_mod.read_gate.alreadyReadSafeBarrier());
-            var timestamp_writes = @import("table_writes.zig").BoundTableWriteSource.init("usage_records", &timestamp_db);
+            var timestamp_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &timestamp_db);
             var timestamp_source: Source = .{ .schema = timestamp_schema_json, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = timestamp_schema_json }} };
             var timestamp_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &timestamp_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, timestamp_reads.source(), timestamp_writes.source());
             defer timestamp_server.deinit();
@@ -13860,7 +13860,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer text_db.close();
         try text_db.setSchemaJson(alloc, text_schema);
         var text_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &text_db, raft_mod.read_gate.alreadyReadSafeBarrier());
-        var text_writes = @import("table_writes.zig").BoundTableWriteSource.init("usage_records", &text_db);
+        var text_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &text_db);
         var text_source: Source = .{ .schema = text_schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = text_schema }} };
         var user_store = usermgr.MemoryStore.init(alloc);
         defer user_store.deinit();

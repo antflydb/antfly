@@ -1597,7 +1597,7 @@ const LocalStandaloneMetadata = struct {
     fn initialFkRetirementOwnership(
         ptr: *anyopaque,
         owner_group_id: u64,
-        proof: @import("../api/table_writes.zig").InitialFkRetirementProof,
+        proof: @import("../common/initial_fk_retirement_proof.zig").InitialFkRetirementProof,
     ) !antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementOwnership.State {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try proof.validate();
@@ -2395,7 +2395,7 @@ const LocalStandaloneMetadata = struct {
         if (state.phase == .preparing_support) return null;
         const targets = try alloc.alloc(antfly.public_api.ProvisionedTableWriteSource.ReplicaRetirementTarget, state.plan.child_ranges.len);
         defer alloc.free(targets);
-        const proof: @import("../api/table_writes.zig").InitialFkRetirementProof = .{
+        const proof: @import("../common/initial_fk_retirement_proof.zig").InitialFkRetirementProof = .{
             .child_table_id = state.plan.child.table_id,
             .plan_id = state.plan.id,
             .plan_digest = state.plan_digest,
@@ -12381,7 +12381,7 @@ test "standalone canceled initial self FK retires exact private owners after res
     defer alloc.free(canceled_status_json);
     var canceled_status = try std.json.parseFromSlice(publication.InitialPublication, alloc, canceled_status_json, .{});
     defer canceled_status.deinit();
-    const proof: @import("../api/table_writes.zig").InitialFkRetirementProof = .{
+    const proof: @import("../common/initial_fk_retirement_proof.zig").InitialFkRetirementProof = .{
         .child_table_id = child.table_id,
         .plan_id = id,
         .plan_digest = canceled_status.value.plan_digest,
