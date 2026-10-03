@@ -3271,7 +3271,12 @@ pub fn encodeQueryRequestWithGraphWireMode(
     // coordinator-owned expressions/rerankers even after their stages have
     // been removed from the shard request. Omitting fields is the established
     // all-fields wire representation and also works with older workers.
-    if (!req.include_all_fields and !(req.include_stored and req.defer_stored_projection)) {
+    // Canonical hierarchy requests require an explicit projection at both
+    // ingress and storage. Their parser reconstructs deferred projection from
+    // these fields, so retain them rather than emitting an invalid envelope.
+    const requires_hierarchy_fields = req.hierarchy_children != null or
+        req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
+    if (!req.include_all_fields and (requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
     if (req.highlight) |highlight| {

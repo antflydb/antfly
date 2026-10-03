@@ -2539,14 +2539,27 @@ test "SQL decisions execute batches across projection predicate aggregation and 
         if (index != 2) try std.testing.expectEqual(@as(usize, 2), fake.max_batch);
     }
     var fixture: TestBackend = .{};
+    var planning_backend = fixture.coordinated();
+    planning_backend.atomic_statement_read_set = true;
+    planning_backend.coordinated_point_reads = true;
     for ([_][]const u8{
         "EXPLAIN SELECT ai_probability(CAST(id AS TEXT), 'Refund?', 'missing') FROM things",
         "EXPLAIN SELECT AVG(ai_probability(CAST(id AS TEXT), 'Refund?', 'missing')) FROM things",
         "EXPLAIN SELECT ai_probability('refund', 'Refund?', 'missing')",
+        "EXPLAIN DELETE FROM things WHERE ai_probability(CAST(id AS TEXT), 'Refund?', 'missing') > 0.8",
+        "EXPLAIN UPDATE things SET id=CAST(ai_probability('refund', 'Refund?', 'missing') AS BIGINT)",
+        "EXPLAIN INSERT INTO things (_id,id) VALUES ('new',CAST(ai_probability('refund','Refund?','missing') AS BIGINT))",
+        "EXPLAIN DELETE FROM things RETURNING ai_probability(CAST(id AS TEXT),'Refund?','missing')",
+        "EXPLAIN INSERT INTO things (_id,id) VALUES ('new',1) ON CONFLICT (_id) DO UPDATE SET id=CAST(ai_probability('refund','Refund?','missing') AS BIGINT)",
+        "EXPLAIN (FORMAT JSON) UPDATE things SET id=1 WHERE ai_probability(CAST(id AS TEXT),'Refund?','missing')>0.8",
+        "EXPLAIN INSERT INTO things (_id,id) SELECT _id,CAST(ai_probability(CAST(id AS TEXT),'Refund?','missing') AS BIGINT) FROM things",
+        "EXPLAIN UPDATE things t SET id=CAST(ai_probability(CAST(s.id AS TEXT),'Refund?','missing') AS BIGINT) FROM things s WHERE t._id=s._id",
+        "EXPLAIN DELETE FROM things t USING things s WHERE t._id=s._id AND ai_probability(CAST(s.id AS TEXT),'Refund?','missing')>0.8",
+        "EXPLAIN INSERT INTO things (_id,id) VALUES ('new',1) ON CONFLICT (_id) DO UPDATE SET id=1 WHERE ai_probability(CAST(things.id AS TEXT),'Refund?','missing')>0.8",
     }) |sql| {
         var explain = try compiler.compile(a, sql, .{});
         defer explain.deinit();
-        var explained = try execute(a, fixture.iface(), &explain, &.{}, .{});
+        var explained = try execute(a, planning_backend, &explain, &.{}, .{});
         defer explained.deinit();
         try std.testing.expectEqual(@as(usize, 0), fixture.pages);
         try std.testing.expect(std.mem.indexOf(u8, explained.output.rows[0][0].string, "DecisionEval") != null);

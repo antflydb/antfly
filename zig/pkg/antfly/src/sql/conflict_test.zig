@@ -593,3 +593,22 @@ test "SQL conflict decisions respect configured row and byte pages" {
         try std.testing.expectEqual(@as(usize, 0), fixture.commits);
     }
 }
+
+test "SQL EXPLAIN exposes deferred conflict decision queries without owner reads" {
+    const Provider = @import("decision_eval.zig").testing.Provider;
+    var fixture: Fixture = .{ .guarded = true, .dynamic = true };
+    var provider: Provider = .{};
+    var backend = fixture.backend();
+    backend.decision_provider = provider.provider();
+    var compiled = try compiler.compile(std.testing.allocator, "EXPLAIN (FORMAT JSON) INSERT INTO items (_id,n) VALUES ('existing',3) ON CONFLICT (_id) DO UPDATE SET n=(SELECT CAST(ai_probability(CAST(n AS TEXT),'Refund?','local') AS BIGINT) FROM items WHERE _id='existing')", .{});
+    defer compiled.deinit();
+    var explained = try runtime.execute(std.testing.allocator, backend, &compiled, &.{}, .{});
+    defer explained.deinit();
+    const plan = explained.output.rows[0][0].string;
+    try std.testing.expect(std.mem.indexOf(u8, plan, "Conflict Scalar Subquery") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan, "DecisionEval") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plan, "ai_probability") != null);
+    try std.testing.expectEqual(@as(usize, 0), fixture.captures);
+    try std.testing.expectEqual(@as(usize, 0), fixture.commits);
+    try std.testing.expectEqual(@as(usize, 0), provider.calls);
+}

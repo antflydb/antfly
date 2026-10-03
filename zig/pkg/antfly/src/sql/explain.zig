@@ -55,6 +55,40 @@ fn scalarDecisionFunctions(alloc: Allocator, bound: @import("bound_scalars.zig")
     if (bound.predicate) |*program| try decisionFunctions(alloc, program, functions);
     for (bound.projections) |optional| if (optional) |*program| try decisionFunctions(alloc, program, functions);
     for (bound.orders) |optional| if (optional) |*program| try decisionFunctions(alloc, program, functions);
+    for (bound.assignments) |optional| if (optional) |*program| try decisionFunctions(alloc, program, functions);
+    for (bound.insert_rows) |row| for (row) |optional| if (optional) |*program| try decisionFunctions(alloc, program, functions);
+}
+
+/// Input relations describe their own nested query stages. Only collect the
+/// outer input binding here, so a call already shown below a Query node is not
+/// advertised as a second invocation at the mutation boundary.
+fn inputDecisionFunctions(alloc: Allocator, bound: describe.BoundStatement, functions: *std.ArrayList([]const u8)) !void {
+    if (bound.relation == null or bound.relation.?.root.operation != .query)
+        try boundDecisionFunctions(alloc, bound, functions);
+}
+
+fn mutationDecisionFunctions(alloc: Allocator, bound: describe.BoundStatement, functions: *std.ArrayList([]const u8)) !void {
+    try boundDecisionFunctions(alloc, bound, functions);
+    if (bound.returning) |returning| try boundDecisionFunctions(alloc, returning.*, functions);
+    if (bound.insert_source) |source| try inputDecisionFunctions(alloc, source.*, functions);
+    if (bound.joined_mutation) |joined| try inputDecisionFunctions(alloc, joined.input.*, functions);
+    if (bound.conflict) |conflict| {
+        if (conflict.predicate) |*program| try decisionFunctions(alloc, program, functions);
+        for (conflict.assignments) |optional| if (optional) |*program| try decisionFunctions(alloc, program, functions);
+    }
+    if (bound.merge_mutation) |merge| {
+        try inputDecisionFunctions(alloc, merge.input.*, functions);
+        for (merge.arms) |arm| {
+            if (arm.predicate) |*program| try decisionFunctions(alloc, program, functions);
+            switch (arm.action) {
+                .insert, .update => |assignments| for (assignments) |assignment| {
+                    if (assignment.program) |*program| try decisionFunctions(alloc, program, functions);
+                },
+                .delete, .nothing => {},
+            }
+        }
+        if (merge.returning_plan) |returning| for (returning.programs) |*program| try decisionFunctions(alloc, program, functions);
+    }
 }
 
 fn queryStages(alloc: Allocator, source: Plan, statement: ast.Select, bound: describe.BoundStatement) !Plan {
@@ -113,7 +147,7 @@ fn relationPlan(alloc: Allocator, bound: *const relation.Bound, node: *const rel
     };
 }
 
-fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.BoundStatement, verbose: bool) !Plan {
+fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.BoundStatement, verbose: bool) anyerror!Plan {
     const kind: []const u8 = switch (statement) {
         .select => "Select",
         .insert => "Insert",
@@ -142,6 +176,26 @@ fn statementPlan(alloc: Allocator, statement: ast.Statement, bound: describe.Bou
     }
     if (statement == .select and child.len != 0 and (relation_bound == null or relation_bound.?.root.operation != .query))
         child = try alloc.dupe(Plan, &.{try queryStages(alloc, child[0], statement.select, bound)});
+    if (bound.conflict) |conflict| {
+        var inputs: std.ArrayList(Plan) = .empty;
+        try inputs.appendSlice(alloc, child);
+        for (conflict.deferred) |optional| if (optional) |deferred| {
+            try inputs.append(alloc, .{
+                .node_type = "Conflict Scalar Subquery",
+                .plans = try alloc.dupe(Plan, &.{try statementPlan(alloc, .{ .select = deferred.query.* }, deferred.binding.*, verbose)}),
+            });
+        };
+        child = inputs.items;
+    }
+    if (statement != .select) {
+        var functions: std.ArrayList([]const u8) = .empty;
+        try mutationDecisionFunctions(alloc, bound, &functions);
+        if (functions.items.len > 0) child = try alloc.dupe(Plan, &.{.{
+            .node_type = "DecisionEval",
+            .functions = functions.items,
+            .plans = child,
+        }});
+    }
     return .{
         .node_type = kind,
         .relation = if (bound.table) |table| try displayName(alloc, table) else null,

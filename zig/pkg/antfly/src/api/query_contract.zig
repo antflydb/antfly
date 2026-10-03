@@ -2818,6 +2818,55 @@ pub fn parseQueryRequestWithDeadline(
     };
 }
 
+/// Storage-only public consumers have no coordinator expression executor.
+/// Reject evaluation before semantic resolution or storage work, rather than
+/// accepting a stage whose filters and computed output would be ignored.
+pub fn validateStoragePublicQueryRequest(alloc: std.mem.Allocator, body: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch |err| {
+        return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
+    };
+    try validatePublicQueryEnvelopeValueAlloc(arena.allocator(), root);
+    if (root.object.get("evaluate")) |stage| {
+        if (stage != .null) return error.UnsupportedQueryRequest;
+    }
+}
+
+test "api query contract storage public consumers reject evaluation before execution" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"evaluate\":{\"scope\":\"candidates\",\"candidate_count\":2,\"compute\":{\"x\":{\"literal\":1}},\"where\":{\"eq\":[{\"literal\":1},{\"literal\":0}]}}}",
+        "{\"eval\\u0075ate\":{}}",
+    }) |body| try std.testing.expectError(error.UnsupportedQueryRequest, validateStoragePublicQueryRequest(alloc, body));
+    try validateStoragePublicQueryRequest(alloc, "{\"evaluate\":null}");
+    try validateStoragePublicQueryRequest(alloc, "{\"full_text_search\":{\"match_all\":{}}}");
+}
+
+test "api query contract hierarchy worker wire preserves explicit deferred projection" {
+    const alloc = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"hierarchy\":{\"children\":{\"parent\":{\"level\":\"source\",\"id\":\"doc:a\"},\"level\":\"unit\"}},\"fields\":[\"unit_id\",\"unit_type\",\"text\"],\"order_by\":[{\"field\":\"_hierarchy.position\"}],\"limit\":1}",
+        "{\"full_text_search\":{\"match\":\"needle\",\"field\":\"content\"},\"fields\":[\"text\"],\"hierarchy\":{\"group_by\":{\"level\":\"unit\"}},\"limit\":1}",
+        "{\"full_text_search\":{\"match\":\"needle\",\"field\":\"content\"},\"fields\":[\"title\"],\"hierarchy\":{\"group_by\":{\"level\":\"source\",\"matches\":{\"fields\":[\"text\"]}}},\"limit\":1}",
+    }) |body| {
+        var original = try parsePublicQueryRequest(alloc, null, "docs", body);
+        defer original.deinit(alloc);
+        try std.testing.expect(original.req.defer_stored_projection);
+        const wire = try @import("local_query_contract.zig").encodeQueryRequest(alloc, original.req);
+        defer alloc.free(wire);
+        var worker = try parseQueryRequest(alloc, null, "docs", wire);
+        defer worker.deinit(alloc);
+        try std.testing.expectEqual(original.req.hierarchy_children != null, worker.req.hierarchy_children != null);
+        try std.testing.expectEqual(original.req.hierarchy_group_level, worker.req.hierarchy_group_level);
+        try std.testing.expectEqual(original.req.hierarchy_grouped_matches, worker.req.hierarchy_grouped_matches);
+        try std.testing.expect(!worker.req.include_all_fields);
+        try std.testing.expect(worker.req.defer_stored_projection);
+        try std.testing.expectEqual(original.req.fields.len, worker.req.fields.len);
+        for (original.req.fields, worker.req.fields) |expected, actual| try std.testing.expectEqualStrings(expected, actual);
+    }
+}
+
 pub fn parsePublicQueryRequest(
     alloc: std.mem.Allocator,
     semantic_resolver: ?SemanticResolver,

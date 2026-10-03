@@ -171,12 +171,28 @@ test "SQL original cross-table MERGE executes matched and source-only rows atomi
     // Decision predicates and assignments run only for the selected arm;
     // RETURNING completes before the native commit is published.
     const Provider = @import("decision_eval.zig").testing.Provider;
-    var ai = try compiler.compile(std.testing.allocator, "MERGE INTO usage_records t USING source_records s ON t.id=s.id WHEN MATCHED AND FALSE THEN UPDATE SET status=ai_choice(s.status,'Unused','{\"yes\":\"Yes\",\"no\":\"No\"}','local') WHEN MATCHED AND ai_probability(s.status,'Refund?','local')>0.8 THEN UPDATE SET status=CASE WHEN ai_probability(s.status,'Refund?','local')>0.8 THEN s.status ELSE 'wrong' END WHEN NOT MATCHED THEN INSERT (id,status) VALUES (s.id,s.status) RETURNING ai_probability(t.status,'Refund?','local')", .{});
+    const decision_sql = "MERGE INTO usage_records t USING source_records s ON t.id=s.id WHEN MATCHED AND FALSE THEN UPDATE SET status=ai_choice(s.status,'Unused','{\"yes\":\"Yes\",\"no\":\"No\"}','local') WHEN MATCHED AND ai_probability(s.status,'Refund?','local')>0.8 THEN UPDATE SET status=CASE WHEN ai_probability(s.status,'Refund?','local')>0.8 THEN s.status ELSE 'wrong' END WHEN NOT MATCHED THEN INSERT (id,status) VALUES (s.id,s.status) RETURNING ai_probability(t.status,'Refund?','local')";
+    var ai = try compiler.compile(std.testing.allocator, decision_sql, .{});
     defer ai.deinit();
     probe = .{};
     var provider: Provider = .{};
     var backend = probe.backend();
     backend.decision_provider = provider.provider();
+    for ([_][]const u8{ "EXPLAIN ", "EXPLAIN (FORMAT JSON) " }) |prefix| {
+        const sql_text = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ prefix, decision_sql });
+        defer std.testing.allocator.free(sql_text);
+        var explanation = try compiler.compile(std.testing.allocator, sql_text, .{});
+        defer explanation.deinit();
+        var planned = try runtime.execute(std.testing.allocator, backend, &explanation, &.{}, .{});
+        defer planned.deinit();
+        const plan = planned.output.rows[0][0].string;
+        try std.testing.expect(std.mem.indexOf(u8, plan, "DecisionEval") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "ai_choice") != null);
+        try std.testing.expect(std.mem.indexOf(u8, plan, "ai_probability") != null);
+        try std.testing.expectEqual(@as(usize, 0), provider.calls);
+        try std.testing.expectEqual(@as(usize, 0), probe.captures);
+        try std.testing.expectEqual(@as(usize, 0), probe.commits);
+    }
     var decided = try runtime.execute(std.testing.allocator, backend, &ai, &.{}, .{});
     defer decided.deinit();
     try std.testing.expectEqual(@as(u64, 2), decided.output.rows_affected);

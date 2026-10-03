@@ -364,6 +364,16 @@ contract tests. The function tests cover both HTTP protocols, credentials,
 usage, budgets, cancellation, binding reuse, NULL inputs, candidate analytics,
 incomplete matches, graph tuples, public parsing, and materialized provenance.
 
+### Embedded query capability
+
+The standalone embedded JSON API and C API storage query endpoints reject
+`evaluate` with `UnsupportedQueryRequest` (mapped to `invalid_argument` by the
+C ABI) before retrieval or semantic inference. Evaluation needs the hosted query coordinator and its decision registry; storage
+kernels never execute provider calls or silently discard evaluation stages.
+SQL EXPLAIN exposes DecisionEval for decision calls in mutation predicates,
+assignments, VALUES, conflict arms, and RETURNING as well as SELECT stages.
+
+
 ## Delivery sequence and evidence
 
 1. Expressions/descriptors: type checking, dependencies, capabilities, no I/O
