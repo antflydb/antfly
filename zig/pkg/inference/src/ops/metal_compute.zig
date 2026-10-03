@@ -23386,6 +23386,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return lookupWeight(ctx, name, false);
     }
 
+    // Gemma 4 PLE lookups go through ComputeBackend.getEmbeddingWeight, not
+    // getWeight/acquireWeight. Metal's lookupWeight has no CPU-only "prepare
+    // the matrix" distinction (that's native_compute's acquireWeight vs.
+    // getEmbeddingWeight split), so an un-shared acquire is the right
+    // behavior here. Without this override the base native_compute vtable's
+    // getEmbeddingWeight stays wired in and reinterprets this MetalCompute
+    // ctx as a *NativeCompute, corrupting the weight-store pointer and
+    // segfaulting.
+    fn getEmbeddingWeightOp(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        return lookupWeight(ctx, name, false);
+    }
+
     fn lookupWeight(ctx: *anyopaque, name: []const u8, shared: bool) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
 
@@ -30687,6 +30699,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.freeTensor = freeOp;
         vt.getWeight = getWeightOp;
         vt.acquireWeight = acquireWeightOp;
+        vt.getEmbeddingWeight = getEmbeddingWeightOp;
         vt.prefetchWeightHint = prefetchWeightHintOp;
         vt.drainPrefetchBudget = drainPrefetchBudgetOp;
         vt.fromFloat32 = fromFloat32Op;

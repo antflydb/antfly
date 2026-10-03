@@ -10932,8 +10932,10 @@ pub const Node = struct {
             };
         }
 
+        // Report usage in the tokens `target_tokens` is measured in; a
+        // whitespace word count undercounts unspaced scripts such as CJK.
         const prompt_tokens = switch (input.value) {
-            .text => |text| estimateTextTokens(text),
+            .text => |text| lib_chunker.fixed_text.countTextTokens(ctx.allocator, text) catch estimateTextTokens(text),
             .binary => 0,
         };
 
@@ -29453,7 +29455,7 @@ fn chunkInputWorkingAdmission(
         );
         const frame_pixels = std.math.mul(usize, @as(usize, info.width), @as(usize, info.height)) catch
             return error.ImageTooLarge;
-        const max_frames = if (config.max_chunks > 0) config.max_chunks else (lib_chunker.FixedChunkConfig{}).max_chunks;
+        const max_frames = if (config.max_chunks > 0) config.max_chunks else lib_chunker.default_gif_max_frames;
         const potential_pixels = std.math.mul(usize, frame_pixels, max_frames) catch
             std.math.maxInt(usize);
         const admitted_pixels = @min(

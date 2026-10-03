@@ -383,9 +383,16 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     }
     if (source.edge !== undefined) {
       if (!isRecord(source.edge)) throw new TypeError(`sources[${index}].edge must be an object`);
-      validateOnlyKeys(source.edge, ["type", "weight", "metadata", "edge_id"], `sources[${index}].edge`);
+      validateOnlyKeys(
+        source.edge,
+        ["type", "weight", "metadata", "edge_id"],
+        `sources[${index}].edge`
+      );
     }
-    for (const [fieldName, value] of [["source", source.nodes?.source], ["target", source.nodes?.target]] as const) {
+    for (const [fieldName, value] of [
+      ["source", source.nodes?.source],
+      ["target", source.nodes?.target],
+    ] as const) {
       if (
         value !== undefined &&
         typeof value !== "string" &&

@@ -7984,6 +7984,7 @@ pub const GraphIndex = struct {
         }
         if (now_ns == null and (direction == .out or direction == .both)) {
             try self.appendPendingDocClearEdges(alloc, &reads.outgoing.?, &results, key, edge_type);
+            try self.appendPendingProducerClearEdges(alloc, &reads.outgoing.?, &results, key, edge_type);
             // Recover deletes interrupted before durable clear intents existed.
             try self.appendOrphanedSourceContributions(alloc, &reads.outgoing.?, &results, key, edge_type);
         }
@@ -7991,14 +7992,16 @@ pub const GraphIndex = struct {
         return try results.toOwnedSlice(alloc);
     }
 
-    fn appendRecoveryEdgeIfMissing(self: *GraphIndex, alloc: Allocator, outgoing: *backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), source: []const u8, kind: []const u8, target: []const u8) !void {
-        const edge_key = try edgeKeyAlloc(alloc, source, self.index_name, kind, target);
+    fn appendRecoveryEdgeIfMissing(self: *GraphIndex, alloc: Allocator, outgoing: *backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), source: []const u8, kind: []const u8, target: []const u8, edge_id: []const u8, owner_document: []const u8) !void {
+        const edge_key = try relationshipKeyAlloc(alloc, source, self.index_name, kind, target, edge_id, owner_document);
         defer alloc.free(edge_key);
         if (outgoing.get(edge_key)) |_| return else |err| if (err != error.NotFound) return err;
         for (results.items) |existing| {
             if (std.mem.eql(u8, existing.source, source) and
                 std.mem.eql(u8, existing.edge_type, kind) and
-                std.mem.eql(u8, existing.target, target)) return;
+                std.mem.eql(u8, existing.target, target) and
+                std.mem.eql(u8, existing.edge_id, edge_id) and
+                std.mem.eql(u8, existing.owner_document, owner_document)) return;
         }
         const source_owned = try alloc.dupe(u8, source);
         errdefer alloc.free(source_owned);
@@ -8006,7 +8009,11 @@ pub const GraphIndex = struct {
         errdefer alloc.free(kind_owned);
         const target_owned = try alloc.dupe(u8, target);
         errdefer alloc.free(target_owned);
-        try results.append(alloc, .{ .source = source_owned, .target = target_owned, .edge_type = kind_owned, .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
+        const id_owned = try alloc.dupe(u8, edge_id);
+        errdefer alloc.free(id_owned);
+        const owner_owned = try alloc.dupe(u8, owner_document);
+        errdefer alloc.free(owner_owned);
+        try results.append(alloc, .{ .source = source_owned, .target = target_owned, .edge_type = kind_owned, .edge_id = id_owned, .owner_document = owner_owned, .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" });
     }
 
     fn appendPendingDocClearEdges(self: *GraphIndex, alloc: Allocator, outgoing: *backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), source: []const u8, requested_type: []const u8) !void {
@@ -8024,13 +8031,37 @@ pub const GraphIndex = struct {
             const kind_end = internal_keys.findComponentTerminator(entry.key, prefix.items.len) orelse return error.InvalidGraphEdgeDelete;
             const target_start = kind_end + 2;
             const target_end = internal_keys.findComponentTerminator(entry.key, target_start) orelse return error.InvalidGraphEdgeDelete;
-            if (target_end + 2 != entry.key.len) continue; // relationship intents use the bounded full-identity recovery path
+            const identity = internal_keys.parseGraphRelationshipSuffix(entry.key, target_end + 2) orelse return error.InvalidGraphEdgeDelete;
             const kind = try internal_keys.decodeBodyAlloc(alloc, entry.key[prefix.items.len..kind_end]);
             defer alloc.free(kind);
             if (requested_type.len != 0 and !std.mem.eql(u8, kind, requested_type)) continue;
             const target = try internal_keys.decodeBodyAlloc(alloc, entry.key[target_start..target_end]);
             defer alloc.free(target);
-            try self.appendRecoveryEdgeIfMissing(alloc, outgoing, results, source, kind, target);
+            const edge_id = try internal_keys.decodeBodyAlloc(alloc, identity.edge_id);
+            defer alloc.free(edge_id);
+            const owner_document = try internal_keys.decodeBodyAlloc(alloc, identity.owner_document);
+            defer alloc.free(owner_document);
+            try self.appendRecoveryEdgeIfMissing(alloc, outgoing, results, source, kind, target, edge_id, owner_document);
+        }
+    }
+
+    /// Producer directories are durable recovery cursors too: their entries
+    /// remain after the outgoing commit until reverse cleanup completes.
+    fn appendPendingProducerClearEdges(self: *GraphIndex, alloc: Allocator, outgoing: *backend_erased.ReadTxn, results: *std.ArrayListUnmanaged(Edge), source: []const u8, requested_type: []const u8) !void {
+        const prefix = try legacyProducerPrefixAlloc(alloc, source);
+        defer alloc.free(prefix);
+        var reverse = try self.beginReadReverseTxn();
+        defer reverse.abort();
+        var cursor = try reverse.openCursor();
+        defer cursor.close();
+        var row = try cursor.seekAtOrAfter(prefix);
+        while (row) |entry| : (row = try cursor.next()) {
+            if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+            var parsed = (try parseOutgoingEdgeKeyAlloc(alloc, entry.key[prefix.len..])) orelse return error.InvalidGraphEdgeDelete;
+            defer parsed.deinit(alloc);
+            if (!std.mem.eql(u8, parsed.source, source)) continue;
+            if (requested_type.len != 0 and !std.mem.eql(u8, parsed.edge_type, requested_type)) continue;
+            try self.appendRecoveryEdgeIfMissing(alloc, outgoing, results, parsed.source, parsed.edge_type, parsed.target, parsed.edge_id, parsed.owner_document);
         }
     }
 
@@ -8069,7 +8100,7 @@ pub const GraphIndex = struct {
             contender_prefix[contender_prefix.len - 1] = 1;
             row = try cursor.next();
             if (row == null or !std.mem.startsWith(u8, row.?.key, contender_prefix)) continue;
-            try self.appendRecoveryEdgeIfMissing(alloc, outgoing, results, source, kind, target);
+            try self.appendRecoveryEdgeIfMissing(alloc, outgoing, results, source, kind, target, "", "");
         }
     }
 
@@ -37637,6 +37668,44 @@ test "graph document clear survives crash after durable outgoing delete" {
     defer GraphIndex.freeEdges(a, incoming);
     try std.testing.expectEqual(@as(usize, 0), incoming.len);
     const after = try g.getPhysicalEdgesForDeletion(a, "doc:a", "link", .out);
+    defer GraphIndex.freeEdges(a, after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "graph document clear recovery preserves parallel relationship identities" {
+    const a = std.testing.allocator;
+    var ob: [256]u8 = undefined;
+    const outgoing = tmpPath(&ob, "clear-identities-out");
+    defer cleanupTmp(outgoing);
+    var rb: [256]u8 = undefined;
+    const reverse = tmpPath(&rb, "clear-identities-in");
+    defer cleanupTmp(reverse);
+    defer test_abort_doc_clear_after_forward_commit = false;
+    {
+        var g = try GraphIndex.openWithPrivateStores(a, outgoing, reverse, "g", .{});
+        defer g.close();
+        try g.batchApply(&.{
+            .{ .source = "a", .target = "b", .edge_type = "link", .edge_id = "first", .owner_document = "owner" },
+            .{ .source = "a", .target = "b", .edge_type = "link", .edge_id = "second", .owner_document = "owner" },
+        }, &.{});
+        test_abort_doc_clear_after_forward_commit = true;
+        try std.testing.expectError(error.TestInjectedGraphClearFailure, g.batchApply(&.{}, &.{
+            .{ .source = "a", .target = "b", .edge_type = "link", .edge_id = "first", .owner_document = "owner", .clear_all_private_state = true },
+            .{ .source = "a", .target = "b", .edge_type = "link", .edge_id = "second", .owner_document = "owner", .clear_all_private_state = true },
+        }));
+        test_abort_doc_clear_after_forward_commit = false;
+    }
+    var g = try GraphIndex.openWithPrivateStores(a, outgoing, reverse, "g", .{});
+    defer g.close();
+    const pending = try g.getPhysicalEdgesForDeletion(a, "a", "link", .both);
+    defer GraphIndex.freeEdges(a, pending);
+    try std.testing.expectEqual(@as(usize, 2), pending.len);
+    try std.testing.expect(!std.mem.eql(u8, pending[0].edge_id, pending[1].edge_id));
+    for (pending) |edge| {
+        try std.testing.expectEqualStrings("owner", edge.owner_document);
+        try g.batchApply(&.{}, &.{.{ .source = edge.source, .target = edge.target, .edge_type = edge.edge_type, .edge_id = edge.edge_id, .owner_document = edge.owner_document, .clear_all_private_state = true }});
+    }
+    const after = try g.getPhysicalEdgesForDeletion(a, "a", "link", .both);
     defer GraphIndex.freeEdges(a, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
 }

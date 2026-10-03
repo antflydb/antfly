@@ -90,8 +90,10 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
         .file_allocator = alloc,
         // Full DB graph apply crosses the LSM and debug allocator on this
         // fiber. Match the production-shaped DB/DataServer VOPR campaigns,
-        // rather than the generic scheduler's 1 MiB task stack.
-        .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+        // rather than the generic scheduler's 1 MiB task stack. 8 MiB
+        // overflowed in Debug builds on the comparable production-shaped
+        // Raft-merge campaign (data/runtime.zig); use the same 32 MiB.
+        .tasks = .{ .stack_size = 32 * 1024 * 1024 },
     });
     defer runtime_io.deinit();
     runtime_io.monotonic_ns = 200 * std.time.ns_per_day;

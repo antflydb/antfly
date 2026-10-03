@@ -27,7 +27,9 @@ class ChunkerConfig:
 
     Attributes:
         provider (ChunkerProvider): The chunking provider to use.
-        max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero uses the chunker default.
+        max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (or omitted, the default)
+            means unlimited — the document is chunked in full with no cap. Set an explicit value up to 4096 to bound chunk
+            count for very large inputs.
         threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0).
         text (TextChunkOptions | Unset): Options specific to text chunking.
         audio (AudioChunkOptions | Unset): Options specific to audio chunking.

@@ -941,6 +941,12 @@ pub const DerivedReplayDebtStatus = struct {
     applied_sequence: u64,
     target_sequence: u64,
     catch_up_required: bool,
+    /// Documents this index has given up indexing after bounded
+    /// error.ReplayDocumentNotVisible retries (see
+    /// ResourceManager.shouldEscalateReplayDocumentNotVisible). Nonzero here
+    /// means the index is missing content it will never retry for on its
+    /// own -- an operator-visible signal distinct from ordinary catch-up lag.
+    replay_document_not_visible_skipped: u64 = 0,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(@constCast(self.index_name));
@@ -2287,6 +2293,9 @@ const LocalMutationExecution = struct {
     const batchInternalPrepared = DB.batchInternalPrepared;
     const batchInternalWithPreparationAllocator = DB.batchInternalWithPreparationAllocator;
     const captureTransformReadSnapshot = DB.captureTransformReadSnapshot;
+    const captureGeneratedWriteReadSnapshot = DB.captureGeneratedWriteReadSnapshot;
+    const validateGeneratedWriteReadSnapshot = DB.validateGeneratedWriteReadSnapshot;
+    const GeneratedWriteReadSnapshot = DB.GeneratedWriteReadSnapshot;
     const clearActiveIndexRepairsLocked = DB.clearActiveIndexRepairsLocked;
     const clearBulkIngestIdentityAllNewLocked = DB.clearBulkIngestIdentityAllNewLocked;
     const clearBulkIngestSeenDocKeysLocked = DB.clearBulkIngestSeenDocKeysLocked;
@@ -2345,7 +2354,7 @@ const LocalMutationExecution = struct {
         try self.executor.failIfUnhealthy();
     }
 
-    fn waitForSyncLevelWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: ManagedSyncTargets, _: types.CancellationToken) !void {
+    fn waitForSyncLevelWithCancellation(self: *@This(), sync_level: types.SyncLevel, _: u64, _: ManagedSyncTargets, _: types.CancellationToken, _: bool) !void {
         std.debug.assert(sync_level == .propose);
         try self.executor.failIfUnhealthy();
     }
@@ -9220,13 +9229,17 @@ pub const DB = struct {
     pub fn snapshotTextMergeStats(self: *DB) types.TextMergeStats {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return self.core.index_manager.textMergeStatsSnapshot();
+        var merge_stats = self.core.index_manager.textMergeStatsSnapshot();
+        if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&merge_stats);
+        return merge_stats;
     }
 
     pub fn trySnapshotTextMergeStats(self: *DB) ?types.TextMergeStats {
         if (!self.core.tryLockApplyShared()) return null;
         defer self.core.unlockApplyShared();
-        return self.core.index_manager.textMergeStatsSnapshot();
+        var merge_stats = self.core.index_manager.textMergeStatsSnapshot();
+        if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&merge_stats);
+        return merge_stats;
     }
 
     pub fn snapshotPrimaryLsmWriteStatsForTest(self: *DB) ?lsm_backend_mod.Backend.WriteStats {
@@ -11658,6 +11671,24 @@ pub const DB = struct {
         };
         defer if (preprepared_generated) |*generated| generated.deinit(preparation_alloc);
         defer if (preprepared_generated_plan) |*plan| plan.deinit();
+        // Document-mode analogue of the relational hoist below: extraction and
+        // generated-enrichment precompute (asset/chunk/embedding requests) run
+        // here, before the exclusive apply lock, instead of unconditionally
+        // in-lock. `preprepared_document_generated` is reused under the lock
+        // only if the catalog generation this precompute observed is still
+        // current (`document_generated_write_plan_generation`) and this
+        // batch's own write keys have not been touched by another commit
+        // since (`generated_precompute_snapshot`, validated unconditionally
+        // alongside `transform_snapshot` below). Either check failing forces
+        // `PreparedGenerationChanged`/`PreparedReadSetChanged`, which the
+        // existing bounded retry in `batchInternalWithPreparationAllocator`
+        // already handles by recomputing from a fresh snapshot -- never by
+        // silently reusing stale precompute.
+        var preprepared_document_generated: ?PrecomputedGeneratedBatch = null;
+        defer if (preprepared_document_generated) |*generated| generated.deinit(preparation_alloc);
+        var document_generated_write_plan_generation: ?u64 = null;
+        var generated_precompute_snapshot: GeneratedWriteReadSnapshot = .{};
+        defer generated_precompute_snapshot.deinit(preparation_alloc);
         if (request_schema_view) |view| if (view.storageMode() == .relational) {
             var stable_keys = std.StringHashMapUnmanaged(void).empty;
             defer stable_keys.deinit(preparation_alloc);
@@ -11824,6 +11855,86 @@ pub const DB = struct {
                 }
             }
         };
+        // Document-mode tables have no `PreparedRelationalWrite`/write-plan
+        // row encoding to hoist, but generated-enrichment precompute (asset
+        // extraction, chunking, embedding) for `.enrichments`/`.full_index`/
+        // `.full_text` sync levels is exactly as safe to run before the lock:
+        // it only needs this write's own submitted value, the enrichment
+        // catalog, and a handful of read-only store lookups (existing
+        // asset/chunk state used to skip unchanged work). The catalog-epoch
+        // and per-document mutation revisions below make stale precompute retry
+        // instead of silently committing.
+        // Transaction resolution publishes keys that still carry their
+        // prepared intents; those reads are only valid under the apply lock,
+        // so resolution keeps the in-lock precompute path.
+        if (opts.transaction_resolution == null and
+            !(if (request_schema_view) |view| view.storageMode() == .relational else false))
+        {
+            const requires_inline_generated =
+                (effective_req.sync_level == .full_text or effective_req.sync_level == .enrichments or effective_req.sync_level == .full_index) or
+                splitShadowRequiresMaterializedDerivedBatch(self);
+            if (requires_inline_generated and effective_req.writes.len > 0) {
+                const precompute_generated_start_ns = monotonicTimeNs();
+                generated_precompute_snapshot = try self.captureGeneratedWriteReadSnapshot(preparation_alloc, effective_req.writes);
+                // Every catalog-derived input this loop needs (dense/sparse
+                // direct-field vectors, graph field-edge configs) is read
+                // from an owned, refcounted WritePlanSnapshot acquired here
+                // -- the same mechanism the relational-row hoist above uses
+                // via `write_plan_snapshot` -- instead of touching
+                // `self.core.index_manager`'s live catalog arrays directly.
+                // The snapshot is cloned under `catalog_mutex.lockShared()`
+                // once per generation and stays valid after that lock is
+                // released, so a concurrent catalog publish can replace or
+                // free the live entries without this precompute observing
+                // freed memory. Pinned before prepareGeneratedEnrichments
+                // runs (which may take slightly longer than this read), so
+                // any catalog publication racing with this precompute is
+                // also caught as a generation change under the lock, never
+                // silently used.
+                write_plan_snapshot = try self.core.index_manager.acquireWritePlanSnapshot();
+                document_generated_write_plan_generation = write_plan_snapshot.?.generation();
+                const extracted_rows = try preparation_alloc.alloc(mapper.ExtractedWrite, effective_req.writes.len);
+                var extracted_rows_initialized: usize = 0;
+                defer {
+                    for (extracted_rows[0..extracted_rows_initialized]) |*item| item.deinit(preparation_alloc);
+                    preparation_alloc.free(extracted_rows);
+                }
+                const doc_plan = write_plan_snapshot.?.plan().*;
+                const doc_plan_needs_parse = doc_plan.graph_fields.len != 0 or doc_plan.dense_fields.len != 0 or doc_plan.sparse_fields.len != 0;
+                for (effective_req.writes, 0..) |write, i| {
+                    if (isMetadataKey(write.key)) {
+                        extracted_rows[i] = .{
+                            .cleaned_value = null,
+                            .graph_writes = &.{},
+                            .mentioned_graph_indexes = &.{},
+                            .dense_embeddings = &.{},
+                            .sparse_embeddings = &.{},
+                        };
+                        extracted_rows_initialized += 1;
+                        continue;
+                    }
+                    extracted_rows[i] = try mapper.extractWrite(preparation_alloc, write.key, write.value);
+                    extracted_rows_initialized += 1;
+                    if (doc_plan_needs_parse) {
+                        var parsed = try std.json.parseFromSlice(std.json.Value, preparation_alloc, write.value, .{});
+                        defer parsed.deinit();
+                        try augmentExtractedWriteWithGraphFieldEdgesFromSnapshotParsed(doc_plan, preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
+                        try doc_plan.appendIndexFieldEmbeddingsFromParsedToExtractedWrite(preparation_alloc, write.key, parsed.value, &extracted_rows[i]);
+                    }
+                }
+                preprepared_document_generated = try prepareGeneratedEnrichments(
+                    self,
+                    preparation_alloc,
+                    effective_req,
+                    extracted_rows[0..extracted_rows_initialized],
+                    generatedPrecomputeModeForSyncLevel(effective_req.sync_level),
+                    opts.force_generated_artifact_names,
+                    null,
+                    generated_memo,
+                );
+                if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
+            }
+        }
 
         // HA encoding is a pure function of the admitted request and can be
         // proportional to the entire batch. Prepare it before the serialized
@@ -12240,6 +12351,14 @@ pub const DB = struct {
         // request from a freshly pinned immutable schema/catalog generation.
         if (preprepared_rows != null and !use_preprepared_rows)
             return error.PreparedGenerationChanged;
+        // Same fence for document-mode's pre-lock generated-enrichment
+        // precompute: a catalog publication (new/changed enrichment, index)
+        // between the pre-lock read and this lock acquisition invalidates it.
+        const use_preprepared_document_generated = preprepared_document_generated != null and
+            document_generated_write_plan_generation != null and
+            self.core.index_manager.writePlanGeneration() == document_generated_write_plan_generation.?;
+        if (preprepared_document_generated != null and !use_preprepared_document_generated)
+            return error.PreparedGenerationChanged;
         // Transform expansion or an epoch/index-plan race invalidates the
         // speculative rows. Pin the currently published epoch once for the
         // serialized fallback; AROW v2 never encodes without its compiled
@@ -12282,6 +12401,13 @@ pub const DB = struct {
             try self.core.checkOrdinaryWriteConflicts(effective_ops.writes, effective_ops.deletes);
         }
         try self.validateTransformReadSnapshot(transform_snapshot);
+        // Catches a concurrent commit to one of this batch's own write keys
+        // between the pre-lock precompute read and this lock acquisition --
+        // the race the catalog-generation check above cannot see, since it
+        // only tracks schema/enrichment catalog changes, not per-document
+        // data changes. use_preprepared_document_generated already forced a
+        // retry on a stale catalog; this call does the same for a stale key.
+        if (use_preprepared_document_generated) try self.validateGeneratedWriteReadSnapshot(generated_precompute_snapshot);
 
         if (effective_req.predicates.len > 0) {
             const predicates_start_ns = monotonicTimeNs();
@@ -13160,6 +13286,17 @@ pub const DB = struct {
 
         var precomputed_generated: PrecomputedGeneratedBatch = .{};
         defer precomputed_generated.deinit(preparation_alloc);
+        // Whether this batch's own rows needed nothing further from the
+        // enrichment runtime: every generated-enrichment request for them was
+        // precomputed and folded into store_writes above, under this same
+        // apply-lock hold. Set after the precompute block below, before
+        // precomputed_generated.generated_enrichment_refs is transferred into
+        // materialized_derived_batch (which zeroes it). A sync_level
+        // .enrichments write with this true does not owe the enrichment
+        // runtime anything from its own commit, so it can skip waiting on the
+        // table-wide applied watermark below -- unrelated backlog queued
+        // ahead of this write's sequence is not this write's debt to drain.
+        var enrichment_fully_precomputed = false;
         var remote_child_range_dispatches = std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup).empty;
         defer {
             for (remote_child_range_dispatches.items) |*dispatch| dispatch.deinit(preparation_alloc);
@@ -13180,6 +13317,9 @@ pub const DB = struct {
             if (use_preprepared_rows and preprepared_generated != null) {
                 precomputed_generated = preprepared_generated.?;
                 preprepared_generated = null;
+            } else if (use_preprepared_document_generated) {
+                precomputed_generated = preprepared_document_generated.?;
+                preprepared_document_generated = null;
             } else {
                 precomputed_generated = try prepareGeneratedEnrichments(
                     self,
@@ -13211,6 +13351,8 @@ pub const DB = struct {
                 }
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.precompute_generated_ns, precompute_generated_start_ns);
+            enrichment_fully_precomputed = effective_req.sync_level == .enrichments and
+                precomputed_generated.generated_enrichment_refs.len == 0;
         }
         if (effective_req.merge_artifacts.len > 0 or (if (req.merge_page) |page| page.artifact_effects.len != 0 else false) or explicit_embedding_artifact_writes.items.len > 0 or
             explicit_graph_artifact_writes.items.len > 0 or
@@ -14020,7 +14162,7 @@ pub const DB = struct {
         if (append_derived_replay and self.executor.hasWorkers()) {
             if (opts.wait_for_sync_level) {
                 const sync_wait_start_ns = monotonicTimeNs();
-                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
+                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
             }
         } else if (append_derived_replay) {
@@ -14035,7 +14177,7 @@ pub const DB = struct {
             }
             if (opts.wait_for_sync_level) {
                 const sync_wait_start_ns = monotonicTimeNs();
-                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation);
+                try self.waitForSyncLevelWithCancellation(effective_req.sync_level, sequence, sync_targets, opts.visibility_cancellation, enrichment_fully_precomputed);
                 if (profile) |active_profile| recordProfileNs(profile, &active_profile.sync_wait_ns, sync_wait_start_ns);
             }
         }
@@ -15441,6 +15583,43 @@ pub const DB = struct {
         }
         result.entries = entries;
         return result;
+    }
+
+    const GeneratedWriteReadSnapshot = struct {
+        const revisions = @import("../document_mutation_revision.zig");
+        const Entry = struct { key: revisions.Key, revision: u64 };
+        entries: []Entry = &.{},
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.entries);
+            self.* = .{};
+        }
+    };
+
+    /// Fence every document's primary and artifact state across precomputation.
+    /// Physical transactions advance these revisions even when TTL timestamps
+    /// and primary bytes are unchanged. Unrelated documents do not invalidate
+    /// this request, and no catalog or provider work runs under the apply lock.
+    fn captureGeneratedWriteReadSnapshot(self: anytype, alloc: Allocator, writes: []const types.BatchWrite) !GeneratedWriteReadSnapshot {
+        const revisions = GeneratedWriteReadSnapshot.revisions;
+        const entries = try alloc.alloc(GeneratedWriteReadSnapshot.Entry, writes.len);
+        errdefer alloc.free(entries);
+        var txn = try self.core.store.beginReadTxn();
+        defer txn.abort();
+        for (writes, entries) |write, *entry| {
+            const key = revisions.keyForPhysical(write.key) orelse try revisions.keyForDocumentAlloc(alloc, write.key);
+            entry.* = .{ .key = key, .revision = try revisions.load(&txn, key) };
+        }
+        return .{ .entries = entries };
+    }
+
+    fn validateGeneratedWriteReadSnapshot(self: anytype, read_snapshot: GeneratedWriteReadSnapshot) !void {
+        if (read_snapshot.entries.len == 0) return;
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        for (read_snapshot.entries) |entry| {
+            if (try GeneratedWriteReadSnapshot.revisions.load(&txn, entry.key) != entry.revision)
+                return error.PreparedReadSetChanged;
+        }
     }
 
     fn validateTransformReadSnapshot(self: anytype, read_snapshot: TransformReadSnapshot) !void {
@@ -35517,6 +35696,10 @@ pub const DB = struct {
                 .applied_sequence = applied_sequence,
                 .target_sequence = target_sequence,
                 .catch_up_required = applied_sequence < target_sequence,
+                .replay_document_not_visible_skipped = if (self.core.index_manager.resource_manager) |manager|
+                    manager.replayDocumentNotVisibleSkippedTotal(resource_manager_mod.replayOwnerIdFromPtr(self.core.index_manager), index_ref.name)
+                else
+                    0,
             };
             initialized += 1;
             transferred_names += 1;
@@ -35615,12 +35798,14 @@ pub const DB = struct {
                 .file_backed = segment.data.isFileBacked(),
             };
         }
+        var merge_stats = self.core.index_manager.textMergeStatsSnapshotForIndex(index_name);
+        if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&merge_stats);
         return .{
             .global_doc_count = text_snapshot.liveDocCount(),
             .total_bytes = total_bytes,
             .segments = segments,
             .merge_policy = index_manager_mod.defaultTextMergePolicyStats(),
-            .merge_stats = self.core.index_manager.textMergeStatsSnapshotForIndex(index_name),
+            .merge_stats = merge_stats,
         };
     }
 
@@ -36738,7 +36923,7 @@ pub const DB = struct {
         if (self.executor.hasWorkers()) {
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, sync_level, sequence, sync_targets);
         }
-        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation);
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation, false);
     }
 
     fn waitForResolvedTransactionSync(self: anytype, sync_level: types.SyncLevel, sequence: u64) !void {
@@ -36759,7 +36944,7 @@ pub const DB = struct {
         }
         if (self.enrichment_runtime) |runtime| runtime.notifySequence(sequence);
         self.notifyResolverReplayRuntimes(sequence);
-        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation);
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, cancellation, false);
         if (sync_level == .full_index and self.text_merge_runtime == null) {
             try self.drainScheduledTextMerges();
         }
@@ -41142,10 +41327,23 @@ pub const DB = struct {
     }
 
     fn waitForSyncLevel(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets) !void {
-        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, .none);
+        try self.waitForSyncLevelWithCancellation(sync_level, sequence, sync_targets, .none, false);
     }
 
-    fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken) !void {
+    /// `skip_enrichment_runtime_wait` lets a caller that already knows this
+    /// commit's own rows needed nothing further from the enrichment runtime
+    /// (every generated-enrichment request for them was precomputed and
+    /// committed synchronously, see `enrichment_fully_precomputed` in
+    /// `batchInternalPrepared`) skip the `.enrichments` wait below. Without
+    /// it, a `sync_level: .enrichments` write blocks on
+    /// `applied_sequence >= sequence`, which is the whole table's enrichment
+    /// watermark: a tiny write queued behind an unrelated backlog would wait
+    /// for that backlog to drain even though it owes the runtime nothing.
+    /// This does not change `.full_text`/`.full_index` behavior (untouched
+    /// branches below) or the watermark-advance logic itself
+    /// (`markPrecomputedEnrichmentAppliedForSync` stays exactly as
+    /// conservative as before).
+    fn waitForSyncLevelWithCancellation(self: *DB, sync_level: types.SyncLevel, sequence: u64, sync_targets: ManagedSyncTargets, cancellation: types.CancellationToken, skip_enrichment_runtime_wait: bool) !void {
         const timeout_ms = if (self.enrichment_runtime) |runtime|
             runtime.syncWaitTimeoutMs()
         else
@@ -41162,7 +41360,8 @@ pub const DB = struct {
             .propose, .write => try self.executor.failIfUnhealthy(),
             .enrichments => {
                 try self.executor.failIfUnhealthy();
-                try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
+                if (!skip_enrichment_runtime_wait)
+                    try self.runEnrichmentUntilWithVisibilityDeadline(sequence, cancellation, deadline_ns);
             },
             .full_text => {
                 try self.runDerivedUntilTargetsWithVisibilityWait(sequence, sync_targets.full_text_indexes, wait);
@@ -42538,6 +42737,7 @@ pub const DB = struct {
                         visible_doc_count = @max(visible_doc_count, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(item.name);
+                    if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&item.text_merge);
                     if (self.derivedCoverageAppliesToIndex(.full_text, item.name))
                         try self.populateConfiguredDerivedCoverageCounts(item.name, item);
                 },
@@ -42649,12 +42849,33 @@ pub const DB = struct {
         runtime_stats.text_merge = if (self.text_merge_runtime) |runtime| runtime.statsAssumeApplyLockHeld() else self.core.index_manager.textMergeStatsSnapshot();
     }
 
+    /// A contended apply lock skips the live per-index refresh below, but the
+    /// durable per-index status snapshot (`saveIndexStatusSnapshots`) is
+    /// written on every applied update as part of the ordinary replay/apply
+    /// commit path, independent of this lock. Read it as a lock-free floor so
+    /// a sustained backfill or schema migration, which keeps the writer-
+    /// preferring apply lock busy, does not leave doc_count frozen at
+    /// whatever the last successful live sample happened to observe. Only
+    /// raise the value: a durable snapshot can itself lag a live sample that
+    /// did succeed, and this is strictly a fallback for when the live sample
+    /// could not run at all.
+    fn refreshIndexDocCountsFromDurableSnapshotBestEffort(self: *DB, alloc: Allocator, runtime_stats: *types.DBStats) void {
+        for (runtime_stats.indexes) |*item| {
+            const status_snapshot = (self.loadIndexStatusSnapshot(alloc, item.name) catch continue) orelse continue;
+            if (status_snapshot.kind != item.kind) continue;
+            if (status_snapshot.doc_count > item.doc_count) item.doc_count = status_snapshot.doc_count;
+        }
+    }
+
     /// Return whether lifecycle and physical index facts were refreshed under
     /// one apply-lock boundary. On contention, only readiness-neutral runtime
     /// diagnostics are overlaid and existing blockers remain intact.
     pub fn overlayRuntimeStatusBestEffort(self: *DB, stats_alloc: Allocator, runtime_stats: *types.DBStats) bool {
         self.overlayRuntimeStatusRuntimeBestEffort(runtime_stats);
-        if (!self.core.tryLockApplyShared()) return false;
+        if (!self.core.tryLockApplyShared()) {
+            self.refreshIndexDocCountsFromDurableSnapshotBestEffort(stats_alloc, runtime_stats);
+            return false;
+        }
         defer self.core.unlockApplyShared();
         self.overlayRuntimeStatusLifecycleFromSnapshot(runtime_stats);
         self.overlayRuntimeStatusIndexesLocked(stats_alloc, runtime_stats) catch {
@@ -44580,6 +44801,7 @@ pub const DB = struct {
                         term_doc_freq_cache_misses += text_snapshot.term_doc_freq_cache_misses;
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
+                    if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&item.text_merge);
                     // Artifact-fed full-text projections carry the same
                     // durable per-document generation outcomes as embeddings
                     // indexes; surface them so terminal failures are settled
@@ -44840,6 +45062,7 @@ pub const DB = struct {
                         indexed_doc_count = @max(indexed_doc_count orelse 0, item.doc_count);
                     }
                     item.text_merge = self.core.index_manager.textMergeStatsForIndex(cfg.name);
+                    if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&item.text_merge);
                     if (self.core.textIndexEntry(cfg.name)) |entry| {
                         const rebuild_state = self.core.index_manager.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
                         if (try rebuild_state.estimateProgress(byte_range.start, byte_range.end, alloc)) |progress| {
@@ -45113,6 +45336,7 @@ pub const DB = struct {
             item.repair_degraded = item.repair_degraded or !index_repair_summary.ready or item.repair_issue_count != 0;
             if (cfg.kind == .full_text) {
                 item.text_merge = self.core.index_manager.textMergeStatsSnapshotForIndex(cfg.name);
+                if (self.text_merge_runtime) |runtime| runtime.overlayRuntimeStats(&item.text_merge);
             }
             if (item.load_error != null) applyTerminalLoadFailureStatus(&item);
             any_index_repair_degraded = any_index_repair_degraded or item.repair_degraded;
@@ -47669,12 +47893,63 @@ pub const DB = struct {
         return null;
     }
 
+    /// Composed (fused/hybrid) search resolves filter_text/exclusion_text and
+    /// filter_query_json/exclusion_query_json exactly once, against a single
+    /// shared doc-number/ordinal space, before fanning out to the text/dense/
+    /// sparse arms (see `searchComposed`). Each per-arm search (searchTextQuery,
+    /// searchDense) already lifts these into applyStoredSearchPatternFilters'
+    /// parent-aware matcher for its OWN chunk-backed member/chunk-mode index,
+    /// but a single shared resolution can never be correct for more than one
+    /// doc-number space at once: whenever any arm in this composed request is
+    /// chunk-backed and returns member/chunk-level hits, the clauses must be
+    /// left unresolved here so each arm's own per-arm handling covers it
+    /// instead (issue #931 - fused/hybrid filter_query, exclusion_query, and
+    /// query.bool.filter/must_not).
+    fn composedRequestTouchesChunkBackedMemberModeArm(self: *DB, alloc: Allocator, req: types.SearchRequest) !bool {
+        if (req.return_mode != .member and req.return_mode != .chunk) return false;
+
+        if (req.full_text_queries.len > 0) {
+            for (req.full_text_queries) |named| {
+                if (try self.core.textIndexIsChunkBacked(alloc, named.index_name)) return true;
+            }
+        } else if (req.full_text != null or (!db_query_search.isDefaultMatchAll(req.query) and db_query_search.isTextQuery(req.query))) {
+            if (try self.core.textIndexIsChunkBacked(alloc, req.index_name)) return true;
+        }
+
+        if (req.dense_queries.len > 0) {
+            for (req.dense_queries) |named| {
+                if (self.core.denseIndex(named.index_name)) |entry| {
+                    if (entry.chunk_name != null) return true;
+                }
+            }
+        } else if (req.dense != null) {
+            if (self.core.denseIndex(req.index_name)) |entry| {
+                if (entry.chunk_name != null) return true;
+            }
+        }
+
+        if (req.sparse_queries.len > 0) {
+            for (req.sparse_queries) |named| {
+                if (self.core.sparseIndex(named.index_name)) |entry| {
+                    if (entry.chunk_name != null) return true;
+                }
+            }
+        } else if (req.sparse != null) {
+            if (self.core.sparseIndex(req.index_name)) |entry| {
+                if (entry.chunk_name != null) return true;
+            }
+        }
+
+        return false;
+    }
+
     fn resolveStructuredDocFilterForComposedCallback(
         ctx: ?*anyopaque,
         alloc: Allocator,
         req: types.SearchRequest,
     ) anyerror!?doc_set.ResolvedDocFilter {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredDocFilterForComposedAlloc(alloc, req, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -47693,6 +47968,7 @@ pub const DB = struct {
         req: types.SearchRequest,
     ) anyerror!?db_query_search.ResolvedTextDocNumFilter {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        if (try self.composedRequestTouchesChunkBackedMemberModeArm(alloc, req)) return null;
         return try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, req, .{
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
@@ -47713,6 +47989,214 @@ pub const DB = struct {
         });
     }
 
+    /// Owned filter_query_json/exclusion_query_json produced by lifting
+    /// query.bool.filter/must_not (filter_text/exclusion_text) clauses out of
+    /// the native per-arm query for chunk-backed member/chunk-mode search.
+    /// Empty when there was nothing to lift.
+    const ChunkBoolFilterLowering = struct {
+        filter_query_json: ?[]u8 = null,
+        exclusion_query_json: ?[]u8 = null,
+
+        fn deinit(self: *ChunkBoolFilterLowering, alloc: Allocator) void {
+            if (self.filter_query_json) |owned| alloc.free(owned);
+            if (self.exclusion_query_json) |owned| alloc.free(owned);
+        }
+    };
+
+    const ChunkBoolFilterLoweringBudget = struct {
+        remaining_nodes: usize = 256,
+    };
+
+    const StoredPatternCombinator = enum { conjuncts, disjuncts };
+
+    /// Member/chunk-mode chunk hits are a separate full-text/vector document
+    /// from their parent row, so resolving `filter_text`/`exclusion_text`
+    /// (query.bool.filter/must_not) against the chunk-backed index's own
+    /// doc-number/ordinal space can never see a parent-only field (issue
+    /// #931). Convert the clauses that `applyStoredSearchPatternFilters`'
+    /// stored-pattern matcher (graph_exec.compilePatternFilter) can also
+    /// express, and fold them into filter_query_json/exclusion_query_json so
+    /// they reach that parent-aware matcher instead. Returns
+    /// error.UnsupportedQueryRequest for a clause the stored-pattern matcher
+    /// cannot represent (e.g. an analyzed `match`/`phrase`), rather than
+    /// silently dropping or misapplying it.
+    fn liftChunkBoolFilterClausesAlloc(
+        alloc: Allocator,
+        filter_text: ?types.TextQuery,
+        exclusion_text: ?types.TextQuery,
+        existing_filter_query_json: []const u8,
+        existing_exclusion_query_json: []const u8,
+    ) !ChunkBoolFilterLowering {
+        var out = ChunkBoolFilterLowering{};
+        errdefer out.deinit(alloc);
+        if (filter_text == null and exclusion_text == null) return out;
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        if (filter_text) |text_query| {
+            var budget = ChunkBoolFilterLoweringBudget{};
+            const lowered = try lowerTextQueryToStoredPatternValueAlloc(arena_alloc, text_query, 0, &budget);
+            out.filter_query_json = try combineStoredPatternJsonAlloc(alloc, arena_alloc, existing_filter_query_json, lowered, .conjuncts);
+        }
+        if (exclusion_text) |text_query| {
+            var budget = ChunkBoolFilterLoweringBudget{};
+            const lowered = try lowerTextQueryToStoredPatternValueAlloc(arena_alloc, text_query, 0, &budget);
+            out.exclusion_query_json = try combineStoredPatternJsonAlloc(alloc, arena_alloc, existing_exclusion_query_json, lowered, .disjuncts);
+        }
+        return out;
+    }
+
+    /// Combines an (optionally empty) existing stored-pattern-filter JSON
+    /// string with a newly lowered node into one filter, returning an owned
+    /// string allocated with `alloc`. `existing_json` is parsed with the
+    /// caller's transient `arena_alloc`; only the final serialized string is
+    /// durably allocated.
+    fn combineStoredPatternJsonAlloc(
+        alloc: Allocator,
+        arena_alloc: Allocator,
+        existing_json: []const u8,
+        addition: std.json.Value,
+        combinator: StoredPatternCombinator,
+    ) ![]u8 {
+        if (existing_json.len == 0) {
+            return try std.json.Stringify.valueAlloc(alloc, addition, .{});
+        }
+        const existing = try std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, existing_json, .{});
+        var items = std.json.Array.init(arena_alloc);
+        try items.ensureTotalCapacity(2);
+        items.appendAssumeCapacity(existing);
+        items.appendAssumeCapacity(addition);
+        var body = std.json.ObjectMap.empty;
+        try body.put(arena_alloc, switch (combinator) {
+            .conjuncts => "conjuncts",
+            .disjuncts => "disjuncts",
+        }, .{ .array = items });
+        return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .object = body }, .{});
+    }
+
+    fn storedPatternWrappedPredicate(alloc: Allocator, name: []const u8, body: std.json.Value) !std.json.Value {
+        var root = std.json.ObjectMap.empty;
+        try root.put(alloc, name, body);
+        return .{ .object = root };
+    }
+
+    fn storedPatternEmptyPredicate(alloc: Allocator, name: []const u8) !std.json.Value {
+        return storedPatternWrappedPredicate(alloc, name, .{ .object = std.json.ObjectMap.empty });
+    }
+
+    fn storedPatternJsonU64(value: u64) std.json.Value {
+        if (value <= std.math.maxInt(i64)) return .{ .integer = @intCast(value) };
+        // Stored-pattern date_range compares numerically; values this large
+        // fall outside any representable nanosecond timestamp we accept
+        // elsewhere, so this branch is unreachable in practice but kept for
+        // exhaustiveness rather than risking silent truncation.
+        return .{ .float = @floatFromInt(value) };
+    }
+
+    /// Lowers the subset of `TextQuery` that `graph_exec.compilePatternFilter`
+    /// can also express (match_all/match_none/term/bool_field/numeric_range/
+    /// date_range/doc_id, and bool_query composed of those) into the
+    /// equivalent stored-pattern-filter JSON value. Analyzed/tokenized shapes
+    /// (match, phrase, multi_phrase, match_phrase, multi_match_bool_prefix)
+    /// and shapes the stored-pattern matcher does not yet lower this way
+    /// (fuzzy, prefix, wildcard, regexp, term_range, ip_range, geo_*) return
+    /// error.UnsupportedQueryRequest rather than a wrong or partial result.
+    fn lowerTextQueryToStoredPatternValueAlloc(
+        alloc: Allocator,
+        query: types.TextQuery,
+        depth: u8,
+        budget: *ChunkBoolFilterLoweringBudget,
+    ) anyerror!std.json.Value {
+        if (depth > 16 or budget.remaining_nodes == 0) return error.UnsupportedQueryRequest;
+        budget.remaining_nodes -= 1;
+        return switch (query) {
+            .match_all => try storedPatternEmptyPredicate(alloc, "match_all"),
+            .match_none => try storedPatternEmptyPredicate(alloc, "match_none"),
+            .term => |term| blk: {
+                var body = std.json.ObjectMap.empty;
+                try body.put(alloc, term.field, .{ .string = term.term });
+                break :blk try storedPatternWrappedPredicate(alloc, "term", .{ .object = body });
+            },
+            .bool_field => |bool_field| blk: {
+                var body = std.json.ObjectMap.empty;
+                try body.put(alloc, "field", .{ .string = bool_field.field });
+                try body.put(alloc, "value", .{ .bool = bool_field.value });
+                break :blk try storedPatternWrappedPredicate(alloc, "bool_field", .{ .object = body });
+            },
+            .numeric_range => |range| blk: {
+                if (range.min == null and range.max == null) return error.UnsupportedQueryRequest;
+                var body = std.json.ObjectMap.empty;
+                try body.put(alloc, "field", .{ .string = range.field });
+                if (range.min) |bound| try body.put(alloc, "min", .{ .float = bound });
+                if (range.max) |bound| try body.put(alloc, "max", .{ .float = bound });
+                try body.put(alloc, "inclusive_min", .{ .bool = range.inclusive_min });
+                try body.put(alloc, "inclusive_max", .{ .bool = range.inclusive_max });
+                break :blk try storedPatternWrappedPredicate(alloc, "numeric_range", .{ .object = body });
+            },
+            .date_range => |range| blk: {
+                if (range.start_ns == null and range.end_ns == null) return error.UnsupportedQueryRequest;
+                var body = std.json.ObjectMap.empty;
+                try body.put(alloc, "field", .{ .string = range.field });
+                if (range.start_ns) |ns| try body.put(alloc, "start_ns", storedPatternJsonU64(ns));
+                if (range.end_ns) |ns| try body.put(alloc, "end_ns", storedPatternJsonU64(ns));
+                try body.put(alloc, "inclusive_start", .{ .bool = range.inclusive_start });
+                try body.put(alloc, "inclusive_end", .{ .bool = range.inclusive_end });
+                break :blk try storedPatternWrappedPredicate(alloc, "date_range", .{ .object = body });
+            },
+            .doc_id => |doc_id| blk: {
+                if (doc_id.ids.len == 0) return error.UnsupportedQueryRequest;
+                var ids = std.json.Array.init(alloc);
+                try ids.ensureTotalCapacity(doc_id.ids.len);
+                for (doc_id.ids) |id| ids.appendAssumeCapacity(.{ .string = id });
+                break :blk try storedPatternWrappedPredicate(alloc, "doc_id", .{ .array = ids });
+            },
+            .bool_query => |bool_query| blk: {
+                if (bool_query.must.len == 0 and bool_query.should.len == 0 and bool_query.must_not.len == 0) {
+                    return error.UnsupportedQueryRequest;
+                }
+                var body = std.json.ObjectMap.empty;
+                // A pure, explicitly-optional should-disjunction has no
+                // must/filter clause to anchor it; the stored-pattern bool
+                // contract always floors a pure should to a minimum of one
+                // match, so make the match-all requirement explicit instead
+                // of weakening that shared invariant.
+                const needs_optional_anchor = bool_query.pure_should_optional and bool_query.must.len == 0;
+                if (bool_query.must.len > 0 or needs_optional_anchor) {
+                    var must = std.json.Array.init(alloc);
+                    try must.ensureTotalCapacity(bool_query.must.len + @as(usize, if (needs_optional_anchor) 1 else 0));
+                    if (needs_optional_anchor) must.appendAssumeCapacity(try storedPatternEmptyPredicate(alloc, "match_all"));
+                    for (bool_query.must) |child| {
+                        must.appendAssumeCapacity(try lowerTextQueryToStoredPatternValueAlloc(alloc, child, depth + 1, budget));
+                    }
+                    try body.put(alloc, "must", .{ .array = must });
+                }
+                if (bool_query.should.len > 0) {
+                    var should = std.json.Array.init(alloc);
+                    try should.ensureTotalCapacity(bool_query.should.len);
+                    for (bool_query.should) |child| {
+                        should.appendAssumeCapacity(try lowerTextQueryToStoredPatternValueAlloc(alloc, child, depth + 1, budget));
+                    }
+                    try body.put(alloc, "should", .{ .array = should });
+                    if (bool_query.min_should > 0) {
+                        try body.put(alloc, "minimum_should_match", .{ .integer = bool_query.min_should });
+                    }
+                }
+                if (bool_query.must_not.len > 0) {
+                    var must_not = std.json.Array.init(alloc);
+                    try must_not.ensureTotalCapacity(bool_query.must_not.len);
+                    for (bool_query.must_not) |child| {
+                        must_not.appendAssumeCapacity(try lowerTextQueryToStoredPatternValueAlloc(alloc, child, depth + 1, budget));
+                    }
+                    try body.put(alloc, "must_not", .{ .array = must_not });
+                }
+                break :blk try storedPatternWrappedPredicate(alloc, "bool", .{ .object = body });
+            },
+            else => error.UnsupportedQueryRequest,
+        };
+    }
+
     fn searchTextQuery(self: *DB, alloc: Allocator, req: types.SearchRequest, text_query: types.TextQuery) !types.SearchResult {
         const needs_algebraic_doc_filter = req.doc_filter_bindings.len > 0 or req.require_algebraic_filter_resolution;
         var algebraic_filter = if (needs_algebraic_doc_filter)
@@ -47721,16 +48205,64 @@ pub const DB = struct {
             AlgebraicDocFilterRequest{ .req = req };
         defer algebraic_filter.deinit();
         var execution_req = algebraic_filter.req;
-        const maybe_resolved_text_filter = try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
-            .ctx = self,
-            .text_index_entry = textIndexEntryCallback,
-            .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
-            .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
-            .live_filter_doc_set = liveFilterDocSetCallback,
-            .all_docs_visible = allDocsVisibleCallback,
-            .project_ordinals_to_doc_ids = false,
-            .identity_read_generation = execution_req.identity_read_generation,
-        });
+        // Chunk members are separate full-text documents from their parent
+        // row and have their own doc numbers, so resolving filter_query/
+        // exclusion_query into parent-row doc-number sets here can never
+        // match a chunk (positive clause: 0 hits) or exclude one (negative
+        // clause: no effect). Leave the JSON filters unresolved for
+        // chunk-backed member/chunk-mode text queries so they survive into
+        // applyStoredSearchPatternFilters, which matches them against the
+        // resolved parent row instead (issue #931).
+        const chunk_backed_for_filter = try self.core.textIndexIsChunkBacked(alloc, execution_req.index_name);
+        const member_mode_for_filter = execution_req.return_mode == .member or execution_req.return_mode == .chunk;
+        const suppress_text_doc_num_filter = chunk_backed_for_filter and member_mode_for_filter;
+        var lifted_bool_filter = ChunkBoolFilterLowering{};
+        defer lifted_bool_filter.deinit(alloc);
+        if (suppress_text_doc_num_filter) {
+            // Discard the composed-search doc-number/ordinal resolution a
+            // shared filter step may already have attached upstream
+            // (searchComposed resolves these unconditionally before
+            // dispatching to per-arm searches); it would be just as wrong
+            // here. resolved_doc_filter -- the generic doc-identity form
+            // filter_prefix resolves into (searchRequestWithIdentityPrefixFilterAlloc)
+            // -- is left intact: db_query_search.searchTextQuery itself
+            // skips using it natively for a chunk-backed member/chunk-mode
+            // query and instead carries it through to
+            // applyStoredSearchPatternFilters' parent-aware matcher.
+            execution_req.resolved_text_doc_filter = null;
+            // query.bool.filter/must_not (native TextQuery filter_text/
+            // exclusion_text) are resolved the same wrong way: against the
+            // chunk-backed index's own doc-number/ordinal space, which never
+            // covers a parent-only field. Lift representable clauses into
+            // filter_query_json/exclusion_query_json instead, so they reach
+            // applyStoredSearchPatternFilters' parent-aware matcher (issue
+            // #931). Unrepresentable shapes fail closed with a clear error
+            // rather than silently matching nothing or everything.
+            lifted_bool_filter = try liftChunkBoolFilterClausesAlloc(
+                alloc,
+                execution_req.filter_text,
+                execution_req.exclusion_text,
+                execution_req.filter_query_json,
+                execution_req.exclusion_query_json,
+            );
+            if (lifted_bool_filter.filter_query_json) |json| execution_req.filter_query_json = json;
+            if (lifted_bool_filter.exclusion_query_json) |json| execution_req.exclusion_query_json = json;
+            if (execution_req.filter_text != null) execution_req.filter_text = null;
+            if (execution_req.exclusion_text != null) execution_req.exclusion_text = null;
+        }
+        const maybe_resolved_text_filter = if (suppress_text_doc_num_filter)
+            null
+        else
+            try db_query_search.resolveStructuredTextDocNumFilterForComposedAlloc(alloc, execution_req, .{
+                .ctx = self,
+                .text_index_entry = textIndexEntryCallback,
+                .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
+                .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
+                .live_filter_doc_set = liveFilterDocSetCallback,
+                .all_docs_visible = allDocsVisibleCallback,
+                .project_ordinals_to_doc_ids = false,
+                .identity_read_generation = execution_req.identity_read_generation,
+            });
         var resolved_text_filter_storage: db_query_search.ResolvedTextDocNumFilter = undefined;
         var has_resolved_text_filter = false;
         defer {
@@ -47748,6 +48280,7 @@ pub const DB = struct {
         const start_ns = platform_time.monotonicNs();
         errdefer observeSearchFailureMetric(metric_name, .search, platform_time.monotonicNs() -| start_ns);
         const result = try db_query_search.searchTextQuery(alloc, execution_req, text_query, .{
+            .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .text_index_is_chunk_backed = textIndexIsChunkBackedCallback,
@@ -47756,7 +48289,7 @@ pub const DB = struct {
             .project_stored_search = projectStoredBytesForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
-            .is_expired_key = isExpiredDocumentKeyCallback,
+            .is_expired_key = isNonvisibleStoredSearchKeyCallback,
             .resolve_doc_set_doc_ids = resolveDocSetDocIdsCallback,
             .resolve_doc_ids_to_doc_set = resolveDocIdsToDocSetCallback,
             .live_filter_doc_set = liveFilterDocSetCallback,
@@ -48021,7 +48554,7 @@ pub const DB = struct {
         return try db_query_result_shape.postprocessTextSearchResult(alloc, req, raw, chunk_backed, .{
             .ctx = self,
             .is_visible = isVisibleSearchHitCallback,
-            .filter_visible_many = filterVisibleSearchHitsManyCallback,
+            .filter_visible_many = filterStoredSearchCandidatesManyCallback,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -48499,14 +49032,64 @@ pub const DB = struct {
         var prove_ns: u64 = 0;
         var inner_ns: u64 = 0;
         const algebraic_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(req);
+        // Chunk members are a separate vector member from their parent row
+        // and share only its ordinal, not its own fields. Resolving
+        // filter_query_json/exclusion_query_json (and filter_text/
+        // exclusion_text, i.e. query.bool.filter/must_not) against the
+        // algebraic/parent doc-number space here - same as against the
+        // chunk-backed index's own doc set - can never see a parent-only
+        // field: a positive clause would match nothing, a negative one would
+        // exclude nothing. Skip the algebraic resolution entirely for
+        // chunk-backed member/chunk-mode dense search (mirroring
+        // searchTextQuery's `suppress_text_doc_num_filter` gate) so the JSON
+        // filters survive unresolved into the lift step below, which folds
+        // them into applyStoredSearchPatternFilters' parent-aware matcher
+        // instead (issue #931). resolved_doc_filter - the generic
+        // doc-identity form filter_prefix resolves into
+        // (searchRequestWithIdentityPrefixFilterAlloc, run before this
+        // wrapper is even reached) - is left intact: db_query_search.searchDense
+        // itself skips applying it natively for a chunk-backed member/chunk-mode
+        // query and instead carries it through to applyStoredSearchPatternFilters'
+        // parent-aware matcher, same as the full-text arm (issue #931/#957).
+        const chunk_backed_for_filter = if (self.core.denseIndex(req.index_name)) |entry|
+            entry.chunk_name != null
+        else
+            false;
+        const member_mode_for_filter = req.return_mode == .member or req.return_mode == .chunk;
+        const suppress_dense_doc_num_filter = chunk_backed_for_filter and member_mode_for_filter;
+        var algebraic_filter = if (suppress_dense_doc_num_filter)
+            AlgebraicDocFilterRequest{ .req = req }
+        else
+            try self.searchRequestWithAlgebraicDocFilterAlloc(req);
         defer algebraic_filter.deinit();
         if (bench_profile) algebraic_ns = platform_time.monotonicNs() - algebraic_start_ns;
+        // query.bool.filter/must_not (filter_text/exclusion_text) resolve the
+        // same wrong way via native TextQuery resolution; lift the
+        // representable clauses into filter_query_json/exclusion_query_json
+        // so the same parent-aware matcher covers this arm too (issue #931).
+        var lifted_dense_bool_filter = ChunkBoolFilterLowering{};
+        defer lifted_dense_bool_filter.deinit(alloc);
+        {
+            if (suppress_dense_doc_num_filter) {
+                lifted_dense_bool_filter = try liftChunkBoolFilterClausesAlloc(
+                    alloc,
+                    algebraic_filter.req.filter_text,
+                    algebraic_filter.req.exclusion_text,
+                    algebraic_filter.req.filter_query_json,
+                    algebraic_filter.req.exclusion_query_json,
+                );
+                if (lifted_dense_bool_filter.filter_query_json) |json| algebraic_filter.req.filter_query_json = json;
+                if (lifted_dense_bool_filter.exclusion_query_json) |json| algebraic_filter.req.exclusion_query_json = json;
+                algebraic_filter.req.filter_text = null;
+                algebraic_filter.req.exclusion_text = null;
+            }
+        }
         const prove_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
         const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const result = try db_query_search.searchDense(alloc, algebraic_filter.req, dense, .{
+            .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
@@ -48587,10 +49170,44 @@ pub const DB = struct {
     fn searchDenseProfiledAtSnapshot(self: *DB, alloc: Allocator, req: types.SearchRequest, dense: types.DenseKnnQuery) !db_query_search.ProfiledDenseSearchResult {
         var identity_prefix_filter = try self.searchRequestWithIdentityPrefixFilterAlloc(req);
         defer identity_prefix_filter.deinit();
-        var algebraic_filter = try self.searchRequestWithAlgebraicDocFilterAlloc(identity_prefix_filter.req);
+        // See searchDense: the algebraic resolver would resolve filter_query_json/
+        // exclusion_query_json/filter_text/exclusion_text against the parent
+        // doc-number space, which never matches a chunk-backed member/chunk-mode
+        // dense index's own doc set (issue #931). resolved_doc_filter - the
+        // generic doc-identity form filter_prefix resolved into just above via
+        // searchRequestWithIdentityPrefixFilterAlloc - is left intact for the
+        // same reason as searchDense: db_query_search.searchDense carries it
+        // through to applyStoredSearchPatternFilters' parent-aware matcher
+        // instead of applying it natively (issue #931/#957).
+        const chunk_backed_for_filter = if (self.core.denseIndex(identity_prefix_filter.req.index_name)) |entry|
+            entry.chunk_name != null
+        else
+            false;
+        const member_mode_for_filter = identity_prefix_filter.req.return_mode == .member or identity_prefix_filter.req.return_mode == .chunk;
+        const suppress_dense_doc_num_filter = chunk_backed_for_filter and member_mode_for_filter;
+        var algebraic_filter = if (suppress_dense_doc_num_filter)
+            AlgebraicDocFilterRequest{ .req = identity_prefix_filter.req }
+        else
+            try self.searchRequestWithAlgebraicDocFilterAlloc(identity_prefix_filter.req);
         defer algebraic_filter.deinit();
+        var lifted_dense_bool_filter = ChunkBoolFilterLowering{};
+        defer lifted_dense_bool_filter.deinit(alloc);
+        if (suppress_dense_doc_num_filter) {
+            lifted_dense_bool_filter = try liftChunkBoolFilterClausesAlloc(
+                alloc,
+                algebraic_filter.req.filter_text,
+                algebraic_filter.req.exclusion_text,
+                algebraic_filter.req.filter_query_json,
+                algebraic_filter.req.exclusion_query_json,
+            );
+            if (lifted_dense_bool_filter.filter_query_json) |json| algebraic_filter.req.filter_query_json = json;
+            if (lifted_dense_bool_filter.exclusion_query_json) |json| algebraic_filter.req.exclusion_query_json = json;
+            algebraic_filter.req.filter_text = null;
+            algebraic_filter.req.exclusion_text = null;
+        }
         try self.proveVectorSearchAccessPath(algebraic_filter.req.index_name, .dense_vector, hasNativeDocIdConstraints(algebraic_filter.req));
         const profiled = db_query_search.searchDenseProfiled(alloc, algebraic_filter.req, dense, .{
+            .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .dense_index = denseIndexCallback,
@@ -48656,6 +49273,7 @@ pub const DB = struct {
         if (bench_profile) prove_ns = platform_time.monotonicNs() - prove_start_ns;
         const inner_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
         const result = try db_query_search.searchSparse(alloc, algebraic_filter.req, sparse, .{
+            .filter_candidate_presence = true,
             .ctx = self,
             .text_index_entry = textIndexEntryCallback,
             .sparse_index = sparseIndexCallback,
@@ -49441,7 +50059,7 @@ pub const DB = struct {
             });
         }
         fn executor(self: *@This()) db_query_search.DenseSearchExecutor {
-            return .{ .ctx = self, .text_index_entry = text, .dense_index = index, .lookup_doc_key = key, .lookup_vector_id = vectorId, .all_docs_visible_fast = allVisible, .load_projected_document = projected, .hbc_search = @This().search, .hbc_search_profiled = profiled, .postprocess = postprocess };
+            return .{ .filter_candidate_presence = true, .ctx = self, .text_index_entry = text, .dense_index = index, .lookup_doc_key = key, .lookup_vector_id = vectorId, .all_docs_visible_fast = allVisible, .load_projected_document = projected, .hbc_search = @This().search, .hbc_search_profiled = profiled, .postprocess = postprocess };
         }
     };
 
@@ -49752,7 +50370,7 @@ pub const DB = struct {
         return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, chunk_backed, .{
             .ctx = self,
             .is_visible = if (chunk_backed) isVisibleSearchHitCallback else isVisibleNonChunkSearchHitCallback,
-            .filter_visible_many = filterVisibleSearchHitsManyCallback,
+            .filter_visible_many = filterStoredSearchCandidatesManyCallback,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -49779,7 +50397,7 @@ pub const DB = struct {
             .load_projected_documents = loadProjectedSearchDocumentManyCallback,
             .load_stored = loadStoredSearchDocumentCallback,
             .load_many_stored = loadStoredSearchDocumentManyCallback,
-            .is_expired_key = isExpiredDocumentKeyCallback,
+            .is_expired_key = isNonvisibleStoredSearchKeyCallback,
         });
     }
 
@@ -52599,12 +53217,23 @@ fn encodeThinReplayRecordPayload(
     for (req.writes, 0..) |write, i| {
         if (!derived_changed_flags[i]) continue;
         const extracted_write = extracted[i];
-        if (extracted_write.hasDocument() or include_generated_enrichment_hint) {
+        // PR #957 review, blocker 8: a write with no content (an
+        // `_edges`-only document is one shape; an `_embeddings`-only write
+        // is another) can never match a generated enrichment request --
+        // those are declared against document FIELDS, and a content-less
+        // write has none to chunk or embed. Gating this whole block on
+        // hasDocument() (rather than waking the enrichment worker for
+        // every write whenever any generated-enrichment target exists)
+        // keeps that content-less write's key out of changed_doc_keys
+        // entirely. Recording it there would otherwise put the #938 fix
+        // right back where it started: full-text/algebraic replay also
+        // consumes this list, and once this batch's OTHER writes give the
+        // record a full_text hint, it would wait forever for a primary row
+        // this key will never have.
+        if (extracted_write.hasDocument()) {
             try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
-            if (extracted_write.hasDocument()) {
-                try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
-                try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
-            }
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .full_text);
+            try appendUniqueReplayRecordHint(alloc, &target_hints, .algebraic);
             if (include_generated_enrichment_hint) {
                 try appendUniqueReplayRecordHint(alloc, &target_hints, .enrichment);
             }
@@ -52619,7 +53248,15 @@ fn encodeThinReplayRecordPayload(
             try appendUniqueReplayRecordHint(alloc, &target_hints, .sparse_vector);
         }
         if (extracted_write.mentioned_graph_indexes.len > 0 or extracted_write.graph_writes.len > 0) {
-            try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, write.key);
+            // Graph-only content (an `_edges`-only document, for example) has
+            // no full-text/dense/sparse/algebraic payload. changed_doc_keys
+            // feeds those replay workers, which reconstruct a synthetic
+            // upsert for every key it contains and expect to find a primary
+            // row. A document whose only content is edges never has one, so
+            // recording its key here would make full-text replay retry
+            // ReplayDocumentNotVisible forever (issue #938). The graph
+            // worker replays this change through changed_artifact_keys
+            // instead, so only the hint belongs here.
             try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
         }
         if (overwritten_flags[i] and extracted_write.hasDocument()) {
@@ -53775,6 +54412,16 @@ fn computeAssetRequestDerived(
     const key = try internal_keys.artifactNamedPrefixAlloc(alloc, request.doc_key, "asset", artifact_name);
     defer alloc.free(key);
 
+    // Resolved once, under IndexManager.catalog_mutex.lockShared(), before
+    // any chunking/inference work below; both the "no source text" delete
+    // path and computeDocumentExtractionAssetRequestDerived need it, and
+    // neither may read the live catalog arrays themselves afterward.
+    var document_extraction_view: DocumentExtractionCatalogView = .{};
+    defer document_extraction_view.deinit(alloc);
+    if (producer_cfg.type == .document_extraction) {
+        document_extraction_view = try buildDocumentExtractionCatalogView(alloc, db, artifact_name);
+    }
+
     const text_indexes: []const []const u8 = request.consumer_indexes;
 
     // Asset-consumes-asset: the source is another asset's produced bytes.
@@ -53805,7 +54452,7 @@ fn computeAssetRequestDerived(
         if (source_text) |s| alloc.free(s);
         try appendFullTextDeleteDocument(alloc, documents, key, text_indexes);
         if (producer_cfg.type == .document_extraction) {
-            try appendDocumentExtractionDeleteKeys(alloc, db, request.doc_key, artifact_name, key, artifact_delete_keys);
+            try appendDocumentExtractionDeleteKeys(alloc, db, &document_extraction_view, request.doc_key, artifact_name, key, artifact_delete_keys);
             return;
         }
         try artifact_delete_keys.append(alloc, try alloc.dupe(u8, key));
@@ -53820,6 +54467,7 @@ fn computeAssetRequestDerived(
         return try computeDocumentExtractionAssetRequestDerived(
             alloc,
             db,
+            &document_extraction_view,
             doc_value,
             source_text.?,
             request,
@@ -54144,9 +54792,174 @@ fn flushPrecomputeAssetProducerBatch(
     }
 }
 
+/// One embedding enrichment consuming a document-extraction chunk artifact,
+/// fully resolved (owned strings, owned resolved consumer index names) while
+/// `DocumentExtractionCatalogView` was built. No field here is a pointer into
+/// `IndexManager`'s live `enrichments`/`dense_indexes`/`sparse_indexes`
+/// arrays, so it stays valid across a concurrent catalog publish.
+const DocumentExtractionEmbeddingView = struct {
+    name: []const u8 = &.{},
+    source_field: []const u8 = &.{},
+    expected_dims: u32 = 0,
+    producer_json: []const u8 = &.{},
+    consumer_indexes: [][]u8 = &.{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.name.len > 0) alloc.free(@constCast(self.name));
+        if (self.source_field.len > 0) alloc.free(@constCast(self.source_field));
+        if (self.producer_json.len > 0) alloc.free(@constCast(self.producer_json));
+        for (self.consumer_indexes) |name| alloc.free(name);
+        if (self.consumer_indexes.len > 0) alloc.free(self.consumer_indexes);
+        self.* = undefined;
+    }
+
+    /// Takes ownership of consumer_indexes on success; the caller owns them on failure.
+    fn cloneFromEnrichment(alloc: Allocator, entry: anytype, consumer_indexes: [][]u8) !DocumentExtractionEmbeddingView {
+        const name = try alloc.dupe(u8, entry.name);
+        errdefer alloc.free(name);
+        const source_field = try alloc.dupe(u8, entry.source_field);
+        errdefer alloc.free(source_field);
+        const producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "";
+        errdefer if (producer_json.len > 0) alloc.free(@constCast(producer_json));
+        return .{
+            .name = name,
+            .source_field = source_field,
+            .expected_dims = entry.expected_dims,
+            .producer_json = producer_json,
+            .consumer_indexes = consumer_indexes,
+        };
+    }
+};
+
+/// One chunk enrichment whose `source_artifact_name` names a document
+/// extraction asset, plus every embedding enrichment that in turn consumes
+/// that chunk artifact -- resolved once per `computeDocumentExtractionAssetRequestDerived`
+/// call, under `IndexManager.catalog_mutex.lockShared()`, instead of each
+/// helper below walking the live catalog arrays itself while chunking,
+/// rendering, or model inference runs with no catalog lock held at all (the
+/// case for the pre-lock document-mode hoist in `batchInternalPrepared`).
+const DocumentExtractionChunkView = struct {
+    name: []const u8 = &.{},
+    source_field: []const u8 = &.{},
+    chunker_json: []const u8 = &.{},
+    chunk_size: u32 = 0,
+    chunk_overlap: u32 = 0,
+    text_indexes: [][]u8 = &.{},
+    dense_embeddings: []DocumentExtractionEmbeddingView = &.{},
+    sparse_embeddings: []DocumentExtractionEmbeddingView = &.{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.name.len > 0) alloc.free(@constCast(self.name));
+        if (self.source_field.len > 0) alloc.free(@constCast(self.source_field));
+        if (self.chunker_json.len > 0) alloc.free(@constCast(self.chunker_json));
+        for (self.text_indexes) |name| alloc.free(name);
+        if (self.text_indexes.len > 0) alloc.free(self.text_indexes);
+        for (self.dense_embeddings) |*embedding| embedding.deinit(alloc);
+        if (self.dense_embeddings.len > 0) alloc.free(self.dense_embeddings);
+        for (self.sparse_embeddings) |*embedding| embedding.deinit(alloc);
+        if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
+        self.* = undefined;
+    }
+};
+
+/// Owned, request-local snapshot of every catalog entry document extraction's
+/// synchronous chunk/embedding derivation for one asset artifact needs.
+/// `buildDocumentExtractionCatalogView` is the only place this reads
+/// `IndexManager`'s live arrays; every helper downstream of
+/// `computeDocumentExtractionAssetRequestDerived` reads this view instead of
+/// `db.core.index_manager`, so a catalog publish racing a pre-lock precompute
+/// can replace or free those live arrays without this view observing it.
+const DocumentExtractionCatalogView = struct {
+    chunks: []DocumentExtractionChunkView = &.{},
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.chunks) |*chunk| chunk.deinit(alloc);
+        if (self.chunks.len > 0) alloc.free(self.chunks);
+        self.* = undefined;
+    }
+};
+
+fn buildDocumentExtractionEmbeddingViews(
+    alloc: Allocator,
+    db: anytype,
+    chunk_artifact_name: []const u8,
+    dense: *std.ArrayListUnmanaged(DocumentExtractionEmbeddingView),
+    sparse: *std.ArrayListUnmanaged(DocumentExtractionEmbeddingView),
+) !void {
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .embedding) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
+        // cloneFromEnrichment takes ownership only on success. End the
+        // consumer cleanup scope before the view becomes the sole owner.
+        var view = blk: {
+            const consumers = if (entry.expected_dims > 0)
+                try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims)
+            else
+                try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
+            errdefer {
+                for (consumers) |name| alloc.free(name);
+                alloc.free(consumers);
+            }
+            break :blk try DocumentExtractionEmbeddingView.cloneFromEnrichment(alloc, entry, consumers);
+        };
+        errdefer view.deinit(alloc);
+        const target = if (entry.expected_dims > 0) dense else sparse;
+        try target.append(alloc, view);
+    }
+}
+
+fn buildDocumentExtractionCatalogView(
+    alloc: Allocator,
+    db: anytype,
+    artifact_name: []const u8,
+) !DocumentExtractionCatalogView {
+    db.core.index_manager.catalog_mutex.lockShared();
+    defer db.core.index_manager.catalog_mutex.unlockShared();
+
+    var chunks = std.ArrayListUnmanaged(DocumentExtractionChunkView).empty;
+    errdefer {
+        for (chunks.items) |*chunk| chunk.deinit(alloc);
+        chunks.deinit(alloc);
+    }
+    for (db.core.index_manager.enrichments.items) |entry| {
+        if (entry.kind != .chunk) continue;
+        if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+
+        var chunk = DocumentExtractionChunkView{};
+        errdefer chunk.deinit(alloc);
+        chunk.name = try alloc.dupe(u8, entry.name);
+        chunk.source_field = try alloc.dupe(u8, entry.source_field);
+        chunk.chunker_json = if (entry.chunker_json.len > 0) try alloc.dupe(u8, entry.chunker_json) else "";
+        chunk.chunk_size = entry.chunk_size;
+        chunk.chunk_overlap = entry.chunk_overlap;
+        const include_default_full_text = entry.full_text_index or
+            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
+        chunk.text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
+
+        var dense = std.ArrayListUnmanaged(DocumentExtractionEmbeddingView).empty;
+        defer {
+            for (dense.items) |*embedding| embedding.deinit(alloc);
+            dense.deinit(alloc);
+        }
+        var sparse = std.ArrayListUnmanaged(DocumentExtractionEmbeddingView).empty;
+        defer {
+            for (sparse.items) |*embedding| embedding.deinit(alloc);
+            sparse.deinit(alloc);
+        }
+        try buildDocumentExtractionEmbeddingViews(alloc, db, entry.name, &dense, &sparse);
+        // Each detached slice moves directly into the chunk's cleanup scope,
+        // including failures in the second detach or in the outer append.
+        chunk.dense_embeddings = try dense.toOwnedSlice(alloc);
+        chunk.sparse_embeddings = try sparse.toOwnedSlice(alloc);
+        try chunks.append(alloc, chunk);
+    }
+    return .{ .chunks = try chunks.toOwnedSlice(alloc) };
+}
+
 fn computeDocumentExtractionAssetRequestDerived(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_value: []const u8,
     source_url: []const u8,
     request: enrichment_types.GeneratedEnrichmentRequest,
@@ -54247,10 +55060,10 @@ fn computeDocumentExtractionAssetRequestDerived(
         source_url,
         if (config.credentials.len > 0) config.credentials else null,
     ) catch |err| switch (err) {
-        error.OutOfMemory => if (extraction_budgeted != null and extraction_budgeted.?.denied()) return error.DocumentExtractionWorkingSetTooLarge else return err,
+        error.OutOfMemory => if (extraction_budgeted != null and extraction_budgeted.?.denied()) return enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?) else return err,
         else => {
             if (!document_extraction_mod.remoteContentErrorIsPermanent(err)) return err;
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, @errorName(err), "remote content download failed", "remote_content_download", artifact_writes);
             return;
         },
     };
@@ -54261,7 +55074,7 @@ fn computeDocumentExtractionAssetRequestDerived(
                 return error.RemoteDocumentFetchFailed;
             const message = try std.fmt.allocPrint(alloc, "{s}: HTTP {d}", .{ http_error.message, http_error.status });
             defer alloc.free(message);
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, "RemoteDocumentFetchFailed", message, "remote_content_http", artifact_writes);
             return;
         },
     };
@@ -54287,10 +55100,15 @@ fn computeDocumentExtractionAssetRequestDerived(
     }
     var extraction_failure: runtime_failure_abi.FailureIdentity = .{};
     var extraction = extractDocumentDownloadedAlloc(document_extraction_alloc, downloaded_mut, source_url, extraction_config, config_json, doc_value, &extraction_failure) catch |err| switch (err) {
-        error.OutOfMemory => if ((extraction_budgeted != null and extraction_budgeted.?.denied()) or pdf_inspection_reservation.limit_exceeded) return error.DocumentExtractionWorkingSetTooLarge else return err,
+        error.OutOfMemory => if (pdf_inspection_reservation.limit_exceeded)
+            return error.DocumentExtractionWorkingSetTooLarge
+        else if (extraction_budgeted != null and extraction_budgeted.?.denied())
+            return enrichment_runtime_mod.documentExtractionBudgetDenialError(&extraction_budgeted.?)
+        else
+            return err,
         else => {
             const exact_error_name = boundaryFailureErrorName(&extraction_failure, err);
-            try appendDocumentExtractionFailureManifest(alloc, db, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
+            try appendDocumentExtractionFailureManifest(alloc, db, view, request.doc_key, artifact_name, source_url, manifest_key, existing_state, previous_child_ranges, from_generation, to_generation, exact_error_name, "document extraction failed", document_extraction_mod.failureStageFromErrorName(exact_error_name, "document_extraction"), artifact_writes);
             return;
         },
     };
@@ -54337,7 +55155,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         desired_chunk_keys.deinit(alloc);
     }
 
-    try collectDocumentExtractionDesiredKeys(alloc, db, request.doc_key, artifact_name, extraction.units, &desired_unit_keys, &desired_unit_fingerprints, &desired_chunk_keys);
+    try collectDocumentExtractionDesiredKeys(alloc, view, request.doc_key, artifact_name, extraction.units, &desired_unit_keys, &desired_unit_fingerprints, &desired_chunk_keys);
 
     const desired_unit_descriptors = try documentExtractionUnitDescriptorsFromKeysAlloc(alloc, desired_unit_keys.items, desired_unit_fingerprints.items);
     defer alloc.free(desired_unit_descriptors);
@@ -54383,7 +55201,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             }
         }
 
-        previous_state = try loadDocumentExtractionPreviousState(alloc, db, request.doc_key, artifact_name, state);
+        previous_state = try loadDocumentExtractionPreviousState(alloc, db, view, request.doc_key, artifact_name, state);
         for (previous_state.unit_keys) |previous_key| {
             if (containsDeleteKey(desired_unit_keys.items, previous_key)) continue;
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
@@ -54460,7 +55278,7 @@ fn computeDocumentExtractionAssetRequestDerived(
         const unit_unchanged = std.mem.eql(u8, unit_descriptor.key, unit_key) and
             unitDescriptorFingerprintMatches(previous_state.unit_descriptors, unit_key, unit_descriptor.fingerprint);
         if (unit_unchanged and
-            try documentUnitCanSkipLocalWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes))
+            try documentUnitCanSkipLocalWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges))
         {
             if (force_reprocess) {
                 const payload = try documentUnitPayloadAlloc(alloc, request.doc_key, artifact_name, unit, unit_descriptor.fingerprint, source_url, extraction.content_type, unit_route);
@@ -54488,9 +55306,9 @@ fn computeDocumentExtractionAssetRequestDerived(
                         .targets = targets,
                     });
                 }
-                try appendDocumentUnitStoredChunkFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit, documents);
+                try appendDocumentUnitStoredChunkFullTextDocuments(alloc, view, request.doc_key, unit, documents);
             } else {
-                try appendDocumentUnitStoredFullTextDocuments(alloc, db, request.doc_key, artifact_name, unit_key, unit, text_indexes, documents);
+                try appendDocumentUnitStoredFullTextDocuments(alloc, view, request.doc_key, unit_key, unit, text_indexes, documents);
             }
             continue;
         }
@@ -54520,7 +55338,7 @@ fn computeDocumentExtractionAssetRequestDerived(
             });
         }
 
-        try appendDocumentUnitChunkWrites(alloc, db, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
+        try appendDocumentUnitChunkWrites(alloc, db, view, request.doc_key, artifact_name, unit_key, unit_descriptor.fingerprint, unit, desired_chunk_keys.items, chunk_range_base_index, previous_child_ranges, artifact_writes, documents, dense_embeddings, sparse_embeddings);
     }
 
     const manifest = try documentExtractionManifestPayloadAlloc(
@@ -55085,6 +55903,7 @@ fn documentGeneratedTextPartsJsonAlloc(
 fn appendDocumentExtractionDeleteKeys(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
     manifest_key: []const u8,
@@ -55099,7 +55918,7 @@ fn appendDocumentExtractionDeleteKeys(
     };
     defer if (existing_state) |value| alloc.free(value);
     if (existing_state != null) {
-        var previous_state = try loadDocumentExtractionPreviousState(alloc, db, doc_key, artifact_name, existing_state);
+        var previous_state = try loadDocumentExtractionPreviousState(alloc, db, view, doc_key, artifact_name, existing_state);
         defer previous_state.deinit(alloc);
         for (previous_state.unit_keys) |previous_key| {
             try artifact_delete_keys.append(alloc, try alloc.dupe(u8, previous_key));
@@ -55124,7 +55943,7 @@ fn appendDocumentExtractionDeleteKeys(
 
 fn collectDocumentExtractionDesiredKeys(
     alloc: Allocator,
-    db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
     units: []const document_extraction_mod.Unit,
@@ -55135,9 +55954,7 @@ fn collectDocumentExtractionDesiredKeys(
     for (units) |unit| {
         try desired_unit_keys.append(alloc, try internal_keys.documentUnitArtifactKeyAlloc(alloc, doc_key, artifact_name, unit.unit_id));
         try desired_unit_fingerprints.append(alloc, try documentExtractionUnitFingerprintAlloc(alloc, unit));
-        for (db.core.index_manager.enrichments.items) |entry| {
-            if (entry.kind != .chunk) continue;
-            if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+        for (view.chunks) |entry| {
             const chunks = if (entry.chunker_json.len > 0)
                 try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
             else
@@ -55179,6 +55996,7 @@ const DocumentExtractionRangeRoute = struct {
 fn loadDocumentExtractionPreviousState(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
     existing_state: ?[]const u8,
@@ -55191,7 +56009,7 @@ fn loadDocumentExtractionPreviousState(
             else => {},
         }
     }
-    var recovered = try scanDocumentExtractionPreviousStateFromStore(alloc, db, doc_key, artifact_name);
+    var recovered = try scanDocumentExtractionPreviousStateFromStore(alloc, db, view, doc_key, artifact_name);
     recovered.recovered_from_store_scan = existing_state != null;
     return recovered;
 }
@@ -55209,6 +56027,7 @@ fn loadDocumentExtractionPreviousStateFromJson(alloc: Allocator, state: []const 
 fn scanDocumentExtractionPreviousStateFromStore(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
 ) !DocumentExtractionPreviousState {
@@ -55235,9 +56054,7 @@ fn scanDocumentExtractionPreviousStateFromStore(
         for (chunk_keys.items) |key| alloc.free(@constCast(key));
         chunk_keys.deinit(alloc);
     }
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
+    for (view.chunks) |entry| {
         const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", entry.name);
         defer alloc.free(chunk_prefix);
         const chunk_rows = try db.core.store.scanPrefix(alloc, chunk_prefix);
@@ -55366,38 +56183,26 @@ fn fullTextTargetRefsAlloc(
 
 fn appendDocumentUnitStoredFullTextDocuments(
     alloc: Allocator,
-    db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
-    source_artifact_name: []const u8,
     unit_key: []const u8,
     unit: document_extraction_mod.Unit,
     unit_text_indexes: []const []const u8,
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
 ) !void {
     try appendStoredFullTextDocument(alloc, documents, unit_key, unit_text_indexes);
-    try appendDocumentUnitStoredChunkFullTextDocuments(alloc, db, doc_key, source_artifact_name, unit, documents);
+    try appendDocumentUnitStoredChunkFullTextDocuments(alloc, view, doc_key, unit, documents);
 }
 
 fn appendDocumentUnitStoredChunkFullTextDocuments(
     alloc: Allocator,
-    db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
-    source_artifact_name: []const u8,
     unit: document_extraction_mod.Unit,
     documents: *std.ArrayListUnmanaged(derived_types.DerivedDocument),
 ) !void {
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
-
-        const include_default_full_text = entry.full_text_index or
-            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
-        const chunk_text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
-        defer {
-            for (chunk_text_indexes) |name| alloc.free(name);
-            alloc.free(chunk_text_indexes);
-        }
-        if (chunk_text_indexes.len == 0) continue;
+    for (view.chunks) |entry| {
+        if (entry.text_indexes.len == 0) continue;
 
         const chunks = if (entry.chunker_json.len > 0)
             try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
@@ -55410,7 +56215,7 @@ fn appendDocumentUnitStoredChunkFullTextDocuments(
             if (!chunk.isText()) continue;
             const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
             defer alloc.free(chunk_key);
-            try appendStoredFullTextDocument(alloc, documents, chunk_key, chunk_text_indexes);
+            try appendStoredFullTextDocument(alloc, documents, chunk_key, entry.text_indexes);
         }
     }
 }
@@ -55420,26 +56225,31 @@ fn storeKeyExists(alloc: Allocator, db: anytype, key: []const u8) !bool {
         error.NotFound => return false,
         else => return err,
     };
-    if (value) |owned| alloc.free(owned);
+    const owned = value orelse return false;
+    alloc.free(owned);
     return true;
 }
 
+/// A unit may skip its local writes only when every chunk the current chunk
+/// enrichments would produce is already stored byte-for-byte. Key existence
+/// alone is not enough: after a chunker config change the old chunk ids can
+/// still exist while holding the previous configuration's text.
 fn documentUnitCanSkipLocalWrites(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     source_artifact_name: []const u8,
     unit_key: []const u8,
+    unit_fingerprint: []const u8,
     unit: document_extraction_mod.Unit,
-    unit_text_indexes: []const []const u8,
+    desired_chunk_keys: []const []const u8,
+    chunk_range_base_index: usize,
+    previous_child_ranges: []const types.DocumentArtifactChildRange,
 ) !bool {
-    _ = unit_text_indexes;
     if (!(try storeKeyExists(alloc, db, unit_key))) return false;
 
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
-
+    for (view.chunks) |entry| {
         const chunks = if (entry.chunker_json.len > 0)
             try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
         else
@@ -55447,12 +56257,24 @@ fn documentUnitCanSkipLocalWrites(
         defer chunker_mod.freeChunks(alloc, chunks);
         document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
+        var arena_state = std.heap.ArenaAllocator.init(alloc);
+        defer arena_state.deinit();
+        const scratch = arena_state.allocator();
+
         for (chunks) |chunk| {
             if (!chunk.isText()) continue;
-            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
-            defer alloc.free(chunk_key);
-            if (!(try storeKeyExists(alloc, db, chunk_key))) return false;
-            if (!(try documentUnitChunkEmbeddingArtifactsPresent(alloc, db, chunk_key, entry.name))) return false;
+            defer _ = arena_state.reset(.retain_capacity);
+            const chunk_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(scratch, doc_key, entry.name, unit.unit_id, @intCast(chunk.chunk_id));
+            const chunk_key_index = documentExtractionKeyIndex(desired_chunk_keys, chunk_key) orelse return false;
+            const stored = (db.core.getStoreValue(scratch, chunk_key) catch |err| switch (err) {
+                error.NotFound => return false,
+                else => return err,
+            }) orelse return false;
+            const chunk_range_id = try documentExtractionRangeIdAlloc(scratch, chunk_range_base_index + (chunk_key_index / document_extraction_range_target_children));
+            const chunk_route = documentExtractionRangeRoute(previous_child_ranges, chunk_range_id, "chunk", "derived_chunks");
+            const expected = try buildDocumentUnitChunkPayloadAlloc(scratch, doc_key, unit_key, unit_fingerprint, entry.name, source_artifact_name, entry.source_field, unit, chunk, true, chunk_route);
+            if (!std.mem.eql(u8, stored, expected)) return false;
+            if (!(try documentUnitChunkEmbeddingArtifactsPresent(alloc, db, &entry, chunk_key))) return false;
         }
     }
     return true;
@@ -55461,30 +56283,18 @@ fn documentUnitCanSkipLocalWrites(
 fn documentUnitChunkEmbeddingArtifactsPresent(
     alloc: Allocator,
     db: anytype,
+    chunk_view: *const DocumentExtractionChunkView,
     chunk_key: []const u8,
-    chunk_artifact_name: []const u8,
 ) !bool {
     const runtime = db.enrichment_runtime;
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .embedding) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
-
-        if (entry.expected_dims > 0) {
-            const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
-            defer {
-                for (consumer_indexes) |name| alloc.free(name);
-                alloc.free(consumer_indexes);
-            }
-            if (consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
-        } else {
-            const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
-            defer {
-                for (consumer_indexes) |name| alloc.free(name);
-                alloc.free(consumer_indexes);
-            }
-            if (consumer_indexes.len == 0 or runtime == null or runtime.?.config.sparse_embedder == null) continue;
-        }
-
+    for (chunk_view.dense_embeddings) |entry| {
+        if (entry.consumer_indexes.len == 0 or runtime == null or runtime.?.config.dense_embedder == null) continue;
+        const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
+        defer alloc.free(artifact_key);
+        if (!(try storeKeyExists(alloc, db, artifact_key))) return false;
+    }
+    for (chunk_view.sparse_embeddings) |entry| {
+        if (entry.consumer_indexes.len == 0 or runtime == null or runtime.?.config.sparse_embedder == null) continue;
         const artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk_key, entry.name);
         defer alloc.free(artifact_key);
         if (!(try storeKeyExists(alloc, db, artifact_key))) return false;
@@ -55492,9 +56302,253 @@ fn documentUnitChunkEmbeddingArtifactsPresent(
     return true;
 }
 
+/// One provider-embedding enrichment (a `kind == .embedding` entry) consuming
+/// chunks from a document unit's chunker, accumulated across the whole unit
+/// so the provider is called in batches honoring generatedEmbedBatchItems()/
+/// generatedEmbedBatchBytes() instead of once per chunk. Mirrors the batching
+/// the generic chunk-embedding path (computeDenseRequestImpl) already does
+/// for non-document-extraction chunk/embedding enrichments.
+const PendingDocumentUnitDenseChunkEmbedding = struct {
+    embedding_name: []const u8,
+    source_field: []const u8,
+    expected_dims: u32,
+    producer_json: []const u8,
+    consumer_indexes: [][]u8,
+    sources: std.ArrayListUnmanaged(ChunkEmbeddingSource) = .empty,
+    chunk_texts: std.ArrayListUnmanaged([]const u8) = .empty,
+    source_indexes: std.ArrayListUnmanaged(usize) = .empty,
+    batch_source_bytes: usize = 0,
+
+    fn deinit(self: *PendingDocumentUnitDenseChunkEmbedding, alloc: Allocator) void {
+        clearChunkEmbeddingSourceList(alloc, &self.sources);
+        self.sources.deinit(alloc);
+        self.chunk_texts.deinit(alloc);
+        self.source_indexes.deinit(alloc);
+        for (self.consumer_indexes) |name| alloc.free(name);
+        alloc.free(self.consumer_indexes);
+    }
+};
+
+const PendingDocumentUnitSparseChunkEmbedding = struct {
+    embedding_name: []const u8,
+    producer_json: []const u8,
+    consumer_indexes: [][]u8,
+    sources: std.ArrayListUnmanaged(ChunkEmbeddingSource) = .empty,
+    chunk_texts: std.ArrayListUnmanaged([]const u8) = .empty,
+    source_indexes: std.ArrayListUnmanaged(usize) = .empty,
+    batch_source_bytes: usize = 0,
+
+    fn deinit(self: *PendingDocumentUnitSparseChunkEmbedding, alloc: Allocator) void {
+        clearChunkEmbeddingSourceList(alloc, &self.sources);
+        self.sources.deinit(alloc);
+        self.chunk_texts.deinit(alloc);
+        self.source_indexes.deinit(alloc);
+        for (self.consumer_indexes) |name| alloc.free(name);
+        alloc.free(self.consumer_indexes);
+    }
+};
+
+fn dupeConsumerIndexNames(alloc: Allocator, names: []const []const u8) ![][]u8 {
+    const out = try alloc.alloc([]u8, names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |name| alloc.free(name);
+        alloc.free(out);
+    }
+    for (names, 0..) |name, i| {
+        out[i] = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn collectPendingDocumentUnitDenseChunkEmbeddings(
+    alloc: Allocator,
+    db: anytype,
+    chunk_view: *const DocumentExtractionChunkView,
+    out: *std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding),
+) !void {
+    const runtime = db.enrichment_runtime orelse return;
+    if (runtime.config.dense_embedder == null) return;
+    for (chunk_view.dense_embeddings) |embed_entry| {
+        if (embed_entry.consumer_indexes.len == 0) continue;
+        // `embedding_name`/`source_field`/`producer_json` borrow from
+        // `chunk_view`, which outlives this pending struct (both live only
+        // within one computeDocumentExtractionAssetRequestDerived call);
+        // `consumer_indexes` is duplicated because PendingDocumentUnit*
+        // ChunkEmbedding.deinit frees it, and it must not free memory the
+        // view's own deinit also owns.
+        const consumer_indexes = try dupeConsumerIndexNames(alloc, embed_entry.consumer_indexes);
+        errdefer {
+            for (consumer_indexes) |name| alloc.free(name);
+            alloc.free(consumer_indexes);
+        }
+        try out.append(alloc, .{
+            .embedding_name = embed_entry.name,
+            .source_field = embed_entry.source_field,
+            .expected_dims = embed_entry.expected_dims,
+            .producer_json = embed_entry.producer_json,
+            .consumer_indexes = consumer_indexes,
+        });
+    }
+}
+
+fn collectPendingDocumentUnitSparseChunkEmbeddings(
+    alloc: Allocator,
+    db: anytype,
+    chunk_view: *const DocumentExtractionChunkView,
+    out: *std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding),
+) !void {
+    const runtime = db.enrichment_runtime orelse return;
+    if (runtime.config.sparse_embedder == null) return;
+    for (chunk_view.sparse_embeddings) |embed_entry| {
+        if (embed_entry.consumer_indexes.len == 0) continue;
+        const consumer_indexes = try dupeConsumerIndexNames(alloc, embed_entry.consumer_indexes);
+        errdefer {
+            for (consumer_indexes) |name| alloc.free(name);
+            alloc.free(consumer_indexes);
+        }
+        try out.append(alloc, .{
+            .embedding_name = embed_entry.name,
+            .producer_json = embed_entry.producer_json,
+            .consumer_indexes = consumer_indexes,
+        });
+    }
+}
+
+/// Append the source and its parallel batch references atomically. Reserve all
+/// fallible container growth before transferring ownership of key/text, so an
+/// allocation denial leaves the pending batch valid and fully reclaimable.
+fn appendPendingDocumentUnitChunkSource(
+    alloc: Allocator,
+    pending: anytype,
+    chunk_key: []const u8,
+    chunk_text: []const u8,
+) !void {
+    try pending.sources.ensureUnusedCapacity(alloc, 1);
+    try pending.chunk_texts.ensureUnusedCapacity(alloc, 1);
+    try pending.source_indexes.ensureUnusedCapacity(alloc, 1);
+    const key = try alloc.dupe(u8, chunk_key);
+    errdefer alloc.free(key);
+    const text = try alloc.dupe(u8, chunk_text);
+    const source_index = pending.sources.items.len;
+    pending.sources.appendAssumeCapacity(.{ .key = key, .text = text });
+    pending.chunk_texts.appendAssumeCapacity(text);
+    pending.source_indexes.appendAssumeCapacity(source_index);
+    pending.batch_source_bytes += chunk_text.len;
+}
+
+fn appendChunkToPendingDenseChunkEmbedding(
+    alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    doc_key: []const u8,
+    chunk_key: []const u8,
+    chunk_text: []const u8,
+    pending: *PendingDocumentUnitDenseChunkEmbedding,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+) !void {
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+    if (pending.chunk_texts.items.len > 0 and
+        (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes + chunk_text.len > max_batch_bytes))
+    {
+        try flushPendingDenseChunkEmbedding(alloc, runtime, dense_embedder, doc_key, pending, artifact_writes, dense_embeddings);
+    }
+    try appendPendingDocumentUnitChunkSource(alloc, pending, chunk_key, chunk_text);
+    if (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes >= max_batch_bytes) {
+        try flushPendingDenseChunkEmbedding(alloc, runtime, dense_embedder, doc_key, pending, artifact_writes, dense_embeddings);
+    }
+}
+
+fn flushPendingDenseChunkEmbedding(
+    alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    dense_embedder: embedder_mod.DenseEmbedder,
+    doc_key: []const u8,
+    pending: *PendingDocumentUnitDenseChunkEmbedding,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
+) !void {
+    if (pending.chunk_texts.items.len == 0) return;
+    const synthetic_request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .dense_embedding,
+        .index_name = "",
+        .doc_key = doc_key,
+        .source_field = pending.source_field,
+        .expected_dims = pending.expected_dims,
+        .producer_json = pending.producer_json,
+    };
+    try flushGeneratedDenseChunkBatch(
+        alloc,
+        runtime,
+        dense_embedder,
+        pending.embedding_name,
+        synthetic_request,
+        artifact_writes,
+        dense_embeddings,
+        pending.sources.items,
+        &pending.source_indexes,
+        &pending.chunk_texts,
+        pending.consumer_indexes,
+        appendDerivedDenseEmbeddingForConsumers,
+    );
+    pending.batch_source_bytes = 0;
+}
+
+fn appendChunkToPendingSparseChunkEmbedding(
+    alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    chunk_key: []const u8,
+    chunk_text: []const u8,
+    pending: *PendingDocumentUnitSparseChunkEmbedding,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+) !void {
+    const max_batch_items = generatedEmbedBatchItems();
+    const max_batch_bytes = generatedEmbedBatchBytes();
+    if (pending.chunk_texts.items.len > 0 and
+        (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes + chunk_text.len > max_batch_bytes))
+    {
+        try flushPendingSparseChunkEmbedding(alloc, runtime, sparse_embedder, pending, artifact_writes, sparse_embeddings);
+    }
+    try appendPendingDocumentUnitChunkSource(alloc, pending, chunk_key, chunk_text);
+    if (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes >= max_batch_bytes) {
+        try flushPendingSparseChunkEmbedding(alloc, runtime, sparse_embedder, pending, artifact_writes, sparse_embeddings);
+    }
+}
+
+fn flushPendingSparseChunkEmbedding(
+    alloc: Allocator,
+    runtime: *enrichment_runtime_mod.EnrichmentRuntime,
+    sparse_embedder: embedder_mod.SparseEmbedder,
+    pending: *PendingDocumentUnitSparseChunkEmbedding,
+    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
+    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
+) !void {
+    if (pending.chunk_texts.items.len == 0) return;
+    try flushGeneratedSparseChunkBatch(
+        alloc,
+        runtime,
+        sparse_embedder,
+        pending.embedding_name,
+        pending.producer_json,
+        artifact_writes,
+        sparse_embeddings,
+        pending.sources.items,
+        &pending.source_indexes,
+        &pending.chunk_texts,
+        pending.consumer_indexes,
+    );
+    pending.batch_source_bytes = 0;
+}
+
 fn appendDocumentUnitChunkWrites(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     source_artifact_name: []const u8,
     unit_key: []const u8,
@@ -55508,9 +56562,7 @@ fn appendDocumentUnitChunkWrites(
     dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
     sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
 ) !void {
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .chunk) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, source_artifact_name)) continue;
+    for (view.chunks) |entry| {
         const chunks = if (entry.chunker_json.len > 0)
             try chunker_mod.chunkTextWithConfigJson(alloc, unit.text, entry.chunker_json)
         else
@@ -55519,13 +56571,28 @@ fn appendDocumentUnitChunkWrites(
         if (chunks.len == 0) continue;
         document_extraction_mod.applyTranscriptTiming(unit, chunks);
 
-        const include_default_full_text = entry.full_text_index or
-            try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
-        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
+        const text_indexes = entry.text_indexes;
+
+        // Resolve, once per chunk-producing entry rather than once per chunk,
+        // which embedding enrichments consume these chunks. The per-chunk
+        // loop below only appends chunk text to these accumulators; the
+        // provider is invoked in batches as thresholds are crossed and once
+        // more after the loop for any remainder.
+        var dense_pending = std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding).empty;
         defer {
-            for (text_indexes) |name| alloc.free(name);
-            alloc.free(text_indexes);
+            for (dense_pending.items) |*pending| pending.deinit(alloc);
+            dense_pending.deinit(alloc);
         }
+        try collectPendingDocumentUnitDenseChunkEmbeddings(alloc, db, &entry, &dense_pending);
+        var sparse_pending = std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding).empty;
+        defer {
+            for (sparse_pending.items) |*pending| pending.deinit(alloc);
+            sparse_pending.deinit(alloc);
+        }
+        try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, &entry, &sparse_pending);
+        const runtime = db.enrichment_runtime;
+        const dense_embedder = if (runtime) |rt| rt.config.dense_embedder else null;
+        const sparse_embedder = if (runtime) |rt| rt.config.sparse_embedder else null;
 
         var arena_state = std.heap.ArenaAllocator.init(alloc);
         defer arena_state.deinit();
@@ -55564,97 +56631,28 @@ fn appendDocumentUnitChunkWrites(
                 });
             }
 
-            try appendDocumentUnitChunkDenseEmbeddingWrites(alloc, db, doc_key, chunk_key, entry.name, entry.source_field, chunk, artifact_writes, dense_embeddings);
-            try appendDocumentUnitChunkSparseEmbeddingWrites(alloc, db, chunk_key, entry.name, chunk, artifact_writes, sparse_embeddings);
+            if (chunk.text) |chunk_text| {
+                if (dense_embedder) |embedder| {
+                    for (dense_pending.items) |*pending| {
+                        try appendChunkToPendingDenseChunkEmbedding(alloc, runtime.?, embedder, doc_key, chunk_key, chunk_text, pending, artifact_writes, dense_embeddings);
+                    }
+                }
+                if (sparse_embedder) |embedder| {
+                    for (sparse_pending.items) |*pending| {
+                        try appendChunkToPendingSparseChunkEmbedding(alloc, runtime.?, embedder, chunk_key, chunk_text, pending, artifact_writes, sparse_embeddings);
+                    }
+                }
+            }
 
             _ = arena_state.reset(.retain_capacity);
         }
-    }
-}
 
-fn appendDocumentUnitChunkDenseEmbeddingWrites(
-    alloc: Allocator,
-    db: anytype,
-    doc_key: []const u8,
-    chunk_key: []const u8,
-    chunk_artifact_name: []const u8,
-    source_field: []const u8,
-    chunk: chunker_mod.Chunk,
-    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-    dense_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite),
-) !void {
-    const chunk_text = chunk.text orelse return;
-    const runtime = db.enrichment_runtime orelse return;
-    const dense_embedder = runtime.config.dense_embedder orelse return;
-
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .embedding) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
-        if (entry.expected_dims == 0) continue;
-
-        const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
-        defer {
-            for (consumer_indexes) |name| alloc.free(name);
-            alloc.free(consumer_indexes);
+        for (dense_pending.items) |*pending| {
+            try flushPendingDenseChunkEmbedding(alloc, runtime.?, dense_embedder.?, doc_key, pending, artifact_writes, dense_embeddings);
         }
-        if (consumer_indexes.len == 0) continue;
-
-        const vector = try enrichment_runtime_mod.embedDenseTracked(runtime, consumer_indexes, alloc, dense_embedder, entry.name, chunk_text, entry.expected_dims);
-        defer alloc.free(vector);
-        const artifact_key = try appendEmbeddingArtifactWrite(
-            alloc,
-            artifact_writes,
-            chunk_key,
-            doc_key,
-            entry.name,
-            source_field,
-            chunk_key,
-            .{ .generated = enrichment_artifact_codec.hashSource(chunk_text) },
-            vector,
-        );
-        defer alloc.free(artifact_key);
-        try appendDerivedDenseEmbeddingForConsumers(alloc, dense_embeddings, chunk_key, doc_key, artifact_key, vector, consumer_indexes);
-    }
-}
-
-fn appendDocumentUnitChunkSparseEmbeddingWrites(
-    alloc: Allocator,
-    db: anytype,
-    chunk_key: []const u8,
-    chunk_artifact_name: []const u8,
-    chunk: chunker_mod.Chunk,
-    artifact_writes: *std.ArrayListUnmanaged(types.BatchWrite),
-    sparse_embeddings: *std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite),
-) !void {
-    const chunk_text = chunk.text orelse return;
-    const runtime = db.enrichment_runtime orelse return;
-    const sparse_embedder = runtime.config.sparse_embedder orelse return;
-
-    for (db.core.index_manager.enrichments.items) |entry| {
-        if (entry.kind != .embedding) continue;
-        if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
-        if (entry.expected_dims != 0) continue;
-
-        const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
-        defer {
-            for (consumer_indexes) |name| alloc.free(name);
-            alloc.free(consumer_indexes);
+        for (sparse_pending.items) |*pending| {
+            try flushPendingSparseChunkEmbedding(alloc, runtime.?, sparse_embedder.?, pending, artifact_writes, sparse_embeddings);
         }
-        if (consumer_indexes.len == 0) continue;
-
-        var sparse = try enrichment_runtime_mod.embedSparseTracked(runtime, consumer_indexes, alloc, sparse_embedder, entry.name, chunk_text);
-        defer sparse.deinit(alloc);
-        const artifact_key = try appendSparseEmbeddingArtifactWrite(
-            alloc,
-            artifact_writes,
-            chunk_key,
-            entry.name,
-            .{ .generated = enrichment_artifact_codec.hashSource(chunk_text) },
-            sparse.indices,
-            sparse.values,
-        );
-        defer alloc.free(artifact_key);
-        try appendDerivedSparseEmbeddingForConsumers(alloc, sparse_embeddings, chunk_key, artifact_key, sparse.indices, sparse.values, consumer_indexes);
     }
 }
 
@@ -56913,6 +57911,7 @@ fn documentExtractionFailureManifestPayloadAlloc(
 fn appendDocumentExtractionFailureManifest(
     alloc: Allocator,
     db: anytype,
+    view: *const DocumentExtractionCatalogView,
     doc_key: []const u8,
     artifact_name: []const u8,
     source_url: []const u8,
@@ -56929,7 +57928,7 @@ fn appendDocumentExtractionFailureManifest(
     var previous_state = DocumentExtractionPreviousState{};
     defer previous_state.deinit(alloc);
     if (existing_state != null) {
-        previous_state = try loadDocumentExtractionPreviousState(alloc, db, doc_key, artifact_name, existing_state);
+        previous_state = try loadDocumentExtractionPreviousState(alloc, db, view, doc_key, artifact_name, existing_state);
     }
 
     const manifest = try documentExtractionFailureManifestPayloadAlloc(
@@ -57919,6 +58918,13 @@ fn reconcileGlobalGraphEdgeWinner(
             try considerGraphEdgeWinner(alloc, &result.winners, edge_key, change.state_key, change.source_priority, source_payload);
         } else {
             try result.deletes.append(alloc, contender_key);
+            // Retiring any one contender -- direct or asset-derived -- must
+            // still fall back to the next-best surviving contender the scan
+            // above already selected; that is the whole point of priority
+            // ordering. "db graph untimed migration restores source order
+            // and direct contributor precedence" and its legacy-writes
+            // sibling both depend on an explicit direct-priority delete
+            // falling back to a surviving asset contender.
         }
     }
 }
@@ -60514,6 +61520,16 @@ fn appendPrecomputedArtifactCoverageOutcomes(
     request: enrichment_types.GeneratedEnrichmentRequest,
     outcome: DerivedCoverageOutcome,
 ) !void {
+    // `indexesDependingOnArtifact` and `derivedCoverageAppliesToIndex` both
+    // walk live `enrichments`/`dense_indexes`/`sparse_indexes`/`graph_indexes`/
+    // `text_indexes` arrays on the IndexManager. This runs from the pre-lock
+    // precompute path (no exclusive apply lock held), so take the catalog's
+    // own shared lock for this short, allocation-only scan -- never held
+    // across chunking, rendering, or model inference -- instead of reading
+    // those arrays while a concurrent catalog publish could replace or free
+    // them.
+    db.core.index_manager.catalog_mutex.lockShared();
+    defer db.core.index_manager.catalog_mutex.unlockShared();
     const consumers = try db.core.index_manager.indexesDependingOnArtifact(alloc, requestArtifactName(request));
     defer {
         for (consumers) |name| alloc.free(name);
@@ -62515,6 +63531,47 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     return timestamps;
 }
 
+fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
+    const keep = try alloc.alloc(bool, hits.len);
+    errdefer alloc.free(keep);
+    @memset(keep, true);
+    if (hits.len == 0) return keep;
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const ProbeKey = struct { key: []const u8, hit_index: usize };
+    var pending = std.ArrayListUnmanaged(ProbeKey).empty;
+    // Probe each member's own row. Ancestor hydration may belong to another
+    // range; an absent local source/unit is not proof this member is missing.
+    for (hits, 0..) |hit, i| {
+        // Named vector members resolve their public hit id to the source
+        // document/chunk, which may be shared by several embeddings. The
+        // artifact reference retains the member's authoritative stored key.
+        const key = if (hit.artifact_ref) |artifact_ref|
+            try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
+        else
+            try encodeStoreLookupKeyAlloc(self, scratch, hit.id);
+        try pending.append(scratch, .{ .key = key, .hit_index = i });
+    }
+    std.mem.sort(ProbeKey, pending.items, {}, struct {
+        fn lessThan(_: void, a: ProbeKey, b: ProbeKey) bool {
+            return std.mem.order(u8, a.key, b.key) == .lt;
+        }
+    }.lessThan);
+    const keys = try scratch.alloc([]const u8, pending.items.len);
+    const values = try scratch.alloc(?[]const u8, pending.items.len);
+    @memset(values, null);
+    for (pending.items, 0..) |item, i| keys[i] = item.key;
+    var txn = try self.core.store.beginProbeTxn();
+    defer txn.abort();
+    try txn.getManySorted(keys, values);
+    for (pending.items, values) |item, value| if (value == null) {
+        keep[item.hit_index] = false;
+    };
+    return keep;
+}
+
 fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
     const keep = try alloc.alloc(bool, hits.len);
     errdefer alloc.free(keep);
@@ -62617,6 +63674,23 @@ fn isVisibleSearchHitCallback(
 ) anyerror!bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     return try isVisibleSearchHit(self, alloc, hit);
+}
+
+// Derived text/vector candidates must have primary rows before grouping
+// or paging. Graph-only vertices retain their separate visibility contract.
+fn filterStoredSearchCandidatesManyCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+) anyerror![]bool {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const present = try filterPresentSearchHitsMany(self, alloc, hits);
+    errdefer alloc.free(present);
+    if (ttlDurationNs(self) == 0) return present;
+    const visible = try filterVisibleSearchHitsMany(self, alloc, hits);
+    defer alloc.free(visible);
+    for (present, visible) |*keep, live| keep.* = keep.* and live;
+    return present;
 }
 
 fn filterVisibleSearchHitsManyCallback(
@@ -63128,6 +64202,25 @@ fn isExpiredDocumentKeyCallback(
     key: []const u8,
 ) anyerror!bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    return try isExpiredDocumentKey(self, alloc, key);
+}
+
+fn isNonvisibleStoredSearchKeyCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    key: []const u8,
+) anyerror!bool {
+    const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const store_key = try encodeStoreLookupKeyAlloc(self, alloc, key);
+    defer alloc.free(store_key);
+    {
+        var txn = try self.core.store.beginProbeTxn();
+        defer txn.abort();
+        _ = txn.get(store_key) catch |err| switch (err) {
+            error.NotFound => return true,
+            else => return err,
+        };
+    }
     return try isExpiredDocumentKey(self, alloc, key);
 }
 
@@ -70472,6 +71565,24 @@ fn applyDerivedBatchToIndexContextProfiled(
         };
         var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
         defer publication_context.deinit();
+        // A document that can never gain visible content (issue #938: an
+        // `_edges`-only document reconstructed by replay as a synthetic
+        // full-text candidate) would otherwise make this exact window retry
+        // error.ReplayDocumentNotVisible forever. Past a bounded number of
+        // consecutive failures here, give up on the still-missing documents
+        // in this window instead of blocking the worker -- and anything
+        // waiting on it to drain, like Lite's run_until_idle() -- forever.
+        // Keyed by this owner's IndexManager address (PR #957 review on the
+        // #938 escalation commit): the ResourceManager below is shared
+        // process-wide across every storage owner, and same-named indexes
+        // (the default `full_text_index_v0` is the common case) or
+        // coincidentally equal sequence numbers across owners must not
+        // combine or reset each other's retry counts.
+        const replay_owner = resource_manager_mod.replayOwnerIdFromPtr(ctx.index_manager);
+        const tolerate_missing_replay_documents = if (ctx.index_manager.resource_manager) |manager|
+            manager.shouldEscalateReplayDocumentNotVisible(replay_owner, index_ref.name, batch.sequence)
+        else
+            false;
         var collected = try collectTextDocumentWritesForIndex(
             ctx.alloc,
             ctx.store,
@@ -70483,10 +71594,13 @@ fn applyDerivedBatchToIndexContextProfiled(
             .{
                 .prefer_inline_when_store_tip_matches_sequence = batch.sequence,
                 .relational_base_rows = ctx.relational_base_rows,
+                .tolerate_missing_replay_documents = tolerate_missing_replay_documents,
             },
         );
         defer collected.deinit();
         if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
+        if (ctx.index_manager.resource_manager) |manager|
+            manager.clearReplayDocumentNotVisibleEscalation(replay_owner, index_ref.name, batch.sequence);
 
         const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
         var write_start: usize = 0;
@@ -71512,6 +72626,12 @@ const OwnedSparseEmbeddingWrites = struct {
 const CollectTextDocumentWritesOptions = struct {
     prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
     relational_base_rows: bool = false,
+    /// Set once replay of this window has retried error.ReplayDocumentNotVisible
+    /// past the bounded limit (see ResourceManager.shouldEscalateReplayDocumentNotVisible).
+    /// A document that is still missing is then skipped and logged once
+    /// instead of counted toward missing_required, so the window can advance
+    /// instead of retrying forever.
+    tolerate_missing_replay_documents: bool = false,
 };
 
 const CollectDocumentWritesOptions = struct {
@@ -71884,7 +73004,7 @@ fn collectTextReplayDeleteKeys(
     defer seen.deinit(alloc);
 
     for (batch.deleted_keys) |key| {
-        if (!try index_manager.textPublicationContextConsumesKeyAssumeCatalogLocked(index_name, publication_context, key)) continue;
+        if (!try index_manager.textPublicationContextRetiresDeletedKeyAssumeCatalogLocked(index_name, publication_context, key)) continue;
         try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
     }
     for (batch.overwritten_doc_keys) |key| {
@@ -72081,6 +73201,14 @@ fn collectTextDocumentWritesForIndex(
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
             if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
+            if (opts.tolerate_missing_replay_documents) {
+                std.log.warn(
+                    "full-text replay giving up on a document with no visible content after bounded retries index={s} key={s}",
+                    .{ index_name, item.doc_key },
+                );
+                if (index_manager.resource_manager) |manager| manager.recordReplayDocumentNotVisibleSkipped(resource_manager_mod.replayOwnerIdFromPtr(index_manager), index_name);
+                continue;
+            }
             result.missing_required += 1;
             continue;
         };
@@ -80852,6 +81980,23 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     try std.testing.expectEqual(@as(usize, 3), dense_members.hits.len);
     for (dense_members.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
 
+    var composed_members = try db.search(alloc, .{
+        .dense_queries = &.{
+            .{ .name = "first", .index_name = "mixed_dense", .query = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
+            .{ .name = "second", .index_name = "mixed_dense", .query = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
+        },
+        .limit = 3,
+        .search_effort = 1.0,
+        .return_mode = .member,
+    });
+    defer composed_members.deinit();
+    try std.testing.expectEqual(@as(usize, 3), composed_members.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), composed_members.total_hits);
+    for (composed_members.hits) |hit| {
+        try std.testing.expect(hit.artifact_ref != null);
+        try std.testing.expectEqual(@as(usize, 2), hit.index_scores.len);
+    }
+
     var dense_chunk_alias = try db.search(alloc, .{
         .index_name = "mixed_dense",
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
@@ -80914,6 +82059,23 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     try std.testing.expectEqual(@as(usize, 3), sparse_members.hits.len);
     for (sparse_members.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
 
+    var composed_sparse_members = try db.search(alloc, .{
+        .sparse_queries = &.{
+            .{ .name = "first", .index_name = "mixed_sparse", .query = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } },
+            .{ .name = "second", .index_name = "mixed_sparse", .query = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } },
+        },
+        .limit = 3,
+        .search_effort = 1.0,
+        .return_mode = .member,
+    });
+    defer composed_sparse_members.deinit();
+    try std.testing.expectEqual(@as(usize, 3), composed_sparse_members.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), composed_sparse_members.total_hits);
+    for (composed_sparse_members.hits) |hit| {
+        try std.testing.expect(hit.artifact_ref != null);
+        try std.testing.expectEqual(@as(usize, 2), hit.index_scores.len);
+    }
+
     var sparse_prefix = try db.search(alloc, .{
         .index_name = "mixed_sparse",
         .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 2 } },
@@ -80964,6 +82126,60 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         .search_effort = 1.0,
         .return_mode = .unit_with_chunks,
     }));
+
+    // Removing an embedding row leaves its ANN/posting member behind until
+    // retirement catches up. The source still exists and must not establish
+    // presence for that member or merge its score into the surviving one.
+    try db.core.store.delete(direct_dense);
+    try db.core.store.delete(direct_sparse);
+    for ([_]bool{ false, true }) |include_stored| {
+        for ([_]bool{ false, true }) |is_sparse| {
+            const index_name = if (is_sparse) "mixed_sparse" else "mixed_dense";
+            const missing_name = if (is_sparse) "title_sparse_v1" else "title_dense_v1";
+            const surviving_name = if (is_sparse) "summary_sparse_v1" else "summary_dense_v1";
+            const query: types.Query = if (is_sparse)
+                .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } }
+            else
+                .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } };
+            var req = types.SearchRequest{ .index_name = index_name, .query = query, .limit = 3, .return_mode = .member, .include_stored = include_stored, .search_effort = 1.0 };
+            var members = try db.search(alloc, req);
+            defer members.deinit();
+            try std.testing.expectEqual(@as(usize, 2), members.hits.len);
+            try std.testing.expectEqual(@as(u32, 2), members.total_hits);
+            for (members.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.artifact_ref.?.name, missing_name));
+
+            req.limit = 1;
+            var page = try db.search(alloc, req);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+            try std.testing.expectEqualStrings(surviving_name, page.hits[0].artifact_ref.?.name);
+            req.offset = 1;
+            var tail = try db.search(alloc, req);
+            defer tail.deinit();
+            try std.testing.expectEqual(@as(usize, 1), tail.hits.len);
+            try std.testing.expect(!std.mem.eql(u8, tail.hits[0].artifact_ref.?.name, missing_name));
+
+            var composed_req = types.SearchRequest{ .limit = 3, .return_mode = .member, .include_stored = include_stored, .search_effort = 1.0 };
+            if (is_sparse) {
+                composed_req.sparse_queries = &.{
+                    .{ .name = "first", .index_name = index_name, .query = query.sparse_knn },
+                    .{ .name = "second", .index_name = index_name, .query = query.sparse_knn },
+                };
+            } else {
+                composed_req.dense_queries = &.{
+                    .{ .name = "first", .index_name = index_name, .query = query.dense_knn },
+                    .{ .name = "second", .index_name = index_name, .query = query.dense_knn },
+                };
+            }
+            var composed = try db.search(alloc, composed_req);
+            defer composed.deinit();
+            try std.testing.expectEqual(@as(usize, 2), composed.hits.len);
+            for (composed.hits) |hit| {
+                try std.testing.expect(!std.mem.eql(u8, hit.artifact_ref.?.name, missing_name));
+                try std.testing.expectEqual(@as(usize, 2), hit.index_scores.len);
+            }
+        }
+    }
 }
 
 fn expectDenseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, dims: usize) !void {
@@ -82579,10 +83795,15 @@ test "db native document filters preserve paged totals across representations" {
             var ordinal = try db.search(alloc, req);
             defer ordinal.deinit();
 
-            // The native engine counted all three matches before paging. Neither
-            // their representation nor an empty result page changes that count.
-            try std.testing.expectEqual(@as(u32, 3), public.total_hits);
-            try std.testing.expectEqual(types.TotalHitsRelation.exact, public.total_hits_relation);
+            // Native postings alone cannot prove that uncollected matches
+            // still have stored rows. Partial text windows report their
+            // verified visible prefix; exhausted windows and primary/native
+            // collectors retain exact totals. Filter representation must not
+            // change either the count proof or the returned page.
+            const partial_text_window = (shape == .match_all or shape == .full_text) and !page.count_only and
+                page.offset +| page.limit < 3;
+            try std.testing.expectEqual(if (partial_text_window) page.offset +| page.limit else @as(u32, 3), public.total_hits);
+            try std.testing.expectEqual(if (partial_text_window) types.TotalHitsRelation.gte else .exact, public.total_hits_relation);
             try std.testing.expectEqual(public.total_hits, ordinal.total_hits);
             try std.testing.expectEqual(public.total_hits_relation, ordinal.total_hits_relation);
             const expected_page_len: usize = if (page.count_only) 0 else @min(page.limit, 3 -| page.offset);
@@ -95933,7 +97154,6 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     var text_result = try db.search(alloc, .{
         .index_name = "selected_text",
         .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
-        .return_mode = .member,
     });
     defer text_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), text_result.total_hits);
@@ -95960,6 +97180,651 @@ test "db direct generated chunks feed multi-source text and graph indexes" {
     const after_delete = try db.getEdges(alloc, "selected_graph", "doc:a", "mentions", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, after_delete);
     try std.testing.expectEqual(@as(usize, 0), after_delete.len);
+}
+
+test "db member-mode chunk hits filter through the parent row on the full-text arm" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    const ephemeral_chunker =
+        "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = ephemeral_chunker,
+    });
+    try db.addIndex(.{
+        .name = "selected_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    // Chunk members are a separate full-text document from their parent row
+    // and never carry the parent's own fields (issue #931). `category` only
+    // exists on the parent row, never on a chunk's own stored payload.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"alpha searchable text\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"alpha also appears here\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .return_mode = .member,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 2), unfiltered.total_hits);
+
+    var included = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .return_mode = .member,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 1), included.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), included.hits.len);
+    try std.testing.expectEqualStrings("doc:keep", included.hits[0].artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .exclusion_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .return_mode = .member,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), excluded.hits.len);
+}
+
+test "db member-mode chunk hits apply query.bool.filter/must_not against the parent row" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    const ephemeral_chunker =
+        "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = ephemeral_chunker,
+    });
+    try db.addIndex(.{
+        .name = "selected_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    // `filter_text`/`exclusion_text` are the native TextQuery form
+    // query.bool.filter/must_not lowers to at the API layer. `category`
+    // only exists on the parent row, never on a chunk's own stored payload.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"alpha searchable text\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"alpha also appears here\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var included = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 1), included.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), included.hits.len);
+    try std.testing.expectEqualStrings("doc:keep", included.hits[0].artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), excluded.hits.len);
+    try std.testing.expectEqualStrings("doc:drop", excluded.hits[0].artifact_ref.?.document_id);
+
+    // An analyzed/tokenized clause (`match`) has no stored-pattern
+    // equivalent; chunk-backed member mode must reject it rather than
+    // silently resolve it against the chunk's own (wrong) doc-number space.
+    try std.testing.expectError(error.UnsupportedQueryRequest, db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_text = .{ .match = .{ .field = "category", .text = "keep" } },
+        .return_mode = .member,
+    }));
+}
+
+// PR #957 review blocker 6: a doc_id clause inside query.bool.filter/
+// must_not (native TextQuery filter_text/exclusion_text) lowers through
+// liftChunkBoolFilterClausesAlloc / lowerTextQueryToStoredPatternValueAlloc
+// into a stored-pattern "doc_id" predicate. applyStoredSearchPatternFilters
+// used to match that predicate against the chunk hit's own id instead of its
+// resolved parent id, so a doc_id filter silently matched nothing and a
+// doc_id exclusion silently excluded nothing.
+test "db member-mode chunk hits apply query.bool.filter/must_not doc_id against the resolved parent id on the full-text arm (PR #957)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .enable_without_producers = true,
+        },
+    });
+    defer db.close();
+
+    const ephemeral_chunker =
+        "{\"provider\":\"antfly\",\"store_chunks\":false,\"text\":{\"target_tokens\":32,\"overlap_tokens\":0}}";
+    try db.addEnrichment(.{
+        .name = "body_chunks_v1",
+        .kind = .chunk,
+        .field = "body",
+        .chunker_json = ephemeral_chunker,
+    });
+    try db.addIndex(.{
+        .name = "selected_text",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"alpha searchable text\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"alpha also appears here\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    var included = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .filter_text = .{ .doc_id = .{ .ids = &.{"doc:keep"} } },
+        .return_mode = .member,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 1), included.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), included.hits.len);
+    try std.testing.expectEqualStrings("doc:keep", included.hits[0].artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "selected_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .exclusion_text = .{ .doc_id = .{ .ids = &.{"doc:keep"} } },
+        .return_mode = .member,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 1), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), excluded.hits.len);
+    try std.testing.expectEqualStrings("doc:drop", excluded.hits[0].artifact_ref.?.document_id);
+}
+
+test "db member-mode chunk hits apply query.bool.filter/must_not against the parent row on the dense arm" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    // Each 15-char body yields exactly 3 chunks at chunk_size 8 / overlap 2
+    // (see the sibling "db chunked dense enrichment..." tests above).
+    // `category` only exists on the parent row, never on a chunk's own
+    // stored payload.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const query_vec = try embedder.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 6), unfiltered.total_hits);
+
+    var included = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .filter_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included.total_hits);
+    for (included.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .exclusion_text = .{ .term = .{ .field = "category", .term = "keep" } },
+        .return_mode = .member,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
+    for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
+}
+
+// PR #957 review blocker 6: same doc_id-against-hit.id gap as the full-text
+// arm above, on the chunk-backed member-mode dense arm. Two parents each
+// producing three chunks: filtering for doc:keep's doc_id used to return 0
+// (hit.id is the chunk's own artifact key, never equal to "doc:keep")
+// instead of 3, and excluding it returned all 6 instead of 3.
+test "db member-mode chunk hits apply query.bool.filter/must_not doc_id against the resolved parent id on the dense arm (PR #957)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+
+    // Each 15-char body yields exactly 3 chunks at chunk_size 8 / overlap 2.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const query_vec = try embedder.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var included = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .filter_text = .{ .doc_id = .{ .ids = &.{"doc:keep"} } },
+        .return_mode = .member,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included.total_hits);
+    for (included.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .exclusion_text = .{ .doc_id = .{ .ids = &.{"doc:keep"} } },
+        .return_mode = .member,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
+    for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
+}
+
+test "db member-mode chunk hits apply filter_query/exclusion_query against the parent row on the dense arm (issue #931)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    // An algebraic index over `category` gives filter_query_json/
+    // exclusion_query_json a real doc-number-set resolution path to
+    // wrongly resolve against (the parent row's own doc space) - without
+    // one, searchRequestWithAlgebraicDocFilterAlloc simply has nothing to
+    // resolve and the bug this test targets can't reproduce.
+    try db.addIndex(.{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"category","path":"category","type":"string"}],
+        \\  "measure_fields": [],
+        \\  "materializations": []
+        \\}
+        ,
+    });
+
+    // filter_query/exclusion_query (unlike query.bool.filter/must_not) used
+    // to reach searchDense's algebraic doc-filter resolver *before* the
+    // chunk-backed member-mode gate ran, resolving-and-clearing them against
+    // the parent doc-number space instead of leaving them for the
+    // parent-aware applyStoredSearchPatternFilters matcher - silently
+    // dropping the filter and returning every chunk regardless.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const keep_doc_ids = (try db.core.index_manager.algebraicIndex("alg").?.index.docIdsForFilterJsonAlloc(db.core.store, "{\"term\":{\"category\":\"keep\"}}")) orelse return error.TestUnexpectedResult;
+    defer db.core.index_manager.algebraicIndex("alg").?.index.freeDocIds(keep_doc_ids);
+    try std.testing.expectEqual(@as(usize, 1), keep_doc_ids.len);
+    try std.testing.expectEqualStrings("doc:keep", keep_doc_ids[0]);
+
+    const query_vec = try embedder.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    var included = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included.total_hits);
+    for (included.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .exclusion_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .require_algebraic_filter_resolution = true,
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
+    for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
+
+    // PR #957 review blocker 1: filter_prefix resolves into
+    // resolved_doc_filter once, before composed search fans out
+    // (searchRequestWithIdentityPrefixFilterAlloc), against the parent-row
+    // identity space. searchDense's chunk-backed member-mode gate used to
+    // clear resolved_doc_filter outright instead of deferring it like
+    // filter_query_json/exclusion_query_json above - silently dropping the
+    // restriction and returning every chunk of every document regardless of
+    // filter_prefix.
+    var prefixed = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .filter_prefix = "doc:keep",
+    });
+    defer prefixed.deinit();
+    try std.testing.expectEqual(@as(u32, 3), prefixed.total_hits);
+    for (prefixed.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    // PR #957 review blocker 3: StoredPatternFilterExecutor's
+    // load_parent_stored loaded the parent row through the RESPONSE
+    // request's own field selection. Restricting the response to `body`
+    // must not change whether the `category` predicate above matches -
+    // the matcher needs the unprojected parent row.
+    var included_body_only = try db.search(alloc, .{
+        .index_name = "dv_v1",
+        .dense = .{ .vector = query_vec, .k = 10 },
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+        .fields = &.{"body"},
+        .include_all_fields = false,
+        .require_algebraic_filter_resolution = true,
+    });
+    defer included_body_only.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included_body_only.total_hits);
+    for (included_body_only.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+}
+
+// PR #957 review blocker 1: the same resolved_doc_filter gap as the dense
+// arm above, on the chunk-backed member-mode sparse arm (searchSparse never
+// even had a suppression gate for the algebraic resolver, and
+// deriveNativeDocIdConstraintsAlloc applied resolved_doc_filter natively
+// against this chunk-backed index's own doc-number space before
+// requestAfterNativeFilters dropped it ahead of postprocessing).
+test "db member-mode chunk hits apply filter_prefix against the parent row on the sparse arm (issue #931/#957)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .sparse_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "sp_v1",
+        .kind = .sparse_vector,
+        .config_json = "{\"field\":\"sparse\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_sparse_v1\"}}",
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.sparseIndex("sp_v1").?.index.stats().doc_count);
+
+    // DeterministicSparseEmbedder hashes each chunk's own text into two
+    // random indices within [0, 1024), so a query built from any single
+    // chunk's text has no guaranteed dimension overlap with the other
+    // chunks (sparse top-k only surfaces candidates that share a nonzero
+    // dimension with the query, unlike dense similarity, which always scores
+    // every vector). Query every dimension explicitly so every live member
+    // scores nonzero and is reachable at k=10, independent of chunk content.
+    var full_coverage_indices: [1024]u32 = undefined;
+    var full_coverage_values: [1024]f32 = undefined;
+    for (0..1024) |i| {
+        full_coverage_indices[i] = @intCast(i);
+        full_coverage_values[i] = 1.0;
+    }
+
+    var prefixed = try db.search(alloc, .{
+        .index_name = "sp_v1",
+        .sparse = .{ .indices = &full_coverage_indices, .values = &full_coverage_values, .k = 10 },
+        .return_mode = .member,
+        .filter_prefix = "doc:keep",
+    });
+    defer prefixed.deinit();
+    try std.testing.expectEqual(@as(u32, 3), prefixed.total_hits);
+    for (prefixed.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+}
+
+test "db composed full_text+dense (rrf) member-mode fusion scopes filter_query/exclusion_query to the parent row without collapsing distinct chunks (issue #931)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var embedder = CountingDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = embedder.interface(),
+        },
+    });
+    defer db.close();
+
+    // The dense index's inline generator registers the "body_chunks_v1"
+    // chunk enrichment as a side effect; the full-text index then sources
+    // from that same chunk artifact so both arms search the identical
+    // chunk-backed member set (issue #931's fused/hybrid scope).
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"chunk_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2,\"embedding_name\":\"chunk_dense_v1\"}}",
+    });
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{\"sources\":[{\"artifact\":\"body_chunks_v1\"}]}",
+    });
+
+    // Each 15-char body yields exactly 3 chunks at chunk_size 8 / overlap 2
+    // (see the sibling dense-arm tests above). `category` only exists on
+    // the parent row, never on a chunk's own stored payload.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:keep", .value = "{\"body\":\"abcdefghijklmno\",\"category\":\"keep\"}" },
+            .{ .key = "doc:drop", .value = "{\"body\":\"pqrstuvwxyzabcd\",\"category\":\"drop\"}" },
+        },
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 6), db.core.index_manager.denseIndex("dv_v1").?.index.metadata.active_count);
+
+    const query_vec = try embedder.interface().embedDense(alloc, "chunk_dense_v1", "abcdefgh", 3);
+    defer alloc.free(query_vec);
+
+    const merge_config = types.MergeConfig{ .strategy = .rrf };
+
+    // Unfiltered: the dense arm alone already covers every chunk (k=10 over
+    // 6 live chunks); the text arm's single exact-term hit is a subset of
+    // it. Fusion must keep all 6 distinct chunks rather than collapsing the
+    // 3 chunks sharing each parent ordinal into one hit per document.
+    var unfiltered = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .term = .{ .field = "body", .term = "abcdefgh" } },
+        .dense_queries = &.{
+            .{ .name = "dv_v1", .index_name = "dv_v1", .query = .{ .vector = query_vec, .k = 10 } },
+        },
+        .merge_config = merge_config,
+        .return_mode = .member,
+    });
+    defer unfiltered.deinit();
+    try std.testing.expectEqual(@as(u32, 6), unfiltered.total_hits);
+    try std.testing.expectEqual(@as(usize, 6), unfiltered.hits.len);
+
+    const included_req: types.SearchRequest = .{
+        .index_name = "ft_v1",
+        .full_text = .{ .term = .{ .field = "body", .term = "abcdefgh" } },
+        .dense_queries = &.{
+            .{ .name = "dv_v1", .index_name = "dv_v1", .query = .{ .vector = query_vec, .k = 10 } },
+        },
+        .merge_config = merge_config,
+        .return_mode = .member,
+        .filter_query_json = "{\"term\":{\"category\":\"keep\"}}",
+    };
+    // Directly guard the composed-level gate itself: searchComposed's shared
+    // filter step (resolveStructuredDocFilterForComposedCallback) resolves
+    // filter_query_json/exclusion_query_json exactly once for every arm
+    // before fanning out, with no awareness that the dense arm here is
+    // chunk-backed and returns member-mode hits. Without this gate tripping,
+    // that shared resolution runs unconditionally and can silently drop the
+    // filter for the whole fused query (issue #931), independent of whether
+    // the text arm's own doc space happens to resolve `category` at all.
+    try std.testing.expect(try db.composedRequestTouchesChunkBackedMemberModeArm(alloc, included_req));
+
+    var included = try db.search(alloc, included_req);
+    defer included.deinit();
+    try std.testing.expectEqual(@as(u32, 3), included.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), included.hits.len);
+    for (included.hits) |hit| try std.testing.expectEqualStrings("doc:keep", hit.artifact_ref.?.document_id);
+
+    var excluded = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .term = .{ .field = "body", .term = "abcdefgh" } },
+        .dense_queries = &.{
+            .{ .name = "dv_v1", .index_name = "dv_v1", .query = .{ .vector = query_vec, .k = 10 } },
+        },
+        .merge_config = merge_config,
+        .return_mode = .member,
+        .exclusion_query_json = "{\"term\":{\"category\":\"keep\"}}",
+    });
+    defer excluded.deinit();
+    try std.testing.expectEqual(@as(u32, 3), excluded.total_hits);
+    try std.testing.expectEqual(@as(usize, 3), excluded.hits.len);
+    for (excluded.hits) |hit| try std.testing.expectEqualStrings("doc:drop", hit.artifact_ref.?.document_id);
 }
 
 test "db asset consumes another asset artifact and re-derives on upstream change" {
@@ -96169,8 +98034,8 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var members = try waitForSearchResult(alloc, &db, .{
             .index_name = "document_text",
             .full_text = .{ .match_all = {} },
-            .return_mode = .member,
             .limit = 10,
+            .return_mode = .member,
         }, 2);
         defer members.deinit();
         try std.testing.expectEqual(@as(usize, 2), members.hits.len);
@@ -96215,8 +98080,8 @@ test "db multi-source full text unions chunk and textual asset streams across de
             .index_name = "document_text",
             .full_text = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
             .filter_prefix = "doc:a",
-            .return_mode = .member,
             .limit = 10,
+            .return_mode = .member,
         }, 1);
         defer prefixed_text.deinit();
         try std.testing.expectEqual(@as(u32, 1), prefixed_text.total_hits);
@@ -96229,7 +98094,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
                 .query = .{ .match = .{ .field = "body", .text = "chunkonlytoken" } },
             }},
             .filter_prefix = "doc:a",
-            .return_mode = .member,
             .limit = 10,
         }, 1);
         defer prefixed_composed_text.deinit();
@@ -96257,7 +98121,6 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var removed_match = try db.search(alloc, .{
             .index_name = "document_text",
             .full_text = .{ .match = .{ .field = "summary", .text = "assetonlytoken" } },
-            .return_mode = .member,
         });
         defer removed_match.deinit();
         try std.testing.expectEqual(@as(u32, 0), removed_match.total_hits);
@@ -96265,8 +98128,8 @@ test "db multi-source full text unions chunk and textual asset streams across de
         var after_delete = try waitForSearchResult(alloc, &db, .{
             .index_name = "document_text",
             .full_text = .{ .match_all = {} },
-            .return_mode = .member,
             .limit = 10,
+            .return_mode = .member,
         }, 1);
         defer after_delete.deinit();
         try std.testing.expectEqual(@as(usize, 1), after_delete.hits.len);
@@ -96280,8 +98143,8 @@ test "db multi-source full text unions chunk and textual asset streams across de
     var recovered = try waitForSearchResult(alloc, &reopened, .{
         .index_name = "document_text",
         .full_text = .{ .match_all = {} },
-        .return_mode = .member,
         .limit = 10,
+        .return_mode = .member,
     }, 1);
     defer recovered.deinit();
     try std.testing.expectEqual(@as(usize, 1), recovered.hits.len);
@@ -98132,6 +99995,109 @@ test "db multi-source graph precedence falls back after winner deletion and reop
     try std.testing.expect(std.mem.indexOf(u8, reopened_edges[0].metadata, "\"winner\":\"fallback\"") != null);
 }
 
+// Regression for PR #957's review of "fix(storage): stop a surviving asset
+// contender from resurrecting an explicitly deleted graph edge": removing an
+// ordinary (non-winning, non-direct) contender must still leave the winning
+// contender's edge in place. The sibling precedence test above exercises the
+// opposite edge of this same reconcileGlobalGraphEdgeWinner path (removing
+// the winner reveals the fallback); this one removes the fallback while the
+// winner survives untouched, which the unconditional winner-removal this
+// fixes used to wipe out alongside it.
+test "db multi-source graph precedence keeps the primary edge after removing the fallback" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+
+        try db.addEnrichment(.{
+            .name = "primary_relations_v1",
+            .kind = .asset,
+            .field = "primary_relations",
+            .content_type = "application/json",
+        });
+        try db.addEnrichment(.{
+            .name = "fallback_relations_v1",
+            .kind = .asset,
+            .field = "fallback_relations",
+            .content_type = "application/json",
+        });
+        try db.addIndex(.{
+            .name = "relations_graph",
+            .kind = .graph,
+            .config_json =
+            \\{"sources":[{"artifact":"primary_relations_v1"},{"artifact":"fallback_relations_v1"}]}
+            ,
+        });
+
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"primary_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2,"winner":"primary"},"fallback_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":1,"winner":"fallback"}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        {
+            const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+            defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+            try std.testing.expectEqual(@as(usize, 1), edges.len);
+            try std.testing.expectEqual(@as(f64, 2), edges[0].weight);
+            try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"primary\"") != null);
+        }
+        const logical_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "relations_graph", "mentions", "doc:b");
+        defer alloc.free(logical_edge_key);
+        const contender_prefix = try internal_keys.graphEdgeContenderEdgePrefixAlloc(alloc, "doc:a", "relations_graph", logical_edge_key);
+        defer alloc.free(contender_prefix);
+        {
+            const contenders = try db.core.store.scanPrefix(alloc, contender_prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, contenders);
+            try std.testing.expectEqual(@as(usize, 2), contenders.len);
+        }
+
+        // Removing the lower-precedence (non-winning) artifact must leave
+        // the still-winning primary edge exactly as it was, not delete it.
+        try db.batch(.{
+            .writes = &.{.{
+                .key = "doc:a",
+                .value =
+                \\{"primary_relations":{"type":"mentions","target":{"document_id":"doc:b"},"weight":2,"winner":"primary"}}
+                ,
+            }},
+            .sync_level = .enrichments,
+        });
+        try db.runUntilIdle();
+
+        const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        try std.testing.expectEqual(@as(f64, 2), edges[0].weight);
+        try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"winner\":\"primary\"") != null);
+        {
+            const contenders = try db.core.store.scanPrefix(alloc, contender_prefix);
+            defer docstore_mod.DocStore.freeResults(alloc, contenders);
+            try std.testing.expectEqual(@as(usize, 1), contenders.len);
+        }
+        try db.sync(true);
+    }
+
+    var reopened = try DB.open(alloc, std.mem.span(path), .{});
+    defer reopened.close();
+    const reopened_edges = try reopened.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, reopened_edges);
+    try std.testing.expectEqual(@as(usize, 1), reopened_edges.len);
+    try std.testing.expectEqual(@as(f64, 2), reopened_edges[0].weight);
+    try std.testing.expect(std.mem.indexOf(u8, reopened_edges[0].metadata, "\"winner\":\"primary\"") != null);
+}
+
 test "db portable restore rebuilds multi-source graph contender provenance" {
     const alloc = std.testing.allocator;
 
@@ -99504,6 +101470,7 @@ const TestAssetProducer = struct {
         switch (request.producer_type) {
             .copy => {},
             .document_extraction => {},
+            .decision => {},
             .generator => self.generator_calls += 1,
             .reader => self.reader_calls += 1,
             .transcriber => self.transcriber_calls += 1,
@@ -105590,6 +107557,268 @@ test "db document extraction skips stable unit local rewrites while replaying fu
     try std.testing.expectEqualStrings("document:000001", chunk_unit_result.hits[0].artifact_ref.?.unit_id.?);
 }
 
+test "db query drops full text hits whose stored document row was deleted directly from the store" {
+    // Issue #929: deleting a chunk enrichment and reprocessing (or a crash
+    // mid-purge) can leave a full-text posting pointing at a stored-document
+    // key whose row is gone -- the write-side fix in this checkout stops
+    // *new* orphans from the enrichment-delete-then-reprocess path, but the
+    // query side must still tolerate any orphaned posting that already
+    // exists (e.g. from a crash, or a store mutated out of band) by
+    // dropping the affected hit instead of failing the whole query with
+    // StoredDocMissing/500, exactly as the issue's own repro observed for
+    // plain row-level queries and match_all. Simulate that end state
+    // directly on a plain (non-chunk) table: delete a row's stored KV entry
+    // out from under its own full-text posting, then assert queries that
+    // would have hit it still succeed with reduced, correct results.
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_rows",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    try db.addIndex(.{ .name = "dv_rows", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2,\"metric\":\"l2_squared\"}" });
+    try db.addIndex(.{ .name = "sp_rows", .kind = .sparse_vector, .config_json = "{\"field\":\"sparse\"}" });
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha beta gamma\",\"embedding\":[0,0],\"sparse\":{\"indices\":[1],\"values\":[5]}}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha delta epsilon\",\"embedding\":[1,0],\"sparse\":{\"indices\":[1],\"values\":[4]}}" },
+        },
+        .sync_level = .full_index,
+    });
+    try db.runUntilIdle();
+
+    // Sanity check: both rows are searchable before one goes missing.
+    var before_term = try db.search(alloc, .{
+        .index_name = "ft_rows",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer before_term.deinit();
+    try std.testing.expectEqual(@as(u32, 2), before_term.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), before_term.hits.len);
+
+    const orphaned_doc_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
+    defer alloc.free(orphaned_doc_key);
+    // Confirm the row exists before deleting it, so a failure to delete
+    // doesn't silently make this test pass for the wrong reason.
+    {
+        var probe = try db.core.store.beginProbeTxn();
+        defer probe.abort();
+        _ = try probe.get(orphaned_doc_key);
+    }
+    // Delete the KV row directly, bypassing db.batch's normal delete path
+    // entirely -- the posting for "doc:a" in ft_rows now has no backing
+    // stored row, the same end state left by #929's enrichment-delete +
+    // reprocess sequence (or a crash mid-purge).
+    try db.core.store.delete(orphaned_doc_key);
+
+    // A child range can own a member while source/unit hydration is remote.
+    const remote_member_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:remote", "remote_chunks", "document:000001", 0);
+    defer alloc.free(remote_member_key);
+    try db.core.store.put(remote_member_key, "{}");
+    defer db.core.store.delete(remote_member_key) catch {};
+
+    // An embedding member can exist locally even when its source chunk,
+    // unit and document belong to another range. Canonical artifact identity,
+    // rather than its source/public id, must drive the probe under OOM too.
+    const remote_source_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:off-shard", "remote_chunks", "document:000001", 0);
+    defer alloc.free(remote_source_key);
+    const remote_embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, remote_source_key, "remote_dense");
+    defer alloc.free(remote_embedding_key);
+    try db.core.store.put(remote_embedding_key, "{}");
+    defer db.core.store.delete(remote_embedding_key) catch {};
+    var remote_embedding_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, remote_embedding_key)).?;
+    defer remote_embedding_ref.deinit(alloc);
+
+    const PresenceAllocationCheck = struct {
+        fn run(test_alloc: Allocator, active_db: *DB, remote_key: []u8, embedding_ref: types.ArtifactRef) !void {
+            const keep = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
+                .{ .id = @constCast("doc:a") },
+                .{ .id = @constCast("doc:b") },
+                .{ .id = remote_key },
+                .{ .id = @constCast("doc:off-shard"), .artifact_ref = embedding_ref },
+                .{ .id = @constCast("doc:b"), .artifact_ref = .{ .document_id = @constCast("doc:b"), .name = @constCast("absent_embedding"), .kind = .embedding } },
+            });
+            defer test_alloc.free(keep);
+            try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, keep);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_embedding_ref });
+
+    // Presence is a candidate visibility rule, including IDs-only and count
+    // requests. Apply it before offset/limit, and refill an orphaned top hit.
+    for ([_]bool{ false, true }) |include_stored| {
+        for ([_]types.TextQuery{ .{ .match_all = {} }, .{ .match = .{ .field = "body", .text = "alpha" } } }) |query| {
+            var page = try db.search(alloc, .{ .index_name = "ft_rows", .full_text = query, .include_stored = include_stored, .limit = 1 });
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+            try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
+            try std.testing.expectEqual(@as(u32, 1), page.total_hits);
+            var after = try db.search(alloc, .{ .index_name = "ft_rows", .full_text = query, .include_stored = include_stored, .offset = 1, .limit = 1 });
+            defer after.deinit();
+            try std.testing.expectEqual(@as(usize, 0), after.hits.len);
+            try std.testing.expectEqual(@as(u32, 1), after.total_hits);
+            var count = try db.search(alloc, .{ .index_name = "ft_rows", .full_text = query, .count_only = true });
+            defer count.deinit();
+            try std.testing.expectEqual(@as(u32, 1), count.total_hits);
+        }
+    }
+
+    for ([_]bool{ false, true }) |include_stored| {
+        for ([_]bool{ false, true }) |is_sparse| {
+            var req: types.SearchRequest = .{ .index_name = if (is_sparse) "sp_rows" else "dv_rows", .include_stored = include_stored, .limit = 1 };
+            if (is_sparse) req.query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1}, .k = 1 } } else req.dense = .{ .vector = &.{ 0, 0 }, .k = 1 };
+            var page = try db.search(alloc, req);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+            try std.testing.expectEqualStrings("doc:b", page.hits[0].id);
+            req.offset = 1;
+            var after = try db.search(alloc, req);
+            defer after.deinit();
+            try std.testing.expectEqual(@as(usize, 0), after.hits.len);
+        }
+    }
+
+    for ([_]bool{ false, true }) |include_stored| {
+        var sorted = try db.search(alloc, .{
+            .index_name = "ft_rows",
+            .full_text = .{ .match_all = {} },
+            .order_by = &.{.{ .field = "_id" }},
+            .include_stored = include_stored,
+            .limit = 1,
+        });
+        defer sorted.deinit();
+        try std.testing.expectEqual(@as(usize, 1), sorted.hits.len);
+        try std.testing.expectEqualStrings("doc:b", sorted.hits[0].id);
+        try std.testing.expectEqual(@as(u32, 1), sorted.total_hits);
+    }
+
+    // A term unique to the now-orphaned row must come back empty, not fail
+    // the query (matches the issue's `query {"query": "harbor"} -> 500`).
+    var unique_term = try db.search(alloc, .{
+        .index_name = "ft_rows",
+        .full_text = .{ .match = .{ .field = "body", .text = "beta" } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer unique_term.deinit();
+    try std.testing.expectEqual(@as(u32, 0), unique_term.total_hits);
+    try std.testing.expectEqual(@as(usize, 0), unique_term.hits.len);
+
+    // A term shared by both rows must drop only the orphaned hit and adjust
+    // total_hits, not fail the whole query.
+    var shared_term = try db.search(alloc, .{
+        .index_name = "ft_rows",
+        .full_text = .{ .match = .{ .field = "body", .text = "alpha" } },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer shared_term.deinit();
+    try std.testing.expectEqual(@as(u32, 1), shared_term.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), shared_term.hits.len);
+    try std.testing.expectEqualStrings("doc:b", shared_term.hits[0].id);
+
+    // match_all must also drop the orphaned hit rather than 500 (the
+    // issue's own repro: `match_all` failed too, not just term queries).
+    var all_result = try db.search(alloc, .{
+        .index_name = "ft_rows",
+        .full_text = .{ .match_all = {} },
+        .include_stored = true,
+        .limit = 10,
+    });
+    defer all_result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), all_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 1), all_result.hits.len);
+    try std.testing.expectEqualStrings("doc:b", all_result.hits[0].id);
+}
+
+test "db text totals require presence proof beyond the requested page" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_rows", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"body\":\"alpha\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    // The same prefix is returned before and after the unseen row goes
+    // missing. Neither query can prove an exact total from that prefix.
+    for ([_]bool{ false, true }) |orphaned| {
+        if (orphaned) {
+            const key = try internal_keys.documentKeyAlloc(alloc, "doc:b");
+            defer alloc.free(key);
+            try db.core.store.delete(key);
+        }
+        const expected_total: u32 = if (orphaned) 1 else 2;
+        for ([_]bool{ false, true }) |include_stored| {
+            for ([_]types.TextQuery{
+                .{ .match_all = {} },
+                .{ .match = .{ .field = "body", .text = "alpha" } },
+            }) |query| {
+                var req = types.SearchRequest{ .index_name = "ft_rows", .full_text = query, .include_stored = include_stored, .limit = 1 };
+                var page = try db.search(alloc, req);
+                defer page.deinit();
+                try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+                try std.testing.expectEqualStrings("doc:a", page.hits[0].id);
+                try std.testing.expectEqual(@as(u32, 1), page.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.gte, page.total_hits_relation);
+
+                req.count_only = true;
+                var count = try db.search(alloc, req);
+                defer count.deinit();
+                try std.testing.expectEqual(expected_total, count.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.exact, count.total_hits_relation);
+
+                req.count_only = false;
+                req.limit = 2;
+                var complete = try db.search(alloc, req);
+                defer complete.deinit();
+                try std.testing.expectEqual(expected_total, complete.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.exact, complete.total_hits_relation);
+                try std.testing.expectEqual(@as(usize, expected_total), complete.hits.len);
+
+                req.limit = 1;
+                req.offset = 1;
+                var tail = try db.search(alloc, req);
+                defer tail.deinit();
+                try std.testing.expectEqual(expected_total, tail.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.exact, tail.total_hits_relation);
+                try std.testing.expectEqual(@as(usize, if (orphaned) 0 else 1), tail.hits.len);
+
+                // Native field-sort collectors check every counted row, so
+                // their limited pages still have an exact presence proof.
+                req.offset = 0;
+                req.order_by = &.{.{ .field = "_id" }};
+                var sorted = try db.search(alloc, req);
+                defer sorted.deinit();
+                try std.testing.expectEqual(expected_total, sorted.total_hits);
+                try std.testing.expectEqual(types.TotalHitsRelation.exact, sorted.total_hits_relation);
+                try std.testing.expectEqual(@as(usize, 1), sorted.hits.len);
+            }
+        }
+    }
+}
+
 test "db materialized dense enrichment survives artifact write list growth" {
     try testMaterializedEmbeddingWriteGrowth(.dense);
 }
@@ -106068,6 +108297,21 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_unit_data.?, "\"unit_id\":\"document:000001\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_unit_data.?, "\"text\":\"alpha beta gamma\"") != null);
 
+    var composed_ancestors = try db.search(alloc, .{
+        .full_text_queries = &.{.{ .name = "only", .index_name = "ft_document_chunks", .query = .{ .match = .{ .field = "text", .text = "gamma" } } }},
+        .return_mode = .member,
+        .limit = 1,
+        .include_stored = false,
+        .hierarchy_include_source = true,
+        .hierarchy_include_unit = true,
+    });
+    defer composed_ancestors.deinit();
+    try std.testing.expectEqual(@as(usize, 1), composed_ancestors.hits.len);
+    try std.testing.expect(composed_ancestors.hits[0].ancestor_source_data != null);
+    try std.testing.expect(composed_ancestors.hits[0].ancestor_unit_data != null);
+    try std.testing.expectEqualStrings(sparse_result.hits[0].ancestor_source_data.?, composed_ancestors.hits[0].ancestor_source_data.?);
+    try std.testing.expectEqualStrings(sparse_result.hits[0].ancestor_unit_data.?, composed_ancestors.hits[0].ancestor_unit_data.?);
+
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -106089,6 +108333,30 @@ test "db document extraction chunks units through source artifact enrichment" {
     const refreshed_sparse_artifact_payload = try db.core.store.get(alloc, sparse_artifact_key);
     defer alloc.free(refreshed_sparse_artifact_payload);
 
+    // A live source/unit must not resurrect an orphaned member when grouped.
+    // Presence applies to the raw member before either grouping or hydration.
+    try db.core.store.delete(chunk_key);
+    for (std.enums.values(types.ReturnMode)) |mode| {
+        for ([_]bool{ false, true }) |include_stored| {
+            var missing = try db.search(alloc, .{
+                .index_name = "ft_document_chunks",
+                .full_text = .{ .match = .{ .field = "text", .text = "delta" } },
+                .return_mode = mode,
+                .include_stored = include_stored,
+                .limit = 1,
+            });
+            defer missing.deinit();
+            try std.testing.expectEqual(@as(usize, 0), missing.hits.len);
+            try std.testing.expectEqual(@as(u32, 0), missing.total_hits);
+        }
+    }
+    var missing_dense = try db.search(alloc, .{ .index_name = "document_vectors", .dense = .{ .vector = query_vec, .k = 1 }, .limit = 1, .include_stored = false });
+    defer missing_dense.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing_dense.hits.len);
+    var missing_sparse = try db.search(alloc, .{ .index_name = "document_chunk_sparse_v1", .query = .{ .sparse_knn = .{ .indices = sparse_query.indices, .values = sparse_query.values, .k = 1 } }, .limit = 1, .include_stored = false });
+    defer missing_sparse.deinit();
+    try std.testing.expectEqual(@as(usize, 0), missing_sparse.hits.len);
+
     try db.batch(.{
         .writes = &.{.{
             .key = "doc:a",
@@ -106101,6 +108369,561 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, dense_artifact_key));
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, sparse_artifact_key));
     try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.denseIndex("document_vectors").?.index.metadata.active_count);
+}
+
+test "db sync_level enrichments precompute for document-mode writes does not hold the apply lock" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+
+    const Writer = struct {
+        db: *DB,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{
+                .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha summary source\"}" }},
+                .sync_level = .enrichments,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var writer = Writer{ .db = &db };
+    const writer_thread = try std.Thread.spawn(.{}, Writer.run, .{&writer});
+    var joined = false;
+    defer if (!joined) {
+        slow_asset.allow();
+        writer_thread.join();
+    };
+
+    // Wait until the asset producer is actually invoked: this batch's
+    // generated-enrichment precompute is in flight, ahead of the apply lock.
+    var attempts: usize = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (slow_asset.started.load(.acquire)) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(slow_asset.started.load(.acquire));
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+
+    // A concurrent reader must not queue behind the in-flight precompute.
+    // Before this fix, sync_level: .enrichments precompute for document-mode
+    // writes ran entirely under the exclusive apply lock, so this probe
+    // (which only takes the shared apply lock) would have blocked for as
+    // long as the asset producer stayed parked.
+    const probe_start_ns = monotonicTimeNs();
+    _ = db.lsmMaintenanceScore();
+    const probe_elapsed_ns = monotonicTimeNs() - probe_start_ns;
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+    try std.testing.expect(probe_elapsed_ns < 500 * std.time.ns_per_ms);
+
+    slow_asset.allow();
+    writer_thread.join();
+    joined = true;
+    try std.testing.expectEqual(@as(?anyerror, null), writer.err);
+
+    const artifact_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "summary_v1");
+    defer alloc.free(artifact_key);
+    const artifact_value = try db.core.store.get(alloc, artifact_key);
+    defer alloc.free(artifact_value);
+    try std.testing.expectEqualStrings("asset:alpha summary source", artifact_value);
+}
+
+test "db document extraction concurrent same-key writes converge without stale precompute" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+            .sparse_embedder = deterministic_sparse.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    var hook = PortableRuntimeBatchPrelockTestHook{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer test_portable_runtime_batch_prelock_hook = null;
+
+    // doc:a does not exist yet: thread_a's pre-lock precompute (hoisted by
+    // this change) reads that absence and plans a from_generation: 0 commit,
+    // then parks at the prelock test hook, just before the apply lock.
+    const Writer = struct {
+        db: *DB,
+        value: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{
+                .writes = &.{.{ .key = "doc:a", .value = self.value }},
+                .sync_level = .enrichments,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var writer_a = Writer{
+        .db = &db,
+        .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"decoy\"}",
+    };
+    const thread_a = try std.Thread.spawn(.{}, Writer.run, .{&writer_a});
+    var joined_a = false;
+    defer if (!joined_a) {
+        hook.release.store(true, .release);
+        thread_a.join();
+    };
+
+    const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(hook.entered.load(.acquire));
+
+    // Commit different content for the same key while thread_a is parked.
+    // Clear the hook first so this write is not itself gated by it.
+    test_portable_runtime_batch_prelock_hook = null;
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YSBnYW1tYSBkZWx0YQ==\",\"text\":\"decoy\"}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    // Release thread_a. Its stale pre-lock precompute (built against a
+    // nonexistent prior document) must be detected and retried against the
+    // now-current state, not silently committed on top of it -- which would
+    // either corrupt the generation counter or leave orphaned chunk/embedding
+    // artifacts from the intermediate commit.
+    hook.release.store(true, .release);
+    thread_a.join();
+    joined_a = true;
+    try std.testing.expectEqual(@as(?anyerror, null), writer_a.err);
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"from_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"to_generation\":2") != null);
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "document_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_entries = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_entries);
+    var chunk_count: usize = 0;
+    var last_chunk_payload: []const u8 = "";
+    for (chunk_entries) |entry| if (internal_keys.isChunkArtifactRecordKey(entry.key)) {
+        chunk_count += 1;
+        last_chunk_payload = entry.value;
+    };
+    // Exactly one surviving chunk, matching thread_a's final ("alpha beta
+    // gamma") content -- no orphaned chunk from the intermediate ("beta
+    // gamma delta") generation this write raced against.
+    try std.testing.expectEqual(@as(usize, 1), chunk_count);
+    try std.testing.expect(std.mem.indexOf(u8, last_chunk_payload, "alpha beta gamma") != null);
+}
+
+test "db document extraction pre-lock precompute survives a concurrent catalog mutation without touching freed memory" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+            .sparse_embedder = deterministic_sparse.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    var hook = PortableRuntimeBatchPrelockTestHook{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer test_portable_runtime_batch_prelock_hook = null;
+
+    // thread_a's pre-lock precompute (extraction against the owned write-plan
+    // snapshot, then chunk/embedding derivation) runs to completion and
+    // parks at the prelock test hook, just before the apply lock.
+    const Writer = struct {
+        db: *DB,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{
+                .writes = &.{.{
+                    .key = "doc:a",
+                    .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
+                }},
+                .sync_level = .enrichments,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var writer_a = Writer{ .db = &db };
+    const thread_a = try std.Thread.spawn(.{}, Writer.run, .{&writer_a});
+    var joined_a = false;
+    defer if (!joined_a) {
+        hook.release.store(true, .release);
+        thread_a.join();
+    };
+
+    const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(hook.entered.load(.acquire));
+
+    // Replace the CHUNK enrichment doc:a's own pre-lock extraction actually
+    // used -- with a different chunk_size -- while thread_a is parked just
+    // before the apply lock. By this point thread_a's
+    // DocumentExtractionCatalogView (built once, under
+    // catalog_mutex.lockShared(), in computeAssetRequestDerived) has
+    // already been fully read -- its chunk/embedding derivation runs
+    // entirely pre-lock, before this hook -- so this exercises the same
+    // class of bug the review blocker identified: upsertEnrichment frees
+    // the live "document_chunks_v1" entry's strings (chunker_json,
+    // source_field, ...) and replaces them in place; thread_a's view, and
+    // everything it derived from "document_chunks_v1" and
+    // "document_chunk_dense_v1" (which consumes it), must be fully owned,
+    // not a borrowed pointer into what this upsert frees. Deleting the
+    // chunk enrichment outright is rejected with error.EnrichmentInUse
+    // while the embedding still names it as source_artifact_name, so this
+    // uses the allowed in-place replace instead. A catalog publish bumps
+    // the write-plan generation thread_a pinned, so this also forces the
+    // existing PreparedGenerationChanged retry path to run against the
+    // replaced catalog entry.
+    test_portable_runtime_batch_prelock_hook = null;
+    _ = try db.upsertEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 4,
+    });
+
+    hook.release.store(true, .release);
+    thread_a.join();
+    joined_a = true;
+    try std.testing.expectEqual(@as(?anyerror, null), writer_a.err);
+
+    // Whether this landed from thread_a's own pre-lock result (if its
+    // pinned generation happened to still match) or a generation-changed
+    // retry against the replaced chunk_size, the testing allocator above
+    // would already have caught any read of, or double free of, memory the
+    // upsert's replace freed. Every surviving chunk still gets its
+    // "document_chunk_dense_v1" embedding artifact -- the replace never
+    // touched that enrichment, so this is the same convergence check as
+    // the "concurrent same-key writes" test above, just with a catalog
+    // replace as the interference instead of another write.
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "document_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_entries = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_entries);
+    var chunk_count: usize = 0;
+    var dense_artifact_count: usize = 0;
+    for (chunk_entries) |entry| {
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+        chunk_count += 1;
+        const dense_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, entry.key, "document_chunk_dense_v1");
+        defer alloc.free(dense_artifact_key);
+        const dense_artifact_payload = try db.core.store.get(alloc, dense_artifact_key);
+        alloc.free(dense_artifact_payload);
+        dense_artifact_count += 1;
+    }
+    try std.testing.expect(chunk_count > 0);
+    try std.testing.expectEqual(chunk_count, dense_artifact_count);
+}
+
+test "db document extraction unit chunks embed in provider batches, not per chunk" {
+    const alloc = std.testing.allocator;
+    const BatchProbe = struct {
+        deterministic: embedder_mod.DeterministicDenseEmbedder = .{},
+        batch_calls: usize = 0,
+        items: usize = 0,
+
+        fn embedDense(_: *anyopaque, _: Allocator, _: []const u8, _: []const u8, _: u32) ![]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedDenseBatch(
+            raw: *anyopaque,
+            batch_alloc: Allocator,
+            embedding_name: []const u8,
+            texts: []const []const u8,
+            dims: u32,
+        ) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batch_calls += 1;
+            self.items += texts.len;
+            const vectors = try batch_alloc.alloc([]const f32, texts.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (vectors[0..initialized]) |vector| batch_alloc.free(@constCast(vector));
+                batch_alloc.free(vectors);
+            }
+            for (texts, vectors) |text, *vector| {
+                vector.* = try embedder_mod.DeterministicDenseEmbedder.embedDense(
+                    &self.deterministic,
+                    batch_alloc,
+                    embedding_name,
+                    text,
+                    dims,
+                );
+                initialized += 1;
+            }
+            return vectors;
+        }
+
+        fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+            return .{
+                .ptr = self,
+                .dense_embed_fn = embedDense,
+                .dense_embed_batch_fn = embedDenseBatch,
+                .deinit_fn = null,
+            };
+        }
+    };
+
+    const c = struct {
+        extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const batch_items_env = "ANTFLY_ENRICHMENT_EMBED_BATCH_ITEMS";
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(batch_items_env, "3", 1));
+    defer _ = c.unsetenv(batch_items_env);
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var probe = BatchProbe{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .owner_id = "worker-a", .dense_embedder = probe.interface() },
+    });
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    // ~2.5 KB of text, base64-encoded, so chunk_size: 256 produces well over
+    // one provider batch (batch items pinned to 3 above) from a single
+    // document_extraction unit.
+    const doc_value = "{\"url\":\"data:text/plain;base64," ++
+        "YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4gYWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdhLiBhbHBoYSBiZXRhIGdhbW1hIGRlbHRhIGVwc2lsb24gemV0YSBldGEgdGhldGEgaW90YSBrYXBwYSBsYW1iZGEgbXUgbnUgeGkgb21pY3JvbiBwaSByaG8gc2lnbWEgdGF1IHVwc2lsb24gcGhpIGNoaSBwc2kgb21lZ2EuIGFscGhhIGJldGEgZ2FtbWEgZGVsdGEgZXBzaWxvbiB6ZXRhIGV0YSB0aGV0YSBpb3RhIGthcHBhIGxhbWJkYSBtdSBudSB4aSBvbWljcm9uIHBpIHJobyBzaWdtYSB0YXUgdXBzaWxvbiBwaGkgY2hpIHBzaSBvbWVnYS4g" ++
+        "\"}";
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = doc_value }},
+        .sync_level = .enrichments,
+    });
+
+    // Well more than one provider batch's worth of chunks, but far fewer
+    // batch calls than chunks: the old per-chunk path would have called the
+    // single-item embedDense (which always errors here) once per chunk.
+    try std.testing.expect(probe.items >= 8);
+    try std.testing.expect(probe.batch_calls < probe.items);
+    const max_batch_items = generatedEmbedBatchItems();
+    const expected_batch_calls = (probe.items + max_batch_items - 1) / max_batch_items;
+    try std.testing.expectEqual(expected_batch_calls, probe.batch_calls);
+
+    // Every chunk this document produced has its own derived dense embedding
+    // artifact -- batching the provider calls did not drop or misattribute
+    // any chunk's embedding.
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "document_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_entries = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_entries);
+    var chunk_count: usize = 0;
+    for (chunk_entries) |entry| {
+        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
+        chunk_count += 1;
+        const dense_artifact_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, entry.key, "document_chunk_dense_v1");
+        defer alloc.free(dense_artifact_key);
+        const dense_artifact_payload = try db.core.store.get(alloc, dense_artifact_key);
+        alloc.free(dense_artifact_payload);
+    }
+    try std.testing.expectEqual(probe.items, chunk_count);
+}
+
+test "db sync_level enrichments returns without waiting on an unrelated enrichment backlog" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var slow_asset = SlowGatedAssetProducer{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = slow_asset.interface(),
+            .inline_retry_max_attempts = 1,
+        },
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    defer slow_asset.allow();
+
+    try db.addEnrichment(.{
+        .name = "summary_v1",
+        .kind = .asset,
+        .field = "body",
+        .content_type = "text/plain",
+        .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}",
+    });
+
+    // sync_level: .write defers this document's asset enrichment to the
+    // background runtime, which picks it up and parks in the producer.
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:backlog", .value = "{\"body\":\"alpha summary source\"}" }},
+        .sync_level = .write,
+    });
+
+    var attempts: usize = 0;
+    while (attempts < slow_test_wait_attempts) : (attempts += 1) {
+        if (slow_asset.started.load(.acquire)) break;
+        sleepPollInterval();
+    }
+    try std.testing.expect(slow_asset.started.load(.acquire));
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+
+    // This row has no value in the enrichment's source field, so its own
+    // sync_level: .enrichments precompute needs nothing from the producer
+    // (generated_enrichment_refs stays empty) and must not wait for
+    // db.enrichment_runtime's applied_sequence to catch up to -- let alone
+    // past -- the backlogged "doc:backlog" commit still parked ahead of it.
+    const wait_start_ns = monotonicTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:tiny", .value = "{\"other\":\"no body field\"}" }},
+        .sync_level = .enrichments,
+    });
+    const wait_elapsed_ns = monotonicTimeNs() - wait_start_ns;
+    try std.testing.expect(!slow_asset.finished.load(.acquire));
+    try std.testing.expect(wait_elapsed_ns < 5 * std.time.ns_per_s);
+
+    slow_asset.allow();
 }
 
 fn testLargeHtmlDataUrlAlloc(alloc: Allocator, version: []const u8, unique_token: []const u8, paragraph_count: usize) ![]u8 {
@@ -106270,6 +109093,118 @@ test "db document extraction changed version updates large chunked source docume
     });
     defer first_result.deinit();
     try std.testing.expectEqual(@as(u32, 0), first_result.total_hits);
+}
+
+fn testChunkArtifactCount(alloc: Allocator, db: *DB, doc_key: []const u8, chunk_name: []const u8) !usize {
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", chunk_name);
+    defer alloc.free(chunk_prefix);
+    const artifacts = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, artifacts);
+    var count: usize = 0;
+    for (artifacts) |artifact| {
+        if (internal_keys.isChunkArtifactRecordKey(artifact.key)) count += 1;
+    }
+    return count;
+}
+
+fn testDefaultTextHitCount(alloc: Allocator, db: *DB, term: []const u8) !u32 {
+    var result = try db.search(alloc, .{
+        .index_name = "ft_default",
+        .full_text = .{ .match = .{ .field = "text", .text = term } },
+        .return_mode = .chunk,
+    });
+    defer result.deinit();
+    return result.total_hits;
+}
+
+// Chunk artifacts routed into the default full-text index must follow their
+// enrichment's lifecycle: a chunker config change rechunks on reprocess
+// (issue 927), a newly registered chunk artifact materializes without wedging
+// full-text replay (issue 928), and a deleted one has its members retired
+// from the index when reprocess purges its rows (issue 929).
+test "db document extraction chunk enrichment lifecycle rechunks adds and retires chunk artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 64,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try db.addIndex(.{ .name = "ft_default", .kind = .full_text, .config_json = "{}" });
+
+    var url = std.ArrayListUnmanaged(u8).empty;
+    defer url.deinit(alloc);
+    try url.appendSlice(alloc, "data:text/plain,");
+    for (0..40) |i| {
+        const word = try std.fmt.allocPrint(alloc, "harbor{d}%20ledger%20window%20", .{i});
+        defer alloc.free(word);
+        try url.appendSlice(alloc, word);
+    }
+    try url.appendSlice(alloc, "zygomorphic");
+    const doc_value = try std.fmt.allocPrint(alloc, "{{\"url\":\"{s}\"}}", .{url.items});
+    defer alloc.free(doc_value);
+
+    try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = doc_value }}, .sync_level = .full_index });
+    try db.runUntilIdle();
+    const small_chunks = try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v1");
+    try std.testing.expect(small_chunks > 4);
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+
+    // Growing the chunk size keeps the old chunk ids 0..n but must replace
+    // their text, so the tail term moves into the new last chunk.
+    _ = try db.upsertEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 4096,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v1"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "harbor0"));
+
+    try db.addEnrichment(.{
+        .name = "document_chunks_v2",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 4096,
+        .chunk_overlap = 0,
+        .full_text_index = true,
+    });
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 1), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v2"));
+    try std.testing.expectEqual(@as(u32, 2), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
+
+    try std.testing.expect(try db.deleteEnrichment(.chunk, "document_chunks_v2"));
+    try std.testing.expect(try db.reprocessDocumentArtifact(alloc, "doc:a", "document_units_v1"));
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 0), try testChunkArtifactCount(alloc, &db, "doc:a", "document_chunks_v2"));
+    try std.testing.expectEqual(@as(u32, 1), try testDefaultTextHitCount(alloc, &db, "zygomorphic"));
 }
 
 test "db document extraction update recovers corrupt previous extraction state" {
@@ -117623,6 +120558,305 @@ test "db encodeThinReplayRecordPayload treats embedding-only writes as artifact 
     try std.testing.expect(journalRecordHasHint(decoded.record, .dense_vector));
 }
 
+test "db encodeThinReplayRecordPayload omits an edges-only document from full-text replay" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+        },
+    };
+
+    var extracted = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted.deinit(alloc);
+    try std.testing.expect(!extracted.hasDocument());
+    try std.testing.expect(extracted.mentioned_graph_indexes.len > 0);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{extracted},
+        &.{},
+        &.{},
+        &.{false},
+        &.{true},
+        50,
+        false,
+        null,
+        null,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    // A document whose only content is `_edges` never gets a primary row.
+    // Recording its key in changed_doc_keys would make full-text/dense/
+    // sparse replay treat it as a document they must find content for --
+    // one that never has any, forever (issue #938). Only the graph hint
+    // belongs here.
+    try std.testing.expectEqual(@as(usize, 0), decoded.record.changed_doc_keys.len);
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+    try std.testing.expect(!journalRecordHasHint(decoded.record, .full_text));
+}
+
+test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full-text-hinted record" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+            .{ .key = "node:b", .value = "{\"name\":\"b\"}" },
+        },
+    };
+
+    var extracted_a = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted_a.deinit(alloc);
+    var extracted_b = try mapper.extractWrite(alloc, req.writes[1].key, req.writes[1].value);
+    defer extracted_b.deinit(alloc);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{ extracted_a, extracted_b },
+        &.{},
+        &.{},
+        &.{ false, false },
+        &.{ true, true },
+        51,
+        false,
+        null,
+        null,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    // node:b's content gives the record a full_text hint; node:a's edges
+    // give it a graph hint. The full-text/algebraic replay worker treats
+    // every key in changed_doc_keys as a synthetic upsert once it sees that
+    // hint, so node:a (which never gets a primary row) must not be one of
+    // them, or replay retries ReplayDocumentNotVisible forever (issue #938).
+    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("node:b", decoded.record.changed_doc_keys[0]);
+}
+
+// PR #957 review, blocker 8: `include_generated_enrichment_hint` is a
+// whole-table flag (true whenever ANY index has a generated-enrichment
+// target), not scoped to writes that could actually match one. It used to
+// put every write's key into changed_doc_keys whenever that flag was set,
+// regardless of hasDocument() -- reopening exactly the #938 gap for a
+// table with a configured generated enrichment.
+test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full-text-hinted record even with a generated enrichment target configured" {
+    const alloc = std.testing.allocator;
+
+    const req = types.BatchRequest{
+        .writes = &.{
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+            .{ .key = "node:b", .value = "{\"name\":\"b\"}" },
+        },
+    };
+
+    var extracted_a = try mapper.extractWrite(alloc, req.writes[0].key, req.writes[0].value);
+    defer extracted_a.deinit(alloc);
+    var extracted_b = try mapper.extractWrite(alloc, req.writes[1].key, req.writes[1].value);
+    defer extracted_b.deinit(alloc);
+
+    const payload = try encodeThinReplayRecordPayload(
+        alloc,
+        req,
+        &.{ extracted_a, extracted_b },
+        &.{},
+        &.{},
+        &.{ false, false },
+        &.{ true, true },
+        51,
+        true, // include_generated_enrichment_hint: a generated-enrichment target exists somewhere on the table.
+        null,
+        null,
+    );
+    defer alloc.free(payload);
+
+    var decoded = try change_journal_mod.decodeRecord(alloc, payload);
+    defer decoded.deinit();
+
+    // Reviewer's reproduction: cloning the unflagged test above with
+    // include_generated_enrichment_hint=true previously yielded 2 keys
+    // (node:a leaked in) instead of 1. node:a has no field content a
+    // generated enrichment could ever match, so it must stay out of
+    // changed_doc_keys regardless of this flag.
+    try std.testing.expect(journalRecordHasHint(decoded.record, .full_text));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .graph));
+    try std.testing.expect(journalRecordHasHint(decoded.record, .enrichment));
+    try std.testing.expectEqual(@as(usize, 1), decoded.record.changed_doc_keys.len);
+    try std.testing.expectEqualStrings("node:b", decoded.record.changed_doc_keys[0]);
+}
+
+test "db run_until_idle does not hang on a document whose only content is graph edges" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+
+    // node:b's ordinary write gives this batch's thin replay record a
+    // full_text hint; node:a's `_edges`-only write gives it a graph hint.
+    // Before the fix, the full-text worker treated every key in the
+    // record's changed_doc_keys as a candidate once it saw that hint,
+    // including node:a -- which never gets a primary row -- so it retried
+    // error.ReplayDocumentNotVisible forever and run_until_idle() never
+    // returned (issue #938).
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "node:b", .value = "{\"name\":\"b\"}" },
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+        },
+    });
+
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(alloc, "node:a"));
+    const b_value = (try db.get(alloc, "node:b")).?;
+    defer alloc.free(b_value);
+    try std.testing.expect(std.mem.indexOf(u8, b_value, "\"b\"") != null);
+}
+
+test "db run_until_idle does not hang on an edges-only row when a generated enrichment is configured" {
+    const alloc = std.testing.allocator;
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .dense_embedder = deterministic.interface() },
+    });
+    defer db.close();
+
+    try db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "semantic",
+        .kind = .dense_vector,
+        .config_json =
+        \\{"field":"embedding","dims":3,"generator":{"kind":"dense_embedding","source_field":"body","embedding_name":"semantic"}}
+        ,
+    });
+    try std.testing.expect(db.core.index_manager.hasGeneratedEnrichmentTargets());
+
+    // PR #957 review, blocker 8: with a generated enrichment configured
+    // anywhere on the table, include_generated_enrichment_hint used to put
+    // node:a's key into changed_doc_keys too, regardless of hasDocument()
+    // -- node:b's "body" field giving the record both a full_text hint and
+    // an enrichment hint reopened exactly the #938 hang, this time behind a
+    // configured generated enrichment instead of a plain mixed batch.
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "node:b", .value = "{\"body\":\"hello\"}" },
+            .{ .key = "node:a", .value = "{\"_edges\":{\"graph\":{\"KNOWS\":[{\"target\":\"node:b\"}]}}}" },
+        },
+    });
+
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(?[]u8, null), try db.get(alloc, "node:a"));
+    const b_value = (try db.get(alloc, "node:b")).?;
+    defer alloc.free(b_value);
+    try std.testing.expect(std.mem.indexOf(u8, b_value, "hello") != null);
+}
+
+test "collectTextDocumentWritesForIndex tolerates a missing document only when told to give up" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    // "doc:never" is targeted for full-text replay but was never written --
+    // the same shape a thin-replay-reconstructed synthetic upsert has for an
+    // `_edges`-only document (issue #938): no primary row will ever appear
+    // for it. Without tolerate_missing_replay_documents this is the ordinary
+    // "not visible yet, retry" signal; with it (set only after bounded
+    // retries on this exact window have been exhausted) it must be a no-op
+    // skip instead.
+    const documents = [_]derived_types.DerivedDocument{.{
+        .key = "doc:never",
+        .targets = &.{.{ .kind = .full_text, .index_name = "ft_v1" }},
+    }};
+
+    {
+        var collected = try collectTextDocumentWritesForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &documents,
+            "ft_v1",
+            false,
+            db.core.index_manager.byte_range,
+            .{},
+        );
+        defer collected.deinit();
+        try std.testing.expectEqual(@as(usize, 1), collected.missing_required);
+        try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
+    }
+
+    {
+        var collected = try collectTextDocumentWritesForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &documents,
+            "ft_v1",
+            false,
+            db.core.index_manager.byte_range,
+            .{ .tolerate_missing_replay_documents = true },
+        );
+        defer collected.deinit();
+        try std.testing.expectEqual(@as(usize, 0), collected.missing_required);
+        try std.testing.expectEqual(@as(usize, 0), collected.docs.items.len);
+    }
+
+    // A skipped document is not silently lost: it is counted per owner and
+    // index, both directly and through the same status listDerivedReplayDebt
+    // surfaces.
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        db.core.index_manager.resource_manager.?.replayDocumentNotVisibleSkippedTotal(
+            resource_manager_mod.replayOwnerIdFromPtr(db.core.index_manager),
+            "ft_v1",
+        ),
+    );
+    const debt = try db.listDerivedReplayDebt(alloc);
+    defer {
+        for (debt) |*status| status.deinit(alloc);
+        alloc.free(debt);
+    }
+    var saw_ft_v1 = false;
+    for (debt) |status| {
+        if (!std.mem.eql(u8, status.index_name, "ft_v1")) continue;
+        try std.testing.expectEqual(@as(u64, 1), status.replay_document_not_visible_skipped);
+        saw_ft_v1 = true;
+    }
+    try std.testing.expect(saw_ft_v1);
+}
+
 test "db thin replay marks artifact-derived target hints" {
     const alloc = std.testing.allocator;
 
@@ -118651,6 +121885,65 @@ test "db full text match_all applies stored filters" {
     try std.testing.expectEqual(@as(usize, 2), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+}
+
+test "db full text match_all applies exclusion_query" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"status\":\"active\",\"body\":\"alpha\"}" },
+            .{ .key = "doc:b", .value = "{\"status\":\"draft\",\"body\":\"beta\"}" },
+            .{ .key = "doc:c", .value = "{\"status\":\"active\",\"body\":\"gamma\"}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // Issue #931 "related observation": exclusion_query (and, separately,
+    // bool.must_not) is silently ignored when the scoring query is
+    // match_all, even though the identical exclusion correctly drops
+    // matches for a non-match_all query (see the filter_query sibling test
+    // above, and the non-match_all case below).
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .match_all = {} },
+        .exclusion_query_json = "{\"term\":{\"status\":\"draft\"}}",
+        .limit = 10,
+    }, 2);
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+    try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
+    try std.testing.expectEqualStrings("doc:c", result.hits[1].id);
+
+    // The equivalent native bool_query{must:[match_all], must_not:[term]}
+    // shape that query.bool.must_not lowers to for full-text requests.
+    var bool_result = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .full_text = .{ .bool_query = .{
+            .must = &.{.{ .match_all = {} }},
+            .must_not = &.{.{ .term = .{ .field = "status", .term = "draft" } }},
+        } },
+        .limit = 10,
+    });
+    defer bool_result.deinit();
+    try std.testing.expectEqual(@as(u32, 2), bool_result.total_hits);
+    try std.testing.expectEqual(@as(usize, 2), bool_result.hits.len);
 }
 
 test "db full_index delete waits for full text visibility" {
@@ -152620,6 +155913,154 @@ pub const test_support = if (builtin.is_test) struct {
     pub const flushDurableReplicationOutboxes = fixture_owner.DB.flushDurableReplicationOutboxes;
 } else struct {};
 
+test "document extraction catalog snapshot releases every allocation on failure" {
+    const Harness = struct {
+        const Entry = struct {
+            kind: enum { chunk, embedding },
+            name: []const u8,
+            source_artifact_name: []const u8,
+            source_field: []const u8 = "text",
+            expected_dims: u32 = 0,
+            producer_json: []const u8 = "{\"model\":\"test\"}",
+            chunker_json: []const u8 = "{}",
+            full_text_index: bool = true,
+            chunk_size: u32 = 10,
+            chunk_overlap: u32 = 2,
+        };
+        const Lock = struct {
+            held: bool = false,
+            fn lockShared(self: *@This()) void {
+                std.debug.assert(!self.held);
+                self.held = true;
+            }
+            fn unlockShared(self: *@This()) void {
+                std.debug.assert(self.held);
+                self.held = false;
+            }
+        };
+        const Manager = struct {
+            catalog_mutex: Lock = .{},
+            enrichments: struct { items: []const Entry } = .{ .items = &.{
+                .{ .kind = .chunk, .name = "chunks", .source_artifact_name = "asset" },
+                .{ .kind = .embedding, .name = "dense", .source_artifact_name = "chunks", .expected_dims = 2 },
+                .{ .kind = .embedding, .name = "sparse", .source_artifact_name = "chunks" },
+                .{ .kind = .chunk, .name = "other_chunks", .source_artifact_name = "asset" },
+                .{ .kind = .embedding, .name = "other_dense", .source_artifact_name = "other_chunks", .expected_dims = 2 },
+                .{ .kind = .embedding, .name = "other_sparse", .source_artifact_name = "other_chunks" },
+            } },
+            fn indexes(self: *@This(), alloc: Allocator) ![][]u8 {
+                std.debug.assert(self.catalog_mutex.held);
+                const names = try alloc.alloc([]u8, 1);
+                errdefer alloc.free(names);
+                names[0] = try alloc.dupe(u8, "consumer");
+                return names;
+            }
+            fn denseIndexesForEmbedding(self: *@This(), alloc: Allocator, _: []const u8, _: u32) ![][]u8 {
+                return self.indexes(alloc);
+            }
+            fn sparseIndexesForEmbedding(self: *@This(), alloc: Allocator, _: []const u8) ![][]u8 {
+                return self.indexes(alloc);
+            }
+            fn textIndexesForChunk(self: *@This(), alloc: Allocator, _: []const u8, _: bool) ![][]u8 {
+                return self.indexes(alloc);
+            }
+        };
+        fn run(alloc: Allocator) !void {
+            var manager = Manager{};
+            defer std.debug.assert(!manager.catalog_mutex.held);
+            const db = .{ .core = .{ .index_manager = &manager } };
+            var snapshot = try buildDocumentExtractionCatalogView(alloc, db, "asset");
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), snapshot.chunks.len);
+            for (snapshot.chunks) |chunk| {
+                try std.testing.expectEqual(@as(usize, 1), chunk.dense_embeddings.len);
+                try std.testing.expectEqual(@as(usize, 1), chunk.sparse_embeddings.len);
+                try std.testing.expectEqualStrings("consumer", chunk.text_indexes[0]);
+                try std.testing.expectEqualStrings("consumer", chunk.dense_embeddings[0].consumer_indexes[0]);
+                try std.testing.expectEqualStrings("consumer", chunk.sparse_embeddings[0].consumer_indexes[0]);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+test "pending document-unit dense embedding collection releases every failed allocation" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const Runtime = struct { config: struct { dense_embedder: ?u8 = 1 } = .{} };
+            var runtime: Runtime = .{};
+            const db = .{ .enrichment_runtime = @as(?*Runtime, &runtime) };
+            var names = [_][]u8{ @constCast("consumer"), @constCast("second_consumer") };
+            var entries = [_]DocumentExtractionEmbeddingView{
+                .{ .name = "embedding", .consumer_indexes = &names },
+                .{ .name = "other_embedding", .consumer_indexes = &names },
+            };
+            const view: DocumentExtractionChunkView = .{ .dense_embeddings = &entries };
+            var pending: std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding) = .empty;
+            defer {
+                for (pending.items) |*item| item.deinit(alloc);
+                pending.deinit(alloc);
+            }
+            try collectPendingDocumentUnitDenseChunkEmbeddings(alloc, db, &view, &pending);
+            try std.testing.expectEqual(@as(usize, 2), pending.items.len);
+            try std.testing.expectEqualStrings("consumer", pending.items[0].consumer_indexes[0]);
+            try std.testing.expectEqualStrings("second_consumer", pending.items[1].consumer_indexes[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "pending document-unit sparse embedding collection releases every failed allocation" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const Runtime = struct { config: struct { sparse_embedder: ?u8 = 1 } = .{} };
+            var runtime: Runtime = .{};
+            const db = .{ .enrichment_runtime = @as(?*Runtime, &runtime) };
+            var names = [_][]u8{ @constCast("consumer"), @constCast("second_consumer") };
+            var entries = [_]DocumentExtractionEmbeddingView{
+                .{ .name = "embedding", .consumer_indexes = &names },
+                .{ .name = "other_embedding", .consumer_indexes = &names },
+            };
+            const view: DocumentExtractionChunkView = .{ .sparse_embeddings = &entries };
+            var pending: std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding) = .empty;
+            defer {
+                for (pending.items) |*item| item.deinit(alloc);
+                pending.deinit(alloc);
+            }
+            try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, &view, &pending);
+            try std.testing.expectEqual(@as(usize, 2), pending.items.len);
+            try std.testing.expectEqualStrings("consumer", pending.items[0].consumer_indexes[0]);
+            try std.testing.expectEqualStrings("second_consumer", pending.items[1].consumer_indexes[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "pending document-unit chunk sources append atomically under allocation failure" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            inline for (.{ PendingDocumentUnitDenseChunkEmbedding, PendingDocumentUnitSparseChunkEmbedding }) |Pending| {
+                var pending: Pending = if (@hasField(Pending, "expected_dims"))
+                    .{ .embedding_name = "embedding", .source_field = "text", .expected_dims = 2, .producer_json = "", .consumer_indexes = &.{} }
+                else
+                    .{ .embedding_name = "embedding", .producer_json = "", .consumer_indexes = &.{} };
+                defer pending.deinit(alloc);
+                try appendPendingDocumentUnitChunkSource(alloc, &pending, "chunk:0", "first");
+                appendPendingDocumentUnitChunkSource(alloc, &pending, "chunk:1", "second") catch |err| {
+                    try std.testing.expectEqual(@as(usize, 1), pending.sources.items.len);
+                    try std.testing.expectEqual(@as(usize, 1), pending.chunk_texts.items.len);
+                    try std.testing.expectEqual(@as(usize, 1), pending.source_indexes.items.len);
+                    try std.testing.expectEqual(@as(usize, 5), pending.batch_source_bytes);
+                    return err;
+                };
+                try std.testing.expectEqual(@as(usize, 2), pending.sources.items.len);
+                try std.testing.expectEqualStrings("second", pending.chunk_texts.items[1]);
+                try std.testing.expectEqual(@as(usize, 1), pending.source_indexes.items[1]);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
 fn graphTestApplyOrdered(db: *DB, req: types.BatchRequest, receipt: OrderedApplyReceipt) !void {
     var request = req;
     request.sync_level = .write;
@@ -154037,4 +157478,178 @@ test "db graph fact generated replacement retains overlap and retires withdrawn 
     const edges = try db.core.index_manager.graphIndex("facts").?.index.getEdges(alloc, "alice", "RELATES_TO", .out);
     defer graph_mod.GraphIndex.freeEdges(alloc, edges);
     try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "db document extraction concurrent writes with unchanged TTL timestamps converge" {
+    if (builtin.single_threaded or builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var deterministic_dense = embedder_mod.DeterministicDenseEmbedder{};
+    var deterministic_sparse = embedder_mod.DeterministicSparseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .dense_embedder = deterministic_dense.interface(),
+            .sparse_embedder = deterministic_sparse.interface(),
+        },
+    });
+    defer db.close();
+
+    try db.setSchema(.{ .version = 1, .ttl_duration_ns = 60 * std.time.ns_per_s, .ttl_field = "expires" });
+
+    try db.addEnrichment(.{
+        .name = "document_units_v1",
+        .kind = .asset,
+        .field = "url",
+        .content_type = "application/json",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunks_v1",
+        .kind = .chunk,
+        .field = "text",
+        .source_artifact_name = "document_units_v1",
+        .chunk_size = 256,
+    });
+    try db.addEnrichment(.{
+        .name = "document_chunk_dense_v1",
+        .kind = .embedding,
+        .field = "text",
+        .source_artifact_name = "document_chunks_v1",
+        .expected_dims = 3,
+    });
+    try db.addIndex(.{
+        .name = "document_vectors",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"embedding_name\":\"document_chunk_dense_v1\"}",
+    });
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"decoy\",\"expires\":4102444800000000000}" }},
+        .sync_level = .full_index,
+    });
+
+    var hook = PortableRuntimeBatchPrelockTestHook{};
+    test_portable_runtime_batch_prelock_hook = &hook;
+    defer test_portable_runtime_batch_prelock_hook = null;
+
+    // Precompute against the original alpha artifacts, then park before
+    // commit. Both concurrent writes retain the same TTL field value.
+    const Writer = struct {
+        db: *DB,
+        value: []const u8,
+        err: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.db.batch(.{
+                .writes = &.{.{ .key = "doc:a", .value = self.value }},
+                .sync_level = .enrichments,
+            }) catch |err| {
+                self.err = err;
+            };
+        }
+    };
+    var writer_a = Writer{
+        .db = &db,
+        .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\",\"text\":\"decoy\",\"expires\":4102444800000000000}",
+    };
+    const thread_a = try std.Thread.spawn(.{}, Writer.run, .{&writer_a});
+    var joined_a = false;
+    defer if (!joined_a) {
+        hook.release.store(true, .release);
+        thread_a.join();
+    };
+
+    const prelock_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
+    while (!hook.entered.load(.acquire) and monotonicTimeNs() < prelock_deadline) {
+        @import("antfly_platform").time.yieldNow();
+    }
+    try std.testing.expect(hook.entered.load(.acquire));
+
+    // Commit different content for the same key while thread_a is parked.
+    // Clear the hook first so this write is not itself gated by it.
+    test_portable_runtime_batch_prelock_hook = null;
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"url\":\"data:text/plain;base64,YmV0YSBnYW1tYSBkZWx0YQ==\",\"text\":\"decoy\",\"expires\":4102444800000000000}",
+        }},
+        .sync_level = .full_index,
+    });
+
+    // Release thread_a. Its stale pre-lock precompute (built against the
+    // original alpha document) must be detected and retried against the
+    // now-current state, not silently committed on top of it -- which would
+    // either corrupt the generation counter or leave orphaned chunk/embedding
+    // artifacts from the intermediate commit.
+    hook.release.store(true, .release);
+    thread_a.join();
+    joined_a = true;
+    try std.testing.expectEqual(@as(?anyerror, null), writer_a.err);
+
+    const manifest_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "document_units_v1");
+    defer alloc.free(manifest_key);
+    const manifest = try db.core.store.get(alloc, manifest_key);
+    defer alloc.free(manifest);
+
+    const chunk_prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "chunk", "document_chunks_v1");
+    defer alloc.free(chunk_prefix);
+    const chunk_entries = try db.core.store.scanPrefix(alloc, chunk_prefix);
+    defer docstore_mod.DocStore.freeResults(alloc, chunk_entries);
+    var chunk_count: usize = 0;
+    var last_chunk_payload: []const u8 = "";
+    for (chunk_entries) |entry| if (internal_keys.isChunkArtifactRecordKey(entry.key)) {
+        chunk_count += 1;
+        last_chunk_payload = entry.value;
+    };
+    // Exactly one surviving chunk, matching thread_a's final ("alpha beta
+    // gamma") content -- no orphaned chunk from the intermediate ("beta
+    // gamma delta") generation this write raced against.
+    const final_primary = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(final_primary);
+    try std.testing.expect(std.mem.indexOf(u8, final_primary, "YWxwaGEgYmV0YSBnYW1tYQ==") != null);
+    try std.testing.expect(std.mem.indexOf(u8, last_chunk_payload, "alpha beta gamma") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"generation\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"from_generation\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest, "\"to_generation\":3") != null);
+    try std.testing.expectEqual(@as(usize, 1), chunk_count);
+    try std.testing.expect(std.mem.indexOf(u8, last_chunk_payload, "alpha beta gamma") != null);
+}
+
+test "db generated write read fences detect artifact mutations and ABA independently of TTL" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("generated-read-fence");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const writes = &.{types.BatchWrite{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }};
+    try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    var snapshot = try db.captureGeneratedWriteReadSnapshot(alloc, writes);
+    defer snapshot.deinit(alloc);
+
+    // A different document must not cause optimistic retries.
+    try db.batch(.{ .writes = &.{.{ .key = "doc:b", .value = "{}" }}, .timestamp_ns = 42 });
+    try db.validateGeneratedWriteReadSnapshot(snapshot);
+
+    // Artifact-only commits leave both the primary bytes and TTL untouched.
+    const artifact = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "chunks", 0);
+    defer alloc.free(artifact);
+    try db.core.store.put(artifact, "{\"text\":\"beta\"}");
+    try std.testing.expectError(error.PreparedReadSetChanged, db.validateGeneratedWriteReadSnapshot(snapshot));
+
+    snapshot.deinit(alloc);
+    snapshot = try db.captureGeneratedWriteReadSnapshot(alloc, writes);
+    try db.core.store.delete(artifact);
+    try std.testing.expectError(error.PreparedReadSetChanged, db.validateGeneratedWriteReadSnapshot(snapshot));
+
+    snapshot.deinit(alloc);
+    snapshot = try db.captureGeneratedWriteReadSnapshot(alloc, writes);
+    try db.batch(.{ .deletes = &.{"doc:a"}, .timestamp_ns = 42 });
+    try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
+    try std.testing.expectError(error.PreparedReadSetChanged, db.validateGeneratedWriteReadSnapshot(snapshot));
 }

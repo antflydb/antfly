@@ -1571,7 +1571,7 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
             try chunk_capabilities.validateInvocation(.chunk, chunk_shape);
             const result = try state.node.chunkInputDirectWithContext(deadline_ns, alloc, parsed.value.model, input, .{
                 .model = if (cfg.model.len > 0) cfg.model else "fixed",
-                .max_chunks = if (cfg.max_chunks > 0) @intCast(cfg.max_chunks) else 50,
+                .max_chunks = @intCast(cfg.max_chunks), // 0 = unlimited
                 .threshold = cfg.threshold,
                 .text = .{
                     .target_tokens = cfg.defaultedTargetTokens(),

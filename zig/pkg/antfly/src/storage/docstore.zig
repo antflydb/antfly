@@ -506,6 +506,7 @@ pub const DocStore = struct {
         retained: retained_effects.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
+        document_revisions: @import("document_mutation_revision.zig").Capture = .{},
         mutation_capture: ?*@import("txn_mutation_capture.zig").Capture = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
@@ -568,6 +569,7 @@ pub const DocStore = struct {
         pub fn abort(self: *Txn) void {
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
+            self.document_revisions.deinit(self.alloc);
             const reader_owner = self.portable_import_reader_owner;
             const payload_session = self.payload_session;
             defer if (payload_session) |session| session.release();
@@ -597,6 +599,7 @@ pub const DocStore = struct {
                 defer self.retained.staging = false;
                 try self.artifact_inputs.stage(self, self.retained.staged);
                 try self.artifact_footprint.stage(self);
+                try self.document_revisions.stage(self);
             }
             const reader_owner = self.portable_import_reader_owner;
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
@@ -615,6 +618,7 @@ pub const DocStore = struct {
             }
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
+            self.document_revisions.deinit(self.alloc);
             self.* = undefined;
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
             if (reader_owner) |owner| owner.releasePortableImportReader();
@@ -754,6 +758,7 @@ pub const DocStore = struct {
             if (try graphRelationshipRetiredCached(self, self.alloc, key, &self.graph_retirements_maybe)) return;
 
             try maintainGraphIncoming(self, self.alloc, key, value, false, false);
+            try self.document_revisions.touch(self.alloc, key);
             try self.artifact_footprint.touch(key, value);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -777,6 +782,7 @@ pub const DocStore = struct {
                     else => return err,
                 };
             }
+            try self.document_revisions.touch(self.alloc, key);
             try self.artifact_footprint.touch(key, null);
             try self.range_mutation.touch(self, key);
             try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -848,6 +854,7 @@ pub const DocStore = struct {
         retained: retained_effects.Capture = .{},
         artifact_inputs: @import("artifact_input_capture.zig").Capture = .{},
         artifact_footprint: @import("artifact_footprint.zig").Capture = .{},
+        document_revisions: @import("document_mutation_revision.zig").Capture = .{},
         columnar_owner: ?*DocStore = null,
         payload_session: ?*artifact_payload.Session = null,
         alloc: Allocator,
@@ -867,6 +874,7 @@ pub const DocStore = struct {
             retained: *retained_effects.Capture,
             artifact_inputs: *@import("artifact_input_capture.zig").Capture,
             artifact_footprint: *@import("artifact_footprint.zig").Capture,
+            document_revisions: *@import("document_mutation_revision.zig").Capture,
             retained_cache: ?*std.atomic.Value(u8) = null,
             payload_session: ?*artifact_payload.Session = null,
             alloc: Allocator,
@@ -926,6 +934,7 @@ pub const DocStore = struct {
                 if (try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, false, false);
+                try self.document_revisions.touch(self.alloc, key);
                 try self.artifact_footprint.touch(key, value);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, value);
@@ -962,6 +971,7 @@ pub const DocStore = struct {
                 if (!retirement_checked and try graphRelationshipRetiredCached(self, self.alloc, key, self.graph_retirements_maybe)) return;
 
                 try maintainGraphIncoming(self, self.alloc, key, value, true, retirement_checked);
+                try self.document_revisions.touch(self.alloc, key);
                 try self.artifact_footprint.touch(key, value);
                 // Active tracking requires point updates for bucket counters.
                 // Restore bulk writers publish into a fresh identity; they may
@@ -997,6 +1007,7 @@ pub const DocStore = struct {
                         else => return err,
                     };
                 }
+                try self.document_revisions.touch(self.alloc, key);
                 try self.artifact_footprint.touch(key, null);
                 try self.range_mutation.touch(self, key);
                 try self.artifact_inputs.touch(self.alloc, self, key, null);
@@ -1061,6 +1072,7 @@ pub const DocStore = struct {
         pub fn abort(self: *Batch) void {
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
+            self.document_revisions.deinit(self.alloc);
             const payload_session = self.payload_session;
             defer if (payload_session) |session| session.release();
 
@@ -1079,6 +1091,7 @@ pub const DocStore = struct {
                 defer self.retained.staging = false;
                 try self.artifact_inputs.stage(self.asTxn(), self.retained.staged);
                 try self.artifact_footprint.stage(self.asTxn());
+                try self.document_revisions.stage(self.asTxn());
             }
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const payload_session = self.payload_session;
@@ -1094,6 +1107,7 @@ pub const DocStore = struct {
             }
             self.retained.deinit(self.alloc);
             self.artifact_inputs.deinit(self.alloc);
+            self.document_revisions.deinit(self.alloc);
             self.* = undefined;
             if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
         }
@@ -1104,6 +1118,7 @@ pub const DocStore = struct {
                 .retained = &self.retained,
                 .artifact_inputs = &self.artifact_inputs,
                 .artifact_footprint = &self.artifact_footprint,
+                .document_revisions = &self.document_revisions,
                 .retained_cache = if (self.columnar_owner) |owner| &owner.retained_effects_cache else null,
                 .payload_session = self.payload_session,
                 .alloc = self.alloc,

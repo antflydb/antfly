@@ -305,7 +305,12 @@ describe("artifact embedding index configuration", () => {
 });
 
 it("preserves arbitrary fact source and relationship ID", () => {
-  const sources = graphIndexSources({ artifact: "relations", path: "$", nodes: { source: "{{ _item.source }}", target: "{{ _item.target }}" }, edge: { edge_id: "{{ _doc.key }}", type: "RELATES_TO" } });
+  const sources = graphIndexSources({
+    artifact: "relations",
+    path: "$",
+    nodes: { source: "{{ _item.source }}", target: "{{ _item.target }}" },
+    edge: { edge_id: "{{ _doc.key }}", type: "RELATES_TO" },
+  });
   expect(sources[0].nodes?.source).toBe("{{ _item.source }}");
   expect(sources[0].edge?.edge_id).toBe("{{ _doc.key }}");
 });

@@ -318,7 +318,7 @@ test "ordered artifact inventory native census record binds bytes and physical r
 
 test "ordered artifact inventory native census resumes authored inventory and rejects imported flags" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const docstore = @import("../docstore.zig");
     const authored = @import("artifact_authored_acceptance.zig");
     const obligations = @import("artifact_producer_obligations.zig");
