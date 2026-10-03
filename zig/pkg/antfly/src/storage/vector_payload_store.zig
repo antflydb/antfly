@@ -17,6 +17,27 @@ const time = @import("antfly_platform").time;
 const LiveSet = @import("source_vector_live_set.zig").LiveSet;
 const generation_publication = @import("generation_publication.zig");
 
+// Metadata grows with records that actually need appending. Keep superseded
+// buffers out of the payload decode arena and preserve cross-session deduplication.
+const PreparationMetadata = struct {
+    alloc: Allocator,
+    records: std.ArrayListUnmanaged(native.BatchRecord) = .empty,
+    seen: std.AutoHashMapUnmanaged(payload.Digest, void) = .empty,
+
+    fn deinit(self: *@This()) void {
+        self.records.deinit(self.alloc);
+        self.seen.deinit(self.alloc);
+    }
+
+    fn append(self: *@This(), digest: payload.Digest, record: native.BatchRecord) !bool {
+        const entry = try self.seen.getOrPut(self.alloc, digest);
+        if (entry.found_existing) return false;
+        errdefer _ = self.seen.remove(digest);
+        try self.records.append(self.alloc, record);
+        return true;
+    }
+};
+
 pub const Stats = payload.Stats;
 
 // Filled only by the deterministic interleaving test below.
@@ -1706,8 +1727,10 @@ pub const Store = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var records = std.ArrayListUnmanaged(native.BatchRecord).empty;
-        var seen = std.AutoHashMap(payload.Digest, void).init(scratch);
+        var metadata_buffer = std.heap.stackFallback(2048, self.alloc);
+        var metadata: PreparationMetadata = .{ .alloc = metadata_buffer.get() };
+        defer metadata.deinit();
+        const records = &metadata.records;
         const sequence = try std.math.add(u64, self.opened.store.covered_source_sequence, 1);
         var bytes: u64 = 0;
         var added_payloads: u64 = 0;
@@ -1738,23 +1761,15 @@ pub const Store = struct {
                     }
                 } else continue;
             }
-            if (records.capacity == 0) {
-                // Arena growth retains superseded buffers until the batch ends.
-                // Reserve once, after skipping already durable payloads, so an
-                // idempotent retry does not allocate unused batch bookkeeping.
-                const remaining = prepared.len - item_index;
-                try records.ensureTotalCapacityPrecise(scratch, remaining);
-                try seen.ensureTotalCapacity(std.math.cast(u32, remaining) orelse return error.Overflow);
-            }
-            if ((try seen.getOrPut(item.reference.digest)).found_existing) continue;
+            if (metadata.seen.contains(item.reference.digest)) continue;
             const vector = if (decoded) |vectors| vectors[item_index] else (try codec.denseEmbeddingVectorView(item.artifact)) orelse try codec.decodeDenseEmbeddingAlloc(scratch, item.artifact);
-            try records.append(scratch, .{
+            if (!try metadata.append(item.reference.digest, .{
                 .kind = .upsert,
                 .key = &item.reference.digest,
                 .source_sequence = sequence,
                 .revision = 1,
                 .vector = vector,
-            });
+            })) continue;
             bytes += vector.len * 4;
             if (found != .vector) {
                 added_payloads += 1;
@@ -6722,4 +6737,57 @@ test "source vector payloads detached reader failure retains authority and retri
     while (!try source.collectStep(&raw, 1)) {}
     try source.advanceCollectionReaders();
     try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+}
+
+fn preparationMetadataFailures(alloc: Allocator) !void {
+    var buffer = std.heap.stackFallback(2048, alloc);
+    var metadata: PreparationMetadata = .{ .alloc = buffer.get() };
+    defer metadata.deinit();
+    for (0..128) |i| {
+        var digest: payload.Digest = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], i, .little);
+        try std.testing.expect(try metadata.append(digest, .{ .kind = .upsert, .key = "key", .source_sequence = 1, .revision = 1 }));
+        try std.testing.expect(!try metadata.append(digest, .{ .kind = .upsert, .key = "duplicate", .source_sequence = 2, .revision = 2 }));
+    }
+    try std.testing.expectEqual(@as(usize, 128), metadata.records.items.len);
+}
+
+test "source vector payloads preparation metadata grows only with eligible unique records" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var buffer = std.heap.stackFallback(2048, failing.allocator());
+    var metadata: PreparationMetadata = .{ .alloc = buffer.get() };
+    defer metadata.deinit();
+    try std.testing.expect(try metadata.append(@splat(0), .{ .kind = .upsert, .key = "one", .source_sequence = 1, .revision = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), metadata.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, preparationMetadataFailures, .{});
+}
+
+test "source vector payloads mixed retry appends only missing records and deduplicates grouped requests" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/mixed-preparation", false);
+    defer store.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 17, &.{ 0.5, 0.25 });
+    defer alloc.free(artifact);
+    var prepared: [130]payload.Prepared = undefined;
+    for (prepared[0..129], 0..) |*item, i| {
+        var name: [32]u8 = undefined;
+        const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&name, "document-{d}", .{i}), "model");
+        defer alloc.free(key);
+        item.* = .{ .reference = try payload.Reference.forArtifact(key, artifact), .artifact = artifact };
+    }
+    try store.prepareBatch(prepared[1..129]);
+    const previous = store.stats.prepared_payloads;
+    prepared[129] = prepared[0];
+    try store.prepareBatch(&prepared);
+    try std.testing.expectEqual(previous + 1, store.stats.prepared_payloads);
+    try store.prepareBatch(&prepared);
+    try std.testing.expectEqual(previous + 1, store.stats.prepared_payloads);
+    for (&prepared) |item| {
+        const found = try store.opened.get(&item.reference.digest, std.math.maxInt(u64), null);
+        try std.testing.expect(found == .vector);
+        try std.testing.expectEqual(@as(u32, 2), found.vector.dims);
+    }
 }

@@ -162,7 +162,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_allocation_tests = b.addTest(.{
         .root_module = replay_allocation_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "storage.db.derived.", "lookup scratch", "replay batcher", "dense replay preserves", "sparse replay preserves" },
+        .filters = &.{ "storage.db.derived.", "lookup scratch", "document read scratch", "replay batcher", "dense replay preserves", "sparse replay preserves" },
     });
     b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
         .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
@@ -5563,6 +5563,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&b.addInstallArtifact(document_lookup_bench, .{ .dest_sub_path = "document-lookup-bench" }).step);
 
     const replay_document_integration_filters = [_][]const u8{
+        "document collectors release",
         "collectDocumentWrites batches sorted document reads",
         "collectDocumentWrites skips missing out-of-range",
         "db reopens persisted index catalog and text index",
@@ -5583,8 +5584,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_document_integration_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &replay_document_integration_filters,
-        // Broad DB codegen peaked at 12.04 GB on macOS during validation.
-        .max_rss = 12 * 1024 * 1024 * 1024,
+        // DB codegen including collector failure sweeps peaked at 14.21 GB
+        // on macOS. Keep the declared bound above the measured requirement.
+        .max_rss = 14 * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("replay-document-integration-test", "Verify replay consumers across text, algebraic, graph and document bodies")
@@ -5998,6 +6000,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.backfill_state.",
             "storage.db.batcher.",
             "storage.db.lookup_key_scratch.",
+            "storage.db.document_read_scratch.",
             "storage.db.config.",
             "storage.db.apply_receipts.",
             "storage.db.durable_outbox.",
