@@ -14,7 +14,10 @@ parser.add_argument("--model-dir", type=Path, required=True)
 parser.add_argument("--device", choices=["cpu", "cuda"], required=True)
 parser.add_argument("--warmup", type=int, default=3)
 parser.add_argument("--reps", type=int, default=20)
+parser.add_argument("--threads", type=int, default=2)
 args = parser.parse_args()
+if not 1 <= args.threads <= 8 or not 3 <= args.reps <= 1000 or not 0 <= args.warmup <= 100:
+    parser.error("threads must be 1..8, reps 3..1000, warmup 0..100")
 weight = args.model_dir / "model.safetensors"
 if weight.stat().st_size != 1_945_828_140:
     raise RuntimeError("Decide checkpoint size mismatch")
@@ -36,7 +39,8 @@ from gliner2.classification.scoring import ClassificationScorer
 
 if args.device == "cuda" and not torch.cuda.is_available():
     raise RuntimeError("CUDA unavailable")
-torch.set_num_threads(2)
+torch.set_num_threads(args.threads)
+torch.set_num_interop_threads(1)
 model = AutoExtractor.from_pretrained(str(args.model_dir), map_location=args.device)
 model.eval()
 scorer = ClassificationScorer(model, device=args.device, dtype=torch.float32).eval()
