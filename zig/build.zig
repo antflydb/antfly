@@ -810,6 +810,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     runtime_fs_mod.addImport("antfly_platform", platform_mod);
+    // usermgr/user_manager.zig and the storage it transitively reaches need
+    // these three ABI modules, which usermgr_mod didn't declare.
+    usermgr_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    usermgr_mod.addImport("antfly_cache_budget", cache_budget_mod);
+    usermgr_mod.addImport("antfly_runtime_fs", runtime_fs_mod);
     const provision_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/metadata/provision_contract.zig"),
         .target = target,

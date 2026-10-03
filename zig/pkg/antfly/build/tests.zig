@@ -5219,6 +5219,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     db_test_mod.addImport("antfly_schema_openapi", antfly_imports.schema_openapi);
     antfly_imports.storage_boundary.configureSources(db_test_mod, false, false);
     db_test_mod.addImport("runtime_failure_abi", antfly_imports.storage_boundary.failure);
+    db_test_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    db_test_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
+    db_test_mod.addImport("antfly_template_content", antfly_imports.template_content);
+    db_test_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    db_test_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
+    db_test_mod.addImport("antfly_inference_execution_context", antfly_imports.inference_execution_context);
+    db_test_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
+    db_test_mod.addImport("antfly_sparse_embedding", antfly_imports.sparse_embedding);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
@@ -5832,6 +5840,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
     antfly_imports.configureRuntimeContracts(sparse_test_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
+    sparse_test_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
+    sparse_test_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
+    sparse_test_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    sparse_test_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
     // Sparse lifecycle tests reach BackendRuntime through shared storage code;
     // its lazy PDF lane is part of that module graph even when the test itself
     // does not render a document.
