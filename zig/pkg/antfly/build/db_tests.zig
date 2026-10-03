@@ -595,7 +595,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "stored structured filters preserve one-key field name collisions",
             "pattern bool filter preserves explicit minimum should match",
             "native dense constraints fail closed without ordinal vector mapping",
-            "buildPatternDocumentHits preserves resolved binding ordinals",
             "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents",
             "executeSearchGraphWithSets preserves node ordinals",
             "cloneNamedSetAsResult preserves hit ordinals",
