@@ -51,7 +51,7 @@ pub fn require(txn: anytype, kind: Kind, namespace: [24]u8) !State {
 }
 
 fn requireNoRaftMarker(txn: anytype) !void {
-    const marker = txn.get(&keys.raft_document_applied_entry_key) catch |err| switch (err) {
+    const marker = txn.get(&keys.ordered_document_applied_entry_key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };

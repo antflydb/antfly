@@ -270,7 +270,7 @@ pub fn layerNorm(
         while (i + VEC_LEN <= dim) : (i += VEC_LEN) {
             const v: F32xN = row[i..][0..VEC_LEN].*;
             sum_acc += v;
-            sumsq_acc = @mulAdd(F32xN, v, v, sumsq_acc);
+            sumsq_acc = linalg_primitives.mulAdd(F32xN, v, v, sumsq_acc);
         }
         var sum: f32 = @reduce(.Add, sum_acc);
         var sumsq: f32 = @reduce(.Add, sumsq_acc);
@@ -294,7 +294,7 @@ pub fn layerNorm(
             const g: F32xN = gamma[i..][0..VEC_LEN].*;
             const bt: F32xN = beta[i..][0..VEC_LEN].*;
             const scale = g * inv_std_splat;
-            row[i..][0..VEC_LEN].* = @mulAdd(F32xN, v - mean_splat, scale, bt);
+            row[i..][0..VEC_LEN].* = linalg_primitives.mulAdd(F32xN, v - mean_splat, scale, bt);
         }
         while (i < dim) : (i += 1) {
             row[i] = gamma[i] * (row[i] - mean) * inv_std + beta[i];

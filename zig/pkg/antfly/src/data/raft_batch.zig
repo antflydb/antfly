@@ -232,7 +232,7 @@ fn consumerTests() type {
             try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
             try std.testing.expect(merge_page_protocol_version > merge_copy_attempt_protocol_version);
             try std.testing.expect(source_scope_protocol_version > relational_transfer_protocol_version);
-            try std.testing.expectEqual(protocol_version, artifact_catalog_protocol_version);
+            try std.testing.expect(protocol_version >= artifact_catalog_protocol_version);
             try std.testing.expect(protocol_version >= acknowledge_many_protocol_version);
             try std.testing.expect(acknowledge_many_protocol_version > source_scope_protocol_version);
             try std.testing.expectEqual(source_scope_protocol_version, source_pin_protocol_version);
@@ -253,6 +253,17 @@ fn consumerTests() type {
             defer decoded.deinit(std.testing.allocator);
             try std.testing.expectEqual(timestamp_protocol_version, decoded.protocol_barrier_version.?);
             try std.testing.expectEqual(@as(usize, 0), decoded.batch.req.writes.len);
+
+            // Feature activation versions are persisted independently of the
+            // latest advertised decoder version. Keep older barriers readable
+            // as new features advance that maximum.
+            for ([_]u16{ artifact_catalog_protocol_version, merge_proof_adoption_protocol_version, protocol_version }) |version| {
+                const barrier = try encodeProtocolBarrier(std.testing.allocator, "docs", version);
+                defer std.testing.allocator.free(barrier);
+                var feature = try decode(std.testing.allocator, barrier);
+                defer feature.deinit(std.testing.allocator);
+                try std.testing.expectEqual(version, feature.protocol_barrier_version.?);
+            }
         }
 
         test "raft protocol barrier rejects unsupported future versions" {

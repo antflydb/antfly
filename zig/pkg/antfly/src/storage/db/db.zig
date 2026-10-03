@@ -673,26 +673,18 @@ pub const OpenOptions = struct {
     /// `name_embedding` model and the extraction artifact carries no vector.
     /// Caller-owned; must outlive the DB. Null disables backfill.
     resolution_embedder: ?embedder_mod.DenseEmbedder = null,
-    /// Optional mirror for committed derived/change-journal effects into the HA
-    /// replication stream. The default policy is async/best-effort; configuring
-    /// a non-async sync_policy makes normal DB writes evaluate the HA commit
-    /// gate for the appended replication record.
+    /// Optional publication of committed derived/change-journal effects.
+    /// The adapter declares local commit requirements and owns remote policy.
     replication_async_effect_mirror: ?ReplicationAsyncEffectMirror = null,
-    /// Optional mirror for committed user batch mutations into the HA
-    /// replication stream. This emits versioned `batch_mutation` envelopes for
-    /// catch-up/read-replica apply and can be paired with sync_policy for
-    /// remote-write/remote-apply gate decisions.
+    /// Optional publication of committed user batch mutations, using versioned
+    /// batch_mutation envelopes for replay. Completion is an adapter callback.
     replication_async_batch_mirror: ?ReplicationAsyncBatchMirror = null,
-    /// Optional mirror for committed metadata/catalog changes into the HA
-    /// replication stream. The initial metadata mutation payload covers table
-    /// schema changes; additional catalog mutation kinds should be nested under
-    /// the stable HA `metadata_mutation` envelope.
+    /// Optional publication of committed metadata/catalog changes, using the
+    /// stable metadata_mutation envelope.
     replication_async_metadata_mirror: ?ReplicationAsyncMetadataMirror = null,
-    /// Optional HA write ownership gate. Client/API writes are allowed only
-    /// when this DB is attached to the current HA primary. Standby apply paths
-    /// must use replicated-apply entry points that explicitly bypass this
-    /// client-write guard. A standby gate also suppresses mutating background
-    /// runtimes at open, even if the generic runtime defaults are enabled.
+    /// Borrowed write admission. Replicated apply explicitly bypasses this
+    /// client guard; the adapter also decides whether mutating background work
+    /// may start, independently of the DB's requested runtime defaults.
     replication_write_gate: ?ReplicationWriteGate = null,
     /// Bounded stall guard for the foreground `runUntilIdle` drain (Lite's
     /// synchronous ingest drain, in particular): if a managed derived index
@@ -791,7 +783,6 @@ test "uninstalled enrichment config releases owned chunk provider routing" {
 }
 
 pub const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
-pub const ReplicationSyncWaitFn = replication_contract.SyncWaitFn;
 
 const ReplicationDeferredCommitGate = replication_commit.ReplicationDeferredCommitGate;
 
@@ -802,14 +793,8 @@ pub const ReplicationAsyncMetadataMirror = replication_contract.AsyncMetadataMir
 pub const SharedReplicationWriteGate = replication_contract.SharedWriteGate;
 pub const ReplicationWriteGate = replication_contract.WriteGate;
 
-fn replicationWriteGateIsStandby(gate: ?ReplicationWriteGate) bool {
-    const configured = gate orelse return false;
-    return switch (configured) {
-        .primary => false,
-        .fenced_primary => false,
-        .standby => true,
-        .shared => |shared| shared.state.isStandbyRole(),
-    };
+fn replicationWriteGateAllowsBackgroundWork(gate: ?ReplicationWriteGate) bool {
+    return if (gate) |configured| configured.allowsBackgroundWork() else true;
 }
 
 pub const ReplayProgress = struct {
@@ -3142,7 +3127,7 @@ const BatchExecutionOptions = struct {
     bypass_replication_write_gate: bool = false,
     replication_applied_lsn_marker: ?u64 = null,
     online_source_applied_index: ?u64 = null,
-    raft_applied_entry_marker: ?OrderedApplyReceipt = null,
+    ordered_apply_receipt: ?OrderedApplyReceipt = null,
     /// Metadata-authorized native hidden-child receipt identity. Never
     /// writes the data-Raft watermark into a native source-authority root.
     native_initial_child_entry: ?OrderedApplyReceipt = null,
@@ -3160,7 +3145,6 @@ const BatchExecutionOptions = struct {
 };
 
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 
 const ordered_apply_receipt_value_len = apply_receipts.ordered_apply_receipt_value_len;
 
@@ -5586,7 +5570,7 @@ pub const DB = struct {
     fn enforceReplicationWriteGate(self: anytype) !void {
         try self.enforcePortableRuntimeGate();
         try enforceReplicationWriteGateOptional(self.local_execution.replication_write_gate);
-        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
     }
 
     /// Keep unavailable work out of lock queues, then revalidate after acquiring
@@ -5977,12 +5961,12 @@ pub const DB = struct {
         // not silently discard it if a restart temporarily removes or
         // downgrades the corresponding mirror configuration.
         if (outbox.batch_payload != null) {
-            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
         }
         if (outbox.replay_payload != null) {
-            const mirror = self.local_execution.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorSyncEnabled(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorSyncEnabled(mirror)) return error.ReplicationPublisherUnavailable;
         }
         try self.enforceReplicationWriteGate();
         var ctx = self.batchContext();
@@ -6080,16 +6064,16 @@ pub const DB = struct {
         const schema_outbox = if (schema_raw) |raw| try decodeDurableReplicationOutbox(raw) else null;
 
         if (batch_outbox != null) {
-            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
         }
         if (replay_outbox != null) {
-            const mirror = self.local_execution.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
         }
         if (schema_outbox != null) {
-            const mirror = self.local_execution.replication_async_metadata_mirror orelse return error.HAMirrorUnavailable;
-            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_metadata_mirror orelse return error.ReplicationPublisherUnavailable;
+            if (!replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
         }
         // Recovery delivers the unlogged effect that closes foreground writes.
         try self.enforcePortableRuntimeGate();
@@ -6118,8 +6102,8 @@ pub const DB = struct {
                 .batch, .restore_batch => self.local_execution.replication_async_batch_mirror,
                 .replay, .primary_effect => self.local_execution.replication_async_effect_mirror,
                 .schema, .row_policy => self.local_execution.replication_async_metadata_mirror,
-            } orelse return error.HAMirrorUnavailable;
-            if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.HAMirrorUnavailable;
+            } orelse return error.ReplicationPublisherUnavailable;
+            if (kind != .restore_batch and kind != .primary_effect and kind != .row_policy and !replicationMirrorRequiresDurableOutbox(mirror)) return error.ReplicationPublisherUnavailable;
             var ctx = self.batchContext();
             try recoverDurableReplicationOutboxContext(&ctx, mirror, outbox, kind);
             // The key names this exact mutation, so concurrent publishers cannot
@@ -6464,8 +6448,8 @@ pub const DB = struct {
                 .lsm_memory => |*lsm_opts| lsm_opts.background_executor = null,
                 .mem => {},
             }
-            const replication_standby_role = replicationWriteGateIsStandby(replication_write_gate);
-            const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and !replication_standby_role;
+            const background_work_allowed = replicationWriteGateAllowsBackgroundWork(replication_write_gate);
+            const start_index_workers = opts.open_mode.allowsIndexWorkers() and opts.start_index_workers and background_work_allowed;
 
             core_owner.* = try db_core.DBCore.fromOpened(
                 alloc,
@@ -6687,7 +6671,7 @@ pub const DB = struct {
                 if (graph_retirement.intent != null)
                     db.core.index_manager.setGraphRetirementAdmissionAssumeCatalogLock(false);
             }
-            const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and !replication_standby_role;
+            const optional_runtimes_initialized = opts.open_mode.allowsOptionalRuntimes() and opts.start_optional_runtimes and background_work_allowed;
             const optional_runtime_workers_enabled = optional_runtimes_initialized and opts.start_optional_runtime_workers;
             db.local_execution.optional_runtime_workers_enabled = optional_runtime_workers_enabled;
             if (optional_runtimes_initialized) {
@@ -9905,7 +9889,7 @@ pub const DB = struct {
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_replication_write_gate = bypass_write_gate,
-            .raft_applied_entry_marker = identity,
+            .ordered_apply_receipt = identity,
         });
     }
 
@@ -9914,7 +9898,7 @@ pub const DB = struct {
             .validate_range_ownership = false,
             .wait_for_sync_level = false,
             .bypass_replication_write_gate = bypass_write_gate,
-            .raft_applied_entry_marker = identity,
+            .ordered_apply_receipt = identity,
         });
     }
 
@@ -10102,7 +10086,7 @@ pub const DB = struct {
         if (identity) |entry| try metadata_writes.append(self.alloc, orderedApplyReceiptWrite(entry, &marker_buf));
         if (replication_lsn) |lsn| try metadata_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_marker_buf));
         if (replication_payload) |payload| {
-            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
             const from_lsn = mirror.publisher.nextLsn();
             outbox_value = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
             outbox_key = try durableReplicationOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
@@ -10391,12 +10375,12 @@ pub const DB = struct {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         if (identity.term == 0 or identity.index == 0 or (replication_lsn != null and replication_lsn.? == 0)) return error.InvalidRowPolicyPublication;
         if (replication_lsn == null and self.local_execution.replication_async_metadata_mirror == null and
-            (self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_write_gate != null)) return error.HAMirrorUnavailable;
+            (self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_write_gate != null)) return error.ReplicationPublisherUnavailable;
         // The policy cut must be serialized with all in-flight primary writes,
         // including writers that passed their fast outbox preflight already.
         // Production HA mirrors share this capture barrier with every mutation.
         if (replication_lsn == null) if (self.local_execution.replication_async_metadata_mirror) |mirror|
-            if (mirror.mutation_barrier == null) return error.HAMirrorUnavailable;
+            if (mirror.mutation_barrier == null) return error.ReplicationPublisherUnavailable;
         var replication_mutation: ?MutationBarrier.ExclusiveLease = null;
         defer if (replication_mutation) |*lease| lease.release();
         if (replication_lsn == null) {
@@ -10633,7 +10617,7 @@ pub const DB = struct {
     pub fn clearOrderedApplyReceipt(self: *DB) !void {
         lockApply(self);
         defer self.core.unlockApply();
-        try self.core.store.putBatch(&.{}, &.{internal_keys.raft_document_applied_entry_key[0..]});
+        try self.core.store.putBatch(&.{}, &.{internal_keys.ordered_document_applied_entry_key[0..]});
     }
 
     fn batchReplicatedApplyWithMarker(self: *DB, req: types.BatchRequest, applied_lsn_marker: ?u64) anyerror!void {
@@ -10836,7 +10820,7 @@ pub const DB = struct {
         };
         switch (mutation.receipt) {
             .native => |position| options.native_topology_position = position,
-            .ordered => |entry| options.raft_applied_entry_marker = entry,
+            .ordered => |entry| options.ordered_apply_receipt = entry,
             .online_source => |index| {
                 request.sync_level = .write;
                 options.online_source_applied_index = index;
@@ -11098,7 +11082,7 @@ pub const DB = struct {
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
-        const trusted_replay = opts.raft_applied_entry_marker != null or opts.native_initial_child_entry != null or opts.replication_applied_lsn_marker != null;
+        const trusted_replay = opts.ordered_apply_receipt != null or opts.native_initial_child_entry != null or opts.replication_applied_lsn_marker != null;
         if (!trusted_replay) try self.maybeFinalizePendingRowPolicyPublication();
         if (req.row_policy_principal_proof.len != 0) {
             if (req.row_policy_admitted_at_seconds <= 0 or req.row_policy_database.len == 0 or
@@ -11525,7 +11509,7 @@ pub const DB = struct {
         // schema or its durable catalog.
         const request_schema_binding: ?transactions_mod.SchemaBinding = if (opts.transaction_resolution) |resolution|
             resolution.schema_binding
-        else if (opts.raft_applied_entry_marker != null and req.relational_schema_version != null)
+        else if (opts.ordered_apply_receipt != null and req.relational_schema_version != null)
             .{ .version = req.relational_schema_version }
         else
             null;
@@ -11564,7 +11548,7 @@ pub const DB = struct {
         defer if (prepared_index_keys) |*keys| keys.deinit();
         if (relational_index_snapshot) |index_snapshot| {
             const view = request_schema_view orelse return error.PreparedGenerationChanged;
-            if (index_snapshot.plan.schemaView().epoch != view.epoch and opts.raft_applied_entry_marker == null)
+            if (index_snapshot.plan.schemaView().epoch != view.epoch and opts.ordered_apply_receipt == null)
                 return error.PreparedGenerationChanged;
         }
         var index_writer = relational_index_records.Writer.init(preparation_alloc);
@@ -11764,11 +11748,11 @@ pub const DB = struct {
         // walking and encoding every document in a large request.
         var preencoded_replication_batch_payload: ?[]u8 = null;
         defer if (preencoded_replication_batch_payload) |payload| preparation_alloc.free(payload);
-        const scoped_restore_ha = opts.restore_staging != null or replication_contract.requiresDurableLifecycleReplication(effective_req);
+        const scoped_replication = opts.restore_staging != null or replication_contract.requiresDurableLifecycleReplication(effective_req);
         if (!opts.bypass_replication_write_gate) if (self.local_execution.replication_async_batch_mirror) |mirror| {
             preencoded_replication_batch_payload = (if (req.artifact_catalog != null)
-                replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand)
-            else if (opts.raft_applied_entry_marker) |entry|
+                replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(preparation_alloc, req, opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand)
+            else if (opts.ordered_apply_receipt) |entry|
                 replication_effects_mod.encodeRaftBatchMutationRequestAlloc(preparation_alloc, opts.restore_replication_request orelse effective_req, entry)
             else
                 replication_effects_mod.encodeBatchMutationRequestAlloc(preparation_alloc, opts.restore_replication_request orelse effective_req)) catch |err| blk: {
@@ -11776,7 +11760,7 @@ pub const DB = struct {
                 // Non-resource encoding failures retain best-effort async
                 // behavior. Admission failures must never retry allocation
                 // uncharged after commit.
-                if (scoped_restore_ha or replicationMirrorSyncEnabled(mirror)) return err;
+                if (scoped_replication or replicationMirrorSyncEnabled(mirror)) return err;
                 break :blk null;
             };
         };
@@ -11867,7 +11851,7 @@ pub const DB = struct {
             }
         }
 
-        if (opts.raft_applied_entry_marker) |identity| {
+        if (opts.ordered_apply_receipt) |identity| {
             switch (try orderedApplyDisposition(
                 try readOrderedApplyReceipt(self.alloc, self.core.store),
                 identity,
@@ -11899,7 +11883,7 @@ pub const DB = struct {
                 if (!opts.bypass_replication_write_gate) return error.MergeCopyFenced;
                 // A delayed committed command must advance the receipt without
                 // touching documents, artifacts, indexes or visibility state.
-                if (opts.raft_applied_entry_marker) |identity| {
+                if (opts.ordered_apply_receipt) |identity| {
                     var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
                     try self.core.store.putBatch(&.{orderedApplyReceiptWrite(identity, &marker_buf)}, &.{});
                 }
@@ -11927,7 +11911,7 @@ pub const DB = struct {
                             var count: usize = 0;
                             var raft_buffer: [ordered_apply_receipt_value_len]u8 = undefined;
                             var standby_buffer: [replication_applied_lsn_value_len]u8 = undefined;
-                            if (opts.raft_applied_entry_marker) |identity| {
+                            if (opts.ordered_apply_receipt) |identity| {
                                 marker_writes[count] = orderedApplyReceiptWrite(identity, &raft_buffer);
                                 count += 1;
                             }
@@ -12037,7 +12021,7 @@ pub const DB = struct {
                 // receipt and coordinator acknowledgement must still commit in
                 // the same terminal batch before Raft advances this entry.
                 var raft_marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-                const completion_writes: []const docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
+                const completion_writes: []const docstore_mod.KVPair = if (opts.ordered_apply_receipt) |identity|
                     &.{orderedApplyReceiptWrite(identity, &raft_marker_value_buf)}
                 else
                     &.{};
@@ -12081,7 +12065,7 @@ pub const DB = struct {
         // including ordinary graph writes and document/relational deletes.
         // Coalescer flushing above may run nested visibility waits, so acquire
         // only after it finishes, without retaining a catalog lease.
-        if (!opts.bypass_replication_write_gate and self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (!opts.bypass_replication_write_gate and self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         var graph_publication = if (self.core.index_manager.hasGraphIndexes())
             self.core.index_manager.beginGraphPrimaryMutation()
         else
@@ -12794,7 +12778,7 @@ pub const DB = struct {
         // derived replay and page-receipt transaction as ordinary artifacts.
         var transferred_artifact_position_bytes: [@import("artifact_publication.zig").Position.encoded_len]u8 = undefined;
         if (transferred_artifacts.len != 0) {
-            const entry = opts.raft_applied_entry_marker orelse return error.InvalidMergePage;
+            const entry = opts.ordered_apply_receipt orelse return error.InvalidMergePage;
             transferred_artifact_position_bytes = try (@import("artifact_publication.zig").Position{ .raft = .{ .term = entry.term, .index = entry.index } }).encode();
         }
         var receiver_artifact_namespace: @import("artifact_publication.zig").Namespace = undefined;
@@ -12997,7 +12981,7 @@ pub const DB = struct {
             opts.extra_store_writes.len == 0 and
             opts.transaction_resolution == null and
             opts.replication_applied_lsn_marker == null and
-            opts.raft_applied_entry_marker == null and
+            opts.ordered_apply_receipt == null and
             !thinReplayInputsHaveDerivedWork(
                 effective_req,
                 deleted_artifact_keys,
@@ -13192,9 +13176,9 @@ pub const DB = struct {
         var durable_replication_replay_payload: ?[]u8 = null;
         var durable_replication_batch_outbox_key: ?[]const u8 = null;
         var durable_replication_replay_outbox_key: ?[]const u8 = null;
-        if (!opts.bypass_replication_write_gate and (opts.transaction_resolution == null or scoped_restore_ha)) {
-            if (self.local_execution.replication_async_batch_mirror) |mirror| if (scoped_restore_ha or replicationMirrorRequiresDurableOutbox(mirror)) {
-                const payload = preencoded_replication_batch_payload orelse return error.HAMirrorUnavailable;
+        if (!opts.bypass_replication_write_gate and (opts.transaction_resolution == null or scoped_replication)) {
+            if (self.local_execution.replication_async_batch_mirror) |mirror| if (scoped_replication or replicationMirrorRequiresDurableOutbox(mirror)) {
+                const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                 const from_lsn = mirror.publisher.nextLsn();
                 const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
@@ -13203,7 +13187,7 @@ pub const DB = struct {
                 };
                 const outbox_key = try durableReplicationOutboxKeyAlloc(
                     self.alloc,
-                    if (scoped_restore_ha) .restore_batch else .batch,
+                    if (scoped_replication) .restore_batch else .batch,
                     from_lsn,
                     self.core.root_generation,
                     outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len],
@@ -13216,7 +13200,7 @@ pub const DB = struct {
                 durable_replication_batch_payload = outbox[replication_outbox_header_len .. outbox.len - replication_outbox_checksum_len];
                 durable_replication_batch_outbox_key = outbox_key;
             };
-            if (append_derived_replay and !scoped_restore_ha) if (self.local_execution.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
+            if (append_derived_replay and !scoped_replication) if (self.local_execution.replication_async_effect_mirror) |mirror| if (replicationMirrorRequiresDurableOutbox(mirror)) {
                 const from_lsn = mirror.publisher.nextLsn();
                 const outbox = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, replay_payload);
                 owned_store_values.append(self.alloc, outbox) catch |err| {
@@ -13255,16 +13239,16 @@ pub const DB = struct {
                 try store_writes.append(self.alloc, replicationAppliedSequenceWrite(lsn, &replication_applied_lsn_value_buf));
             }
         }
-        var raft_applied_entry_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-        const raft_applied_entry_write: ?docstore_mod.KVPair = if (opts.raft_applied_entry_marker) |identity|
-            orderedApplyReceiptWrite(identity, &raft_applied_entry_value_buf)
+        var ordered_apply_receipt_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+        const ordered_apply_receipt_write: ?docstore_mod.KVPair = if (opts.ordered_apply_receipt) |identity|
+            orderedApplyReceiptWrite(identity, &ordered_apply_receipt_value_buf)
         else
             null;
         // A transaction resolution owns a second idempotency boundary: normal
         // document writes must not be replayed once its decision is terminal,
         // while the command receipt and participant acknowledgement still
         // must be completed. Keep those completion writes separate.
-        if (raft_applied_entry_write) |write| {
+        if (ordered_apply_receipt_write) |write| {
             if (opts.transaction_resolution == null) try store_writes.append(self.alloc, write);
         }
         var split_range_value: ?[]u8 = null;
@@ -13279,7 +13263,7 @@ pub const DB = struct {
         var ordered_artifact_value: ?[]u8 = null;
         defer if (ordered_artifact_value) |value| self.alloc.free(value);
         if (req.artifact_catalog) |command| {
-            const entry = opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand;
+            const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             if (!std.mem.eql(u8, &command.namespace, &@import("online_source_contract.zig").namespaceBytes(self.core.identity_namespace))) return error.IdentityNamespaceMismatch;
@@ -13501,9 +13485,9 @@ pub const DB = struct {
         // data from already-deleted intents.
         var transaction_replication_batch_payload: ?[]const u8 = null;
         var transaction_replication_replay_payload: ?[]const u8 = null;
-        if (opts.transaction_resolution) |resolution| if (!opts.bypass_replication_write_gate and !scoped_restore_ha) {
+        if (opts.transaction_resolution) |resolution| if (!opts.bypass_replication_write_gate and !scoped_replication) {
             if (self.local_execution.replication_async_batch_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
-                const payload = preencoded_replication_batch_payload orelse return error.HAMirrorUnavailable;
+                const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                 // The outbox borrows the request-owned buffer through commit
                 // and the HA wait; keep its original budgeted owner intact.
                 const key_array = transactions_mod.makeTransactionReplicationBatchOutboxKey(resolution.txn_id);
@@ -13572,7 +13556,7 @@ pub const DB = struct {
                     .expected_intent_revision = resolution.expected_intent_revision,
                     .known_intent_keys = resolution.intent_keys,
                     .skip_all_intent_application = relationalColumns(self) != null,
-                    .completion_writes = if (raft_applied_entry_write) |write| &.{write} else &.{},
+                    .completion_writes = if (ordered_apply_receipt_write) |write| &.{write} else &.{},
                     .resolved_participant = resolution.resolved_participant,
                 },
             );
@@ -13614,7 +13598,7 @@ pub const DB = struct {
             if (transaction_replication_batch_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
             } else if (durable_replication_batch_payload) |payload| {
-                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_restore_ha));
+                deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContextStrict(&replication_ctx, payload, scoped_replication));
             } else if (preencoded_replication_batch_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationEncodedBatchMutationCommitLockedContext(&replication_ctx, payload));
             } else deferred_replication_gates.append(try appendReplicationBatchMutationCommitLockedContext(&replication_ctx, effective_req));
@@ -13622,7 +13606,7 @@ pub const DB = struct {
                 deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
             } else if (durable_replication_replay_payload) |payload| {
                 deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, payload));
-            } else if (append_derived_replay and !scoped_restore_ha) deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, replay_payload));
+            } else if (append_derived_replay and !scoped_replication) deferred_replication_gates.append(try appendReplicationReplayPayloadCommitLockedContext(&replication_ctx, replay_payload));
         }
         if (opts.committed_batch_effects_observer) |observer| {
             try observer.observe(if (append_derived_replay) replay_payload else "");
@@ -28698,7 +28682,7 @@ pub const DB = struct {
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         try self.enforceVectorMigrationConfigurationGate();
         const reconciled_row_count = try self.validateStorageModeCompatibilityLocked(table_schema);
         if (durable_replication_schema_outbox_key != null) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
@@ -28949,7 +28933,7 @@ pub const DB = struct {
         schema_json_digest: [32]u8,
         before_catalog_digest: [32]u8,
         after_catalog_digest: [32]u8,
-        raft_entry: OrderedApplyReceipt,
+        ordered_receipt: OrderedApplyReceipt,
         native: bool = false,
     };
 
@@ -28961,7 +28945,7 @@ pub const DB = struct {
         schema_digest: [32]u8,
         public_schema_json_digest: [32]u8,
         catalog_digest: [32]u8,
-        raft_entry: OrderedApplyReceipt,
+        ordered_receipt: OrderedApplyReceipt,
         native: bool = false,
     };
 
@@ -28988,7 +28972,7 @@ pub const DB = struct {
             return error.InvalidInitialChildPublication;
         const replay = if (input.native)
             try self.core.getStoreValue(self.alloc, hidden.key)
-        else if (try self.orderedMutationAlreadyApplied(input.raft_entry))
+        else if (try self.orderedMutationAlreadyApplied(input.ordered_receipt))
             (try self.core.getStoreValue(self.alloc, hidden.key)) orelse return error.InitialChildPublicationChanged
         else
             null;
@@ -29001,7 +28985,7 @@ pub const DB = struct {
                 !std.mem.eql(u8, &prior.schema_digest, &input.schema_digest) or
                 !std.mem.eql(u8, &prior.public_schema_json_digest, &input.public_schema_json_digest) or
                 !std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) or
-                prior.provision_term != input.raft_entry.term or prior.provision_index != input.raft_entry.index)
+                prior.provision_term != input.ordered_receipt.term or prior.provision_index != input.ordered_receipt.index)
                 return error.InitialChildPublicationChanged;
             if (replication_lsn) |lsn| try self.recordReplicationApplied(lsn);
             return;
@@ -29037,12 +29021,12 @@ pub const DB = struct {
             .schema_digest = input.schema_digest,
             .public_schema_json_digest = input.public_schema_json_digest,
             .catalog_digest = input.catalog_digest,
-            .provision_term = input.raft_entry.term,
-            .provision_index = input.raft_entry.index,
+            .provision_term = input.ordered_receipt.term,
+            .provision_index = input.ordered_receipt.index,
         };
         const encoded_record = try record.encode();
         var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-        const marker = orderedApplyReceiptWrite(input.raft_entry, &marker_buf);
+        const marker = orderedApplyReceiptWrite(input.ordered_receipt, &marker_buf);
         // Self-referential parents share these hidden child owners. Install
         // their accepted generation scopes in the same durable transaction as
         // the initial schema and hidden gate, before any release can route a
@@ -29084,7 +29068,7 @@ pub const DB = struct {
             write_count += 1;
         }
         const replication_outbox = if (replication_payload) |payload| blk: {
-            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
+            const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
             const from_lsn = mirror.publisher.nextLsn();
             const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, payload);
             const key = try durableReplicationOutboxKeyAlloc(self.alloc, .restore_batch, from_lsn, self.core.root_generation, payload);
@@ -29110,7 +29094,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
-        if (!input.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), input.raft_entry)) {
+        if (!input.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), input.ordered_receipt)) {
             .already_applied => {
                 self.core.unlockApply();
                 apply_held = false;
@@ -29156,7 +29140,7 @@ pub const DB = struct {
                 !std.mem.eql(u8, &prior.schema_digest, &input.schema_digest) or
                 !std.mem.eql(u8, &prior.public_schema_json_digest, &input.public_schema_json_digest) or
                 !std.mem.eql(u8, &prior.catalog_digest, &input.catalog_digest) or
-                prior.provision_term != input.raft_entry.term or prior.provision_index != input.raft_entry.index)
+                prior.provision_term != input.ordered_receipt.term or prior.provision_index != input.ordered_receipt.index)
                 return error.InitialChildPublicationChanged;
             self.core.unlockApply();
             apply_held = false;
@@ -29347,7 +29331,7 @@ pub const DB = struct {
                 const expected = try admission.sourceInstallDigest(publication.fence, publication.before_schema_json_digest, publication.schema_json_digest, publication.before_catalog_digest, publication.after_catalog_digest);
                 if (std.mem.eql(u8, &receipt.digest, &expected)) {
                     const completed = (try @import("relational_integrity_topology.zig").completed(&read)) orelse return error.GenerationAdmissionChanged;
-                    if (!completed.eql(publication.fence) or receipt.term != publication.raft_entry.term or receipt.index != publication.raft_entry.index)
+                    if (!completed.eql(publication.fence) or receipt.term != publication.ordered_receipt.term or receipt.index != publication.ordered_receipt.index)
                         return error.GenerationAdmissionChanged;
                     const actual = try read.get(public_schema_json_key);
                     if (!std.mem.eql(u8, actual, schema_json)) return error.IntegrityCatalogChanged;
@@ -29362,7 +29346,7 @@ pub const DB = struct {
         // already advanced. Check its durable marker before re-preparing the
         // old→new catalog comparison; the apply-locked check below still
         // closes the race with another entry.
-        if (!publication.native and try self.orderedMutationAlreadyApplied(publication.raft_entry)) return;
+        if (!publication.native and try self.orderedMutationAlreadyApplied(publication.ordered_receipt)) return;
         return self.setSchemaJsonMode(alloc, schema_json, publication);
     }
 
@@ -29400,8 +29384,8 @@ pub const DB = struct {
                     .schema_json_digest = published.schema_json_digest,
                     .before_catalog_digest = published.before_catalog_digest,
                     .after_catalog_digest = published.after_catalog_digest,
-                    .applied_term = published.raft_entry.term,
-                    .applied_index = published.raft_entry.index,
+                    .applied_term = published.ordered_receipt.term,
+                    .applied_index = published.ordered_receipt.index,
                 })
             else if (replicationMirrorRequiresDurableOutbox(mirror))
                 try replication_effects_mod.encodeSchemaMetadataMutationAlloc(self.alloc, runtime_schema, schema_json)
@@ -29442,13 +29426,13 @@ pub const DB = struct {
         var source_receipt_buffer: [48]u8 = undefined;
         if (publication) |published| {
             if (!published.native) {
-                const marker = orderedApplyReceiptWrite(published.raft_entry, &raft_marker_buffer);
+                const marker = orderedApplyReceiptWrite(published.ordered_receipt, &raft_marker_buffer);
                 schema_metadata_writes[schema_metadata_write_count] = marker;
                 schema_metadata_write_count += 1;
             }
             const admission = @import("relational_integrity_generation_admission.zig");
             const digest = try admission.sourceInstallDigest(published.fence, published.before_schema_json_digest, published.schema_json_digest, published.before_catalog_digest, published.after_catalog_digest);
-            source_receipt_buffer = (admission.AppliedReceipt{ .digest = digest, .term = published.raft_entry.term, .index = published.raft_entry.index }).encode();
+            source_receipt_buffer = (admission.AppliedReceipt{ .digest = digest, .term = published.ordered_receipt.term, .index = published.ordered_receipt.index }).encode();
             schema_metadata_writes[schema_metadata_write_count] = .{ .key = admission.source_install_receipt_key, .value = &source_receipt_buffer };
             schema_metadata_write_count += 1;
         }
@@ -29470,7 +29454,7 @@ pub const DB = struct {
         try self.lockApplyForPortableRuntime();
         var apply_held = true;
         errdefer if (apply_held) self.core.unlockApply();
-        if (publication) |published| if (!published.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), published.raft_entry)) {
+        if (publication) |published| if (!published.native) switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), published.ordered_receipt)) {
             .already_applied => {
                 self.core.unlockApply();
                 apply_held = false;
@@ -29660,7 +29644,7 @@ pub const DB = struct {
         );
     }
 
-    pub fn beginReplicatedTransactionAtRaftEntry(
+    pub fn beginReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         timestamp_ns: u64,
@@ -29787,7 +29771,7 @@ pub const DB = struct {
         try self.writeTransactionInternal(txn_id, req, null);
     }
 
-    pub fn writeReplicatedTransactionAtRaftEntry(
+    pub fn writeReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
@@ -29801,9 +29785,9 @@ pub const DB = struct {
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
-        if (raft_entry == null) try self.maybeFinalizePendingRowPolicyPublication();
+        if (ordered_receipt == null) try self.maybeFinalizePendingRowPolicyPublication();
         var verified_principal: ?std.json.Parsed(row_policy_authority_mod.Payload) = null;
         defer if (verified_principal) |*principal| principal.deinit();
         var row_policy_lease: ?row_policy_gate_mod.Gate.Lease = null;
@@ -29811,14 +29795,14 @@ pub const DB = struct {
             if (req.row_policy_database.len == 0 or req.row_policy_admitted_at_seconds <= 0 or
                 req.restore_staging_scope != null) return error.RowPolicyAuthenticationRequired;
             const now_seconds: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s));
-            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (raft_entry != null) req.row_policy_admitted_at_seconds else now_seconds);
-            row_policy_lease = if (raft_entry != null)
+            verified_principal = try self.verifyRowPolicyPrincipal(self.alloc, req.row_policy_principal_proof, req.row_policy_database, .write, if (ordered_receipt != null) req.row_policy_admitted_at_seconds else now_seconds);
+            row_policy_lease = if (ordered_receipt != null)
                 try self.local_execution.row_policy_gate.enterReplicatedPrincipal(&verified_principal.?.value)
             else
                 try self.local_execution.row_policy_gate.enterVerifiedPrincipal(&verified_principal.?.value, now_seconds);
         } else if (req.row_policy_database.len != 0 or req.row_policy_admitted_at_seconds != 0) {
             return error.RowPolicyAuthenticationRequired;
-        } else if (raft_entry == null) {
+        } else if (ordered_receipt == null) {
             row_policy_lease = try self.local_execution.row_policy_gate.enterRaw();
         } else if (self.local_execution.row_policy_gate.currentPhase() != .disabled and
             (req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0))
@@ -29832,7 +29816,7 @@ pub const DB = struct {
         const max_prepared_retries = 2;
         var retries: usize = 0;
         while (true) {
-            self.writeTransactionInternalOnce(txn_id, req, raft_entry, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
+            self.writeTransactionInternalOnce(txn_id, req, ordered_receipt, preparation.guard.allocator(), if (verified_principal) |*principal| &principal.value else null, if (row_policy_lease) |*lease| lease else null) catch |err| switch (err) {
                 error.PreparedGenerationChanged, error.PreparedReadSetChanged => {
                     if (retries >= max_prepared_retries) return err;
                     retries += 1;
@@ -29848,7 +29832,7 @@ pub const DB = struct {
         self: *DB,
         txn_id: types.TxnId,
         req: types.TransactionIntentRequest,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
         preparation_alloc: Allocator,
         row_policy_principal: ?*const row_policy_authority_mod.Payload,
         row_policy_lease: ?*const row_policy_gate_mod.Gate.Lease,
@@ -30172,7 +30156,7 @@ pub const DB = struct {
         defer if (index_spans.len != 0) preparation_alloc.free(index_spans);
         try self.prepareOnlineVectorIntentBoundsLocked(preparation_alloc, intents.items, prepared_schema_view);
         if (row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
-        if (raft_entry) |identity| {
+        if (ordered_receipt) |identity| {
             switch (try orderedApplyDisposition(try readOrderedApplyReceipt(preparation_alloc, self.core.store), identity)) {
                 .already_applied => return,
                 .apply => {},
@@ -30515,7 +30499,7 @@ pub const DB = struct {
         );
     }
 
-    pub fn resolveReplicatedTransactionAtRaftEntry(
+    pub fn resolveReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         status: transactions_mod.TxnStatus,
@@ -30543,7 +30527,7 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
         resolved_participant: ?[]const u8,
     ) !void {
         var preparation: RequestPreparationContext = undefined;
@@ -30555,7 +30539,7 @@ pub const DB = struct {
             commit_version,
             sync_level,
             visibility_cancellation,
-            raft_entry,
+            ordered_receipt,
             resolved_participant,
             &preparation.guard,
         ) catch |err| return preparation.mapError(err);
@@ -30568,7 +30552,7 @@ pub const DB = struct {
         commit_version: u64,
         sync_level: types.SyncLevel,
         visibility_cancellation: types.CancellationToken,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
         resolved_participant: ?[]const u8,
         preparation: *PreparedRowAllocator,
     ) !void {
@@ -30577,16 +30561,16 @@ pub const DB = struct {
         defer if (staging_progress) |*progress| progress.deinit();
         const restore_scope: ?[32]u8 = if (staging_progress) |progress| progress.value.scope.digest() else null;
         const mirror_scoped_restore = restore_scope != null and self.local_execution.replication_async_batch_mirror != null;
-        const bypass_ha = raft_entry != null and !mirror_scoped_restore;
-        var replication_mutation = if (!bypass_ha) self.acquireReplicationMutationShared() else null;
+        const bypass_replication_write_gate = ordered_receipt != null and !mirror_scoped_restore;
+        var replication_mutation = if (!bypass_replication_write_gate) self.acquireReplicationMutationShared() else null;
         defer if (replication_mutation) |*lease| lease.release();
-        if (!bypass_ha) try self.enforceReplicationWriteGate();
+        if (!bypass_replication_write_gate) try self.enforceReplicationWriteGate();
         if (mirror_scoped_restore) try self.flushDurableReplicationOutboxes();
         if (status != .committed) {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-            const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
+            const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
                 switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
                     .already_applied => return,
                     .apply => {},
@@ -30625,7 +30609,7 @@ pub const DB = struct {
                     return error.PreparedGenerationChanged;
                 }
                 var marker_value_buf: [ordered_apply_receipt_value_len]u8 = undefined;
-                const marker_writes: []const docstore_mod.KVPair = if (raft_entry) |identity| blk: {
+                const marker_writes: []const docstore_mod.KVPair = if (ordered_receipt) |identity| blk: {
                     switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
                         .already_applied => {
                             self.core.unlockApply();
@@ -30672,8 +30656,8 @@ pub const DB = struct {
                 .restore_staging_scope = restore_scope,
             }, null, .{
                 .visibility_cancellation = visibility_cancellation,
-                .bypass_replication_write_gate = bypass_ha,
-                .raft_applied_entry_marker = raft_entry,
+                .bypass_replication_write_gate = bypass_replication_write_gate,
+                .ordered_apply_receipt = ordered_receipt,
                 .durable_rows = &durable_rows,
                 .transaction_resolution = .{
                     .txn_id = txn_id,
@@ -31097,9 +31081,9 @@ pub const DB = struct {
     pub fn applyRelationalTopologyControl(
         self: *DB,
         command: @import("relational_integrity_topology.zig").Command,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
     ) !void {
-        return self.applyRelationalTopologyControlWithReplication(command, raft_entry, null, null, null, null);
+        return self.applyRelationalTopologyControlWithReplication(command, ordered_receipt, null, null, null, null);
     }
 
     /// Internal source-retention controls share the lifecycle transaction path:
@@ -31124,7 +31108,7 @@ pub const DB = struct {
             try self.flushDurableReplicationOutboxes();
             try self.preflightReplicationBatchSyncCommit();
         }
-        var applied_index = if (opts.raft_applied_entry_marker) |entry| entry.index else opts.online_source_applied_index orelse 0;
+        var applied_index = if (opts.ordered_apply_receipt) |entry| entry.index else opts.online_source_applied_index orelse 0;
         var payload: ?[]u8 = null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         apply_source: {
@@ -31141,7 +31125,7 @@ pub const DB = struct {
             defer if (catalog_admission) self.local_execution.index_structural_mutation_mutex.unlock();
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
-            if (opts.raft_applied_entry_marker) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+            if (opts.ordered_apply_receipt) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
                 .already_applied => {
                     if (command == .admit) {
                         const repair = blk: {
@@ -31157,7 +31141,7 @@ pub const DB = struct {
                 .apply => {},
             };
             if (!command.scope().fence.namespace.eql(self.core.identity_namespace)) return error.IdentityNamespaceMismatch;
-            if (command.scope().authority == .native and opts.raft_applied_entry_marker != null) return error.OnlineSourceScopeChanged;
+            if (command.scope().authority == .native and opts.ordered_apply_receipt != null) return error.OnlineSourceScopeChanged;
             // Complete any committed native admission before a retry can
             // advance the owner clock. It must never recapture a later cut.
             if (command.scope().authority == .native and command == .admit) {
@@ -31248,9 +31232,9 @@ pub const DB = struct {
             try @import("online_source.zig").stage(&txn, command, applied_index);
             if (req.artifact_catalog) |install| try @import("artifact_reconcile_intent.zig").clear(self.alloc, &txn, install, applied_index);
             if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
-                payload = if (req.artifact_catalog != null) try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand) else try replication_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
+                payload = if (req.artifact_catalog != null) try replication_effects_mod.encodeArtifactCatalogMutationRequestAlloc(self.alloc, req, opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand) else try replication_effects_mod.encodeOnlineSourceMutationRequestAlloc(self.alloc, req, applied_index);
             for (opts.extra_store_writes) |write| try txn.put(write.key, write.value);
-            if (opts.raft_applied_entry_marker) |entry| {
+            if (opts.ordered_apply_receipt) |entry| {
                 var bytes: [ordered_apply_receipt_value_len]u8 = undefined;
                 const marker = orderedApplyReceiptWrite(entry, &bytes);
                 try txn.put(marker.key, marker.value);
@@ -31522,7 +31506,7 @@ pub const DB = struct {
         const provenance = @import("artifact_producer_provenance.zig");
         try adoption.validateRequest(req);
         const command = req.merge_proof_adoption orelse return error.InvalidBatchRequest;
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null or
             opts.extra_store_writes.len != 0 or opts.extra_store_deletes.len != 0) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
@@ -31624,7 +31608,7 @@ pub const DB = struct {
         const transport = @import("artifact_publication_transport.zig");
         const control = req.artifact_publication_transport orelse return error.InvalidBatchRequest;
         try transport.validateBatchRequest(req);
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0 or opts.artifact_upload_finalize != null) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var namespace: [24]u8 = undefined;
@@ -31745,7 +31729,7 @@ pub const DB = struct {
         // A source/catalog race is an ordered outcome, not an apply failure.
         // Keep accepted provenance intact and commit the rejection with the
         // applied watermark, so retries cannot wedge a committed Raft entry.
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         var txn = try self.core.store.beginWriteTxn();
         errdefer txn.abort();
         try @import("artifact_publication.zig").stageRejection(&txn, command, entry.index, reason);
@@ -31775,7 +31759,7 @@ pub const DB = struct {
         const inventory = @import("artifact_inventory.zig");
         try publication.validateRequest(self.alloc, req);
         const command = req.artifact_publication orelse return error.InvalidBatchRequest;
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidBatchRequest;
         if (entry.term == 0 or entry.index == 0) return error.InvalidBatchRequest;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
@@ -32223,7 +32207,7 @@ pub const DB = struct {
         const inventory = @import("artifact_inventory.zig");
         try inventory.validateRequest(req);
         const command = req.artifact_catalog orelse return error.InvalidArtifactCatalogCommand;
-        const entry = opts.raft_applied_entry_marker orelse return error.InvalidArtifactCatalogCommand;
+        const entry = opts.ordered_apply_receipt orelse return error.InvalidArtifactCatalogCommand;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
         var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -32350,7 +32334,7 @@ pub const DB = struct {
         defer admission.release();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (opts.raft_applied_entry_marker) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+        if (opts.ordered_apply_receipt) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -32367,7 +32351,7 @@ pub const DB = struct {
                 else => return err,
             };
         }
-        if (opts.raft_applied_entry_marker) |entry| {
+        if (opts.ordered_apply_receipt) |entry| {
             var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
@@ -32413,14 +32397,14 @@ pub const DB = struct {
                 command.transfer != null or command.parent_retirement != null or command.parent_activation != null or
                 command.child_generations != null) return error.InvalidBatchRequest;
             const install = command.child_schema_install.?;
-            const entry = opts.raft_applied_entry_marker orelse opts.native_fk_generation_entry orelse return error.InvalidBatchRequest;
+            const entry = opts.ordered_apply_receipt orelse opts.native_fk_generation_entry orelse return error.InvalidBatchRequest;
             return self.installPublishedChildSchema(self.alloc, install.schema_json, .{
                 .fence = command.fence,
                 .before_schema_json_digest = install.before_schema_json_digest,
                 .schema_json_digest = install.schema_json_digest,
                 .before_catalog_digest = install.before_catalog_digest,
                 .after_catalog_digest = install.after_catalog_digest,
-                .raft_entry = entry,
+                .ordered_receipt = entry,
                 .native = opts.native_fk_generation_entry != null,
             });
         };
@@ -32429,11 +32413,11 @@ pub const DB = struct {
                 command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
                 command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
             const provision = command.initial_child_provision.?;
-            const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
+            const entry = opts.ordered_apply_receipt orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
             var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) {
-                if (self.local_execution.replication_async_metadata_mirror != null and self.local_execution.replication_async_batch_mirror == null) return error.HAMirrorUnavailable;
+                if (self.local_execution.replication_async_metadata_mirror != null and self.local_execution.replication_async_batch_mirror == null) return error.ReplicationPublisherUnavailable;
                 try self.enforceReplicationWriteGate();
                 try self.ensureDurableReplicationStartupBarrier();
                 try self.flushDurableReplicationOutboxes();
@@ -32452,7 +32436,7 @@ pub const DB = struct {
                 .schema_digest = provision.schema_digest,
                 .public_schema_json_digest = provision.public_schema_json_digest,
                 .catalog_digest = provision.catalog_digest,
-                .raft_entry = entry,
+                .ordered_receipt = entry,
                 .native = opts.native_initial_child_entry != null,
             }, opts.replication_applied_lsn_marker, payload);
             if (payload != null) try self.flushDurableReplicationOutboxes();
@@ -32462,11 +32446,11 @@ pub const DB = struct {
             if (command.initial_child_control == null or command.initial_child_provision != null or
                 command.child_schema_install != null or command.transfer != null or command.parent_retirement != null or
                 command.parent_activation != null or command.child_generations != null) return error.InvalidBatchRequest;
-            const entry = opts.raft_applied_entry_marker orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
+            const entry = opts.ordered_apply_receipt orelse opts.native_initial_child_entry orelse return error.InvalidBatchRequest;
             var replication_mutation = if (opts.bypass_replication_write_gate) null else self.acquireReplicationMutationShared();
             defer if (replication_mutation) |*lease| lease.release();
             if (!opts.bypass_replication_write_gate) {
-                if (self.local_execution.replication_async_metadata_mirror != null and self.local_execution.replication_async_batch_mirror == null) return error.HAMirrorUnavailable;
+                if (self.local_execution.replication_async_metadata_mirror != null and self.local_execution.replication_async_batch_mirror == null) return error.ReplicationPublisherUnavailable;
                 try self.enforceReplicationWriteGate();
                 try self.ensureDurableReplicationStartupBarrier();
                 try self.flushDurableReplicationOutboxes();
@@ -32489,14 +32473,14 @@ pub const DB = struct {
             try self.flushDurableReplicationOutboxes();
             try self.preflightReplicationBatchSyncCommit();
         }
-        const native_control = opts.raft_applied_entry_marker == null and opts.native_fk_generation_entry == null and
+        const native_control = opts.ordered_apply_receipt == null and opts.native_fk_generation_entry == null and
             (if (req.relational_topology) |command| @import("native_topology_receipt.zig").supports(command) else false);
         if (native_control) try @import("native_topology_receipt.zig").validateRequest(self.alloc, req);
         const mirror_control = !opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null;
         const payload = if (mirror_control and !native_control)
             if (req.relational_topology) |command|
                 if (command.action == .seal_graph_retirement)
-                    try replication_effects_mod.encodeGraphRetirementSealMutationRequestAlloc(self.alloc, req, opts.raft_applied_entry_marker orelse return error.InvalidBatchRequest)
+                    try replication_effects_mod.encodeGraphRetirementSealMutationRequestAlloc(self.alloc, req, opts.ordered_apply_receipt orelse return error.InvalidBatchRequest)
                 else
                     try replication_effects_mod.encodeBatchMutationRequestAlloc(self.alloc, req)
             else
@@ -32505,9 +32489,9 @@ pub const DB = struct {
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         if (req.relational_topology) |command| {
-            try self.applyRelationalTopologyControlWithReplication(command, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control } else null);
+            try self.applyRelationalTopologyControlWithReplication(command, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload, opts.native_fk_generation_entry, if (native_control) .{ .request = req, .replay = opts.native_topology_position, .mirror = mirror_control } else null);
         } else {
-            try self.applyRangeFinalization(req.split_transition.?, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload);
+            try self.applyRangeFinalization(req.split_transition.?, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload);
         }
         if (mirror_control) try self.flushDurableReplicationOutboxes();
     }
@@ -32521,14 +32505,14 @@ pub const DB = struct {
     fn applyRelationalTopologyControlWithReplication(
         self: *DB,
         command: @import("relational_integrity_topology.zig").Command,
-        raft_entry: ?OrderedApplyReceipt,
+        ordered_receipt: ?OrderedApplyReceipt,
         replication_lsn: ?u64,
         replication_payload: ?[]const u8,
         native_receipt: ?OrderedApplyReceipt,
         native_control: ?NativeTopologyContext,
     ) !void {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return error.ReadOnly;
-        const receipt_entry = raft_entry orelse native_receipt;
+        const receipt_entry = ordered_receipt orelse native_receipt;
         var mutation = self.core.snapshot_admission.acquireMutation();
         defer mutation.release();
         const structural_held = command.action == .begin;
@@ -32536,7 +32520,7 @@ pub const DB = struct {
         defer if (structural_held) self.local_execution.index_structural_mutation_mutex.unlock();
         try self.lockApplyForPortableRuntime();
         defer self.core.unlockApply();
-        if (raft_entry) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
+        if (ordered_receipt) |entry| switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry)) {
             .already_applied => return,
             .apply => {},
         };
@@ -32557,7 +32541,7 @@ pub const DB = struct {
             try txn.put(&internal_keys.identity_namespace_key, &namespace_bytes);
         }
         const topology = @import("relational_integrity_topology.zig");
-        if (raft_entry != null) try @import("../source_authority.zig").requireRaftMarkerAllowed(&txn);
+        if (ordered_receipt != null) try @import("../source_authority.zig").requireRaftMarkerAllowed(&txn);
         if ((command.action == .transfer) != (command.transfer != null) or
             (command.action == .seal_graph_retirement and command.graph_retirement == null) or
             (command.graph_retirement != null and command.action != .begin and command.action != .seal_graph_retirement) or
@@ -32570,7 +32554,7 @@ pub const DB = struct {
                 (command.action == .cancel and (command.fence.role == .child_generation_parent or command.fence.role == .child_generation_dual))) != (command.child_generations != null))) return error.InvalidBatchRequest;
         if (command.child_schema_install != null) return error.InvalidBatchRequest;
         const native_prepared: ?@import("native_topology_receipt.zig").Prepared = if (native_control) |control| blk: {
-            if (raft_entry != null or native_receipt != null) return error.InvalidControlReceiptPosition;
+            if (ordered_receipt != null or native_receipt != null) return error.InvalidControlReceiptPosition;
             const owner = try @import("../source_authority.zig").load(&txn);
             if (owner == null or owner.?.kind != .native) {
                 if (control.replay != null) return error.InvalidControlReceiptPosition;
@@ -32580,7 +32564,7 @@ pub const DB = struct {
         } else null;
         const stamp: ?@import("receipt_position.zig").Position = if (native_prepared) |prepared|
             .{ .native = prepared.receipt }
-        else if (raft_entry) |entry|
+        else if (ordered_receipt) |entry|
             .{ .raft = .{ .term = entry.term, .index = entry.index } }
         else
             null;
@@ -32867,7 +32851,7 @@ pub const DB = struct {
             .provision_initial_child, .release_initial_child, .cancel_initial_child => unreachable, // Handled before generic topology transaction.
             .prune => try @import("relational_integrity_handoff.zig").prune(self.alloc, &txn, command.fence, self.core.byteRange()),
         };
-        if (raft_entry) |entry| {
+        if (ordered_receipt) |entry| {
             var marker_buf: [ordered_apply_receipt_value_len]u8 = undefined;
             const marker = orderedApplyReceiptWrite(entry, &marker_buf);
             try txn.put(marker.key, marker.value);
@@ -32901,7 +32885,7 @@ pub const DB = struct {
         try self.core.markTransactionParticipantsResolvedExtraBatch(txn_id, participants, .{});
     }
 
-    pub fn markReplicatedTransactionParticipantResolvedAtRaftEntry(
+    pub fn markReplicatedTransactionParticipantResolvedAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         participant: []const u8,
@@ -32925,7 +32909,7 @@ pub const DB = struct {
         };
     }
 
-    pub fn markReplicatedTransactionParticipantsResolvedAtRaftEntry(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: OrderedApplyReceipt) !void {
+    pub fn markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(self: *DB, txn_id: transactions_mod.TxnId, participants: []const []const u8, identity: OrderedApplyReceipt) !void {
         lockApply(self);
         defer self.core.unlockApply();
         switch (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), identity)) {
@@ -32955,7 +32939,7 @@ pub const DB = struct {
         return try self.core.cleanupTransactionMetadataIfEligible(txn_id, cutoff_timestamp, retained_cutoff_timestamp);
     }
 
-    pub fn cleanupReplicatedTransactionAtRaftEntry(
+    pub fn cleanupReplicatedTransactionAtOrderedReceipt(
         self: *DB,
         txn_id: transactions_mod.TxnId,
         cutoff_timestamp: u64,
@@ -34674,7 +34658,7 @@ pub const DB = struct {
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
         if (self.local_execution.replication_async_batch_mirror != null and self.local_execution.replication_async_effect_mirror == null)
-            return error.HAMirrorUnavailable;
+            return error.ReplicationPublisherUnavailable;
         try self.executor.failIfUnhealthy();
         var snapshot_mutation = self.core.snapshot_admission.acquireMutation();
         defer snapshot_mutation.release();
@@ -34778,9 +34762,9 @@ pub const DB = struct {
         }
         try appendArtifactSourceRevisionWritesFromReplay(self.alloc, replay, sequence, &writes, &revision_keys, &revision_values);
         var context = self.batchContext();
-        var primary_ha = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
-        defer primary_ha.deinit(self.alloc);
-        try primary_ha.stage(&context, &writes);
+        var primary_replication = try PrimaryReplicationEffect.prepare(&context, writes.items, mutation.deletes.items, replay);
+        defer primary_replication.deinit(self.alloc);
+        try primary_replication.stage(&context, &writes);
         var backlog = try self.executor.admitBacklogBytes(@intCast(replay.len));
         defer backlog.cancel();
         try policy.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
@@ -34790,7 +34774,7 @@ pub const DB = struct {
         graph_publication.release();
         var gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(&context));
         defer gates.releaseTransition();
-        gates.append(try primary_ha.appendLocked(&context));
+        gates.append(try primary_replication.appendLocked(&context));
         self.core.unlockApply();
         apply_held = false;
         snapshot_mutation.release();
@@ -34800,7 +34784,7 @@ pub const DB = struct {
         gates.releaseTransition();
         releaseReplicationMutationShared(&replication_mutation);
         try gates.waitForDurabilityAndAuthority(context.replication_write_gate);
-        try primary_ha.clear(&context);
+        try primary_replication.clear(&context);
         return mutation.rewritten;
     }
 
@@ -42983,10 +42967,10 @@ pub const DB = struct {
         try txn.commit();
     }
 
-    fn encodeRestoreStagingReplicationPayload(self: *DB, req: types.BatchRequest, raft_entry: ?OrderedApplyReceipt) ![]u8 {
+    fn encodeRestoreStagingReplicationPayload(self: *DB, req: types.BatchRequest, ordered_receipt: ?OrderedApplyReceipt) ![]u8 {
         const staging = @import("restore_staging.zig");
         if (req.restore_staging.? == .install_generation_admissions)
-            return replication_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, raft_entry orelse return error.InvalidRestoreStagingCommand);
+            return replication_effects_mod.encodeRestoreGenerationAdmissionMutationRequestAlloc(self.alloc, req, ordered_receipt orelse return error.InvalidRestoreStagingCommand);
         if (req.restore_staging.? == .begin) {
             const stored = try self.core.getStoreValue(self.alloc, staging.bootstrap_key);
             defer if (stored) |bytes| self.alloc.free(bytes);
@@ -43082,7 +43066,7 @@ pub const DB = struct {
         // receipt before its projection watermark was durable. Repair one
         // bounded local slice on EVERY committed-control retry; no optional
         // worker or leader RPC is required, and no apply lock is held here.
-        if (opts.raft_applied_entry_marker != null or opts.replication_applied_lsn_marker != null) {
+        if (opts.ordered_apply_receipt != null or opts.replication_applied_lsn_marker != null) {
             if (req.restore_staging.? == .finish and (req.restore_staging.?.finish.phase == .validated or req.restore_staging.?.finish.phase == .published)) {
                 if (!try self.prepareRestoreStagingIndexesStepLocal(self.alloc, req.restore_staging.?.finish.scope, true)) return error.RestoreProjectionCatchUpPending;
             }
@@ -43096,14 +43080,14 @@ pub const DB = struct {
             try self.preflightReplicationBatchSyncCommit();
         }
         const payload = if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null)
-            try self.encodeRestoreStagingReplicationPayload(req, opts.raft_applied_entry_marker)
+            try self.encodeRestoreStagingReplicationPayload(req, opts.ordered_apply_receipt)
         else
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         switch (req.restore_staging.?) {
-            .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
-            .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
-            .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.raft_applied_entry_marker, opts.replication_applied_lsn_marker, payload),
+            .begin => |scope| try self.beginRestoreStagingWithMarker(self.alloc, scope, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
+            .finish => |finish| _ = try self.finishRestoreStagingWithMarker(self.alloc, finish.scope, finish.phase, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
+            .install_generation_admissions => |install| _ = try self.installRestoreGenerationAdmissionsWithMarker(self.alloc, install, opts.ordered_apply_receipt, opts.replication_applied_lsn_marker, payload),
             .import_page, .rewrite_page => unreachable,
         }
         if (payload != null) try self.flushDurableReplicationOutboxes();
@@ -43214,7 +43198,7 @@ pub const DB = struct {
 
     fn stageRestoreStagingReplicationOutbox(self: *DB, txn: anytype, payload: ?[]const u8) !void {
         const bytes = payload orelse return;
-        const mirror = self.local_execution.replication_async_batch_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = self.local_execution.replication_async_batch_mirror orelse return error.ReplicationPublisherUnavailable;
         const from_lsn = mirror.publisher.nextLsn();
         const encoded = try encodeDurableReplicationOutboxAlloc(self.alloc, from_lsn, bytes);
         defer self.alloc.free(encoded);
@@ -62960,7 +62944,7 @@ const PrimaryReplicationEffect = struct {
 
     fn prepare(ctx: *const BatchExecutionContext, writes: []const docstore_mod.KVPair, deletes: []const []const u8, replay: []const u8) !@This() {
         const mirror = ctx.replication_async_effect_mirror orelse return .{};
-        if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+        if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         try preflightReplicationMirrorSyncCommitContext(ctx, mirror);
         const payload = try replication_effects_mod.primary_effect.encodeAlloc(ctx.alloc, writes, deletes, replay);
         return prepareEncoded(ctx, payload);
@@ -62975,7 +62959,7 @@ const PrimaryReplicationEffect = struct {
 
     fn prepareEncoded(ctx: *const BatchExecutionContext, payload: []u8) !@This() {
         errdefer ctx.alloc.free(payload);
-        const mirror = ctx.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = ctx.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
         const from_lsn = mirror.publisher.nextLsn();
         const key = try durableReplicationOutboxKeyAlloc(ctx.alloc, .primary_effect, from_lsn, ctx.root_generation, payload);
         errdefer ctx.alloc.free(key);
@@ -62998,7 +62982,7 @@ const PrimaryReplicationEffect = struct {
 
     fn appendLocked(self: *const @This(), ctx: *const BatchExecutionContext) !?ReplicationDeferredCommitGate {
         const payload = self.payload orelse return null;
-        const mirror = ctx.replication_async_effect_mirror orelse return error.HAMirrorUnavailable;
+        const mirror = ctx.replication_async_effect_mirror orelse return error.ReplicationPublisherUnavailable;
         lockAtomic(ctx.log_mutex);
         defer ctx.log_mutex.*.unlock();
         // A failed append keeps the outbox, even under asynchronous policy.
@@ -63007,7 +62991,7 @@ const PrimaryReplicationEffect = struct {
             noteReplicationMirrorFailure(mirror, "primary effect", err);
             return err;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
         return .{ .mirror = mirror, .lsn = lsn };
     }
 
@@ -63286,9 +63270,9 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
-    try primary_ha.stage(ctx, &store_writes);
+    var primary_replication = try PrimaryReplicationEffect.prepare(ctx, store_writes.items, delete_keys.items, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
+    try primary_replication.stage(ctx, &store_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     try ctx.store.putBatchWithReplay(ctx.io, store_writes.items, delete_keys.items, .{
@@ -63303,7 +63287,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     }
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -63311,7 +63295,7 @@ fn executeDeleteBatchContext(ctx: *const BatchExecutionContext, candidate_keys: 
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try markPrecomputedEnrichmentAppliedForSyncContext(ctx, sync_level, sequence);
     try applyDerivedBacklogPressureContext(ctx, sequence, sync_level, sync_targets);
     if (ctx.executor.hasWorkers()) {
@@ -63643,11 +63627,11 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     derived_batch.sequence = sequence;
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepare(ctx, &.{}, &.{ candidate.artifact_key, due_key }, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
+    var primary_replication = try PrimaryReplicationEffect.prepare(ctx, &.{}, &.{ candidate.artifact_key, due_key }, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
     var primary_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     defer primary_writes.deinit(ctx.alloc);
-    try primary_ha.stage(ctx, &primary_writes);
+    try primary_replication.stage(ctx, &primary_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     var guard = GraphDirectTtlCommitGuard{
@@ -63680,7 +63664,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -63688,7 +63672,7 @@ fn expireDirectGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: 
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try applyDerivedBacklogPressureContext(ctx, sequence, .full_index, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, .full_index, sequence, sync_targets);
@@ -63881,12 +63865,12 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     derived_batch.sequence = sequence;
     const replay_payload = try encodeChangeRecordPayload(ctx, derived_batch, sequence);
     defer ctx.alloc.free(replay_payload);
-    var primary_ha = try PrimaryReplicationEffect.prepareGraphRetirement(ctx, .{ .candidate = candidate, .source_digest = source_digest }, replay_payload);
-    defer primary_ha.deinit(ctx.alloc);
+    var primary_replication = try PrimaryReplicationEffect.prepareGraphRetirement(ctx, .{ .candidate = candidate, .source_digest = source_digest }, replay_payload);
+    defer primary_replication.deinit(ctx.alloc);
     var primary_writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty;
     defer primary_writes.deinit(ctx.alloc);
     try primary_writes.appendSlice(ctx.alloc, mutation.writes.items);
-    try primary_ha.stage(ctx, &primary_writes);
+    try primary_replication.stage(ctx, &primary_writes);
     var backlog_admission = try ctx.executor.admitBacklogBytes(@intCast(replay_payload.len));
     defer backlog_admission.cancel();
     _ = ctx.store.putBatchWithPromotionsReplayAndBuiltWrite(
@@ -63909,7 +63893,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     ctx.executor.commitBacklogAdmission(sequence, &backlog_admission);
     var deferred_replication_gates = ReplicationDeferredCommitGates.begin(replicationTransitionMutexFromContext(ctx));
     defer deferred_replication_gates.releaseTransition();
-    deferred_replication_gates.append(try primary_ha.appendLocked(ctx));
+    deferred_replication_gates.append(try primary_replication.appendLocked(ctx));
     ctx.apply_mutex.unlockExclusive();
     apply_mutex_held = false;
     if (snapshot_mutation) |*lease| lease.release();
@@ -63917,7 +63901,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
     DB.notifyQueryVisibilityTargetAdvancedScopedContext(ctx, sequence, sync_targets);
     releaseReplicationMutationShared(&replication_mutation);
     try deferred_replication_gates.waitForDurabilityAndAuthority(ctx.replication_write_gate);
-    try primary_ha.clear(ctx);
+    try primary_replication.clear(ctx);
     try applyDerivedBacklogPressureContext(ctx, sequence, .full_index, sync_targets);
     if (ctx.executor.hasWorkers()) {
         notifyExecutorForSyncLevelWithDenseBulkDeferral(ctx.async_context, ctx.executor, .full_index, sequence, sync_targets);
@@ -64207,7 +64191,7 @@ const enforceReplicationWriteGateOptional = replication_commit.enforceReplicatio
 
 fn enforceReplicationWriteGateContext(ctx: *const BatchExecutionContext) !void {
     try enforceReplicationWriteGateOptional(ctx.replication_write_gate);
-    if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+    if (ctx.async_context) |async_ctx| if (async_ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
 }
 
 fn enforcePortableRuntimeGateOptional(pending: ?*const std.atomic.Value(bool)) !void {
@@ -69689,7 +69673,7 @@ fn applyDerivedBatchToIndexContextProfiled(
     else
         null;
     defer if (graph_publication) |*lease| lease.release();
-    if (index_ref.kind == .graph and ctx.primary_replication_append_pending.load(.acquire)) return error.HAMirrorUnavailable;
+    if (index_ref.kind == .graph and ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
     var index_apply_guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
     defer index_apply_guard.unlock();
     if (index_ref.kind == .graph) {
@@ -76999,7 +76983,7 @@ fn clearSystemMetadataFromSplitDestination(alloc: Allocator, dest_store: *docsto
     // A destination prepared from an older layout must not inherit the
     // parent's merge ownership or retired-transition fences either.
     try dest_store.putBatch(&.{}, &.{
-        internal_keys.raft_document_applied_entry_key[0..],
+        internal_keys.ordered_document_applied_entry_key[0..],
         merge_state_mod.legacy_key,
     });
 }
@@ -96321,7 +96305,7 @@ test "db rewriteEntityEdges retains scoped source replay and curation" {
     }
 }
 
-test "db rewriteEntityEdges clears acknowledged HA outbox and retains failed acknowledgement" {
+test "db rewriteEntityEdges clears acknowledged replication outbox and retains failed acknowledgement" {
     const alloc = std.testing.allocator;
     const contract = @import("replication_contract.zig");
     const FakePublisher = struct {
@@ -96349,7 +96333,7 @@ test "db rewriteEntityEdges clears acknowledged HA outbox and retains failed ack
             const self: *@This() = @ptrCast(@alignCast(mirror.publisher.ptr));
             // A replacement seed must freeze the local commit/tail pair
             // before remote recovery can acknowledge this mutation.
-            var capture = self.barrier.tryAcquireExclusive() orelse return error.HASeedCaptureBlockedByRemoteDurabilityWait;
+            var capture = self.barrier.tryAcquireExclusive() orelse return error.CheckpointCaptureBlockedByCompletionWait;
             capture.release();
             if (self.fail) return error.TestAcknowledgementFailed;
         }
@@ -96366,6 +96350,20 @@ test "db rewriteEntityEdges clears acknowledged HA outbox and retains failed ack
         try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "doc:a", .target = "old", .edge_type = "links" }}, .sync_level = .full_index });
         var barrier: MutationBarrier = .{};
         var publisher: FakePublisher = .{ .fail = fail, .barrier = &barrier };
+        // A coarse batch publisher cannot represent the exact artifact and
+        // producer-ownership changes. Reject before mutating or publishing.
+        db.local_execution.replication_async_batch_mirror = .{ .publisher = publisher.publisher() };
+        try std.testing.expectError(error.ReplicationPublisherUnavailable, db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
+        try std.testing.expectEqual(@as(usize, 0), publisher.published);
+        {
+            const unchanged = try db.getEdges(alloc, "g", "old", "links", .in);
+            defer graph_mod.GraphIndex.freeEdges(alloc, unchanged);
+            try std.testing.expectEqual(@as(usize, 1), unchanged.len);
+            var pending = try durable_outbox_store.readPending(alloc, db.core.store);
+            defer pending.deinit(alloc);
+            try std.testing.expect(pending.isEmpty());
+        }
+        db.local_execution.replication_async_batch_mirror = null;
         db.local_execution.replication_async_effect_mirror = .{ .publisher = publisher.publisher(), .mutation_barrier = &barrier };
         if (fail) try std.testing.expectError(error.TestAcknowledgementFailed, db.rewriteEntityEdges(alloc, "g", "old", "survivor")) else try std.testing.expectEqual(@as(usize, 1), try db.rewriteEntityEdges(alloc, "g", "old", "survivor"));
         try std.testing.expectEqual(@as(usize, 1), publisher.published);
@@ -134660,7 +134658,7 @@ fn testChildGenerationInstall(native: bool) !void {
             .schema_json_digest = next_json_digest,
             .before_catalog_digest = before_catalog_digest,
             .after_catalog_digest = after_catalog_digest,
-            .raft_entry = .{ .term = 1, .index = if (native) 5 else 1 },
+            .ordered_receipt = .{ .term = 1, .index = if (native) 5 else 1 },
             .native = native,
         };
         for (0..2) |_| {
@@ -149817,7 +149815,7 @@ test "db ordered artifact inventory chunk reconstruction resumes bounded pages a
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 1, .little);
-        try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+        try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
         try txn.commit();
     }
     try std.testing.expectError(error.EnrichmentSourceChanged, reconstruction.prepare(alloc, db.core.store, scope, checkpoint, .{}));
@@ -149837,7 +149835,7 @@ test "db ordered artifact inventory chunk reconstruction resumes bounded pages a
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 2, .little);
-        try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+        try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
         try txn.commit();
     }
     try std.testing.expectError(error.OnlineMergeArtifactTailsUnsupported, reconstruction.prepare(alloc, db.core.store, other_scope, null, .{}));

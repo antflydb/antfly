@@ -299,7 +299,7 @@ test "ordered artifact inventory reconstruction orders bounded pages and resumes
                 var marker: [16]u8 = undefined;
                 std.mem.writeInt(u64, marker[0..8], 1, .little);
                 std.mem.writeInt(u64, marker[8..16], index, .little);
-                try db.core.store.putBatch(&.{ .{ .key = member, .value = "{\"body\":\"chunk text\",\"ordinal\":0}" }, .{ .key = &keys.raft_document_applied_entry_key, .value = &marker } }, &.{});
+                try db.core.store.putBatch(&.{ .{ .key = member, .value = "{\"body\":\"chunk text\",\"ordinal\":0}" }, .{ .key = &keys.ordered_document_applied_entry_key, .value = &marker } }, &.{});
                 index += 1;
                 {
                     var txn = try db.core.store.beginWriteTxn();

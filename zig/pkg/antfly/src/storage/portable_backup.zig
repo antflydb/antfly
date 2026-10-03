@@ -541,7 +541,7 @@ pub fn exportPortableToWriterWithOptions(
             // standby's local LSN. The pinned prepared record authenticates it.
             if (!proof.scope.fence.namespace.eql(certificate.cut.namespace) or proof.applied_index != certificate.cut.applied_index or proof.retained_start != certificate.cut.retained_start) return error.SourceSnapshotCutMismatch;
         } else {
-            const marker = scan.get(&internal_keys.raft_document_applied_entry_key) catch |err| switch (err) {
+            const marker = scan.get(&internal_keys.ordered_document_applied_entry_key) catch |err| switch (err) {
                 error.NotFound => return error.SourceSnapshotCutMismatch,
                 else => return err,
             };

@@ -30,7 +30,7 @@ pub fn orderedApplyReceiptWrite(
     std.mem.writeInt(u64, value_buf[0..8], identity.term, .little);
     std.mem.writeInt(u64, value_buf[8..16], identity.index, .little);
     return .{
-        .key = internal_keys.raft_document_applied_entry_key[0..],
+        .key = internal_keys.ordered_document_applied_entry_key[0..],
         .value = value_buf[0..],
     };
 }
@@ -39,17 +39,17 @@ pub fn readOrderedApplyReceipt(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
 ) !?OrderedApplyReceipt {
-    const raw = store.get(alloc, internal_keys.raft_document_applied_entry_key[0..]) catch |err| switch (err) {
+    const raw = store.get(alloc, internal_keys.ordered_document_applied_entry_key[0..]) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };
     defer alloc.free(raw);
-    if (raw.len != ordered_apply_receipt_value_len) return error.CorruptRaftAppliedEntry;
+    if (raw.len != ordered_apply_receipt_value_len) return error.CorruptOrderedApplyReceipt;
     const identity: OrderedApplyReceipt = .{
         .term = std.mem.readInt(u64, raw[0..8], .little),
         .index = std.mem.readInt(u64, raw[8..16], .little),
     };
-    if (identity.term == 0 or identity.index == 0) return error.CorruptRaftAppliedEntry;
+    if (identity.term == 0 or identity.index == 0) return error.CorruptOrderedApplyReceipt;
     return identity;
 }
 
@@ -59,11 +59,11 @@ pub fn orderedApplyDisposition(
     persisted: ?OrderedApplyReceipt,
     incoming: OrderedApplyReceipt,
 ) !OrderedApplyDisposition {
-    if (incoming.term == 0 or incoming.index == 0) return error.InvalidRaftAppliedEntry;
+    if (incoming.term == 0 or incoming.index == 0) return error.InvalidOrderedApplyReceipt;
     const current = persisted orelse return .apply;
     if (current.index > incoming.index) return .already_applied;
     if (current.index < incoming.index) return .apply;
-    if (current.term != incoming.term) return error.ConflictingRaftAppliedEntry;
+    if (current.term != incoming.term) return error.ConflictingOrderedApplyReceipt;
     return .already_applied;
 }
 
@@ -83,18 +83,22 @@ pub fn readReplicationAppliedSequence(alloc: Allocator, store: *docstore_mod.Doc
         else => return err,
     };
     defer alloc.free(raw);
-    if (raw.len != replication_applied_lsn_value_len) return error.CorruptHAAppliedReplicationLsn;
+    if (raw.len != replication_applied_lsn_value_len) return error.CorruptReplicationAppliedSequence;
     return std.mem.readInt(u64, raw[0..replication_applied_lsn_value_len], .little);
 }
 
 test "storage.hot_standby apply receipts preserve independent Raft and HA encodings" {
-    var raft_buf: [ordered_apply_receipt_value_len]u8 = undefined;
+    var ordered_buf: [ordered_apply_receipt_value_len]u8 = undefined;
     var replication_buf: [replication_applied_lsn_value_len]u8 = undefined;
-    const raft = orderedApplyReceiptWrite(.{ .term = 0x0102030405060708, .index = 9 }, &raft_buf);
-    const ha = replicationAppliedSequenceWrite(11, &replication_buf);
-    try std.testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1, 9, 0, 0, 0, 0, 0, 0, 0 }, raft.value);
-    try std.testing.expectEqualSlices(u8, &.{ 11, 0, 0, 0, 0, 0, 0, 0 }, ha.value);
-    try std.testing.expect(!std.mem.eql(u8, raft.key, ha.key));
+    const ordered = orderedApplyReceiptWrite(.{ .term = 0x0102030405060708, .index = 9 }, &ordered_buf);
+    const replication = replicationAppliedSequenceWrite(11, &replication_buf);
+    // These released keys are independent of the implementation names. A
+    // rename must not strand persisted progress or replay a committed write.
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0xff, 0x05 }, ordered.key);
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0xff, 0x04 }, replication.key);
+    try std.testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1, 9, 0, 0, 0, 0, 0, 0, 0 }, ordered.value);
+    try std.testing.expectEqualSlices(u8, &.{ 11, 0, 0, 0, 0, 0, 0, 0 }, replication.value);
+    try std.testing.expect(!std.mem.eql(u8, ordered.key, replication.key));
 }
 
 test "storage.hot_standby apply receipts reject conflicting identities without advancing progress" {
@@ -103,7 +107,7 @@ test "storage.hot_standby apply receipts reject conflicting identities without a
     try std.testing.expectEqual(OrderedApplyDisposition.already_applied, try orderedApplyDisposition(current, current));
     try std.testing.expectEqual(OrderedApplyDisposition.already_applied, try orderedApplyDisposition(current, .{ .term = 2, .index = 10 }));
     try std.testing.expectEqual(OrderedApplyDisposition.apply, try orderedApplyDisposition(current, .{ .term = 4, .index = 12 }));
-    try std.testing.expectError(error.ConflictingRaftAppliedEntry, orderedApplyDisposition(current, .{ .term = 4, .index = 11 }));
-    try std.testing.expectError(error.InvalidRaftAppliedEntry, orderedApplyDisposition(current, .{ .term = 0, .index = 12 }));
-    try std.testing.expectError(error.InvalidRaftAppliedEntry, orderedApplyDisposition(null, .{ .term = 3, .index = 0 }));
+    try std.testing.expectError(error.ConflictingOrderedApplyReceipt, orderedApplyDisposition(current, .{ .term = 4, .index = 11 }));
+    try std.testing.expectError(error.InvalidOrderedApplyReceipt, orderedApplyDisposition(current, .{ .term = 0, .index = 12 }));
+    try std.testing.expectError(error.InvalidOrderedApplyReceipt, orderedApplyDisposition(null, .{ .term = 3, .index = 0 }));
 }

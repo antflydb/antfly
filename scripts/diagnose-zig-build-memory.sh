@@ -183,10 +183,11 @@ rss_mb_from_kb() {
     awk -v kb="$1" 'BEGIN { printf "%.2f", kb / 1024 }'
 }
 
-echo "timestamp	elapsed_s	pid	rss_kb	rss_mb	command" > "${timeline}"
+printf 'timestamp\telapsed_s\tpid\trss_kb\trss_mb\tcommand\tsample_id\n' > "${timeline}"
 
 start_epoch="$(date +%s)"
 sample_taken="0"
+sample_id="0"
 sample_pid=""
 max_rss_kb="0"
 max_pid=""
@@ -203,6 +204,7 @@ echo "logs: ${build_log}" >&2
 echo "rss:  ${timeline}" >&2
 
 while kill -0 "${build_pid}" 2>/dev/null; do
+    sample_id="$((sample_id + 1))"
     now="$(date +%s)"
     elapsed="$((now - start_epoch))"
 
@@ -213,8 +215,8 @@ while kill -0 "${build_pid}" 2>/dev/null; do
         cmd="$(ps -o command= -p "${pid}" 2>/dev/null | tr '\t' ' ' || true)"
         rss_mb="$(rss_mb_from_kb "${rss_kb}")"
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${elapsed}" "${pid}" "${rss_kb}" "${rss_mb}" "${cmd}" \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${elapsed}" "${pid}" "${rss_kb}" "${rss_mb}" "${cmd}" "${sample_id}" \
             >> "${timeline}"
 
         if [ "${rss_kb}" -gt "${max_rss_kb}" ]; then

@@ -87,14 +87,15 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // platform frameworks. Linux ARM64 reached 4.99 GB in the
         // v0.2.1-rc0 release build, while the integrated HA API kernel
         // reached 8.10 GB in a clean aarch64-linux-musl ReleaseFast
-        // build. Reserve 10 GiB so the scheduler serializes competing
-        // roots instead of discarding a successful production build.
-        .api_kernel => @as(usize, if (target.os.tag == .macos) 11 else 10) * 1024 * 1024 * 1024,
-        // Physical storage now compiles separately from distributed
-        // coordination. Retain the split kernel's conservative 20 GiB
-        // reservation; the former monolithic 24/22 GiB measurements
-        // do not describe either of these independent artifacts.
-        .storage_kernel => 20 * 1024 * 1024 * 1024,
+        // build. Linux retains 10 GiB. The macOS claim now includes a
+        // provisional margin over the subsequently exceeded 11 GiB claim.
+        .api_kernel => @as(usize, if (target.os.tag == .macos) 14 else 10) * 1024 * 1024 * 1024,
+        // September's macOS 20 GiB claim is below the reported 22–23 GB
+        // compiler peak. 28 GiB includes >=25% headroom at 23 decimal GB.
+        // Keep the measured Linux profiles separate. The other macOS bumps
+        // below are provisional 25% margins over claims reported as exceeded;
+        // replace them with cold-build evidence before lowering them.
+        .storage_kernel => @as(usize, if (target.os.tag == .macos) 28 else 20) * 1024 * 1024 * 1024,
         // The aarch64-macOS ReleaseSafe distributed unit reached 12.14 GB
         // after the September 2026 runtime changes. Keep a measured margin
         // without reducing Linux runner concurrency.
@@ -105,16 +106,28 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // the 10 GiB reservation keeps it serialized with the macOS
         // storage kernel until both release runners confirm that.
         .serverless => 10 * 1024 * 1024 * 1024,
-        // The broad aarch64-macOS ReleaseFast inference root now
-        // reaches roughly 13.6 GB after storage/runtime integration.
-        // Reserve enough headroom for mode-dependent IR; the build
+        // The broad aarch64-macOS ReleaseFast inference root
+        // previously reached roughly 13.6 GB after storage integration;
+        // the 16 GiB claim has since been reported as exceeded on macOS.
+        // Add provisional headroom for mode-dependent IR; the build
         // scheduler can overlap whichever roots fit without forcing
         // callers to serialize the whole build.
-        .inference => 16 * 1024 * 1024 * 1024,
-        // Clean aarch64-macOS ReleaseFast codegen currently peaks
-        // around 2.23 GB, just above the former 2 GiB reservation.
-        .cli => 3 * 1024 * 1024 * 1024,
+        .inference => @as(usize, if (target.os.tag == .macos) 20 else 16) * 1024 * 1024 * 1024,
+        // macOS CLI exceeded the newer 3 GiB claim too; provision 4 GiB
+        // pending a fresh cold-build trace. Keep the Linux claim unchanged.
+        .cli => @as(usize, if (target.os.tag == .macos) 4 else 3) * 1024 * 1024 * 1024,
     };
+}
+
+test "macOS reservations cover reported storage peak and prevent unsafe overlap" {
+    const macos = try std.zig.system.resolveTargetQuery(std.testing.io, .{ .cpu_arch = .aarch64, .os_tag = .macos });
+    const profile: CompileMemoryProfile = .{ .host = macos, .target = macos, .optimize = .fast, .strip = false, .cpu_inference = true };
+    const reported_storage_bytes: usize = 23_000_000_000;
+    const storage = runtimeCompileMaxRss(.storage_kernel, profile);
+    try std.testing.expect(storage >= reported_storage_bytes + reported_storage_bytes / 4);
+    // A 48 GiB developer host with 8 GiB reserved for other work cannot
+    // admit storage and inference simultaneously under the revised claims.
+    try std.testing.expect(storage + runtimeCompileMaxRss(.inference, profile) > 40 * 1024 * 1024 * 1024);
 }
 
 test "measured release reservations admit storage with inference and preserve unmeasured profiles" {

@@ -27,6 +27,7 @@ import generate_pipeline_cases as adaptation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import paired_benchmark
+from linux_cpu import host_provenance
 
 HERE = Path(__file__).resolve().parent
 SCOPE = "gliner25_direct_core_cpu_fp32"
@@ -560,7 +561,12 @@ def checked_ready(
             raise BenchmarkError(f"{arm} ready contract differs: {key}")
     if arm == "native" and (
         ready.get("build_mode") != "fast"
-        or ready.get("scheduler") != "serial_io"
+        or ready.get("scheduler")
+        != (
+            "bounded_io"
+            if not ready.get("system_blas") and threads > 1
+            else "serial_io"
+        )
         or ready.get("cases_sha256") != oracle.sha256_file(cases_path)
     ):
         raise BenchmarkError(
@@ -568,6 +574,15 @@ def checked_ready(
         )
     if arm == "python" and ready.get("interop_threads") != 1:
         raise BenchmarkError("Python interop thread budget differs")
+
+
+def thread_environment(threads: int) -> dict[str, str]:
+    # BLAS supports the full benchmark budget. The native fallback pool has
+    # its own eight-worker maximum, including in BLAS-enabled workers.
+    return {
+        **{name: str(threads) for name in THREAD_ENV},
+        "ANTFLY_INFERENCE_CPU_THREADS": str(min(threads, 8)),
+    }
 
 
 def run_variant(
@@ -605,7 +620,7 @@ def run_variant(
         name: canonical_result(all_cases[name]["expected"]) for name in selected
     }
     env = dict(os.environ)
-    env.update({name: str(args.threads) for name in THREAD_ENV})
+    env.update(thread_environment(args.threads))
     env.update(
         PYTHONDONTWRITEBYTECODE="1",
         TOKENIZERS_PARALLELISM="false",
@@ -760,7 +775,7 @@ def driver(args: argparse.Namespace) -> None:
         not 1 <= args.threads <= 32
         or not 0 <= args.warmup <= 8
         or not 2 <= args.pairs <= 64
-        or not 1 <= args.timeout_ms <= 60000
+        or not 1 <= args.timeout_ms <= 300000
         or not 1 <= args.startup_timeout <= 300
         or not 256 <= args.max_rss_mib <= 12288
     ):
@@ -804,6 +819,7 @@ def driver(args: argparse.Namespace) -> None:
             "machine": platform.machine(),
             "processor": platform.processor(),
         },
+        "host": host_provenance(),
         "models": [],
     }
     try:

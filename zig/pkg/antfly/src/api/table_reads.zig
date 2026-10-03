@@ -46,8 +46,8 @@ else
 const doc_set = @import("../storage/db/doc_set.zig");
 const doc_identity = if (control_only_storage_sources) struct {} else @import("../storage/db/doc_identity.zig");
 const db_embedder = if (control_only_storage_sources) struct {} else @import("../storage/db/enrichment/embedder.zig");
-const ha_public_gate_state = @import("../storage/hot_standby/public_gate_state.zig");
-const ha_read_gate_mod = @import("../storage/hot_standby/read_gate.zig");
+const hot_standby_public_gate_state = @import("../storage/hot_standby/public_gate_state.zig");
+const hot_standby_read_gate_mod = @import("../storage/hot_standby/read_gate.zig");
 const hot_standby_standby_mod = @import("../storage/hot_standby/standby.zig");
 const storage_schema = @import("../storage/schema.zig");
 const dynamic_field_capability = @import("../storage/db/dynamic_field_capability.zig");
@@ -1542,12 +1542,12 @@ pub const GraphReadBarrier = struct {
     }
 };
 
-pub const HAReadGate = union(enum) {
+pub const HotStandbyReadGate = union(enum) {
     standby: *const hot_standby_standby_mod.Standby,
-    shared: *const ha_public_gate_state.State,
+    shared: *const hot_standby_public_gate_state.State,
 
-    pub fn check(self: HAReadGate, consistency: raft_mod.ReadConsistency) !void {
-        const request = ha_read_gate_mod.Request{
+    pub fn check(self: HotStandbyReadGate, consistency: raft_mod.ReadConsistency) !void {
+        const request = hot_standby_read_gate_mod.Request{
             .consistency = switch (consistency) {
                 .stale => .stale_ok,
                 .leader_lease, .read_index => .primary,
@@ -1556,7 +1556,7 @@ pub const HAReadGate = union(enum) {
         switch (self) {
             .shared => |state| try state.checkRead(request),
             .standby => |standby| {
-                const decision = try ha_read_gate_mod.evaluateStandby(standby, request);
+                const decision = try hot_standby_read_gate_mod.evaluateStandby(standby, request);
                 switch (decision.action) {
                     .serve_standby => {},
                     .wait_for_apply => return error.HAReadWaitForApply,
@@ -3272,7 +3272,7 @@ pub const ProvisionedTableReadSource = struct {
     prepare_for_read: ?ReadPreparation = null,
     group_visible_root_generation: ?GroupVisibleRootGenerationSource = null,
     resident_db: ?ResidentDbSource = null,
-    ha_read_gate: ?HAReadGate = null,
+    hot_standby_read_gate: ?HotStandbyReadGate = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
@@ -3546,11 +3546,11 @@ pub const ProvisionedTableReadSource = struct {
         return self;
     }
 
-    pub fn withHAReadGate(
+    pub fn withHotStandbyReadGate(
         self: *ProvisionedTableReadSource,
-        gate: ?HAReadGate,
+        gate: ?HotStandbyReadGate,
     ) *ProvisionedTableReadSource {
-        self.ha_read_gate = gate;
+        self.hot_standby_read_gate = gate;
         return self;
     }
 
@@ -3648,8 +3648,8 @@ pub const ProvisionedTableReadSource = struct {
         };
     }
 
-    fn ensureHAReadAllowed(self: *ProvisionedTableReadSource, consistency: raft_mod.ReadConsistency) !void {
-        if (self.ha_read_gate) |gate| try gate.check(consistency);
+    fn ensureHotStandbyReadAllowed(self: *ProvisionedTableReadSource, consistency: raft_mod.ReadConsistency) !void {
+        if (self.hot_standby_read_gate) |gate| try gate.check(consistency);
     }
 
     const RetainedSingleOwnerRead = struct {
@@ -3675,7 +3675,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn openRelationalRead(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, from: []const u8, to: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             const Single = struct {
                 alloc: std.mem.Allocator,
@@ -3819,7 +3819,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn openRelationalStatement(ptr: *anyopaque, alloc: std.mem.Allocator, scans: []const @import("table_read_source.zig").RelationalStatementScan, consistency: raft_mod.ReadConsistency) !@import("table_read_source.zig").RelationalStatementRead {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null and self.distributed_router == null) return error.SqlStatementSnapshotRequired;
         if (scans.len == 0 or scans.len > 64) return error.SqlProgramLimitExceeded;
         const View = @import("table_read_source.zig").RelationalReadView;
@@ -3842,7 +3842,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn openRelationalStatementSnapshot(ptr: *anyopaque, alloc: std.mem.Allocator, table: []const u8, schema_version: u32, consistency: raft_mod.ReadConsistency, cancellation: ?@import("antfly_cancellation").CancellationToken, deadline_ns: ?u64) !@import("table_read_source.zig").RelationalStatementSnapshot {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
         const opts: db_mod.types.ScanOptions = .{ .cancellation = cancellation, .execution_deadline_ns = deadline_ns };
         var prepared = try self.prepareRoutedSpanRead(alloc, table, "", "", .{ .scan = .{ .from_key = "", .to_key = "", .opts = opts } }, consistency, .general);
@@ -4071,14 +4071,14 @@ pub const ProvisionedTableReadSource = struct {
 
     fn openRelationalReadGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, from_key: []const u8, to_key: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").RelationalReadView {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null) return null;
         return self.groupLocalSourceWithFence(fence).openRelationalReadGroupLocal(alloc, group_id, table_name, from_key, to_key, opts, consistency);
     }
 
     fn tryStatementReadFenceGroupRouted(ptr: *anyopaque, alloc: std.mem.Allocator, fence: metadata_api.CatalogRouteFence, group_id: u64, table_name: []const u8, opts: db_mod.types.ScanOptions, consistency: raft_mod.ReadConsistency) !?@import("table_read_source.zig").StatementReadFence {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.local_read_source == null) return error.SqlStatementSnapshotRequired;
         return self.groupLocalSourceWithFence(fence).tryStatementReadFenceGroupLocal(alloc, group_id, table_name, opts, consistency);
     }
@@ -4343,7 +4343,7 @@ pub const ProvisionedTableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (try ordered_rows.isIndexScan(alloc, opts)) {
             var result = (try scan(ptr, alloc, table_name, from_key, to_key, opts, consistency)) orelse return false;
             defer result.deinit(alloc);
@@ -4603,7 +4603,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try checkLookupOptionsActive(opts);
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.catalog.vtable.restore_scope_for_group != null) {
             // The standalone restore validator pins the same unpublished
             // catalog as the distributed adapter. Admit only its exact owner
@@ -4660,7 +4660,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.documentArtifactManifest(
@@ -4705,7 +4705,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.documentArtifactManifests(
@@ -4751,7 +4751,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.scan(&hosted, alloc, table_name, from_key, to_key, opts, consistency);
@@ -4817,7 +4817,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.query(&hosted, alloc, table_name, req, consistency);
@@ -5057,7 +5057,7 @@ pub const ProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             var hosted = self.routedHostedSource();
             return HostedProvisionedTableReadSource.preflightQuery(
@@ -5241,7 +5241,7 @@ pub const ProvisionedTableReadSource = struct {
     }
 
     fn lookupRestoreStaging(self: *ProvisionedTableReadSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, key: []const u8, opts: db_mod.types.LookupOptions, fence: ?metadata_api.CatalogRouteFence) !?LookupResponse {
-        try self.ensureHAReadAllowed(.read_index);
+        try self.ensureHotStandbyReadAllowed(.read_index);
         try checkLookupOptionsActive(opts);
         if (comptime control_only_storage_sources) {
             var local = self.local_read_source orelse return error.StorageKernelOwnerUnavailable;
@@ -5285,7 +5285,7 @@ pub const ProvisionedTableReadSource = struct {
     ) !?LookupResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         if (opts.restore_staging_scope != null) return self.lookupRestoreStaging(alloc, group_id, table_name, key, opts, null);
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = key, .opts = opts } }, consistency, .general, 0);
@@ -5335,7 +5335,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifest {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general, 0);
@@ -5377,7 +5377,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.DocumentArtifactManifestList {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .lookup = .{ .key = doc_key, .opts = .{} } }, consistency, .general, 0);
@@ -5419,7 +5419,7 @@ pub const ProvisionedTableReadSource = struct {
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             // A routed data-Raft query may run on a leader that only recently
@@ -5505,7 +5505,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?ScanResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general, 0);
@@ -5567,7 +5567,7 @@ pub const ProvisionedTableReadSource = struct {
         sink: ScanStreamSink,
     ) !bool {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = try self.prepareKnownGroupRead(alloc, group_id, table_name, .{ .scan = .{ .from_key = from_key, .to_key = to_key, .opts = opts } }, consistency, .general, 0);
@@ -5612,7 +5612,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn queryGroupCoordinator(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             const fence = try self.coordinatorGroupFence(alloc, group_id, table_name, req);
             var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -5626,7 +5626,7 @@ pub const ProvisionedTableReadSource = struct {
 
     fn searchResultGroupCoordinator(ptr: *anyopaque, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, req: db_mod.types.SearchRequest, consistency: raft_mod.ReadConsistency) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         if (self.distributed_router != null) {
             const fence = try self.coordinatorGroupFence(alloc, group_id, table_name, req);
             var route_storage: [1]table_catalog.CatalogGroupRoute = undefined;
@@ -5647,7 +5647,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?query_api.QueryResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = if (self.graph_read_barrier != null and consistency != .stale)
@@ -5723,7 +5723,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?db_mod.types.SearchResult {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         var attempt: usize = 0;
         while (attempt < topology_read_attempt_limit) : (attempt += 1) {
             var read_activity = if (self.graph_read_barrier != null and consistency != .stale)
@@ -5984,7 +5984,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphExpandResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         return try self.groupLocalSource().graphExpandGroupLocal(alloc, group_id, table_name, req, consistency);
     }
 
@@ -6010,7 +6010,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphHydrateResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         return try self.groupLocalSource().graphHydrateGroupLocal(alloc, group_id, table_name, req, consistency);
     }
 
@@ -6036,7 +6036,7 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
     ) !?distributed_graph.GraphEdgesResponse {
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
-        try self.ensureHAReadAllowed(consistency);
+        try self.ensureHotStandbyReadAllowed(consistency);
         return try self.groupLocalSource().graphEdgesGroupLocal(alloc, group_id, table_name, req, consistency);
     }
 
@@ -21927,7 +21927,7 @@ fn consumerTests() type {
             };
 
             var source = ProvisionedTableReadSource.init("/tmp/unused-antfly-ha-read-gate", NoCatalog.iface(), raft_mod.read_gate.alreadyReadSafeBarrier());
-            _ = source.withHAReadGate(.{ .standby = &standby });
+            _ = source.withHotStandbyReadGate(.{ .standby = &standby });
 
             try std.testing.expectError(
                 error.HAReadRequiresPrimary,

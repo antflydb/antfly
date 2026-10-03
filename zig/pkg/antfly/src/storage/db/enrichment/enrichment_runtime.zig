@@ -31703,7 +31703,7 @@ test "ordered artifact inventory unit chunk callback reconstructs publishes and 
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 1, .little);
             std.mem.writeInt(u64, marker[8..16], index, .little);
-            try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+            try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
             try txn.commit();
         }
         fn apply(self: *@This(), db: *db_mod.DB, index: u64) !void {
@@ -31989,7 +31989,7 @@ test "ordered artifact inventory chunk callback waits for acceptance and atomica
     var marker: [16]u8 = undefined;
     std.mem.writeInt(u64, marker[0..8], 1, .little);
     std.mem.writeInt(u64, marker[8..16], 11, .little);
-    try db.core.store.putBatch(&.{ .{ .key = manifest_key, .value = &empty }, .{ .key = &internal_keys.raft_document_applied_entry_key, .value = &marker } }, &.{});
+    try db.core.store.putBatch(&.{ .{ .key = manifest_key, .value = &empty }, .{ .key = &internal_keys.ordered_document_applied_entry_key, .value = &marker } }, &.{});
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try std.testing.expectError(error.EnrichmentSourceChanged, previous.?.requireCurrent(&read, db.root_incarnation));

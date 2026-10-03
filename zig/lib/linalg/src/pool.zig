@@ -84,7 +84,7 @@ pub inline fn cachedCpuCount() usize {
     };
     const cached = Once.value.load(.acquire);
     if (cached != 0) return cached;
-    const detected = std.Thread.getCpuCount() catch 1;
+    const detected = @import("cpu_budget.zig").effective(std.Thread.getCpuCount() catch 1);
     Once.value.store(@max(detected, 1), .release);
     return @max(detected, 1);
 }

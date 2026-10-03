@@ -15,7 +15,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const primitives = @import("primitives.zig");
-const gemm = @import("gemm.zig");
+const gemm = @import("gemm_dispatch.zig");
 const pool = @import("pool.zig");
 
 const vec_len = primitives.vec_len;
