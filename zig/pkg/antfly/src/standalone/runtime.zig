@@ -12542,7 +12542,11 @@ test "standalone catalog remote apply outage preserves committed creation and re
     const committed_lsn = primary.lastLsn();
     try std.testing.expect(committed_lsn != 0);
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
-    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
+    // "pending" is a retry of an already-attempted mutation (ambiguous: it
+    // may have landed before the outage). "not_committed" is a brand-new
+    // proposal that never reaches the log once catalog_durability_failed is
+    // set, so beginCatalogMutationLocked reports it as a known drop.
+    try std.testing.expectError(error.ProposalDropped, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("not_committed") == null);
     try std.testing.expectEqual(committed_lsn, primary.lastLsn());
     metadata.deinit();
