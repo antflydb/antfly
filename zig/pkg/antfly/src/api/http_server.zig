@@ -3902,6 +3902,7 @@ pub const ApiHttpServer = struct {
     /// parameter state; every execution still binds against its own snapshot.
     sql_plan_cache: sql_plan_cache.Cache,
     sql_schema_cache: sql_schema_cache.Cache,
+    lake_read_cache: @import("../serverless/query/lake_serving_cache.zig").Cache,
     pgwire_listener: ?*@import("sql_pgwire.zig").Listener = null,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
@@ -4110,6 +4111,7 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
             .sql_plan_cache = sql_plan_cache.Cache.init(owner_alloc, .{}),
             .sql_schema_cache = sql_schema_cache.Cache.init(owner_alloc),
+            .lake_read_cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(owner_alloc),
             .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
@@ -4624,6 +4626,7 @@ pub const ApiHttpServer = struct {
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
         self.sql_schema_cache.deinit();
+        self.lake_read_cache.deinit();
         self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
@@ -19464,7 +19467,9 @@ pub const ApiHttpServer = struct {
         defer definitions.deinit();
         const listed = try tables_api.buildTableListWithDefinitions(arena, &snapshot, null, storage_statuses, &definitions);
         for (listed) |*item| item.name = labels.get(item.name) orelse return error.InvalidCatalogRecord;
-        std.mem.sort(metadata_openapi.TableStatus, listed, {}, struct {
+        // TableStatus includes the complete schema and can exceed the bit-size
+        // supported by std.mem.sort's SIMD rotation path.
+        std.sort.pdq(metadata_openapi.TableStatus, listed, {}, struct {
             fn less(_: void, l: metadata_openapi.TableStatus, r: metadata_openapi.TableStatus) bool {
                 return std.mem.lessThan(u8, l.name, r.name);
             }

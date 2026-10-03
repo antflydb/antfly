@@ -25,11 +25,15 @@ const Fixture = struct {
     native_opened: usize = 0,
     native_closed: usize = 0,
     row_returned: bool = false,
+    policy_catalog_changed: bool = false,
     view: [1]reads.RelationalReadView = undefined,
     const native_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"amount\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}";
     fn catalog(raw: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
         const self: *Fixture = @ptrCast(@alignCast(raw));
-        if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
+        if (call == .policy_publication_status) {
+            if (self.policy_catalog_changed) return error.RowPolicyCatalogChanged;
+            return alloc.dupe(u8, "null");
+        }
         if (call != .resolve_many) return error.UnexpectedCatalogCall;
         const input = call.resolve_many;
         if (input.expected_revision) |revision| if (revision != 1) return error.CatalogGenerationChanged;
@@ -113,6 +117,8 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         defer server.deinit();
         var identity: ?server_mod.AuthenticatedIdentity = null;
         const cases = [_]struct { sql: []const u8, expected: []const u8 }{
+            .{ .sql = "SELECT COUNT(*) FROM events", .expected = "5" },
+            .{ .sql = "SELECT COUNT(*) AS total FROM events WHERE amount > 2", .expected = "3" },
             .{ .sql = "SELECT SUM(amount) FROM events WHERE amount > 2", .expected = "12" },
             .{ .sql = "SELECT COUNT(*) FROM events e JOIN events x ON e.amount = x.amount", .expected = "5" },
             .{ .sql = "SELECT SUM(e.amount) FROM events e JOIN native n ON e.amount = n.amount", .expected = "3" },
@@ -127,6 +133,14 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
             try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
             try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
         }
+        // Catalog changes must remain retryable failures, never permission to
+        // treat a lake source as unprotected after the latest-main policy fix.
+        fixture.policy_catalog_changed = true;
+        var changing_adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+        var changing_count = try @import("../sql/compiler.zig").compile(alloc, "SELECT COUNT(*) FROM events", .{});
+        defer changing_count.deinit();
+        try std.testing.expectError(error.RowPolicyCatalogChanged, @import("../sql/runtime.zig").execute(alloc, changing_adapter.backend(), &changing_count, &.{}, .{}));
+        fixture.policy_catalog_changed = false;
         try std.testing.expectEqual(fixture.native_opened, fixture.native_closed);
         try std.testing.expectEqual(@as(usize, 1), fixture.native_opened);
         var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };

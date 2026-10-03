@@ -50,7 +50,24 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("../sy
         } else false;
         if (!present) try fields.append(a, condition.column);
     }
-    const cursor = try adapter.openLakeScan(alloc, table, .{ .fields = fields.items, .limit = request.opts.limit });
+    var pushed: std.ArrayList(catalog.Condition) = .empty;
+    for (input_conditions) |condition| {
+        const op: catalog.Condition.Op = switch (condition.op) {
+            .eq => .eq,
+            .ne => .neq,
+            .lt => .lt,
+            .lte => .lte,
+            .gt => .gt,
+            .gte => .gte,
+            .is_null => .is_null,
+            .is_not_null => .is_not_null,
+            else => continue,
+        };
+        var value = condition.value orelse .null;
+        if (value == .string and (try table.column(condition.column)).type == .integer) value = .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidQueryRequest };
+        try pushed.append(a, .{ .column = condition.column, .op = op, .value = value });
+    }
+    const cursor = try adapter.openLakeScan(alloc, table, .{ .fields = fields.items, .conditions = pushed.items, .after = if (request.from.len == 0) null else request.from, .primary_order = true, .limit = request.opts.limit });
     defer cursor.close(cursor.ptr);
     var output: std.Io.Writer.Allocating = .init(alloc);
     errdefer output.deinit();

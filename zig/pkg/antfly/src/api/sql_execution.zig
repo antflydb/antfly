@@ -656,7 +656,7 @@ pub const Adapter = struct {
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
         try self.verify(alloc, table);
         try self.checkLakeRead(alloc, table);
-        const cursor = try @import("lake_sql_cursor.zig").open(alloc, table, request, self.context, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store });
+        const cursor = try @import("lake_sql_cursor.zig").openWithCache(alloc, table, request, self.context, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store }, &self.server.lake_read_cache);
         errdefer cursor.close(cursor.ptr);
         try self.verify(alloc, table);
         return cursor;
@@ -727,6 +727,7 @@ pub const Adapter = struct {
                 const normalized = try self.context.platformDeadline();
                 source.* = try @import("../serverless/query/lake_serving.zig").ServingSource.openWithContext(alloc, schema, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store }, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
                 errdefer source.deinit();
+                try source.attachCache(&self.server.lake_read_cache, request.table.external_base_source.?.binding, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
                 try owner.sources.put(alloc, request.table.id, source);
             } else try native.append(scratch.allocator(), request);
         }

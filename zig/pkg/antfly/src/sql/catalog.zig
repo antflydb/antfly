@@ -132,12 +132,43 @@ pub const Page = struct {
     }
 };
 
+/// Borrowed typed vectors plus a page-owned selection. Vectors remain valid
+/// until the cursor's next pull or close; consumers retain only their results.
+/// SQL names are literal, and null bitmaps distinguish SQL NULL from JSON null.
+pub const ColumnPage = struct {
+    batch: @import("../storage/rowsource/types.zig").ColumnBatch,
+    selection: []const usize,
+    after: ?[]const u8 = null,
+    pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        const index = self.selection[row];
+        if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
+        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.row_refs[index]) }, .sql_null = false };
+        const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
+        if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
+        const value: std.json.Value = switch (column.values) {
+            .i64 => |values| .{ .integer = values[index] },
+            .f64 => |values| .{ .float = values[index] },
+            .bool => |values| .{ .bool = values[index] },
+            .bytes => |values| .{ .string = values[index] },
+            .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
+            .vector_f32 => return error.UnsupportedSqlExecution,
+        };
+        return .{ .value = value, .sql_null = false };
+    }
+};
+
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
 pub const Cursor = struct {
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!Page,
     close: *const fn (*anyopaque) void,
+    /// Optional native column path; consumers may fall back to next().
+    next_columns: ?*const fn (*anyopaque, std.mem.Allocator, u32) anyerror!ColumnPage = null,
+    /// Exact snapshot count; null means the retained cursor must be scanned.
+    /// Providers may use metadata only after accounting for filters/deletes.
+    count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
 };
 
 pub const StatementScan = struct { table: Table, request: Scan };

@@ -2297,7 +2297,7 @@ pub fn buildSupportedI64RowGroupBatchFromCachedCoalescedObjectRangeReaderAlloc(
     );
 }
 
-fn buildSupportedI64RowGroupBatchFromMaybeCachedCoalescedObjectRangeReaderAlloc(
+pub fn buildSupportedI64RowGroupBatchFromMaybeCachedCoalescedObjectRangeReaderAlloc(
     alloc: Allocator,
     reader: ObjectRangeReader,
     cache: ?*ObjectRangeCache,
@@ -3762,6 +3762,7 @@ pub const TestPlainI64Column = struct {
     column_id: []const u8,
     values: []const i64,
     field_id: ?i32 = null,
+    write_statistics: bool = false,
 };
 
 pub const TestPlainByteArrayColumn = struct {
@@ -3778,6 +3779,8 @@ const TestColumnFooter = struct {
     encoding: i32 = 0,
     compression_codec: i32 = 0,
     field_id: ?i32 = null,
+    min_i64: ?i64 = null,
+    max_i64: ?i64 = null,
 };
 
 fn appendSingleColumnFooterMetadata(
@@ -3924,6 +3927,18 @@ fn appendColumnFooterMetadata(
     try appendI64(out, alloc, @intCast(column.compressed_len));
     try appendField(out, alloc, &meta_prev, 9, .i64);
     try appendI64(out, alloc, @intCast(column.column_offset));
+    if (column.min_i64) |min| {
+        try appendField(out, alloc, &meta_prev, 12, .struct_);
+        var stats_prev: i16 = 0;
+        var encoded: [8]u8 = undefined;
+        try appendField(out, alloc, &stats_prev, 5, .binary);
+        std.mem.writeInt(i64, &encoded, column.max_i64.?, .little);
+        try appendBinary(out, alloc, &encoded);
+        try appendField(out, alloc, &stats_prev, 6, .binary);
+        std.mem.writeInt(i64, &encoded, min, .little);
+        try appendBinary(out, alloc, &encoded);
+        try appendStop(out, alloc);
+    }
     try appendStop(out, alloc);
 
     try appendStop(out, alloc);
@@ -3974,6 +3989,8 @@ pub fn buildTestPlainI64ParquetObjectAlloc(alloc: Allocator, columns: []const Te
             .compressed_len = chunk.items.len,
             .uncompressed_len = chunk.items.len,
             .field_id = column.field_id,
+            .min_i64 = if (column.write_statistics) std.mem.min(i64, column.values) else null,
+            .max_i64 = if (column.write_statistics) std.mem.max(i64, column.values) else null,
         };
         try object.appendSlice(alloc, chunk.items);
     }

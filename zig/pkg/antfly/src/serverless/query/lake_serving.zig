@@ -65,6 +65,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
     coalesce_options: serverless_query.LakeRangeCoalesceOptions = .{},
     sidecar_context: PinnedExternalLakeSidecarContext = .{},
     iceberg_delete_plan: ?serverless_query.LakeIcebergDeletePlan = null,
+    shared_reader: ?*@import("lake_serving_cache.zig").Reader = null,
 
     pub fn init(
         inventory: external_source_api.Inventory,
@@ -76,10 +77,15 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
         };
     }
 
+    pub fn reader(self: *@This()) serverless_query.LakeParquetObjectRangeReader {
+        if (self.shared_reader) |cached| return cached.reader();
+        return self.object_reader.parquetReader();
+    }
+
     pub fn parquetScanner(self: *@This()) PinnedExternalLakeRowsScanner {
         return .{
             .inventory = self.inventory,
-            .reader = self.object_reader.parquetReader(),
+            .reader = self.reader(),
             .cache = self.cache,
             .coalesce_options = self.coalesce_options,
             .sidecar_context = self.sidecar_context,
@@ -107,7 +113,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
 
         var discovered = serverless_query.discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
             alloc,
-            self.object_reader.parquetReader(),
+            self.reader(),
             self.inventory,
             request.projected_columns,
             64 * 1024,
@@ -142,7 +148,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
 
         var discovered = serverless_query.discoverLakeParquetSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
             alloc,
-            self.object_reader.parquetReader(),
+            self.reader(),
             self.inventory,
             projected_columns,
             64 * 1024,
@@ -167,7 +173,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
 
         if (self.iceberg_delete_plan) |delete_plan| {
             iceberg_deleted_refs = try serverless_query.readLakeIcebergDeleteRowRefsAlloc(alloc, .{
-                .reader = self.object_reader.parquetReader(),
+                .reader = self.reader(),
                 .client = self.object_reader.client,
                 .cache = self.cache,
                 .data_inventory = inventory,
@@ -186,7 +192,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
 
         const scanner = PinnedExternalLakeRowsScanner{
             .inventory = inventory,
-            .reader = self.object_reader.parquetReader(),
+            .reader = self.reader(),
             .cache = self.cache,
             .coalesce_options = self.coalesce_options,
             .sidecar_context = self.sidecar_context,
@@ -214,7 +220,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
 
         if (self.iceberg_delete_plan) |delete_plan| {
             iceberg_deleted_refs = try serverless_query.readLakeIcebergDeleteRowRefsAlloc(alloc, .{
-                .reader = self.object_reader.parquetReader(),
+                .reader = self.reader(),
                 .client = self.object_reader.client,
                 .cache = self.cache,
                 .data_inventory = inventory,
@@ -244,7 +250,7 @@ pub const PinnedExternalObjectStorageLakeRowsScanner = struct {
 
         return try serverless_query.executeLakeParquetSupportedI64ObjectRangeExpressionAggregatesAlloc(alloc, .{
             .binding = binding,
-            .reader = self.object_reader.parquetReader(),
+            .reader = self.reader(),
             .cache = self.cache,
             .inventory = inventory,
             .aggregate = local_request,
@@ -395,7 +401,27 @@ pub const ServingSource = struct {
         return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store };
     }
 
+    pub fn attachCache(self: *ServingSource, cache: *@import("lake_serving_cache.zig").Cache, binding: @import("../external_source/catalog_binding.zig").Binding, context: @import("lake_read_context.zig").Context) !void {
+        const reader = try self.alloc.create(@import("lake_serving_cache.zig").Reader);
+        errdefer self.alloc.destroy(reader);
+        const scope_bytes = try std.json.Stringify.valueAlloc(self.alloc, .{
+            .credentials = binding.credential_ref,
+            .source_uri = binding.source_uri,
+            .filesystem_root = if (self.store.fs_client) |fs| @as(?[]const u8, fs.root_dir) else null,
+            .s3_endpoint = if (self.store.s3_client) |s3| @as(?[]const u8, s3.cfg.credentials.endpoint) else null,
+            .s3_region = if (self.store.s3_client) |s3| @as(?[]const u8, s3.cfg.credentials.region) else null,
+            .s3_ssl = if (self.store.s3_client) |s3| @as(?bool, s3.cfg.credentials.use_ssl) else null,
+            .gcs_endpoint = if (self.store.gcs_client) |gcs| @as(?[]const u8, gcs.cfg.endpoint) else null,
+        }, .{});
+        defer self.alloc.free(scope_bytes);
+        var scope: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(scope_bytes, &scope, .{});
+        reader.* = .{ .base = self.scanner.object_reader, .cache = cache, .scope = scope, .context = context };
+        self.scanner.shared_reader = reader;
+    }
+
     pub fn deinit(self: *ServingSource) void {
+        if (self.scanner.shared_reader) |reader| self.alloc.destroy(reader);
         if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
         self.inventory.deinit(self.alloc);
         self.store.deinit();

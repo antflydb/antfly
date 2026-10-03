@@ -13,6 +13,10 @@ const Json = std.json.Value;
 
 fn addRow(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, row: catalog.Row) !void {
     const cells = try bound.input.cells(alloc, row);
+    return addCells(context, bound, grouped, alloc, cells);
+}
+
+fn addCells(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, cells: []const Datum) !void {
     if (!try bound.input.matchesWithProvider(alloc, cells, context.parameters, context.backend.decision_provider)) return;
     const values = try alloc.alloc(Datum, bound.group_count);
     for (bound.input.projections[0..bound.group_count], values) |program, *value| value.* = try context.evaluate(alloc, program.?, cells);
@@ -146,12 +150,39 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         defer if (after) |key| context.alloc.free(key);
         var pages: usize = 0;
         var visited: usize = 0;
-        while (!predicates.empty) {
+        var metadata_counted = false;
+        const count_only = bound.group_count == 0 and bound.input.predicate == null and predicates.terms.items.len == 0 and predicates.primary_key == null and for (bound.specs, bound.inputs, bound.filters) |spec, input, filter| {
+            if (spec.kind != .count or spec.distinct or input != null or filter != null) break false;
+        } else true;
+        if (count_only and !predicates.empty) if (try scan.count(context, table, .{ .fields = fields[0..field_count], .limit = context.limits.page_rows })) |count| {
+            try grouped.addGlobalCount(count);
+            metadata_counted = true;
+        };
+        while (!predicates.empty and !metadata_counted) {
             try context.checkpoint();
             pages += 1;
             if (pages > context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var arena = std.heap.ArenaAllocator.init(context.alloc);
             defer arena.deinit();
+            if (!external) if (try scan.columns(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.page_rows })) |column_page| {
+                if (column_page.selection.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
+                if (column_page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
+                visited += column_page.selection.len;
+                for (0..column_page.selection.len) |index| {
+                    try context.checkpoint();
+                    var row_arena = std.heap.ArenaAllocator.init(context.alloc);
+                    defer row_arena.deinit();
+                    const cells = try bound.input.columnCells(row_arena.allocator(), column_page, index);
+                    try addCells(context, bound, grouped, row_arena.allocator(), cells);
+                }
+                const next = column_page.after orelse break;
+                if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;
+                if (after) |previous| if (std.mem.eql(u8, previous, next)) return error.InvalidSqlBackendResponse;
+                const owned = try context.alloc.dupe(u8, next);
+                if (after) |previous| context.alloc.free(previous);
+                after = owned;
+                continue;
+            };
             const page = try scan.page(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.page_rows });
             defer page.deinit();
             if (page.rows.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;

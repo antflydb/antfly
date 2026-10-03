@@ -45,12 +45,48 @@ predicates before limits and emit snapshot-derived `_id` values. Iceberg reads
 apply the existing position/equality delete machinery. Provider reads receive
 the request's cancellation and deadline.
 
-Lake scans currently admit at most 100,000 materialized rows, 32 MiB of decoded
-materialized data and 1,000,000 examined rows per cursor, in addition to SQL's
-statement budget. `EXPLAIN` identifies `Lake Scan`; verbose plans include the
-source format and configured snapshot selector without opening the source.
-Unsupported Parquet encodings fail through the existing lake
-engine. Source attachments reject native write constraints, indexes, defaults,
+Lake cursors pull typed column batches, retaining one file's footer/delete
+metadata and one decoded row group. Opening a pinned cursor does not read data
+pages; the first page need not wait for later files. Aggregate execution consumes
+selected typed cells directly, and row objects are created at the row API
+boundary. Physical snapshot identities use opaque versioned `lake1:` IDs with
+numeric row-group/row ordinals. File metadata is ordered by identity before
+scanning, so pagination needs no full row sort. IDs are stable within a snapshot;
+clients must preserve them verbatim and must not parse or synthesize them.
+
+Simple integer, string and boolean comparisons prune disjoint row groups from
+footer min/max statistics, and files can be skipped when their known row groups
+are all disjoint. Missing statistics, annotated decimal/timestamp types and
+unsupported comparisons stay residual; predicates and Iceberg position/equality
+deletes are evaluated before page limits. Exact unfiltered `COUNT(*)` uses footer
+row counts only when no deletes or cursor constraints apply. Other aggregates,
+filtered counts and delete-bearing counts scan the selected rows normally.
+
+API SQL reads share a server-owned 64 MiB range cache (at most 4,096 entries).
+Keys bind the credential reference/scope, source endpoint, object version and
+byte range. Unversioned reads bypass it; cache hits still check cancellation and
+deadlines. Shared cached bytes are separate from each statement's memory budget.
+
+Each stream admits at most 100,000,000 examined rows, with at most 1,000,000 rows
+and 32 MiB input/decoded bytes per row-group materialization. SQL defaults admit
+10,000,000 scanned rows, 65,536 scan pages and 64 MiB retained bytes per statement;
+output remains bounded by the existing result/page limits. Large individual row
+groups can still fail the materialization budget. Sorting, grouping and hash
+joins retain bounded state and report a limit error when it exceeds the budget;
+disk spilling, parallel prefetch, page-level decoding and transform-aware
+partition pruning remain future engine work.
+
+The regression fixture scans 131,072 and 1,048,576 integer rows in 65,536-row
+Parquet groups under a 32 MiB tracking allocator. Peak tracked allocations are
+7,080,911 and 7,081,025 bytes respectively: input growth adds file metadata rather
+than retaining all rows. This measures cursor memory for that fixture, not
+process memory or query latency. Tests also verify lazy first-page I/O, warm
+range reuse, pruning without decoded pages, changed-object rejection, exact
+large integers, SQL/JSON null distinction and Iceberg deletes before limits.
+
+`EXPLAIN` identifies `Lake Scan`; verbose plans include the source format and
+configured snapshot selector without opening the source. Unsupported Parquet
+encodings fail through the existing lake engine. Source attachments reject native write constraints, indexes, defaults,
 generated columns and TTL. SQL mutations and public batches reject writes;
 existing native tables cannot acquire or remove an attachment through a schema
 update. External scans reject native serializable range-proof requests and

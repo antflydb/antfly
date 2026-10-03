@@ -1024,7 +1024,7 @@ fn sortAndDeduplicateExternalRowRefs(refs: []rowsource.RowRef) usize {
     return out;
 }
 
-fn externalRowRefLessThan(_: void, left_ref: rowsource.RowRef, right_ref: rowsource.RowRef) bool {
+pub fn externalRowRefLessThan(_: void, left_ref: rowsource.RowRef, right_ref: rowsource.RowRef) bool {
     const left = switch (left_ref) {
         .external => |value| value,
         else => return false,

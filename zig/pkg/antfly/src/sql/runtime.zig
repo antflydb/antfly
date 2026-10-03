@@ -27,11 +27,11 @@ const Datum = @import("scalar.zig").Datum;
 pub const Limits = struct {
     result_rows: usize = 128,
     mutation_rows: usize = 4096,
-    scan_rows: usize = 100_000,
-    retained_bytes: usize = 8 * 1024 * 1024,
+    scan_rows: usize = 10_000_000,
+    retained_bytes: usize = 64 * 1024 * 1024,
     page_rows: u32 = 256,
     page_bytes: usize = 256 * 1024,
-    scan_pages: usize = 16_384,
+    scan_pages: usize = 65_536,
 };
 pub const Column = describe.Column;
 pub const Output = struct {
@@ -168,14 +168,27 @@ pub const Context = struct {
             self.cursor = null;
         }
 
-        pub fn page(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
+        fn open(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan) !void {
             if (!self.opened) {
                 self.opened = true;
-                if (context.backend.vtable.open_scan) |open|
-                    self.cursor = try open(context.backend.ptr, context.alloc, table, request);
+                if (context.backend.vtable.open_scan) |capture|
+                    self.cursor = try capture(context.backend.ptr, context.alloc, table, request);
             }
+        }
+        pub fn page(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Page {
+            try self.open(context, table, request);
             if (self.cursor) |cursor| return cursor.next(cursor.ptr, alloc, request.limit);
             return context.backend.vtable.scan(context.backend.ptr, alloc, table, request);
+        }
+        pub fn count(self: *ScanState, context: Context, table: catalog.Table, request: catalog.Scan) !?u64 {
+            try self.open(context, table, request);
+            if (self.cursor) |cursor| if (cursor.count_rows) |count_rows| return try count_rows(cursor.ptr);
+            return null;
+        }
+        pub fn columns(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.ColumnPage {
+            try self.open(context, table, request);
+            if (self.cursor) |cursor| if (cursor.next_columns) |next| return try next(cursor.ptr, alloc, request.limit);
+            return null;
         }
 
         pub fn retained(self: ScanState, context: Context) bool {
@@ -394,7 +407,14 @@ pub const Context = struct {
         var scan_state: ScanState = .{};
         defer scan_state.deinit();
         if (limit == 0) return .{ .columns = columns, .command_tag = "SELECT" };
-        while (!predicates.empty) {
+        var metadata_counted = false;
+        if (statement.count_all and statement.predicate == null and !predicates.empty) {
+            if (try scan_state.count(self, table_def, .{ .fields = native_fields.items, .limit = self.limits.page_rows })) |exact_count| {
+                scanned = std.math.cast(usize, exact_count) orelse return error.SqlNumericOutOfRange;
+                metadata_counted = true;
+            }
+        }
+        while (!predicates.empty and !metadata_counted) {
             try self.checkpoint();
             page_count += 1;
             if (page_count > self.limits.scan_pages) return error.SqlProgramLimitExceeded;

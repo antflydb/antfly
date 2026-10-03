@@ -19,6 +19,33 @@ immutable lake files:
 - Materialize only hot rows, hot projections, and derived summaries when the
   workload proves they are worth owning inside Antfly.
 
+## Native SQL Serving Implementation
+
+Read-only lake attachments now use the native SQL catalog and execution runtime.
+The serving cursor pulls existing typed `ColumnBatch` vectors one row group at a
+time. SQL aggregates can consume selected vector cells without constructing row
+JSON; row pages remain available to public queries and existing operators. The
+provider contract exposes optional column pulls and exact metadata counts, so
+other native sources can adopt the same execution interface incrementally.
+
+Cursor identities bind source, snapshot, file and physical row ordinals. Ordering
+file metadata by identity and scanning ordinals in order preserves public `_id`
+pagination without sorting all rows. Safe min/max predicates prune row groups;
+unsupported comparisons remain residual. Unfiltered, delete-free `COUNT(*)`
+reads footer counts, and Iceberg deletes use the existing snapshot/sequence rules
+before emitting selected rows. API SQL reads reuse a bounded server-owned cache
+keyed by credential scope, endpoint, immutable object version and byte range.
+
+This establishes streaming and reusable column inputs; expression evaluation is
+still row-wise over selected cells. Large individual row groups retain the
+existing 32 MiB materialization bound. Blocking sorts, high-cardinality groups
+and hash joins remain subject to SQL's retained-memory budget. The next native
+execution layers are page-sized decode batches, vector expression kernels,
+bounded prefetch through the existing I/O runtime, and temporary-storage spill
+for blocking operators. Iceberg partition pruning needs a transform-aware proof;
+raw partition values alone are insufficient. These layers belong behind the
+same snapshot-bound provider contract.
+
 ## Relationship To Arrow, Parquet, Iceberg, And Lance
 
 These are related, but they are not one layer:

@@ -549,6 +549,14 @@ pub const Grouped = struct {
         _ = try self.appendGroup(&.{}, hasher.final());
     }
 
+    /// Seed exact COUNT(*) states supplied by an authorized snapshot provider.
+    /// Other aggregates still consume typed input pages through add().
+    pub fn addGlobalCount(self: *Grouped, count: u64) !void {
+        if (self.failed or self.finished or self.groups.items.len != 1 or self.key_count != 0 or self.rows_seen != 0) return error.InvalidSqlBackendResponse;
+        for (self.specs) |spec| if (spec.kind != .count or spec.distinct) return error.InvalidSqlBackendResponse;
+        for (self.groups.items[0].states) |*state| state.count = count;
+    }
+
     pub fn groupCount(self: *const Grouped) usize {
         return self.groups.items.len;
     }
