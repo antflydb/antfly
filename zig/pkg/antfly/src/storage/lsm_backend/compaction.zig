@@ -7070,6 +7070,7 @@ pub fn reconcileTombstonesStep(backend: anytype) anyerror!bool {
             zig017_return_error = error.ResourceBudgetExceeded;
             break :zig017_failure error.ResourceBudgetExceeded;
         };
+        zig017_return_error = err;
         return @as(anyerror!bool, err);
     };
     if (!done) return true;

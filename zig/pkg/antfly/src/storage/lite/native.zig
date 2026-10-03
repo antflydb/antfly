@@ -1163,8 +1163,10 @@ const IndexEditor = struct {
         node.page = link.page;
         node.original_page = link.page;
         node.dirty = false;
-        try node.keys.ensureTotalCapacity(alloc, decoded.keys.len);
-        try node.links.ensureTotalCapacity(alloc, decoded.pointers.len);
+        // Reserve the decoded entries and one insertion without geometric
+        // over-allocation in the arena's bounded single-key edit scratch.
+        try node.keys.ensureTotalCapacityPrecise(alloc, decoded.keys.len + 1);
+        try node.links.ensureTotalCapacityPrecise(alloc, decoded.pointers.len + 1);
         for (decoded.keys, decoded.key_pages.?) |key, page| {
             node.keys.appendAssumeCapacity(.{ .bytes = key, .page = page });
         }
@@ -14622,7 +14624,7 @@ test "lite index snapshots preserve pinned external values through allocation fa
             try std.testing.expectEqualStrings("old", docs[1].value);
         }
     };
-    try std.testing.checkAllAllocationFailures(a, Runner.run, .{ &file, pinned });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, pinned });
     const current = try file.snapshotDocumentsWithPrefixAlloc(a, "ns\x00");
     defer NativeFile.freeSnapshotDocuments(a, current);
     try std.testing.expectEqual(@as(usize, 1), current.len);
@@ -14792,7 +14794,7 @@ test "lite grouped snapshots preserve allocator ownership pinned values and mixe
                 try std.testing.expectEqualStrings("d", docs[2].key);
             }
         };
-        try std.testing.checkAllAllocationFailures(a, Runner.run, .{ &file, pinned });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Runner.run, .{ &file, pinned });
         var output_budget = MaintenanceTestAllocator{ .backing = a };
         const docs = try file.snapshotDocumentsWithPrefixAtCheckpointAlloc(output_budget.allocator(), "", pinned);
         NativeFile.freeSnapshotDocuments(output_budget.allocator(), docs);
