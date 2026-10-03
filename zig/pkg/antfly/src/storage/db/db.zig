@@ -95207,11 +95207,15 @@ test "db enrichment status changes notify query visibility hook" {
     var deterministic = embedder_mod.DeterministicDenseEmbedder{};
     var db = try DB.open(alloc, std.mem.span(path), .{
         .enrichment = .{ .dense_embedder = deterministic.interface() },
+        // Assert the explicit status edge without racing startup/replay
+        // notifications from independently scheduled workers.
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
     });
     defer db.close();
 
     const HookCtx = struct {
-        calls: u64 = 0,
+        status_calls: u64 = 0,
         table_name: ?[]const u8 = null,
         group_id: u64 = 0,
         saw_db: bool = false,
@@ -95219,7 +95223,10 @@ test "db enrichment status changes notify query visibility hook" {
 
         fn onChange(ptr: *anyopaque, table_name: []const u8, group_id: u64, changed_db: ?*DB, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.calls += 1;
+            // Attachment also replays existing repair debt. That is a valid
+            // visibility edge, independent of the enrichment status contract.
+            if (event.change != .status) return;
+            self.status_calls += 1;
             self.table_name = table_name;
             self.group_id = group_id;
             self.saw_db = changed_db != null;
@@ -95235,12 +95242,19 @@ test "db enrichment status changes notify query visibility hook" {
         .on_change = HookCtx.onChange,
     });
 
+    defer db.setQueryVisibilityHook(null);
+
+    try std.testing.expectEqual(@as(u64, 0), hook_ctx.status_calls);
     try db.enrichment_runtime.?.markAppliedThrough(1);
 
-    try std.testing.expectEqual(@as(u64, 1), hook_ctx.calls);
+    try std.testing.expectEqual(@as(u64, 1), hook_ctx.status_calls);
     try std.testing.expectEqualStrings("docs", hook_ctx.table_name.?);
     try std.testing.expectEqual(@as(u64, 7001), hook_ctx.group_id);
     try std.testing.expect(hook_ctx.saw_db);
+    try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
+
+    try db.enrichment_runtime.?.markAppliedThrough(2);
+    try std.testing.expectEqual(@as(u64, 2), hook_ctx.status_calls);
     try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
 }
 
