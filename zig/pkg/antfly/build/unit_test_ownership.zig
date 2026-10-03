@@ -30,8 +30,9 @@ pub fn apply(b: *std.Build, aggregate: *Step) *Step {
 pub fn selection(run: *Step.Run, object: *Step.Compile) []const u8 {
     for (run.argv.items, 0..) |arg, index| {
         if (arg != .bytes) continue;
+        if (std.mem.startsWith(u8, arg.bytes, "--suite-filter=")) return arg.bytes["--suite-filter=".len..];
         if (std.mem.startsWith(u8, arg.bytes, "--test-filter=")) return arg.bytes["--test-filter=".len..];
-        if (std.mem.eql(u8, arg.bytes, "--test-filter") and index + 1 < run.argv.items.len) {
+        if ((std.mem.eql(u8, arg.bytes, "--test-filter") or std.mem.eql(u8, arg.bytes, "--suite-filter")) and index + 1 < run.argv.items.len) {
             const next = run.argv.items[index + 1];
             if (next == .bytes) return next.bytes;
         }
@@ -43,9 +44,11 @@ fn matchesSelection(argv: []const Step.Run.Arg, filters: []const []const u8, anc
     var has_runtime_filter = false;
     for (argv, 0..) |arg, index| {
         if (arg != .bytes) continue;
-        const filter = if (std.mem.startsWith(u8, arg.bytes, "--test-filter="))
+        const filter = if (std.mem.startsWith(u8, arg.bytes, "--suite-filter="))
+            arg.bytes["--suite-filter=".len..]
+        else if (std.mem.startsWith(u8, arg.bytes, "--test-filter="))
             arg.bytes["--test-filter=".len..]
-        else if (std.mem.eql(u8, arg.bytes, "--test-filter") and index + 1 < argv.len and argv[index + 1] == .bytes)
+        else if ((std.mem.eql(u8, arg.bytes, "--test-filter") or std.mem.eql(u8, arg.bytes, "--suite-filter")) and index + 1 < argv.len and argv[index + 1] == .bytes)
             argv[index + 1].bytes
         else
             continue;
@@ -61,19 +64,22 @@ fn matchesSelection(argv: []const Step.Run.Arg, filters: []const []const u8, anc
 
 test "ownership anchors survive prepended runtime and compile filters" {
     const argv = [_]Step.Run.Arg{
-        .{ .bytes = @constCast("--test-filter") },                   .{ .bytes = @constCast("system catalog") },
-        .{ .bytes = @constCast("--test-filter=backup heartbeat ") },
+        .{ .bytes = @constCast("--test-filter") },                    .{ .bytes = @constCast("system catalog") },
+        .{ .bytes = @constCast("--suite-filter=backup heartbeat ") },
     };
     try std.testing.expect(matchesSelection(&argv, &.{}, "backup heartbeat "));
     try std.testing.expect(matchesSelection(&.{}, &.{ "join planning", "public openapi contract" }, "public openapi contract"));
 }
 
 test "ownership anchors respect runtime scope and exact filter identity" {
-    const argv = [_]Step.Run.Arg{ .{ .bytes = @constCast("--test-filter") }, .{ .bytes = @constCast("focused") } };
-    try std.testing.expect(!matchesSelection(&argv, &.{"broad"}, "broad"));
-    try std.testing.expect(!matchesSelection(&argv, &.{}, "focus"));
+    for ([_][]const u8{ "--test-filter", "--suite-filter" }) |option| {
+        const argv = [_]Step.Run.Arg{ .{ .bytes = @constCast(option) }, .{ .bytes = @constCast("focused") } };
+        try std.testing.expect(matchesSelection(&argv, &.{"broad"}, "focused"));
+        try std.testing.expect(!matchesSelection(&argv, &.{"broad"}, "broad"));
+        try std.testing.expect(!matchesSelection(&argv, &.{}, "focus"));
+        try std.testing.expect(!matchesSelection(&argv, &.{}, "all"));
+    }
     try std.testing.expect(matchesSelection(&.{}, &.{}, "all"));
-    try std.testing.expect(!matchesSelection(&argv, &.{}, "all"));
 }
 
 fn copySelected(b: *std.Build, original: *Step, copies: *std.AutoHashMap(*Step, *Step)) *Step {
