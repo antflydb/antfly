@@ -360,6 +360,8 @@ pub const Instruction = struct {
                 if (!expected.eq(self.output) or lhs.dims[lhs_contract] != rhs.dims[rhs_contract]) return error.InvalidResidentProgramShape;
                 geometry.dot = .{ .batch = if (rank == 3) @intCast(lhs.dims[0]) else 1, .rows = @intCast(lhs.dims[lhs_free]), .columns = @intCast(rhs.dims[rhs_free]), .contracting = @intCast(lhs.dims[lhs_contract]), .lhs_transposed = lhs_transposed, .rhs_transposed = rhs_transposed };
                 geometry.work_items = std.math.mul(u64, out_count, geometry.dot.?.contracting) catch return error.ResourceLimitExceeded;
+                // A transposed left operand is first copied row-major on the device.
+                if (lhs_transposed) geometry.scratch_bytes = std.math.mul(usize, @intCast(lhs.numElements().?), 4) catch return error.ResourceLimitExceeded;
             },
             .gather => |attrs| {
                 if (n != 2 or attrs.axis != 0 or attrs.elements or self.inputs[0].rank_ == 0 or
@@ -575,8 +577,12 @@ test "resident matrix dots validate both retained operand layouts" {
                     .inputs = .{ Shape.init(.f32, lhs_dims[3 - rank ..]), Shape.init(.f32, rhs_dims[3 - rank ..]), .{}, .{} },
                     .num_inputs = 2,
                 };
-                const geometry = try instruction.validate(.{ .max_scratch_bytes = 0 });
                 const batch: u32 = if (rank == 3) 2 else 1;
+                // A transposed left operand ([batch?, 5, 3]) is copied first.
+                const scratch: usize = if (lt) 60 * @as(usize, batch) else 0;
+                const geometry = try instruction.validate(.{ .max_scratch_bytes = scratch });
+                try std.testing.expectEqual(scratch, geometry.scratch_bytes);
+                if (lt) try std.testing.expectError(error.ResourceLimitExceeded, instruction.validate(.{ .max_scratch_bytes = scratch - 1 }));
                 try std.testing.expectEqual(Dot{ .batch = batch, .rows = 3, .columns = 4, .contracting = 5, .lhs_transposed = lt, .rhs_transposed = rt }, geometry.dot.?);
                 try std.testing.expectEqual(@as(u64, 60) * batch, geometry.work_items);
                 try std.testing.expectError(error.ResourceLimitExceeded, instruction.validate(.{ .max_instruction_work = 60 * batch - 1 }));

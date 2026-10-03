@@ -49,12 +49,75 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "gliner25"))
 sys.path.insert(0, str(HERE))
 
-import oracle  # noqa: E402
+import oracle
 
 # Train splits only; the evaluation harness holds out clinc150, sst5,
 # typed_decisions, crossner_politics, crossner_science and mit_movie.
-CLASSIFICATION = {"banking77": "intent", "ag_news": "topic"}
-NER = ["crossner_ai", "crossner_literature", "crossner_music", "mit_restaurant"]
+RECIPES = {
+    # The pilot's sets. AG News (non-commercial terms) and MIT restaurant (no
+    # license) keep weights trained on it private.
+    "pilot": (
+        {"banking77": "intent", "ag_news": "topic"},
+        ["crossner_ai", "crossner_literature", "crossner_music", "mit_restaurant"],
+    ),
+    # Permissive sets only (antenna_training_sets.py); AG News and MIT
+    # restaurant become held-out evaluation sets.
+    "clean": (
+        {
+            "banking77": "intent",
+            "huffpost": "topic",
+            "dbpedia": "topic",
+            "massive_intent": "intent",
+        },
+        [
+            "crossner_ai",
+            "crossner_literature",
+            "crossner_music",
+            "fewnerd",
+            "massive_slots",
+            "multiconer",
+        ],
+    ),
+}
+
+
+class Sets:
+    """``antenna_datasets`` for the evaluation suite's sets, else
+    ``antenna_training_sets`` (training-only, train split)."""
+
+    def __init__(self) -> None:
+        import antenna_datasets
+        import antenna_training_sets
+
+        self.evaluation = antenna_datasets
+        self.training = antenna_training_sets
+        self.__file__ = antenna_datasets.__file__
+
+    def _module(self, name: str) -> Any:
+        known = name in self.training.CLASSIFICATION or name in self.training.NER
+        return self.training if known else self.evaluation
+
+    def load_classification(self, name: str, split: str) -> list[dict[str, Any]]:
+        module = self._module(name)
+        return (
+            module.load_classification(name)
+            if module is self.training
+            else module.load_classification(name, split)
+        )
+
+    def label_names(self, name: str) -> list[str]:
+        return self._module(name).label_names(name)
+
+    def load_ner(self, name: str, split: str) -> list[dict[str, Any]]:
+        module = self._module(name)
+        return (
+            module.load_ner(name)
+            if module is self.training
+            else module.load_ner(name, split)
+        )
+
+    def entity_types(self, name: str) -> list[str]:
+        return self._module(name).entity_types(name)
 
 
 def sigmoid(value: float) -> float:
@@ -76,16 +139,16 @@ def fits(args, splitter, text: str) -> bool:
 
 
 def classification_rows(
-    args, datasets, classifier, split: str, rng: random.Random
+    args, datasets, classifier, splitter, split: str, rng: random.Random
 ) -> list[dict[str, Any]]:
     from gliner2.classification import ClassificationConfig, ClassificationSchema
 
     rows = []
-    for name, task in CLASSIFICATION.items():
+    for name, task in RECIPES[args.recipe][0].items():
         records = [
             record
             for record in datasets.load_classification(name, split)
-            if fits(args, classifier.model.processor.word_splitter, record["text"])
+            if fits(args, splitter, record["text"])
         ]
         rng.shuffle(records)
         names = list(datasets.label_names(name))
@@ -111,19 +174,22 @@ def classification_rows(
                     },
                 }
             )
-            scores = classifier.score(
-                record["text"],
-                schema,
-                config=ClassificationConfig(max_len=args.max_words),
-            )
-            probabilities = [
-                round(
-                    args.gold_weight * (label == gold)
-                    + (1 - args.gold_weight) * sigmoid(scores.tasks[task][label]),
-                    6,
+            if classifier is None:
+                probabilities = [float(label == gold) for label in labels]
+            else:
+                scores = classifier.score(
+                    record["text"],
+                    schema,
+                    config=ClassificationConfig(max_len=args.max_words),
                 )
-                for label in labels
-            ]
+                probabilities = [
+                    round(
+                        args.gold_weight * (label == gold)
+                        + (1 - args.gold_weight) * sigmoid(scores.tasks[task][label]),
+                        6,
+                    )
+                    for label in labels
+                ]
             rows.append(
                 {
                     "version": 1,
@@ -142,7 +208,7 @@ def entity_rows(
     args, datasets, extractor, splitter, split: str, rng: random.Random
 ) -> list[dict[str, Any]]:
     rows = []
-    for name in NER:
+    for name in RECIPES[args.recipe][1]:
         records = [
             record
             for record in datasets.load_ner(name, split)
@@ -182,12 +248,24 @@ def entity_rows(
                 }
                 for index, (start, end, kind) in enumerate(sorted(set(spans)))
             ]
+            # Large type sets (Few-NERD's 66, MASSIVE's 55) are sampled per
+            # row like large label sets: every type the row's spans use, plus
+            # shuffled negatives, within the job's query budget.
+            schema_types = types
+            if len(types) > args.max_labels:
+                present = sorted({kind for _, _, kind in spans})
+                count = max(len(present), rng.randint(args.min_labels, args.max_labels))
+                schema_types = present + rng.sample(
+                    [kind for kind in types if kind not in present],
+                    count - len(present),
+                )
+                rng.shuffle(schema_types)
             rows.append(
                 {
                     "version": 1,
                     "id": record["id"],
                     "text": text,
-                    "schema": {"entities": types},
+                    "schema": {"entities": schema_types},
                     "entities": entities,
                 }
             )
@@ -195,12 +273,11 @@ def entity_rows(
 
 
 def build(args: argparse.Namespace) -> dict[str, Any]:
-    import antenna_datasets as datasets
-
-    provenance, torch = oracle.prepare_runtime(args.upstream)
+    provenance, _ = oracle.prepare_runtime(args.upstream)
     from gliner2 import AutoExtractor
     from gliner2.classification import Classifier
 
+    datasets = Sets()
     teacher = (
         AutoExtractor.from_pretrained(
             str(args.classifier),
@@ -211,7 +288,8 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
         .float()
         .eval()
     )
-    classifier = Classifier(teacher)
+    # Hard labels (gold weight 1) need no teacher scores.
+    classifier = None if args.gold_weight == 1 else Classifier(teacher)
     extractor = None
     if args.teacher_entities:
         extractor = (
@@ -225,7 +303,9 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
             .eval()
         )
     rng = random.Random(args.seed)
-    rows = classification_rows(args, datasets, classifier, "train", rng) + entity_rows(
+    rows = classification_rows(
+        args, datasets, classifier, teacher.processor.word_splitter, "train", rng
+    ) + entity_rows(
         args, datasets, extractor, teacher.processor.word_splitter, "train", rng
     )
     # The native job requires disjoint splits by text; datasets repeat texts.
@@ -266,8 +346,12 @@ def build(args: argparse.Namespace) -> dict[str, Any]:
                 "seed": args.seed,
                 "per_dataset": args.per_dataset,
                 "label_sampling": [args.min_labels, args.max_labels],
-                "classification_sets": CLASSIFICATION,
-                "entity_sets": NER,
+                "recipe": args.recipe,
+                "classification_sets": RECIPES[args.recipe][0],
+                "entity_sets": RECIPES[args.recipe][1],
+                "training_sets_module_sha256": oracle.sha256_file(
+                    Path(datasets.training.__file__)
+                ),
                 "provenance": provenance,
                 "heldout_quality_claim": False,
             },
@@ -305,6 +389,7 @@ def main() -> int:
     parser.add_argument("--validation-fraction", type=float, default=0.05)
     parser.add_argument("--max-words", type=int, default=128)
     parser.add_argument("--seed", type=int, default=20260925)
+    parser.add_argument("--recipe", choices=sorted(RECIPES), default="pilot")
     print(json.dumps(build(parser.parse_args()), sort_keys=True))
     return 0
 

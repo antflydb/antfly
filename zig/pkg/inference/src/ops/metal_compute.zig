@@ -7020,6 +7020,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return residentTrainingPrimitiveOp(ctx, &.{ .snapshot = .{ .input = input, .shape = shape } }, .{}, null);
     }
 
+    /// A fresh row-major copy of `input` with its last two axes swapped.
+    fn residentTransposeLastTwo(self: *MetalCompute, input: MetalTensor, shape: @import("ml").graph.Shape) !MetalTensor {
+        const rank = shape.rank_;
+        if (rank < 2) return error.UnsupportedResidentProgramInstruction;
+        var output = shape;
+        output.dims[rank - 2] = shape.dims[rank - 1];
+        output.dims[rank - 1] = shape.dims[rank - 2];
+        var map = ops.resident_program.Affine{ .rank = rank };
+        var input_strides: [8]u32 = undefined;
+        var input_stride: u32 = 1;
+        var output_stride: u32 = 1;
+        var axis = rank;
+        while (axis > 0) {
+            axis -= 1;
+            input_strides[axis] = input_stride;
+            map.output_strides[axis] = output_stride;
+            input_stride *= @intCast(shape.dims[axis]);
+            output_stride *= @intCast(output.dims[axis]);
+        }
+        for (0..rank) |i| map.input_strides[i] = input_strides[i];
+        map.input_strides[rank - 2] = input_strides[rank - 1];
+        map.input_strides[rank - 1] = input_strides[rank - 2];
+        return self.residentProgramAffine(input, output, map);
+    }
+
     fn residentProgramAffine(self: *MetalCompute, input: MetalTensor, output_shape: @import("ml").graph.Shape, map: ops.resident_program.Affine) !MetalTensor {
         var dimensions: [8]i32 = undefined;
         for (output_shape.dims[0..output_shape.rank_], 0..) |dim, axis| dimensions[axis] = @intCast(dim);
@@ -7172,14 +7197,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 // The device kernels read the left operand as [rows, contracting]
                 // and take the right operand's contracting axis: 0 for
                 // [contracting, columns], 1 for [columns, contracting]. A
-                // transposed left operand has no kernel; never run it as if it
-                // were untransposed.
-                if (dot.lhs_transposed) return error.UnsupportedResidentProgramInstruction;
+                // transposed left operand ([contracting, rows], which autodiff
+                // emits for weight gradients) is transposed on the device
+                // first; it is never run as if it were untransposed.
+                var transposed: ?MetalTensor = null;
+                defer if (transposed) |*value| value.deinit();
+                if (dot.lhs_transposed) transposed = try self.residentTransposeLastTwo(tensors[0], instruction.inputs[0]);
+                const lhs = transposed orelse tensors[0];
                 const rhs_contract_axis: u32 = if (dot.rhs_transposed) 1 else 0;
                 const output = if (instruction.inputs[0].rank_ == 2)
-                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, tensors[0], tensors[1], dot.rows, dot.columns, dot.contracting, rhs_contract_axis)
+                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, lhs, tensors[1], dot.rows, dot.columns, dot.contracting, rhs_contract_axis)
                 else
-                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, tensors[0], tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, rhs_contract_axis, shape);
+                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, lhs, tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, rhs_contract_axis, shape);
                 break :blk output orelse return error.UnsupportedResidentProgramInstruction;
             },
             else => return error.UnsupportedResidentProgramInstruction,
