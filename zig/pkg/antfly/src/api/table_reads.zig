@@ -8628,7 +8628,7 @@ fn validateDecisionRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchReq
 
 fn decisionCollectionRequest(req: db_mod.types.SearchRequest) db_mod.types.SearchRequest {
     var copy = req;
-    if (req.evaluation_limit > 0) {
+    if (req.hasHitEvaluation()) {
         copy.limit = req.evaluation_limit;
         copy.offset = 0;
         copy.count_only = false;
@@ -8637,7 +8637,7 @@ fn decisionCollectionRequest(req: db_mod.types.SearchRequest) db_mod.types.Searc
 }
 
 fn distributedSearchShardLimit(req: db_mod.types.SearchRequest) u32 {
-    if (req.evaluation_limit > 0) return req.evaluation_limit;
+    if (req.hasHitEvaluation()) return req.evaluation_limit;
     if (req.graph_metric_rerank) |rerank| {
         return db_mod.types.graphMetricRerankCandidateCount(rerank, req.offset, req.limit);
     }
@@ -8660,7 +8660,7 @@ const DistributedCoordinatorPaging = struct {
 /// Graph-metric reranking is computed against shard-local published vectors,
 /// then merged by final score using the caller's page at the coordinator.
 fn distributedCoordinatorPaging(req: db_mod.types.SearchRequest) DistributedCoordinatorPaging {
-    if (req.evaluation_limit > 0 or req.reranker != null or req.pruner != null) return .{
+    if (req.hasHitEvaluation() or req.reranker != null or req.pruner != null) return .{
         .offset = 0,
         .limit = distributedSearchShardLimit(req),
     };
@@ -8829,6 +8829,7 @@ fn distributedSearchShardRequest(
     copy.evaluation_json = "";
     copy.evaluation_limit = 0;
     copy.evaluation_matches = false;
+    copy.evaluation_graph = false;
     copy.reranker = null;
     copy.reranker_query_text = "";
     // Graph-metric scoring remains shard-local because its published vector is
@@ -18768,6 +18769,27 @@ fn consumerTests() type {
             try std.testing.expect(capability.sortable);
             try std.testing.expectEqualStrings("observed_declared", capability.doc_value_coverage);
             try std.testing.expectEqualStrings("declared", capability.queryability_state);
+        }
+
+        test "api query contract graph evaluation preserves base hit paging and shard windows" {
+            const req: db_mod.types.SearchRequest = .{ .limit = 2, .offset = 3, .evaluation_limit = 20, .evaluation_graph = true };
+            const collection = decisionCollectionRequest(req);
+            try std.testing.expectEqual(@as(u32, 2), collection.limit);
+            try std.testing.expectEqual(@as(u32, 3), collection.offset);
+            const shard = distributedSearchShardRequest(req, &.{}, false);
+            try std.testing.expectEqual(@as(u32, 5), shard.limit);
+            try std.testing.expectEqual(@as(u32, 0), shard.offset);
+            try std.testing.expect(!shard.evaluation_graph);
+            const coordinator = distributedCoordinatorPaging(req);
+            try std.testing.expectEqual(@as(u32, 3), coordinator.offset);
+            try std.testing.expectEqual(@as(u32, 2), coordinator.limit);
+            var count = req;
+            count.count_only = true;
+            try std.testing.expect(decisionCollectionRequest(count).count_only);
+            var hits = req;
+            hits.evaluation_graph = false;
+            try std.testing.expectEqual(@as(u32, 20), decisionCollectionRequest(hits).limit);
+            try std.testing.expectEqual(@as(u32, 0), distributedCoordinatorPaging(hits).offset);
         }
 
         test "distributed reranking widens retrieval and stays coordinator owned" {

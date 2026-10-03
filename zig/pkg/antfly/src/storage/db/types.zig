@@ -1802,9 +1802,15 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const SearchRequest = struct {
+    pub fn hasHitEvaluation(self: @This()) bool {
+        return self.evaluation_limit > 0 and !self.evaluation_graph;
+    }
+
     evaluation_json: []const u8 = "",
     evaluation_limit: u32 = 0,
     evaluation_matches: bool = false,
+    /// Graph evaluation owns a separate collection window; base hit paging is unchanged.
+    evaluation_graph: bool = false,
     /// Set only after catalog schema/index preparation; never populated by public JSON.
     prepared_read_table_id: u64 = 0,
     /// Request-owned routing map parallel to filter_doc_ids; never serialized.
@@ -1993,6 +1999,7 @@ const hierarchy_children_rejected_fields = [_][]const u8{
     "evaluation_json",
     "evaluation_limit",
     "evaluation_matches",
+    "evaluation_graph",
     "query",
     "index_name",
     "primary_text_index_name",

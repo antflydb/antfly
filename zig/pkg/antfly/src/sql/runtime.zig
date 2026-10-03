@@ -659,35 +659,42 @@ pub const Context = struct {
         const mutations = try self.arena.alloc(catalog.Mutation, statement.rows.len);
         var keys: std.StringHashMapUnmanaged(void) = .empty;
         var retained: usize = 0;
-        for (statement.rows, mutations, 0..) |row, *mutation, row_index| {
-            try self.checkpoint();
-            if (row.len != columns.len) return error.InvalidSqlParameters;
-            const key_datum: @import("scalar.zig").Datum = if (key_index) |key_at| blk: {
-                if (!statement.isDefault(row_index, key_at)) break :blk try self.insertValue(row[key_at], columns[key_at], row_index, key_at);
-                break :blk .{ .value = .{ .string = try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena) }, .sql_null = false };
-            } else .{ .value = .{ .string = try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena) }, .sql_null = false };
-            const key = key_datum.value;
-            if (key_datum.sql_null or key != .string or key.string.len == 0) return error.SqlRowIdentityRequired;
-            if (!std.unicode.utf8ValidateSlice(key.string)) return error.SqlTypeMismatch;
-            if ((try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
-            var object: std.json.ObjectMap = .empty;
-            var json_null_fields: std.ArrayList([]const u8) = .empty;
-            for (columns, row, 0..) |column, item, i| {
-                if (key_index != null and i == key_index.?) continue;
-                if (statement.isDefault(row_index, i)) continue;
-                const datum = try self.insertValue(item, column, row_index, i);
-                const typed = datum.value;
-                const json_null = typed == .null and !datum.sql_null;
-                if (datum.sql_null and !column.nullable) return error.SqlNotNullViolation;
-                if (json_null) try json_null_fields.append(self.arena, column.path);
-                try putField(self.arena, &object, column.path, try clone(self.arena, typed));
+        var first: usize = 0;
+        while (first < statement.rows.len) {
+            var page_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer page_arena.deinit();
+            const page = try self.insertDecisionPage(page_arena.allocator(), statement, first);
+            for (statement.rows[first..page.end], mutations[first..page.end], first..) |row, *mutation, row_index| {
+                try self.checkpoint();
+                if (row.len != columns.len) return error.InvalidSqlParameters;
+                const key_datum: @import("scalar.zig").Datum = if (key_index) |key_at| blk: {
+                    if (!statement.isDefault(row_index, key_at)) break :blk try self.insertValue(row[key_at], columns[key_at], row_index, key_at, page.values[row_index - first][key_at]);
+                    break :blk .{ .value = .{ .string = try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena) }, .sql_null = false };
+                } else .{ .value = .{ .string = try (self.backend.vtable.generate_row_id orelse return error.SqlRowIdentityRequired)(self.backend.ptr, self.arena) }, .sql_null = false };
+                const key = try clone(self.arena, key_datum.value);
+                if (key_datum.sql_null or key != .string or key.string.len == 0) return error.SqlRowIdentityRequired;
+                if (!std.unicode.utf8ValidateSlice(key.string)) return error.SqlTypeMismatch;
+                if ((try keys.getOrPut(self.arena, key.string)).found_existing and (statement.conflict == null or !@import("conflict.zig").allowsDuplicateKeys(statement.conflict.?))) return error.DuplicateSqlRow;
+                var object: std.json.ObjectMap = .empty;
+                var json_null_fields: std.ArrayList([]const u8) = .empty;
+                for (columns, row, 0..) |column, item, i| {
+                    if (key_index != null and i == key_index.?) continue;
+                    if (statement.isDefault(row_index, i)) continue;
+                    const datum = try self.insertValue(item, column, row_index, i, page.values[row_index - first][i]);
+                    const typed = datum.value;
+                    const json_null = typed == .null and !datum.sql_null;
+                    if (datum.sql_null and !column.nullable) return error.SqlNotNullViolation;
+                    if (json_null) try json_null_fields.append(self.arena, column.path);
+                    try putField(self.arena, &object, column.path, try clone(self.arena, typed));
+                }
+                const document: Json = .{ .object = object };
+                retained = std.math.add(usize, retained, jsonSize(document) + key.string.len) catch return error.SqlProgramLimitExceeded;
+                if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
+                mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items };
             }
-            const document: Json = .{ .object = object };
-            retained = std.math.add(usize, retained, jsonSize(document) + key.string.len) catch return error.SqlProgramLimitExceeded;
-            if (retained > self.limits.retained_bytes) return error.SqlProgramLimitExceeded;
-            mutation.* = .{ .key = key.string, .expected_version = 0, .unique_absence = true, .row = document, .json_null_fields = json_null_fields.items };
+            first = page.end;
+            try self.checkpoint();
         }
-        try self.checkpoint();
         const resolved = if (statement.conflict) |clause| try @import("conflict.zig").resolve(self, table_def, clause, self.binding.conflict orelse return error.InvalidSqlBackendResponse, mutations, &.{}) else mutations;
         return self.commitMutations(table_def, resolved, "INSERT", statement.returning);
     }
@@ -755,11 +762,58 @@ pub const Context = struct {
         return self.commitMutations(table, resolved, "INSERT", statement.returning);
     }
 
-    fn insertValue(self: Context, literal: ast.Value, column: catalog.Column, row: usize, cell: usize) !@import("scalar.zig").Datum {
-        if (self.binding.scalars.insert_rows.len != 0) if (self.binding.scalars.insert_rows[row][cell]) |program| {
-            const result = try self.evaluate(self.arena, program, &.{});
+    const InsertDecisionPage = struct { end: usize, values: []const []const ?Datum };
+
+    fn insertDecisionPage(self: Context, scratch: std.mem.Allocator, statement: ast.Insert, first: usize) !InsertDecisionPage {
+        const decision = @import("decision_eval.zig");
+        var budget: decision.PageBudget = .{ .row_limit = self.limits.page_rows, .byte_limit = self.limits.page_bytes };
+        var end = first;
+        while (end < statement.rows.len) {
+            var bytes: usize = 0;
+            if (self.binding.scalars.insert_rows.len != 0) {
+                for (self.binding.scalars.insert_rows[end], 0..) |optional, column| {
+                    if (statement.isDefault(end, column)) continue;
+                    if (optional) |program| for (program.instructions) |instruction| {
+                        const input_value = switch (instruction.operation) {
+                            .literal => |literal_value| literal_value,
+                            .parameter => |index| self.parameters[index],
+                            else => continue,
+                        };
+                        bytes +|= try operators.datumBytes(Datum.fromJson(input_value));
+                    };
+                }
+            }
+            end += 1;
+            if (budget.addBytes(bytes)) break;
+        }
+        const values = try scratch.alloc([]?Datum, end - first);
+        for (statement.rows[first..end], values) |row, *output| {
+            output.* = try scratch.alloc(?Datum, row.len);
+            @memset(output.*, null);
+        }
+        for (0..statement.columns.len) |column| {
+            var programs: std.ArrayList(*const @import("scalar.zig").Program) = .empty;
+            var positions: std.ArrayList(usize) = .empty;
+            if (self.binding.scalars.insert_rows.len != 0) for (self.binding.scalars.insert_rows[first..end], first..) |row, index| {
+                if (statement.isDefault(index, column)) continue;
+                if (row[column]) |*program| {
+                    try programs.append(scratch, program);
+                    try positions.append(scratch, index - first);
+                }
+            };
+            const inputs = try scratch.alloc([]const Datum, programs.items.len);
+            @memset(inputs, &.{});
+            const evaluated = try decision.evaluateInvocations(scratch, self.backend.decision_provider, programs.items, inputs, self.parameters);
+            for (positions.items, evaluated) |position, datum| values[position][column] = datum;
+        }
+        return .{ .end = end, .values = values };
+    }
+
+    fn insertValue(self: Context, literal: ast.Value, column: catalog.Column, row: usize, cell: usize, evaluated: ?Datum) !Datum {
+        if (self.binding.scalars.insert_rows.len != 0 and self.binding.scalars.insert_rows[row][cell] != null) {
+            const result = evaluated orelse return error.InvalidSqlProgram;
             return .{ .value = try coerce(self.arena, result.value, column.type), .sql_null = result.sql_null };
-        };
+        }
         const result = try self.value(literal, column);
         return .{ .value = result, .sql_null = result == .null and !(column.type == .json and literal == .string) };
     }
@@ -2749,4 +2803,99 @@ fn groupedWindowAllocationScenario(a: std.mem.Allocator) !void {
 }
 test "SQL grouped and window deferred projections unwind allocation failures" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, groupedWindowAllocationScenario, .{});
+}
+
+const InsertDecisionFixture = struct {
+    calls: usize = 0,
+    max_batch: usize = 0,
+    writes: usize = 0,
+    metadata_bytes: usize = 65536,
+    fail_after: ?usize = null,
+    fn backend(self: *@This()) catalog.Backend {
+        return .{ .ptr = self, .decision_provider = .{ .ptr = self, .validate_fn = validate, .evaluate_batch_fn = batch }, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .checkpoint = checkpoint } };
+    }
+    fn resolve(_: *anyopaque, _: std.mem.Allocator, _: ast.Name, _: catalog.Action) !catalog.Table {
+        return .{ .id = 1, .physical_name = "things", .schema_version = 1, .columns = &.{
+            .{ .name = "p", .path = "p", .type = .number },
+            .{ .name = "payload", .path = "payload", .type = .json },
+        } };
+    }
+    fn scan(_: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+        return error.UnexpectedScan;
+    }
+    fn checkpoint(_: *anyopaque) !void {}
+    fn validate(_: *anyopaque, _: []const u8, questions: Json) !void {
+        try @import("../functions/decisions.zig").validateQuestions(questions, @import("../functions/decisions.zig").capabilities(.antfly));
+    }
+    fn batch(ptr: *anyopaque, a: std.mem.Allocator, requests: []const @import("../functions/decisions.zig").Request) ![]const Json {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (self.fail_after) |count_| if (self.calls >= count_) return error.DecisionProviderUnavailable;
+        self.calls += requests.len;
+        self.max_batch = @max(self.max_batch, requests.len);
+        const results = try a.alloc(Json, requests.len);
+        for (results) |*result| {
+            result.* = try std.json.parseFromSliceLeaky(Json, a, "{\"model\":\"mock\",\"answers\":{\"answer\":{\"type\":\"noul\",\"noul\":0.9}},\"usage\":{\"input_tokens\":2,\"output_tokens\":0}}", .{});
+            const payload = try a.alloc(u8, self.metadata_bytes);
+            @memset(payload, 'x');
+            try result.object.put(a, "metadata", .{ .string = payload });
+        }
+        return results;
+    }
+    fn mutate(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, mutations: []const catalog.Mutation) !catalog.MutationOutcome {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (mutations) |mutation| {
+            try std.testing.expect(std.mem.startsWith(u8, mutation.key, "row"));
+            try std.testing.expectEqual(@as(u64, 0), mutation.expected_version);
+            try std.testing.expect(mutation.unique_absence);
+            if (mutation.row.?.object.get("p")) |datum| if (datum != .null) try std.testing.expectApproxEqAbs(@as(f64, 0.9), datum.float, 0.001);
+            if (mutation.row.?.object.get("payload")) |payload| try std.testing.expectEqual(self.metadata_bytes, payload.object.get("metadata").?.string.len);
+        }
+        self.writes += 1;
+        return .committed;
+    }
+};
+
+test "SQL INSERT values release provider payloads and batch heterogeneous conditional programs" {
+    const a = std.testing.allocator;
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(a);
+    try sql.appendSlice(a, "INSERT INTO things (_id,p) VALUES ");
+    for (0..16) |index| {
+        const item = try std.fmt.allocPrint(a, "{s}(lower('ROW{d}'),CASE WHEN {s} THEN ai_probability('input-{d}','Question {d}?','local') ELSE NULL END)", .{ if (index == 0) "" else ",", index, if (index % 2 == 0) "TRUE" else "FALSE", index, index });
+        defer a.free(item);
+        try sql.appendSlice(a, item);
+    }
+    var compiled = try compiler.compile(a, sql.items, .{});
+    defer compiled.deinit();
+    for ([_]Limits{ .{ .page_rows = 1, .retained_bytes = 1024 * 1024 }, .{ .page_rows = 4 }, .{ .page_rows = 4, .page_bytes = 1 } }) |limits| {
+        var fixture: InsertDecisionFixture = .{};
+        var result = try execute(a, fixture.backend(), &compiled, &.{}, limits);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 8), fixture.calls);
+        try std.testing.expectEqual(@as(usize, if (limits.page_bytes == 1 or limits.page_rows == 1) 1 else 2), fixture.max_batch);
+        try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+        try std.testing.expectEqual(@as(u64, 16), result.output.rows_affected);
+        fixture = .{ .fail_after = 2 };
+        try std.testing.expectError(error.DecisionProviderUnavailable, execute(a, fixture.backend(), &compiled, &.{}, limits));
+        try std.testing.expectEqual(@as(usize, 0), fixture.writes);
+    }
+    var fixture: InsertDecisionFixture = .{};
+    var json = try compiler.compile(a, "INSERT INTO things (_id,payload) VALUES ('row0',ai_decide('input','{\"answer\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}','local')),('row1',ai_decide('input','{\"answer\":{\"type\":\"noul\",\"instructions\":\"Refund?\"}}','local'))", .{});
+    defer json.deinit();
+    var result = try execute(a, fixture.backend(), &json, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+}
+fn insertDecisionAllocationScenario(a: std.mem.Allocator) !void {
+    var fixture: InsertDecisionFixture = .{ .metadata_bytes = 0 };
+    var compiled = try compiler.compile(a, "INSERT INTO things (_id,p) VALUES (lower('ROW0'),ai_probability('input','Refund?','local')),(lower('ROW1'),ai_probability('input','Return?','local'))", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.backend(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
+    try std.testing.expectEqual(@as(usize, 1), fixture.writes);
+}
+test "SQL INSERT decision pages unwind allocation failures before commit" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, insertDecisionAllocationScenario, .{});
 }

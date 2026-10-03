@@ -2211,6 +2211,7 @@ fn applyCommonSearchRequestOptions(
             const plan = try @import("../functions/expressions.zig").Plan.parse(scratch.allocator(), raw);
             req.evaluation_limit = plan.candidate_count;
             req.evaluation_matches = plan.scope == .matches;
+            req.evaluation_graph = plan.graph_query != null;
             req.include_stored = true;
             req.defer_stored_projection = true;
             if (request.search_after != null or request.search_before != null or request.reranker != null or request.pruner != null or request.aggregations != null) return error.UnsupportedQueryRequest;
@@ -2380,8 +2381,8 @@ fn applySearchRequestFields(
         &.{};
     req.fields = fields;
     req.include_all_fields = include_all_fields;
-    req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null or req.evaluation_limit > 0;
-    req.defer_stored_projection = req.evaluation_limit > 0 or canDeferStoredProjection(fields) or
+    req.include_stored = include_all_fields or fields.len > 0 or req.reranker != null or req.hasHitEvaluation();
+    req.defer_stored_projection = req.hasHitEvaluation() or canDeferStoredProjection(fields) or
         !req.hierarchy_match_include_all_fields or
         !req.hierarchy_source_include_all_fields or
         !req.hierarchy_unit_include_all_fields;
@@ -2734,7 +2735,7 @@ pub fn parseQueryRequestWithDeadline(
     // include-all projections at the DB boundary.
     try validateCanonicalHierarchyExecutionBudget(req);
 
-    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, if (req.evaluation_limit > 0) req.evaluation_limit else req.limit);
+    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, if (req.hasHitEvaluation()) req.evaluation_limit else req.limit);
     errdefer normalized_query.deinit(alloc);
     try ensureQueryDeadline(execution_deadline_ns);
 
@@ -2784,7 +2785,7 @@ pub fn parseQueryRequestWithDeadline(
     try ensureQueryDeadline(execution_deadline_ns);
 
     {
-        const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, if (req.evaluation_limit > 0) req.evaluation_limit else req.limit);
+        const vector_queries = try buildSemanticVectorQueries(alloc, semantic_resolver, table_name, request, if (req.hasHitEvaluation()) req.evaluation_limit else req.limit);
         errdefer vector_queries.deinit(alloc);
         try ensureQueryDeadline(execution_deadline_ns);
         req.dense_queries = vector_queries.dense;
@@ -3177,7 +3178,7 @@ fn buildPreflightSearchRequestAlloc(
     const fields = try applySearchRequestFields(alloc, request.fields, &req);
     errdefer freeClonedFields(alloc, fields);
 
-    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, if (req.evaluation_limit > 0) req.evaluation_limit else req.limit);
+    var normalized_query = try normalizePublicQueryBucketsAlloc(alloc, request, if (req.hasHitEvaluation()) req.evaluation_limit else req.limit);
     errdefer normalized_query.deinit(alloc);
 
     if (normalized_query.full_text) |query| {
@@ -3213,7 +3214,7 @@ fn buildPreflightSearchRequestAlloc(
     req.exclusion_query_json = normalized_query.exclusion_query_json;
     normalized_query.exclusion_query_json = "";
 
-    const vector_queries = try buildPreflightSemanticVectorQueries(alloc, request, if (req.evaluation_limit > 0) req.evaluation_limit else req.limit);
+    const vector_queries = try buildPreflightSemanticVectorQueries(alloc, request, if (req.hasHitEvaluation()) req.evaluation_limit else req.limit);
     errdefer vector_queries.deinit(alloc);
     req.dense_queries = vector_queries.dense;
     req.sparse_queries = vector_queries.sparse;

@@ -90,15 +90,26 @@ pub fn validate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, pro
 }
 
 pub fn evaluateBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
-    const output = try a.alloc(scalar.Datum, rows.len);
     if (!hasExternal(program)) {
+        const output = try a.alloc(scalar.Datum, rows.len);
         for (rows, output) |cells, *value| value.* = try program.evaluate(a, cells, parameters, .{});
         return output;
     }
+    const programs = try a.alloc(*const scalar.Program, rows.len);
+    @memset(programs, program);
+    return evaluateInvocations(a, provider, programs, rows, parameters);
+}
+
+/// A VALUES page can contain different programs/configurations for every cell.
+/// Resolve its conditional decision demands together without retaining provider
+/// payloads in the owned mutation arena.
+pub fn evaluateInvocations(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, programs: []const *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
+    if (programs.len != rows.len) return error.InvalidSqlProgram;
+    const output = try a.alloc(scalar.Datum, rows.len);
     const ready = try a.alloc(bool, rows.len);
     @memset(ready, false);
     const values = try a.alloc([]?scalar.Datum, rows.len);
-    for (values) |*row| {
+    for (values, programs) |*row, program| {
         row.* = try a.alloc(?scalar.Datum, program.instructions.len);
         @memset(row.*, null);
     }
@@ -106,7 +117,7 @@ pub fn evaluateBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider
     while (remaining > 0) {
         var requests: std.ArrayList(decisions.Request) = .empty;
         var demands: std.ArrayList(struct { row: usize, demand: scalar.DecisionDemand }) = .empty;
-        for (rows, 0..) |cells, i| {
+        for (rows, programs, 0..) |cells, program, i| {
             if (ready[i]) continue;
             var demand: ?scalar.DecisionDemand = null;
             const value = program.evaluate(a, cells, parameters, .{ .decision_values = values[i], .decision_demand = &demand }) catch |err| {
@@ -271,8 +282,13 @@ pub const PageBudget = struct {
     rows: usize = 0,
     bytes: usize = 0,
     pub fn add(self: *@This(), cells: []const scalar.Datum) !bool {
+        var bytes: usize = 0;
+        for (cells) |cell| bytes +|= try @import("operators.zig").datumBytes(cell);
+        return self.addBytes(bytes);
+    }
+    pub fn addBytes(self: *@This(), bytes: usize) bool {
         self.rows += 1;
-        for (cells) |cell| self.bytes +|= try @import("operators.zig").datumBytes(cell);
+        self.bytes +|= bytes;
         return self.rows >= self.row_limit or self.bytes >= self.byte_limit;
     }
 };

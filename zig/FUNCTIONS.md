@@ -192,7 +192,8 @@ assignments, and mutation expressions including MERGE arms,
 conflict-update predicates and assignments, and RETURNING. Validate every bound
 decision specification and provider before starting mutation reads. MERGE keeps
 ordered arm selection lazy, and conflict updates evaluate assignments only for
-existing owner rows whose predicates pass. External mutation work uses
+existing owner rows whose predicates pass. INSERT VALUES evaluates heterogeneous cell programs in bounded decision pages,
+releasing provider responses after copying final mutation values. External mutation work uses
 row- and byte-bounded decision pages and retains the existing native row and
 read-set fences. Assignment inference runs only for rows passing the predicate.
 RETURNING uses the same page bounds and releases provider scratch after each
@@ -277,6 +278,10 @@ pattern rows return `_computed`. Evaluation runs after named graph operations
 complete; it does not alter traversal or dependencies between graph operations.
 Existing graph aggregates cannot be combined with this stage; use its computed
 aggregations instead.
+
+Graph evaluation widens only the named MATCH collection. Ordinary retrieval
+hits keep their requested offset, limit, and count behavior, including shard
+collection and coordinator merging.
 
 ## Configuration and supported boundaries
 

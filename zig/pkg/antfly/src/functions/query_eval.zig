@@ -324,7 +324,9 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     }
     const graphs = try a.alloc(types.GraphSearchResult, 1);
     graphs[0] = .{ .name = try a.dupe(u8, "customers"), .matches = graph_matches, .hits = graph_hits, .total_hits = 2 };
-    var graph_result: types.SearchResult = .{ .alloc = a, .hits = &.{}, .total_hits = 0, .graph_results = graphs };
+    const base_hits = try a.alloc(types.SearchHit, 1);
+    base_hits[0] = .{ .id = try a.dupe(u8, "base-offset-row") };
+    var graph_result: types.SearchResult = .{ .alloc = a, .hits = base_hits, .total_hits = 9, .graph_results = graphs };
     defer graph_result.deinit();
     const graph_stage = "{\"graph_query\":\"customers\",\"scope\":\"matches\",\"max_rows\":2,\"compute\":{\"hidden\":{\"field\":\"customer.document._artifact_unit_fingerprint\"},\"p\":{\"call\":\"ai_probability\",\"input\":{\"field\":\"customer.document.body\"},\"statement\":\"Refund?\",\"decider\":\"local\"}},\"where\":{\"gte\":[{\"ref\":\"p\"},{\"literal\":0.8}]}}";
     const query = @import("../api/query_contract.zig");
@@ -338,7 +340,12 @@ test "decision functions candidate filtering sorting and aggregates reuse a name
     const retrieval = graph_query.documentRetrievalQuery();
     try std.testing.expect(retrieval.include_all_fields);
     try std.testing.expectEqual(@as(usize, 0), retrieval.fields.len);
+    request.req.limit = 1;
     try apply(a, request.req, &graph_result, &meta, options);
+    try std.testing.expectEqual(@as(usize, 1), graph_result.hits.len);
+    try std.testing.expectEqualStrings("base-offset-row", graph_result.hits[0].id);
+    try std.testing.expectEqual(@as(u32, 9), graph_result.total_hits);
+
     var encoded = try query.encodeQueryResponses(a, "docs", request.req, .{ .evaluation_json = meta.evaluation_json }, graph_result);
     defer encoded.deinit(a);
     const wire = try std.json.parseFromSlice(Json, a, encoded.json, .{});

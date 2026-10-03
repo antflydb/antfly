@@ -105,6 +105,9 @@ test "decision functions graph evaluation separates collection and output window
     defer request.deinit(a);
     try std.testing.expectEqual(@as(u32, 8), request.req.graph_queries[0].query.return_limit);
     try std.testing.expectEqual(@as(?u32, 1), request.req.graph_queries[0].query.evaluation_output_limit);
+    try std.testing.expect(request.req.evaluation_graph);
+    try std.testing.expect(!request.req.hasHitEvaluation());
+    try std.testing.expectEqual(@as(u32, 1), request.req.limit);
 }
 
 test "decision functions graph dependency views keep the original prefix" {
