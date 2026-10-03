@@ -66,23 +66,54 @@ API SQL reads share a server-owned 64 MiB range cache (at most 4,096 entries).
 Keys bind the credential reference/scope, source endpoint, object version and
 byte range. Unversioned reads bypass it; cache hits still check cancellation and
 deadlines. Shared cached bytes are separate from each statement's memory budget.
+The cursor prefetches the next eligible row group's projected ranges (or the
+next file's footer) through the existing I/O runtime: at most four concurrent
+reads and 32 MiB of requested ranges per lookahead batch. Worker buffers use
+independent allocations outside the SQL arena; provider response copies can add
+temporary memory. Closing or canceling a cursor cancels and joins every worker
+before releasing source metadata. Prefetch failures stay speculative: required
+reads still enforce pinned versions, deadlines and cancellation.
 
 Each stream admits at most 100,000,000 examined rows, with at most 1,000,000 rows
 and 32 MiB input/decoded bytes per row-group materialization. SQL defaults admit
 10,000,000 scanned rows, 65,536 scan pages and 64 MiB retained bytes per statement;
 output remains bounded by the existing result/page limits. Large individual row
-groups can still fail the materialization budget. Sorting, grouping and hash
-joins retain bounded state and report a limit error when it exceeds the budget;
-disk spilling, parallel prefetch, page-level decoding and transform-aware
-partition pruning remain future engine work.
+groups can still fail the materialization budget. Blocking sorts, mergeable
+grouped aggregates (including DISTINCT inputs), and hash-join build rows spill
+when their retained state approaches the memory budget. Sorts merge bounded
+runs and stream past OFFSET; groups merge partial states one key at a time;
+joins keep a bounded bucket directory and persist outer-join match markers.
+The in-memory paths remain available for small inputs.
+
+API SQL statements default to a shared 1 GiB live spill quota and at most 64
+open spill files per statement. `sql.runtime.Limits` exposes `spill_bytes`
+(`0` disables spilling) and `spill_root` (default `/tmp`). Temporary directories
+and files are private; files are immediately unlinked while open, and handles
+and directories are cleaned up on completion, cancellation and error. Spill
+records preserve exact numeric tags, SQL/JSON null distinction and row order,
+with length and checksum validation. Disk exhaustion and oversized records
+still return errors. Pattern-set aggregate state, window input partitions,
+result buffers, and individual decoded row groups remain memory-bounded.
+
+Numeric and boolean expression batches use bounded instruction-major kernels,
+including four-lane exact integer arithmetic and comparisons. Mixed numeric
+values retain scalar conversion semantics. Lazy expressions (CASE, AND/OR) and
+unsupported types/functions use the scalar evaluator. Page-level decoding and
+transform-aware partition pruning remain future engine work.
 
 The regression fixture scans 131,072 and 1,048,576 integer rows in 65,536-row
 Parquet groups under a 32 MiB tracking allocator. Peak tracked allocations are
-7,080,911 and 7,081,025 bytes respectively: input growth adds file metadata rather
+7,080,935 and 7,081,049 bytes respectively: input growth adds file metadata rather
 than retaining all rows. This measures cursor memory for that fixture, not
 process memory or query latency. Tests also verify lazy first-page I/O, warm
 range reuse, pruning without decoded pages, changed-object rejection, exact
 large integers, SQL/JSON null distinction and Iceberg deletes before limits.
+Forced-spill SQL tests execute sorting with large OFFSET, grouping with DISTINCT,
+and joins under a 256 KiB statement budget. Operator tests cover duplicate join
+keys and unmatched rows; spill tests cover quota failures, cancellation, checksum
+corruption and cleanup. Prefetch tests prove overlapping reads, warm reuse and
+provider-token cancellation independent of the worker I/O runtime. Kernel tests
+compare results and numeric errors with the scalar evaluator.
 
 `EXPLAIN` identifies `Lake Scan`; verbose plans include the source format and
 configured snapshot selector without opening the source. Unsupported Parquet

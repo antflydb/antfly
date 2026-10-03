@@ -23,17 +23,17 @@ const operation = @import("operation.zig");
 const Allocator = std.mem.Allocator;
 
 pub fn open(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions) !catalog.Cursor {
-    return openWithCache(alloc, table, request, context, options, null);
+    return openWithCache(alloc, table, request, context, options, null, null);
 }
 
-pub fn openWithCache(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, cache: ?*@import("../serverless/query/lake_serving_cache.zig").Cache) !catalog.Cursor {
+pub fn openWithCache(alloc: Allocator, table: catalog.Table, request: catalog.Scan, context: operation.RequestContext, options: @import("../serverless/configured_object_store_support.zig").BindingObjectStoreOpenOptions, cache: ?*@import("../serverless/query/lake_serving_cache.zig").Cache, io: ?std.Io) !catalog.Cursor {
     const source = try alloc.create(serving.ServingSource);
     errdefer alloc.destroy(source);
     const schema: @import("../storage/schema.zig").TableSchema = .{ .storage_mode = .relational, .external_base_source = table.external_base_source };
     const normalized = try context.platformDeadline();
-    source.* = try serving.ServingSource.openWithContext(alloc, schema, options, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+    source.* = try serving.ServingSource.openWithContext(alloc, schema, options, .{ .io = io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
     errdefer source.deinit();
-    if (cache) |shared| try source.attachCache(shared, table.external_base_source.?.binding, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+    if (cache) |shared| try source.attachCache(shared, table.external_base_source.?.binding, .{ .io = io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
     const cursor = try openPinned(alloc, table, request, context, source);
     const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
     owner.source = source;

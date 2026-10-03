@@ -421,7 +421,10 @@ pub const ServingSource = struct {
     }
 
     pub fn deinit(self: *ServingSource) void {
-        if (self.scanner.shared_reader) |reader| self.alloc.destroy(reader);
+        if (self.scanner.shared_reader) |reader| {
+            reader.drain(true);
+            self.alloc.destroy(reader);
+        }
         if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
         self.inventory.deinit(self.alloc);
         self.store.deinit();

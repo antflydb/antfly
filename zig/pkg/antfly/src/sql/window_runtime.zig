@@ -552,7 +552,7 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
     }
     const orders = try alloc.alloc(operators.Order, statement.order_by.len);
     for (statement.order_by, orders) |order, *out| out.* = .{ .descending = order.descending, .nulls_first = order.nulls_first };
-    var top = try operators.TopK.init(context.alloc, offset + limit + @intFromBool(statement.limit == null), orders, context.limits.retained_bytes);
+    var top = try operators.TopK.initWithSpill(context.alloc, offset + limit + @intFromBool(statement.limit == null), orders, context.limits.retained_bytes, context.spill);
     defer top.deinit();
     var eval = std.heap.ArenaAllocator.init(context.alloc);
     defer eval.deinit();
@@ -587,10 +587,10 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
         for (bound.orders, keys) |program, *out| out.* = try context.evaluate(eval.allocator(), program, row);
         try top.add(.{ .values = values, .keys = keys, .ordinal = index });
     }
-    const ordered = try top.finish(alloc);
-    const remaining = ordered.len -| offset;
+    const ordered = try top.finishPage(alloc, offset, limit + @intFromBool(statement.limit == null));
+    const remaining = ordered.len;
     if (statement.limit == null and remaining > limit) return error.SqlResultTooLarge;
-    const selected = ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)];
+    const selected = ordered[0..@min(remaining, limit)];
     const rows = try context.arena.alloc([]const Json, selected.len);
     const flags = try context.arena.alloc([]const bool, selected.len);
     for (selected, rows, flags) |row, *out, *nulls| {

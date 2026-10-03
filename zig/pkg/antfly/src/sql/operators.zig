@@ -80,6 +80,9 @@ pub const TopK = struct {
     copied_rows: usize = 0,
     finished: bool = false,
     released: usize = 0,
+    capacity: usize = 0,
+    spill_manager: ?*@import("spill.zig").Manager = null,
+    external: ?*@import("spill.zig").Sort = null,
     // Replacement exchanges a candidate with the displaced root. Retaining
     // that root's arena avoids one allocator round-trip per competitive row.
     scratch: ?std.heap.ArenaAllocator = null,
@@ -90,10 +93,71 @@ pub const TopK = struct {
         const entries = try alloc.alloc(OwnedRow, k);
         errdefer alloc.free(entries);
         const owned_orders = try alloc.dupe(Order, orders);
-        return .{ .alloc = alloc, .entries = entries, .orders = owned_orders, .max_bytes = max_bytes, .retained_bytes = bytes };
+        return .{ .alloc = alloc, .entries = entries, .orders = owned_orders, .max_bytes = max_bytes, .retained_bytes = bytes, .capacity = k };
     }
 
+    pub fn initWithSpill(alloc: Allocator, k: usize, orders: []const Order, max_bytes: usize, manager: ?*@import("spill.zig").Manager) !TopK {
+        if (manager != null and k > (max_bytes / 4) / @sizeOf(OwnedRow)) {
+            if (orders.len > 256) return error.SqlProgramLimitExceeded;
+            var top: TopK = .{ .alloc = alloc, .entries = &.{}, .orders = try alloc.dupe(Order, orders), .max_bytes = max_bytes, .retained_bytes = 0, .capacity = k, .spill_manager = manager };
+            errdefer alloc.free(top.orders);
+            try top.startSpill();
+            return top;
+        }
+        var top = try init(alloc, k, orders, if (manager != null) max_bytes - max_bytes / 4 else max_bytes);
+        top.spill_manager = manager;
+        return top;
+    }
+    fn startSpill(self: *TopK) !void {
+        const manager = self.spill_manager orelse return error.SqlProgramLimitExceeded;
+        const sort = try self.alloc.create(@import("spill.zig").Sort);
+        errdefer self.alloc.destroy(sort);
+        sort.* = @import("spill.zig").Sort.init(self.alloc, manager, self.orders, self.max_bytes / 4);
+        errdefer sort.deinit();
+        while (self.released < self.count) {
+            const entry = &self.entries[self.released];
+            try sort.add(entry.row);
+            self.retained_bytes -= entry.allocatedBytes();
+            entry.deinit();
+            self.released += 1;
+        }
+        self.released = 0;
+        if (self.scratch) |*arena| arena.deinit();
+        self.scratch = null;
+        self.alloc.free(self.entries);
+        self.entries = &.{};
+        self.count = 0;
+        self.retained_bytes = 0;
+        self.external = sort;
+    }
+    /// Return only the requested output window; spilled OFFSET rows are read
+    /// and discarded through one scratch arena rather than retained in memory.
+    pub fn finishPage(self: *TopK, alloc: Allocator, offset: usize, limit: usize) ![]const Row {
+        if (self.external) |sort| {
+            self.finished = true;
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            for (0..@min(offset, self.capacity)) |_| {
+                _ = arena.reset(.free_all);
+                if ((try sort.next(arena.allocator())) == null) return &.{};
+            }
+            var rows: std.ArrayList(Row) = .empty;
+            for (0..@min(limit, self.capacity -| offset)) |_| {
+                const row = try sort.next(alloc) orelse break;
+                try rows.append(alloc, row);
+            }
+            return rows.toOwnedSlice(alloc);
+        }
+        const rows = try self.finish(alloc);
+        const begin = @min(offset, rows.len);
+        for (0..begin) |index| self.releaseFinishedRow(index);
+        return rows[begin..][0..@min(limit, rows.len - begin)];
+    }
     pub fn deinit(self: *TopK) void {
+        if (self.external) |sort| {
+            sort.deinit();
+            self.alloc.destroy(sort);
+        }
         for (self.entries[self.released..self.count]) |*entry| entry.deinit();
         if (self.scratch) |*scratch| scratch.deinit();
         self.alloc.free(self.entries);
@@ -107,6 +171,14 @@ pub const TopK = struct {
     }
 
     pub fn add(self: *TopK, row: Row) !void {
+        if (self.external) |sort| return sort.add(row);
+        self.addInMemory(row) catch |err| {
+            if (self.spill_manager == null or (err != error.SqlProgramLimitExceeded and err != error.OutOfMemory)) return err;
+            try self.startSpill();
+            try self.external.?.add(row);
+        };
+    }
+    fn addInMemory(self: *TopK, row: Row) !void {
         if (self.finished) return error.InvalidSqlBackendResponse;
         if (row.keys.len != self.orders.len) return error.InvalidSqlBackendResponse;
         if (self.entries.len == 0) return;
@@ -184,6 +256,7 @@ pub const TopK = struct {
     /// Once sorted, result encoding consumes each row and promptly releases
     /// its source arena. Peak memory need not retain two complete result sets.
     pub fn releaseFinishedRow(self: *TopK, index: usize) void {
+        if (self.external != null) return;
         std.debug.assert(self.finished and index == self.released and index < self.count);
         self.retained_bytes -= self.entries[index].allocatedBytes();
         self.entries[index].deinit();
@@ -363,7 +436,7 @@ pub const GroupResult = struct { keys: []const Datum, aggregates: []const Datum,
 /// Build-side ownership for a streaming hash join. Probe rows remain borrowed
 /// from one native page; only the build relation occupies retained memory.
 pub const HashJoin = struct {
-    pub const Limits = struct { rows: usize = 100000, bytes: usize = 8 * 1024 * 1024 };
+    pub const Limits = struct { rows: usize = 100000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null };
     const PackedRow = struct {
         width: usize,
         values: []const Datum,
@@ -374,11 +447,18 @@ pub const HashJoin = struct {
     pub const Match = struct {
         index: usize,
         row: PackedRow,
+        transient: bool = false,
 
         /// Expand positional NULL slots only for the current candidate. Cell
         /// payloads continue to borrow the immutable packed build relation.
         pub fn materializeValues(self: Match, alloc: Allocator) ![]const Datum {
-            if (self.row.values.len == self.row.width) return alloc.dupe(Datum, self.row.values);
+            if (self.row.values.len == self.row.width) {
+                const result = try alloc.dupe(Datum, self.row.values);
+                if (self.transient) {
+                    for (result) |*value| value.* = try cloneDatum(alloc, value.*);
+                }
+                return result;
+            }
             const result = try alloc.alloc(Datum, self.row.width);
             @memset(result, .{});
             for (self.row.ordinals, self.row.values) |ordinal, value| result[ordinal] = value;
@@ -391,6 +471,20 @@ pub const HashJoin = struct {
         cursor: ?usize,
 
         pub fn next(self: *Probe) !?Match {
+            if (self.owner.disk) |*file| while (self.cursor) |index| {
+                _ = self.owner.disk_arena.reset(.free_all);
+                const decoded = try file.read(self.owner.disk_arena.allocator(), index);
+                self.cursor = if (decoded.next == @import("spill.zig").none) null else @intCast(decoded.next);
+                self.owner.probes += 1;
+                if (decoded.row.keys.len != self.keys.len) return error.InvalidSqlSpill;
+                var equal = true;
+                for (decoded.row.keys, self.keys) |left, right| if (left.sql_null or right.sql_null or (try scalar.compare(left.value, right.value)) != .eq) {
+                    equal = false;
+                    break;
+                };
+                if (equal) return .{ .index = index, .row = .{ .width = decoded.row.values.len, .values = decoded.row.values, .ordinals = &.{}, .keys = decoded.row.keys }, .transient = true };
+            };
+            if (self.owner.disk != null) return null;
             while (self.cursor) |index| {
                 const entry = &self.owner.entries.items[index];
                 self.cursor = entry.next;
@@ -418,15 +512,54 @@ pub const HashJoin = struct {
     probes: u64 = 0,
     sealed: bool = false,
 
+    disk: ?@import("spill.zig").File = null,
+    disk_heads: []u64 = &.{},
+    disk_arena: std.heap.ArenaAllocator = undefined,
+    row_count: usize = 0,
+    fn startSpill(self: *HashJoin) !void {
+        const manager = self.limits.spill orelse return error.SqlProgramLimitExceeded;
+        const alloc = self.budget.allocator();
+        const slots = std.math.floorPowerOfTwo(usize, @max(@as(usize, 16), self.limits.bytes / 64));
+        const heads = try alloc.alloc(u64, slots);
+        errdefer alloc.free(heads);
+        @memset(heads, @import("spill.zig").none);
+        var file = try manager.create();
+        errdefer file.close();
+        for (self.entries.items, 0..) |entry, ordinal| {
+            var arena = std.heap.ArenaAllocator.init(self.backing);
+            defer arena.deinit();
+            const values = try (Match{ .index = ordinal, .row = entry.row }).materializeValues(arena.allocator());
+            const hashed = try hash(entry.row.keys);
+            const bucket = if (hashed) |value| value & (heads.len - 1) else 0;
+            const offset = try file.append(.{ .values = values, .keys = entry.row.keys, .ordinal = ordinal }, if (hashed != null) heads[bucket] else @import("spill.zig").none);
+            if (hashed != null) heads[bucket] = offset;
+        }
+        self.rows.deinit();
+        self.rows = std.heap.ArenaAllocator.init(alloc);
+        self.entries.clearAndFree(alloc);
+        self.heads.clearAndFree(alloc);
+        self.disk_heads = heads;
+        self.disk = file;
+    }
+    fn appendDisk(self: *HashJoin, values: []const Datum, keys: []const Datum) !void {
+        const hashed = try hash(keys);
+        const bucket = if (hashed) |value| value & (self.disk_heads.len - 1) else 0;
+        const offset = try self.disk.?.append(.{ .values = values, .keys = keys, .ordinal = self.row_count }, if (hashed != null) self.disk_heads[bucket] else @import("spill.zig").none);
+        if (hashed != null) self.disk_heads[bucket] = offset;
+    }
     pub fn create(alloc: Allocator, limits: Limits) !*HashJoin {
         if (limits.bytes < @sizeOf(HashJoin)) return error.SqlProgramLimitExceeded;
         const self = try alloc.create(HashJoin);
         self.* = .{ .backing = alloc, .budget = .{ .backing = alloc, .limit = limits.bytes - @sizeOf(HashJoin) }, .limits = limits, .rows = undefined };
         self.rows = std.heap.ArenaAllocator.init(self.budget.allocator());
+        self.disk_arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         return self;
     }
     pub fn deinit(self: *HashJoin) void {
         const alloc = self.budget.allocator();
+        if (self.disk) |*file| file.close();
+        self.disk_arena.deinit();
+        alloc.free(self.disk_heads);
         self.rows.deinit();
         self.entries.deinit(alloc);
         self.heads.deinit(alloc);
@@ -444,7 +577,22 @@ pub const HashJoin = struct {
         return hasher.final();
     }
     pub fn add(self: *HashJoin, values: []const Datum, keys: []const Datum) !void {
+        if (self.sealed or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
+        if (self.row_count >= self.limits.rows) return error.SqlProgramLimitExceeded;
+        self.key_count = keys.len;
+        if (self.disk == null and self.limits.spill != null) {
+            var estimate: usize = 4096;
+            for (values) |value| estimate +|= (try datumBytes(value)) *| 4;
+            for (keys) |value| estimate +|= (try datumBytes(value)) *| 4;
+            if (self.budget.live > self.budget.limit / 2 or estimate > self.budget.limit -| self.budget.live) try self.startSpill();
+        }
+        if (self.disk != null) {
+            try self.appendDisk(values, keys);
+            self.row_count += 1;
+            return;
+        }
         self.addInner(values, keys) catch |err| return if (err == error.OutOfMemory and self.budget.exhausted) error.SqlProgramLimitExceeded else err;
+        self.row_count += 1;
     }
     fn addInner(self: *HashJoin, values: []const Datum, keys: []const Datum) !void {
         if (self.sealed or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
@@ -476,13 +624,31 @@ pub const HashJoin = struct {
     pub fn probe(self: *HashJoin, keys: []const Datum) !Probe {
         self.sealed = true;
         if (self.key_count != null and self.key_count.? != keys.len) return error.InvalidSqlBackendResponse;
+        if (self.disk != null) {
+            const bucket = if (try hash(keys)) |hashed| self.disk_heads[hashed & (self.disk_heads.len - 1)] else @import("spill.zig").none;
+            return .{ .owner = self, .keys = keys, .cursor = if (bucket == @import("spill.zig").none) null else @intCast(bucket) };
+        }
         return .{ .owner = self, .keys = keys, .cursor = if (try hash(keys)) |hashed| self.heads.get(hashed) else null };
     }
     /// Mark only after the complete ON residual accepts this candidate.
-    pub fn markMatched(self: *HashJoin, index: usize) void {
+    pub fn markMatched(self: *HashJoin, index: usize) !void {
+        if (self.disk) |*file| {
+            try file.match(index);
+            return;
+        }
         self.entries.items[index].matched = true;
     }
-    pub fn unmatched(self: *HashJoin, next: *usize) ?Match {
+    pub fn unmatched(self: *HashJoin, next: *usize) !?Match {
+        if (self.disk) |*file| {
+            while (next.* < file.size) {
+                const offset = next.*;
+                _ = self.disk_arena.reset(.free_all);
+                const row = try file.read(self.disk_arena.allocator(), offset);
+                next.* = @intCast(row.following);
+                if (!row.matched) return .{ .index = offset, .row = .{ .width = row.row.values.len, .values = row.row.values, .ordinals = &.{}, .keys = row.row.keys }, .transient = true };
+            }
+            return null;
+        }
         while (next.* < self.entries.items.len) {
             const index = next.*;
             next.* += 1;
@@ -497,7 +663,7 @@ pub const HashJoin = struct {
 /// states, never the scanned rows. A stable heap owner keeps quota allocator
 /// pointers valid through map growth and result handoff.
 pub const Grouped = struct {
-    pub const Limits = struct { groups: usize = 10000, bytes: usize = 8 * 1024 * 1024 };
+    pub const Limits = struct { groups: usize = 10000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null };
     const Group = struct { keys: OwnedRow, states: []Aggregate, next: ?usize };
     backing: Allocator,
     budget: MemoryBudget,
@@ -511,6 +677,40 @@ pub const Grouped = struct {
     finished: bool = false,
     key_count: ?usize = null,
 
+    external: ?*@import("spill_grouped.zig").Grouped = null,
+    result_cursor: usize = 0,
+    fn clearGroups(self: *Grouped) void {
+        const alloc = self.budget.allocator();
+        for (self.groups.items) |*group| {
+            group.keys.deinit();
+            for (group.states) |*state| state.deinit();
+            alloc.free(group.states);
+        }
+        self.groups.clearAndFree(alloc);
+        self.heads.clearAndFree(alloc);
+    }
+    fn startSpill(self: *Grouped) !void {
+        const manager = self.limits.spill orelse return error.SqlProgramLimitExceeded;
+        const external = try self.backing.create(@import("spill_grouped.zig").Grouped);
+        errdefer self.backing.destroy(external);
+        external.* = try @import("spill_grouped.zig").Grouped.init(self.backing, manager, self.specs, self.key_count orelse 0, self.limits.bytes);
+        errdefer external.deinit();
+        for (self.groups.items) |group| try external.partial(group.keys.row.values, group.states, group.keys.row.ordinal);
+        self.clearGroups();
+        self.external = external;
+    }
+    pub fn nextResult(self: *Grouped, alloc: Allocator) !?GroupResult {
+        if (self.external) |external| {
+            const result = try external.next(alloc);
+            if (result != null and external.output_count > self.limits.groups) return error.SqlProgramLimitExceeded;
+            self.finished = true;
+            return result;
+        }
+        if (self.result_cursor == self.groups.items.len) return null;
+        const result = try self.resultAt(alloc, self.result_cursor);
+        self.result_cursor += 1;
+        return result;
+    }
     pub fn create(alloc: Allocator, specs: []const AggregateSpec, limits: Limits) !*Grouped {
         if (limits.bytes < @sizeOf(Grouped) or specs.len > 256) return error.SqlProgramLimitExceeded;
         const self = try alloc.create(Grouped);
@@ -521,14 +721,12 @@ pub const Grouped = struct {
     }
 
     pub fn deinit(self: *Grouped) void {
-        const alloc = self.budget.allocator();
-        for (self.groups.items) |*group| {
-            group.keys.deinit();
-            for (group.states) |*state| state.deinit();
-            alloc.free(group.states);
+        if (self.external) |external| {
+            external.deinit();
+            self.backing.destroy(external);
         }
-        self.groups.deinit(alloc);
-        self.heads.deinit(alloc);
+        const alloc = self.budget.allocator();
+        self.clearGroups();
         alloc.free(self.specs);
         std.debug.assert(self.budget.live == 0);
         self.backing.destroy(self);
@@ -536,6 +734,22 @@ pub const Grouped = struct {
 
     pub fn add(self: *Grouped, keys: []const Datum, inputs: []const Datum) !void {
         if (self.failed or self.finished) return error.InvalidSqlBackendResponse;
+        if (inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
+        self.key_count = keys.len;
+        const mergeable = for (self.specs) |spec| {
+            if (spec.kind == .pattern_set) break false;
+        } else true;
+        if (self.external == null and self.limits.spill != null and mergeable) {
+            var needed: usize = 4096 + self.specs.len * @sizeOf(Aggregate) * 2;
+            for (keys) |key| needed +|= (try datumBytes(key)) *| 4;
+            for (inputs) |input| needed +|= (try datumBytes(input)) *| 4;
+            if (self.budget.live > self.budget.limit / 2 or needed > self.budget.limit -| self.budget.live) try self.startSpill();
+        }
+        if (self.external) |external| {
+            try external.add(keys, inputs, self.rows_seen);
+            self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+            return;
+        }
         self.update(keys, inputs) catch |err| {
             self.failed = true;
             return if (err == error.OutOfMemory and self.budget.exhausted) error.SqlProgramLimitExceeded else err;
@@ -558,7 +772,7 @@ pub const Grouped = struct {
     }
 
     pub fn groupCount(self: *const Grouped) usize {
-        return self.groups.items.len;
+        return if (self.external != null) @intCast(self.rows_seen) else self.groups.items.len;
     }
 
     pub fn resultAt(self: *Grouped, alloc: Allocator, index: usize) !GroupResult {
@@ -877,17 +1091,17 @@ test "SQL hash join streams duplicate matches and preserves unmatched SQL NULL r
     var probe = try join.probe(&.{Datum.json(.{ .number_string = "1.00" })});
     var matches: usize = 0;
     while (try probe.next()) |match| {
-        join.markMatched(match.index);
+        try join.markMatched(match.index);
         matches += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), matches);
     var null_probe = try join.probe(&.{.{}});
     try std.testing.expect((try null_probe.next()) == null);
     var cursor: usize = 0;
-    const remaining = try join.unmatched(&cursor).?.materializeValues(std.testing.allocator);
+    const remaining = try (try join.unmatched(&cursor)).?.materializeValues(std.testing.allocator);
     defer std.testing.allocator.free(remaining);
     try std.testing.expectEqualStrings("null", remaining[0].value.string);
-    try std.testing.expect(join.unmatched(&cursor) == null);
+    try std.testing.expect((try join.unmatched(&cursor)) == null);
 }
 
 test "SQL hash join packs sparse five thousand row build under the default quota" {
@@ -923,14 +1137,129 @@ test "SQL packed hash join preserves SQL NULL and JSON null through allocation f
             try std.testing.expect(values[0].sql_null and values[3].sql_null);
             try std.testing.expect(!values[1].sql_null and values[1].value == .null);
             try std.testing.expectEqualStrings("owned", values[2].value.string);
-            join.markMatched(match.index);
+            try join.markMatched(match.index);
             var cursor: usize = 0;
-            const unmatched = try join.unmatched(&cursor).?.materializeValues(alloc);
+            const unmatched = try (try join.unmatched(&cursor)).?.materializeValues(alloc);
             defer alloc.free(unmatched);
             try std.testing.expectEqual(@as(usize, 3), unmatched.len);
             for (unmatched) |value| try std.testing.expect(value.sql_null);
-            try std.testing.expect(join.unmatched(&cursor) == null);
+            try std.testing.expect((try join.unmatched(&cursor)) == null);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL disk spilling sorts offset pages aggregates distinct keys and outer join matches" {
+    var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 256 * 1024 };
+    defer std.debug.assert(quota.live == 0);
+    const a = quota.allocator();
+    const spill = @import("spill.zig");
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    {
+        var top = try TopK.initWithSpill(a, 501, &.{.{}}, 32 * 1024, &manager);
+        defer top.deinit();
+        for (0..1000) |i| {
+            const value = Datum.json(.{ .integer = @intCast(999 - i) });
+            try top.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = i });
+        }
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const page = try top.finishPage(arena.allocator(), 499, 2);
+        try std.testing.expectEqual(@as(usize, 2), page.len);
+        try std.testing.expectEqual(@as(i64, 499), page[0].values[0].value.integer);
+        try std.testing.expectEqual(@as(i64, 500), page[1].values[0].value.integer);
+        try std.testing.expect(top.external != null);
+    }
+    {
+        const group = try Grouped.create(a, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .count, .distinct = true } }, .{ .groups = 200, .bytes = 64 * 1024, .spill = &manager });
+        defer group.deinit();
+        for (0..2000) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i % 200) });
+            const value = Datum.json(.{ .integer = 9007199254740 });
+            try group.add(&.{key}, &.{ value, value, value });
+        }
+        try std.testing.expect(group.external != null);
+        var count: usize = 0;
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const row = (try group.nextResult(arena.allocator())) orelse break;
+            try std.testing.expectEqual(@as(i64, 10), row.aggregates[0].value.integer);
+            try std.testing.expectEqual(@as(i64, 90071992547400), row.aggregates[1].value.integer);
+            try std.testing.expectEqual(@as(i64, 1), row.aggregates[2].value.integer);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 200), count);
+    }
+    {
+        const join = try HashJoin.create(a, .{ .rows = 2000, .bytes = 64 * 1024, .spill = &manager });
+        defer join.deinit();
+        for (0..1000) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i % 100) });
+            try join.add(&.{ Datum.json(.{ .integer = @intCast(i) }), Datum.json(.null), .{} }, &.{key});
+        }
+        try std.testing.expect(join.disk != null);
+        var probe = try join.probe(&.{Datum.json(.{ .integer = 42 })});
+        var found: usize = 0;
+        while (try probe.next()) |match| {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const values = try match.materializeValues(arena.allocator());
+            try std.testing.expectEqual(@as(i64, 42), @mod(values[0].value.integer, 100));
+            try std.testing.expect(!values[1].sql_null and values[2].sql_null);
+            try join.markMatched(match.index);
+            found += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 10), found);
+        var position: usize = 0;
+        var unmatched_count: usize = 0;
+        while (try join.unmatched(&position)) |_| unmatched_count += 1;
+        try std.testing.expectEqual(@as(usize, 990), unmatched_count);
+    }
+    try std.testing.expect(manager.merges > 0);
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "SQL spilled aggregate partials merge averages extrema booleans and high cardinality distinct" {
+    var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 256 * 1024 };
+    defer std.debug.assert(quota.live == 0);
+    const a = quota.allocator();
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const group = try Grouped.create(a, &.{
+        .{ .kind = .count },                                         .{ .kind = .sum, .input_type = .integer },
+        .{ .kind = .avg, .input_type = .integer },                   .{ .kind = .min, .input_type = .integer },
+        .{ .kind = .max, .input_type = .integer },                   .{ .kind = .bool_and, .input_type = .boolean },
+        .{ .kind = .bool_or, .input_type = .boolean },               .{ .kind = .count, .distinct = true, .input_type = .integer },
+        .{ .kind = .sum, .distinct = true, .input_type = .integer },
+    }, .{ .bytes = 64 * 1024, .spill = &manager });
+    defer group.deinit();
+    for (0..1000) |i| {
+        const n = Datum.json(.{ .integer = @intCast(i % 500) });
+        const b = Datum.json(.{ .bool = i % 2 == 0 });
+        try group.add(&.{Datum.json(.{ .integer = 1 })}, &.{ n, n, n, n, n, b, b, n, n });
+    }
+    try std.testing.expect(group.external != null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const result = (try group.nextResult(arena.allocator())).?;
+    try std.testing.expectEqual(@as(i64, 1000), result.aggregates[0].value.integer);
+    try std.testing.expectEqual(@as(i64, 249500), result.aggregates[1].value.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 249.5), result.aggregates[2].value.float, 0.0000001);
+    try std.testing.expectEqual(@as(i64, 0), result.aggregates[3].value.integer);
+    try std.testing.expectEqual(@as(i64, 499), result.aggregates[4].value.integer);
+    try std.testing.expect(!result.aggregates[5].value.bool and result.aggregates[6].value.bool);
+    try std.testing.expectEqual(@as(i64, 500), result.aggregates[7].value.integer);
+    try std.testing.expectEqual(@as(i64, 124750), result.aggregates[8].value.integer);
+    try std.testing.expect((try group.nextResult(arena.allocator())) == null);
 }

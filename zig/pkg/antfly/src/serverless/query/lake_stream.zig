@@ -85,6 +85,7 @@ pub const Stream = struct {
         self.current = null;
     }
     fn clearFile(self: *Stream) void {
+        if (self.source.scanner.shared_reader) |reader| reader.drain(true);
         self.clearBatch();
         if (self.deleted.len != 0) self.alloc.free(self.deleted);
         self.deleted = &.{};
@@ -96,6 +97,7 @@ pub const Stream = struct {
     pub fn next(self: *Stream) !?types.ColumnBatch {
         try self.context.ensureActive();
         self.clearBatch();
+        if (self.source.scanner.shared_reader) |reader| reader.drain(false);
         while (true) {
             if (self.discovered) |*plan| {
                 while (self.group_index < plan.row_group_plan.row_groups.len) {
@@ -118,6 +120,7 @@ pub const Stream = struct {
                     self.stats.groups_decoded += 1;
                     self.stats.rows_examined += group.row_count;
                     try self.context.ensureActive();
+                    try self.prefetchNext();
                     return self.current.?.batch;
                 }
                 self.clearFile();
@@ -131,6 +134,41 @@ pub const Stream = struct {
                 continue;
             }
             try self.loadFile(index);
+        }
+    }
+    fn prefetchNext(self: *Stream) !void {
+        const reader = self.source.scanner.shared_reader orelse return;
+        if (reader.context.io == null) return;
+        const plan = &self.discovered.?;
+        const file = plan.inventory.files[0];
+        for (plan.row_group_plan.row_groups[self.group_index..]) |input| {
+            const group = for (file.row_groups) |candidate| {
+                if (candidate.ordinal == input.row_group_ordinal) break candidate;
+            } else continue;
+            if (!groupMayMatch(group, self.predicates)) continue;
+            const range_io = @import("lake_range_io.zig");
+            var reads: std.ArrayList(range_io.RangeRead) = .empty;
+            defer reads.deinit(self.alloc);
+            const object = try range_io.objectRefForExternalFileUri(file);
+            for (group.column_chunks) |chunk| {
+                for (self.columns) |column| if (std.mem.eql(u8, column, chunk.column_id)) {
+                    try reads.append(self.alloc, try range_io.planColumnChunkRead(object, chunk));
+                    break;
+                };
+            }
+            const physical = try range_io.coalescePhysicalReadsAlloc(self.alloc, reads.items, self.source.scanner.coalesce_options);
+            defer self.alloc.free(physical);
+            try reader.prefetch(physical);
+            return;
+        }
+        // Next-file footer lookahead also helps single-row-group datasets.
+        for (self.files[self.file_index..]) |index| {
+            const upcoming = self.source.inventory.files[index];
+            if (!fileMayMatch(upcoming, self.predicates)) continue;
+            const object = try @import("lake_range_io.zig").objectRefForExternalFileUri(upcoming);
+            const footer = try @import("lake_range_io.zig").planParquetFooterRead(object, 64 * 1024);
+            try reader.prefetch(&.{footer});
+            return;
         }
     }
     fn loadFile(self: *Stream, index: usize) !void {

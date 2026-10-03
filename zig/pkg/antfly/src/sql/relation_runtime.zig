@@ -612,7 +612,7 @@ fn Engine(comptime Context: type) type {
                     self.borrowed_hash = true;
                 };
                 if (self.hash_join == null) {
-                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes });
+                    self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .spill = self.engine.context.spill });
                     var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                     defer scratch.deinit();
                     while (try self.right.?.next(scratch.allocator())) |values| {
@@ -643,7 +643,7 @@ fn Engine(comptime Context: type) type {
                                 if (!accepted.value.bool) continue;
                             }
                             self.left_matched = true;
-                            self.hash_join.?.markMatched(match.index);
+                            try self.hash_join.?.markMatched(match.index);
                             return try alloc.dupe(Datum, values);
                         }
                         self.probe = null;
@@ -651,7 +651,7 @@ fn Engine(comptime Context: type) type {
                     }
                     if (self.eof) {
                         if (kind == .right or kind == .full) {
-                            if (self.hash_join.?.unmatched(&self.unmatched_index)) |match| return try self.combine(alloc, null, try match.materializeValues(alloc));
+                            if (try self.hash_join.?.unmatched(&self.unmatched_index)) |match| return try self.combine(alloc, null, try match.materializeValues(alloc));
                         }
                         return null;
                     }
@@ -677,7 +677,7 @@ fn Engine(comptime Context: type) type {
             opened: bool = false,
 
             fn iface(self: *Adapter) catalog.Backend {
-                return .{ .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
+                return .{ .execution_io = self.engine.context.backend.execution_io, .spill_manager = self.engine.context.spill, .ptr = self, .decision_provider = self.engine.context.backend.decision_provider, .pinned_statement_snapshot = true, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = Adapter.checkpoint } };
             }
             fn resolve(ptr: *anyopaque, _: Allocator, _: @import("ast.zig").Name, _: catalog.Action) !catalog.Table {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

@@ -36,15 +36,27 @@ reads footer counts, and Iceberg deletes use the existing snapshot/sequence rule
 before emitting selected rows. API SQL reads reuse a bounded server-owned cache
 keyed by credential scope, endpoint, immutable object version and byte range.
 
-This establishes streaming and reusable column inputs; expression evaluation is
-still row-wise over selected cells. Large individual row groups retain the
-existing 32 MiB materialization bound. Blocking sorts, high-cardinality groups
-and hash joins remain subject to SQL's retained-memory budget. The next native
-execution layers are page-sized decode batches, vector expression kernels,
-bounded prefetch through the existing I/O runtime, and temporary-storage spill
-for blocking operators. Iceberg partition pruning needs a transform-aware proof;
-raw partition values alone are insufficient. These layers belong behind the
-same snapshot-bound provider contract.
+The native executor now runs bounded instruction-major numeric/boolean kernels
+on selected cells, with four-lane exact integer arithmetic and comparisons.
+Lazy and unsupported expressions fall back intact to scalar evaluation. API
+lake cursors overlap up to four version-pinned projected range reads in a
+32 MiB lookahead batch through the existing I/O runtime. Cancellation reaches
+provider tokens; workers join before source metadata is released.
+
+Blocking sorts, mergeable grouped aggregates (including DISTINCT), and hash-join
+build rows can spill through statement-owned temporary storage. Bounded merge
+runs support sorting and per-key state reduction; joins use a bounded bucket
+directory and persistent match markers for outer joins. The shared statement
+spill quota defaults to 1 GiB and 64 open files. Private files are immediately
+unlinked and close on success/error/cancellation. Small inputs keep the existing
+in-memory paths. The exact datum codec preserves integers and SQL/JSON nulls.
+
+Large individual row groups retain the existing 32 MiB materialization bound.
+Window input partitions, pattern-set aggregate state, and result buffers still
+obey SQL's retained-memory budget. Page-sized decoding remains future work.
+Iceberg partition pruning needs a transform-aware proof; raw partition values
+alone are insufficient. These layers stay behind the same snapshot-bound
+provider contract.
 
 ## Relationship To Arrow, Parquet, Iceberg, And Lance
 

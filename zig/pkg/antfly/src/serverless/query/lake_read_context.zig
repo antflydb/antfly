@@ -19,6 +19,7 @@ const storage = @import("../../storage/object_storage.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
+    io: ?std.Io = null,
     deadline_ns: ?u64 = null,
     cancellation: ?storage.CancellationToken = null,
     pub fn ensureActive(self: Context) !void {
@@ -70,7 +71,19 @@ pub const Store = struct {
         const self = from(raw);
         try self.context.ensureActive();
         var opts = options;
-        opts.cancellation = self.token();
+        const Combined = struct {
+            store: *Store,
+            parent: ?storage.CancellationToken,
+            fn canceled(raw_token: *const anyopaque) bool {
+                const value: *const @This() = @ptrCast(@alignCast(raw_token));
+                value.store.context.ensureActive() catch return true;
+                if (value.parent) |parent| parent.check() catch return true;
+                return false;
+            }
+        };
+        const combined: Combined = .{ .store = self, .parent = options.cancellation };
+        opts.cancellation = .{ .ptr = &combined, .is_cancelled_fn = Combined.canceled };
+        try opts.cancellation.?.check();
         var base = self.base;
         base.allocator = alloc;
         var result = base.getObject(bucket, key, opts) catch |err| {

@@ -93,6 +93,52 @@ pub const Reader = struct {
     base: ObjectReader,
     scope: [32]u8,
     context: Context,
+    pending: [4]?std.Io.Future(anyerror!void) = @splat(null),
+    prefetch_bytes: usize = 0,
+    prefetch_cancelled: std.atomic.Value(bool) = .init(false),
+    /// One lookahead batch, four concurrent ranges, at most 32 MiB in flight.
+    /// Workers use independent page allocations, never a SQL arena/quota.
+    pub fn prefetch(self: *Reader, reads: []const ranges.RangeRead) !void {
+        self.drain(false);
+        const io = self.context.io orelse return;
+        try self.context.ensureActive();
+        self.prefetch_cancelled.store(false, .release);
+        self.prefetch_bytes = 0;
+        for (reads[0..@min(reads.len, self.pending.len)], 0..) |read, i| {
+            if (read.range.len > 32 * 1024 * 1024 -| self.prefetch_bytes) break;
+            self.prefetch_bytes += @intCast(read.range.len);
+            self.pending[i] = io.concurrent(warm, .{ self, read }) catch break;
+        }
+    }
+    fn warm(self: *Reader, read: ranges.RangeRead) anyerror!void {
+        var worker: Reader = .{ .cache = self.cache, .base = self.base, .scope = self.scope, .context = self.context };
+        const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = prefetchCanceled };
+        worker.context.cancellation = token;
+        worker.base.cancellation = token;
+        const bytes = try readPlanned(&worker, std.heap.page_allocator, read);
+        defer std.heap.page_allocator.free(bytes);
+    }
+    fn prefetchCanceled(raw: *const anyopaque) bool {
+        const self: *const Reader = @ptrCast(@alignCast(raw));
+        if (self.prefetch_cancelled.load(.acquire)) return true;
+        self.context.ensureActive() catch return true;
+        return false;
+    }
+    /// Prefetch failures are speculative. Required reads preserve their own
+    /// errors; close cancels/joins before footer metadata or clients are freed.
+    pub fn drain(self: *Reader, cancel: bool) void {
+        if (cancel) self.prefetch_cancelled.store(true, .release);
+        const io = self.context.io orelse return;
+        for (&self.pending) |*future| if (future.*) |*active| {
+            if (cancel) {
+                active.cancel(io) catch {};
+            } else {
+                active.await(io) catch {};
+            }
+            future.* = null;
+        };
+        self.prefetch_bytes = 0;
+    }
     pub fn reader(self: *Reader) parquet.ObjectRangeReader {
         return .{ .ctx = self, .read_range_alloc = readRange, .read_planned_range_alloc = readPlanned };
     }
@@ -141,4 +187,76 @@ test "external lake shared cache bounds memory and segregates versions and crede
     const stats = cache.snapshot();
     try std.testing.expectEqual(@as(usize, 6), stats.stored_bytes);
     try std.testing.expectEqual(@as(u64, 1), stats.evictions);
+}
+
+test "external lake prefetch overlaps bounded ranges warms versions and joins on close" {
+    const storage = @import("../../storage/object_storage.zig");
+    const a = std.testing.allocator;
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", "abcdefghijklmnop", .{});
+    defer put.deinit(a);
+    const Slow = struct {
+        base: storage.ObjectStorage,
+        gate: std.atomic.Value(bool) = .init(false),
+        canceled: std.atomic.Value(usize) = .init(0),
+        entered: std.atomic.Value(usize) = .init(0),
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.entered.fetchAdd(1, .acq_rel);
+            // Deliberately poll outside the worker's I/O cancellation system:
+            // a provider may own a separate runtime. The composed token must
+            // stop it when LIMIT closes the cursor without canceling request.
+            while (!self.gate.load(.acquire)) {
+                if (options.cancellation) |token| token.check() catch |err| {
+                    _ = self.canceled.fetchAdd(1, .acq_rel);
+                    return err;
+                };
+                std.atomic.spinLoopHint();
+            }
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var slow: Slow = .{ .base = client, .vtable = client.vtable.* };
+    slow.vtable.get_object = Slow.get;
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(.{ .allocator = a, .ptr = &slow, .vtable = &slow.vtable }), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    defer reader.drain(true);
+    const object: ranges.ObjectRef = .{ .bucket = "bucket", .key = "data", .byte_len = 16, .version = .{ .etag = put.etag.? } };
+    var reads: [4]ranges.RangeRead = undefined;
+    for (&reads, 0..) |*read, i| read.* = .{ .object = object, .range = .{ .offset = i * 4, .len = 4 }, .purpose = .parquet_column_chunk };
+    try reader.prefetch(&reads);
+    defer slow.gate.store(true, .release);
+    for (0..200) |_| {
+        if (slow.entered.load(.acquire) >= 2) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expect(slow.entered.load(.acquire) >= 2);
+    slow.gate.store(true, .release);
+    reader.drain(false);
+    try std.testing.expectEqual(@as(usize, 4), slow.entered.load(.acquire));
+    const bytes = try reader.reader().readPlannedAlloc(a, reads[2]);
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("ijkl", bytes);
+    try std.testing.expectEqual(@as(usize, 4), slow.entered.load(.acquire));
+    try std.testing.expect(cache.snapshot().hits > 0);
+    // A fresh scope misses the prior cache. Cancellation drains blocked jobs
+    // before their provider/metadata owners go out of scope.
+    slow.gate.store(false, .release);
+    reader.scope[0] = 1;
+    const entered_before = slow.entered.load(.acquire);
+    try reader.prefetch(&reads);
+    for (0..200) |_| {
+        if (slow.entered.load(.acquire) > entered_before) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    reader.drain(true);
+    try std.testing.expect(slow.canceled.load(.acquire) > 0);
+    for (reader.pending) |future| try std.testing.expect(future == null);
 }

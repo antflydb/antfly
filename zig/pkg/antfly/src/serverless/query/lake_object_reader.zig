@@ -27,6 +27,7 @@ const Allocator = std.mem.Allocator;
 pub const ObjectStorageRangeReader = struct {
     client: object_storage.ObjectStorage,
     retry_policy: RetryPolicy = .{},
+    cancellation: ?object_storage.CancellationToken = null,
 
     pub const RetryPolicy = struct {
         max_attempts: u8 = 1,
@@ -96,13 +97,16 @@ pub const ObjectStorageRangeReader = struct {
         key: []const u8,
         opts: object_storage.GetOptions,
     ) !object_storage.GetResult {
+        var options = opts;
+        if (self.cancellation) |token| options.cancellation = token;
         const max_attempts = self.retry_policy.attempts();
         var attempt: u8 = 0;
         while (true) {
+            if (options.cancellation) |token| try token.check();
             attempt += 1;
             var client = self.client;
             client.allocator = alloc;
-            return client.getObject(bucket, key, opts) catch |err| {
+            return client.getObject(bucket, key, options) catch |err| {
                 if (attempt >= max_attempts or !isRetryableObjectReadError(err)) return err;
                 continue;
             };

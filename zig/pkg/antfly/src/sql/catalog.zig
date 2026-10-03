@@ -236,6 +236,8 @@ pub const DdlReceipt = struct {
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
 pub const Backend = struct {
+    execution_io: ?std.Io = null,
+    spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,
     vtable: *const VTable,

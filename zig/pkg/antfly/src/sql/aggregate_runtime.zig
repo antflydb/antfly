@@ -82,8 +82,8 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
 
 fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {
     const decision = @import("decision_eval.zig");
-    var begin: usize = 0;
-    while (begin < grouped.groupCount()) {
+    var exhausted = false;
+    while (!exhausted) {
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
@@ -91,14 +91,16 @@ fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, groupe
         var cells: std.ArrayList([]const Datum) = .empty;
         var ordinals: std.ArrayList(u64) = .empty;
         var bytes: usize = 0;
-        while (begin < grouped.groupCount() and cells.items.len < context.limits.page_rows) {
-            const group = try grouped.resultAt(a, begin);
+        while (cells.items.len < context.limits.page_rows) {
+            const group = (try grouped.nextResult(a)) orelse {
+                exhausted = true;
+                break;
+            };
             const row = try a.alloc(Datum, group.keys.len + group.aggregates.len);
             @memcpy(row[0..group.keys.len], group.keys);
             @memcpy(row[group.keys.len..], group.aggregates);
             try cells.append(a, row);
             try ordinals.append(a, group.ordinal);
-            begin += 1;
             for (row) |cell| bytes +|= try operators.datumBytes(cell);
             if (bytes >= context.limits.page_bytes) break;
         }
@@ -131,7 +133,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const offset = try context.count(statement.offset, 0);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
-    const grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes });
+    const grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes, .spill = context.spill });
     defer grouped.deinit();
     if (bound.group_count == 0) try grouped.ensureGlobalGroup();
     if (context.binding.table) |table| {
@@ -168,13 +170,9 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                 if (column_page.selection.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
                 if (column_page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
                 visited += column_page.selection.len;
-                for (0..column_page.selection.len) |index| {
-                    try context.checkpoint();
-                    var row_arena = std.heap.ArenaAllocator.init(context.alloc);
-                    defer row_arena.deinit();
-                    const cells = try bound.input.columnCells(row_arena.allocator(), column_page, index);
-                    try addCells(context, bound, grouped, row_arena.allocator(), cells);
-                }
+                const cells = try arena.allocator().alloc([]const Datum, column_page.selection.len);
+                for (cells, 0..) |*row, index| row.* = try bound.input.columnCells(arena.allocator(), column_page, index);
+                try addRows(context, bound, grouped, arena.allocator(), cells);
                 const next = column_page.after orelse break;
                 if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;
                 if (after) |previous| if (std.mem.eql(u8, previous, next)) return error.InvalidSqlBackendResponse;
@@ -223,7 +221,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     // Grouping is complete here: allocating for the requested limit when only
     // a few groups exist wastes memory (especially for scalar subqueries in a
     // large INSERT source) without changing which rows can be returned.
-    var top = try operators.TopK.init(context.alloc, @min(capacity, grouped.groupCount()), orders, context.limits.retained_bytes);
+    var top = try operators.TopK.initWithSpill(context.alloc, @min(capacity, grouped.groupCount()), orders, context.limits.retained_bytes, context.spill);
     defer top.deinit();
     const decision = @import("decision_eval.zig");
     const external_results = decision.hasExternalPrograms(bound.outputs) or decision.hasExternalPrograms(bound.orders) or
@@ -232,12 +230,12 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         const projection = try decision.SortedProjection.init(context.arena, bound.outputs, bound.orders, bound.order_outputs);
         try addGroupedDecisionPages(context, bound, grouped, &top, projection);
         return projection.finish(context, &top, offset, limit, statement.limit == null);
-    } else for (0..grouped.groupCount()) |index| {
+    } else while (true) {
         try context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
         const alloc = arena.allocator();
-        const group = try grouped.resultAt(alloc, index);
+        const group = (try grouped.nextResult(alloc)) orelse break;
         const cells = try alloc.alloc(Datum, group.keys.len + group.aggregates.len);
         @memcpy(cells[0..group.keys.len], group.keys);
         @memcpy(cells[group.keys.len..], group.aggregates);
@@ -253,10 +251,10 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         for (bound.orders, keys) |program, *value| value.* = try context.evaluate(alloc, program, cells);
         try top.add(.{ .values = values, .keys = keys, .ordinal = group.ordinal });
     }
-    const ordered = try top.finish(context.arena);
-    const remaining = ordered.len -| offset;
+    const ordered = try top.finishPage(context.arena, offset, limit + @intFromBool(statement.limit == null));
+    const remaining = ordered.len;
     if (statement.limit == null and remaining > limit) return error.SqlResultTooLarge;
-    const selected = ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)];
+    const selected = ordered[0..@min(remaining, limit)];
     const rows = try context.arena.alloc([]const Json, selected.len);
     const nulls = try context.arena.alloc([]const bool, selected.len);
     for (selected, rows, nulls) |row, *output, *null_row| {

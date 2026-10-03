@@ -1038,7 +1038,7 @@ fn asFloat(value: Json) !f64 {
         else => error.SqlTypeMismatch,
     };
 }
-fn arithmetic(op: ast.Scalar.Binary, left: Json, right: Json) !Json {
+pub fn arithmetic(op: ast.Scalar.Binary, left: Json, right: Json) !Json {
     if (left == .integer and right == .integer) {
         const a = left.integer;
         const b = right.integer;
@@ -1095,7 +1095,7 @@ pub fn semanticHash(value: Json) !u64 {
     var budget: json_order.Budget = .{};
     return json_order.hash(value, &budget, 0);
 }
-fn comparison(op: ast.Scalar.Binary, order: std.math.Order) Json {
+pub fn comparison(op: ast.Scalar.Binary, order: std.math.Order) Json {
     return .{ .bool = switch (op) {
         .eq => order == .eq,
         .neq => order != .eq,

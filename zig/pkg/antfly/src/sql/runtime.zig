@@ -32,6 +32,8 @@ pub const Limits = struct {
     page_rows: u32 = 256,
     page_bytes: usize = 256 * 1024,
     scan_pages: usize = 65_536,
+    spill_bytes: u64 = 1024 * 1024 * 1024,
+    spill_root: []const u8 = "/tmp",
 };
 pub const Column = describe.Column;
 pub const Output = struct {
@@ -140,11 +142,17 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     // Resolve exactly once so validation and execution cannot pin different
     // catalog identities within one statement.
     const binding = try describe.bind(arena, backend, compiled, &.{});
-    const context = Context{ .alloc = alloc, .arena = arena, .backend = backend, .binding = binding, .parameters = parameters, .limits = limits };
+    var manager: ?@import("spill.zig").Manager = null;
+    defer if (manager) |*owned| owned.deinit();
+    if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
+        manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+    };
+    const context = Context{ .alloc = alloc, .arena = arena, .backend = backend, .binding = binding, .parameters = parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null };
     return context.run(compiled.statement);
 }
 
 pub const Context = struct {
+    spill: ?*@import("spill.zig").Manager = null,
     alloc: std.mem.Allocator,
     arena: std.mem.Allocator,
     backend: catalog.Backend,
@@ -385,7 +393,7 @@ pub const Context = struct {
         if (self.binding.order_keys.len != 0 and !self.binding.primary_order and !statement.count_all and limit != 0) {
             const orders = try self.arena.alloc(operators.Order, self.binding.order_keys.len);
             for (self.binding.order_keys, orders) |key, *order| order.* = .{ .descending = key.descending, .nulls_first = key.nulls_first };
-            top_k = try operators.TopK.init(self.alloc, offset + limit + @intFromBool(statement.limit == null), orders, self.limits.retained_bytes);
+            top_k = try operators.TopK.initWithSpill(self.alloc, offset + limit + @intFromBool(statement.limit == null), orders, self.limits.retained_bytes, self.spill);
         }
         const deferred = try self.arena.alloc(bool, fields.items.len);
         @memset(deferred, false);
@@ -540,11 +548,11 @@ pub const Context = struct {
             after = owned_next;
         }
         if (top_k) |*operator| {
-            const ordered = try operator.finish(self.arena);
-            const remaining = ordered.len -| offset;
+            const ordered = try operator.finishPage(self.arena, offset, limit + @intFromBool(statement.limit == null));
+            const remaining = ordered.len;
+            const start = operator.released;
             if (statement.limit == null and remaining > limit) return error.SqlResultTooLarge;
-            for (0..@min(offset, ordered.len)) |index| operator.releaseFinishedRow(index);
-            const selected = ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)];
+            const selected = ordered[0..@min(remaining, limit)];
             if (defer_projection) {
                 var first: usize = 0;
                 while (first < selected.len) {
@@ -567,7 +575,7 @@ pub const Context = struct {
                         const values = try @import("decision_eval.zig").evaluateBatch(scratch, self.backend.decision_provider, &program, inputs.items, self.parameters);
                         for (output, values) |cells, datum| cells[column] = datum;
                     };
-                    for (output, first + @min(offset, ordered.len)..) |values, index| {
+                    for (output, first + start..) |values, index| {
                         const cells = try self.arena.alloc(Json, values.len);
                         const nulls = try self.arena.alloc(bool, values.len);
                         for (values, cells, nulls) |datum, *cell, *flag| {
@@ -580,7 +588,7 @@ pub const Context = struct {
                     }
                     first += inputs.items.len;
                 }
-            } else for (ordered[@min(offset, ordered.len)..][0..@min(remaining, limit)], @min(offset, ordered.len)..) |row, index| {
+            } else for (ordered[0..@min(remaining, limit)], start..) |row, index| {
                 try self.checkpoint();
                 const cells = try self.arena.alloc(Json, row.values.len);
                 const nulls = try self.arena.alloc(bool, row.values.len);
@@ -2987,5 +2995,33 @@ test "SQL decisions retain trusted routing across reads CTEs grouped and window 
         var result = try execute(a, backend, &compiled, &.{}, .{});
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), provider.calls);
+    }
+}
+
+test "SQL runtime executes spilled order group distinct and join under a small statement budget" {
+    const a = std.testing.allocator;
+    for ([_]struct { sql: []const u8, first: []const u8, second: []const u8 }{
+        .{ .sql = "SELECT CAST(_id AS BIGINT) AS k FROM things ORDER BY k DESC LIMIT 2 OFFSET 1499", .first = "500", .second = "499" },
+        .{ .sql = "SELECT CAST(_id AS BIGINT) AS k, SUM(CAST(_id AS BIGINT)) AS total, COUNT(DISTINCT _id) AS n FROM things GROUP BY CAST(_id AS BIGINT) ORDER BY k LIMIT 2 OFFSET 1998", .first = "1998", .second = "1999" },
+        .{ .sql = "SELECT CAST(a._id AS BIGINT) AS k FROM things a JOIN things b ON a._id = b._id ORDER BY k DESC LIMIT 2", .first = "1999", .second = "1998" },
+    }) |case| {
+        var fixture: TestBackend = .{ .row_count = 2000 };
+        var backend = fixture.coordinated();
+        backend.pinned_statement_snapshot = true;
+        backend.execution_io = std.testing.io;
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
+        defer std.debug.assert(quota.live == 0);
+        var result = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);
+        try std.testing.expectEqualStrings(case.first, result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings(case.second, result.output.rows[1][0].string);
+        try std.testing.expect(result.state.budget.peak <= 256 * 1024);
+        if (result.output.rows[0].len == 3) {
+            try std.testing.expectEqualStrings(case.first, result.output.rows[0][1].string);
+            try std.testing.expectEqualStrings("1", result.output.rows[0][2].string);
+        }
     }
 }
