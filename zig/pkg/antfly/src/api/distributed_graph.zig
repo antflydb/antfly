@@ -3592,7 +3592,7 @@ fn executeDistributedPattern(
 
     // Hydrate documents if requested.
     const hits = if (graphResultHydrationRequested(req, graph_query.query))
-        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
 
@@ -3896,7 +3896,7 @@ fn executeDistributedConjunctivePattern(
         if (unique_nodes.len > 0) alloc.free(unique_nodes);
     }
     const hits = if (graphResultHydrationRequested(req, graph_query.query))
-        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, unique_nodes, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     const name = state.name;
@@ -4697,7 +4697,7 @@ fn executeDistributedTraverse(
         });
     }
     const hydrated_hits = if (hydration_requested)
-        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, state.nodes.items, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     state.hits = try adoptHydratedHits(
@@ -4792,7 +4792,7 @@ fn executeDistributedShortestPath(
     }
 
     const hits = if (graphResultHydrationRequested(req, graph_query.query))
-        try hydrateHitsForResultNodes(alloc, admission, nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, nodes, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     errdefer {
@@ -5089,7 +5089,7 @@ fn executeDistributedKShortestPaths(
     }
 
     const hits = if (graphResultHydrationRequested(req, graph_query.query))
-        try hydrateHitsForResultNodes(alloc, admission, out_nodes, graph_query.query.include_all_fields, graph_query.query.fields)
+        try hydrateHitsForResultNodes(alloc, admission, out_nodes, graph_query.query.documentRetrievalQuery().include_all_fields, graph_query.query.documentRetrievalQuery().fields)
     else
         try alloc.alloc(db_mod.types.SearchHit, 0);
     errdefer {
@@ -9861,7 +9861,14 @@ fn resolveResultRefNodes(
 
     if (std.mem.startsWith(u8, result_ref.ref, "$graph_results.")) {
         const name = result_ref.ref["$graph_results.".len..];
-        for (prior_results) |graph_result| {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        for (prior_results) |original| {
+            var output_limit: ?u32 = null;
+            for (req.graph_queries) |query| if (std.mem.eql(u8, query.name, original.name)) {
+                output_limit = query.query.evaluation_output_limit;
+            };
+            const graph_result = try original.dependencyView(scratch.allocator(), output_limit, source_table);
             if (!std.mem.eql(u8, graph_result.name, name)) continue;
             if (result_ref.binding) |binding| {
                 if (result_ref.limit == 0 and

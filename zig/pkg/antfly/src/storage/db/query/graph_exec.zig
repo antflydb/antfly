@@ -472,6 +472,9 @@ pub fn executeGraphQueriesWithSets(
         alloc.free(results);
     }
 
+    var dependency_arena = std.heap.ArenaAllocator.init(alloc);
+    defer dependency_arena.deinit();
+    const dependency_results = try dependency_arena.allocator().alloc(types.GraphSearchResult, graph_queries.len);
     for (sorted_query_indexes, 0..) |query_index, i| {
         results[i] = executor.func(
             executor.ctx,
@@ -502,17 +505,19 @@ pub fn executeGraphQueriesWithSets(
             return err;
         };
         initialized += 1;
+        dependency_results[i] = try results[i].dependencyView(dependency_arena.allocator(), graph_queries[query_index].query.evaluation_output_limit, req.graph_owning_table);
+        const dependency = &dependency_results[i];
         var resolved_doc_set: ?*const doc_set.ResolvedDocSet = null;
         var resolved_doc_set_complete = false;
         // A source-table doc set cannot represent a qualified graph identity.
         // Canonical dependencies resolve directly from the typed graph result;
         // do not manufacture a key-only compatibility set that can reinterpret
         // `other_table/shared` as `source_table/shared`.
-        if (!graphResultHasQualifiedIdentity(results[i]) and executor.resolve_hits_to_doc_set != null) {
+        if (!graphResultHasQualifiedIdentity(dependency.*) and executor.resolve_hits_to_doc_set != null) {
             const resolve = executor.resolve_hits_to_doc_set.?;
-            if (results[i].nodes.len == results[i].total_hits) {
+            if (dependency.nodes.len == dependency.total_hits) {
                 if (executor.resolve_nodes_to_doc_set) |resolve_nodes| {
-                    resolved_sets[i] = try resolve_nodes(executor.ctx, alloc, req, results[i].nodes);
+                    resolved_sets[i] = try resolve_nodes(executor.ctx, alloc, req, dependency.nodes);
                     if (resolved_sets[i]) |*set| {
                         resolved_doc_set = set;
                         resolved_doc_set_complete = true;
@@ -520,20 +525,20 @@ pub fn executeGraphQueriesWithSets(
                 }
             }
             if (resolved_doc_set == null) {
-                resolved_sets[i] = try resolve(executor.ctx, alloc, req, results[i].hits);
+                resolved_sets[i] = try resolve(executor.ctx, alloc, req, dependency.hits);
                 if (resolved_sets[i]) |*set| {
                     resolved_doc_set = set;
-                    resolved_doc_set_complete = @as(u64, results[i].total_hits) <= results[i].hits.len;
+                    resolved_doc_set_complete = @as(u64, dependency.total_hits) <= dependency.hits.len;
                 }
             }
         }
         try available_sets.append(alloc, .{
-            .name = results[i].name,
-            .hits = results[i].hits,
-            .total_hits = results[i].total_hits,
+            .name = dependency.name,
+            .hits = dependency.hits,
+            .total_hits = dependency.total_hits,
             .resolved_doc_set = resolved_doc_set,
             .resolved_doc_set_complete = resolved_doc_set_complete,
-            .graph_result = &results[i],
+            .graph_result = dependency,
         });
     }
 
@@ -2116,7 +2121,7 @@ fn buildPatternDocumentHits(
 
         const documents = if (query.include_documents) blk: {
             if (executor.load_projected_documents) |load_many| {
-                const loaded = try load_many(executor.ctx, alloc, query, keys[0..batch_len]);
+                const loaded = try load_many(executor.ctx, alloc, query.documentRetrievalQuery(), keys[0..batch_len]);
                 if (loaded.len != batch_len) {
                     freeOptionalOwnedBytes(alloc, loaded);
                     return error.InvalidQueryResult;
@@ -2132,7 +2137,7 @@ fn buildPatternDocumentHits(
                 if (loaded.len > 0) alloc.free(loaded);
             }
             for (keys[0..batch_len], 0..) |key, i| {
-                loaded[i] = try executor.load_projected_document(executor.ctx, alloc, query, key);
+                loaded[i] = try executor.load_projected_document(executor.ctx, alloc, query.documentRetrievalQuery(), key);
                 initialized += 1;
             }
             break :blk loaded;
@@ -6107,7 +6112,7 @@ test "cloneNamedSetAsResult preserves hit ordinals" {
     try std.testing.expectEqualStrings("{\"title\":\"A\"}", with_stored.hits[0].stored_data.?);
 }
 
-test "buildPatternDocumentHits preserves resolved binding ordinals" {
+test "decision functions graph hydration fetches hidden inputs and preserves binding ordinals" {
     const alloc = std.testing.allocator;
 
     var bindings = try alloc.alloc(types.GraphPatternBinding, 2);
@@ -6139,6 +6144,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
 
     const Harness = struct {
         batch_loaded: bool = false,
+        full_inputs: bool = false,
         seen_generation: ?u64 = null,
 
         fn matchPattern(
@@ -6170,9 +6176,11 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
         ) anyerror![]?[]u8 {
             const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
             self.batch_loaded = true;
-            try std.testing.expect(!query.include_all_fields);
-            try std.testing.expectEqual(@as(usize, 1), query.fields.len);
-            try std.testing.expectEqualStrings("title", query.fields[0]);
+            try std.testing.expectEqual(self.full_inputs, query.include_all_fields);
+            if (self.full_inputs) try std.testing.expectEqual(@as(usize, 0), query.fields.len) else {
+                try std.testing.expectEqual(@as(usize, 1), query.fields.len);
+                try std.testing.expectEqualStrings("title", query.fields[0]);
+            }
             try std.testing.expectEqual(@as(usize, 2), keys.len);
             try std.testing.expectEqualStrings("doc:a", keys[0]);
             try std.testing.expectEqualStrings("doc:b", keys[1]);
@@ -6234,6 +6242,28 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
     try std.testing.expectEqualStrings("doc:b", hits[1].id);
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), hits[1].doc_ordinal);
     try std.testing.expectEqualStrings("{\"title\":\"binding-1\"}", hits[1].stored_data.?);
+
+    harness.full_inputs = true;
+    const decision_hits = try buildPatternDocumentHits(alloc, .{
+        .query_type = .pattern,
+        .index_name = "graph",
+        .start_nodes = .{ .keys = &.{} },
+        .include_documents = true,
+        .fields = &.{"title"},
+        .include_all_fields = false,
+        .defer_document_projection = true,
+    }, 42, &matches, .{
+        .ctx = &harness,
+        .match_pattern = Harness.matchPattern,
+        .load_projected_document = Harness.loadProjectedDocument,
+        .load_projected_documents = Harness.loadProjectedDocuments,
+        .lookup_doc_ordinal = Harness.lookupOrdinal,
+    });
+    defer {
+        for (decision_hits) |*hit| hit.deinit(alloc);
+        alloc.free(decision_hits);
+    }
+    try std.testing.expectEqual(@as(usize, 2), decision_hits.len);
 
     bindings[1].node.table = try alloc.dupe(u8, "entities");
     try std.testing.expectError(error.UnsupportedQueryRequest, buildPatternDocumentHits(

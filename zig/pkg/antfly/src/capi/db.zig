@@ -4733,6 +4733,7 @@ pub fn searchPublicQueryJson(
     request_json: capi.Slice,
     out_buf: *capi.Buffer,
 ) capi.ErrorCode {
+    query_api.validateStoragePublicQueryRequest(handle.alloc, request_json.bytes()) catch |err| return capi.mapError(err);
     // `linked_storage` says this compiled library links the full storage
     // internals -- true unconditionally for the default `libantfly` since
     // it is shared with the `antfly` executable -- not that `handle` is a

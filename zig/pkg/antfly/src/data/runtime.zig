@@ -8856,6 +8856,7 @@ pub const DataServer = struct {
 
     fn syncInferenceRuntimeConfig(self: *DataServer) void {
         const inference_api_url = self.configuredInferenceAPIURL();
+        self.read_source.decision_registry = if (self.api_server_cfg.node_config) |config| &config.registry else null;
         _ = self.read_source.withInferenceAPIURL(inference_api_url);
         _ = self.write_source.withInferenceAPIURL(inference_api_url);
         if (self.data_raft_apply) |apply_sm| {

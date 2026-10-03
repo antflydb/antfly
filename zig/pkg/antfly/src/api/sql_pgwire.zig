@@ -298,6 +298,7 @@ const OwnedRead = struct {
     identity: ?http.AuthenticatedIdentity,
     authority: Authority,
     native_adapter: execution.Adapter,
+    decision_runtime: ?@import("../functions/runtime.zig").Runtime = null,
     session_id: ?[]u8 = null,
     staged: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
     range_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{},
@@ -366,6 +367,8 @@ const OwnedRead = struct {
             self.native_adapter.staged = &self.staged;
             if (state.metadata.isolation != .read_committed) self.native_adapter.range_reads = &self.range_guards;
         }
+        self.decision_runtime = try self.native_adapter.decisionRuntime();
+        if (self.decision_runtime) |*active| self.native_adapter.decision_provider = active.provider();
         self.guarded = .{ .native = self.native_adapter.backend(), .authority = &self.authority, .revision = &self.native_adapter.revision, .expected_guard = self.authority.request.binding_guard };
         const parameters = try normalizeParameters(arena, request.parameters, request.parameter_types);
         var stream_backend = self.guarded.backend();

@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.path_edge import PathEdge
     from ..models.pattern_match_bindings import PatternMatchBindings
+    from ..models.pattern_match_computed import PatternMatchComputed
 
 
 T = TypeVar("T", bound="PatternMatch")
@@ -21,15 +22,21 @@ class PatternMatch:
     """Deprecated graph_searches pattern response row.
 
     Attributes:
+        field_computed (PatternMatchComputed | Unset):
         bindings (PatternMatchBindings | Unset):
         path (list[PathEdge] | Unset):
     """
 
+    field_computed: PatternMatchComputed | Unset = UNSET
     bindings: PatternMatchBindings | Unset = UNSET
     path: list[PathEdge] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        field_computed: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.field_computed, Unset):
+            field_computed = self.field_computed.to_dict()
+
         bindings: dict[str, Any] | Unset = UNSET
         if not isinstance(self.bindings, Unset):
             bindings = self.bindings.to_dict()
@@ -44,6 +51,8 @@ class PatternMatch:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if field_computed is not UNSET:
+            field_dict["_computed"] = field_computed
         if bindings is not UNSET:
             field_dict["bindings"] = bindings
         if path is not UNSET:
@@ -55,8 +64,16 @@ class PatternMatch:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.path_edge import PathEdge
         from ..models.pattern_match_bindings import PatternMatchBindings
+        from ..models.pattern_match_computed import PatternMatchComputed
 
         d = dict(src_dict)
+        _field_computed = d.pop("_computed", UNSET)
+        field_computed: PatternMatchComputed | Unset
+        if isinstance(_field_computed, Unset):
+            field_computed = UNSET
+        else:
+            field_computed = PatternMatchComputed.from_dict(_field_computed)
+
         _bindings = d.pop("bindings", UNSET)
         bindings: PatternMatchBindings | Unset
         if isinstance(_bindings, Unset):
@@ -74,6 +91,7 @@ class PatternMatch:
                 path.append(path_item)
 
         pattern_match = cls(
+            field_computed=field_computed,
             bindings=bindings,
             path=path,
         )
