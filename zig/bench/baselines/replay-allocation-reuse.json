@@ -19,16 +19,24 @@
     ],
     "vector_batch_items": 128,
     "replay_samples_per_variant_and_case": 7,
-    "vector_samples_per_variant_and_mode": 3
+    "vector_samples_per_variant_and_mode": 3,
+    "replay_index_kinds": [
+      "full_text",
+      "algebraic"
+    ],
+    "algebraic_documents_per_journal_record": [
+      128
+    ]
   },
   "method": "Same harness in both trees. Alternate baseline/candidate order; replay has one untallied warm-up per process. Every persisted vector dataset is reread and validated. Journal setup excluded from replay timing; vector checkpoint reported separately.",
   "limitations": [
     "Native macOS ARM64 shared host; no Docker CPU/memory envelope or OpenAI calls.",
     "Replay timings include diagnostic allocator overhead; vector timing runs use the original uninstrumented SMP allocator.",
     "Allocation counts cover the passed allocator, not every direct libc allocation; peak requested live bytes are not RSS.",
-    "No measured reduction in peak live heap. Single-record-per-document replay timing is variable; do not claim zero overhead."
+    "No measured reduction in peak live heap. Single-record-per-document replay timing is variable; do not claim zero overhead.",
+    "Text/algebraic replay timing uses a validating consumer and excludes downstream document parsing/indexing. Graph and full-document throughput have not been benchmarked; real-body correctness is checked separately by database integration fixtures."
   ],
-  "build_command": "python3 tools/run_bounded_zig_build.py --max-rss-cap 15032385536 -- build replay-allocation-test vector-payload-test replay-allocation-bench vector-payload-bench -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -j1 --summary all",
+  "build_command": "python3 tools/run_bounded_zig_build.py --max-rss-cap 15032385536 -- build replay-allocation-test replay-document-integration-test vector-payload-test replay-allocation-bench vector-payload-bench -Doptimize=ReleaseFast -Dmetal=false -Dcuda=false -Donnx=false -j1 --summary all",
   "summary": {
     "replay-256-budgeted": {
       "elapsed_ns": {
@@ -262,6 +270,98 @@
         "change_percent": 0.0
       },
       "paired_elapsed_change_percent_median": -15.476321889833311
+    },
+    "algebraic-bulk-256-unbudgeted": {
+      "elapsed_ns": {
+        "baseline": 21897000,
+        "changed": 20363000,
+        "change_percent": -7.005525871123897
+      },
+      "allocations": {
+        "baseline": 190962,
+        "changed": 90767,
+        "change_percent": -52.46855395314252
+      },
+      "allocated_bytes": {
+        "baseline": 130661800,
+        "changed": 128338952,
+        "change_percent": -1.77775600825949
+      },
+      "peak_live_bytes": {
+        "baseline": 1192155,
+        "changed": 1192155,
+        "change_percent": 0.0
+      },
+      "paired_elapsed_change_percent_median": -6.5746008441915915
+    },
+    "algebraic-bulk-1024-unbudgeted": {
+      "elapsed_ns": {
+        "baseline": 9209000,
+        "changed": 7954000,
+        "change_percent": -13.627972635465301
+      },
+      "allocations": {
+        "baseline": 160486,
+        "changed": 60438,
+        "change_percent": -62.340640305073336
+      },
+      "allocated_bytes": {
+        "baseline": 43052204,
+        "changed": 41198604,
+        "change_percent": -4.305470632815922
+      },
+      "peak_live_bytes": {
+        "baseline": 1255008,
+        "changed": 1255008,
+        "change_percent": 0.0
+      },
+      "paired_elapsed_change_percent_median": -15.535317166154828
+    },
+    "algebraic-bulk-256-budgeted": {
+      "elapsed_ns": {
+        "baseline": 22040000,
+        "changed": 21192000,
+        "change_percent": -3.8475499092558985
+      },
+      "allocations": {
+        "baseline": 190962,
+        "changed": 90767,
+        "change_percent": -52.46855395314252
+      },
+      "allocated_bytes": {
+        "baseline": 130661800,
+        "changed": 128338952,
+        "change_percent": -1.77775600825949
+      },
+      "peak_live_bytes": {
+        "baseline": 1192155,
+        "changed": 1192155,
+        "change_percent": 0.0
+      },
+      "paired_elapsed_change_percent_median": -3.2737689264766057
+    },
+    "algebraic-bulk-1024-budgeted": {
+      "elapsed_ns": {
+        "baseline": 10028000,
+        "changed": 8416000,
+        "change_percent": -16.07499002792182
+      },
+      "allocations": {
+        "baseline": 160486,
+        "changed": 60438,
+        "change_percent": -62.340640305073336
+      },
+      "allocated_bytes": {
+        "baseline": 43052204,
+        "changed": 41198604,
+        "change_percent": -4.305470632815922
+      },
+      "peak_live_bytes": {
+        "baseline": 1255008,
+        "changed": 1255008,
+        "change_percent": 0.0
+      },
+      "paired_elapsed_change_percent_median": -14.946942900454774
     }
   },
   "samples": [
@@ -279,7 +379,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -295,7 +396,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -311,7 +413,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -327,7 +430,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -343,7 +447,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -359,7 +464,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -375,7 +481,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -391,7 +498,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -407,7 +515,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -423,7 +532,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -439,7 +549,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -455,7 +566,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -471,7 +583,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -487,7 +600,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -503,7 +617,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -519,7 +634,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -535,7 +651,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -551,7 +668,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -567,7 +685,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -583,7 +702,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -599,7 +719,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -615,7 +736,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -631,7 +753,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -647,7 +770,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -663,7 +787,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -679,7 +804,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -695,7 +821,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -711,7 +838,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -727,7 +855,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -743,7 +872,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -759,7 +889,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -775,7 +906,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -791,7 +923,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -807,7 +940,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -823,7 +957,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -839,7 +974,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -855,7 +991,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -871,7 +1008,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -887,7 +1025,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -903,7 +1042,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -919,7 +1059,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -935,7 +1076,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 196,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -951,7 +1093,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -967,7 +1110,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -983,7 +1127,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -999,7 +1144,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1015,7 +1161,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1031,7 +1178,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1047,7 +1195,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1063,7 +1212,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1079,7 +1229,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1095,7 +1246,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1111,7 +1263,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1127,7 +1280,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1143,7 +1297,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "replay",
@@ -1159,7 +1314,8 @@
       "peak_live_bytes": 4824416,
       "checksum": 70400000,
       "windows": 49,
-      "documents_per_record": 1
+      "documents_per_record": 1,
+      "index_kind": "full_text"
     },
     {
       "workload": "vector",
@@ -2561,7 +2717,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2577,7 +2734,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2593,7 +2751,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2609,7 +2768,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2625,7 +2785,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2641,7 +2802,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2657,7 +2819,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2673,7 +2836,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2689,7 +2853,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2705,7 +2870,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2721,7 +2887,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2737,7 +2904,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2753,7 +2921,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2769,7 +2938,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2785,7 +2955,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2801,7 +2972,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2817,7 +2989,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2833,7 +3006,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2849,7 +3023,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2865,7 +3040,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2881,7 +3057,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2897,7 +3074,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2913,7 +3091,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2929,7 +3108,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2945,7 +3125,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2961,7 +3142,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -2977,7 +3159,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -2993,7 +3176,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3009,7 +3193,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3025,7 +3210,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3041,7 +3227,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3057,7 +3244,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3073,7 +3261,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3089,7 +3278,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3105,7 +3295,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3121,7 +3312,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3137,7 +3329,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3153,7 +3346,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3169,7 +3363,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3185,7 +3380,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3201,7 +3397,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3217,7 +3414,8 @@
       "peak_live_bytes": 1192155,
       "checksum": 70400000,
       "windows": 196,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3233,7 +3431,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3249,7 +3448,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3265,7 +3465,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3281,7 +3482,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3297,7 +3499,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3313,7 +3516,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3329,7 +3533,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3345,7 +3550,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3361,7 +3567,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3377,7 +3584,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3393,7 +3601,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3409,7 +3618,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "baseline",
@@ -3425,7 +3635,8 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
-      "workload": "replay"
+      "workload": "replay",
+      "index_kind": "full_text"
     },
     {
       "variant": "changed",
@@ -3441,7 +3652,997 @@
       "peak_live_bytes": 1255008,
       "checksum": 70400000,
       "windows": 49,
+      "workload": "replay",
+      "index_kind": "full_text"
+    },
+    {
+      "variant": "baseline",
+      "pair": 0,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 22393000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 0,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 20036000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 1,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21690000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 1,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 22072000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 2,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21857000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 2,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 20425000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 3,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 20952000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 3,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21897000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 4,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21627000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 4,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 19704000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 5,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 20363000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 5,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21796000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 6,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 22268000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 6,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 20232000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 0,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9036000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 0,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 7678000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 1,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 7954000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 1,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9083000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 2,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 8716000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 2,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 8192000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 3,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 7976000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 3,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9443000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 4,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9209000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 4,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 7777000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 5,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 7753000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 5,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9249000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 6,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9544000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 6,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": false,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 7971000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 0,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 22300000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 0,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21043000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 1,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21273000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 1,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21993000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 2,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 22040000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 2,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 20624000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 3,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21500000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 3,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 22037000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 4,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 22238000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 4,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21558000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 5,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 20768000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 5,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 22278000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 6,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21082000,
+      "allocations": 190962,
+      "allocated_bytes": 130661800,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 6,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 256,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 21192000,
+      "allocations": 90767,
+      "allocated_bytes": 128338952,
+      "peak_live_bytes": 1192155,
+      "checksum": 70400000,
+      "windows": 196,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 0,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 10028000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 0,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 8366000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 1,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9069000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 1,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 10187000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 2,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9895000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 2,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 8416000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 3,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 8777000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 3,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9653000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 4,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 10120000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 4,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 8237000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 5,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 8304000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 5,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 10371000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "baseline",
+      "pair": 6,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 9926000,
+      "allocations": 160486,
+      "allocated_bytes": 43052204,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
+      "workload": "replay"
+    },
+    {
+      "variant": "changed",
+      "pair": 6,
+      "sample": 1,
+      "documents": 50000,
+      "batch": 1024,
+      "budgeted": true,
+      "documents_per_record": 128,
+      "index_kind": "algebraic",
+      "elapsed_ns": 8455000,
+      "allocations": 60438,
+      "allocated_bytes": 41198604,
+      "peak_live_bytes": 1255008,
+      "checksum": 70400000,
+      "windows": 49,
       "workload": "replay"
     }
-  ]
+  ],
+  "validation": {
+    "replay_contract_tests_passed": 77,
+    "replay_ownership_and_allocation_failure_index_kinds": [
+      "full_text",
+      "algebraic",
+      "dense_vector",
+      "sparse_vector",
+      "graph"
+    ],
+    "database_integration_checks_passed": 19,
+    "database_integration_named_cases": [
+      "db algebraic bulk ingest survives reopen with durable lsm primary backend",
+      "db managed full text admission replays transitive artifact producers",
+      "db managed algebraic admission builds and reopens an isolated generation",
+      "db algebraic generation build yields and resumes from its durable source cursor",
+      "db full text repair page replay is idempotent without compaction",
+      "db enrichment graph ttl replay honors source tombstone",
+      "db document deletion retires graph source contender and due entry",
+      "db graph index reloads on reopen for neighbor queries with durable lsm primary backend",
+      "db reopens persisted index catalog and text index",
+      "db derived text replay admits natural segments below hard segment limit",
+      "db lookup projects nested document fields",
+      "db bulk ingest keeps direct writes visible before graph batch",
+      "db transaction committed transform appends derived replay from final value",
+      "db restore snapshot recreates text sparse and graph indexes for durable lsm primary backend"
+    ],
+    "database_integration_named_case_count": 14,
+    "vector_payload_checks_passed": 69,
+    "total_local_checks_passed": 165,
+    "replay_and_database_skips": 0,
+    "replay_and_database_leaks": 0,
+    "expanded_runner_smoke_documents": 1000,
+    "expanded_runner_smoke_index_kinds": [
+      "full_text",
+      "algebraic"
+    ]
+  }
 }

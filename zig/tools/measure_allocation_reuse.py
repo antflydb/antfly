@@ -28,6 +28,7 @@ def main():
     parser.add_argument('--dimensions', type=int, default=1536)
     parser.add_argument('--samples', type=int, default=7)
     parser.add_argument('--vector-samples', type=int, default=3)
+    parser.add_argument('--index-kinds', nargs='+', choices=['full_text', 'algebraic'], default=['full_text', 'algebraic'])
     args = parser.parse_args()
     if min(args.documents, args.dimensions, args.samples, args.vector_samples) <= 0:
         parser.error('counts and sample sizes must be positive')
@@ -46,18 +47,19 @@ def main():
     def save():
         (args.output / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
 
-    for records in [1, 128]:
-        for budgeted in [False, True]:
-            for batch in [256, 1024]:
-                for pair in range(args.samples):
-                    for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
-                        label = f'replay-{records}-{budgeted}-{batch}-{pair}-{variant}'
-                        lines = run(label, [binaries[variant] / 'replay-allocation-bench', args.documents,
-                                           batch, 1, 'budgeted' if budgeted else 'unbudgeted', records], env)
-                        data = json.loads(next(x for x in lines if x.startswith('{')))
-                        results.append(dict(workload='replay', variant=variant, pair=pair, **data))
-                        print(label, data['elapsed_ns'], flush=True)
-                        save()
+    for kind in args.index_kinds:
+        for records in [1, 128]:
+            for budgeted in [False, True]:
+                for batch in [256, 1024]:
+                    for pair in range(args.samples):
+                        for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
+                            label = f'replay-{kind}-{records}-{budgeted}-{batch}-{pair}-{variant}'
+                            lines = run(label, [binaries[variant] / 'replay-allocation-bench', args.documents,
+                                               batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind], env)
+                            data = json.loads(next(x for x in lines if x.startswith('{')))
+                            results.append(dict(workload='replay', variant=variant, pair=pair, **data))
+                            print(label, data['elapsed_ns'], flush=True)
+                            save()
     for mode in ['counted', 'timing']:
         child_env = env.copy()
         if mode == 'counted':
@@ -82,12 +84,12 @@ def main():
                     save()
     summary = {}
     for workload in ['replay', 'vector']:
-        groups = sorted({(x.get('documents_per_record', 1), x.get('batch', 0),
+        groups = sorted({(x.get('index_kind', 'none'), x.get('documents_per_record', 1), x.get('batch', 0),
                           x.get('measurement', 'budgeted' if x.get('budgeted') else 'unbudgeted'))
                          for x in results if x['workload'] == workload})
-        for records, batch, mode in groups:
+        for kind, records, batch, mode in groups:
             group = {v: [x for x in results if x['workload'] == workload and x['variant'] == v
-                         and x.get('documents_per_record', 1) == records and x.get('batch', 0) == batch
+                         and x.get('index_kind', 'none') == kind and x.get('documents_per_record', 1) == records and x.get('batch', 0) == batch
                          and x.get('measurement', 'budgeted' if x.get('budgeted') else 'unbudgeted') == mode]
                      for v in binaries}
             fields = ['elapsed_ns', 'allocations', 'allocated_bytes', 'peak_live_bytes'] if workload == 'replay' else [
@@ -101,7 +103,7 @@ def main():
                             next(x[field] for x in group['baseline'] if x['pair'] == pair) - 1)
                       for pair in range(len(group['baseline']))]
             stats['paired_elapsed_change_percent_median'] = statistics.median(ratios)
-            summary[f'{workload}-{records}-{batch}-{mode}'] = stats
+            summary[f'{workload}-{kind}-{records}-{batch}-{mode}'] = stats
     (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     print(json.dumps(summary, indent=2))
 

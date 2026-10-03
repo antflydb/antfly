@@ -32,6 +32,12 @@ pub fn main(init: std.process.Init) !void {
     const samples = if (args.len > 3) try std.fmt.parseInt(usize, args[3], 10) else 7;
     const budgeted = args.len > 4 and std.mem.eql(u8, args[4], "budgeted");
     const documents_per_record = if (args.len > 5) try std.fmt.parseInt(usize, args[5], 10) else 1;
+    const kind: @FieldType(indexes.ManagedIndexRef, "kind") = if (args.len > 6)
+        std.meta.stringToEnum(@FieldType(indexes.ManagedIndexRef, "kind"), args[6]) orelse return error.InvalidIndexKind
+    else
+        .full_text;
+    if (kind != .full_text and kind != .algebraic) return error.UnsupportedBenchmarkIndexKind;
+    const index: indexes.ManagedIndexRef = .{ .name = "title_body", .kind = kind };
     if (batch == 0 or documents_per_record == 0) return error.InvalidBatch;
     const setup = std.heap.c_allocator;
     var log = try journal.Journal.open("allocation-benchmark-memory", .{
@@ -52,7 +58,7 @@ pub fn main(init: std.process.Init) !void {
             initialized += 1;
         }
         sequence += 1;
-        const encoded = try journal.encodeRecord(setup, .{ .sequence = sequence, .changed_doc_keys = keys, .target_hints = &.{.full_text} });
+        const encoded = try journal.encodeRecord(setup, .{ .sequence = sequence, .changed_doc_keys = keys, .target_hints = &.{worker.targetHintForManagedIndex(index)} });
         defer setup.free(encoded);
         _ = try log.appendOpaque(encoded);
         offset = end;
@@ -63,7 +69,7 @@ pub fn main(init: std.process.Init) !void {
         var manager = resources.ResourceManager.init(.{});
         defer manager.deinit(setup);
         const started = time.monotonicNs();
-        const stats = try worker.catchUpIndexWithOptions(counter.allocator(), source.Source.fromJournal(&log), .{ .name = "title_body", .kind = .full_text }, 0, &consumer, Consumer.apply, .{
+        const stats = try worker.catchUpIndexWithOptions(counter.allocator(), source.Source.fromJournal(&log), index, 0, &consumer, Consumer.apply, .{
             .resource_manager = if (budgeted) &manager else null,
             .max_records_per_window = batch,
             .max_items_per_window = batch,
@@ -71,8 +77,8 @@ pub fn main(init: std.process.Init) !void {
         const elapsed = time.monotonicNs() - started;
         if (manager.snapshot().memory.used_bytes != 0) return error.LeakedReservation;
         if (consumer.count != count or counter.live != 0) return error.InvalidReplayOrLeakedMemory;
-        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
-            sample, count, batch, budgeted, documents_per_record, elapsed, counter.calls, counter.bytes, counter.peak, consumer.checksum, stats.applied_entries,
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"index_kind\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
+            sample, count, batch, budgeted, documents_per_record, @tagName(kind), elapsed, counter.calls, counter.bytes, counter.peak, consumer.checksum, stats.applied_entries,
         });
     }
 }

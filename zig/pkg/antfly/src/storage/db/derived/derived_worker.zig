@@ -1715,33 +1715,44 @@ test "catchUpIndex batches resolution artifact graph journal records before appl
     try std.testing.expectEqualStrings(artifact_key, capture.last_batch.?.changed_artifact_keys[0]);
 }
 
-test "replay batch borrows shared targets and clones retain independent ownership" {
+test "replay batch borrows shared text and algebraic targets and clones own their data" {
     const alloc = std.testing.allocator;
-    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, null, 0);
-    var clone: derived_types.DerivedBatch = undefined;
-    {
-        defer builder.deinit();
-        try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b", "c" }, .deleted_doc_keys = &.{"deleted"} });
-        const batch = try builder.finishBorrowed(1);
-        try std.testing.expectEqual(batch.documents[0].targets.ptr, batch.documents[1].targets.ptr);
-        try std.testing.expectEqual(builder.index_ref.name.ptr, batch.documents[0].targets[0].index_name.ptr);
-        clone = try derived_types.cloneBatch(alloc, batch);
+    for ([_]db_types.IndexKind{ .full_text, .algebraic, .dense_vector, .sparse_vector, .graph }) |kind| {
+        var builder = ReplayChunkBuilder.init(alloc, .{ .name = "projection", .kind = kind }, null, 0);
+        var clone: derived_types.DerivedBatch = undefined;
+        {
+            defer builder.deinit();
+            try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b", "c" }, .deleted_doc_keys = &.{"deleted"}, .overwritten_doc_keys = &.{"overwritten"} });
+            const batch = try builder.finishBorrowed(1);
+            const document_count: usize = if (kind == .graph) 0 else 3;
+            try std.testing.expectEqual(document_count, batch.documents.len);
+            if (kind == .full_text or kind == .algebraic) {
+                try std.testing.expectEqual(batch.documents[0].targets.ptr, batch.documents[1].targets.ptr);
+                try std.testing.expectEqual(builder.index_ref.name.ptr, batch.documents[0].targets[0].index_name.ptr);
+                try std.testing.expectEqual(if (kind == .full_text) derived_types.DerivedTarget.full_text else derived_types.DerivedTarget.algebraic, batch.documents[0].targets[0].kind);
+            } else {
+                for (batch.documents) |doc| try std.testing.expectEqual(@as(usize, 0), doc.targets.len);
+            }
+            clone = try derived_types.cloneBatch(alloc, batch);
+        }
+        defer derived_types.deinitDerivedBatch(alloc, &clone);
+        if (kind != .graph) try std.testing.expectEqualStrings("c", clone.documents[2].key);
+        if (kind == .full_text or kind == .algebraic) try std.testing.expectEqualStrings("projection", clone.documents[2].targets[0].index_name);
+        try std.testing.expectEqualStrings("deleted", clone.deleted_keys[0]);
+        try std.testing.expectEqual(@as(usize, if (kind == .graph) 0 else 1), clone.overwritten_doc_keys.len);
     }
-    defer derived_types.deinitDerivedBatch(alloc, &clone);
-    try std.testing.expectEqualStrings("c", clone.documents[2].key);
-    try std.testing.expectEqualStrings("text", clone.documents[2].targets[0].index_name);
-    try std.testing.expectEqualStrings("deleted", clone.deleted_keys[0]);
 }
 
-fn replayBatchAllocationFailure(alloc: Allocator) !void {
-    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, null, 0);
+fn replayBatchAllocationFailure(alloc: Allocator, kind: db_types.IndexKind) !void {
+    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "projection", .kind = kind }, null, 0);
     defer builder.deinit();
     try builder.appendRecord(.{ .changed_doc_keys = &.{ "a", "b", "c" }, .deleted_doc_keys = &.{"deleted"} });
     _ = try builder.finishBorrowed(1);
 }
 
 test "replay batch cleans up every allocation failure before borrowed publication" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, replayBatchAllocationFailure, .{});
+    for ([_]db_types.IndexKind{ .full_text, .algebraic, .dense_vector, .sparse_vector, .graph }) |kind|
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, replayBatchAllocationFailure, .{kind});
 }
 
 test "replay batch budget denial rolls back key ownership" {

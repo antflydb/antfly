@@ -162,7 +162,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_allocation_tests = b.addTest(.{
         .root_module = replay_allocation_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "catchUpIndex", "coalesced replay", "replay batch", "change journal borrowed binary scratch" },
+        .filters = &.{ "storage.db.derived.", "replay batcher", "dense replay preserves", "sparse replay preserves" },
     });
     b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
         .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
@@ -5544,6 +5544,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     // Reuse the same storage compilation for full VOPR qualification.
     const run_index_maintenance_vopr = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_integration_tests, &.{"index maintenance VOPR "});
     vopr_test_step.dependOn(&run_index_maintenance_vopr.step);
+
+    const replay_document_integration_filters = [_][]const u8{
+        "db reopens persisted index catalog and text index",
+        "db derived text replay admits natural segments below hard segment limit",
+        "db managed full text admission replays transitive artifact producers",
+        "db full text repair page replay is idempotent without compaction",
+        "db algebraic bulk ingest survives reopen with durable lsm primary backend",
+        "db managed algebraic admission builds and reopens an isolated generation",
+        "db algebraic generation build yields and resumes from its durable source cursor",
+        "db graph index reloads on reopen for neighbor queries with durable lsm primary backend",
+        "db enrichment graph ttl replay honors source tombstone",
+        "db document deletion retires graph source contender and due entry",
+        "db bulk ingest keeps direct writes visible before graph batch",
+        "db transaction committed transform appends derived replay from final value",
+        "db lookup projects nested document fields",
+        "db restore snapshot recreates text sparse and graph indexes for durable lsm primary backend",
+    };
+    const replay_document_integration_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &replay_document_integration_filters,
+        .max_rss = 8 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("replay-document-integration-test", "Verify replay consumers across text, algebraic, graph and document bodies")
+        .dependOn(&b.addRunArtifact(replay_document_integration_tests).step);
 
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const relational_index_lifecycle_tests = b.addTest(.{
