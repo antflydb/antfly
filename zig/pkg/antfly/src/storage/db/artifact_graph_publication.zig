@@ -50,8 +50,8 @@ pub fn prepare(alloc: std.mem.Allocator, command: publication.Command, catalogs:
             const source = identity.source_node orelse identity.doc_key;
             if (mutation.value) |value| {
                 const edge = codec.decodeGraphEdgeAlloc(owned, value) catch |err| return authoredOutputError(err);
-                try writes.append(owned, .{ .index_name = identity.index_name, .source = source, .target = identity.target_doc_key, .edge_type = identity.edge_type, .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at, .metadata_json = edge.metadata_json, .owner = identity.doc_key });
-            } else try deletes.append(owned, .{ .index_name = identity.index_name, .source = source, .target = identity.target_doc_key, .edge_type = identity.edge_type, .owner = identity.doc_key });
+                try writes.append(owned, .{ .index_name = identity.index_name, .source = source, .target = identity.target_doc_key, .edge_type = identity.edge_type, .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at, .metadata_json = edge.metadata_json, .edge_id = identity.edge_id, .owner_document = if (identity.edge_id.len != 0) identity.doc_key else "", .owner = if (identity.edge_id.len == 0) identity.doc_key else "" });
+            } else try deletes.append(owned, .{ .index_name = identity.index_name, .source = source, .target = identity.target_doc_key, .edge_type = identity.edge_type, .edge_id = identity.edge_id, .owner_document = if (identity.edge_id.len != 0) identity.doc_key else "", .owner = if (identity.edge_id.len == 0) identity.doc_key else "" });
         }
     }
     var coverage: std.ArrayList(publication.Coverage) = .empty;
@@ -126,6 +126,71 @@ test "ordered artifact inventory graph publication validates guards generations 
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 1), result.batch.graph_writes.len);
         try std.testing.expectEqualStrings("owner", result.batch.graph_writes[0].owner);
+        try std.testing.expectEqualStrings("entity", result.batch.graph_writes[0].source);
+        try std.testing.expect(result.coverage[0].outcome.? == .produced);
+    }
+    const guards = command.mutation_preconditions;
+    command.mutation_preconditions = guards[0..1];
+    try std.testing.expectError(error.InvalidBatchRequest, prepare(alloc, command, catalogs));
+    command.mutation_preconditions = guards;
+    command.producer_generation = 8;
+    try std.testing.expectError(error.EnrichmentSourceChanged, prepare(alloc, command, catalogs));
+    command.producer_generation = 7;
+    command.producer_artifact_name = "foreign";
+    try std.testing.expectError(error.InvalidBatchRequest, prepare(alloc, command, catalogs));
+    command.producer_artifact_name = "relations";
+    var malformed_effects = [_]publication.Mutation{ command.mutations[0], command.mutations[1] };
+    malformed_effects[0].value = "invalid edge bytes";
+    command.mutations = &malformed_effects;
+    try std.testing.expectError(error.InvalidBatchRequest, prepare(alloc, command, catalogs));
+    malformed_effects[0].value = edge;
+    const stale_count = try contenders.encodeVisibleCount(8, 1);
+    malformed_effects[1].value = &stale_count;
+    try std.testing.expectError(error.InvalidBatchRequest, prepare(alloc, command, catalogs));
+}
+
+test "ordered artifact inventory graph publication preserves explicit identities through guards and replay" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqual(error.InvalidBatchRequest, authoredOutputError(error.ResourceLimitExceeded));
+    try std.testing.expectEqual(error.OutOfMemory, authoredOutputError(error.OutOfMemory));
+    try std.testing.expectEqual(error.ResourceBudgetExceeded, authoredOutputError(error.ResourceBudgetExceeded));
+    const config = "{\"source\":{\"artifact\":\"relations\"}}";
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(alloc);
+    try bytes.appendSlice(alloc, "AIDX\x02\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00g\x03");
+    var size: [4]u8 = undefined;
+    std.mem.writeInt(u32, &size, config.len, .little);
+    try bytes.appendSlice(alloc, &size);
+    try bytes.appendSlice(alloc, config);
+    try bytes.appendSlice(alloc, "\x07\x00\x00\x00\x00\x00\x00\x00");
+    const catalogs: inventory.Catalogs = .{ .indexes = bytes.items };
+    const edge_key = try keys.graphRelationshipArtifactKeyAlloc(alloc, "owner", "g", "links", "target", "entity", "fact-id");
+    defer alloc.free(edge_key);
+    const edge = try codec.encodeGraphEdgeAlloc(alloc, null, 7, 0.5, 1, 2, "{}");
+    defer alloc.free(edge);
+    const count_key = try keys.graphEdgeContenderCountKeyAlloc(alloc, "owner", "g");
+    defer alloc.free(count_key);
+    const count = try contenders.encodeVisibleCount(7, 1);
+    var command: publication.Command = .{
+        .producer_kind = .graph,
+        .namespace = @splat(1),
+        .authority_epoch = 1,
+        .catalog_digest = catalogs.digest(),
+        .producer_name = "g",
+        .producer_generation = 7,
+        .producer_artifact_name = "relations",
+        .sources = &.{.{ .document_key = "owner", .content_digest = @splat(3), .timestamp = 1, .input_position = null }},
+        .mutation_preconditions = &.{ .{ .key = edge_key, .content_digest = null, .input_position = null, .source_index = 0 }, .{ .key = count_key, .content_digest = null, .input_position = null, .source_index = 0 } },
+        .mutations = &.{ .{ .family = .graph, .key = edge_key, .value = edge, .source_index = 0 }, .{ .family = .graph, .key = count_key, .value = &count, .source_index = 0 } },
+        .publication_digest = @splat(0),
+    };
+    {
+        var result = try prepare(alloc, command, catalogs);
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.batch.graph_writes.len);
+        try std.testing.expectEqualStrings("", result.batch.graph_writes[0].owner);
+        try std.testing.expectEqualStrings("owner", result.batch.graph_writes[0].owner_document);
+        try std.testing.expectEqualStrings("fact-id", result.batch.graph_writes[0].edge_id);
         try std.testing.expectEqualStrings("entity", result.batch.graph_writes[0].source);
         try std.testing.expect(result.coverage[0].outcome.? == .produced);
     }

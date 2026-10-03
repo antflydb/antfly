@@ -16,7 +16,11 @@ parser.add_argument("--warmup", type=int, default=3)
 parser.add_argument("--reps", type=int, default=20)
 parser.add_argument("--threads", type=int, default=2)
 args = parser.parse_args()
-if not 1 <= args.threads <= 8 or not 3 <= args.reps <= 1000 or not 0 <= args.warmup <= 100:
+if (
+    not 1 <= args.threads <= 8
+    or not 3 <= args.reps <= 1000
+    or not 0 <= args.warmup <= 100
+):
     parser.error("threads must be 1..8, reps 3..1000, warmup 0..100")
 weight = args.model_dir / "model.safetensors"
 if weight.stat().st_size != 1_945_828_140:

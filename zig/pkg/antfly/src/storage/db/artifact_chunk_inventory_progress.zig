@@ -232,7 +232,7 @@ pub fn collectObsoletePage(alloc: std.mem.Allocator, store: anytype, root: u128)
 
 test "ordered artifact inventory reconstruction orders bounded pages and resumes after restart" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ordered-inventory", .{tmp.sub_path});

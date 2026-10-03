@@ -7020,6 +7020,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return residentTrainingPrimitiveOp(ctx, &.{ .snapshot = .{ .input = input, .shape = shape } }, .{}, null);
     }
 
+    /// A fresh row-major copy of `input` with its last two axes swapped.
+    fn residentTransposeLastTwo(self: *MetalCompute, input: MetalTensor, shape: @import("ml").graph.Shape) !MetalTensor {
+        const rank = shape.rank_;
+        if (rank < 2) return error.UnsupportedResidentProgramInstruction;
+        var output = shape;
+        output.dims[rank - 2] = shape.dims[rank - 1];
+        output.dims[rank - 1] = shape.dims[rank - 2];
+        var map = ops.resident_program.Affine{ .rank = rank };
+        var input_strides: [8]u32 = undefined;
+        var input_stride: u32 = 1;
+        var output_stride: u32 = 1;
+        var axis = rank;
+        while (axis > 0) {
+            axis -= 1;
+            input_strides[axis] = input_stride;
+            map.output_strides[axis] = output_stride;
+            input_stride *= @intCast(shape.dims[axis]);
+            output_stride *= @intCast(output.dims[axis]);
+        }
+        for (0..rank) |i| map.input_strides[i] = input_strides[i];
+        map.input_strides[rank - 2] = input_strides[rank - 1];
+        map.input_strides[rank - 1] = input_strides[rank - 2];
+        return self.residentProgramAffine(input, output, map);
+    }
+
     fn residentProgramAffine(self: *MetalCompute, input: MetalTensor, output_shape: @import("ml").graph.Shape, map: ops.resident_program.Affine) !MetalTensor {
         var dimensions: [8]i32 = undefined;
         for (output_shape.dims[0..output_shape.rank_], 0..) |dim, axis| dimensions[axis] = @intCast(dim);
@@ -7172,14 +7197,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 // The device kernels read the left operand as [rows, contracting]
                 // and take the right operand's contracting axis: 0 for
                 // [contracting, columns], 1 for [columns, contracting]. A
-                // transposed left operand has no kernel; never run it as if it
-                // were untransposed.
-                if (dot.lhs_transposed) return error.UnsupportedResidentProgramInstruction;
+                // transposed left operand ([contracting, rows], which autodiff
+                // emits for weight gradients) is transposed on the device
+                // first; it is never run as if it were untransposed.
+                var transposed: ?MetalTensor = null;
+                defer if (transposed) |*value| value.deinit();
+                if (dot.lhs_transposed) transposed = try self.residentTransposeLastTwo(tensors[0], instruction.inputs[0]);
+                const lhs = transposed orelse tensors[0];
                 const rhs_contract_axis: u32 = if (dot.rhs_transposed) 1 else 0;
                 const output = if (instruction.inputs[0].rank_ == 2)
-                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, tensors[0], tensors[1], dot.rows, dot.columns, dot.contracting, rhs_contract_axis)
+                    try metal_runtime.decoderRuntimeDotGeneral2DF32Device(self.provider_impl, lhs, tensors[1], dot.rows, dot.columns, dot.contracting, rhs_contract_axis)
                 else
-                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, tensors[0], tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, rhs_contract_axis, shape);
+                    try metal_runtime.decoderRuntimeDotGeneralBatchedF32Device(self.provider_impl, lhs, tensors[1], dot.batch, dot.rows, dot.columns, dot.contracting, rhs_contract_axis, shape);
                 break :blk output orelse return error.UnsupportedResidentProgramInstruction;
             },
             else => return error.UnsupportedResidentProgramInstruction,
@@ -14090,6 +14119,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, output, true, &shape);
     }
 
+    /// Model storage, whose address and contents stay fixed for the
+    /// session; identity-keyed device caches may retain a copy of it.
+    fn immutableTable(buf: *const Buf) bool {
+        return !buf.mutable_state and (buf.weight_handle_name != null or buf.lazy_entry != null or buf.boundary_immutable_f32);
+    }
+
     fn embeddingLookupOp(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const weight_buf = toBuf(weight);
@@ -14104,13 +14139,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (quantized_storage == null and weight_buf.native_dense_bytes == null and !disableRuntimeEmbeddingLookup()) {
             var weight_mt = try self.ownedMetalTensorFromCt(weight);
             defer weight_mt.deinit();
-            if (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
-                .weight = weight_mt,
-                .ids = ids,
-                .total = total,
-                .dim = dim,
-            })) |tensor| {
-                return self.ctFromOwnedMetalTensor(tensor);
+            // A host-visible table is cached on the device keyed by its host
+            // address, which only model storage keeps stable; an activation's
+            // address is reused by a later table of the same size.
+            if (weight_mt.isDevice() or immutableTable(weight_buf)) {
+                if (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
+                    .weight = weight_mt,
+                    .ids = ids,
+                    .total = total,
+                    .dim = dim,
+                })) |tensor| {
+                    return self.ctFromOwnedMetalTensor(tensor);
+                }
             }
         }
         if (quantized_storage) |storage| {
@@ -23346,6 +23386,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return lookupWeight(ctx, name, false);
     }
 
+    // Gemma 4 PLE lookups go through ComputeBackend.getEmbeddingWeight, not
+    // getWeight/acquireWeight. Metal's lookupWeight has no CPU-only "prepare
+    // the matrix" distinction (that's native_compute's acquireWeight vs.
+    // getEmbeddingWeight split), so an un-shared acquire is the right
+    // behavior here. Without this override the base native_compute vtable's
+    // getEmbeddingWeight stays wired in and reinterprets this MetalCompute
+    // ctx as a *NativeCompute, corrupting the weight-store pointer and
+    // segfaulting.
+    fn getEmbeddingWeightOp(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        return lookupWeight(ctx, name, false);
+    }
+
     fn lookupWeight(ctx: *anyopaque, name: []const u8, shared: bool) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
 
@@ -30647,6 +30699,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.freeTensor = freeOp;
         vt.getWeight = getWeightOp;
         vt.acquireWeight = acquireWeightOp;
+        vt.getEmbeddingWeight = getEmbeddingWeightOp;
         vt.prefetchWeightHint = prefetchWeightHintOp;
         vt.drainPrefetchBudget = drainPrefetchBudgetOp;
         vt.fromFloat32 = fromFloat32Op;
@@ -39652,4 +39705,43 @@ test "metal_compute: integer CumSum matches native for batched strided scans" {
         try std.testing.expectEqual(.i32, actual_bytes.dtype);
         try std.testing.expectEqualSlices(u8, expected_bytes.payload.bytes, actual_bytes.payload.bytes);
     };
+}
+
+test "metal_compute: embedding lookup reads a recycled activation table's current contents" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+
+    // Activations come from pooled buffers, so a later table of the same
+    // shape can land in the buffer an earlier lookup read from. Every lookup
+    // must see the values written in this iteration.
+    const rows = 60;
+    const dim = 64;
+    const values = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(values);
+    const ids = [_]i64{ 0, 7, 59 };
+    for (0..32) |iteration| {
+        for (values, 0..) |*value, i| value.* = @floatFromInt(iteration * 1000 + i / dim);
+        const uploaded = try cb.fromFloat32Shape(values, &.{ rows, dim });
+        defer cb.free(uploaded);
+        const table = try cb.add(uploaded, uploaded);
+        defer cb.free(table);
+        const gathered = try cb.embeddingLookup(table, &ids, ids.len, dim);
+        defer cb.free(gathered);
+        const host = try cb.toFloat32(gathered, allocator);
+        defer allocator.free(host);
+        for (ids, 0..) |id, row| {
+            const expected: f32 = @floatFromInt(2 * (iteration * 1000 + @as(usize, @intCast(id))));
+            for (host[row * dim ..][0..dim]) |got| try std.testing.expectEqual(expected, got);
+        }
+    }
 }

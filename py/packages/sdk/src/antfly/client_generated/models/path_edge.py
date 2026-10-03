@@ -19,6 +19,10 @@ T = TypeVar("T", bound="PathEdge")
 class PathEdge:
     """
     Attributes:
+        edge_id (str | Unset): Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this
+            graph index, owning document, and endpoint/type tuple.
+        owner_document (str | Unset): Owning fact document key in the graph index table when it differs from the logical
+            source. The document is the authority for replay and deletion.
         source (str | Unset):
         target (str | Unset):
         type_ (str | Unset):
@@ -26,6 +30,8 @@ class PathEdge:
         metadata (PathEdgeMetadata | Unset):
     """
 
+    edge_id: str | Unset = UNSET
+    owner_document: str | Unset = UNSET
     source: str | Unset = UNSET
     target: str | Unset = UNSET
     type_: str | Unset = UNSET
@@ -34,6 +40,10 @@ class PathEdge:
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
+        edge_id = self.edge_id
+
+        owner_document = self.owner_document
+
         source = self.source
 
         target = self.target
@@ -49,6 +59,10 @@ class PathEdge:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if edge_id is not UNSET:
+            field_dict["edge_id"] = edge_id
+        if owner_document is not UNSET:
+            field_dict["owner_document"] = owner_document
         if source is not UNSET:
             field_dict["source"] = source
         if target is not UNSET:
@@ -67,6 +81,10 @@ class PathEdge:
         from ..models.path_edge_metadata import PathEdgeMetadata
 
         d = dict(src_dict)
+        edge_id = d.pop("edge_id", UNSET)
+
+        owner_document = d.pop("owner_document", UNSET)
+
         source = d.pop("source", UNSET)
 
         target = d.pop("target", UNSET)
@@ -83,6 +101,8 @@ class PathEdge:
             metadata = PathEdgeMetadata.from_dict(_metadata)
 
         path_edge = cls(
+            edge_id=edge_id,
+            owner_document=owner_document,
             source=source,
             target=target,
             type_=type_,

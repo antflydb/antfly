@@ -81,7 +81,7 @@ pub fn parseDenseEmbeddingAlloc(
             };
         },
         .string => .{
-            .vector = try vector_codec.decodePackedF32Base64Alloc(alloc, value.string),
+            .vector = try decodePackedF32Alloc(alloc, value.string),
             .k = default_k,
         },
         else => error.UnsupportedQueryRequest,
@@ -102,7 +102,8 @@ pub fn parseSparseEmbeddingAlloc(
     const indices = if (packed_indices != null or packed_values != null) blk: {
         if (packed_indices == null or packed_values == null) return error.InvalidQueryRequest;
         if (packed_indices.? != .string or packed_values.? != .string) return error.InvalidQueryRequest;
-        break :blk vector_codec.decodePackedU32Base64Alloc(alloc, packed_indices.?.string) catch return error.InvalidQueryRequest;
+        break :blk vector_codec.decodePackedU32Base64Alloc(alloc, packed_indices.?.string) catch |err|
+            return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
     } else blk: {
         if (indices_val == null or values_val == null) return error.InvalidQueryRequest;
         if (indices_val.? != .array or values_val.? != .array) return error.InvalidQueryRequest;
@@ -111,15 +112,14 @@ pub fn parseSparseEmbeddingAlloc(
         const out = try alloc.alloc(u32, indices_val.?.array.items.len);
         errdefer alloc.free(out);
         for (indices_val.?.array.items, 0..) |item, i| {
-            if (item != .integer) return error.InvalidQueryRequest;
-            out[i] = @intCast(item.integer);
+            out[i] = try jsonNumberToU32(item);
         }
         break :blk out;
     };
     errdefer alloc.free(indices);
 
     const values = if (packed_indices != null or packed_values != null)
-        vector_codec.decodePackedF32Base64Alloc(alloc, packed_values.?.string) catch return error.InvalidQueryRequest
+        try decodePackedF32Alloc(alloc, packed_values.?.string)
     else blk: {
         const out = try alloc.alloc(f32, values_val.?.array.items.len);
         errdefer alloc.free(out);
@@ -127,20 +127,48 @@ pub fn parseSparseEmbeddingAlloc(
         break :blk out;
     };
     errdefer alloc.free(values);
+    if (indices.len != values.len) return error.InvalidQueryRequest;
 
     return .{
         .indices = indices,
         .values = values,
-        .k = if (value.object.get("k")) |k| @intCast(k.integer) else default_k,
+        .k = if (value.object.get("k")) |k| try jsonNumberToU32(k) else default_k,
     };
 }
 
 fn jsonNumberToF32(value: std.json.Value) !f32 {
-    return switch (value) {
+    const number: f32 = switch (value) {
         .float => @floatCast(value.float),
         .integer => @floatFromInt(value.integer),
-        else => error.InvalidQueryRequest,
+        .number_string => |raw| std.fmt.parseFloat(f32, raw) catch return error.InvalidQueryRequest,
+        else => return error.InvalidQueryRequest,
     };
+    if (!std.math.isFinite(number)) return error.InvalidQueryRequest;
+    return number;
+}
+
+fn jsonNumberToU32(value: std.json.Value) !u32 {
+    // Lossless JSON parsing preserves numeric tokens so relationship predicates
+    // retain their precision. Convert only at the embedding's typed boundary,
+    // without allocating or materializing another JSON tree. Indices and k
+    // retain their integer-only contract in either parsing mode.
+    return switch (value) {
+        .integer => |number| std.math.cast(u32, number) orelse error.InvalidQueryRequest,
+        .number_string => |raw| std.fmt.parseUnsigned(u32, raw, 10) catch return error.InvalidQueryRequest,
+        else => return error.InvalidQueryRequest,
+    };
+}
+
+pub fn decodePackedF32Alloc(alloc: std.mem.Allocator, encoded: []const u8) ![]f32 {
+    const values = vector_codec.decodePackedF32Base64Alloc(alloc, encoded) catch |err|
+        return if (err == error.OutOfMemory) err else error.InvalidQueryRequest;
+    errdefer alloc.free(values);
+    try validateF32Values(values);
+    return values;
+}
+
+pub fn validateF32Values(values: []const f32) !void {
+    for (values) |number| if (!std.math.isFinite(number)) return error.InvalidQueryRequest;
 }
 
 test "parse dense embedding array" {
@@ -193,4 +221,57 @@ test "parse packed sparse embedding object" {
     try std.testing.expectEqual(@as(u32, 5), parsed.sparse.indices[1]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), parsed.sparse.values[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), parsed.sparse.values[1], 0.0001);
+}
+
+test "embedding numeric representations preserve values and unsigned bounds" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |parse_numbers| {
+        var dense_json = try std.json.parseFromSlice(std.json.Value, alloc, "[1,2.5,1e-3]", .{ .parse_numbers = parse_numbers });
+        defer dense_json.deinit();
+        var dense = try parseEmbeddingValueAlloc(alloc, dense_json.value, 7);
+        defer dense.deinit(alloc);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2.5, 0.001 }, dense.dense.vector);
+
+        var sparse_json = try std.json.parseFromSlice(std.json.Value, alloc, "{\"indices\":[0,4294967295],\"values\":[1e-3,2.5],\"k\":4294967295}", .{ .parse_numbers = parse_numbers });
+        defer sparse_json.deinit();
+        var sparse = try parseEmbeddingValueAlloc(alloc, sparse_json.value, 7);
+        defer sparse.deinit(alloc);
+        try std.testing.expectEqualSlices(u32, &.{ 0, std.math.maxInt(u32) }, sparse.sparse.indices);
+        try std.testing.expectEqualSlices(f32, &.{ 0.001, 2.5 }, sparse.sparse.values);
+        try std.testing.expectEqual(std.math.maxInt(u32), sparse.sparse.k);
+
+        var packed_json = try std.json.parseFromSlice(std.json.Value, alloc, "{\"packed_indices\":\"AQAAAAUAAAA=\",\"packed_values\":\"AAAAPwAAQD8=\",\"k\":0}", .{ .parse_numbers = parse_numbers });
+        defer packed_json.deinit();
+        var decoded = try parseEmbeddingValueAlloc(alloc, packed_json.value, 7);
+        defer decoded.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 0), decoded.sparse.k);
+    }
+}
+
+test "embedding numeric validation rejects malformed values without trapping or leaking" {
+    const alloc = std.testing.allocator;
+    for ([_]bool{ true, false }) |parse_numbers| {
+        for ([_][]const u8{
+            "[1e100]",
+            "[\"1\"]",
+            "{\"indices\":[-1],\"values\":[1]}",
+            "{\"indices\":[-0],\"values\":[1]}",
+            "{\"indices\":[4294967296],\"values\":[1]}",
+            "{\"indices\":[1.5],\"values\":[1]}",
+            "{\"indices\":[1],\"values\":[1e100]}",
+            "{\"indices\":[1],\"values\":[1],\"k\":-1}",
+            "{\"indices\":[1],\"values\":[1],\"k\":4294967296}",
+            "{\"indices\":[1],\"values\":[1],\"k\":1.5}",
+            "{\"indices\":[1],\"values\":[1],\"k\":\"1\"}",
+            "{\"indices\":[1],\"values\":[1],\"k\":null}",
+            "{\"packed_indices\":\"AQAAAAUAAAA=\",\"packed_values\":\"AAAAPw==\"}",
+            "{\"packed_indices\":\"AQAAAA==\",\"packed_values\":\"AACAfw==\"}",
+            "{\"packed_indices\":\"AQAAAA==\",\"packed_values\":\"AAAAPw==\",\"k\":false}",
+            "\"AACAfw==\"",
+        }) |body| {
+            var json = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = parse_numbers });
+            defer json.deinit();
+            try std.testing.expectError(error.InvalidQueryRequest, parseEmbeddingValueAlloc(alloc, json.value, 7));
+        }
+    }
 }

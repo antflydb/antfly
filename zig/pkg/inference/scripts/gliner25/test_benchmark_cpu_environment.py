@@ -19,12 +19,20 @@ class ThreadBudgetTests(unittest.TestCase):
     def test_blas_readiness_accepts_a_separate_native_fallback_budget(self):
         bundle = {"model_id": "model", "revision": "revision", "files": {}}
         ready = {
-            "event": "ready", "arm": "native", "scope": bench.SCOPE,
+            "event": "ready",
+            "arm": "native",
+            "scope": bench.SCOPE,
             "timing_boundary": bench.TIMING_BOUNDARY,
-            "model_id": "model", "revision": "revision", "model_files": {},
-            "dtype": "float32", "threads": 32, "qualification": False,
-            "build_mode": "ReleaseFast", "scheduler": "serial_io",
-            "cases_sha256": "hash", "system_blas": True,
+            "model_id": "model",
+            "revision": "revision",
+            "model_files": {},
+            "dtype": "float32",
+            "threads": 32,
+            "qualification": False,
+            "build_mode": "ReleaseFast",
+            "scheduler": "serial_io",
+            "cases_sha256": "hash",
+            "system_blas": True,
             "effective_cpu_threads": 8,
         }
         with patch.object(bench.oracle, "sha256_file", return_value="hash"):

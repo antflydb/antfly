@@ -152,6 +152,7 @@ fn verifyInventory(alloc: Allocator, io: std.Io, root: []const u8, handle: seal.
 /// Caller holds the DB apply lock. The normal path never exposes prepared
 /// admission to another writer. Restart retries complete this same frozen cut.
 pub fn ensureAssumeApply(db: *DB, scope: ledger.Scope) !void {
+    if (try db.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
     if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
@@ -257,6 +258,7 @@ pub fn publicationCertificateIfPresent(db: *DB, scope: ledger.Scope, cancellatio
 }
 
 pub fn preparePublication(db: *DB, scope: ledger.Scope, cancellation: Cancellation) !snapshot.Certificate {
+    if (try db.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     try cancellation.check();

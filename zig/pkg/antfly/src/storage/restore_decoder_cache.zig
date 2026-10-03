@@ -7,7 +7,7 @@
 //! cursor is durable in the target, never in this disposable cache.
 const std = @import("std");
 const builtin = @import("builtin");
-const DB = @import("db/db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const Namespace = @import("db/doc_identity_namespace.zig").Namespace;
 const Runtime = @import("background_runtime.zig").BackendRuntime;
 const Scheduler = @import("../common/maintenance_scheduler.zig").Scheduler;

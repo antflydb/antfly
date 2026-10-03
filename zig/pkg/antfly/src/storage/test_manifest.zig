@@ -25,6 +25,8 @@ comptime {
     _ = @import("db/durable_outbox.zig");
     _ = @import("db/durable_outbox_store.zig");
     _ = @import("db/primary_effect.zig");
+    _ = @import("db/graph_edge_types.zig");
+    _ = @import("document_mutation_revision.zig");
     _ = @import("db/replication_contract.zig");
     _ = @import("db/replication_ingress.zig");
     _ = @import("db/replication_effects.zig");
@@ -34,6 +36,7 @@ comptime {
     _ = @import("hot_standby/native_topology_receipt_integration_test.zig");
     _ = @import("hot_standby/online_source_integration_test.zig");
     _ = @import("hot_standby/db_integration_test.zig");
+    _ = @import("hot_standby/graph_endpoint_cleanup_test.zig");
     _ = @import("portable_wal.zig");
     _ = @import("relational_index.zig");
     _ = @import("db/relational_index_keys.zig");

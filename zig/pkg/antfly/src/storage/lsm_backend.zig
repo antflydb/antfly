@@ -7793,7 +7793,15 @@ pub const Backend = struct {
         defer self.maintenance_io_budget_remaining = saved_budget;
 
         var flushes: u64 = 0;
-        if (self.activeImmutableMemtableCount() > 0 and try self.flushOldestImmutableMemtable()) {
+        // A direct-bulk-ingest batch queues its already-sorted state as an
+        // immutable memtable so it can be published without a mutable-insert
+        // detour; it is not an ordinary flush candidate. Forcing it through
+        // the normal flush path here would record a spurious flush and
+        // defeat the bulk flush-threshold multiplier the caller configured.
+        // Bulk sessions defer their memtable flush to session finish (see
+        // finishBulkIngestSessionWithOptionsLocked); only the manifest
+        // checkpoint below must not wait for that.
+        if (!self.bulkIngestActive() and self.activeImmutableMemtableCount() > 0 and try self.flushOldestImmutableMemtable()) {
             flushes = 1;
         }
         var manifest_publishes: u64 = 0;
@@ -12144,6 +12152,88 @@ fn implementationTests() type {
             try std.testing.expectEqual(@as(usize, 2500), try countRunEntriesForTest(&backend));
             try std.testing.expectEqualStrings(update, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:00000000"));
             try std.testing.expectEqualStrings(update, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:00000499"));
+        }
+
+        test "bulk append index prefix probes merge pending keys namespaces and disk tombstones" {
+            const alloc = std.testing.allocator;
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1 });
+            defer backend.close();
+            {
+                var initial = try backend.beginBatchWithOptions(.{});
+                defer initial.abort();
+                try initial.put(.{ .name = "docs" }, "p:a", "disk");
+                try initial.put(.{ .name = "docs" }, "p:b", "disk");
+                try initial.put(.{ .name = "other" }, "p:a", "other");
+                try initial.commit();
+            }
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try std.testing.expect(!try txn.hasPrefix(.{}, "p:"));
+            try txn.appendPut(.{}, "bulk:a", "first");
+            try txn.appendPut(.{}, "bulk:a", "last");
+            try std.testing.expect(try txn.hasPrefix(.{}, "bulk:"));
+            try std.testing.expectEqual(@as(usize, 2), txn.bulk_appends.entryCount());
+            try txn.delete(.{ .name = "docs" }, "p:a");
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try txn.delete(.{ .name = "docs" }, "p:b");
+            try std.testing.expect(!try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "other" }, "p:"));
+            try txn.put(.{ .name = "docs" }, "p:c", "new");
+            try std.testing.expect(try txn.hasPrefix(.{ .name = "docs" }, "p:"));
+            try txn.delete(.{}, "bulk:a");
+            try std.testing.expect(!try txn.hasPrefix(.{}, "bulk:"));
+            try txn.commit();
+        }
+
+        test "bulk append index native namespace overlay preserves latest values across drain" {
+            const alloc = std.testing.allocator;
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1, .bulk_ingest_flush_threshold_multiplier = 2 });
+            defer backend.close();
+            var txn = try backend.beginBatchWithOptions(.{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try txn.appendPut(.{}, "a", "old");
+            try txn.appendPut(.{ .name = "docs" }, "a", "namespaced");
+            try txn.appendPut(.{}, "z", "last");
+            try txn.appendPut(.{}, "a", "new");
+            try std.testing.expectEqualStrings("new", try txn.get(.{}, "a"));
+            try std.testing.expectEqualStrings("namespaced", try txn.get(.{ .name = "docs" }, "a"));
+            try std.testing.expectError(error.NotFound, txn.get(.{}, "missing"));
+            var values: [3]?[]const u8 = undefined;
+            try txn.getManySorted(.{}, &.{ "a", "missing", "z" }, &values);
+            try std.testing.expectEqualStrings("new", values[0].?);
+            try std.testing.expect(values[1] == null);
+            try std.testing.expectEqualStrings("last", values[2].?);
+            try txn.delete(.{}, "a");
+            try std.testing.expectError(error.NotFound, txn.get(.{}, "a"));
+            try std.testing.expectEqual(@as(u32, 0), txn.bulk_index.entries.count());
+            try txn.appendPut(.{}, "a", "recreated");
+            try std.testing.expectEqualStrings("recreated", try txn.get(.{}, "a"));
+            try txn.commit();
+            try std.testing.expectEqualStrings("recreated", try backend.getMergedWithMutable(&backend.mutable, .{}, "a"));
+        }
+
+        test "bulk append index native bound overlay preserves latest values across drain" {
+            const alloc = std.testing.allocator;
+            var backend = Backend.init(alloc, .{ .flush_threshold = 1, .bulk_ingest_flush_threshold_multiplier = 2 });
+            defer backend.close();
+            var txn = try runtime_mod.BoundWriteTxn(Backend).openWithOptions(&backend, .{ .name = "docs" }, .{ .mode = .bulk_ingest });
+            defer txn.abort();
+            try txn.appendPut("a", "old");
+            try txn.appendPut("z", "last");
+            try txn.appendPut("a", "new");
+            try std.testing.expectEqualStrings("new", try txn.get("a"));
+            try std.testing.expectError(error.NotFound, txn.get("missing"));
+            var values: [3]?[]const u8 = undefined;
+            try txn.getManySorted(&.{ "a", "missing", "z" }, &values);
+            try std.testing.expectEqualStrings("new", values[0].?);
+            try std.testing.expect(values[1] == null);
+            try std.testing.expectEqualStrings("last", values[2].?);
+            try txn.put("a", "updated");
+            try std.testing.expectEqual(@as(u32, 0), txn.bulk_index.entries.count());
+            try std.testing.expectEqualStrings("updated", try txn.get("a"));
+            try txn.commit();
+            try std.testing.expectEqualStrings("updated", try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "a"));
         }
 
         test "lsm backend runtime erases bound store handles with cursor access across runs" {

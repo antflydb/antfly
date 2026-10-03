@@ -441,7 +441,7 @@ pub const PreparedRetirement = struct {
 
 test "ordered artifact inventory named extraction directory resumes lookup enumeration and metadata-only retirement" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const Guard = struct {
         pub fn validate(_: @This(), _: anytype) !void {}
     };

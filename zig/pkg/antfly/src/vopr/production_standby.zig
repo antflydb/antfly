@@ -276,7 +276,11 @@ fn testProductionOwners(cancel_after_promotion: bool) !void {
     defer tmp.cleanup();
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/standby", .{tmp.sub_path});
     defer alloc.free(root);
-    var vopr_io = try vopr.vopr_io.VoprIo.init(.{ .tasks = .{ .stack_size = 8 * 1024 * 1024 } });
+    // Match the 32 MiB headroom used by the other production-shaped
+    // DataServer VOPR campaigns (data/runtime.zig, vopr/data_server.zig):
+    // 8 MiB overflowed under Debug codegen on the equivalent single-server
+    // Raft-merge campaign.
+    var vopr_io = try vopr.vopr_io.VoprIo.init(.{ .tasks = .{ .stack_size = 32 * 1024 * 1024 } });
     defer vopr_io.deinit();
     var backend = try background.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = vopr_io.io() }, .filesystem_io = vopr_io.io() });
     var backend_live = true;

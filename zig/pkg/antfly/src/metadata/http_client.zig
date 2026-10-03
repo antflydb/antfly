@@ -4513,10 +4513,11 @@ test "store-root enrollment status is a body-bound admin read and preserves abse
     try std.testing.expectError(error.StoreRootEnrollmentChanged, client.readSystemCatalog("http://metadata.invalid", .{ .store_root_enrollment_status = identity }, 25, null));
 }
 
-test "system catalog policy publication status preserves absent stamp without reclassifying other conflicts" {
+test "system catalog policy publication status preserves explicit absence without reclassifying policy conflicts" {
     const alloc = std.testing.allocator;
     const Executor = struct {
         body: []const u8,
+        status: u16 = 409,
         fn execute(ptr: *anyopaque, a: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/system-catalog"));
@@ -4525,13 +4526,24 @@ test "system catalog policy publication status preserves absent stamp without re
                 try std.testing.expect(request.header(@import("../system_catalog/setting_authority.zig").header_name) == null or
                     request.header(@import("../system_catalog/setting_authority.zig").header_name).?.len == 0);
             }
-            return .{ .status = 409, .body = try a.dupe(u8, self.body) };
+            if (self.status != 200) return .{ .status = self.status, .body = try a.dupe(u8, self.body) };
+            const headers = try a.alloc(http_common.Header, 2);
+            errdefer a.free(headers);
+            headers[0] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-group"), .value = try a.dupe(u8, "77") };
+            headers[1] = .{ .name = try a.dupe(u8, "x-antfly-catalog-metadata-incarnation"), .value = try a.dupe(u8, "11111111111111111111111111111111") };
+            return .{ .status = 200, .body = try a.dupe(u8, self.body), .headers = headers };
         }
     };
     var executor = Executor{ .body = "RowPolicyCatalogChanged" };
     var client = MetadataHttpClient.init(alloc, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
     _ = client.withInternalServiceAuth("policy-status-service-secret-0123456789", "policy-status-test");
     try std.testing.expectError(error.RowPolicyCatalogChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
+    executor.status = 200;
+    executor.body = "null";
+    var absent = try client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null);
+    defer absent.deinit(alloc);
+    try std.testing.expectEqualStrings("null", absent.body);
+    executor.status = 409;
     executor.body = "CatalogGenerationChanged";
     try std.testing.expectError(error.CatalogGenerationChanged, client.readSystemCatalog("http://metadata.invalid", .{ .policy_publication_status = 7 }, 25, null));
     executor.body = "RowPolicyCatalogChanged";
