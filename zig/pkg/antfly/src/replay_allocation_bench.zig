@@ -1,10 +1,13 @@
 //! Measures replay construction and decoding with a synchronous validating
-//! consumer. Journal setup is outside the timed/counting region; indexing,
+//! consumer. Memory journal/primary-store setup is outside the timed/counting
+//! region; select the source with positional argument 7 (journal or primary). Indexing,
 //! OpenAI calls and document-body decoding are deliberately excluded.
 const std = @import("std");
 const worker = @import("storage/db/derived/derived_worker.zig");
 const journal = @import("storage/db/derived/change_journal.zig");
 const source = @import("storage/db/derived/replay_source.zig");
+const mem_backend = @import("storage/mem_backend.zig");
+const docstore = @import("storage/docstore.zig");
 const types = @import("storage/db/derived/derived_types.zig");
 const indexes = @import("storage/db/catalog/index_manager.zig");
 const resources = @import("storage/resource_manager.zig");
@@ -37,6 +40,7 @@ pub fn main(init: std.process.Init) !void {
     else
         .full_text;
     if (kind != .full_text and kind != .algebraic) return error.UnsupportedBenchmarkIndexKind;
+    const primary = args.len > 7 and std.mem.eql(u8, args[7], "primary");
     const index: indexes.ManagedIndexRef = .{ .name = "title_body", .kind = kind };
     if (batch == 0 or documents_per_record == 0) return error.InvalidBatch;
     const setup = std.heap.c_allocator;
@@ -45,6 +49,12 @@ pub fn main(init: std.process.Init) !void {
         .lsm_options = .{ .flush_threshold = 512, .compact_threshold_runs = 256, .wal_enabled = false, .obsolete_retention_ns = 0 },
     });
     defer log.close();
+    var backend = mem_backend.Backend.init(setup, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(setup, .{});
+    var store = try docstore.DocStore.openRuntime(setup, runtime_store);
+    defer store.close();
+    const replay_source = if (primary) source.Source.fromPrimaryStore(&store, null, null) else source.Source.fromJournal(&log);
     var offset: usize = 0;
     var sequence: u64 = 0;
     while (offset < count) {
@@ -60,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
         sequence += 1;
         const encoded = try journal.encodeRecord(setup, .{ .sequence = sequence, .changed_doc_keys = keys, .target_hints = &.{worker.targetHintForManagedIndex(index)} });
         defer setup.free(encoded);
-        _ = try log.appendOpaque(encoded);
+        if (primary) try store.appendReplayOpaque(setup, sequence, encoded) else _ = try log.appendOpaque(encoded);
         offset = end;
     }
     for (0..samples + 1) |sample| {
@@ -69,7 +79,7 @@ pub fn main(init: std.process.Init) !void {
         var manager = resources.ResourceManager.init(.{});
         defer manager.deinit(setup);
         const started = time.monotonicNs();
-        const stats = try worker.catchUpIndexWithOptions(counter.allocator(), source.Source.fromJournal(&log), index, 0, &consumer, Consumer.apply, .{
+        const stats = try worker.catchUpIndexWithOptions(counter.allocator(), replay_source, index, 0, &consumer, Consumer.apply, .{
             .resource_manager = if (budgeted) &manager else null,
             .max_records_per_window = batch,
             .max_items_per_window = batch,
@@ -77,8 +87,8 @@ pub fn main(init: std.process.Init) !void {
         const elapsed = time.monotonicNs() - started;
         if (manager.snapshot().memory.used_bytes != 0) return error.LeakedReservation;
         if (consumer.count != count or counter.live != 0) return error.InvalidReplayOrLeakedMemory;
-        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"index_kind\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
-            sample, count, batch, budgeted, documents_per_record, @tagName(kind), elapsed, counter.calls, counter.bytes, counter.peak, consumer.checksum, stats.applied_entries,
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"index_kind\":\"{s}\",\"source\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
+            sample, count, batch, budgeted, documents_per_record, @tagName(kind), if (primary) "primary" else "journal", elapsed, counter.calls, counter.bytes, counter.peak, consumer.checksum, stats.applied_entries,
         });
     }
 }

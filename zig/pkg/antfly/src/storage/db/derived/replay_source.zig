@@ -259,32 +259,37 @@ fn journalMatchingCursorForEachNext(
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
 ) !MatchingRecordStats {
-    const entries = try cursor.journal.iterateOpaqueFrom(cursor.alloc, cursor.next_sequence + 1);
-    defer {
-        for (entries) |*entry| entry.deinit(cursor.alloc);
-        cursor.alloc.free(entries);
-    }
+    const log_mod = @import("derived_log.zig");
+    const Scan = struct {
+        cursor: *JournalMatchingCursor,
+        max_matched: usize,
+        consumer_ctx: *anyopaque,
+        consume: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+        stats: MatchingRecordStats = .{ .scan_batches = 1 },
 
-    var stats = MatchingRecordStats{};
-    stats.scan_batches = 1;
-    for (entries) |entry| {
-        if (!try change_journal_mod.encodedRecordHasHint(entry.payload, cursor.hint)) {
-            stats.scanned_entries += 1;
-            stats.hint_filter_skips += 1;
-            cursor.next_sequence = entry.sequence;
-            continue;
+        fn visit(self: *@This(), entry: log_mod.EntryView) !log_mod.ScanAction {
+            if (!try change_journal_mod.encodedRecordHasHint(entry.payload, self.cursor.hint)) {
+                self.stats.scanned_entries += 1;
+                self.stats.hint_filter_skips += 1;
+                self.cursor.next_sequence = entry.sequence;
+                return .@"continue";
+            }
+            self.consume(self.consumer_ctx, entry.sequence, entry.payload) catch |err| switch (err) {
+                StopReplayChunk.StopReplayChunk => return .stop,
+                else => return err,
+            };
+            self.stats.scanned_entries += 1;
+            self.stats.matched_entries += 1;
+            self.stats.last_sequence = entry.sequence;
+            self.cursor.next_sequence = entry.sequence;
+            return if (self.max_matched != 0 and self.stats.matched_entries >= self.max_matched) .stop else .@"continue";
         }
-        consume(ctx, entry.sequence, entry.payload) catch |err| switch (err) {
-            StopReplayChunk.StopReplayChunk => return stats,
-            else => return err,
-        };
-        stats.scanned_entries += 1;
-        cursor.next_sequence = entry.sequence;
-        stats.matched_entries += 1;
-        stats.last_sequence = entry.sequence;
-        if (max_matched_entries != 0 and stats.matched_entries >= max_matched_entries) break;
-    }
-    return stats;
+    };
+    var scan = Scan{ .cursor = cursor, .max_matched = max_matched_entries, .consumer_ctx = ctx, .consume = consume };
+    // Payloads are borrowed only while collecting. The stream closes its read
+    // transaction before apply, and rejected lookahead remains at the cursor.
+    try cursor.journal.iterateOpaqueFromStreamingWithContext(cursor.next_sequence + 1, &scan, Scan.visit);
+    return scan.stats;
 }
 
 fn primaryStoreMatchingCursorForEachNext(
@@ -1394,4 +1399,52 @@ test "replay source primary visibility checks the exact replay sequence" {
     try std.testing.expect(!(try source.isSequenceVisible(2)));
     try std.testing.expect(try source.isSequenceVisible(3));
     try std.testing.expect(!(try source.isSequenceVisible(4)));
+}
+
+test "replay source journal cursor streams borrowed entries and resumes rejected records" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("streaming-cursor-regression", .{ .backend = .lsm_memory });
+    defer journal.close();
+    for (1..5) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"document"},
+            .target_hints = if (sequence == 1) &.{.graph} else &.{.full_text},
+        });
+        defer alloc.free(payload);
+        _ = try journal.appendOpaque(payload);
+    }
+    // Only cursor construction may allocate through the replay allocator.
+    // The old suffix materialization would fail on its first payload copy.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    var cursor = try Source.fromJournal(&journal).openMatchingCursor(failing.allocator(), 0, .full_text);
+    defer cursor.deinit(failing.allocator());
+    const Context = struct {
+        calls: usize = 0,
+        last: u64 = 0,
+        reject: bool = false,
+        fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.reject) return error.StopReplayChunk;
+            if (!try change_journal_mod.encodedRecordHasHint(payload, .full_text)) return error.InvalidPayload;
+            self.calls += 1;
+            self.last = sequence;
+        }
+    };
+    var context: Context = .{};
+    const first = try cursor.forEachNext(1, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), first.hint_filter_skips);
+    try std.testing.expectEqual(@as(u64, 2), first.last_sequence);
+    context.reject = true;
+    const rejected = try cursor.forEachNext(1, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 0), rejected.matched_entries);
+    // A write between windows must not overlap a live journal scan transaction.
+    const appended = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 5, .changed_doc_keys = &.{"new"}, .target_hints = &.{.full_text} });
+    defer alloc.free(appended);
+    _ = try journal.appendOpaque(appended);
+    context.reject = false;
+    const rest = try cursor.forEachNext(0, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 3), rest.matched_entries);
+    try std.testing.expectEqual(@as(u64, 5), context.last);
+    try std.testing.expectEqual(@as(usize, 4), context.calls);
 }

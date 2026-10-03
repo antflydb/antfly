@@ -12,6 +12,7 @@ bytes through the benchmark allocator, not RSS or complete process allocation.
 """
 import argparse
 import json
+import itertools
 import os
 from pathlib import Path
 import statistics
@@ -29,8 +30,12 @@ def main():
     parser.add_argument('--samples', type=int, default=7)
     parser.add_argument('--vector-samples', type=int, default=3)
     parser.add_argument('--index-kinds', nargs='+', choices=['full_text', 'algebraic'], default=['full_text', 'algebraic'])
+    parser.add_argument('--replay-sources', nargs='+', choices=['journal', 'primary'], default=['journal'])
+    parser.add_argument('--documents-per-record', nargs='+', type=int, default=[1, 128])
+    parser.add_argument('--batches', nargs='+', type=int, default=[256, 1024])
+    parser.add_argument('--replay-only', action='store_true')
     args = parser.parse_args()
-    if min(args.documents, args.dimensions, args.samples, args.vector_samples) <= 0:
+    if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches) <= 0:
         parser.error('counts and sample sizes must be positive')
     args.output.mkdir(parents=True, exist_ok=False)
     binaries = {'baseline': args.baseline_bin.resolve(), 'changed': args.candidate_bin.resolve()}
@@ -47,20 +52,20 @@ def main():
     def save():
         (args.output / 'results.json').write_text(json.dumps(results, indent=2) + '\n')
 
-    for kind in args.index_kinds:
-        for records in [1, 128]:
-            for budgeted in [False, True]:
-                for batch in [256, 1024]:
-                    for pair in range(args.samples):
-                        for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
-                            label = f'replay-{kind}-{records}-{budgeted}-{batch}-{pair}-{variant}'
-                            lines = run(label, [binaries[variant] / 'replay-allocation-bench', args.documents,
-                                               batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind], env)
-                            data = json.loads(next(x for x in lines if x.startswith('{')))
-                            results.append(dict(workload='replay', variant=variant, pair=pair, **data))
-                            print(label, data['elapsed_ns'], flush=True)
-                            save()
-    for mode in ['counted', 'timing']:
+    for replay_source, kind, records, budgeted, batch in itertools.product(
+            args.replay_sources, args.index_kinds, args.documents_per_record, [False, True], args.batches):
+        for pair in range(args.samples):
+            for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
+                label = f'replay-{replay_source}-{kind}-{records}-{budgeted}-{batch}-{pair}-{variant}'
+                lines = run(label, [binaries[variant] / 'replay-allocation-bench', args.documents,
+                                   batch, 1, 'budgeted' if budgeted else 'unbudgeted', records, kind, replay_source], env)
+                data = json.loads(next(x for x in lines if x.startswith('{')))
+                if data.get('source', 'journal') != replay_source:
+                    raise ValueError('both replay binaries must support the requested source')
+                results.append(dict(workload='replay', variant=variant, pair=pair, **data))
+                print(label, data['elapsed_ns'], flush=True)
+                save()
+    for mode in ([] if args.replay_only else ['counted', 'timing']):
         child_env = env.copy()
         if mode == 'counted':
             child_env['ANTFLY_COUNT_BENCH_ALLOCATIONS'] = '1'
@@ -84,12 +89,12 @@ def main():
                     save()
     summary = {}
     for workload in ['replay', 'vector']:
-        groups = sorted({(x.get('index_kind', 'none'), x.get('documents_per_record', 1), x.get('batch', 0),
+        groups = sorted({(x.get('source', 'journal'), x.get('index_kind', 'none'), x.get('documents_per_record', 1), x.get('batch', 0),
                           x.get('measurement', 'budgeted' if x.get('budgeted') else 'unbudgeted'))
                          for x in results if x['workload'] == workload})
-        for kind, records, batch, mode in groups:
+        for replay_source, kind, records, batch, mode in groups:
             group = {v: [x for x in results if x['workload'] == workload and x['variant'] == v
-                         and x.get('index_kind', 'none') == kind and x.get('documents_per_record', 1) == records and x.get('batch', 0) == batch
+                         and x.get('source', 'journal') == replay_source and x.get('index_kind', 'none') == kind and x.get('documents_per_record', 1) == records and x.get('batch', 0) == batch
                          and x.get('measurement', 'budgeted' if x.get('budgeted') else 'unbudgeted') == mode]
                      for v in binaries}
             fields = ['elapsed_ns', 'allocations', 'allocated_bytes', 'peak_live_bytes'] if workload == 'replay' else [
@@ -103,7 +108,7 @@ def main():
                             next(x[field] for x in group['baseline'] if x['pair'] == pair) - 1)
                       for pair in range(len(group['baseline']))]
             stats['paired_elapsed_change_percent_median'] = statistics.median(ratios)
-            summary[f'{workload}-{kind}-{records}-{batch}-{mode}'] = stats
+            summary[f'{workload}-{replay_source}-{kind}-{records}-{batch}-{mode}'] = stats
     (args.output / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
     print(json.dumps(summary, indent=2))
 

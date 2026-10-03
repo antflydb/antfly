@@ -266,7 +266,11 @@ pub fn catchUpIndexFromMatchingCursor(
         // Oversized records may need more scratch once, but cannot establish
         // a large retained high-water mark for subsequent windows.
         defer {
-            decode_scratch.trimRetainedCapacity(scratch_alloc, 64 * 1024);
+            const retained_limit = if (options.resource_manager) |manager|
+                @min(@as(u64, 64 * 1024), manager.availableAdmissionBytes(.derived_replay_window) / 8)
+            else
+                64 * 1024;
+            decode_scratch.trimRetainedCapacity(scratch_alloc, @intCast(retained_limit));
             if (scratch_budget) |*budget| _ = budget.releaseUnusedCredit();
         }
         if (options.deadline_ns) |deadline| {
@@ -284,11 +288,28 @@ pub fn catchUpIndexFromMatchingCursor(
         defer builder.deinit();
 
         const collect_started_ns = monotonicTimeNs();
-        const chunk_stats = try replay_cursor.forEachNext(
-            options.max_records_per_window,
-            &builder,
-            replayChunkConsumeRecord,
-        );
+        const had_retained_scratch = decode_scratch.retainedCapacityBytes() != 0;
+        var retried_fresh = false;
+        const chunk_stats = collect: while (true) {
+            const collected = replay_cursor.forEachNext(options.max_records_per_window, &builder, replayChunkConsumeRecord) catch |err| {
+                // An empty window gets one retry after reclaiming cached
+                // scratch and key-block slack. The failed record has not
+                // advanced the cursor; a fresh exact-sized retry is bounded.
+                if (err == error.ResourceBudgetExceeded and
+                    (had_retained_scratch or builder.hasSpareKeyCapacity()) and
+                    !retried_fresh and builder.accepted_records == 0)
+                {
+                    builder.resetEmptyWindow();
+                    builder.minimal_key_blocks = true;
+                    decode_scratch.trimRetainedCapacity(scratch_alloc, 0);
+                    if (scratch_budget) |*budget| _ = budget.releaseUnusedCredit();
+                    retried_fresh = true;
+                    continue :collect;
+                }
+                return err;
+            };
+            break :collect collected;
+        };
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
         if (chunk_stats.last_sequence == 0) {
             break;
@@ -442,12 +463,18 @@ fn monotonicTimeNs() u64 {
 }
 
 const ReplayChunkBuilder = struct {
+    const KeyBlock = struct { next: ?*KeyBlock, allocation_len: usize, used: usize };
     alloc: Allocator,
     index_ref: index_manager_mod.ManagedIndexRef,
     resource_manager: ?*resource_manager_mod.ResourceManager,
     decode_scratch: *change_journal_mod.BorrowedBinaryRecordScratch = undefined,
     scratch_alloc: Allocator = undefined,
     scratch_budget: ?*resource_manager_mod.BudgetedAllocator = null,
+    // Each block includes its header and is admitted at its full allocation
+    // size before allocation. Keys live through apply and are freed together.
+    key_blocks: ?*KeyBlock = null,
+    accepted_records: usize = 0,
+    minimal_key_blocks: bool = false,
     documents: []derived_types.DerivedDocument = &.{},
     target: [1]derived_types.DerivedTargetRef = undefined,
     max_chunk_bytes: u64,
@@ -481,21 +508,72 @@ const ReplayChunkBuilder = struct {
 
     fn deinit(self: *@This()) void {
         if (self.documents.len > 0) self.alloc.free(self.documents);
-        for (self.changed_doc_keys.items) |key| self.alloc.free(key);
         self.changed_doc_keys.deinit(self.alloc);
-        for (self.deleted_doc_keys.items) |key| self.alloc.free(key);
         self.deleted_doc_keys.deinit(self.alloc);
-        for (self.overwritten_doc_keys.items) |key| self.alloc.free(key);
         self.overwritten_doc_keys.deinit(self.alloc);
-        for (self.changed_artifact_keys.items) |key| self.alloc.free(key);
         self.changed_artifact_keys.deinit(self.alloc);
         self.seen_changed_docs.deinit(self.alloc);
         self.seen_deleted_docs.deinit(self.alloc);
         self.seen_overwritten_docs.deinit(self.alloc);
         self.seen_changed_artifacts.deinit(self.alloc);
+        while (self.key_blocks) |block| {
+            const next = block.next;
+            const bytes = @as([*]align(@alignOf(KeyBlock)) u8, @ptrCast(block))[0..block.allocation_len];
+            self.alloc.free(bytes);
+            self.key_blocks = next;
+        }
         if (self.resource_manager) |manager|
             manager.adjustUsage(.derived_replay_window, &self.tracked_bytes, 0) catch {};
         self.* = undefined;
+    }
+
+    fn resetEmptyWindow(self: *@This()) void {
+        var fresh = ReplayChunkBuilder.init(self.alloc, self.index_ref, self.resource_manager, self.max_chunk_bytes);
+        fresh.decode_scratch = self.decode_scratch;
+        fresh.scratch_alloc = self.scratch_alloc;
+        fresh.scratch_budget = self.scratch_budget;
+        fresh.max_items = self.max_items;
+        fresh.estimated_dense_vector_bytes = self.estimated_dense_vector_bytes;
+        fresh.target_sequence = self.target_sequence;
+        self.deinit();
+        self.* = fresh;
+    }
+
+    fn hasSpareKeyCapacity(self: *const @This()) bool {
+        var next = self.key_blocks;
+        while (next) |block| : (next = block.next) {
+            if (block.used < block.allocation_len - @sizeOf(KeyBlock)) return true;
+        }
+        return false;
+    }
+
+    fn preferredKeyBlockBytes(self: *const @This(), headroom: u64) usize {
+        if (self.minimal_key_blocks) return 0;
+        var preferred: u64 = 4096;
+        if (self.max_chunk_bytes != 0) preferred = @min(preferred, self.max_chunk_bytes / 8);
+        preferred = @min(preferred, headroom / 8);
+        return @intCast(preferred);
+    }
+
+    fn copyKey(self: *@This(), value: []const u8) ![]const u8 {
+        if (self.key_blocks == null or self.key_blocks.?.allocation_len - @sizeOf(KeyBlock) - self.key_blocks.?.used < value.len) {
+            const minimum = std.math.add(usize, @sizeOf(KeyBlock), value.len) catch return error.OutOfMemory;
+            const headroom = if (self.resource_manager) |manager| manager.availableAdmissionBytes(.derived_replay_window) else std.math.maxInt(u64);
+            const bytes = @max(minimum, self.preferredKeyBlockBytes(headroom));
+            const previous = self.tracked_bytes;
+            try self.observeTrackedBytes(previous +| bytes);
+            errdefer self.observeTrackedBytes(previous) catch {};
+            const memory = try self.alloc.alignedAlloc(u8, .of(KeyBlock), bytes);
+            const block: *KeyBlock = @ptrCast(memory.ptr);
+            block.* = .{ .next = self.key_blocks, .allocation_len = bytes, .used = 0 };
+            self.key_blocks = block;
+        }
+        const block = self.key_blocks.?;
+        const start = @sizeOf(KeyBlock) + block.used;
+        const owned = @as([*]u8, @ptrCast(block))[start..][0..value.len];
+        @memcpy(owned, value);
+        block.used += value.len;
+        return owned;
     }
 
     fn appendUniqueKey(
@@ -506,8 +584,7 @@ const ReplayChunkBuilder = struct {
     ) !void {
         if (value.len == 0) return;
         if (seen.contains(value)) return;
-        const owned = try self.alloc.dupe(u8, value);
-        errdefer self.alloc.free(owned);
+        const owned = try self.copyKey(value);
         const prior_list_capacity = list.capacity;
         const prior_seen_capacity = seen.capacity();
         try seen.put(self.alloc, owned, {});
@@ -515,7 +592,6 @@ const ReplayChunkBuilder = struct {
         try list.append(self.alloc, owned);
         errdefer list.items.len -= 1;
         var next_tracked_bytes = self.tracked_bytes;
-        next_tracked_bytes +|= owned.len;
         // Reserve descriptors with their keys, before the window is published.
         // finishBorrowed consumes this credit without another admission step.
         if (list == &self.changed_doc_keys)
@@ -570,10 +646,13 @@ const ReplayChunkBuilder = struct {
             // The hard limit also covers shared decode scratch and other replay
             // workers. Size the next record against available admission, rather
             // than discovering descriptor/key growth at publication time.
-            if (self.recordAdmissionBytes(record) > manager.availableAdmissionBytes(.derived_replay_window)) return true;
+            const available = manager.availableAdmissionBytes(.derived_replay_window);
+            if (self.recordAdmissionBytes(record, available) > available) return true;
         }
         return false;
     }
+
+    const KeyAdmission = struct { remaining: usize, preferred: usize };
 
     fn keyAdmissionBytes(
         list: *const std.ArrayListUnmanaged([]const u8),
@@ -581,6 +660,7 @@ const ReplayChunkBuilder = struct {
         keys: []const []const u8,
         descriptor_bytes: u64,
         artifact_kind: ?db_types.IndexKind,
+        key_space: *KeyAdmission,
     ) u64 {
         var count: u64 = 0;
         var bytes: u64 = 0;
@@ -593,7 +673,13 @@ const ReplayChunkBuilder = struct {
                 } else if (!internal_keys.isEmbeddingArtifactKey(key) and !internal_keys.isDerivedEmbeddingArtifactKey(key)) continue;
             }
             count +|= 1;
-            bytes +|= key.len +| descriptor_bytes;
+            bytes +|= descriptor_bytes;
+            if (key_space.remaining < key.len) {
+                const allocation = @max(@as(u64, key_space.preferred), @as(u64, key.len) +| @sizeOf(KeyBlock));
+                bytes +|= allocation;
+                key_space.remaining = std.math.cast(usize, allocation - @sizeOf(KeyBlock)) orelse return std.math.maxInt(u64);
+            }
+            key_space.remaining -= key.len;
         }
         if (count == 0) return 0;
         // Duplicate keys within this record may overestimate growth; they never
@@ -607,14 +693,21 @@ const ReplayChunkBuilder = struct {
         return bytes;
     }
 
-    fn recordAdmissionBytes(self: *const @This(), record: change_journal_mod.Record) u64 {
-        var bytes = keyAdmissionBytes(&self.deleted_doc_keys, &self.seen_deleted_docs, record.deleted_doc_keys, 0, null);
+    fn recordAdmissionBytes(self: *const @This(), record: change_journal_mod.Record, headroom: u64) u64 {
+        var key_space = KeyAdmission{
+            .remaining = if (self.key_blocks) |block| block.allocation_len - @sizeOf(KeyBlock) - block.used else 0,
+            .preferred = self.preferredKeyBlockBytes(headroom),
+        };
+        var bytes: u64 = 0;
         if (self.index_ref.kind != .graph) {
-            bytes +|= keyAdmissionBytes(&self.changed_doc_keys, &self.seen_changed_docs, record.changed_doc_keys, @sizeOf(derived_types.DerivedDocument), null);
-            bytes +|= keyAdmissionBytes(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, 0, null);
+            bytes +|= keyAdmissionBytes(&self.changed_doc_keys, &self.seen_changed_docs, record.changed_doc_keys, @sizeOf(derived_types.DerivedDocument), null, &key_space);
+        }
+        bytes +|= keyAdmissionBytes(&self.deleted_doc_keys, &self.seen_deleted_docs, record.deleted_doc_keys, 0, null, &key_space);
+        if (self.index_ref.kind != .graph) {
+            bytes +|= keyAdmissionBytes(&self.overwritten_doc_keys, &self.seen_overwritten_docs, record.overwritten_doc_keys, 0, null, &key_space);
         }
         if (self.index_ref.kind == .graph or self.index_ref.kind == .dense_vector or self.index_ref.kind == .sparse_vector)
-            bytes +|= keyAdmissionBytes(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, 0, self.index_ref.kind);
+            bytes +|= keyAdmissionBytes(&self.changed_artifact_keys, &self.seen_changed_artifacts, record.changed_artifact_keys, 0, self.index_ref.kind, &key_space);
         if (self.index_ref.kind == .dense_vector)
             bytes +|= @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) *| self.estimatedDenseVectorBytes();
         return bytes;
@@ -682,7 +775,11 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
         return replay_source_mod.StopReplayChunk.StopReplayChunk;
     if (change_journal_mod.looksLikeBinaryRecord(payload)) {
         const denial_generation = if (builder.scratch_budget) |budget| budget.denialGeneration() else 0;
-        const record = change_journal_mod.decodeBinaryRecordBorrowedScratch(builder.scratch_alloc, payload, builder.decode_scratch) catch |err| {
+        const record = change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(builder.scratch_alloc, payload, builder.decode_scratch, .{
+            .changed_doc_keys = builder.index_ref.kind != .graph,
+            .overwritten_doc_keys = builder.index_ref.kind != .graph,
+            .changed_artifact_keys = builder.index_ref.kind != .full_text and builder.index_ref.kind != .algebraic,
+        }) catch |err| {
             if (err == error.OutOfMemory) {
                 if (builder.scratch_budget) |budget| {
                     if (budget.denialGeneration() != denial_generation) {
@@ -704,6 +801,7 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
         if (builder.scratch_budget) |budget| _ = budget.releaseUnusedCredit();
         if (builder.wouldOverflowWithRecord(record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
         try builder.appendRecord(record);
+        builder.accepted_records += 1;
         return;
     }
 
@@ -711,6 +809,7 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
     defer record.deinit();
     if (builder.wouldOverflowWithRecord(record.record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
     try builder.appendRecord(record.record);
+    builder.accepted_records += 1;
 }
 
 fn recordEstimatedBytesForIndex(record: change_journal_mod.Record, kind: db_types.IndexKind, estimated_dense_vector_bytes: u64) u64 {
@@ -1962,4 +2061,77 @@ test "replay batch descriptor admission is deduplicated and finish needs no new 
     const batch = try builder.finishBorrowed(1);
     try std.testing.expectEqual(@as(usize, 2), batch.documents.len);
     try std.testing.expectEqual(admitted, builder.tracked_bytes);
+}
+
+test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
+    const alloc = std.testing.allocator;
+    var log = try change_journal_mod.Journal.open("fresh-review-retained-scratch", testInMemoryJournalOpenOptions());
+    defer log.close();
+    var deleted: [20][]const u8 = undefined;
+    var names: [20][8]u8 = undefined;
+    for (&deleted, &names, 0..) |*key, *name, i| key.* = try std.fmt.bufPrint(name, "d{d:0>3}", .{i});
+    try appendChangeJournalRecord(&log, alloc, .{ .sequence = 1, .deleted_doc_keys = &deleted, .target_hints = &.{.full_text} });
+    try appendChangeJournalRecord(&log, alloc, .{ .sequence = 2, .changed_doc_keys = &.{ "u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7" }, .target_hints = &.{.full_text} });
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 2000 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    var cursor = try replay_source_mod.Source.fromJournal(&log).openMatchingCursor(alloc, 0, .full_text);
+    defer cursor.deinit(alloc);
+    const index: index_manager_mod.ManagedIndexRef = .{ .name = "text", .kind = .full_text };
+    const retry = try catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager, .max_records_per_window = 1 });
+    try std.testing.expectEqual(@as(usize, 20), capture.applied_deleted_keys);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expectEqual(@as(u64, 2), retry.last_applied_sequence);
+    try std.testing.expectEqual(@as(usize, 8), capture.applied_documents);
+}
+
+test "replay key blocks admit their header and spare capacity and roll back failed allocations" {
+    const alloc = std.testing.allocator;
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 64 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
+    defer builder.deinit();
+    const first = try builder.copyKey("abcd");
+    const second = try builder.copyKey("efgh");
+    try std.testing.expectEqual(@as(u64, 2 * (@sizeOf(ReplayChunkBuilder.KeyBlock) + 4)), builder.tracked_bytes);
+    try std.testing.expectEqual(builder.tracked_bytes, manager.snapshot().memory.used_bytes);
+    try std.testing.expectError(error.ResourceBudgetExceeded, builder.copyKey("ijkl"));
+    try std.testing.expectEqualStrings("abcd", first);
+    try std.testing.expectEqualStrings("efgh", second);
+    try std.testing.expectEqual(builder.tracked_bytes, manager.snapshot().memory.used_bytes);
+    // A backing allocator failure releases the reservation taken before allocation.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    var failed = ReplayChunkBuilder.init(failing.allocator(), .{ .name = "text", .kind = .full_text }, &manager, 0);
+    defer failed.deinit();
+    // Free the successful blocks to leave admission available for the injected failure.
+    builder.deinit();
+    builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
+    try std.testing.expectError(error.OutOfMemory, failed.copyKey("abcd"));
+    try std.testing.expectEqual(@as(u64, 0), failed.tracked_bytes);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+}
+
+test "catchUpIndex drops key block slack before rejecting an otherwise fitting record" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("compact-key-admission", testInMemoryJournalOpenOptions());
+    defer journal.close();
+    try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 1, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    // A one-key scratch list, output list, dedup map, descriptor and exact key
+    // block fit. The preferred block's unused bytes do not fit.
+    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 580 };
+    var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+    const stats = try catchUpIndexWithOptions(alloc, replay_source_mod.Source.fromJournal(&journal), .{ .name = "text", .kind = .full_text }, 0, &capture, testApplyCapture, .{ .resource_manager = &manager });
+    try std.testing.expectEqual(@as(u64, 1), stats.last_applied_sequence);
+    try std.testing.expectEqual(@as(usize, 1), capture.applied_documents);
+    try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 580);
 }
