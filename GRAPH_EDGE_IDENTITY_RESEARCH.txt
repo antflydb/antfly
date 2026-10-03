@@ -1,0 +1,194 @@
+Historical investigation captured before implementation.
+The implemented contract and example are in docs/guides/artifact-indexes.mdx.
+Statements about unchanged production behavior and a separate future phase below
+refer to the investigation baseline, not this worktree's current implementation.
+
+Antfly relationship identity investigation — 2026-09-30
+
+Recommendation
+
+Support a directed property multigraph with stable, application-supplied edge
+IDs. Keep existing writes without an ID as tuple upserts. Preserve document
+storage as the canonical home for searchable facts, and make graph adjacency
+an exact relationship projection with an optional reference to that document.
+Document today's tuple identity immediately; treat multigraph support as an
+explicit feature proposal, not a confirmed roadmap commitment.
+
+Scope and evidence
+
+Investigated in .worktrees/graph-edge-identity on research/graph-edge-identity,
+based on 46e79f25fbd233646c00c9b6f07686453e905e1f. Checked the cited key encoder
+at 5e63256 as well. The root checkout's existing changes were left untouched.
+
+Current source references (paths are relative to this worktree):
+- zig/pkg/antfly/src/graph/graph.zig: graphIndexEdgeKeyAlloc, Edge, EdgeProbe,
+  BatchWrite, BatchDelete, applyMutationPage, probeEdgesAllocBounded,
+  EdgeScanCursor, validateTreeBatchWrites.
+- zig/pkg/antfly/src/graph/paths.zig: pathEdgeIdentityEql, rootPathMatches,
+  test "k shortest paths preserve parallel typed edge identities".
+- zig/pkg/antfly/src/graph/pattern.zig: exact closing-edge probes return at
+  most one edge per source/target/type; see probeEdgesBounded in the optimized
+  pattern plan.
+- zig/pkg/antfly/src/storage/db/db.zig: materializeGraphArtifactValuePaged,
+  appendRelationItem, and collectGraphMutationsForArtifacts.
+- zig/pkg/antfly/src/storage/internal_keys.zig: graph edge artifact keys and
+  source-owned contender keys.
+- specs/openapi/antfly/indexes.yaml: Edge, GraphPathEdge,
+  GraphArtifactNodeMappingConfig, GraphArtifactEdgeMappingConfig.
+- docs/guides/artifact-indexes.mdx: ordered source precedence and source
+  ownership are documented, but the exact edge identity tuple is not stated.
+
+Today's behavior
+
+Within a table and graph index, identity is (source document, edge type,
+target document). Storage has no edge-ID component. Writes replace the
+complete value, including weight, created_at, updated_at, and metadata.
+Putting a UUID in metadata changes the payload, not identity. Different
+types and reciprocal directions are different physical relationships.
+Deleting by the tuple removes that relationship in both physical directions.
+
+This looks like a consistent design choice: counters explicitly compare
+identity sets, probes return one optional edge, path identity uses endpoints
+and type, and the wire schema has no edge ID. It is not evidence of AJ's
+intent or a future roadmap. Source precedence also matters: artifact sources
+use an earlier-source-wins policy, so 'last write wins' must not be used as a
+blanket description of all materialization behavior.
+
+Verification
+
+Added a focused test to graph.zig:
+  graph same typed endpoints replace fact payload in both directions
+It writes alice->acme RELATES_TO with two different metadata UUIDs and checks
+that only the second payload survives, including both timestamps and weight,
+in outgoing and incoming reads. It checks that a different type survives and
+that tuple deletion leaves that other type intact.
+
+Ran from zig/:
+  zig build antfly-graph-test -j2 -- \
+    'graph same typed endpoints replace fact payload in both directions' \
+    'k shortest paths preserve parallel typed edge identities'
+Result: 2 passed, 0 failed, 0 leaked; build exit status 0.
+zig fmt --check and git diff --check also passed.
+These are focused storage/path checks, not a complete distributed or driver
+qualification. No production behavior was changed. No Neo4j server was run.
+
+Neo4j comparison
+
+Neo4j permits many relationships with the same endpoints and relationship
+type. CREATE creates another relationship. MERGE matches the supplied pattern;
+MERGE (a)-[:RELATES_TO]->(b) asks for an existing relationship for that pair,
+whereas MERGE (a)-[r:RELATES_TO {uuid: $uuid}]->(b) distinguishes facts by UUID.
+Mutable fact text and validity timestamps belong in SET, not the identity
+pattern. MERGE is not an automatic cleanup of existing duplicate relationships.
+
+Graphiti's current Neo4j implementation uses exactly that UUID-bearing MERGE
+for single and bulk entity-edge saves, then sets the fact properties. It also
+stores facts' embeddings and temporal/provenance fields on the relationship.
+The current upstream file includes a Kuzu fact-node representation too, so
+the statement 'all Graphiti facts are relationships' is provider-specific.
+
+Neo4j exposes elementId(), but its documentation does not promise a stable
+mapping outside a transaction and recommends application-generated IDs.
+Relationship property uniqueness constraints can enforce uniqueness of uuid
+within a relationship type; they do not impose one edge per pair. A uuid
+uniqueness constraint is broader than an endpoint-qualified MERGE pattern.
+
+Sources checked:
+https://neo4j.com/docs/cypher-manual/current/clauses/create/
+https://neo4j.com/docs/cypher-manual/current/clauses/merge/
+https://neo4j.com/docs/cypher-manual/current/functions/scalar/
+https://neo4j.com/docs/cypher-manual/current/schema/constraints/create-constraints/
+https://github.com/getzep/graphiti/blob/main/graphiti_core/models/edges/edge_db_queries.py
+
+Proposed long-term contract
+
+1. Separate edge type, edge identity, and backing fact document. Type describes
+   a relationship category; edge_id names one relationship; document_ref points
+   to searchable fact content, embeddings, provenance, and validity fields.
+   Both Alice->Acme facts remain RELATES_TO and are selected by that type.
+
+2. An omitted ID addresses the existing implicit tuple relationship. An
+   explicit ID addresses a distinct relationship under that tuple. Repeating
+   an explicit identity is an idempotent upsert; a new ID adds an edge.
+   Start with IDs scoped to table/index/source/type/target. Global UUID lookup
+   or uniqueness, if required, is a separate locator/constraint rather than
+   an accidental promise. Endpoint changes use an explicit delete-plus-create
+   operation; otherwise replay can strand the old adjacency.
+
+3. Retain current key rows for implicit edges. Use a versioned, encoded ID
+   suffix (or a new versioned record kind) for explicit edges. Outgoing prefix
+   order should remain source/index/type/target/id, with reverse rows ordered
+   target/index/type/source/id. This keeps type scans and pair scans efficient.
+   Existing parsers reject extra components, so this needs coordinated reader
+   support, capability negotiation, and a durable format-version policy.
+   Mixed versions must not silently ignore new rows. Choose a tagged implicit
+   identity so user-provided IDs cannot collide with compatibility identities.
+
+4. Carry IDs through writes/deletes, internal artifacts, snapshots, replicas,
+   range splits, reverse rebuilds, typed postings, cursors, wire results, and
+   generated SDKs. Pair/type probes need a bounded list/prefix scan or an
+   existence-only mode; an ID-qualified probe can still return one edge.
+   Preserve omitted-ID deletion as deleting only the implicit relationship;
+   deleting all parallel relationships needs an explicit operation.
+
+5. Specify query cardinality. Node BFS can return distinct reached nodes while
+   examining all eligible edges. Edge results retain each relationship.
+   Relationship matches and K-shortest paths must distinguish IDs even when
+   the node sequence and type are identical. Edge predicates must be applied
+   before collapsing neighbors. Preserve existing path simplicity rules.
+   Budgets count actual inspected relationships and retained ID bytes.
+
+6. Keep exact relationships separate from algorithm projections. Existence
+   topology changes on pair multiplicity transitions 0->1 and 1->0; removing
+   one of two facts must leave the pair connected. Relationship degree and
+   distinct-neighbor degree are different. PageRank/eigenvector/HITS need an
+   explicit multiplicity projection; confidence aggregation requires a stated
+   operator. Existing metrics are unweighted, and weight is also used for
+   path cost/confidence, so do not assume one universal aggregation rule.
+   Keep tree types strict by default or define a separate parent-uniqueness
+   policy; parallel edges should not quietly weaken tree guarantees.
+
+7. Add edge-ID mapping to artifact configuration using stable producer IDs,
+   such as Graphiti fact UUIDs. Do not generate random IDs on each replay or
+   use array position as persistent identity when input can reorder. Preserve
+   ordered source precedence for the same explicit identity. Conflicting
+   backing references need a stated policy.
+
+Document-backed arbitrary endpoints are a separate phase
+
+Current artifact mapping fixes the source endpoint to the owning document;
+only the target is mapped. Adding edge_id alone permits two Alice-owned
+artifacts to connect Alice to Acme, but it does not let a separately stored
+fact document automatically project Alice->Acme.
+
+Supporting that model needs a deliberate distinction between the owner
+document and logical endpoints, with deletion reconciliation, source-endpoint
+adjacency routing, reverse repair, replay fencing, and range-split recovery.
+The existing source-owner invariant is valuable and should remain the default.
+This is broader than appending an ID to the graph key and should have its own
+design and distributed qualification.
+
+Graphiti driver implications
+
+The driver described by the user preserves fact documents while using an
+edge as pair connectivity. That is a reasonable compatibility projection for
+unfiltered reachability followed by complete fact hydration. Its code is not
+present in this checkout, so this investigation does not verify the driver.
+
+Correctness requires keeping connectivity while any fact remains, removing it
+when the last fact disappears, and handling concurrent document/edge updates
+and repair. Fetches must preserve endpoint direction, tenant/group isolation,
+and complete pagination. Temporal or fact predicates applied only after BFS
+can filter returned facts but cannot retroactively change which paths were
+traversed. Pair edges alone cannot reproduce per-fact weighted paths or
+relationship counts. These are model limits to test, not diagnosed driver bugs.
+
+Suggested delivery order
+
+First document the exact current tuple contract and artifact precedence.
+Next ship explicit edge IDs with complete result, probe, pagination, mutation,
+and path semantics while retaining implicit tuple compatibility.
+Then design fact-document projection with arbitrary endpoints and explicit
+algorithm projection policies. Test same-type parallel edges across reopen,
+replay, delete-one/delete-last, self-loops, reciprocal edges, source precedence,
+distributed range splits, budgets, K-paths, counts, and temporal predicates.

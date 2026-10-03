@@ -2386,6 +2386,7 @@ const datetime = @import("../datetime.zig");
 pub const formatDateTimeNsAlloc = datetime.formatDateTimeNsAlloc;
 pub const parseRfc3339ToNs = datetime.parseRfc3339ToNs;
 pub const parseDateToNs = datetime.parseDateToNs;
+pub const parseRfc3339ToSignedNs = datetime.parseRfc3339ToSignedNs;
 
 fn isValidDate(value: []const u8) bool {
     return parseDateToNs(value) != null;

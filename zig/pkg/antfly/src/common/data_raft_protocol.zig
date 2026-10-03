@@ -39,7 +39,7 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 18;
+pub const batch_protocol_version: u16 = 22;
 pub const batch_row_semantics_protocol_version: u16 = 18;
 pub const batch_artifact_catalog_protocol_version: u16 = 14;
 /// Full producer publications require a separate all-member barrier; the
@@ -66,3 +66,10 @@ pub const batch_merge_chunk_protocol_version: u16 = 9;
 pub const batch_native_snapshot_protocol_version: u16 = 10;
 pub const batch_relational_transfer_protocol_version: u16 = 11;
 pub const batch_source_scope_protocol_version: u16 = 12;
+
+/// Version 20 transfers durable relationship retirements during merges.
+pub const batch_merge_retirements_protocol_version: u16 = 20;
+
+/// Version 22 adds qualified endpoint cleanup, ordered retirement stamps, and
+/// bounded owner revival pages. It subsumes version 21 endpoint incarnations.
+pub const batch_graph_cleanup_generation_protocol_version: u16 = 22;

@@ -76,6 +76,9 @@ pub fn begin(a: A, inner: backend.ReadTxn, raw: []const u8, incoming: bool, comp
                     const boundary = try seekPast(self.alloc, self.scope, value.key, self.incoming, backwards);
                     defer self.alloc.free(boundary);
                     entry = if (backwards) try self.inner.seekAtOrBefore(boundary) else try self.inner.seekAtOrAfter(boundary);
+                    if (backwards) if (entry) |same| if (std.mem.eql(u8, same.key, value.key)) {
+                        entry = try self.inner.prev();
+                    };
                 }
                 return null;
             }

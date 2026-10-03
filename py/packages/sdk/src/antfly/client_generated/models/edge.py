@@ -28,6 +28,10 @@ class Edge:
             the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-byte limit.
         weight (float): Finite non-negative edge cost or confidence. The max_weight_product path objective additionally
             requires values in [0,1].
+        edge_id (str | Unset): Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this
+            graph index, owning document, and endpoint/type tuple.
+        owner_document (str | Unset): Owning fact document key in the graph index table when it differs from the logical
+            source. The document is the authority for replay and deletion.
         created_at (datetime.datetime | Unset): When the edge was created
         updated_at (datetime.datetime | Unset): When the edge was last updated
         metadata (EdgeMetadata | Unset): Optional edge metadata
@@ -37,6 +41,8 @@ class Edge:
     target: str
     type_: str
     weight: float
+    edge_id: str | Unset = UNSET
+    owner_document: str | Unset = UNSET
     created_at: datetime.datetime | Unset = UNSET
     updated_at: datetime.datetime | Unset = UNSET
     metadata: EdgeMetadata | Unset = UNSET
@@ -50,6 +56,10 @@ class Edge:
         type_ = self.type_
 
         weight = self.weight
+
+        edge_id = self.edge_id
+
+        owner_document = self.owner_document
 
         created_at: str | Unset = UNSET
         if not isinstance(self.created_at, Unset):
@@ -73,6 +83,10 @@ class Edge:
                 "weight": weight,
             }
         )
+        if edge_id is not UNSET:
+            field_dict["edge_id"] = edge_id
+        if owner_document is not UNSET:
+            field_dict["owner_document"] = owner_document
         if created_at is not UNSET:
             field_dict["created_at"] = created_at
         if updated_at is not UNSET:
@@ -94,6 +108,10 @@ class Edge:
         type_ = d.pop("type")
 
         weight = d.pop("weight")
+
+        edge_id = d.pop("edge_id", UNSET)
+
+        owner_document = d.pop("owner_document", UNSET)
 
         _created_at = d.pop("created_at", UNSET)
         created_at: datetime.datetime | Unset
@@ -121,6 +139,8 @@ class Edge:
             target=target,
             type_=type_,
             weight=weight,
+            edge_id=edge_id,
+            owner_document=owner_document,
             created_at=created_at,
             updated_at=updated_at,
             metadata=metadata,

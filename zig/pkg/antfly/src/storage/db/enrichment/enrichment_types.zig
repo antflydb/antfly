@@ -182,6 +182,8 @@ pub const GeneratedEnrichmentRequest = struct {
     /// non-empty, the runtime samples the document's same-shard graph
     /// adjacency into the rendered producer input before dispatch.
     neighbor_context_json: []const u8 = "",
+    /// Pinned transitive dependency on committed graph adjacency.
+    requires_committed_graph: bool = false,
     execution_json: []const u8 = "",
     /// Upstream materialized asset for a chunk-backed request, pinned with the
     /// same catalog generation as the rest of the plan.
@@ -281,6 +283,7 @@ pub fn cloneGeneratedRequest(alloc: Allocator, request: GeneratedEnrichmentReque
         .independently_required = request.independently_required,
         .content_type = content_type,
         .producer_json = producer_json,
+        .requires_committed_graph = request.requires_committed_graph,
         .neighbor_context_json = neighbor_context_json,
         .execution_json = execution_json,
         .upstream_artifact_name = upstream_artifact_name,

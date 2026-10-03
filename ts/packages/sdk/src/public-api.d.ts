@@ -11509,6 +11509,10 @@ export interface components {
         };
         /** @description A typed, weighted connection between documents */
         Edge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             /**
              * Format: byte
              * @description Base64-encoded source document key
@@ -11668,6 +11672,10 @@ export interface components {
             length?: number;
         };
         PathEdge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             source?: string;
             target?: string;
             type?: string;
@@ -13054,10 +13062,14 @@ export interface components {
              * @enum {string}
              */
             model?: "document" | "external";
+            /** @description Logical source endpoint. When set, edge.edge_id is required; the artifact document remains the durable owner. */
+            source?: components["schemas"]["GraphTemplateValue"];
             target?: components["schemas"]["GraphTemplateValue"];
         };
-        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        /** @description Maps each artifact item to a relationship identity, type, weight, and public metadata. */
         GraphArtifactEdgeMappingConfig: {
+            /** @description Stable application relationship ID. Required with nodes.source. Replays update the same identity; distinct IDs preserve parallel relationships. */
+            edge_id?: components["schemas"]["GraphTemplateValue"];
             type?: components["schemas"]["GraphTemplateValue"];
             weight?: components["schemas"]["GraphTemplateValue"];
             /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
@@ -17000,6 +17012,34 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
+        GraphRelationshipPropertyPredicate: {
+            /** @description JSON pointer to /metadata/... or /edge_id, /owner_document, /source, /target, /type, /weight, /created_at, /updated_at. */
+            field: string;
+            /** @enum {string} */
+            op: "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "is_null" | "is_not_null";
+            /** @description Non-null scalar comparison value. Omit for is_null and is_not_null. */
+            value?: unknown;
+            /**
+             * @description Datetime compares RFC3339 instants rather than string ordering.
+             * @default scalar
+             * @enum {string}
+             */
+            value_type?: "scalar" | "datetime";
+        };
+        /** @description AND predicates applied to every relationship before neighbor admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a created_at value. Invalid timestamp properties never match. */
+        GraphRelationshipFilter: {
+            properties?: components["schemas"]["GraphRelationshipPropertyPredicate"][];
+            /**
+             * Format: date-time
+             * @description Require metadata.valid_at <= instant < metadata.invalid_at.
+             */
+            valid_at?: string;
+            /**
+             * Format: date-time
+             * @description Require metadata.created_at <= instant < metadata.expired_at.
+             */
+            known_at?: string;
+        };
         /** @description Inclusive per-edge weight filter. At least one bound is required. Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual stored edges and does not constrain the aggregate path objective. */
         GraphEdgeWeightRange: {
             /** Format: double */
@@ -17009,6 +17049,7 @@ export interface components {
         };
         /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphIdentifier"];
             to: components["schemas"]["GraphIdentifier"];
             /** @description Stored-edge direction relative to `from`; defaults to `out`. */
@@ -17150,6 +17191,7 @@ export interface components {
         };
         /** @description Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge. */
         GraphTraversal: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             start: components["schemas"]["GraphNodeSelector"];
             /** @description Stored-edge direction relative to each expanded node; defaults to `out`. */
             direction?: components["schemas"]["EdgeDirection"];
@@ -17198,6 +17240,7 @@ export interface components {
         };
         /** @description Find the best path from `from` to `to` in the requested stored-edge direction. */
         GraphShortestPath: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
@@ -17223,8 +17266,9 @@ export interface components {
             index: string;
             shortest_path: components["schemas"]["GraphShortestPath"];
         };
-        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction and type, and are ordered best-first by the selected objective. */
+        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction, type, edge ID and fact owner, and are ordered best-first by the selected objective. */
         GraphKShortestPaths: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
@@ -17355,6 +17399,7 @@ export interface components {
          * @description Deprecated graph_searches traversal and path parameters.
          */
         GraphQueryParams: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: components["schemas"]["GraphEdgeType"][];
             direction?: components["schemas"]["EdgeDirection"];
@@ -17379,6 +17424,7 @@ export interface components {
          * @description Deprecated linear graph_searches pattern edge.
          */
         PatternEdgeStep: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
             types?: components["schemas"]["GraphEdgeType"][];
             direction?: components["schemas"]["EdgeDirection"];
@@ -17516,6 +17562,10 @@ export interface components {
         GraphPathEdgeDirection: "out" | "in";
         /** @description One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables. */
         GraphPathEdge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             direction: components["schemas"]["GraphPathEdgeDirection"];
