@@ -965,8 +965,10 @@ What bears on Laya:
   head, served with the runtime's prefix KV cache.
 - Antenna needs an encoder for embeddings, chunking and extraction
   ([ANTENNA.md](../antenna/ANTENNA.md)), so this does not transfer directly.
-  On the encoder, the cheaper open levers are question-first positions
-  (running), a pointer head, and rare-token anchors.
+  On the encoder, the cheaper open levers were question-first positions, a
+  pointer head, and rare-token anchors. The first two do not close the gap,
+  and the markers are already special tokens (see
+  [Scaling packed training on Open-Jev](#scaling-packed-training-on-open-jev-2026-09-27)).
 - Antenna's step 8 (a schema-blind trunk with task branches) should expect
   the same accuracy loss unless one of those closes it.
 
@@ -1201,6 +1203,19 @@ the gap.** Same 16k subset and recipe as the layout control.
   question-blind lower layers, full fusion per question, token order, and
   the decision head. What remains is the encoder base, as the Jeeves and
   MoJev evidence suggests.
+
+**Rare-token anchors (2026-10-03): already in place.** Jeeves found that
+mapping its layout markers to unused tokens beat plain text such as "State"
+([Lessons from Jeeves](#lessons-from-jeeves-research-2026-09-29)). Laya's
+encoder layout already uses special tokens where it matters:
+- every option marker is `[MASK]`;
+- every decision anchor is its branch's `[CLS]`;
+- `[SEP]` closes the trunk, the question and the options.
+
+The question type is also given twice, as a type embedding and as the
+plain-text `"<type> question:"` prefix. Swapping that prefix for an unused
+token is the only part left untested. It is not worth a run: the type
+embedding already carries it, and an unused token's embedding is untrained.
 
 **Two Metal training faults found on the way** (both fixed, with tests):
 - *Fused gather of `add(matrix, bias)` with integer indices.* The
