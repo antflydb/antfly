@@ -336,14 +336,30 @@ don't replace. The private Hugging Face repo antflydb/antenna-0 now holds the
 clean `student/` (run21), `gliner/` (run22) and `decision/` (dec7). Its git
 history still has the earlier version.
 
+Adding SNIPS BookRestaurant (CC0 1.0, 1,973 booking requests, 14 slot types)
+to the clean stage 3 rows (run23):
+- **MIT restaurant:** rises from 0.436 to 0.485.
+- **Held-out sets:** classification goes from 0.372 to 0.385 and NER from 0.619 to 0.625.
+- **Banking77:** goes from 0.626 to 0.596, within its noise.
+
+MIT restaurant's own types (amenity, hours, price, rating) appear in no
+permissive set, which bounds what substitutes can recover. antenna-0's
+`gliner/` is now run23.
+
+On the throughput binary, bigger microbatches pay little. Batch 8 gives 960
+examples a minute against 714 at batch 4, and its longest microbatches still
+exceed the Studio's device limits. Batch 16 and 32 don't fit with the
+materialized attention profile on 36 GB. Larger batches need the fused,
+linear-memory attention profile.
+
 Run21 finished on the throughput branch (#959). Resumed from its own pause
 checkpoint, it ran at 209 microbatches per minute against 49, with
 bit-identical losses.
 
 ## Next
 
-- A permissive restaurant-style slot set (SNIPS, license to confirm) for the
-  clean stage 3.
+- Restaurant-style types beyond SNIPS (amenity, hours, price, rating) from a
+  permissive source, or teacher-labelled restaurant queries.
 - Decision head on run19's trunk, with the same curriculum.
 - Classification markers are the remaining gap. The mixed pool has 216 real
   class names and fills the rest of each label list from entity types; add

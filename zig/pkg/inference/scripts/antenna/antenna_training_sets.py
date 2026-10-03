@@ -22,6 +22,7 @@ license). Records use ``antenna_datasets``' shapes:
 | massive_slots | MASSIVE 1.1 en-US slot annotations, 55 types | CC BY 4.0 |
 | fewnerd | Few-NERD supervised (DFKI-SLT/few-nerd), 66 fine types | CC BY-SA 4.0 |
 | multiconer | MultiCoNER v2 English (MultiCoNER/multiconer_v2), 33 types, lowercased | CC BY 4.0 |
+| snips_restaurant | SNIPS NLU benchmark BookRestaurant (sonos/nlu-benchmark), 14 slot types | CC0 1.0 |
 
 Every file is fetched from a pinned revision through ``antenna_datasets``'
 cache and checked against its SHA-256 here.
@@ -64,9 +65,15 @@ SOURCES = {
         f"{HF}/MultiCoNER/multiconer_v2/resolve/4be2d62c912977ee26ed14d2553a4fe17ca3d980/EN-English/en_train.conll",
         "1e1af77f95e92aa287c40feb7c10b384192c8ff026c916114a54713f331138ea",
     ),
+    # The repository is CC0 1.0; only BookRestaurant is used, so MIT movie
+    # stays as far out of domain as before.
+    "snips_restaurant": (
+        "https://raw.githubusercontent.com/sonos/nlu-benchmark/b86ac7f1577868c42158d0dec77db50956046696/2017-06-custom-intent-engines/BookRestaurant/train_BookRestaurant_full.json",
+        "7677e82cd6e9a8191f0a4502568c786278c984900b4796d3628e46f1abf73ef4",
+    ),
 }
 CLASSIFICATION = ("huffpost", "dbpedia", "massive_intent")
-NER = ("massive_slots", "fewnerd", "multiconer")
+NER = ("massive_slots", "fewnerd", "multiconer", "snips_restaurant")
 
 _FEWNERD = {
     "broadcastprogram": "broadcast program",
@@ -92,6 +99,14 @@ _FEWNERD = {
     "livingthing": "living thing",
     "medical": "medical term",
     "artist/author": "artist or author",
+}
+_SNIPS = {
+    "party_size_number": "party size",
+    "party_size_description": "party description",
+    "timeRange": "time range",
+    "served_dish": "dish",
+    "poi": "point of interest",
+    "sort": "ranking preference",
 }
 _MULTICONER = {
     "AerospaceManufacturer": "aerospace manufacturer",
@@ -265,6 +280,20 @@ def _io_sentences(name: str) -> list[tuple[list[str], list[str]]]:
                 _massive_tokens, (row["annot_utt"] for row in _massive_rows())
             )
         ]
+    if name == "snips_restaurant":
+        sentences = []
+        for row in json.loads(_fetch("snips_restaurant").decode("utf-8"))[
+            "BookRestaurant"
+        ]:
+            tokens, tags = [], []
+            for chunk in row["data"]:
+                entity = chunk.get("entity")
+                kind = _SNIPS.get(entity, _camel(entity)) if entity else "O"
+                for word in chunk["text"].split():
+                    tokens.append(word)
+                    tags.append(kind)
+            sentences.append((tokens, tags))
+        return sentences
     if name == "fewnerd":
         rows, features = _parquet(_fetch("fewnerd"))
         names = features["fine_ner_tags"]["feature"]["names"]
