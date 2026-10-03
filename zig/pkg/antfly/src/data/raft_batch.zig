@@ -27,6 +27,7 @@ pub const merge_transition_protocol_version = internal_batch_forwarding.raft_bat
 pub const split_delta_predecessor_protocol_version = internal_batch_forwarding.raft_batch_split_delta_predecessor_protocol_version;
 pub const merge_artifacts_protocol_version = internal_batch_forwarding.raft_batch_merge_artifacts_protocol_version;
 pub const merge_copy_attempt_protocol_version = internal_batch_forwarding.raft_batch_merge_copy_attempt_protocol_version;
+pub const merge_retirements_protocol_version = internal_batch_forwarding.raft_batch_merge_retirements_protocol_version;
 pub const merge_page_protocol_version = internal_batch_forwarding.raft_batch_merge_page_protocol_version;
 pub const online_source_protocol_version = internal_batch_forwarding.raft_batch_online_source_protocol_version;
 pub const source_pin_protocol_version = internal_batch_forwarding.raft_batch_source_pin_protocol_version;
@@ -230,6 +231,7 @@ fn consumerTests() type {
             try std.testing.expect(split_delta_predecessor_protocol_version > merge_transition_protocol_version);
             try std.testing.expect(merge_artifacts_protocol_version > split_delta_predecessor_protocol_version);
             try std.testing.expect(merge_copy_attempt_protocol_version > merge_artifacts_protocol_version);
+            try std.testing.expect(merge_retirements_protocol_version > merge_copy_attempt_protocol_version);
             try std.testing.expect(merge_page_protocol_version > merge_copy_attempt_protocol_version);
             try std.testing.expect(source_scope_protocol_version > relational_transfer_protocol_version);
             try std.testing.expect(protocol_version >= artifact_catalog_protocol_version);
@@ -564,4 +566,28 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+test "raft batch round trips guarded graph owner replay afterimages" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../storage/graph_cleanup_contract.zig");
+    const key = try contract.ownerJobKeyAlloc(alloc, "owner\x00\xff");
+    defer alloc.free(key);
+    const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7 });
+    defer alloc.free(old);
+    const next = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7, .phase = .inputs });
+    defer alloc.free(next);
+    const req: db_mod.types.BatchRequest = .{
+        .graph_endpoint_cleanup = true,
+        .graph_endpoint_cleanup_planned = true,
+        .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "owner\x00\xff", .generation = 7, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(old) }},
+        .merge_artifacts = &.{.{ .key = key, .value = next }},
+    };
+    const bytes = try encode(alloc, "docs", req);
+    defer alloc.free(bytes);
+    var decoded = try decode(alloc, bytes);
+    defer decoded.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, next, decoded.batch.req.merge_artifacts[0].value);
+    try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
+    try db_mod.types.validateGraphEndpointCleanupCommand(decoded.batch.req);
 }

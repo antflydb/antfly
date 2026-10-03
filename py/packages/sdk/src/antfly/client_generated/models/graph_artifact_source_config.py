@@ -33,8 +33,8 @@ class GraphArtifactSourceConfig:
                 KiB; `maxLength` is the standard-schema code-point ceiling and `x-antfly-max-utf8-bytes` carries the exact wire-
                 byte limit.
             nodes (GraphArtifactNodeMappingConfig | Unset): Maps each artifact item to graph node identifiers.
-            edge (GraphArtifactEdgeMappingConfig | Unset): Maps each artifact item to an edge type, weight, and public
-                metadata.
+            edge (GraphArtifactEdgeMappingConfig | Unset): Maps each artifact item to a relationship identity, type, weight,
+                and public metadata.
             context (GraphArtifactContextConfig | Unset): Document fields made available to graph mapping templates through
                 `_doc.value`.
     """

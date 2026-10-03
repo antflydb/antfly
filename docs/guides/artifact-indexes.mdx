@@ -98,7 +98,146 @@ Filter-only and exclusion-only query trees are not scoring text queries and rece
 
 Graph `sources` are ordered. When two sources materialize the same edge identity, the earlier source wins. Mapping (`path`, `format`, `nodes`, `edge`, and `context`) belongs on each source, because streams can use different record shapes. The optional `source` object is the one-source convenience form and is mutually exclusive with `sources`.
 
-Artifact-backed edges are owned by the source document key; `nodes.target` maps the other endpoint. Source ownership is not configurable, so replay, deletion, routing, and range splits share one identity contract. Outgoing traversal routes directly to that source owner. Incoming and bidirectional traversal use an exact, bounded coordinator route directory fenced by the table topology and per-shard read generations. A cold or generation-mismatched entry falls back to compact, bounded reverse-index probes and records the proven source shards; expansion then goes only to those shards. Cross-range paths stay exact without synchronous cross-shard dual writes, and repeated traversals avoid cluster-wide probe fanout.
+Every materialized relationship belongs to the document that produced its artifact. By default that document is also the logical source endpoint, and `nodes.target` maps the target. An optional `nodes.source` template maps a different logical source; it requires an `edge.edge_id` mapping. Ownership still belongs to the producing document, so replay, deletion, and range transfers follow the fact even when neither endpoint is that document.
+
+Without `edge_id`, identity is `(index, source, type, target)`: repeated writes update the same relationship. With `edge_id`, identity also includes the producing document and the supplied ID. Two facts with the same endpoints and type therefore survive independently. A repeated explicit identity is an idempotent upsert. IDs are scoped to that identity, not globally unique, and a UUID stored only in metadata does not affect identity. Use a stable producer ID; random IDs generated during replay and array positions that change when input reorders are unsuitable.
+
+### Project searchable facts onto arbitrary endpoints
+
+This index keeps each fact as a normal document and projects its `relations` field into the graph:
+
+```json
+{
+  "type": "graph",
+  "source": {
+    "artifact": "fact_relations_v1",
+    "path": "$",
+    "nodes": {
+      "source": "{{ _item.source }}",
+      "target": "{{ _item.target }}"
+    },
+    "edge": {
+      "edge_id": "{{ _doc.key }}",
+      "type": "RELATES_TO",
+      "weight": "{{ _item.confidence }}"
+    }
+  },
+  "artifact": {
+    "name": "fact_relations_v1",
+    "kind": "asset",
+    "source": { "type": "field", "value": "relations" },
+    "content_type": "application/json"
+  }
+}
+```
+
+Insert these documents under keys `fact:works` and `fact:founded`:
+
+```json
+{
+  "fact": "Alice works at Acme",
+  "relations": [{ "source": "alice", "target": "acme", "confidence": 0.9 }]
+}
+```
+
+```json
+{
+  "fact": "Alice co-founded Acme",
+  "relations": [{ "source": "alice", "target": "acme", "confidence": 0.8 }]
+}
+```
+
+Both relationships have type `RELATES_TO`, so type filters continue to work. Their `edge_id` values distinguish the facts; `owner_document` in edge and path results identifies the producing document when it differs from the logical source. Fetch that document from the graph index's table for its text, embeddings, provenance, and validity fields. Endpoint hydration continues to return entity documents. For several same-pair relationships produced by one document, map a per-item UUID instead of `_doc.key`.
+
+Updating a fact's artifact replaces its previous relationship projection, including retiring relationships whose endpoints changed. Deleting the fact or removing its source artifact removes its relationships. Updating or deleting an endpoint document does not delete independently owned fact relationships; endpoints can exist without stored entity documents. Deleting one of several facts leaves the pair connected until its last relationship disappears. Ordered source precedence applies to the same complete relationship identity within one owner.
+
+Endpoint cleanup covers relationships stored on the deleting shard. It retires incident source-owned relationships, including parallel IDs and self loops. Retirement survives graph replay, reconstruction, and snapshot restore. Independently owned fact relationships keep their fact-document lifecycle. An explicit relationship write can revive that exact identity; a meaningful update to the producing document starts a new projection lifecycle. Rewriting an identical document preserves retirement. Explicit relationship deletion also survives replay and restore. Deleting a graph index clears its retirements before an index with the same name can be recreated.
+
+Node traversal returns distinct reached nodes; relationship matches and paths retain relationship IDs. K-shortest paths can differ only by fact ID. Type, weight, and metadata predicates apply to relationships before neighbor admission. Graph degree counts relationships, and existing unweighted PageRank, eigenvector, and HITS use relationship multiplicity; connectivity treats parallel relationships as the same connection. These metrics do not aggregate confidence weights. To compute distinct-neighbor degree or aggregate confidence, materialize a separate pair projection with an application-chosen aggregation rule. Tree types allow one parent relationship, including its ID, per source and type.
+
+For source-owned indexes, outgoing traversal routes directly to the source's shard. Incoming traversal uses an exact, bounded route directory fenced by topology and per-shard read generations; a cold entry uses compact reverse-index probes. When an index maps arbitrary source endpoints, outgoing and bidirectional expansion consult the pinned shard set because the fact can belong to any shard. Work and retained-byte budgets still apply. The owner shard maintains both endpoint adjacency directions locally; range transfer copies owner records and reconstructs endpoint adjacency.
+
+### Fact predicates, weighted paths, and counts
+
+Project traversal-relevant properties into each relation item alongside its endpoints:
+
+```json
+{
+  "fact": "Alice works at Acme",
+  "relations": [{
+    "source": "alice", "target": "acme", "confidence": 0.9,
+    "group_id": "team-a",
+    "valid_at": "2020-01-01T00:00:00Z", "invalid_at": null,
+    "created_at": "2020-02-01T00:00:00Z", "expired_at": null
+  }]
+}
+```
+
+Without an explicit metadata mapping, the relation item becomes edge metadata, preserving JSON nulls and numeric literals through field extraction, projection, repair, and restore. Edge weights are converted separately to double precision. These projected fields are updated with the fact document. Entity or fact hydration does not supply traversal predicates: the edge projection must carry them.
+
+Use `edge_filter` on `traverse`, `shortest_path`, `k_shortest_paths`, or on each MATCH edge. Every relationship in a variable-length MATCH edge must pass its filter. Filters apply before node deduplication, path ranking, OPTIONAL matching, NOT EXISTS checks, and counting. They work in either direction and across shards.
+
+```json
+{
+  "graph_queries": {
+    "fact_paths": {
+      "index": "facts",
+      "k_shortest_paths": {
+        "from": { "key": "alice" }, "to": { "key": "acme" },
+        "k": 2, "objective": "max_weight_product",
+        "edge_types": ["RELATES_TO"],
+        "edge_filter": {
+          "valid_at": "2022-01-01T00:00:00Z",
+          "known_at": "2023-01-01T00:00:00Z",
+          "properties": [{ "field": "/metadata/group_id", "op": "eq", "value": "team-a" }]
+        }
+      }
+    }
+  }
+}
+```
+
+`valid_at` tests the fact's `[valid_at, invalid_at)` interval; `known_at` tests its `[created_at, expired_at)` interval. Missing or null valid-time bounds are open. A knowledge-time test requires a non-null `created_at`. Invalid timestamp properties fail the filter. These names refer to metadata fields, distinct from the graph's physical creation/update timestamps. RFC3339 timezone offsets and fractions are compared as instants, including dates before 1970.
+
+Property predicates use JSON pointers, including `~0` and `~1` escaping and array indices, and combine with AND. Operators are `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `is_null`, and `is_not_null`. Supply a non-null scalar `value` for comparisons; omit it for null tests. Missing/null properties fail all comparisons, including `ne`, matching Cypher's WHERE behavior. Different scalar types do not compare. Numeric metadata literals compare exactly, including large integers, long decimals, and exponent notation. Stored edge weights compare using their shortest round-trip decimal, so a stored double-precision `0.1` matches `/weight` equal to `0.1`; distinct literals remain distinct. Strings compare lexically unless `value_type` is `datetime`, which requires RFC3339 strings. At most 64 predicates totaling 64 KiB are accepted, with up to 256 components per JSON pointer. Array indices use canonical unsigned decimal spelling. Metadata numbers retain their precision in graph responses. Filters prepare constants once and scan only the requested metadata paths; temporary decoding uses the graph query memory budget.
+
+Relationship IDs and owner document keys have no separate 64 KiB limit; they consume the existing request, storage, and graph work budgets. HTTP identities are nonempty UTF-8 strings. An explicit owner equal to the logical source is canonicalized to implicit source ownership, so specifying it does not create a second relationship identity.
+
+Embedded C ABI traversal, shortest-path, K-path, and named graph-query requests accept the same `edge_filter` object as HTTP. Edge and path responses carry `edge_id_b64` and `owner_document_b64`, preserving opaque native identifiers just like `source_b64` and `target_b64`. Path edges also expose `metadata_json` and `traversal_direction` (`0` outgoing, `1` incoming, `2` both; null for an unoriented self-loop). Traversal paths retain the exact selected fact relationship. Native Zig callers can use `findShortestPathWithOptions` and `findKShortestPathsWithOptions`; the original positional methods remain available.
+
+Path objectives are explicit: `min_hops`, `min_weight_sum` for nonnegative costs, or `max_weight_product` for confidence weights in `[0,1]`. Same-type parallel facts remain separate candidates, with their own weights and metadata. K paths can differ only by relationship ID and owner. Predicates choose the traversable graph first; they are not applied after selecting the cheapest path. Filtered queries use exact edge expansion when an algebraic optimization cannot prove equivalent results.
+
+Algebraic `provenance` labels are opaque strings. Versioned labels use the prefix `antfly:graph-provenance:v1:` and a lossless base64url payload. Read relationship IDs, owners, and endpoints from the structured `path_edges` fields rather than parsing provenance labels.
+
+For a fixed one-hop MATCH, `count(*)` counts relationship matches, while a distinct target alias counts connected entities. MATCH anchors enumerate stored documents: store entity documents alongside facts when using those entities as anchors. Direct traversal can start from a graph key without a stored entity document. For joins or variable-length patterns, `count(*)` counts complete matches, not globally unique relationships. For example:
+
+```json
+{
+  "graph_queries": {
+    "counts": {
+      "index": "facts",
+      "match": {
+        "anchor": "a",
+        "nodes": { "a": { "filter": { "ids": ["alice"] } }, "b": {} },
+        "edges": [{ "from": "a", "to": "b", "types": ["RELATES_TO"],
+          "edge_filter": { "valid_at": "2022-01-01T00:00:00Z" } }]
+      },
+      "return": { "aggregates": {
+        "facts": { "count": "*" },
+        "entities": { "count": "b", "distinct": true }
+      } }
+    }
+  }
+}
+```
+
+Neo4j also allows multiple same-type relationships between two nodes. Its [Cypher shortest-path selectors](https://neo4j.com/docs/cypher-manual/current/patterns/shortest-paths/) select by hop count and support relationship prefilters; weighted K paths are supplied by [GDS Yen's algorithm](https://neo4j.com/docs/graph-data-science/current/algorithms/yens/). Antfly exposes these behaviors through its graph query API rather than accepting Cypher. The two temporal intervals follow [Graphiti's fact model](https://help.getzep.com/facts).
+
+### Storage compatibility
+
+Implicit relationships retain their existing keys. Explicit identities use a versioned key suffix, and derived journal records containing them use format v8; ordinary batches continue to use v7. New readers accept existing v2–v7 journal records. Upgrade every replica, coordinator, and backup/restore reader before creating explicit relationships or enabling `nodes.source`. An older reader cannot interpret the new relationship keys, so downgrade requires removing the new projections and rebuilding compatible indexes and replay state. Relationship IDs remain scoped identities rather than globally unique UUIDs. Data-Raft admission rejects document and relationship writes until every applying replica supports protocol version 21, before catalog-dependent graph effects are extracted. HA replay independently requires batch envelope version 20 for these graph apply effects, including document-derived relationships; older standbys reject the envelope before applying any rows. The envelope preserves each control’s original schema and exact Raft receipts.
+
+Portable backups preserve each explicit relationship’s owner, logical endpoints, ID, weight, timestamps, and metadata in a dedicated relationship block. Such archives require AFB reader version 6 or later; older readers reject them before import. Backups containing only implicit relationships retain the legacy edge blocks and reader version 2 requirement. Archives containing durable endpoint retirements require reader version 7. Explicit relationships use derived journal version 8 and data-Raft protocol version 21; existing owner and TTL journals remain readable.
 
 ## Readiness Is Two Flags, Not One
 

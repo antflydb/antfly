@@ -2339,7 +2339,7 @@ fn batchRequiresTopologyArbitration(req: antfly.db.types.BatchRequest) bool {
 }
 
 fn batchMutatesDocuments(req: antfly.db.types.BatchRequest) bool {
-    return req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
+    return req.graph_endpoint_cleanup or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or
         req.graph_writes.len != 0 or req.graph_deletes.len != 0 or req.transaction != null;
 }
 
@@ -5429,6 +5429,8 @@ pub const DataServer = struct {
     /// thread to continue during blocking restore and catalog durability I/O.
     data_raft_reconcile_mutex: std.atomic.Mutex = .unlocked,
     initial_fk_retirement_running: std.atomic.Value(bool) = .init(false),
+    graph_cleanup_running: std.atomic.Value(bool) = .init(false),
+    graph_cleanup_sweep: @import("graph_cleanup_sweep.zig").Sweep = .{},
     initial_fk_retirement_last_at_ms: u64 = 0,
     initial_fk_retirement_deadline_ns: u64 = 0,
     initial_fk_retirement_recovery_cursor: @import("fk_retirement_worker.zig").RecoveryCursor = .{},
@@ -6396,6 +6398,34 @@ pub const DataServer = struct {
     fn continueInitialFkRetirement(ptr: *anyopaque) bool {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return !self.background_jobs_shutdown.load(.acquire) and platform_time.monotonicNs() < self.initial_fk_retirement_deadline_ns;
+    }
+
+    fn runGraphEndpointCleanupRound(self: *DataServer) !void {
+        const raft = self.data_raft orelse return;
+        if (self.graph_cleanup_running.swap(true, .acq_rel)) return;
+        defer self.graph_cleanup_running.store(false, .release);
+        if (self.background_jobs_shutdown.load(.acquire)) return;
+        // At most eight range probes per round; one indexed routing capture
+        // per sweep, with current leadership checked before every proposal.
+        const catalog = self.write_source.catalog;
+        const deadline = catalog.budget(null).nowNs() +| 100 * std.time.ns_per_ms;
+        for (0..8) |_| {
+            const visit = (try self.graph_cleanup_sweep.next(self.alloc, catalog, deadline)) orelse return;
+            const range = visit.range;
+            lockAtomic(&self.data_raft_mutex);
+            const leader = raft.host.http_host.host.isLocalLeader(range.group_id);
+            self.data_raft_mutex.unlock();
+            if (!leader) continue;
+            const table = visit.table orelse continue;
+            var response = (try self.read_source.source().lookupGroupLocal(self.alloc, range.group_id, table.name, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}" }, .leader_lease)) orelse continue;
+            defer response.deinit(self.alloc);
+            var status = try std.json.parseFromSlice(antfly.db.types.GraphEndpointCleanupStatus, self.alloc, response.json, .{});
+            defer status.deinit();
+            if (status.value.pending) {
+                try self.proposeRaftBatchGroupWithLeaderWait(self.alloc, range.group_id, table.name, status.value.request(), .{ .discovery = .cached, .allow_remote_forward = false, .visibility_cancellation = .fromAtomic(&self.background_jobs_shutdown) }, 100 * std.time.ns_per_ms);
+                return;
+            }
+        }
     }
 
     fn runInitialFkRetirementRound(self: *DataServer) !void {
@@ -9118,6 +9148,9 @@ pub const DataServer = struct {
         // Durable cleanup epochs survive transient allocation/queue failures;
         // the control loop is their allocation-free watchdog.
         self.write_source.maintainDroppedTableRecovery();
+        self.runGraphEndpointCleanupRound() catch |err| {
+            std.log.warn("graph endpoint cleanup deferred err={s}", .{@errorName(err)});
+        };
         self.runInitialFkRetirementRound() catch |err| {
             std.log.warn("initial FK retirement maintenance deferred err={s}", .{@errorName(err)});
         };
@@ -9465,6 +9498,7 @@ pub const DataServer = struct {
             self.alloc.destroy(executor);
             self.distributed_read_http_executor = null;
         }
+        self.graph_cleanup_sweep.deinit();
         self.initial_fk_retirement_recovery_cursor.deinit();
         self.initial_fk_retirement_gc_cursor.deinit();
         if (self.owned_backend_runtime) |*runtime| runtime.deinit();
@@ -12111,6 +12145,7 @@ pub const DataServer = struct {
     }
 
     fn requiredRaftBatchProtocolVersion(req: antfly.db.types.BatchRequest) u16 {
+        if (antfly.db.types.requiresGraphRelationshipProtocol(req)) return @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
         if (@import("../api/batch.zig").requiresRowSemanticsEnvelope(req.writes, req.predicates))
             return @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
         if (req.merge_proof_adoption != null) return data_raft_batch.merge_proof_adoption_protocol_version;
@@ -36633,13 +36668,37 @@ fn consumerTests() type {
         }
 
         test "data raft source finalization and receiver checkpoints apply document range metadata" {
+            const alloc = std.testing.allocator;
+            const artifact = try antfly.internal_keys.graphEdgeArtifactKeyAlloc(alloc, "a", "g", "R", "b");
+            defer alloc.free(artifact);
+            const retirement = try antfly.internal_keys.graphRetirementKeyAlloc(alloc, artifact);
+            defer alloc.free(retirement);
+            try std.testing.expectEqual(
+                @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version,
+                DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = retirement, .value = "1" }} }),
+            );
             const row_protocol = @import("../common/data_raft_protocol.zig").batch_row_semantics_protocol_version;
-            try std.testing.expectEqual(row_protocol, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"}]}}}" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "row", .value = "{\"j\":null}", .json_null_fields = &.{"j"} }} }));
             try std.testing.expectEqual(row_protocol, DataServer.requiredRaftBatchProtocolVersion(.{ .predicates = &.{.{ .key = "row", .expected_version = 0, .unique_absence = true }} }));
             try std.testing.expectEqual(
                 data_raft_batch.merge_artifacts_protocol_version,
                 DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = "artifact", .value = "payload" }} }),
             );
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .transaction = .{ .resolve = .{ .txn_id = @splat(0), .status = .committed, .commit_version = 1 } } }));
+            try std.testing.expect(DataServer.requiredRaftBatchProtocolVersion(.{ .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }) < data_raft_batch.merge_retirements_protocol_version);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .writes = &.{.{ .key = "a", .value = "{\"links\":[\"hub\"]}" }}, .transaction = .{ .prepare = .{ .txn_id = @splat(0), .topology_epoch = 1 } } }));
+            // A pending-target write is a deterministic rejection. It must
+            // advance the committed entry so the next cleanup page can apply.
+            try std.testing.expectEqual(error.IntegrityTopologyBusy, RaftTableApplyStateMachine.ExpectedApplyFailure.forRequest(error.IntegrityTopologyBusy, .{ .graph_writes = &.{.{ .index_name = "g", .source = "new", .target = "hub", .edge_type = "R" }} }).?.toError());
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"b"} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }} }));
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one" }} }));
+            const relationship = try antfly.internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact", "g", "R", "b", "a", "one");
+            defer alloc.free(relationship);
+            try std.testing.expectEqual(@import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version, DataServer.requiredRaftBatchProtocolVersion(.{ .merge_artifacts = &.{.{ .key = relationship, .value = "payload" }} }));
+
             try std.testing.expectEqual(
                 data_raft_batch.timestamp_protocol_version,
                 DataServer.requiredRaftBatchProtocolVersion(.{}),
@@ -46013,6 +46072,15 @@ pub const implementation_tests = implementationTests();
 fn implementationTests() type {
     if (!(@import("builtin").is_test and !control_only_storage_sources)) return struct {};
     const Suite = struct {
+        test "graph endpoint cleanup routing worker requires an attached Raft owner and generation protocol" {
+            var server: DataServer = undefined;
+            server.data_raft = null;
+            try server.runGraphEndpointCleanupRound();
+            const version = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
+            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true }));
+            try std.testing.expectEqual(version, DataServer.requiredRaftBatchProtocolVersion(.{ .deletes = &.{"hub"} }));
+        }
+
         test "data runtime native FK retirement preserves source ownership and exact cold path" {
             const alloc = std.testing.allocator;
             const hidden = @import("../storage/db/relational_initial_child_publication.zig");

@@ -5504,6 +5504,10 @@ pub fn cloneRemoteCanonicalGraphNodePathEdges(
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, item.type);
         errdefer alloc.free(edge_type);
+        const edge_id = if (item.edge_id) |id| try alloc.dupe(u8, id) else "";
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = if (item.owner_document) |owner| try alloc.dupe(u8, owner) else "";
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
         const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
@@ -5511,6 +5515,8 @@ pub fn cloneRemoteCanonicalGraphNodePathEdges(
             .target = target,
             .edge_type = edge_type,
             .weight = item.weight,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .metadata = metadata,
             .traversal_direction = switch (item.direction) {
                 .out => .out,
@@ -5531,6 +5537,8 @@ pub fn freeRemoteGraphNodePathEdgeItems(
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
     if (edges.len > 0) alloc.free(edges);
@@ -5599,6 +5607,8 @@ pub fn parseRemoteCanonicalGraphPath(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(edges);
@@ -5660,6 +5670,8 @@ pub fn parseRemoteCanonicalPathEdges(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (edges.len > 0) alloc.free(edges);
@@ -5673,6 +5685,10 @@ pub fn parseRemoteCanonicalPathEdges(
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, item.type);
         errdefer alloc.free(edge_type);
+        const edge_id = if (item.edge_id) |id| try alloc.dupe(u8, id) else "";
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = if (item.owner_document) |owner| try alloc.dupe(u8, owner) else "";
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
         const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
@@ -5680,6 +5696,8 @@ pub fn parseRemoteCanonicalPathEdges(
             .target = target,
             .edge_type = edge_type,
             .weight = item.weight,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .metadata = metadata,
             .traversal_direction = switch (item.direction) {
                 .out => .out,

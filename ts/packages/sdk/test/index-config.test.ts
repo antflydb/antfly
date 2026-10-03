@@ -291,7 +291,7 @@ describe("artifact embedding index configuration", () => {
     );
     expect(() =>
       graphIndexSources({ artifact: "relations", nodes: { source: "{{ _doc.key }}" } } as never)
-    ).toThrow(/not supported/);
+    ).toThrow(/requires edge.edge_id/);
     expect(() =>
       graphIndexSources({ artifact: "relations", nodes: { target: Number.POSITIVE_INFINITY } })
     ).toThrow(/nodes.target/);
@@ -302,4 +302,10 @@ describe("artifact embedding index configuration", () => {
       /not supported/
     );
   });
+});
+
+it("preserves arbitrary fact source and relationship ID", () => {
+  const sources = graphIndexSources({ artifact: "relations", path: "$", nodes: { source: "{{ _item.source }}", target: "{{ _item.target }}" }, edge: { edge_id: "{{ _doc.key }}", type: "RELATES_TO" } });
+  expect(sources[0].nodes?.source).toBe("{{ _item.source }}");
+  expect(sources[0].edge?.edge_id).toBe("{{ _doc.key }}");
 });

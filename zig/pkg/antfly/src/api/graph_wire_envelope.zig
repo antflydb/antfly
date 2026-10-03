@@ -23,7 +23,9 @@ pub fn captureRequestTransportAlloc(
     body: []const u8,
     expected_operations: anytype,
 ) !db_mod.types.GraphQueryTransport {
-    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{}) catch |err| switch (err) {
+    // This sidecar is forwarded verbatim to storage. Preserve predicate number
+    // tokens so transport cannot change the canonical execution plan's values.
+    var parsed = ant_json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.InvalidGraphWireEnvelope,
     };
@@ -44,15 +46,34 @@ pub fn captureRequestTransportAlloc(
     );
 }
 
-/// Capture an already-parsed canonical operation map. Serverless admission uses
-/// this after rejecting the legacy field, avoiding another parse of the public
-/// body while keeping canonical response encoding bound to the admitted plan.
+/// Capture an already-parsed canonical operation map. Callers must preserve
+/// predicate number tokens with parse_numbers=false when parsing that map.
 pub fn captureCanonicalOperationsAlloc(
     alloc: std.mem.Allocator,
     operations: std.json.Value,
     expected_operations: anytype,
 ) !db_mod.types.GraphQueryTransport {
     return captureOperationsAlloc(alloc, operations, expected_operations, .canonical);
+}
+
+/// Capture the typed, losslessly parsed canonical contract without building a
+/// second JSON tree. Raw routing envelopes may have already rounded numbers.
+pub fn captureTypedCanonicalOperationsAlloc(
+    alloc: std.mem.Allocator,
+    operations: anytype,
+    expected_operations: anytype,
+) !db_mod.types.GraphQueryTransport {
+    if (operations.map.count() != expected_operations.len) return error.InvalidGraphWireEnvelope;
+    for (expected_operations) |operation| {
+        if (operations.map.get(operation.name) == null) return error.InvalidGraphWireEnvelope;
+    }
+    const operations_json = try std.json.Stringify.valueAlloc(alloc, operations, .{ .emit_null_optional_fields = false });
+    return .{
+        .dialect = .canonical,
+        .operations_json = operations_json,
+        .admitted_operations_ptr = @ptrCast(expected_operations.ptr),
+        .admitted_operations_len = expected_operations.len,
+    };
 }
 
 fn captureOperationsAlloc(

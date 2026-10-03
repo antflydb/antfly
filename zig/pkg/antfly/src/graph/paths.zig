@@ -25,6 +25,7 @@
 //!   max_weight: Dijkstra log — maximize product of edge weights in [0, 1]
 
 const std = @import("std");
+const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
@@ -82,6 +83,12 @@ const GraphIndexEdgeReader = struct {
 pub const PathWeightMode = enum { min_hops, min_weight, max_weight };
 
 pub const PathFindOptions = struct {
+    edge_filter: relationship_filter.Filter = .{},
+    /// Optional qualified endpoints; null targets preserve legacy key-only selection.
+    source_table: ?[]const u8 = null,
+    target_table: ?[]const u8 = null,
+    // Yen owns one cache lease shared by all of its spur searches.
+    edge_filter_retained: bool = false,
     weight_mode: PathWeightMode = .min_hops,
     edge_types: []const []const u8 = &.{},
     direction: EdgeDirection = .out,
@@ -107,6 +114,8 @@ pub const PathFindOptions = struct {
 };
 
 pub const PathEdge = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
@@ -147,6 +156,8 @@ pub fn freePath(alloc: Allocator, path: Path) void {
         alloc.free(e.source);
         alloc.free(e.target);
         alloc.free(e.edge_type);
+        if (e.edge_id.len > 0) alloc.free(e.edge_id);
+        if (e.owner_document.len > 0) alloc.free(e.owner_document);
         if (e.metadata.len > 0) alloc.free(e.metadata);
     }
     alloc.free(path.edges);
@@ -174,11 +185,14 @@ const PathNode = struct {
 };
 
 const OwnedEdgeInfo = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
     weight: f64,
     metadata: []const u8 = "",
+    traversal_direction: ?EdgeDirection = null,
 };
 
 fn destroyPathNode(alloc: Allocator, node: *PathNode) void {
@@ -188,6 +202,8 @@ fn destroyPathNode(alloc: Allocator, node: *PathNode) void {
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
     alloc.destroy(node);
@@ -201,6 +217,7 @@ fn createPathNode(
     hops: u32,
     parent: ?*PathNode,
     edge: ?Edge,
+    direction: ?EdgeDirection,
 ) !*PathNode {
     const node = try alloc.create(PathNode);
     errdefer alloc.destroy(node);
@@ -215,14 +232,21 @@ fn createPathNode(
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, value.edge_type);
         errdefer alloc.free(edge_type);
+        const edge_id = try alloc.dupe(u8, value.edge_id);
+        errdefer alloc.free(edge_id);
+        const owner_document = try alloc.dupe(u8, value.owner_document);
+        errdefer alloc.free(owner_document);
         const metadata = if (value.metadata.len > 0) try alloc.dupe(u8, value.metadata) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
         break :blk .{
             .source = source,
             .target = target,
             .edge_type = edge_type,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .weight = value.weight,
             .metadata = metadata,
+            .traversal_direction = direction,
         };
     } else null;
     node.* = .{
@@ -237,19 +261,17 @@ fn createPathNode(
 }
 
 /// Table identity of the node an edge leads to, canonicalized against the
-/// index-owning table. Only a forward arrival (next_key == edge.target)
-/// carries the tag, mirroring the BFS traversal engine.
-fn canonicalNextNodeTable(opts: *const PathFindOptions, next_key: []const u8, edge: *const Edge) ?[]const u8 {
-    const table = if (std.mem.eql(u8, next_key, edge.target))
-        traversal_mod.metadataTargetTable(edge.metadata) orelse return null
-    else
-        traversal_mod.metadataSourceTable(edge.metadata) orelse return null;
-    if (opts.owning_table.len > 0 and std.mem.eql(u8, table, opts.owning_table)) return null;
-    return table;
+/// index-owning table. Forward arrivals read the target tag; reverse arrivals
+/// read the source tag, matching the BFS traversal engine.
+fn canonicalNextNodeTable(opts: *const PathFindOptions, table: ?[]const u8) ?[]const u8 {
+    const name = table orelse return null;
+    if (std.mem.eql(u8, name, opts.owning_table)) return null;
+    return name;
 }
 
 fn retainPathNodeState(
     key: []const u8,
+    table: ?[]const u8,
     edge: ?Edge,
     budget: *work_budget_mod.WorkBudget,
     retained_bytes: *usize,
@@ -259,8 +281,16 @@ fn retainPathNodeState(
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
     var added = std.math.add(usize, @sizeOf(PathNode) + 3 * @sizeOf(*PathNode), duplicated_key_bytes) catch
         return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    if (table) |name| {
+        // BFS owns both a node table and a visited identity table. This is
+        // also a conservative bound for Dijkstra, whose map borrows the node.
+        const table_bytes = std.math.mul(usize, 2, name.len) catch
+            return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+        added = std.math.add(usize, added, table_bytes) catch
+            return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
+    }
     if (edge) |value| {
-        for ([_][]const u8{ value.source, value.target, value.edge_type, value.metadata }) |part| {
+        for ([_][]const u8{ value.source, value.target, value.edge_type, value.edge_id, value.owner_document, value.metadata }) |part| {
             added = std.math.add(usize, added, part.len) catch
                 return budget.exhaust(.retained_state_bytes, budget.max_retained_state_bytes);
         }
@@ -270,6 +300,8 @@ fn retainPathNodeState(
 }
 
 const EdgeIdentity = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
@@ -281,13 +313,15 @@ const EdgeIdentityContext = struct {
         hashIdentityPart(&hasher, key.source);
         hashIdentityPart(&hasher, key.target);
         hashIdentityPart(&hasher, key.edge_type);
+        hashIdentityPart(&hasher, key.edge_id);
+        hashIdentityPart(&hasher, key.owner_document);
         return hasher.final();
     }
 
     pub fn eql(_: @This(), a: EdgeIdentity, b: EdgeIdentity) bool {
         return std.mem.eql(u8, a.source, b.source) and
             std.mem.eql(u8, a.target, b.target) and
-            std.mem.eql(u8, a.edge_type, b.edge_type);
+            std.mem.eql(u8, a.edge_id, b.edge_id) and std.mem.eql(u8, a.owner_document, b.owner_document) and std.mem.eql(u8, a.edge_type, b.edge_type);
     }
 
     fn hashIdentityPart(hasher: *std.hash.Wyhash, value: []const u8) void {
@@ -338,11 +372,15 @@ fn putExcludedEdge(
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
+    edge_id: []const u8,
+    owner_document: []const u8,
 ) !void {
     const borrowed: EdgeIdentity = .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
     };
     if (set.contains(borrowed)) return;
 
@@ -352,7 +390,13 @@ fn putExcludedEdge(
     errdefer alloc.free(owned_target);
     const owned_edge_type = try alloc.dupe(u8, edge_type);
     errdefer alloc.free(owned_edge_type);
+    const owned_id = try alloc.dupe(u8, edge_id);
+    errdefer alloc.free(owned_id);
+    const owned_owner = try alloc.dupe(u8, owner_document);
+    errdefer alloc.free(owned_owner);
     try set.putNoClobber(alloc, .{
+        .edge_id = owned_id,
+        .owner_document = owned_owner,
         .source = owned_source,
         .target = owned_target,
         .edge_type = owned_edge_type,
@@ -365,6 +409,8 @@ fn deinitExcludedEdges(set: *ExcludedEdgeSet, alloc: Allocator) void {
         alloc.free(key.source);
         alloc.free(key.target);
         alloc.free(key.edge_type);
+        if (key.edge_id.len > 0) alloc.free(key.edge_id);
+        if (key.owner_document.len > 0) alloc.free(key.owner_document);
     }
     set.deinit(alloc);
 }
@@ -417,7 +463,7 @@ pub fn findShortestPathWithExclusions(
     source: []const u8,
     target: []const u8,
     opts: PathFindOptions,
-    excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
+    excluded_nodes: ?*const node_identity.Map(void),
     excluded_edges: ?*const ExcludedEdgeSet,
 ) !?Path {
     return findShortestPathWithExclusionsAndEdgeReader(
@@ -438,7 +484,7 @@ fn findShortestPathWithExclusionsAndEdgeReader(
     source: []const u8,
     target: []const u8,
     opts: PathFindOptions,
-    excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
+    excluded_nodes: ?*const node_identity.Map(void),
     excluded_edges: ?*const ExcludedEdgeSet,
     returned_state_budget: ?*work_budget_mod.WorkBudget,
 ) !?Path {
@@ -447,38 +493,30 @@ fn findShortestPathWithExclusionsAndEdgeReader(
         work_budget_mod.default_max_explored_edges,
     );
     var effective_opts = opts;
+    effective_opts.edge_filter = try opts.edge_filter.prepare(alloc);
+    defer if (opts.edge_filter.prepared == null) effective_opts.edge_filter.releasePrepared(alloc);
     if (effective_opts.work_budget == null) effective_opts.work_budget = &local_work_budget;
+    var filter_lease = try work_budget_mod.RetainedLease.init(effective_opts.work_budget, if (opts.edge_filter_retained) 0 else effective_opts.edge_filter.retainedBytes());
+    defer filter_lease.deinit();
+    effective_opts.edge_filter_retained = true;
 
     if (effective_opts.node_admission) |admission| {
-        if (!try traversal_mod.startNodeAdmittedWithEdgeReader(alloc, edge_reader, source, effective_opts.direction, admission, effective_opts.work_budget)) {
-            return null;
-        }
+        if (canonicalNextNodeTable(&effective_opts, effective_opts.source_table)) |table| {
+            const mask = try admission.filterAlloc(alloc, &.{.{ .key = source, .table = table, .external = true }});
+            defer alloc.free(mask);
+            if (!mask[0]) return null;
+        } else if (!try traversal_mod.startNodeAdmittedWithEdgeReader(alloc, edge_reader, source, effective_opts.direction, admission, effective_opts.work_budget)) return null;
     }
 
     // Same source and target — trivial path
-    if (std.mem.eql(u8, source, target)) {
-        const retained_bytes = std.math.add(usize, @sizeOf(Path) + @sizeOf([]const u8), source.len) catch
-            return effective_opts.work_budget.?.exhaust(.retained_state_bytes, effective_opts.work_budget.?.max_retained_state_bytes);
-        try effective_opts.work_budget.?.retainStateBytes(retained_bytes);
-        errdefer effective_opts.work_budget.?.releaseStateBytes(retained_bytes);
-        const node = try alloc.dupe(u8, source);
-        var node_owned = true;
-        errdefer if (node_owned) alloc.free(node);
-        const nodes = try alloc.alloc([]const u8, 1);
-        errdefer alloc.free(nodes);
-        nodes[0] = node;
-        const edges = try alloc.alloc(PathEdge, 0);
-        errdefer alloc.free(edges);
-        const path = Path{
-            .nodes = nodes,
-            .edges = edges,
-            .total_weight = 0.0,
-            .length = 0,
-            .retained_budget = returned_state_budget,
-            .retained_state_bytes = retained_bytes,
-        };
-        node_owned = false;
-        return path;
+    if (pathTargetMatches(source, canonicalNextNodeTable(&effective_opts, effective_opts.source_table), target, effective_opts)) {
+        const table = canonicalNextNodeTable(&effective_opts, effective_opts.source_table);
+        var node_bytes: usize = 0;
+        try retainPathNodeState(source, table, null, effective_opts.work_budget.?, &node_bytes);
+        defer effective_opts.work_budget.?.releaseStateBytes(node_bytes);
+        const node = try createPathNode(alloc, source, table, 0, 0, null, null, null);
+        defer destroyPathNode(alloc, node);
+        return try reconstructPath(alloc, node, effective_opts.work_budget.?, returned_state_budget);
     }
 
     if (effective_opts.weight_mode == .min_hops) {
@@ -498,7 +536,7 @@ fn bfsShortestPath(
     source: []const u8,
     target: []const u8,
     opts: PathFindOptions,
-    excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
+    excluded_nodes: ?*const node_identity.Map(void),
     excluded_edges: ?*const ExcludedEdgeSet,
     returned_state_budget: ?*work_budget_mod.WorkBudget,
 ) !?Path {
@@ -524,14 +562,14 @@ fn bfsShortestPath(
     // Seed
     try work_budget.checkIntermediateStates(1, opts.max_intermediate_states);
     try work_budget.consumeNode();
-    try retainPathNodeState(source, null, work_budget, &retained_node_bytes);
-    const start = try createPathNode(alloc, source, null, 0, 0, null, null);
+    try retainPathNodeState(source, canonicalNextNodeTable(&opts, opts.source_table), null, work_budget, &retained_node_bytes);
+    const start = try createPathNode(alloc, source, canonicalNextNodeTable(&opts, opts.source_table), 0, 0, null, null, null);
     var start_owned = true;
     errdefer if (start_owned) destroyPathNode(alloc, start);
     try node_pool.append(alloc, start);
     start_owned = false;
     try queue.append(alloc, start);
-    _ = try visited.putIfAbsent(alloc, .{ .table = null, .key = source }, {});
+    _ = try visited.putIfAbsent(alloc, .{ .table = start.table, .key = source }, {});
 
     while (queue_head < queue.items.len) {
         const current = queue.items[queue_head];
@@ -548,6 +586,8 @@ fn bfsShortestPath(
         defer stream.deinit();
         while (try stream.nextBudget(work_budget, edge_stream.batch_records)) |edges| {
             defer edge_reader.freeEdges(alloc, edges);
+            var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+            defer table_scratch.deinit();
             try work_budget.consumeMaterializedEdges(edges);
 
             const admitted_edges = if (opts.node_admission) |admission| blk: {
@@ -561,25 +601,27 @@ fn bfsShortestPath(
                 try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
-                    if (!shouldTraverseEdge(opts, &edge)) continue;
-                    const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
-                    if (excluded_nodes) |en| if (en.contains(next_key)) continue;
+                    if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
+                    const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, current.table, if (opts.owning_table.len > 0) opts.owning_table else null, opts.direction);
+                    if (!endpoint.connected) continue;
+                    const next_key = endpoint.key;
+                    if (excluded_nodes) |en| if (en.contains(.{ .key = next_key, .table = canonicalNextNodeTable(&opts, endpoint.table) })) continue;
                     if (excluded_edges) |ee| {
                         if (ee.contains(.{
                             .source = edge.source,
                             .target = edge.target,
                             .edge_type = edge.edge_type,
+                            .edge_id = edge.edge_id,
+                            .owner_document = edge.owner_document,
                         })) continue;
                     }
-                    const target_table = canonicalNextNodeTable(&opts, next_key, &edge);
+                    const target_table = canonicalNextNodeTable(&opts, endpoint.table);
                     if (visited.contains(.{ .table = target_table, .key = next_key })) continue;
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = next_key,
                         .table = target_table,
-                        .external = std.mem.eql(u8, next_key, edge.target) and
-                            (admission.external_targets or
-                                target_table != null),
+                        .external = target_table != null or (endpoint.direction != .in and admission.external_targets),
                     });
                 }
                 const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
@@ -592,29 +634,33 @@ fn bfsShortestPath(
             defer if (admitted_edges) |mask| alloc.free(mask);
 
             for (edges, 0..) |edge, edge_index| {
-                const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, current.table, if (opts.owning_table.len > 0) opts.owning_table else null, opts.direction);
+                if (!endpoint.connected) continue;
+                const next_key = endpoint.key;
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
-                    if (!shouldTraverseEdge(opts, &edge)) continue;
-                    if (excluded_nodes) |en| if (en.contains(next_key)) continue;
+                    if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
+                    if (excluded_nodes) |en| if (en.contains(.{ .key = next_key, .table = canonicalNextNodeTable(&opts, endpoint.table) })) continue;
                     if (excluded_edges) |ee| {
                         if (ee.contains(.{
                             .source = edge.source,
                             .target = edge.target,
                             .edge_type = edge.edge_type,
+                            .edge_id = edge.edge_id,
+                            .owner_document = edge.owner_document,
                         })) continue;
                     }
                 }
-                const next_table = canonicalNextNodeTable(&opts, next_key, &edge);
+                const next_table = canonicalNextNodeTable(&opts, endpoint.table);
                 if (visited.contains(.{ .table = next_table, .key = next_key })) continue;
-                const is_target = std.mem.eql(u8, next_key, target);
+                const is_target = pathTargetMatches(next_key, next_table, target, opts);
                 if (!is_target) {
                     const pending_states = queue.items.len - queue_head;
                     try work_budget.checkIntermediateStates(pending_states + 1, opts.max_intermediate_states);
                 }
                 try work_budget.consumeNode();
-                try retainPathNodeState(next_key, edge, work_budget, &retained_node_bytes);
+                try retainPathNodeState(next_key, next_table, edge, work_budget, &retained_node_bytes);
                 _ = try visited.putIfAbsent(alloc, .{ .table = next_table, .key = next_key }, {});
 
                 const node = try createPathNode(
@@ -625,6 +671,7 @@ fn bfsShortestPath(
                     current.hops + 1,
                     current,
                     edge,
+                    endpoint.direction,
                 );
                 var node_owned = true;
                 errdefer if (node_owned) destroyPathNode(alloc, node);
@@ -654,7 +701,7 @@ fn dijkstraPath(
     source: []const u8,
     target: []const u8,
     opts: PathFindOptions,
-    excluded_nodes: ?*const std.StringHashMapUnmanaged(void),
+    excluded_nodes: ?*const node_identity.Map(void),
     excluded_edges: ?*const ExcludedEdgeSet,
     returned_state_budget: ?*work_budget_mod.WorkBudget,
 ) !?Path {
@@ -679,21 +726,21 @@ fn dijkstraPath(
 
     try work_budget.checkIntermediateStates(1, opts.max_intermediate_states);
     try work_budget.consumeNode();
-    try retainPathNodeState(source, null, work_budget, &retained_node_bytes);
-    const start = try createPathNode(alloc, source, null, 0.0, 0, null, null);
+    try retainPathNodeState(source, canonicalNextNodeTable(&opts, opts.source_table), null, work_budget, &retained_node_bytes);
+    const start = try createPathNode(alloc, source, canonicalNextNodeTable(&opts, opts.source_table), 0.0, 0, null, null, null);
     var start_owned = true;
     errdefer if (start_owned) destroyPathNode(alloc, start);
     try node_pool.append(alloc, start);
     start_owned = false;
     try heap.push(alloc, start);
-    try best_dist.put(alloc, .{ .node = start.key, .hops = 0 }, 0.0);
+    try best_dist.put(alloc, .{ .node = start.key, .table = start.table, .hops = 0 }, 0.0);
 
     while (heap.pop()) |current| {
         if (pathStateDominated(&best_dist, current.key, current.table, current.hops, current.distance, true)) continue;
 
         // Dijkstra may return on settlement because pathEdgeCost guarantees a
         // non-negative additive cost for every admitted edge.
-        if (std.mem.eql(u8, current.key, target))
+        if (pathTargetMatches(current.key, current.table, target, opts))
             return try reconstructPath(alloc, current, work_budget, returned_state_budget);
 
         if (opts.max_depth > 0 and current.hops >= opts.max_depth) continue;
@@ -705,6 +752,8 @@ fn dijkstraPath(
         defer stream.deinit();
         while (try stream.nextBudget(work_budget, edge_stream.batch_records)) |edges| {
             defer edge_reader.freeEdges(alloc, edges);
+            var table_scratch = traversal_mod.MetadataScratch.init(alloc, work_budget);
+            defer table_scratch.deinit();
             try work_budget.consumeMaterializedEdges(edges);
 
             const admitted_edges = if (opts.node_admission) |admission| blk: {
@@ -718,24 +767,26 @@ fn dijkstraPath(
                 try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
-                    if (!shouldTraverseEdge(opts, &edge)) continue;
-                    const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
-                    if (excluded_nodes) |en| if (en.contains(next_key)) continue;
+                    if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
+                    const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, current.table, if (opts.owning_table.len > 0) opts.owning_table else null, opts.direction);
+                    if (!endpoint.connected) continue;
+                    const next_key = endpoint.key;
+                    if (excluded_nodes) |en| if (en.contains(.{ .key = next_key, .table = canonicalNextNodeTable(&opts, endpoint.table) })) continue;
                     if (excluded_edges) |ee| {
                         if (ee.contains(.{
                             .source = edge.source,
                             .target = edge.target,
                             .edge_type = edge.edge_type,
+                            .edge_id = edge.edge_id,
+                            .owner_document = edge.owner_document,
                         })) continue;
                     }
-                    const target_table = canonicalNextNodeTable(&opts, next_key, &edge);
+                    const target_table = canonicalNextNodeTable(&opts, endpoint.table);
                     candidate_indexes.appendAssumeCapacity(edge_index);
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = next_key,
                         .table = target_table,
-                        .external = std.mem.eql(u8, next_key, edge.target) and
-                            (admission.external_targets or
-                                target_table != null),
+                        .external = target_table != null or (endpoint.direction != .in and admission.external_targets),
                     });
                 }
                 const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
@@ -748,29 +799,33 @@ fn dijkstraPath(
             defer if (admitted_edges) |mask| alloc.free(mask);
 
             for (edges, 0..) |edge, edge_index| {
-                const next_key = if (std.mem.eql(u8, current.key, edge.source)) edge.target else edge.source;
+                const endpoint = try traversal_mod.resolveAdjacent(&table_scratch, edge, current.key, current.table, if (opts.owning_table.len > 0) opts.owning_table else null, opts.direction);
+                if (!endpoint.connected) continue;
+                const next_key = endpoint.key;
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
-                    if (!shouldTraverseEdge(opts, &edge)) continue;
-                    if (excluded_nodes) |en| if (en.contains(next_key)) continue;
+                    if (!try shouldTraverseEdge(alloc, opts, &edge)) continue;
+                    if (excluded_nodes) |en| if (en.contains(.{ .key = next_key, .table = canonicalNextNodeTable(&opts, endpoint.table) })) continue;
                     if (excluded_edges) |ee| {
                         if (ee.contains(.{
                             .source = edge.source,
                             .target = edge.target,
                             .edge_type = edge.edge_type,
+                            .edge_id = edge.edge_id,
+                            .owner_document = edge.owner_document,
                         })) continue;
                     }
                 }
 
-                const next_table = canonicalNextNodeTable(&opts, next_key, &edge);
+                const next_table = canonicalNextNodeTable(&opts, endpoint.table);
                 const new_dist = current.distance + try pathEdgeCost(opts.weight_mode, edge.weight);
                 const next_hops = current.hops + 1;
                 if (!pathStateDominated(&best_dist, next_key, next_table, next_hops, new_dist, false)) {
                     try work_budget.checkIntermediateStates(heap.items.len + 1, opts.max_intermediate_states);
                     try work_budget.consumeNode();
-                    try retainPathNodeState(next_key, edge, work_budget, &retained_node_bytes);
-                    const node = try createPathNode(alloc, next_key, next_table, new_dist, next_hops, current, edge);
+                    try retainPathNodeState(next_key, next_table, edge, work_budget, &retained_node_bytes);
+                    const node = try createPathNode(alloc, next_key, next_table, new_dist, next_hops, current, edge, endpoint.direction);
                     var node_owned = true;
                     errdefer if (node_owned) destroyPathNode(alloc, node);
                     try node_pool.append(alloc, node);
@@ -825,8 +880,13 @@ pub fn findKShortestPathsWithEdgeReader(
         work_budget_mod.default_max_explored_edges,
     );
     var effective_opts = opts;
+    effective_opts.edge_filter = try opts.edge_filter.prepare(alloc);
+    defer if (opts.edge_filter.prepared == null) effective_opts.edge_filter.releasePrepared(alloc);
     const uses_local_work_budget = effective_opts.work_budget == null;
     if (effective_opts.work_budget == null) effective_opts.work_budget = &local_work_budget;
+    var filter_lease = try work_budget_mod.RetainedLease.init(effective_opts.work_budget, if (opts.edge_filter_retained) 0 else effective_opts.edge_filter.retainedBytes());
+    defer filter_lease.deinit();
+    effective_opts.edge_filter_retained = true;
     // Yen needs releasable leases for transient spur/candidate paths. Strip the
     // local pointer only from paths that actually escape this function.
     const transient_state_budget = effective_opts.work_budget;
@@ -898,12 +958,8 @@ pub fn findKShortestPathsWithEdgeReader(
             var excluded_edges = ExcludedEdgeSet.empty;
             defer deinitExcludedEdges(&excluded_edges, alloc);
 
-            var excluded_nodes = std.StringHashMapUnmanaged(void).empty;
-            defer {
-                var nit = excluded_nodes.keyIterator();
-                while (nit.next()) |nk| alloc.free(nk.*);
-                excluded_nodes.deinit(alloc);
-            }
+            var excluded_nodes = node_identity.Map(void){};
+            defer excluded_nodes.deinit(alloc);
 
             // For each existing result path, if the root path matches,
             // exclude the edge from spur node to next node
@@ -919,18 +975,18 @@ pub fn findKShortestPathsWithEdgeReader(
                     edge.source,
                     edge.target,
                     edge.edge_type,
+                    edge.edge_id,
+                    edge.owner_document,
                 );
             }
 
             // Exclude root path nodes (except spur node)
             for (0..spur_idx) |i| {
-                const node_key = prev_path.nodes[i];
-                if (!excluded_nodes.contains(node_key)) {
-                    try excluded_nodes.put(alloc, try alloc.dupe(u8, node_key), {});
-                }
+                _ = try excluded_nodes.putIfAbsent(alloc, .{ .key = prev_path.nodes[i], .table = pathNodeTable(prev_path, i) }, {});
             }
 
             var spur_opts = effective_opts;
+            spur_opts.source_table = pathNodeTable(prev_path, spur_idx);
             if (effective_opts.max_depth > 0) {
                 const root_hops: u32 = @intCast(spur_idx);
                 if (root_hops >= effective_opts.max_depth) continue;
@@ -1052,16 +1108,28 @@ fn getEdgesForPathBudget(
 // Helpers
 // ============================================================================
 
-fn shouldTraverseEdge(opts: PathFindOptions, edge: *const Edge) bool {
-    if (opts.min_weight) |min_weight| if (edge.weight < min_weight) return false;
-    if (opts.max_weight) |max_weight| if (edge.weight > max_weight) return false;
+fn pathNodeTable(path: *const Path, index: usize) ?[]const u8 {
+    return if (path.node_tables.len == path.nodes.len) path.node_tables[index] else null;
+}
+
+fn pathTargetMatches(key: []const u8, table: ?[]const u8, target: []const u8, opts: PathFindOptions) bool {
+    return std.mem.eql(u8, key, target) and (opts.target_table == null or optionalStringEql(table, canonicalNextNodeTable(&opts, opts.target_table)));
+}
+
+fn shouldTraverseEdge(alloc: Allocator, opts: PathFindOptions, edge: *const Edge) !bool {
+    if (opts.min_weight) |bound| if (edge.weight < bound) return false;
+    if (opts.max_weight) |bound| if (edge.weight > bound) return false;
     if (opts.edge_types.len > 0) {
+        var matched = false;
         for (opts.edge_types) |et| {
-            if (std.mem.eql(u8, edge.edge_type, et)) return true;
+            if (std.mem.eql(u8, edge.edge_type, et)) {
+                matched = true;
+                break;
+            }
         }
-        return false;
+        if (!matched) return false;
     }
-    return true;
+    return opts.edge_filter.matchesWithBudget(alloc, edge.*, opts.work_budget);
 }
 
 pub fn pathEdgeCost(mode: PathWeightMode, weight: f64) !f64 {
@@ -1095,19 +1163,25 @@ pub fn sumPathEdgeWeights(edges: anytype) !f64 {
     return total;
 }
 
-fn clonePathEdge(alloc: Allocator, edge: anytype) !PathEdge {
+pub fn clonePathEdge(alloc: Allocator, edge: anytype) !PathEdge {
     const source = try alloc.dupe(u8, edge.source);
     errdefer alloc.free(source);
     const target = try alloc.dupe(u8, edge.target);
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     errdefer if (metadata.len > 0) alloc.free(metadata);
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = if (@hasField(@TypeOf(edge), "traversal_direction"))
@@ -1208,10 +1282,10 @@ test "path weight filters preserve explicit zero bounds" {
     const zero = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0, .created_at = 0, .updated_at = 0, .metadata = "" };
     const positive = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = 0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
     const negative = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = -0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
-    try std.testing.expect(shouldTraverseEdge(.{ .max_weight = 0 }, &zero));
-    try std.testing.expect(!shouldTraverseEdge(.{ .max_weight = 0 }, &positive));
-    try std.testing.expect(shouldTraverseEdge(.{ .max_weight = 0 }, &negative));
-    try std.testing.expect(!shouldTraverseEdge(.{ .min_weight = 0 }, &negative));
+    try std.testing.expect(try shouldTraverseEdge(std.testing.allocator, .{ .max_weight = 0 }, &zero));
+    try std.testing.expect(!try shouldTraverseEdge(std.testing.allocator, .{ .max_weight = 0 }, &positive));
+    try std.testing.expect(try shouldTraverseEdge(std.testing.allocator, .{ .max_weight = 0 }, &negative));
+    try std.testing.expect(!try shouldTraverseEdge(std.testing.allocator, .{ .min_weight = 0 }, &negative));
 }
 
 test "path scoring follows the selected objective" {
@@ -1268,14 +1342,20 @@ fn reconstructPath(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(path_edges);
     }
 
-    var node_tables = try alloc.alloc(?[]const u8, count);
-    @memset(node_tables, null);
     var any_table = false;
+    n = end_node;
+    while (n) |node| : (n = node.parent) if (node.table != null) {
+        any_table = true;
+    };
+    const node_tables = if (any_table) try alloc.alloc(?[]const u8, count) else try alloc.alloc(?[]const u8, 0);
+    @memset(node_tables, null);
     errdefer {
         for (node_tables) |table| if (table) |value| alloc.free(value);
         alloc.free(node_tables);
@@ -1301,12 +1381,7 @@ fn reconstructPath(
     const total_weight = try sumPathEdgeWeights(path_edges);
 
     // Preserve the "empty means all query-table" contract for pure-local
-    // paths so existing consumers see no shape change. Last fallible step is
-    // above, so the collapsed empty slice never reaches the errdefer.
-    if (!any_table) {
-        alloc.free(node_tables);
-        node_tables = &.{};
-    }
+    // paths so existing consumers see no shape change.
 
     return Path{
         .nodes = nodes,
@@ -1321,17 +1396,25 @@ fn reconstructPath(
 
 fn reconstructedPathOwnedBytes(end_node: *const PathNode) !usize {
     var total: usize = @sizeOf(Path);
+    var count: usize = 0;
+    var any_table = false;
     var cursor: ?*const PathNode = end_node;
     while (cursor) |node| : (cursor = node.parent) {
+        count += 1;
+        if (node.table) |table| {
+            any_table = true;
+            total = try std.math.add(usize, total, table.len);
+        }
         total = try std.math.add(usize, total, @sizeOf([]const u8));
         total = try std.math.add(usize, total, node.key.len);
         if (node.parent_edge) |edge| {
             total = try std.math.add(usize, total, @sizeOf(PathEdge));
-            for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part| {
+            for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part| {
                 total = try std.math.add(usize, total, part.len);
             }
         }
     }
+    if (any_table) total = try std.math.add(usize, total, try std.math.mul(usize, count, @sizeOf(?[]const u8)));
     return total;
 }
 
@@ -1351,7 +1434,7 @@ fn pathToKey(alloc: Allocator, path: *const Path) ![]u8 {
     for (path.edges) |edge| {
         total_len = std.math.add(usize, total_len, 1) catch
             return error.PathIdentityTooLarge;
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document }) |part| {
             total_len = std.math.add(usize, total_len, @sizeOf(u64)) catch
                 return error.PathIdentityTooLarge;
             total_len = std.math.add(usize, total_len, part.len) catch
@@ -1384,7 +1467,7 @@ fn pathToKey(alloc: Allocator, path: *const Path) ![]u8 {
             .both => 3,
         } else 0;
         pos += 1;
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type }) |part| {
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document }) |part| {
             std.mem.writeInt(u64, buf[pos..][0..8], @intCast(part.len), .little);
             pos += 8;
             @memcpy(buf[pos..][0..part.len], part);
@@ -1426,7 +1509,7 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
 fn pathEdgeIdentityEql(a: PathEdge, b: PathEdge) bool {
     return std.mem.eql(u8, a.source, b.source) and
         std.mem.eql(u8, a.target, b.target) and
-        std.mem.eql(u8, a.edge_type, b.edge_type) and
+        std.mem.eql(u8, a.edge_id, b.edge_id) and std.mem.eql(u8, a.owner_document, b.owner_document) and std.mem.eql(u8, a.edge_type, b.edge_type) and
         a.traversal_direction == b.traversal_direction;
 }
 
@@ -1457,13 +1540,23 @@ fn joinedPathOwnedBytes(root: *const Path, spur_idx: usize, spur: *const Path) !
     for (root.nodes[0..spur_idx]) |node| total = try std.math.add(usize, total, node.len);
     for (spur.nodes) |node| total = try std.math.add(usize, total, node.len);
     for (root.edges[0..spur_idx]) |edge| {
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part|
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part|
             total = try std.math.add(usize, total, part.len);
     }
     for (spur.edges) |edge| {
-        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.metadata }) |part|
+        for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part|
             total = try std.math.add(usize, total, part.len);
     }
+    var any_table = false;
+    for (0..spur_idx) |i| if (pathNodeTable(root, i)) |table| {
+        any_table = true;
+        total = try std.math.add(usize, total, table.len);
+    };
+    for (0..spur.nodes.len) |i| if (pathNodeTable(spur, i)) |table| {
+        any_table = true;
+        total = try std.math.add(usize, total, table.len);
+    };
+    if (any_table) total = try std.math.add(usize, total, try std.math.mul(usize, node_count, @sizeOf(?[]const u8)));
     return total;
 }
 
@@ -1486,9 +1579,33 @@ fn joinPaths(alloc: Allocator, root: *const Path, spur_idx: usize, spur: *const 
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(edges);
+    }
+
+    var any_table = false;
+    for (0..root_node_count) |i| if (pathNodeTable(root, i) != null) {
+        any_table = true;
+    };
+    for (0..spur.nodes.len) |i| if (pathNodeTable(spur, i) != null) {
+        any_table = true;
+    };
+    const node_tables = if (any_table) try alloc.alloc(?[]const u8, total_nodes) else try alloc.alloc(?[]const u8, 0);
+    @memset(node_tables, null);
+    errdefer {
+        for (node_tables) |table| if (table) |value| alloc.free(value);
+        alloc.free(node_tables);
+    }
+    if (any_table) {
+        for (0..root_node_count) |i| if (pathNodeTable(root, i)) |table| {
+            node_tables[i] = try alloc.dupe(u8, table);
+        };
+        for (0..spur.nodes.len) |i| if (pathNodeTable(spur, i)) |table| {
+            node_tables[root_node_count + i] = try alloc.dupe(u8, table);
+        };
     }
 
     // Copy root nodes and edges up to spur_idx
@@ -1513,6 +1630,7 @@ fn joinPaths(alloc: Allocator, root: *const Path, spur_idx: usize, spur: *const 
 
     return Path{
         .nodes = nodes,
+        .node_tables = node_tables,
         .edges = edges,
         .total_weight = tw,
         .length = @intCast(total_edges),
@@ -1789,6 +1907,33 @@ test "k shortest paths" {
     try std.testing.expect(found_paths[1].total_weight <= found_paths[2].total_weight);
 }
 
+test "k shortest paths preserve same type fact relationship ids" {
+    const alloc = std.testing.allocator;
+    var sb: [256]u8 = undefined;
+    const store_path = tmpPath(&sb, "k-fact-id-s");
+    defer cleanupTmp(store_path);
+    var rb: [256]u8 = undefined;
+    const reverse_path = tmpPath(&rb, "k-fact-id-r");
+    defer cleanupTmp(reverse_path);
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+    var graph = try GraphIndex.open(alloc, &store, reverse_path, "facts", .{});
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "A", .target = "B", .edge_type = "RELATES_TO", .edge_id = "works", .owner_document = "fact:works", .weight = 1 },
+        .{ .source = "A", .target = "B", .edge_type = "RELATES_TO", .edge_id = "founded", .owner_document = "fact:founded", .weight = 2 },
+        .{ .source = "B", .target = "C", .edge_type = "RELATES_TO" },
+    }, &.{});
+    const found = try findKShortestPaths(alloc, &graph, "A", "C", 2, .{ .weight_mode = .min_weight });
+    defer freePaths(alloc, found);
+    try std.testing.expectEqual(@as(usize, 2), found.len);
+    try std.testing.expectEqualStrings("works", found[0].edges[0].edge_id);
+    try std.testing.expectEqualStrings("founded", found[1].edges[0].edge_id);
+    try std.testing.expectEqualStrings("fact:works", found[0].edges[0].owner_document);
+    try std.testing.expectEqual(@as(f64, 2), found[0].total_weight);
+    try std.testing.expectEqual(@as(f64, 3), found[1].total_weight);
+}
+
 test "k shortest paths preserve parallel typed edge identities" {
     const alloc = std.testing.allocator;
     var sb: [256]u8 = undefined;
@@ -2036,7 +2181,7 @@ test "path search honors the cross-table expansion policy" {
 
     // The only route to the event runs THROUGH a cross-table entity node.
     try g.addEdge("doc:a", "entity/ada", "mentions", 1.0, 0, 0, "{\"target_table\":\"entities\"}");
-    try g.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"target_table\":\"events\"}");
+    try g.addEdge("entity/ada", "event/xyz", "participates_in", 1.0, 0, 0, "{\"source_table\":\"entities\",\"target_table\":\"events\"}");
 
     for ([_]PathWeightMode{ .min_hops, .min_weight }) |mode| {
         // Default policy: the search must not continue through the tagged
@@ -2148,4 +2293,215 @@ test "consumed path state detaches its request-scoped release hook" {
     try std.testing.expectEqual(@as(usize, 0), path.retained_state_bytes);
     freePath(alloc, path);
     try std.testing.expectEqual(@as(usize, retained_bytes), budget.retained_state_bytes);
+}
+
+test "fact temporal predicates affect traversal weighted ranking and relationship counts" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const expired = "{\"group_id\":\"g\",\"valid_at\":\"2020-01-01T00:00:00Z\",\"invalid_at\":\"2021-01-01T00:00:00Z\",\"created_at\":\"2020-01-01T00:00:00Z\"}";
+    const valid = "{\"group_id\":\"g\",\"valid_at\":\"2020-01-01T00:00:00Z\",\"invalid_at\":null,\"created_at\":\"2020-01-01T00:00:00Z\",\"expired_at\":null}";
+    const future_knowledge = "{\"group_id\":\"g\",\"valid_at\":\"2020-01-01T00:00:00Z\",\"created_at\":\"2024-01-01T00:00:00Z\"}";
+    try graph.batchApply(&.{
+        .{ .source = "Alice", .target = "Acme", .edge_type = "RELATES_TO", .edge_id = "a-expired", .owner_document = "fact:expired", .weight = 0.1, .metadata_json = expired },
+        .{ .source = "Alice", .target = "Acme", .edge_type = "RELATES_TO", .edge_id = "b-works", .owner_document = "fact:works", .weight = 0.5, .metadata_json = valid },
+        .{ .source = "Alice", .target = "Acme", .edge_type = "RELATES_TO", .edge_id = "c-founded", .owner_document = "fact:founded", .weight = 0.8, .metadata_json = valid },
+        .{ .source = "Alice", .target = "C", .edge_type = "RELATES_TO", .edge_id = "expired-shortcut", .owner_document = "fact:shortcut", .weight = 0.01, .metadata_json = expired },
+        .{ .source = "Alice", .target = "C", .edge_type = "RELATES_TO", .edge_id = "not-yet-known", .owner_document = "fact:future", .weight = 0.02, .metadata_json = future_knowledge },
+        .{ .source = "Acme", .target = "C", .edge_type = "RELATES_TO", .metadata_json = valid },
+    }, &.{});
+    var filter = try relationship_filter.parsePublicAlloc(alloc, .{
+        .valid_at = "2022-01-01T00:00:00Z",
+        .known_at = "2023-01-01T00:00:00Z",
+        .properties = .{.{ .field = "/metadata/group_id", .op = "eq", .value = "g" }},
+    });
+    defer filter.deinit(alloc);
+    const sums = try findKShortestPaths(alloc, &graph, "Alice", "C", 3, .{ .weight_mode = .min_weight, .edge_filter = filter });
+    defer freePaths(alloc, sums);
+    try std.testing.expectEqual(@as(usize, 2), sums.len);
+    try std.testing.expectEqualStrings("b-works", sums[0].edges[0].edge_id);
+    try std.testing.expectEqualStrings("c-founded", sums[1].edges[0].edge_id);
+    try std.testing.expectEqual(@as(f64, 1.5), sums[0].total_weight);
+    try std.testing.expectEqual(@as(f64, 1.8), sums[1].total_weight);
+    const products = try findKShortestPaths(alloc, &graph, "Alice", "C", 2, .{ .weight_mode = .max_weight, .edge_filter = filter });
+    defer freePaths(alloc, products);
+    try std.testing.expectEqualStrings("c-founded", products[0].edges[0].edge_id);
+    const shortest = (try findShortestPath(alloc, &graph, "Alice", "C", .{ .edge_filter = filter })) orelse return error.TestExpectedPath;
+    defer freePath(alloc, shortest);
+    try std.testing.expectEqual(@as(u32, 2), shortest.length);
+    const traversal = @import("traversal.zig");
+    for ([_]EdgeDirection{ .out, .both }) |direction| {
+        const reached = try traversal.traverse(alloc, &graph, "Alice", .{ .max_depth = 1, .direction = direction, .edge_filter = filter });
+        defer traversal.freeOwnedResults(alloc, reached);
+        try std.testing.expectEqual(@as(usize, 1), reached.len);
+        try std.testing.expectEqualStrings("Acme", reached[0].key);
+    }
+    const incoming = try traversal.traverse(alloc, &graph, "C", .{ .max_depth = 1, .direction = .in, .edge_filter = filter });
+    defer traversal.freeOwnedResults(alloc, incoming);
+    try std.testing.expectEqual(@as(usize, 1), incoming.len);
+    try std.testing.expectEqualStrings("Acme", incoming[0].key);
+    const pattern = @import("pattern.zig");
+    const nodes = [_]pattern.MatchNode{ .{ .alias = "a" }, .{ .alias = "b" } };
+    const specs = [_]pattern.CountAggregateSpec{ .{}, .{ .alias = "b", .distinct = true } };
+    for ([_]bool{ false, true }) |filtered| {
+        const edges = [_]pattern.MatchEdge{.{ .from = "a", .to = "b", .step = .{ .types = &.{"RELATES_TO"}, .edge_filter = if (filtered) filter else .{} } }};
+        const counts = try pattern.aggregateConjunctivePattern(alloc, &graph, &.{"Alice"}, .{ .anchor_alias = "a", .nodes = &nodes, .edges = &edges }, &specs, .{});
+        defer {
+            for (counts) |*count| count.deinit(alloc);
+            alloc.free(counts);
+        }
+        try std.testing.expectEqual(@as(u128, if (filtered) 2 else 5), counts[0].value);
+        try std.testing.expectEqual(@as(u128, if (filtered) 1 else 2), counts[1].value);
+    }
+}
+
+test "fact temporal predicates apply to variable MATCH optional and not exists" {
+    const alloc = std.testing.allocator;
+    const pattern = @import("pattern.zig");
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    const valid = "{\"valid_at\":\"2020-01-01T00:00:00Z\"}";
+    const expired = "{\"invalid_at\":\"2021-01-01T00:00:00Z\"}";
+    try graph.batchApply(&.{
+        .{ .source = "A", .target = "B", .edge_type = "R", .edge_id = "one", .metadata_json = valid },
+        .{ .source = "A", .target = "B", .edge_type = "R", .edge_id = "two", .metadata_json = valid },
+        .{ .source = "B", .target = "C", .edge_type = "R", .metadata_json = valid },
+        .{ .source = "A", .target = "C", .edge_type = "R", .metadata_json = expired },
+    }, &.{});
+    const filter = relationship_filter.Filter{ .valid_at_ns = @import("../storage/schema.zig").parseRfc3339ToSignedNs("2022-01-01T00:00:00Z") };
+    const variable_nodes = [_]pattern.MatchNode{ .{ .alias = "a" }, .{ .alias = "c" } };
+    const variable_edges = [_]pattern.MatchEdge{.{ .from = "a", .to = "c", .step = .{ .min_hops = 2, .max_hops = 2, .edge_filter = filter } }};
+    const variable = try pattern.aggregateConjunctivePattern(alloc, &graph, &.{"A"}, .{ .anchor_alias = "a", .nodes = &variable_nodes, .edges = &variable_edges }, &.{.{}}, .{});
+    defer {
+        for (variable) |*count| count.deinit(alloc);
+        alloc.free(variable);
+    }
+    try std.testing.expectEqual(@as(u128, 2), variable[0].value);
+    const nodes = [_]pattern.MatchNode{ .{ .alias = "a" }, .{ .alias = "b" }, .{ .alias = "c" } };
+    const required = [_]pattern.MatchEdge{
+        .{ .from = "a", .to = "b", .step = .{ .edge_filter = filter } },
+        .{ .from = "b", .to = "c", .step = .{ .edge_filter = filter } },
+    };
+    for ([_]bool{ false, true }) |filtered| {
+        const absent = [_]pattern.MatchEdge{.{ .from = "a", .to = "c", .step = .{ .edge_filter = if (filtered) filter else .{} } }};
+        const predicates = [_]pattern.MatchPredicate{.{ .not_exists = &absent }};
+        const counts = try pattern.aggregateConjunctivePattern(alloc, &graph, &.{"A"}, .{ .anchor_alias = "a", .nodes = &nodes, .edges = &required, .predicates = &predicates }, &.{.{}}, .{});
+        defer {
+            for (counts) |*count| count.deinit(alloc);
+            alloc.free(counts);
+        }
+        try std.testing.expectEqual(@as(u128, if (filtered) 2 else 0), counts[0].value);
+    }
+    const optional_nodes = [_]pattern.MatchNode{.{ .alias = "maybe" }};
+    const optional_edges = [_]pattern.MatchEdge{.{ .from = "a", .to = "maybe", .step = .{ .edge_filter = .{ .properties = &.{.{ .field = "/metadata/missing", .op = .is_not_null }} } } }};
+    const optional = [_]pattern.OptionalPattern{.{ .nodes = &optional_nodes, .edges = &optional_edges }};
+    const optional_counts = try pattern.aggregateConjunctivePattern(alloc, &graph, &.{"A"}, .{ .anchor_alias = "a", .nodes = &variable_nodes, .edges = &variable_edges, .optional = &optional }, &.{ .{}, .{ .alias = "maybe" } }, .{});
+    defer {
+        for (optional_counts) |*count| count.deinit(alloc);
+        alloc.free(optional_counts);
+    }
+    try std.testing.expectEqual(@as(u128, 2), optional_counts[0].value);
+    try std.testing.expectEqual(@as(u128, 0), optional_counts[1].value);
+}
+
+pub fn freePathEdgeAlloc(alloc: Allocator, edge: PathEdge) void {
+    alloc.free(edge.source);
+    alloc.free(edge.target);
+    alloc.free(edge.edge_type);
+    if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+    if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
+    if (edge.metadata.len > 0) alloc.free(edge.metadata);
+}
+
+pub fn freePathEdgesAlloc(alloc: Allocator, edges: []const PathEdge) void {
+    for (edges) |edge| freePathEdgeAlloc(alloc, edge);
+    alloc.free(edges);
+}
+
+pub fn pathEdgeOwnedBytes(edge: PathEdge) usize {
+    return @sizeOf(PathEdge) +| edge.source.len +| edge.target.len +| edge.edge_type.len +| edge.edge_id.len +| edge.owner_document.len +| edge.metadata.len;
+}
+
+test "path nodes retain qualified equal-key reverse edge provenance" {
+    const alloc = std.testing.allocator;
+    const parent = try createPathNode(alloc, "same", null, 0, 0, null, null, null);
+    defer destroyPathNode(alloc, parent);
+    var scratch = traversal_mod.MetadataScratch.init(alloc, null);
+    defer scratch.deinit();
+    const edge = Edge{ .source = "same", .target = "same", .edge_type = "R", .edge_id = "one", .weight = 0.5, .created_at = 0, .updated_at = 0, .metadata = "{\"source_table\":\"people\",\"target_table\":\"companies\"}" };
+    for ([_]EdgeDirection{ .in, .both }) |direction| {
+        const endpoint = try traversal_mod.resolveAdjacent(&scratch, edge, parent.key, parent.table, "companies", direction);
+        try std.testing.expect(endpoint.connected);
+        const node = try createPathNode(alloc, endpoint.key, endpoint.table, 0.5, 1, parent, edge, endpoint.direction);
+        defer destroyPathNode(alloc, node);
+        try std.testing.expectEqualStrings("people", node.table.?);
+        try std.testing.expectEqual(EdgeDirection.in, node.parent_edge.?.traversal_direction.?);
+        try std.testing.expectEqualStrings("one", node.parent_edge.?.edge_id);
+    }
+}
+
+test "qualified parallel K paths preserve every endpoint and charge table storage" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "A", .target = "B", .edge_type = "R", .edge_id = "one", .weight = 1, .metadata_json = "{\"target_table\":\"entities\"}" },
+        .{ .source = "A", .target = "B", .edge_type = "R", .edge_id = "two", .weight = 2, .metadata_json = "{\"target_table\":\"entities\"}" },
+    }, &.{});
+    for ([_]PathWeightMode{ .min_hops, .min_weight }) |mode| {
+        var budget = work_budget_mod.WorkBudget.init(1000, 1000);
+        const paths = try findKShortestPaths(alloc, &graph, "A", "B", 2, .{ .owning_table = "facts", .weight_mode = mode, .work_budget = &budget });
+        var charged: usize = 0;
+        for (paths) |path| {
+            try std.testing.expectEqual(@as(usize, 2), path.node_tables.len);
+            try std.testing.expectEqualStrings("entities", path.node_tables[1].?);
+            var actual: usize = @sizeOf(Path) + path.nodes.len * @sizeOf([]const u8) + path.edges.len * @sizeOf(PathEdge) + path.node_tables.len * @sizeOf(?[]const u8);
+            for (path.nodes) |key| actual += key.len;
+            for (path.node_tables) |table| if (table) |value| {
+                actual += value.len;
+            };
+            for (path.edges) |edge| for ([_][]const u8{ edge.source, edge.target, edge.edge_type, edge.edge_id, edge.owner_document, edge.metadata }) |part| {
+                actual += part.len;
+            };
+            try std.testing.expectEqual(actual, path.retained_state_bytes);
+            charged += actual;
+        }
+        try std.testing.expectEqual(@as(usize, 2), paths.len);
+        try std.testing.expectEqual(charged, budget.retained_state_bytes);
+        freePaths(alloc, paths);
+        try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
+    }
+}
+
+test "qualified Yen spur seeds and root exclusions distinguish equal document keys" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "A", .target = "B", .edge_type = "R", .edge_id = "ab", .weight = 1, .metadata_json = "{\"target_table\":\"entities\"}" },
+        .{ .source = "B", .target = "C", .edge_type = "R", .edge_id = "bc", .weight = 1, .metadata_json = "{\"source_table\":\"entities\"}" },
+        .{ .source = "B", .target = "A", .edge_type = "R", .edge_id = "ba", .weight = 1, .metadata_json = "{\"source_table\":\"entities\",\"target_table\":\"entities\"}" },
+        .{ .source = "A", .target = "C", .edge_type = "R", .edge_id = "ac", .weight = 1, .metadata_json = "{\"source_table\":\"entities\"}" },
+    }, &.{});
+    for ([_]PathWeightMode{ .min_hops, .min_weight }) |mode| {
+        const paths = try findKShortestPaths(alloc, &graph, "A", "C", 3, .{ .owning_table = "facts", .target_table = "facts", .expand_cross_table_local = true, .weight_mode = mode });
+        defer freePaths(alloc, paths);
+        try std.testing.expectEqual(@as(usize, 2), paths.len);
+        try std.testing.expectEqual(@as(u32, 2), paths[0].length);
+        try std.testing.expectEqual(@as(u32, 3), paths[1].length);
+        try std.testing.expectEqualStrings("entities", paths[1].node_tables[1].?);
+        try std.testing.expectEqualStrings("A", paths[1].nodes[2]);
+        try std.testing.expectEqualStrings("entities", paths[1].node_tables[2].?);
+    }
+}
+
+test "qualified same-key path endpoints require a real relationship" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{.{ .source = "shared", .target = "shared", .edge_type = "R", .edge_id = "one", .weight = 1, .metadata_json = "{\"target_table\":\"people\"}" }}, &.{});
+    const path = (try findShortestPath(alloc, &graph, "shared", "shared", .{ .owning_table = "facts", .target_table = "people" })).?;
+    defer freePath(alloc, path);
+    try std.testing.expectEqual(@as(u32, 1), path.length);
+    try std.testing.expectEqualStrings("people", path.node_tables[1].?);
 }

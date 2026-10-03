@@ -378,6 +378,11 @@ pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
+    /// Private owner-leader maintenance: one bounded durable endpoint page.
+    graph_endpoint_cleanup: bool = false,
+    /// Exact leader-selected effects; replicas must never replan this page.
+    graph_endpoint_cleanup_planned: bool = false,
+    graph_endpoint_cleanup_guards: []const @import("../graph_cleanup_contract.zig").Guard = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
@@ -462,6 +467,7 @@ pub const BatchRequest = struct {
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
     if (req.merge_artifacts.len == 0) return;
+    if (req.graph_endpoint_cleanup) return validateGraphEndpointCleanupCommand(req);
     if (req.merge_replication == null or req.merge_checkpoint != null or
         req.split_checkpoint != null or req.split_replication != null or
         req.split_transition != null or req.merge_source_transition != null or
@@ -473,9 +479,10 @@ pub fn validateMergeArtifacts(req: BatchRequest) !void {
     for (req.merge_artifacts) |row| {
         if (!keys.isGraphEdgeArtifactKey(row.key) and !keys.isEmbeddingArtifactKey(row.key) and
             !keys.isDerivedEmbeddingArtifactKey(row.key) and !keys.isAssetArtifactKey(row.key) and
-            !keys.isGraphGlobalEdgeContenderKey(row.key) and
+            !keys.isGraphRetirementKey(row.key) and !keys.isGraphGlobalEdgeContenderKey(row.key) and
             !keys.isGraphEdgeTtlLifetimeKey(row.key) and !keys.isGraphEdgeTtlTombstoneKey(row.key))
             return error.InvalidBatchRequest;
+        if (keys.isGraphRetirementKey(row.key)) _ = @import("../graph_cleanup_contract.zig").retirementGeneration(row.value) catch return error.InvalidBatchRequest;
     }
 }
 
@@ -5068,3 +5075,128 @@ pub const IndexTargetVisibility = struct {
     config_hash: u64,
     serving_set_effect: ServingSetEffect = .may_reduce,
 };
+
+/// New relationship keys and durable endpoint retirements require peers that
+/// understand their complete identities before any primary rows are applied.
+pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
+    const keys = @import("../internal_keys.zig");
+    // Document writes can embed relationship IDs or derive graph effects from
+    // the local catalog. Gate their complete apply contract before extraction.
+    // Deletes generate exact retirements during apply even when the input
+    // contains only legacy tuples or document keys. Classify those effects
+    // before proposal; inspecting only already-materialized rows is too late.
+    if (req.writes.len != 0 or req.graph_endpoint_cleanup or req.deletes.len != 0 or req.graph_deletes.len != 0 or req.transforms.len != 0 or req.merge_page != null) return true;
+    if (req.transaction) |control| {
+        if (control == .resolve and control.resolve.status == .committed) return true;
+        // Field-derived inline edges depend on the local graph catalog, so
+        // even ordinary document values can acquire durable endpoint guards.
+        if (control == .prepare and req.writes.len != 0) return true;
+    }
+    for (req.graph_writes) |write| if (write.edge_id.len != 0 or write.owner_document.len != 0) return true;
+    for (req.graph_deletes) |delete| if (delete.edge_id.len != 0 or delete.owner_document.len != 0) return true;
+    for (req.merge_artifacts) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
+    for (req.writes) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
+    return false;
+}
+
+/// Shared binary-safe planner response and ordered maintenance request.
+/// Missing afterimages decode as an empty page for historical planners.
+pub const GraphEndpointCleanupStatus = struct {
+    pending: bool = false,
+    guards: []const @import("../graph_cleanup_contract.zig").Guard = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
+    deletes: []const []const u8 = &.{},
+    merge_artifacts: []const BatchWrite = &.{},
+
+    pub fn request(self: @This()) BatchRequest {
+        return .{
+            .graph_endpoint_cleanup = true,
+            .graph_endpoint_cleanup_planned = true,
+            .graph_endpoint_cleanup_guards = self.guards,
+            .graph_deletes = self.graph_deletes,
+            .deletes = self.deletes,
+            .merge_artifacts = self.merge_artifacts,
+            .sync_level = .write,
+        };
+    }
+};
+
+/// Cleanup is a private, effect-bearing command, never a flag that can be
+/// attached to a public mutation or a lifecycle control.
+pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
+    for (req.graph_writes) |write| try @import("../../graph/mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
+    for (req.graph_deletes) |delete| try @import("../../graph/mutation_identity.zig").validate(delete.edge_id, delete.owner_document, delete.owner);
+    if (!req.graph_endpoint_cleanup) {
+        if (req.graph_endpoint_cleanup_planned or req.graph_endpoint_cleanup_guards.len != 0) return error.InvalidBatchRequest;
+        return;
+    }
+    if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
+    const defaults = BatchRequest{};
+    inline for (std.meta.fields(BatchRequest)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field.name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field.name, "timestamp_ns") and !std.mem.eql(u8, field.name, "sync_level")) {
+            if (comptime std.mem.eql(u8, field.name, "deletes") or std.mem.eql(u8, field.name, "graph_deletes") or std.mem.eql(u8, field.name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field.name, "merge_artifacts")) {
+                if (!req.graph_endpoint_cleanup_planned and @field(req, field.name).len != 0) return error.InvalidBatchRequest;
+            } else {
+                const value = @field(req, field.name);
+                if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+                    if (value.len != 0) return error.InvalidBatchRequest;
+                } else if (!std.meta.eql(value, @field(defaults, field.name))) return error.InvalidBatchRequest;
+            }
+        }
+    }
+}
+
+/// Planned pages can only remove inline edges and this maintenance queue.
+/// In particular, the constraint exemption never admits a document deletion.
+fn validatePlannedGraphEndpointCleanup(req: BatchRequest) !void {
+    const keys = @import("../internal_keys.zig");
+    const contract = @import("../graph_cleanup_contract.zig");
+    if (req.graph_deletes.len + req.deletes.len + req.merge_artifacts.len > 256 or req.graph_endpoint_cleanup_guards.len > 256) return error.InvalidBatchRequest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for (req.graph_endpoint_cleanup_guards, 0..) |guard, i| {
+        if (guard.kind == .owner_replay and guard.generation == 0) return error.InvalidBatchRequest;
+        for (req.graph_endpoint_cleanup_guards[0..i]) |prior| if (guard.kind == prior.kind and std.mem.eql(u8, guard.endpoint, prior.endpoint)) return error.InvalidBatchRequest;
+    }
+    for (req.deletes) |key| {
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| {
+            covered = if (guard.kind == .endpoint) contract.matchesKey(key, guard.endpoint) else contract.matchesOwnerJobKey(key, guard.endpoint) or (keys.isGraphRetirementKey(key) and try contract.ownedBy(alloc, key, guard.endpoint));
+            if (covered) break;
+        }
+        if (!covered) return error.InvalidBatchRequest;
+    }
+    for (req.graph_deletes) |edge| {
+        if (edge.owner_document.len != 0 or edge.index_name.len == 0 or edge.source.len == 0 or edge.target.len == 0) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| if (guard.kind == .endpoint and std.mem.eql(u8, guard.endpoint, edge.target)) {
+            covered = true;
+            break;
+        };
+        if (!covered) return error.InvalidBatchRequest;
+    }
+    for (req.merge_artifacts) |row| {
+        if (row.json_null_fields.len != 0) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| {
+            if (guard.kind != .owner_replay) continue;
+            if (contract.matchesOwnerJobKey(row.key, guard.endpoint)) {
+                const next = try contract.decodeOwnerJob(row.key, row.value);
+                if (next.generation != guard.generation) return error.InvalidBatchRequest;
+                covered = true;
+            } else covered = contract.isReplayInput(row.key) and try contract.ownedBy(alloc, row.key, guard.endpoint);
+            if (covered) break;
+        }
+        if (!covered) return error.InvalidBatchRequest;
+    }
+}
+
+test "graph relationship protocol gates document effects before extraction" {
+    for ([_][]const u8{
+        "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"},{\"target\":\"b\",\"edge_id\":\"two\"}]}}}",
+        "{\"links\":[\"b\"]}",
+        "{}",
+    }) |document| try std.testing.expect(requiresGraphRelationshipProtocol(.{ .writes = &.{.{ .key = "a", .value = document }} }));
+    try std.testing.expect(!requiresGraphRelationshipProtocol(.{}));
+}

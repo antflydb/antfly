@@ -4139,3 +4139,31 @@ test "db ordered artifact inventory follower completes initial build under durab
     defer result.deinit();
     try std.testing.expectEqual(@as(u32, 1), result.total_hits);
 }
+
+test "server ordered graph cleanup applies complete planner pages and duplicate receipts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("ordered-graph-cleanup");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    const contract = @import("graph_cleanup_contract.zig");
+    const key = try contract.ownerJobKeyAlloc(alloc, "owner");
+    defer alloc.free(key);
+    const value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7, .phase = .inputs });
+    defer alloc.free(value);
+    try db.core.store.put(key, value);
+    var index: u64 = 1;
+    while (index <= 3) : (index += 1) {
+        var response = (try db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}" })).?;
+        defer response.deinit(alloc);
+        var status = try std.json.parseFromSlice(types.GraphEndpointCleanupStatus, alloc, response.json, .{});
+        defer status.deinit();
+        try std.testing.expect(status.value.pending);
+        const req = status.value.request();
+        try server_test_adapter.applyOrdered(&db, req, .{ .term = 1, .index = index });
+        try server_test_adapter.applyOrdered(&db, req, .{ .term = 1, .index = index });
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key));
+    try std.testing.expect((try db.prepareGraphEndpointCleanupBatch(alloc)) == null);
+}
