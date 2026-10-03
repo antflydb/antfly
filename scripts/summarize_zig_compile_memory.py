@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Summarize diagnose-zig-build-memory.sh samples; never rewrite reservations."""
+
 import argparse
 import json
 import math
 from pathlib import Path
 import re
 
-GIB = 1024 ** 3
+GIB = 1024**3
 
 
 def summarize(text):
@@ -27,20 +28,34 @@ def summarize(text):
         # per-PID maxima form an upper envelope, not a simultaneous RSS peak.
         processes = samples.setdefault(sample, {})
         processes[pid] = max(processes.get(pid, 0), size)
-        match = re.search(r"(?:^|\s)--name\s+(antfly-storage-kernel|antfly-runtime-[\w-]+)(?:\s|$)", command)
+        match = re.search(
+            r"(?:^|\s)--name\s+(antfly-storage-kernel|antfly-runtime-[\w-]+)(?:\s|$)",
+            command,
+        )
         if not match:
             continue
-        unit = "storage_kernel" if match[1] == "antfly-storage-kernel" else match[1].removeprefix("antfly-runtime-")
+        unit = (
+            "storage_kernel"
+            if match[1] == "antfly-storage-kernel"
+            else match[1].removeprefix("antfly-runtime-")
+        )
         row = units.setdefault(unit, {"peak_rss_bytes": 0, "command": command})
         if size > row["peak_rss_bytes"]:
             row.update(peak_rss_bytes=size, command=command)
     for row in units.values():
-        row["minimum_reservation_gib"] = math.ceil(row["peak_rss_bytes"] * 5 / (4 * GIB))
-    return {"format_version": 1, "units": units,
-            "sampled_compiler_aggregate_peak_bytes": max((sum(p.values()) for p in samples.values()), default=0),
-            "aggregate_is_same_poll": precise_samples,
-            "reservation_headroom_percent": 25,
-            "qualification": False}
+        row["minimum_reservation_gib"] = math.ceil(
+            row["peak_rss_bytes"] * 5 / (4 * GIB)
+        )
+    return {
+        "format_version": 1,
+        "units": units,
+        "sampled_compiler_aggregate_peak_bytes": max(
+            (sum(p.values()) for p in samples.values()), default=0
+        ),
+        "aggregate_is_same_poll": precise_samples,
+        "reservation_headroom_percent": 25,
+        "qualification": False,
+    }
 
 
 def main():
