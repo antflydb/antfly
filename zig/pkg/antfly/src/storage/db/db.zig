@@ -100144,6 +100144,7 @@ const TestAssetProducer = struct {
         switch (request.producer_type) {
             .copy => {},
             .document_extraction => {},
+            .decision => {},
             .generator => self.generator_calls += 1,
             .reader => self.reader_calls += 1,
             .transcriber => self.transcriber_calls += 1,
