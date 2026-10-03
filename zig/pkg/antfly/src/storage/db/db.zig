@@ -52192,17 +52192,50 @@ const NeighborContextReplayHints = struct {
     }
 };
 
-/// Only explicit direct mutations wake adjacency-dependent producers. Generated
-/// projection replay must not feed its own producer back into the work queue.
+/// Direct document and relationship mutations wake adjacency-dependent producers.
+/// Generated projection publication must not feed its producer back into the queue.
 /// Hash-based deduplication keeps batching linear in the changed endpoint count.
 fn directGraphNeighborContextHintsAlloc(
     alloc: Allocator,
     req: types.BatchRequest,
+    writes: []const types.GraphEdgeWrite,
+    artifact_keys: []const []const u8,
     manager: ?*index_manager_mod.IndexManager,
     owning_table: ?[]const u8,
 ) !NeighborContextReplayHints {
     const active = manager orelse return .{};
-    if (req.graph_writes.len == 0 and req.graph_deletes.len == 0) return .{};
+    if (!active.hasAssetNeighborContext()) return .{};
+    if (writes.len == 0 and req.graph_deletes.len == 0) {
+        var has_graph_artifacts = false;
+        for (artifact_keys) |key| if (internal_keys.isGraphEdgeArtifactKey(key)) {
+            has_graph_artifacts = true;
+            break;
+        };
+        if (!has_graph_artifacts) return .{};
+    }
+    if (writes.len == 0 and req.graph_deletes.len == 0 and req.writes.len == 0 and req.deletes.len == 0) return .{};
+    // Artifact afterimages include removals omitted from the mapped write list.
+    // Admit only owners directly written/deleted by this request, so generated
+    // publication and imported projections cannot feed back into their producer.
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const scratch_alloc = arena.allocator();
+    var direct_owners = std.StringHashMapUnmanaged(void).empty;
+    for (req.writes) |write| try direct_owners.put(scratch_alloc, write.key, {});
+    for (req.deletes) |key| try direct_owners.put(scratch_alloc, key, {});
+    var removed = std.ArrayListUnmanaged(types.GraphEdgeDelete).empty;
+    if (direct_owners.count() != 0) for (artifact_keys) |key| {
+        const identity = (try internal_keys.parseGraphEdgeArtifactKeyAlloc(scratch_alloc, key)) orelse continue;
+        if (!direct_owners.contains(identity.doc_key)) continue;
+        try removed.append(scratch_alloc, .{
+            .index_name = identity.index_name,
+            .source = if (identity.logical_source.len != 0) identity.logical_source else identity.doc_key,
+            .target = identity.target_doc_key,
+            .edge_type = identity.edge_type,
+            .edge_id = identity.edge_id,
+            .owner_document = identity.doc_key,
+        });
+    };
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (keys.items) |key| alloc.free(key);
@@ -52216,7 +52249,7 @@ fn directGraphNeighborContextHintsAlloc(
     var table_loaded = table != null;
     var directions = std.StringHashMapUnmanaged(index_manager_mod.IndexManager.NeighborContextDirections).empty;
     defer directions.deinit(alloc);
-    inline for (.{ req.graph_writes, req.graph_deletes }) |mutations| {
+    inline for (.{ writes, req.graph_deletes, removed.items }) |mutations| {
         for (mutations) |mutation| {
             const slot = try directions.getOrPut(alloc, mutation.index_name);
             if (!slot.found_existing) slot.value_ptr.* = try active.assetNeighborContextDirectionsForGraphIndex(alloc, mutation.index_name);
@@ -52283,6 +52316,10 @@ const NeighborContextGraphSourceLease = struct {
 /// sampling this graph, so waiting for it here would create a dependency cycle.
 /// Reuse authoritative artifact replay (including contender arbitration and
 /// deletions), with bounded pages and a per-generation volatile frontier.
+const neighbor_context_refresh_page_records: usize = 64;
+const neighbor_context_refresh_pages_per_turn: usize = 4;
+const neighbor_context_refresh_records_per_turn = neighbor_context_refresh_page_records * neighbor_context_refresh_pages_per_turn;
+
 fn acquireNeighborContextGraphSource(ptr: *anyopaque, index_name: []const u8) !enrichment_runtime_mod.NeighborContextGraphSource.Lease {
     const append_ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ptr));
     const ctx = append_ctx.async_context orelse return error.EnrichmentRetryInProgress;
@@ -52309,26 +52346,38 @@ fn acquireNeighborContextGraphSource(ptr: *anyopaque, index_name: []const u8) !e
             ctx: *const AsyncContext,
             index_name: []const u8,
             tip: u64,
+            entry: *index_manager_mod.IndexManager.GraphIndex,
             records: usize = 0,
 
             fn consume(raw: *anyopaque, sequence: u64, payload: []const u8) !void {
                 const state: *@This() = @ptrCast(@alignCast(raw));
                 if (sequence > state.tip) return error.StopReplayChunk;
+                if (state.records == neighbor_context_refresh_records_per_turn) return error.GraphSourceReplayPending;
                 state.records += 1;
-                if (state.records > graph_pattern_mod.default_max_explored_edges) return error.GraphExploredEdgesBudgetExceeded;
                 var decoded = try change_journal_mod.decodeRecord(state.ctx.alloc, payload);
                 defer decoded.deinit();
                 // Only committed effects: do not run asset producers/materialize
                 // missing generated effects, and do not publish their checkpoint.
                 try state.ctx.index_manager.deleteGraphDocsByName(state.index_name, decoded.record.deleted_doc_keys);
                 try applyGraphArtifactMutationPages(state.ctx, state.index_name, decoded.record.changed_artifact_keys, &.{}, sequence);
+                // Mutation helpers invalidate a previously sampled frontier.
+                // Restore it only after this entire record applies successfully.
+                state.entry.neighbor_source_sequence = sequence;
             }
         };
-        var refresh = Refresh{ .ctx = ctx, .index_name = index_name, .tip = tip };
-        while (true) {
-            const stats = try cursor.forEachNext(64, &refresh, Refresh.consume);
-            if (stats.last_sequence == 0 or stats.last_sequence >= tip) break;
+        var refresh = Refresh{ .ctx = ctx, .index_name = index_name, .tip = tip, .entry = entry };
+        var complete = false;
+        for (0..neighbor_context_refresh_pages_per_turn) |_| {
+            const stats = try cursor.forEachNext(neighbor_context_refresh_page_records, &refresh, Refresh.consume);
+            // Include skipped records: fallback hint scans must also resume
+            // instead of rescanning unrelated journal entries on every turn.
+            entry.neighbor_source_sequence = @max(entry.neighbor_source_sequence, @min(stats.last_sequence, tip));
+            if (stats.last_sequence == 0 or stats.last_sequence >= tip) {
+                complete = true;
+                break;
+            }
         }
+        if (!complete) return error.GraphSourceReplayPending;
         entry.neighbor_source_sequence = tip;
     }
     lease.* = .{ .alloc = ctx.alloc, .publication = publication, .apply_guard = guard, .snapshot = snapshot };
@@ -52356,7 +52405,7 @@ fn prepareDirectChangeRecord(
 ) !change_journal_mod.Record {
     var record = try change_journal_mod.recordFromDerivedBatch(ctx.alloc, batch, sequence);
     errdefer change_journal_mod.deinitRecord(ctx.alloc, &record);
-    var hints = try directGraphNeighborContextHintsAlloc(ctx.alloc, req, ctx.index_manager, owning_table);
+    var hints = try directGraphNeighborContextHintsAlloc(ctx.alloc, req, batch.graph_writes, record.changed_artifact_keys, ctx.index_manager, owning_table);
     defer hints.deinit(ctx.alloc);
     if (hints.keys.len > 0) {
         const merged = merge: {
@@ -52523,7 +52572,21 @@ fn encodeThinReplayRecordPayload(
         try appendUniqueReplayRecordHint(alloc, &target_hints, .graph);
     }
 
-    var neighbor_hints = try directGraphNeighborContextHintsAlloc(alloc, req, index_manager, owning_table);
+    var neighbor_hints = hints: {
+        const active = index_manager orelse break :hints NeighborContextReplayHints{};
+        if (!active.hasAssetNeighborContext()) break :hints NeighborContextReplayHints{};
+        var direct_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+        defer direct_writes.deinit(alloc);
+        try direct_writes.appendSlice(alloc, req.graph_writes);
+        for (extracted, 0..) |write, i| {
+            if (derived_changed_flags[i]) try direct_writes.appendSlice(alloc, write.graph_writes);
+        }
+        var notification_artifacts = std.ArrayListUnmanaged([]const u8).empty;
+        defer notification_artifacts.deinit(alloc);
+        try notification_artifacts.appendSlice(alloc, thin_changed_artifact_keys.items);
+        for (deleted_artifact_keys) |key| try notification_artifacts.append(alloc, key);
+        break :hints try directGraphNeighborContextHintsAlloc(alloc, req, direct_writes.items, notification_artifacts.items, active, owning_table);
+    };
     defer neighbor_hints.deinit(alloc);
     if (neighbor_hints.keys.len > 0) try appendUniqueReplayRecordHint(alloc, &target_hints, .enrichment);
     for (neighbor_hints.keys) |key| try appendUniqueReplayRecordKeyWithSet(alloc, &changed_doc_keys, &changed_doc_key_set, key);
@@ -62107,7 +62170,11 @@ fn shouldPrecomputeGeneratedRequest(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !bool {
     _ = self;
-    _ = request;
+    // Neighbor context depends on committed adjacency, including graph effects
+    // in this batch. The precommit producer path has neither that snapshot nor
+    // the composed neighbor input/skip hash. Retain this request for postcommit
+    // replay; synchronous levels still wait for its generated coverage there.
+    if (request.kind == .asset and request.neighbor_context_json.len != 0) return false;
     return switch (mode) {
         .none => false,
         .all => true,
@@ -153183,6 +153250,14 @@ test "db graph fact neighbor replay releases partial allocations" {
             defer targets.deinit(alloc);
             const thin = try encodeThinReplayRecordPayload(alloc, req, &.{}, &.{}, &.{}, &.{}, &.{}, 1, false, &manager, &targets, "facts");
             defer alloc.free(thin);
+            const artifact = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, "fact", "g", "R", "b", "a", "fact");
+            defer alloc.free(artifact);
+            var mapped = try directGraphNeighborContextHintsAlloc(alloc, .{ .writes = &.{.{ .key = "fact", .value = "{}" }} }, &.{write}, &.{artifact}, &manager, "facts");
+            defer mapped.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), mapped.keys.len);
+            var generated = try directGraphNeighborContextHintsAlloc(alloc, .{}, &.{}, &.{artifact}, &manager, "facts");
+            defer generated.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 0), generated.keys.len);
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
@@ -153356,4 +153431,170 @@ test "db graph fact qualified path bypasses algebraic shortcut" {
     const paths = try db.findKShortestPathsWithOptions(alloc, "g", "a", "b", 1, .{ .target_table = "foreign", .max_depth = 3 });
     defer paths_mod.freePaths(alloc, paths);
     try std.testing.expectEqual(@as(usize, 0), paths.len);
+}
+
+test "db graph fact inline mutation wakes incoming producers for additions replacement removal and deletion" {
+    const Fixture = struct {
+        fn produceBounded(ptr: *anyopaque, alloc: Allocator, request: asset_producer_mod.Request, context: asset_producer_mod.InvocationContext) ![]u8 {
+            try context.check();
+            return GateAssetProducer.produce(ptr, alloc, request);
+        }
+        fn drain(db: *DB) !void {
+            try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+            try db.runDerivedUntil(db.core.nextDerivedSequence());
+            try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+        }
+        fn hasNeighbor(db: *DB, doc: []const u8) !bool {
+            const key = try internal_keys.artifactNamedPrefixAlloc(db.alloc, doc, "asset", "context");
+            defer db.alloc.free(key);
+            const value = try db.core.store.get(db.alloc, key);
+            defer db.alloc.free(value);
+            return std.mem.indexOf(u8, value, "\"target\":\"a\"") != null;
+        }
+    };
+    const alloc = std.testing.allocator;
+    for ([_]types.SyncLevel{ .write, .full_index }) |sync_level| {
+        var tmp = try TestDirectory.init("inline-neighbor-lifecycle");
+        defer tmp.cleanup();
+        var producer = GateAssetProducer{};
+        producer.allowAll();
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .in } });
+        var config: enrichment_runtime_mod.Config = .{ .asset_producer = .{ .ptr = &producer, .vtable = &.{
+            .produce = GateAssetProducer.produce,
+            .produce_with_context = Fixture.produceBounded,
+            .foreground_bounded = true,
+            .invocation_memory_for_requests = GateAssetProducer.invocationMemory,
+        } } };
+        try db.initOptionalEnrichmentRuntime(&config);
+        try db.batch(.{ .writes = &.{ .{ .key = "b", .value = "{\"body\":\"Bob\"}" }, .{ .key = "c", .value = "{\"body\":\"Carol\"}" } }, .sync_level = sync_level });
+        try Fixture.drain(&db);
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"f\"}]}}}" }}, .sync_level = sync_level });
+        try Fixture.drain(&db);
+        try std.testing.expect(try Fixture.hasNeighbor(&db, "b"));
+        // A synchronous source-field update must retain committed adjacency
+        // in producer input and its skip hash, just like asynchronous replay.
+        try db.batch(.{ .writes = &.{.{ .key = "b", .value = "{\"body\":\"Bob revised\"}" }}, .sync_level = sync_level });
+        try Fixture.drain(&db);
+        try std.testing.expect(try Fixture.hasNeighbor(&db, "b"));
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"c\",\"edge_id\":\"f\"}]}}}" }}, .sync_level = sync_level });
+        try Fixture.drain(&db);
+        try std.testing.expect(!try Fixture.hasNeighbor(&db, "b"));
+        try std.testing.expect(try Fixture.hasNeighbor(&db, "c"));
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[]}}}" }}, .sync_level = sync_level });
+        try Fixture.drain(&db);
+        try std.testing.expect(!try Fixture.hasNeighbor(&db, "c"));
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"f\"}]}}}" }}, .sync_level = sync_level });
+        try Fixture.drain(&db);
+        try db.batch(.{ .deletes = &.{"a"}, .sync_level = sync_level });
+        try Fixture.drain(&db);
+        try std.testing.expect(!try Fixture.hasNeighbor(&db, "b"));
+    }
+}
+
+test "db graph fact neighbor context excludes foreign source namespace" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-foreign-neighbor");
+    defer tmp.cleanup();
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.core.store.put(internal_keys.graph_owning_table_key, "here");
+    db.local_execution.row_policy_table_name = "here";
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alpha\"}" }}, .sync_level = .write });
+    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "foreign-source-neighbor", .edge_type = "R", .edge_id = "f", .owner_document = "f", .metadata_json = "{\"source_table\":\"foreign\",\"target_table\":\"here\"}" }}, .sync_level = .write });
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const path = try db.findShortestPathWithOptions(alloc, "g", "a", "foreign-source-neighbor", .{ .owning_table = "here" });
+    defer if (path) |value| paths_mod.freePath(alloc, value);
+    try std.testing.expect(path == null);
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alpha revised\"}" }}, .sync_level = .write });
+    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "a", "asset", "context");
+    defer alloc.free(key);
+    const output = try db.core.store.get(alloc, key);
+    defer alloc.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "foreign-source-neighbor") == null);
+}
+
+test "db graph fact neighbor refresh resumes bounded turns without certifying consumer coverage" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("neighbor-refresh-turns");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    for (0..2 * neighbor_context_refresh_records_per_turn + 7) |i| {
+        try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f", .weight = @floatFromInt(i + 1) }}, .sync_level = .write });
+    }
+    const checkpoint = try db.core.loadAppliedSequence(alloc, "g");
+    const source = db.enrichment_runtime.?.config.neighbor_context_graph_source.?;
+    const entry = db.core.index_manager.graphIndex("g").?;
+    var previous = entry.neighbor_source_sequence;
+    var turns: usize = 0;
+    while (true) {
+        const lease = source.acquire_fn(source.ptr, "g") catch |err| {
+            try std.testing.expectEqual(error.GraphSourceReplayPending, err);
+            try std.testing.expect(entry.neighbor_source_sequence > previous);
+            previous = entry.neighbor_source_sequence;
+            turns += 1;
+            try std.testing.expect(turns <= 3);
+            // The acquisition released publication/catalog/index locks on yield.
+            var publication = db.core.index_manager.beginGraphPrimaryMutation();
+            publication.release();
+            try std.testing.expectEqual(checkpoint, try db.core.loadAppliedSequence(alloc, "g"));
+            continue;
+        };
+        lease.release();
+        break;
+    }
+    try std.testing.expectEqual(@as(usize, 2), turns);
+    try std.testing.expectEqual(db.core.store.lastReplaySequence(0), entry.neighbor_source_sequence);
+    try std.testing.expectEqual(checkpoint, try db.core.loadAppliedSequence(alloc, "g"));
+    const edges = try entry.index.getEdges(alloc, "a", "R", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqual(@as(f64, 2 * neighbor_context_refresh_records_per_turn + 7), edges[0].weight);
+}
+
+test "db graph fact neighbor context resolves equal-key qualified reverse orientation" {
+    const alloc = std.testing.allocator;
+    for ([_]types.EnrichmentNeighborContextConfig{ .{ .graph_index = "g", .direction = .in }, .{ .graph_index = "g", .direction = .both } }) |neighbor_context| {
+        var tmp = try TestDirectory.init("qualified-reverse-neighbor");
+        defer tmp.cleanup();
+        var producer = GateAssetProducer{};
+        producer.allowAll();
+        var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+        defer db.close();
+        try db.core.store.put(internal_keys.graph_owning_table_key, "here");
+        db.local_execution.row_policy_table_name = "here";
+        try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+        try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = neighbor_context });
+        var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+        try db.initOptionalEnrichmentRuntime(&config);
+        try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alpha\"}" }}, .sync_level = .write });
+        try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+        try db.runDerivedUntil(db.core.nextDerivedSequence());
+        try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "a", .edge_type = "R", .edge_id = "f", .owner_document = "f", .metadata_json = "{\"source_table\":\"foreign\",\"target_table\":\"h\\u0065re\"}" }}, .sync_level = .write });
+        try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+        const key = try internal_keys.artifactNamedPrefixAlloc(alloc, "a", "asset", "context");
+        defer alloc.free(key);
+        const output = try db.core.store.get(alloc, key);
+        defer alloc.free(output);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"direction\":\"in\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, output, "\"direction\":\"out\"") == null);
+    }
 }

@@ -13662,6 +13662,13 @@ pub const IndexManager = struct {
         }
     };
 
+    pub fn hasAssetNeighborContext(self: *const IndexManager) bool {
+        for (self.enrichments.items) |entry| {
+            if (entry.kind == .asset and entry.neighbor_context_json.len != 0) return true;
+        }
+        return false;
+    }
+
     /// Read-only scheduling lookup for graph-edge mutations: does any
     /// admitted asset enrichment sample `neighbor_context` adjacency from the
     /// named graph index, and in which orientations? An edge write or delete

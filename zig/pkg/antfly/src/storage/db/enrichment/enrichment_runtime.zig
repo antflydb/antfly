@@ -12069,7 +12069,7 @@ fn neighborContextBlockAlloc(
         source.acquire_fn(source.ptr, config.graph_index) catch |err| switch (err) {
             // Lifecycle/publication readiness is dependency debt, not a
             // failed provider invocation that can exhaust its retry budget.
-            error.GraphMaintenanceInProgress, error.ReplicationPublisherUnavailable => return error.ArtifactPublicationPending,
+            error.GraphMaintenanceInProgress, error.ReplicationPublisherUnavailable, error.GraphSourceReplayPending => return error.ArtifactPublicationPending,
             else => return err,
         }
     else
@@ -12092,6 +12092,11 @@ fn neighborContextBlockAlloc(
         }
         selected.deinit(alloc);
     }
+    const table = if (runtime.index_manager.primary_store) |store| store.get(alloc, internal_keys.graph_owning_table_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    } else null;
+    defer if (table) |value| alloc.free(value);
     if (runtime.index_manager.graphIndex(config.graph_index)) |entry| {
         const direction: graph_mod.EdgeDirection = switch (config.direction) {
             .out => .out,
@@ -12119,11 +12124,18 @@ fn neighborContextBlockAlloc(
             defer graph_mod.GraphIndex.freeEdges(alloc, page.edges);
             remaining_scanned_rows -= page.scanned_rows;
             for (page.edges) |edge| {
-                const outgoing = std.mem.eql(u8, edge.source, request.doc_key);
+                // Per-edge scratch is released before the next row, bounding
+                // decoded routing storage independently of the node's degree.
+                var routing = graph_metadata_tables.Scratch.init(alloc, null);
+                defer routing.deinit();
+                const source_table = (try routing.table(edge.metadata, "source_table")) orelse table;
+                const target_table = (try routing.table(edge.metadata, "target_table")) orelse table;
+                const endpoint = graph_metadata_tables.adjacentInTables(edge, request.doc_key, table, source_table, target_table, direction);
+                if (!endpoint.connected) continue;
                 try insertBoundedNeighbor(alloc, &selected, config.limit, .{
                     .edge_type = edge.edge_type,
-                    .orientation = if (outgoing) .out else .in,
-                    .neighbor = if (outgoing) edge.target else edge.source,
+                    .orientation = if (endpoint.direction == .in) .in else .out,
+                    .neighbor = endpoint.key,
                     .weight = edge.weight,
                 });
             }

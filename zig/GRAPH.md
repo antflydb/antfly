@@ -999,8 +999,22 @@ The rejected visit and the next page's repeated visit both count as physical
 scan work, including repeated contributor selection. Retained native cursors charge
 the adjacency entry once and charge any repeated contributor visits. If no edge
 can fit, a bounded read returns the byte-budget error rather than repeating an
-empty page. Bounded local reads and graph neighbor enrichment enforce a total scan ceiling. Distributed pattern edge
-RPCs carry a shard scan ceiling and report physical rows scanned, including
+empty page. Bounded local reads and graph neighbor enrichment enforce a total
+scan ceiling.
+
+Neighbor-context sampling resolves root endpoint table tags with the same rules
+as traversal, including incoming relationships whose raw source and target keys
+are equal across tables. Direct document graph writes notify dependent producers
+for both added and removed endpoints; generated publication does not schedule its
+own producer. Neighbor-dependent producers run after primary commit even for
+synchronous writes, which wait for their generated coverage. Before sampling,
+committed graph effects catch up in at most four 64-record replay pages per turn. The source frontier advances independently of
+consumer coverage and includes skipped journal records. An unfinished turn
+releases its publication/index leases and remains dependency work without spending
+the provider retry budget. Reopen and graph mutation invalidate that volatile
+frontier, so it cannot certify recovery or retain the replay journal.
+
+Distributed pattern edge RPCs carry a shard scan ceiling and report physical rows scanned, including
 expired rows. The coordinator charges those rows to the request-owned graph
 budget across shard reads and named pattern operations. It reads shards
 sequentially while that physical budget is active because a failed fair-share
