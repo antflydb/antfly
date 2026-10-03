@@ -76,6 +76,7 @@ RECIPES = {
             "fewnerd",
             "massive_slots",
             "multiconer",
+            "snips_restaurant",
         ],
     ),
 }
