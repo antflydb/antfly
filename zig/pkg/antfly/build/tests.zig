@@ -2636,12 +2636,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_lib_storage_tests = addFilteredTestRunArtifact(b, lib_storage_tests);
-    addRuntimeSkipTestFilters(run_lib_storage_tests, &release_scale_test_filters);
-    const lib_storage_test_step = b.step("antfly-storage-test", "Run root-module storage tests only");
-    lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
+    const lib_storage_test_step = b.step("antfly-storage-test", "Run local and server storage tests");
 
-    const ha_tests = b.addTest(.{
+    const hot_standby_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{"storage.hot_standby"},
         .test_runner = .{
@@ -2649,9 +2646,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             .mode = .simple,
         },
     });
-    const run_ha_tests = addFilteredTestRunArtifact(b, ha_tests);
-    const ha_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby storage tests");
-    ha_test_step.dependOn(&run_ha_tests.step);
+    const run_hot_standby_tests = addFilteredTestRunArtifact(b, hot_standby_tests);
+    const hot_standby_test_step = b.step("antfly-storage-hot-standby-test", "Run hot-standby storage tests");
+    hot_standby_test_step.dependOn(&run_hot_standby_tests.step);
 
     // cmd/standby.zig is owned by the distributed runtime unit. Keep its
     // focused parser root inside pkg/antfly/src so relative imports stay
@@ -2672,7 +2669,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"standby cmd"},
     });
     const run_standby_cli_tests = b.addRunArtifact(standby_cli_tests);
-    ha_test_step.dependOn(&run_standby_cli_tests.step);
+    hot_standby_test_step.dependOn(&run_standby_cli_tests.step);
 
     const lsm_backend_runtime_filters = selectTestFilters(b, &.{"storage.lsm_backend."});
     const lsm_backend_tests = b.addTest(.{
@@ -4697,7 +4694,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     const run_server_db_tests = addCuratedTestRunArtifact(b, server_db_tests, &server_db_filters);
     b.step("antfly-server-db-test", "Run server ordered apply and transaction recovery integration tests").dependOn(&run_server_db_tests.step);
-    unit_test_step.dependOn(&run_server_db_tests.step);
+    // Server integration owns an independent aggregate slice. Do not send a
+    // local-root caller filter to it; the dedicated server gate narrows its
+    // suite, and the storage gate validates filters across both inventories.
+    const run_unit_server_db_tests = addFilteredTestRunArtifactWithRuntimeFilters(b, server_db_tests, &server_db_filters);
+    unit_test_step.dependOn(&run_unit_server_db_tests.step);
+    @import("test_support.zig").addOwnerTestRuns(b, lib_storage_test_step, &.{
+        .{ .artifact = lib_storage_tests, .filters = &lib_storage_default_filters },
+        .{ .artifact = server_db_tests, .filters = &server_db_filters },
+    }, &release_scale_test_filters);
 
     const raft_storage_test_step = b.step("antfly-raft-storage-test", "Run Raft snapshot artifact storage tests");
     raft_storage_test_step.dependOn(&run_raft_storage_tests.step);
@@ -6134,8 +6139,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "unit-storage-test",
         "Run the storage portion of the default antfly-unit-test target in bounded codegen shards",
     );
-    unit_storage_sharded_test_step.dependOn(&run_server_db_tests.step);
-    lib_storage_test_step.dependOn(&run_server_db_tests.step);
+    unit_storage_sharded_test_step.dependOn(&run_unit_server_db_tests.step);
     const unit_storage_shard_audit = b.addSystemCommand(&.{"python3"});
     unit_storage_shard_audit.addFileArg(b.path("tools/audit_storage_test_shards.py"));
     unit_storage_shard_audit.addArg("--root");

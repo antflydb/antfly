@@ -80,7 +80,7 @@ pub const Config = struct {
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
-    ha: ?HAConfig = null,
+    ha: ?HotStandbyConfig = null,
     inference: InferenceConfig = .{},
     remote_content: ?RemoteContentConfig = null,
     connections: ConnectionsConfig = .{},
@@ -232,7 +232,7 @@ pub const Config = struct {
     /// the node's HA state and admin endpoint. Enum-valued sync fields are kept
     /// as strings and parsed by the runtime's flag parsers so both surfaces
     /// accept exactly the same spellings.
-    pub const HAConfig = struct {
+    pub const HotStandbyConfig = struct {
         admin_url: ?[]const u8 = null,
         admin_token_env: ?[]const u8 = null,
         cluster_id: ?u64 = null,
@@ -260,15 +260,15 @@ pub const Config = struct {
         fence_wal: ?[]const u8 = null,
         former_primary_log: ?[]const u8 = null,
 
-        pub fn wantsPrimary(self: HAConfig) bool {
+        pub fn wantsPrimary(self: HotStandbyConfig) bool {
             return self.primary_log != null or self.primary_slots != null;
         }
 
-        pub fn wantsStandby(self: HAConfig) bool {
+        pub fn wantsStandby(self: HotStandbyConfig) bool {
             return self.standby_log != null or self.standby_progress != null;
         }
 
-        fn deinit(self: *HAConfig, alloc: std.mem.Allocator) void {
+        fn deinit(self: *HotStandbyConfig, alloc: std.mem.Allocator) void {
             inline for (.{
                 "admin_url",       "admin_token_env",      "primary_log",  "primary_slots",
                 "primary_node_id", "seed_capture_root",    "standby_log",  "standby_progress",
@@ -926,7 +926,7 @@ pub const Config = struct {
             // `hot_standby` is the current config key; `ha` is accepted for one
             // minor release as a deprecated alias. If both are set, `hot_standby`
             // wins and `ha` is silently ignored (no conflict error).
-            .ha = try haConfigFromOpenApi(alloc, validated.value.hot_standby orelse validated.value.ha),
+            .ha = try hotStandbyConfigFromOpenApi(alloc, validated.value.hot_standby orelse validated.value.ha),
             .inference = if (validated.value.inference) |inference| .{
                 .api_url = if (inference.api_url) |url| (if (url.len > 0) try alloc.dupe(u8, url) else null) else null,
                 .api_key = try rawOptionalStringField(alloc, raw_root.get("inference"), "api_key"),
@@ -1027,9 +1027,9 @@ pub const Config = struct {
         return @intCast(raw);
     }
 
-    fn haConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HotStandbyConfig) !?HAConfig {
+    fn hotStandbyConfigFromOpenApi(alloc: std.mem.Allocator, value: ?common_openapi.HotStandbyConfig) !?HotStandbyConfig {
         const cfg = value orelse return null;
-        var out = HAConfig{};
+        var out = HotStandbyConfig{};
         errdefer out.deinit(alloc);
         if (cfg.admin) |admin| {
             out.admin_url = try optionalOwnedString(alloc, admin.url);

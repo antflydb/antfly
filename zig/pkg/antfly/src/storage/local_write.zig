@@ -414,8 +414,8 @@ pub const ManagedDbOpenOptions = struct {
 
 /// Install the exact private reservation before an owner is adopted. A
 /// canceled owner may only reopen for authenticated cancellation recovery.
-pub fn configureRestoreOwnerDb(alloc: std.mem.Allocator, db: *db_mod.DB, bootstrap: @import("db/restore_staging_contract.zig").OwnerBootstrap, allow_canceled: bool, ha_replay: bool) !void {
-    if (allow_canceled and ha_replay) return error.InvalidRestoreStagingCommand;
+pub fn configureRestoreOwnerDb(alloc: std.mem.Allocator, db: *db_mod.DB, bootstrap: @import("db/restore_staging_contract.zig").OwnerBootstrap, allow_canceled: bool, hot_standby_replay: bool) !void {
+    if (allow_canceled and hot_standby_replay) return error.InvalidRestoreStagingCommand;
     try bootstrap.validate();
     if (!db.core.identity_namespace.eql(bootstrap.scope.target_namespace)) return error.RestoreStagingScopeChanged;
     if (try db.restoreStagingStatus(alloc)) |loaded| {
@@ -423,7 +423,7 @@ pub fn configureRestoreOwnerDb(alloc: std.mem.Allocator, db: *db_mod.DB, bootstr
         defer progress.deinit();
         if (!std.mem.eql(u8, &progress.value.scope.digest(), &bootstrap.scope.digest())) return error.RestoreStagingScopeChanged;
         if (progress.value.phase == .canceled) {
-            if (!allow_canceled and !ha_replay) return error.RestoreStagingCanceled;
+            if (!allow_canceled and !hot_standby_replay) return error.RestoreStagingCanceled;
             // Recovery authority binds the entire immutable owner descriptor,
             // not merely its scope digest. Reject mismatched schema/index or
             // range bytes even after the target is terminal.

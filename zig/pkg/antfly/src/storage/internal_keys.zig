@@ -130,7 +130,7 @@ pub const replication_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
 /// Latest document-store mutation applied from the local data Raft log. The
 /// value stores term/index and is committed in the same primary batch as the
 /// document effects so restart replay cannot repeat non-idempotent transforms.
-pub const raft_document_applied_entry_key = [_]u8{ replay_namespace, 0xff, 0x05 };
+pub const ordered_document_applied_entry_key = [_]u8{ replay_namespace, 0xff, 0x05 };
 pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
 pub const asset_artifact_source_index_kind: u8 = 0x21;
 pub const document_child_range_outbox_kind: u8 = 0x22;
