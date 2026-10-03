@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const member_identity = @import("member_identity.zig");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
 const doc_set = @import("../doc_set.zig");
@@ -308,44 +309,13 @@ fn dedupeSearchHitsByExactId(alloc: Allocator, result: *types.SearchResult) !voi
     rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
 }
 
-const SearchMemberIdentity = struct {
-    source_table: ?[]const u8,
-    id: []const u8,
-    artifact_ref: ?types.ArtifactRef,
-};
-
-const SearchMemberIdentityContext = struct {
-    pub fn hash(_: SearchMemberIdentityContext, identity: SearchMemberIdentity) u64 {
-        var hasher = std.hash.Wyhash.init(0x4152_5449_4641_4354);
-        hashOptionalBytes(&hasher, identity.source_table);
-        if (identity.artifact_ref) |artifact_ref| {
-            hasher.update(&.{1});
-            hashArtifactRef(&hasher, artifact_ref);
-        } else {
-            hasher.update(&.{0});
-            hashLengthPrefixedBytes(&hasher, identity.id);
-        }
-        return hasher.final();
-    }
-
-    pub fn eql(_: SearchMemberIdentityContext, left: SearchMemberIdentity, right: SearchMemberIdentity) bool {
-        if (!optionalBytesEqual(left.source_table, right.source_table)) return false;
-        if (left.artifact_ref) |left_ref| {
-            const right_ref = right.artifact_ref orelse return false;
-            return artifactRefsEqual(left_ref, right_ref);
-        }
-        if (right.artifact_ref != null) return false;
-        return std.mem.eql(u8, left.id, right.id);
-    }
-};
-
 fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResult) !void {
     const source = result.*;
     const original_hits_len = result.hits.len;
     var seen = std.HashMapUnmanaged(
-        SearchMemberIdentity,
+        member_identity.Identity,
         void,
-        SearchMemberIdentityContext,
+        member_identity.Context,
         std.hash_map.default_max_load_percentage,
     ).empty;
     defer seen.deinit(alloc);
@@ -357,11 +327,7 @@ fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResul
     }
 
     for (result.hits) |hit| {
-        const identity = SearchMemberIdentity{
-            .source_table = hit.source_table,
-            .id = hit.id,
-            .artifact_ref = hit.artifact_ref,
-        };
+        const identity = member_identity.Identity.fromHit(hit);
         const gop = try seen.getOrPut(alloc, identity);
         if (gop.found_existing) continue;
         try deduped.append(alloc, try hit.clone(alloc));
@@ -374,77 +340,6 @@ fn dedupeSearchHitsByMemberIdentity(alloc: Allocator, result: *types.SearchResul
     if (result.hits.len > 0) alloc.free(result.hits);
     result.hits = owned_hits;
     rewriteLocalTotalAfterObservedDrop(result, source, original_hits_len, result.hits.len);
-}
-
-fn hashArtifactRef(hasher: *std.hash.Wyhash, artifact_ref: types.ArtifactRef) void {
-    hashLengthPrefixedBytes(hasher, artifact_ref.document_id);
-    hashLengthPrefixedBytes(hasher, artifact_ref.name);
-    hasher.update(&.{@intFromEnum(artifact_ref.kind)});
-    hashOptionalU32(hasher, artifact_ref.chunk_id);
-    hashOptionalBytes(hasher, artifact_ref.unit_id);
-    if (artifact_ref.source) |source| {
-        hasher.update(&.{1});
-        hasher.update(&.{@intFromEnum(source.kind)});
-        hashLengthPrefixedBytes(hasher, source.name);
-        hashOptionalU32(hasher, source.chunk_id);
-        hashOptionalBytes(hasher, source.unit_id);
-    } else {
-        hasher.update(&.{0});
-    }
-}
-
-fn hashLengthPrefixedBytes(hasher: *std.hash.Wyhash, value: []const u8) void {
-    var len_bytes: [@sizeOf(u64)]u8 = undefined;
-    std.mem.writeInt(u64, &len_bytes, value.len, .little);
-    hasher.update(&len_bytes);
-    hasher.update(value);
-}
-
-fn hashOptionalBytes(hasher: *std.hash.Wyhash, value: ?[]const u8) void {
-    if (value) |bytes| {
-        hasher.update(&.{1});
-        hashLengthPrefixedBytes(hasher, bytes);
-    } else {
-        hasher.update(&.{0});
-    }
-}
-
-fn hashOptionalU32(hasher: *std.hash.Wyhash, value: ?u32) void {
-    if (value) |number| {
-        hasher.update(&.{1});
-        var bytes: [@sizeOf(u32)]u8 = undefined;
-        std.mem.writeInt(u32, &bytes, number, .little);
-        hasher.update(&bytes);
-    } else {
-        hasher.update(&.{0});
-    }
-}
-
-fn artifactRefsEqual(left: types.ArtifactRef, right: types.ArtifactRef) bool {
-    if (left.kind != right.kind or
-        left.chunk_id != right.chunk_id or
-        !std.mem.eql(u8, left.document_id, right.document_id) or
-        !std.mem.eql(u8, left.name, right.name) or
-        !optionalBytesEqual(left.unit_id, right.unit_id))
-    {
-        return false;
-    }
-    if (left.source) |left_source| {
-        const right_source = right.source orelse return false;
-        return left_source.kind == right_source.kind and
-            left_source.chunk_id == right_source.chunk_id and
-            std.mem.eql(u8, left_source.name, right_source.name) and
-            optionalBytesEqual(left_source.unit_id, right_source.unit_id);
-    }
-    return right.source == null;
-}
-
-fn optionalBytesEqual(left: ?[]const u8, right: ?[]const u8) bool {
-    if (left) |left_bytes| {
-        const right_bytes = right orelse return false;
-        return std.mem.eql(u8, left_bytes, right_bytes);
-    }
-    return right == null;
 }
 
 fn dedupeSearchHitsByOrdinal(alloc: Allocator, result: *types.SearchResult) !void {

@@ -605,9 +605,11 @@ pub const ArtifactSourceRef = struct {
     unit_id: ?[]u8 = null,
 
     pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
         return .{
             .kind = self.kind,
-            .name = try alloc.dupe(u8, self.name),
+            .name = name,
             .chunk_id = self.chunk_id,
             .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
         };
@@ -629,12 +631,18 @@ pub const ArtifactRef = struct {
     source: ?ArtifactSourceRef = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
+        const document_id = try alloc.dupe(u8, self.document_id);
+        errdefer alloc.free(document_id);
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
+        const unit_id = if (self.unit_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (unit_id) |id| alloc.free(id);
         return .{
-            .document_id = try alloc.dupe(u8, self.document_id),
-            .name = try alloc.dupe(u8, self.name),
+            .document_id = document_id,
+            .name = name,
             .kind = self.kind,
             .chunk_id = self.chunk_id,
-            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
+            .unit_id = unit_id,
             .source = if (self.source) |source| try source.clone(alloc) else null,
         };
     }
@@ -2689,15 +2697,15 @@ pub const ChunkHit = struct {
     artifact_ref: ?ArtifactRef = null,
 
     pub fn clone(self: ChunkHit, alloc: Allocator) !ChunkHit {
-        return .{
-            .id = try alloc.dupe(u8, self.id),
-            .score = self.score,
-            .distance = self.distance,
-            .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
-            .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
-        };
+        var cloned: ChunkHit = .{ .id = try alloc.dupe(u8, self.id) };
+        errdefer cloned.deinit(alloc);
+        cloned.score = self.score;
+        cloned.distance = self.distance;
+        cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+        return cloned;
     }
 
     pub fn deinit(self: *ChunkHit, alloc: Allocator) void {

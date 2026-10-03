@@ -55467,6 +55467,10 @@ fn collectPendingDocumentUnitDenseChunkEmbeddings(
         // ChunkEmbedding.deinit frees it, and it must not free memory the
         // view's own deinit also owns.
         const consumer_indexes = try dupeConsumerIndexNames(alloc, embed_entry.consumer_indexes);
+        errdefer {
+            for (consumer_indexes) |name| alloc.free(name);
+            alloc.free(consumer_indexes);
+        }
         try out.append(alloc, .{
             .embedding_name = embed_entry.name,
             .source_field = embed_entry.source_field,
@@ -55488,12 +55492,38 @@ fn collectPendingDocumentUnitSparseChunkEmbeddings(
     for (chunk_view.sparse_embeddings) |embed_entry| {
         if (embed_entry.consumer_indexes.len == 0) continue;
         const consumer_indexes = try dupeConsumerIndexNames(alloc, embed_entry.consumer_indexes);
+        errdefer {
+            for (consumer_indexes) |name| alloc.free(name);
+            alloc.free(consumer_indexes);
+        }
         try out.append(alloc, .{
             .embedding_name = embed_entry.name,
             .producer_json = embed_entry.producer_json,
             .consumer_indexes = consumer_indexes,
         });
     }
+}
+
+/// Append the source and its parallel batch references atomically. Reserve all
+/// fallible container growth before transferring ownership of key/text, so an
+/// allocation denial leaves the pending batch valid and fully reclaimable.
+fn appendPendingDocumentUnitChunkSource(
+    alloc: Allocator,
+    pending: anytype,
+    chunk_key: []const u8,
+    chunk_text: []const u8,
+) !void {
+    try pending.sources.ensureUnusedCapacity(alloc, 1);
+    try pending.chunk_texts.ensureUnusedCapacity(alloc, 1);
+    try pending.source_indexes.ensureUnusedCapacity(alloc, 1);
+    const key = try alloc.dupe(u8, chunk_key);
+    errdefer alloc.free(key);
+    const text = try alloc.dupe(u8, chunk_text);
+    const source_index = pending.sources.items.len;
+    pending.sources.appendAssumeCapacity(.{ .key = key, .text = text });
+    pending.chunk_texts.appendAssumeCapacity(text);
+    pending.source_indexes.appendAssumeCapacity(source_index);
+    pending.batch_source_bytes += chunk_text.len;
 }
 
 fn appendChunkToPendingDenseChunkEmbedding(
@@ -55514,14 +55544,7 @@ fn appendChunkToPendingDenseChunkEmbedding(
     {
         try flushPendingDenseChunkEmbedding(alloc, runtime, dense_embedder, doc_key, pending, artifact_writes, dense_embeddings);
     }
-    const source_index = pending.sources.items.len;
-    try pending.sources.append(alloc, .{
-        .key = try alloc.dupe(u8, chunk_key),
-        .text = try alloc.dupe(u8, chunk_text),
-    });
-    try pending.chunk_texts.append(alloc, pending.sources.items[source_index].text);
-    try pending.source_indexes.append(alloc, source_index);
-    pending.batch_source_bytes += chunk_text.len;
+    try appendPendingDocumentUnitChunkSource(alloc, pending, chunk_key, chunk_text);
     if (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes >= max_batch_bytes) {
         try flushPendingDenseChunkEmbedding(alloc, runtime, dense_embedder, doc_key, pending, artifact_writes, dense_embeddings);
     }
@@ -55579,14 +55602,7 @@ fn appendChunkToPendingSparseChunkEmbedding(
     {
         try flushPendingSparseChunkEmbedding(alloc, runtime, sparse_embedder, pending, artifact_writes, sparse_embeddings);
     }
-    const source_index = pending.sources.items.len;
-    try pending.sources.append(alloc, .{
-        .key = try alloc.dupe(u8, chunk_key),
-        .text = try alloc.dupe(u8, chunk_text),
-    });
-    try pending.chunk_texts.append(alloc, pending.sources.items[source_index].text);
-    try pending.source_indexes.append(alloc, source_index);
-    pending.batch_source_bytes += chunk_text.len;
+    try appendPendingDocumentUnitChunkSource(alloc, pending, chunk_key, chunk_text);
     if (pending.chunk_texts.items.len >= max_batch_items or pending.batch_source_bytes >= max_batch_bytes) {
         try flushPendingSparseChunkEmbedding(alloc, runtime, sparse_embedder, pending, artifact_writes, sparse_embeddings);
     }
@@ -80796,6 +80812,23 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     try std.testing.expectEqual(@as(usize, 3), dense_members.hits.len);
     for (dense_members.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
 
+    var composed_members = try db.search(alloc, .{
+        .dense_queries = &.{
+            .{ .name = "first", .index_name = "mixed_dense", .query = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
+            .{ .name = "second", .index_name = "mixed_dense", .query = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
+        },
+        .limit = 3,
+        .search_effort = 1.0,
+        .return_mode = .member,
+    });
+    defer composed_members.deinit();
+    try std.testing.expectEqual(@as(usize, 3), composed_members.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), composed_members.total_hits);
+    for (composed_members.hits) |hit| {
+        try std.testing.expect(hit.artifact_ref != null);
+        try std.testing.expectEqual(@as(usize, 2), hit.index_scores.len);
+    }
+
     var dense_chunk_alias = try db.search(alloc, .{
         .index_name = "mixed_dense",
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
@@ -80857,6 +80890,23 @@ test "db vector indexes combine direct document and chunk-backed artifact source
     defer sparse_members.deinit();
     try std.testing.expectEqual(@as(usize, 3), sparse_members.hits.len);
     for (sparse_members.hits) |hit| try std.testing.expect(hit.artifact_ref != null);
+
+    var composed_sparse_members = try db.search(alloc, .{
+        .sparse_queries = &.{
+            .{ .name = "first", .index_name = "mixed_sparse", .query = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } },
+            .{ .name = "second", .index_name = "mixed_sparse", .query = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } },
+        },
+        .limit = 3,
+        .search_effort = 1.0,
+        .return_mode = .member,
+    });
+    defer composed_sparse_members.deinit();
+    try std.testing.expectEqual(@as(usize, 3), composed_sparse_members.hits.len);
+    try std.testing.expectEqual(@as(u32, 3), composed_sparse_members.total_hits);
+    for (composed_sparse_members.hits) |hit| {
+        try std.testing.expect(hit.artifact_ref != null);
+        try std.testing.expectEqual(@as(usize, 2), hit.index_scores.len);
+    }
 
     var sparse_prefix = try db.search(alloc, .{
         .index_name = "mixed_sparse",
@@ -106801,6 +106851,21 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expect(sparse_result.hits[0].ancestor_unit_data != null);
     try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_unit_data.?, "\"unit_id\":\"document:000001\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, sparse_result.hits[0].ancestor_unit_data.?, "\"text\":\"alpha beta gamma\"") != null);
+
+    var composed_ancestors = try db.search(alloc, .{
+        .full_text_queries = &.{.{ .name = "only", .index_name = "ft_document_chunks", .query = .{ .match = .{ .field = "text", .text = "gamma" } } }},
+        .return_mode = .member,
+        .limit = 1,
+        .include_stored = false,
+        .hierarchy_include_source = true,
+        .hierarchy_include_unit = true,
+    });
+    defer composed_ancestors.deinit();
+    try std.testing.expectEqual(@as(usize, 1), composed_ancestors.hits.len);
+    try std.testing.expect(composed_ancestors.hits[0].ancestor_source_data != null);
+    try std.testing.expect(composed_ancestors.hits[0].ancestor_unit_data != null);
+    try std.testing.expectEqualStrings(sparse_result.hits[0].ancestor_source_data.?, composed_ancestors.hits[0].ancestor_source_data.?);
+    try std.testing.expectEqualStrings(sparse_result.hits[0].ancestor_unit_data.?, composed_ancestors.hits[0].ancestor_unit_data.?);
 
     try db.batch(.{
         .writes = &.{.{
@@ -153332,6 +153397,83 @@ test "document extraction catalog snapshot releases every allocation on failure"
                 try std.testing.expectEqualStrings("consumer", chunk.text_indexes[0]);
                 try std.testing.expectEqualStrings("consumer", chunk.dense_embeddings[0].consumer_indexes[0]);
                 try std.testing.expectEqualStrings("consumer", chunk.sparse_embeddings[0].consumer_indexes[0]);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+test "pending document-unit dense embedding collection releases every failed allocation" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const Runtime = struct { config: struct { dense_embedder: ?u8 = 1 } = .{} };
+            var runtime: Runtime = .{};
+            const db = .{ .enrichment_runtime = @as(?*Runtime, &runtime) };
+            var names = [_][]u8{ @constCast("consumer"), @constCast("second_consumer") };
+            var entries = [_]DocumentExtractionEmbeddingView{
+                .{ .name = "embedding", .consumer_indexes = &names },
+                .{ .name = "other_embedding", .consumer_indexes = &names },
+            };
+            const view: DocumentExtractionChunkView = .{ .dense_embeddings = &entries };
+            var pending: std.ArrayListUnmanaged(PendingDocumentUnitDenseChunkEmbedding) = .empty;
+            defer {
+                for (pending.items) |*item| item.deinit(alloc);
+                pending.deinit(alloc);
+            }
+            try collectPendingDocumentUnitDenseChunkEmbeddings(alloc, db, &view, &pending);
+            try std.testing.expectEqual(@as(usize, 2), pending.items.len);
+            try std.testing.expectEqualStrings("consumer", pending.items[0].consumer_indexes[0]);
+            try std.testing.expectEqualStrings("second_consumer", pending.items[1].consumer_indexes[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "pending document-unit sparse embedding collection releases every failed allocation" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const Runtime = struct { config: struct { sparse_embedder: ?u8 = 1 } = .{} };
+            var runtime: Runtime = .{};
+            const db = .{ .enrichment_runtime = @as(?*Runtime, &runtime) };
+            var names = [_][]u8{ @constCast("consumer"), @constCast("second_consumer") };
+            var entries = [_]DocumentExtractionEmbeddingView{
+                .{ .name = "embedding", .consumer_indexes = &names },
+                .{ .name = "other_embedding", .consumer_indexes = &names },
+            };
+            const view: DocumentExtractionChunkView = .{ .sparse_embeddings = &entries };
+            var pending: std.ArrayListUnmanaged(PendingDocumentUnitSparseChunkEmbedding) = .empty;
+            defer {
+                for (pending.items) |*item| item.deinit(alloc);
+                pending.deinit(alloc);
+            }
+            try collectPendingDocumentUnitSparseChunkEmbeddings(alloc, db, &view, &pending);
+            try std.testing.expectEqual(@as(usize, 2), pending.items.len);
+            try std.testing.expectEqualStrings("consumer", pending.items[0].consumer_indexes[0]);
+            try std.testing.expectEqualStrings("second_consumer", pending.items[1].consumer_indexes[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "pending document-unit chunk sources append atomically under allocation failure" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            inline for (.{ PendingDocumentUnitDenseChunkEmbedding, PendingDocumentUnitSparseChunkEmbedding }) |Pending| {
+                var pending: Pending = if (@hasField(Pending, "expected_dims"))
+                    .{ .embedding_name = "embedding", .source_field = "text", .expected_dims = 2, .producer_json = "", .consumer_indexes = &.{} }
+                else
+                    .{ .embedding_name = "embedding", .producer_json = "", .consumer_indexes = &.{} };
+                defer pending.deinit(alloc);
+                try appendPendingDocumentUnitChunkSource(alloc, &pending, "chunk:0", "first");
+                appendPendingDocumentUnitChunkSource(alloc, &pending, "chunk:1", "second") catch |err| {
+                    try std.testing.expectEqual(@as(usize, 1), pending.sources.items.len);
+                    try std.testing.expectEqual(@as(usize, 1), pending.chunk_texts.items.len);
+                    try std.testing.expectEqual(@as(usize, 1), pending.source_indexes.items.len);
+                    try std.testing.expectEqual(@as(usize, 5), pending.batch_source_bytes);
+                    return err;
+                };
+                try std.testing.expectEqual(@as(usize, 2), pending.sources.items.len);
+                try std.testing.expectEqualStrings("second", pending.chunk_texts.items[1]);
+                try std.testing.expectEqual(@as(usize, 1), pending.source_indexes.items[1]);
             }
         }
     };
