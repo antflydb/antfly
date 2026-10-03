@@ -619,6 +619,11 @@ different sizes; see the report for caveats).
   0.723 / 0.624: NER matches, and classification trails by 0.07-0.10. The
   probe `scripts/antenna/gap_probe.py` places the remaining gap in the
   classification label markers; the next pool adds real label sets.
+- **Clean recipe:** with permissively licensed data only, two distillation
+  epochs and stage 3 give 0.663 / 0.415 classification and 0.645 / 0.626 NER
+  F1 (run26). The second epoch adds 0.03 held-out classification and leaves
+  NER unchanged. Details:
+  [work-log/completed/inference/antenna/2026-10-03-embedding-layout.md](../../../../../work-log/completed/inference/antenna/2026-10-03-embedding-layout.md).
 - **Decision head:** a Laya decision head trained on the frozen Antenna trunk
   (`scripts/antenna/init_decision_head.py`, `freeze_layers` set to the layer
   count plus one; Open-Jev, then Laya's step-0 split) scores 0.511 on Laya's
