@@ -7636,9 +7636,15 @@ pub const ApiHttpServer = struct {
         if (table_id == 0 or physical_table.len == 0 or database.len == 0) return error.RowPolicyCatalogChanged;
         var internal_context = context;
         internal_context.row_policy_install_authority = true;
-        const bytes = self.source.systemCatalog(alloc, internal_context, .{ .policy_publication_status = table_id }) catch |err| {
-            if (err == error.RowPolicyCatalogChanged) return null;
-            return err;
+        const bytes = self.source.systemCatalog(alloc, internal_context, .{ .policy_publication_status = table_id }) catch |err| switch (err) {
+            // A missing stamp/publication means row-policy install authority
+            // was never provisioned for this table (loadPolicyPublicationStamp
+            // and its sibling loadServingPolicyInstallSnapshot both report
+            // this as RowPolicyUnsupported, not RowPolicyCatalogChanged) --
+            // the ordinary unprotected case, same as an explicit disabled
+            // publication every owner has acknowledged.
+            error.RowPolicyCatalogChanged, error.RowPolicyUnsupported => return null,
+            else => return err,
         };
         defer alloc.free(bytes);
         var parsed = try std.json.parseFromSlice(@import("../system_catalog/policies.zig").PublicationStamp, alloc, bytes, .{ .ignore_unknown_fields = true });
@@ -33472,6 +33478,12 @@ test "api http row policy signer skips absent admitted identity" {
 test "ordinary read needs no principal without policy but active policy fails closed" {
     const Fixture = struct {
         active: bool = false,
+        // A table that never had row-policy install authority provisioned at
+        // all reports this through loadPolicyPublicationStamp's missing-stamp
+        // case as RowPolicyUnsupported, distinct from RowPolicyCatalogChanged
+        // (a stamp that exists but fails its own shape/identity check). Both
+        // must be treated as the ordinary unprotected read.
+        never_provisioned: bool = false,
         fn status(_: *anyopaque) !metadata_api.MetadataStatus {
             return .{ .metadata_group_id = 77, .metrics = .{} };
         }
@@ -33480,6 +33492,7 @@ test "ordinary read needs no principal without policy but active policy fails cl
             try std.testing.expect(call == .policy_publication_status);
             try std.testing.expectEqual(@as(u64, 7), call.policy_publication_status);
             try std.testing.expect(context.row_policy_install_authority);
+            if (self.never_provisioned) return error.RowPolicyUnsupported;
             if (!self.active) return error.RowPolicyCatalogChanged;
             return std.json.Stringify.valueAlloc(alloc, @import("../system_catalog/policies.zig").PublicationStamp{
                 .table_id = 7,
@@ -33499,6 +33512,9 @@ test "ordinary read needs no principal without policy but active policy fails cl
     try std.testing.expect((try server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1)) == null);
     fixture.active = true;
     try std.testing.expectError(error.RowPolicyAuthenticationRequired, server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1));
+    fixture.active = false;
+    fixture.never_provisioned = true;
+    try std.testing.expect((try server.rowPolicyReadProof(std.testing.allocator, null, .{}, 7, "docs", "main", 1)) == null);
 }
 
 test "api http server authenticates trusted principal" {
