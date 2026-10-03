@@ -49,6 +49,22 @@ pub const BackendType = enum {
     pjrt,
     wasm,
 
+    pub fn parse(value: []const u8) ?BackendType {
+        if (std.mem.eql(u8, value, "native")) return .native;
+        if (std.mem.eql(u8, value, "onnx")) return .onnx;
+        if (std.mem.eql(u8, value, "metal")) return .metal;
+        if (std.mem.eql(u8, value, "cuda")) return .cuda;
+        if (std.mem.eql(u8, value, "xla") or std.mem.eql(u8, value, "pjrt")) return .pjrt;
+        if (std.mem.eql(u8, value, "wasm") or std.mem.eql(u8, value, "webgpu")) return .wasm;
+        return null;
+    }
+
+    pub fn parseOptional(value: ?[]const u8) !?BackendType {
+        const raw = value orelse return null;
+        if (std.mem.eql(u8, raw, "auto")) return null;
+        return parse(raw) orelse error.InvalidArguments;
+    }
+
     pub fn available(self: BackendType) bool {
         return switch (self) {
             .native => build_options.enable_native,
@@ -1158,4 +1174,15 @@ test "effective backend order prefers native layoutlmv3 before onnx" {
     };
     const effective = effectiveBackendOrder(std.testing.allocator, &scratch, &preferred, manifest);
     try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native, .onnx }, effective);
+}
+
+test "backend names parse canonical values aliases and optional auto" {
+    inline for (.{ "native", "onnx", "metal", "cuda", "pjrt", "wasm" }) |name|
+        try std.testing.expectEqual(std.meta.stringToEnum(BackendType, name).?, BackendType.parse(name).?);
+    try std.testing.expectEqual(BackendType.pjrt, BackendType.parse("xla").?);
+    try std.testing.expectEqual(BackendType.wasm, BackendType.parse("webgpu").?);
+    try std.testing.expect(BackendType.parse("unknown") == null);
+    try std.testing.expect(try BackendType.parseOptional(null) == null);
+    try std.testing.expect(try BackendType.parseOptional("auto") == null);
+    try std.testing.expectError(error.InvalidArguments, BackendType.parseOptional("unknown"));
 }

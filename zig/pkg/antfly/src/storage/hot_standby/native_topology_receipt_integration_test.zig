@@ -30,7 +30,7 @@ test "native topology receipts survive restart and exact standby replay without 
     const ns: @import("../db/doc_identity_namespace.zig").Namespace = .{ .table_id = 11, .shard_id = 12, .range_id = 13 };
     const options: db_mod.OpenOptions = .{ .identity_namespace = ns, .online_source_authority = .native, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
     var primary_options = options;
-    primary_options.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&stream) };
+    primary_options.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&stream, .{});
     var primary = try db_mod.DB.open(alloc, primary_path, primary_options);
     var primary_open = true;
     defer if (primary_open) primary.close();

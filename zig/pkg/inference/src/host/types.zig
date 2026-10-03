@@ -577,11 +577,19 @@ test "chat serialization includes sampling controls when configured" {
         .presence_penalty = 0.2,
     });
     defer alloc.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"temperature\":0.25") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"top_p\":0.9") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"top_k\":40") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"frequency_penalty\":0.1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"presence_penalty\":0.2") != null);
+    const parsed = try std.json.parseFromSlice(struct {
+        temperature: f32,
+        top_p: f32,
+        top_k: u32,
+        frequency_penalty: f32,
+        presence_penalty: f32,
+    }, alloc, body, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(f32, 0.25), parsed.value.temperature);
+    try std.testing.expectEqual(@as(f32, 0.9), parsed.value.top_p);
+    try std.testing.expectEqual(@as(u32, 40), parsed.value.top_k);
+    try std.testing.expectEqual(@as(f32, 0.1), parsed.value.frequency_penalty);
+    try std.testing.expectEqual(@as(f32, 0.2), parsed.value.presence_penalty);
 }
 
 test "forced tool call synthesis normalizes plain JSON content" {

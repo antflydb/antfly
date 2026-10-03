@@ -87,8 +87,8 @@ const participants_prefix = "\x00\x00__txn_participants__:";
 const participant_index_prefix = "\x00\x00__txn_participant_index_v1__:";
 const resolved_index_prefix = "\x00\x00__txn_resolved_index_v1__:";
 const resolved_participants_prefix = "\x00\x00__txn_resolved_participants__:";
-const ha_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
-const ha_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
+const hot_standby_batch_outbox_prefix = "\x00\x00__txn_ha_batch_outbox__:";
+const hot_standby_replay_outbox_prefix = "\x00\x00__txn_ha_replay_outbox__:";
 
 // ============================================================================
 // Types
@@ -1458,8 +1458,8 @@ pub const TxnManager = struct {
             try readHasPrefix(&read, intent_locks_prefix) or
             try readHasPrefix(&read, read_guards_prefix) or
             try readHasPrefix(&read, read_members_prefix) or
-            try readHasPrefix(&read, ha_batch_outbox_prefix) or
-            try readHasPrefix(&read, ha_replay_outbox_prefix))
+            try readHasPrefix(&read, hot_standby_batch_outbox_prefix) or
+            try readHasPrefix(&read, hot_standby_replay_outbox_prefix))
         {
             return true;
         }
@@ -2516,15 +2516,15 @@ pub const TxnManager = struct {
         const record_key = makeRecordKey(txn_id);
         const participant_key = makeSidecarKey(participants_prefix, txn_id);
         const resolved_key = makeSidecarKey(resolved_participants_prefix, txn_id);
-        const ha_batch_key = makeTransactionReplicationBatchOutboxKey(txn_id);
-        const ha_replay_key = makeTransactionReplicationReplayOutboxKey(txn_id);
+        const hot_standby_batch_key = makeTransactionReplicationBatchOutboxKey(txn_id);
+        const hot_standby_replay_key = makeTransactionReplicationReplayOutboxKey(txn_id);
         const intent_keys_key = makeSidecarKey(intent_keys_prefix, txn_id);
         const schema_lease_key = makeSidecarKey(schema_leases_prefix, txn_id);
         var deletes = std.ArrayListUnmanaged([]const u8).empty;
         defer deletes.deinit(self.alloc);
         const admission_key = makeSidecarKey(intent_admission_prefix, txn_id);
         try deletes.append(self.alloc, &admission_key);
-        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &ha_batch_key, &ha_replay_key, &intent_keys_key, &schema_lease_key });
+        try deletes.appendSlice(self.alloc, &.{ &record_key, &participant_key, &resolved_key, &hot_standby_batch_key, &hot_standby_replay_key, &intent_keys_key, &schema_lease_key });
         try deletes.appendSlice(self.alloc, extra_batch.deletes);
         const member_prefix = makeSidecarKey(participant_index_prefix, txn_id);
         const resolution_prefix = makeSidecarKey(resolved_index_prefix, txn_id);
@@ -2901,12 +2901,12 @@ fn participantListCountInRead(
     return count;
 }
 
-pub fn makeTransactionReplicationBatchOutboxKey(txn_id: TxnId) [ha_batch_outbox_prefix.len + 16]u8 {
-    return makeSidecarKey(ha_batch_outbox_prefix, txn_id);
+pub fn makeTransactionReplicationBatchOutboxKey(txn_id: TxnId) [hot_standby_batch_outbox_prefix.len + 16]u8 {
+    return makeSidecarKey(hot_standby_batch_outbox_prefix, txn_id);
 }
 
-pub fn makeTransactionReplicationReplayOutboxKey(txn_id: TxnId) [ha_replay_outbox_prefix.len + 16]u8 {
-    return makeSidecarKey(ha_replay_outbox_prefix, txn_id);
+pub fn makeTransactionReplicationReplayOutboxKey(txn_id: TxnId) [hot_standby_replay_outbox_prefix.len + 16]u8 {
+    return makeSidecarKey(hot_standby_replay_outbox_prefix, txn_id);
 }
 
 fn applyResolveDecision(record: *TxnRecord, status: TxnStatus, timestamp: u64) TxnError!void {

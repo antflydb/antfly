@@ -45,6 +45,11 @@ const BenchResult = struct {
 pub fn main(init: std.process.Init) !void {
     const allocator = std.heap.page_allocator;
     const cfg = try parseArgs(init);
+    if (cfg.measure_iters == 0) return error.InvalidIterationCount;
+    std.debug.print("x86_kernel={s} effective_cpu_threads={}\n", .{
+        if (linalg.x86.enabled) @tagName(linalg.x86.selected()) else "not_applicable",
+        linalg.pool.cachedCpuCount(),
+    });
     const result = try runBench(allocator, cfg);
 
     std.debug.print(
@@ -79,18 +84,18 @@ pub fn main(init: std.process.Init) !void {
         cfg.head_dim,
         cfg.channel_groups,
         cfg.primitive_repeats,
-        nsToMs(result.dot_ns),
-        nsToMs(result.axpy_ns),
-        nsToMs(result.cross_ns),
-        nsToMs(result.deberta_ns),
-        nsToMs(result.channel_ns),
-        nsToMs(result.sgemm_qkv_ns),
-        nsToMs(result.sgemm_mlp_up_ns),
-        nsToMs(result.sgemm_transb_proj_ns),
-        nsToMs(result.sgemm_transb_qk_ns),
-        nsToMs(result.sgemm_transb_f16_proj_ns),
-        nsToMs(result.flash_attn_clip_text_ns),
-        nsToMs(result.flash_attn_bert_base_ns),
+        nsToMs(result.dot_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.axpy_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.cross_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.deberta_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.channel_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.sgemm_qkv_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.sgemm_mlp_up_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.sgemm_transb_proj_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.sgemm_transb_qk_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.sgemm_transb_f16_proj_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.flash_attn_clip_text_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
+        nsToMs(result.flash_attn_bert_base_ns) / @as(f64, @floatFromInt(cfg.measure_iters)),
         result.checksum,
     });
 }

@@ -1802,6 +1802,15 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const SearchRequest = struct {
+    pub fn hasHitEvaluation(self: @This()) bool {
+        return self.evaluation_limit > 0 and !self.evaluation_graph;
+    }
+
+    evaluation_json: []const u8 = "",
+    evaluation_limit: u32 = 0,
+    evaluation_matches: bool = false,
+    /// Graph evaluation owns a separate collection window; base hit paging is unchanged.
+    evaluation_graph: bool = false,
     /// Set only after catalog schema/index preparation; never populated by public JSON.
     prepared_read_table_id: u64 = 0,
     /// Request-owned routing map parallel to filter_doc_ids; never serialized.
@@ -1987,6 +1996,10 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
+    "evaluation_json",
+    "evaluation_limit",
+    "evaluation_matches",
+    "evaluation_graph",
     "query",
     "index_name",
     "primary_text_index_name",
@@ -2454,6 +2467,7 @@ pub const GraphMetricRerankScoreDetails = struct {
 };
 
 pub const SearchHit = struct {
+    computed_json: ?[]u8 = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
     /// table. This is not serialized as part of the public search-hit shape.
@@ -2481,6 +2495,7 @@ pub const SearchHit = struct {
         var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.computed_json) |data| alloc.free(data);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
@@ -2491,6 +2506,7 @@ pub const SearchHit = struct {
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
             freeHighlights(alloc, cloned.highlights);
         }
+        cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
@@ -2523,6 +2539,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.computed_json) |data| alloc.free(data);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
@@ -2873,6 +2890,27 @@ pub const GraphSearchResult = struct {
     metric_status: []GraphMetricStatus = &.{},
     truncated: bool = false,
 
+    /// Borrowed dependency view: inference collection must not enlarge the
+    /// graph relation seen by subsequent named operations. Only the slice
+    /// containers belong to scratch; never deinit this view as an owned result.
+    pub fn dependencyView(self: GraphSearchResult, scratch: Allocator, limit: ?u32, source_table: []const u8) !GraphSearchResult {
+        const maximum = limit orelse return self;
+        if (self.matches.len <= maximum) return self;
+        var view = self;
+        view.matches = self.matches[0..maximum];
+        view.truncated = true;
+        var hits: std.ArrayList(SearchHit) = .empty;
+        for (self.hits) |hit| {
+            var included = false;
+            for (view.matches) |match| for (match.bindings) |binding| {
+                if (std.mem.eql(u8, hit.id, binding.node.key) and std.mem.eql(u8, hit.source_table orelse source_table, binding.node.table orelse source_table)) included = true;
+            };
+            if (included) try hits.append(scratch, hit);
+        }
+        view.hits = hits.items;
+        return view;
+    }
+
     /// Detach request-scoped retained-state release hooks at the result
     /// ownership boundary. The request budget remains consumptively charged,
     /// while result deinit continues to own and free the allocations.
@@ -3061,11 +3099,13 @@ pub const GraphPatternBinding = struct {
 };
 
 pub const GraphPatternMatch = struct {
+    computed_json: ?[]u8 = null,
     bindings: []GraphPatternBinding,
     path: []graph_query_mod.PathEdgeInfo,
     null_aliases: [][]u8 = &.{},
 
     pub fn deinit(self: *GraphPatternMatch, alloc: Allocator) void {
+        if (self.computed_json) |bytes| alloc.free(bytes);
         for (self.bindings) |*binding| binding.deinit(alloc);
         if (self.bindings.len > 0) alloc.free(self.bindings);
         for (self.path) |edge| {
@@ -4002,9 +4042,6 @@ pub const OrderedApplyReceipt = struct {
     term: u64,
     index: u64,
 };
-
-/// Server source compatibility; the durable term/index encoding is unchanged.
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,

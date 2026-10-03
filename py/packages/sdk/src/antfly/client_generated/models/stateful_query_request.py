@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ..models.phrase_query import PhraseQuery
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
+    from ..models.query_evaluation import QueryEvaluation
     from ..models.query_hierarchy import QueryHierarchy
     from ..models.query_highlight import QueryHighlight
     from ..models.query_request_aggregations import QueryRequestAggregations
@@ -64,6 +65,11 @@ class StatefulQueryRequest:
     the stateful public transport boundary for the v0.2 transition window.
 
         Attributes:
+            evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
+                offset/limit. Candidates require candidate_count; matches require
+                max_rows and fail if the full qualifying population exceeds that budget.
+                Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+                be combined with evaluation. NULL inputs skip inference; errors fail.
             table_target (CatalogTableTarget | Unset): An explicit native table target. Components are literal names; dots
                 do not qualify a string table name.
             table (str | Unset): Literal table name in default.public. Global queries require exactly one of table or
@@ -380,6 +386,7 @@ class StatefulQueryRequest:
                 - intersection: Only include nodes appearing in both
     """
 
+    evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
     table: str | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
@@ -531,6 +538,10 @@ class StatefulQueryRequest:
         from ..models.term_query import TermQuery
         from ..models.term_range_query import TermRangeQuery
         from ..models.wildcard_query import WildcardQuery
+
+        evaluate: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.evaluate, Unset):
+            evaluate = self.evaluate.to_dict()
 
         table_target: dict[str, Any] | Unset = UNSET
         if not isinstance(self.table_target, Unset):
@@ -822,6 +833,8 @@ class StatefulQueryRequest:
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
+        if evaluate is not UNSET:
+            field_dict["evaluate"] = evaluate
         if table_target is not UNSET:
             field_dict["table_target"] = table_target
         if table is not UNSET:
@@ -934,6 +947,7 @@ class StatefulQueryRequest:
         from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
+        from ..models.query_evaluation import QueryEvaluation
         from ..models.query_hierarchy import QueryHierarchy
         from ..models.query_highlight import QueryHighlight
         from ..models.query_request_aggregations import QueryRequestAggregations
@@ -950,6 +964,13 @@ class StatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         d = dict(src_dict)
+        _evaluate = d.pop("evaluate", UNSET)
+        evaluate: QueryEvaluation | Unset
+        if isinstance(_evaluate, Unset):
+            evaluate = UNSET
+        else:
+            evaluate = QueryEvaluation.from_dict(_evaluate)
+
         _table_target = d.pop("table_target", UNSET)
         table_target: CatalogTableTarget | Unset
         if isinstance(_table_target, Unset):
@@ -1838,6 +1859,7 @@ class StatefulQueryRequest:
             expand_strategy = StatefulQueryRequestExpandStrategy(_expand_strategy)
 
         stateful_query_request = cls(
+            evaluate=evaluate,
             table_target=table_target,
             table=table,
             query=query,

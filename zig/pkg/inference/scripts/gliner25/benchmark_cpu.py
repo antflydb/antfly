@@ -26,6 +26,7 @@ import generate_pipeline_cases as adaptation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import paired_benchmark
+from linux_cpu import host_provenance
 
 HERE = Path(__file__).resolve().parent
 SCOPE = "gliner25_direct_core_cpu_fp32"
@@ -325,10 +326,17 @@ def checked_ready(arm: str, ready: dict[str, Any], bundle: dict[str, Any], cases
     for key, expected in fields.items():
         if ready.get(key) != expected:
             raise BenchmarkError(f"{arm} ready contract differs: {key}")
-    if arm == "native" and (ready.get("build_mode") != "ReleaseFast" or ready.get("scheduler") != "serial_io" or ready.get("cases_sha256") != oracle.sha256_file(cases_path)):
+    if arm == "native" and (ready.get("build_mode") != "ReleaseFast" or ready.get("scheduler") != ("bounded_io" if not ready.get("system_blas") and threads > 1 else "serial_io") or ready.get("cases_sha256") != oracle.sha256_file(cases_path)):
         raise BenchmarkError("native build, scheduling, or fixture identity is not qualified for timing")
     if arm == "python" and ready.get("interop_threads") != 1:
         raise BenchmarkError("Python interop thread budget differs")
+
+
+def thread_environment(threads: int) -> dict[str, str]:
+    # BLAS supports the full benchmark budget. The native fallback pool has
+    # its own eight-worker maximum, including in BLAS-enabled workers.
+    return {**{name: str(threads) for name in THREAD_ENV},
+            "ANTFLY_INFERENCE_CPU_THREADS": str(min(threads, 8))}
 
 
 def run_variant(args: argparse.Namespace, variant: str, directory: Path) -> dict[str, Any]:
@@ -350,7 +358,7 @@ def run_variant(args: argparse.Namespace, variant: str, directory: Path) -> dict
         raise BenchmarkError("requested benchmark exceeds worker command budget")
     expected = {name: canonical_result(all_cases[name]["expected"]) for name in selected}
     env = dict(os.environ)
-    env.update({name: str(args.threads) for name in THREAD_ENV})
+    env.update(thread_environment(args.threads))
     env.update(PYTHONDONTWRITEBYTECODE="1", TOKENIZERS_PARALLELISM="false", HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     env.pop("USE_FLASHDEBERTA", None)
     native_command = [str(args.native_bin), "--model-dir", str(model_dir), "--cases", str(case_path), "--threads", str(args.threads), "--timeout-ms", str(args.timeout_ms), "--max-commands", str(command_count)]
@@ -415,7 +423,7 @@ def run_variant(args: argparse.Namespace, variant: str, directory: Path) -> dict
 
 
 def driver(args: argparse.Namespace) -> None:
-    if not 1 <= args.threads <= 32 or not 0 <= args.warmup <= 8 or not 2 <= args.pairs <= 64 or not 1 <= args.timeout_ms <= 60000 or not 1 <= args.startup_timeout <= 300 or not 256 <= args.max_rss_mib <= 12288:
+    if not 1 <= args.threads <= 32 or not 0 <= args.warmup <= 8 or not 2 <= args.pairs <= 64 or not 1 <= args.timeout_ms <= 300000 or not 1 <= args.startup_timeout <= 300 or not 256 <= args.max_rss_mib <= 12288:
         raise BenchmarkError("invalid benchmark resource or sampling limits")
     if args.output.exists() or not args.native_bin.is_file():
         raise BenchmarkError("requires a new output directory and an existing native binary")
@@ -431,7 +439,7 @@ def driver(args: argparse.Namespace) -> None:
               "native_binary": {"path": str(args.native_bin), "sha256": oracle.sha256_file(args.native_bin)},
               "driver_sha256": oracle.sha256_file(Path(__file__)), "source": provenance,
               "platform": {"system": platform.system(), "machine": platform.machine(), "processor": platform.processor()},
-              "models": []}
+              "host": host_provenance(), "models": []}
     try:
         for variant in (("small", "base", "multi") if args.model == "all" else (args.model,)):
             report["models"].append(run_variant(args, variant, args.output / variant))

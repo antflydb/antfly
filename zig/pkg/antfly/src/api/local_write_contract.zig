@@ -71,7 +71,7 @@ pub const ManagedDbOpenMode = enum {
     status_only,
 };
 
-pub const RestoreTerminalAdmission = enum { none, ha_replay, cancel_recovery };
+pub const RestoreTerminalAdmission = enum { none, hot_standby_replay, cancel_recovery };
 pub const StartupCatchUpMetadata = struct {
     pub const MetadataSource = enum { supplied, local_persisted };
     pub const IdentityValidation = enum {
