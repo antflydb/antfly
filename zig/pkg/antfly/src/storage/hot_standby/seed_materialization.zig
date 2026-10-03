@@ -249,10 +249,10 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
                 if (hidden_catalog != null or schema_json != null) return error.SeedReplicaIdentityMismatch;
             }
         }
-        var native_ha_owner = false;
+        var native_hot_standby_owner = false;
         for (native_owners) |owner| {
             if (owner.scope.target_namespace.shard_id != replica.group_id) continue;
-            native_ha_owner = true;
+            native_hot_standby_owner = true;
             var verified = try db_mod.DB.open(alloc, staged.path(), .{ .open_mode = .query_readonly, .primary_only_readonly = true, .identity_namespace = owner.scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
             defer verified.close();
             var bootstrap = (try verified.readRestoreStagingBootstrap(alloc)) orelse return error.SeedReplicaIdentityMismatch;
@@ -269,7 +269,7 @@ pub fn materialize(alloc: Allocator, request: MaterializeRequest) !MaterializeRe
         if (try staged.publish() != .durable) return error.LiveDBPublicationConflict;
         // Stream authority reconstructs an owner, not Raft membership. The
         // independent registry keeps it discoverable for replay and reseeding.
-        if (native_ha_owner) continue;
+        if (native_hot_standby_owner) continue;
         try catalog.catalog().upsertReplica(.{
             .group_id = replica.group_id,
             .replica_id = request.target_replica_id,

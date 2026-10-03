@@ -356,11 +356,11 @@ const hot_standby_contract_type_names = [_][]const u8{
     "HAActionReceipt",
 };
 
-const HaToStandbyAliasPair = struct { ha: []const u8, standby: []const u8 };
+const LegacyStandbyAliasPair = struct { ha: []const u8, standby: []const u8 };
 
 // Deprecated aliases, remove after 0.4: every `HA*` facade name above that has
 // a same-shape `Standby*` counterpart, paired for the alias-equivalence test.
-const hot_standby_to_standby_alias_pairs = [_]HaToStandbyAliasPair{
+const hot_standby_to_standby_alias_pairs = [_]LegacyStandbyAliasPair{
     .{ .ha = "HASyncPolicy", .standby = "StandbySyncPolicy" },
     .{ .ha = "HAIdentity", .standby = "StandbyIdentity" },
     .{ .ha = "HALeaseWatchdogProof", .standby = "StandbyLeaseWatchdogProof" },

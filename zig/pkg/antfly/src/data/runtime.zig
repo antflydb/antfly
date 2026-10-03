@@ -4255,10 +4255,10 @@ pub const DataServerConfig = struct {
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
-    ha: DataServerHAConfig = .{},
+    hot_standby: DataServerHotStandbyConfig = .{},
 };
 
-pub const DataServerHAConfig = struct {
+pub const DataServerHotStandbyConfig = struct {
     /// Explicit node-local metadata directory for restore owner authority.
     /// Standalone seed activation supplies its installed metadata directory;
     /// otherwise private state stays beneath the configured replica root.
@@ -4283,42 +4283,42 @@ pub const DataServerHAConfig = struct {
     /// Optional storage-specific producer for an immutable logical snapshot.
     /// DataServer still validates and packages the result; providers cannot
     /// select the published generation root or bypass the mutation barrier.
-    seed_snapshot_provider: ?HASeedSnapshotProvider = null,
+    seed_snapshot_provider: ?HotStandbySeedSnapshotProvider = null,
     internal_primary: ?*antfly.hot_standby.primary.Primary = null,
     primary_retention_policy: antfly.hot_standby.slot_store.RetentionPolicy = .{},
     primary_sync_policy: antfly.hot_standby.primary.SyncPolicy = .{},
-    primary_sync_wait: HASyncWaitConfig = .{},
-    standby_replication: ?HAStandbyReplicationConfig = null,
+    primary_sync_wait: HotStandbySyncWaitConfig = .{},
+    standby_replication: ?HotStandbyStandbyReplicationConfig = null,
 };
 
-pub const HASeedSnapshotRequest = struct {
+pub const HotStandbySeedSnapshotRequest = struct {
     capture_root: []const u8,
     generation: []const u8,
     auth_artifact_json: ?[]const u8 = null,
 };
 
-pub const HASeedPreparedSnapshot = struct {
+pub const HotStandbySeedPreparedSnapshot = struct {
     root: []u8,
 
-    pub fn deinit(self: *HASeedPreparedSnapshot, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *HotStandbySeedPreparedSnapshot, alloc: std.mem.Allocator) void {
         alloc.free(self.root);
         self.* = undefined;
     }
 };
 
-pub const HASeedSnapshotProvider = struct {
+pub const HotStandbySeedSnapshotProvider = struct {
     ptr: *anyopaque,
     prepare_fn: *const fn (
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
-        request: HASeedSnapshotRequest,
-    ) anyerror!HASeedPreparedSnapshot,
+        request: HotStandbySeedSnapshotRequest,
+    ) anyerror!HotStandbySeedPreparedSnapshot,
 
     pub fn prepare(
-        self: HASeedSnapshotProvider,
+        self: HotStandbySeedSnapshotProvider,
         alloc: std.mem.Allocator,
-        request: HASeedSnapshotRequest,
-    ) !HASeedPreparedSnapshot {
+        request: HotStandbySeedSnapshotRequest,
+    ) !HotStandbySeedPreparedSnapshot {
         return try self.prepare_fn(self.ptr, alloc, request);
     }
 };
@@ -4328,12 +4328,12 @@ const hot_standby_seed_snapshot_topology_name = antfly.hot_standby.seed_topology
 const hot_standby_seed_snapshot_max_topology_bytes = 16 * 1024 * 1024;
 const hot_standby_seed_snapshot_max_store_bytes: u64 = 64 * 1024 * 1024 * 1024;
 
-const HASeedSnapshotTopologyReplica = antfly.hot_standby.seed_topology.ReplicaSnapshot;
-const HASeedSnapshotExtensionArtifact = antfly.hot_standby.seed_topology.ExtensionArtifact;
-const HASeedSnapshotAuthArtifact = antfly.hot_standby.seed_topology.AuthArtifact;
-const HASeedSnapshotTopology = antfly.hot_standby.seed_topology.Topology;
+const HotStandbySeedSnapshotTopologyReplica = antfly.hot_standby.seed_topology.ReplicaSnapshot;
+const HotStandbySeedSnapshotExtensionArtifact = antfly.hot_standby.seed_topology.ExtensionArtifact;
+const HotStandbySeedSnapshotAuthArtifact = antfly.hot_standby.seed_topology.AuthArtifact;
+const HotStandbySeedSnapshotTopology = antfly.hot_standby.seed_topology.Topology;
 
-const HASeedExtensionCaptureProbe = struct {
+const HotStandbySeedExtensionCaptureProbe = struct {
     ptr: *anyopaque,
     after_copy_fn: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!void,
 
@@ -4344,7 +4344,7 @@ const HASeedExtensionCaptureProbe = struct {
 
 fn freeHotStandbySeedSnapshotExtensionArtifacts(
     alloc: std.mem.Allocator,
-    artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
+    artifacts: *std.ArrayListUnmanaged(HotStandbySeedSnapshotExtensionArtifact),
 ) void {
     for (artifacts.items) |artifact| {
         alloc.free(artifact.path);
@@ -4418,7 +4418,7 @@ fn hotStandbySeedExtensionEntryForPath(
 }
 
 fn hotStandbySeedExtensionArtifactDirectory(
-    artifacts: []const HASeedSnapshotExtensionArtifact,
+    artifacts: []const HotStandbySeedSnapshotExtensionArtifact,
     path: []const u8,
 ) bool {
     for (artifacts) |artifact| {
@@ -4430,14 +4430,14 @@ fn hotStandbySeedExtensionArtifactDirectory(
     return false;
 }
 
-pub const HASyncWaitConfig = struct {
+pub const HotStandbySyncWaitConfig = struct {
     max_rounds: usize = 200,
     sleep_ns: u64 = 10 * std.time.ns_per_ms,
     poll_ctx: ?*anyopaque = null,
     poll_fn: ?antfly.hot_standby.sync_wait.HotStandbyProgressPollFn = null,
 };
 
-fn hotStandbyPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.hot_standby.sync_wait.HotStandbyPrimaryProgressSyncWait {
+fn hotStandbyPrimarySyncWaitFromConfig(cfg: HotStandbySyncWaitConfig) antfly.hot_standby.sync_wait.HotStandbyPrimaryProgressSyncWait {
     return .{
         .max_rounds = cfg.max_rounds,
         .sleep_ns = cfg.sleep_ns,
@@ -4446,7 +4446,7 @@ fn hotStandbyPrimarySyncWaitFromConfig(cfg: HASyncWaitConfig) antfly.hot_standby
     };
 }
 
-pub const HAStandbyReplicationConfig = struct {
+pub const HotStandbyStandbyReplicationConfig = struct {
     upstream_base_uri: []const u8,
     slot_name: []const u8,
     /// Authentication authority for the upstream internal HA endpoints.
@@ -4455,20 +4455,20 @@ pub const HAStandbyReplicationConfig = struct {
     bearer_token: ?[]const u8 = null,
     standby_log_path: ?[]const u8 = null,
     standby_progress_path: ?[]const u8 = null,
-    options: HAStandbyReplicationOptions = .{},
+    options: HotStandbyStandbyReplicationOptions = .{},
     catch_up_until_end_of_wal: bool = false,
     executor: ?antfly.common.http.RequestExecutor = null,
 };
 
 /// A server-owned upstream/slot pair retained until replication quiesces.
-const HAStandbyUpstreamRetired = struct {
+const HotStandbyStandbyUpstreamRetired = struct {
     upstream_url: []u8,
     slot_name: []u8,
 };
 
-pub const HAStandbyReplicationOptions = antfly.hot_standby.http_replication_client.ReplicateOptions;
-pub const HAStandbyReplicationResult = antfly.hot_standby.http_replication_client.Result;
-pub const HAStandbyReplicationLoopResult = antfly.hot_standby.http_replication_client.LoopResult;
+pub const HotStandbyStandbyReplicationOptions = antfly.hot_standby.http_replication_client.ReplicateOptions;
+pub const HotStandbyStandbyReplicationResult = antfly.hot_standby.http_replication_client.Result;
+pub const HotStandbyStandbyReplicationLoopResult = antfly.hot_standby.http_replication_client.LoopResult;
 
 fn hotStandbyReplicationWindowReachedEnd(
     upstream_end_of_wal: bool,
@@ -4481,7 +4481,7 @@ fn hotStandbyReplicationWindowReachedEnd(
         progress.applied_lsn == progress.received_lsn;
 }
 
-const HAStandbyReplicationErrorCode = enum(u8) {
+const HotStandbyStandbyReplicationErrorCode = enum(u8) {
     none = 0,
     HttpConnectionClosing,
     ConnectionResetByPeer,
@@ -4540,7 +4540,7 @@ const HAStandbyReplicationErrorCode = enum(u8) {
     Other,
 };
 
-fn hotStandbyStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErrorCode {
+fn hotStandbyStandbyReplicationErrorCode(err: anyerror) HotStandbyStandbyReplicationErrorCode {
     return switch (@import("../common/http/http_common.zig").canonicalTransportError(err)) {
         error.HttpConnectionClosing => .HttpConnectionClosing,
         error.ConnectionResetByPeer => .ConnectionResetByPeer,
@@ -4600,7 +4600,7 @@ fn hotStandbyStandbyReplicationErrorCode(err: anyerror) HAStandbyReplicationErro
     };
 }
 
-fn hotStandbyStandbyReplicationErrorName(code: HAStandbyReplicationErrorCode) ?[]const u8 {
+fn hotStandbyStandbyReplicationErrorName(code: HotStandbyStandbyReplicationErrorCode) ?[]const u8 {
     return switch (code) {
         .MetadataHABindingBusy => "MetadataHABindingBusy",
         .none => null,
@@ -4775,7 +4775,7 @@ fn isNonFatalHotStandbyStandbyReplicationError(err: anyerror) bool {
 }
 
 fn isSupersededHotStandbyStandbyReplicationRound(err: anyerror) bool {
-    // Replication fetches intentionally release ha_state_mutex while waiting
+    // Replication fetches intentionally release hot_standby_state_mutex while waiting
     // on the upstream. Promotion can replace the standby generation between
     // config capture and fetch, or while a fetch is in flight. Discarding
     // either attempt is successful synchronization, not an availability
@@ -5716,7 +5716,7 @@ pub const DataServer = struct {
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
-    hot_standby_cfg: DataServerHAConfig = .{},
+    hot_standby_cfg: DataServerHotStandbyConfig = .{},
     hot_standby_state_mutex: std.atomic.Mutex = .unlocked,
     /// Global primary mutation/capture ordering point. All DB/catalog writers
     /// share this instance through their HA mirror configuration.
@@ -5736,7 +5736,7 @@ pub const DataServer = struct {
     hot_standby_primary_mirror_sync_wait_count: std.atomic.Value(u64) = .init(0),
     hot_standby_primary_mirror_sync_degraded_count: std.atomic.Value(u64) = .init(0),
     hot_standby_standby_replication_failure_count: std.atomic.Value(u64) = .init(0),
-    hot_standby_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HAStandbyReplicationErrorCode.none)),
+    hot_standby_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HotStandbyStandbyReplicationErrorCode.none)),
     hot_standby_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     hot_standby_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     hot_standby_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
@@ -5744,13 +5744,13 @@ pub const DataServer = struct {
     /// Owned independently of the active config: promotion clears that
     /// config while a replication round can still be reading these strings.
     /// The initial caller-owned pair is never stored here or freed by us.
-    hot_standby_standby_upstream_owned: ?HAStandbyUpstreamRetired = null,
-    /// Strings replaced by `setHAStandbyUpstream`. A replication round may
+    hot_standby_standby_upstream_owned: ?HotStandbyStandbyUpstreamRetired = null,
+    /// Strings replaced by `setHotStandbyStandbyUpstream`. A replication round may
     /// still be holding an unlocked copy of the old config mid-fetch (see
-    /// `runHAStandbyReplicationRound`), so a swap must never free the
+    /// `runHotStandbyStandbyReplicationRound`), so a swap must never free the
     /// strings it replaces; they are retired here and freed only at
     /// `deinit`, once no round can still be reading them.
-    hot_standby_standby_upstream_retired: std.ArrayListUnmanaged(HAStandbyUpstreamRetired) = .empty,
+    hot_standby_standby_upstream_retired: std.ArrayListUnmanaged(HotStandbyStandbyUpstreamRetired) = .empty,
     query_async_limit: std.Io.Limit,
     work_cost_port: ?DataServerWorkCostPort = null,
     backend_runtime_mutex: std.atomic.Mutex = .unlocked,
@@ -5802,7 +5802,7 @@ pub const DataServer = struct {
     const dense_posting_maintenance_idle_interval_ns = 1 * std.time.ns_per_s;
     const dense_posting_maintenance_retry_interval_ns = 100 * std.time.ns_per_ms;
     const vector_block_maintenance_interval_ns = 1 * std.time.ns_per_s;
-    // Receiving and applying a fetched batch holds ha_state_mutex so promotion
+    // Receiving and applying a fetched batch holds hot_standby_state_mutex so promotion
     // cannot consume the standby while records are in flight. Bound both the
     // durable work count and elapsed apply time: record cost varies with LSM
     // pressure, so a count-only window does not guarantee control-plane
@@ -6070,8 +6070,8 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
-            .hot_standby_cfg = cfg.ha,
-            .hot_standby_primary_sync_wait = hotStandbyPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
+            .hot_standby_cfg = cfg.hot_standby,
+            .hot_standby_primary_sync_wait = hotStandbyPrimarySyncWaitFromConfig(cfg.hot_standby.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
@@ -6115,8 +6115,8 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
-            .hot_standby_cfg = cfg.ha,
-            .hot_standby_primary_sync_wait = hotStandbyPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
+            .hot_standby_cfg = cfg.hot_standby,
+            .hot_standby_primary_sync_wait = hotStandbyPrimarySyncWaitFromConfig(cfg.hot_standby.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
@@ -6159,8 +6159,8 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
-            .hot_standby_cfg = cfg.ha,
-            .hot_standby_primary_sync_wait = hotStandbyPrimarySyncWaitFromConfig(cfg.ha.primary_sync_wait),
+            .hot_standby_cfg = cfg.hot_standby,
+            .hot_standby_primary_sync_wait = hotStandbyPrimarySyncWaitFromConfig(cfg.hot_standby.primary_sync_wait),
             .query_async_limit = cfg.query_async_limit,
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = cfg.backend_runtime,
@@ -6610,7 +6610,7 @@ pub const DataServer = struct {
         }
         api_server_cfg.resource_manager = &self.provisioned_storage.resource_manager;
         self.configureHotStandbyPublicGateState();
-        self.attachHaExecutors(&api_server_cfg);
+        self.attachHotStandbyExecutors(&api_server_cfg);
         if (self.backend_runtime) |runtime| {
             const io = runtime.apiIo() orelse return error.HttpRuntimeUnavailable;
             _ = self.read_source.withIoInterface(io, self.query_async_limit);
@@ -6674,9 +6674,9 @@ pub const DataServer = struct {
         _ = self.read_source.withHotStandbyReadGate(self.hotStandbyReadGate());
         const replication_write_gate = self.hotStandbyWriteGate();
         const hot_standby_primary_mirror = self.hotStandbyPrimaryMirror();
-        if (self.status_source.standalone_hot_standby) |metadata_ha| {
-            try metadata_ha.bindMirror(replication_write_gate, hot_standby_primary_mirror);
-            if (hot_standby_primary_mirror != null) try prepareStandaloneMetadataStartup(metadata_ha);
+        if (self.status_source.standalone_hot_standby) |metadata_hot_standby| {
+            try metadata_hot_standby.bindMirror(replication_write_gate, hot_standby_primary_mirror);
+            if (hot_standby_primary_mirror != null) try prepareStandaloneMetadataStartup(metadata_hot_standby);
         }
         _ = try self.write_source.withHotStandbyWriteGate(replication_write_gate);
         _ = try self.write_source.withHotStandbyMirror(hot_standby_primary_mirror);
@@ -7050,8 +7050,8 @@ pub const DataServer = struct {
     pub fn applyHotStandbyReplicationRecord(self: *DataServer, record: antfly.hot_standby.replication_record.RecordView) !void {
         if (isWholeInstanceHotStandbyControlRecord(record)) return;
         if (record.kind == .metadata_mutation and record.table_id == 0 and record.shard_id == 0) {
-            const metadata_ha = self.status_source.standalone_hot_standby orelse return error.HAMetadataAuthorityUnavailable;
-            return metadata_ha.applyRecord(record);
+            const metadata_hot_standby = self.status_source.standalone_hot_standby orelse return error.HAMetadataAuthorityUnavailable;
+            return metadata_hot_standby.applyRecord(record);
         }
 
         var snapshot = try self.write_source.catalog.adminSnapshot();
@@ -7134,7 +7134,7 @@ pub const DataServer = struct {
         );
     }
 
-    pub const HACatalogCommit = struct {
+    pub const HotStandbyCatalogCommit = struct {
         mirror: antfly.db.ReplicationAsyncEffectMirror,
         generation: u64,
         lsn: u64,
@@ -7142,7 +7142,7 @@ pub const DataServer = struct {
 
     /// Caller holds the shared mutation barrier and catalog lock. An append
     /// failure can have an uncertain durable outcome, so fence until replay.
-    pub fn appendHotStandbyCatalogCreate(self: *DataServer, payload: []const u8) !HACatalogCommit {
+    pub fn appendHotStandbyCatalogCreate(self: *DataServer, payload: []const u8) !HotStandbyCatalogCommit {
         platform_sync.lockYielding(&self.hot_standby_state_mutex);
         defer self.hot_standby_state_mutex.unlock();
         const generation = self.hot_standby_public_gate_state.currentGeneration();
@@ -7167,7 +7167,7 @@ pub const DataServer = struct {
     /// visible catalog record is already in this log frontier. Reuse the normal
     /// RemoteApply wait rather than treating a primary-local lookup as proof.
     pub fn acknowledgeHotStandbyExistingCatalog(self: *DataServer) !void {
-        const commit: HACatalogCommit = blk: {
+        const commit: HotStandbyCatalogCommit = blk: {
             platform_sync.lockYielding(&self.hot_standby_state_mutex);
             defer self.hot_standby_state_mutex.unlock();
             const generation = self.hot_standby_public_gate_state.currentGeneration();
@@ -7183,7 +7183,7 @@ pub const DataServer = struct {
     /// Local catalog publication has completed. A remote timeout leaves an
     /// uncertain client outcome, but must not undo committed catalog state or
     /// require a process restart when the standby becomes available again.
-    pub fn acknowledgeHotStandbyCatalogCreate(self: *DataServer, commit: HACatalogCommit) !void {
+    pub fn acknowledgeHotStandbyCatalogCreate(self: *DataServer, commit: HotStandbyCatalogCommit) !void {
         const mirror = commit.mirror;
         // Do not hold the transition mutex while waiting for receiver acks.
         if (hot_standby_publisher_adapter.options(mirror).sync_wait_fn) |wait| {
@@ -7352,7 +7352,7 @@ pub const DataServer = struct {
         _ = ledger.gcStep(4, self, terminalOwnerReclaimed) catch return;
     }
 
-    const HAStandbyFetchSnapshot = struct {
+    const HotStandbyStandbyFetchSnapshot = struct {
         identity: antfly.hot_standby.standby.Identity,
         requested_lsn: u64,
     };
@@ -7362,8 +7362,8 @@ pub const DataServer = struct {
         executor: antfly.common.http.RequestExecutor,
         upstream_base_uri: []const u8,
         slot_name: []const u8,
-        options: HAStandbyReplicationOptions,
-    ) !HAStandbyReplicationResult {
+        options: HotStandbyStandbyReplicationOptions,
+    ) !HotStandbyStandbyReplicationResult {
         if (self.http_server == null) try self.initApiServer();
         var client = antfly.hot_standby.http_replication_client.Client.initWithOptions(
             self.alloc,
@@ -7378,8 +7378,8 @@ pub const DataServer = struct {
         executor: antfly.common.http.RequestExecutor,
         upstream_base_uri: []const u8,
         slot_name: []const u8,
-        options: HAStandbyReplicationOptions,
-    ) !HAStandbyReplicationLoopResult {
+        options: HotStandbyStandbyReplicationOptions,
+    ) !HotStandbyStandbyReplicationLoopResult {
         if (self.http_server == null) try self.initApiServer();
         var client = antfly.hot_standby.http_replication_client.Client.initWithOptions(
             self.alloc,
@@ -7430,8 +7430,8 @@ pub const DataServer = struct {
         client: *antfly.hot_standby.http_replication_client.Client,
         upstream_base_uri: []const u8,
         slot_name: []const u8,
-        options: HAStandbyReplicationOptions,
-    ) !HAStandbyReplicationResult {
+        options: HotStandbyStandbyReplicationOptions,
+    ) !HotStandbyStandbyReplicationResult {
         const snapshot = try self.snapshotHotStandbyStandbyForFetch();
         var batch_options = options;
         if (batch_options.max_records == 0) {
@@ -7524,7 +7524,7 @@ pub const DataServer = struct {
         };
     }
 
-    fn snapshotHotStandbyStandbyForFetch(self: *DataServer) !HAStandbyFetchSnapshot {
+    fn snapshotHotStandbyStandbyForFetch(self: *DataServer) !HotStandbyStandbyFetchSnapshot {
         lockAtomic(&self.hot_standby_state_mutex);
         defer self.hot_standby_state_mutex.unlock();
         const ctx = self.hot_standby_cfg.admin_context orelse return error.HAStandbyNotConfigured;
@@ -7541,7 +7541,7 @@ pub const DataServer = struct {
 
     fn runHotStandbyStandbyReplicationRound(self: *DataServer) !void {
         // `standby_replication` is a value (struct-of-slices) that
-        // `setHAStandbyUpstream` swaps under `ha_state_mutex` (see below).
+        // `setHotStandbyStandbyUpstream` swaps under `hot_standby_state_mutex` (see below).
         // Reading it unlocked here would race: this round would capture a
         // now-stale copy of the config concurrently with a swap freeing the
         // strings it points at once they are no longer the "current" pair.
@@ -7584,11 +7584,11 @@ pub const DataServer = struct {
     /// upstream primary and slot, without a restart. This is the runtime
     /// side of `antfly standby follow` / `POST /admin/v1/standby/upstream`.
     ///
-    /// Must be called with `ha_state_mutex` already held by the caller
+    /// Must be called with `hot_standby_state_mutex` already held by the caller
     /// (the HTTP admin dispatch loop holds it for the whole request; see
     /// `http_admin.Server.handleOperation`). `std.atomic.Mutex` is not
     /// reentrant, so this method must never try to lock it itself.
-    pub fn setHAStandbyUpstream(
+    pub fn setHotStandbyStandbyUpstream(
         self: *DataServer,
         upstream_url: []const u8,
         slot_name: []const u8,
@@ -7626,7 +7626,7 @@ pub const DataServer = struct {
         // The strings this swap replaces may still be in use by a
         // replication round that copied `cfg` before this swap took the
         // lock (rounds release the lock during their network I/O; see
-        // `runHAStandbyReplicationRound`). Only retire strings we
+        // `runHotStandbyStandbyReplicationRound`). Only retire strings we
         // previously allocated ourselves; the very first pair belongs to
         // whoever configured continuous replication (standalone runtime
         // config, CLI flags, etc.) and is never ours to free.
@@ -7658,10 +7658,10 @@ pub const DataServer = struct {
         expected: antfly.hot_standby.standby.Identity,
     ) anyerror!antfly.hot_standby.http_admin.Server.StandbyUpstreamResult {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        return self.setHAStandbyUpstream(upstream_url, slot_name, expected);
+        return self.setHotStandbyStandbyUpstream(upstream_url, slot_name, expected);
     }
 
-    fn openPromotedPrimaryFromStandbyIfReady(self: *DataServer, cfg: HAStandbyReplicationConfig) !bool {
+    fn openPromotedPrimaryFromStandbyIfReady(self: *DataServer, cfg: HotStandbyStandbyReplicationConfig) !bool {
         if (self.hot_standby_cfg.admin_context == null) return false;
         if (self.hot_standby_promoted_primary) |*primary| {
             // A failed metadata outbox recovery keeps promotion fenced. Retry
@@ -7771,7 +7771,7 @@ pub const DataServer = struct {
 
     fn rewireHotStandbyPromotionMirrors(self: *DataServer) !void {
         const hot_standby_primary_mirror = self.hotStandbyPrimaryMirror();
-        if (self.status_source.standalone_hot_standby) |metadata_ha| try metadata_ha.bindMirror(self.hotStandbyWriteGate(), hot_standby_primary_mirror);
+        if (self.status_source.standalone_hot_standby) |metadata_hot_standby| try metadata_hot_standby.bindMirror(self.hotStandbyWriteGate(), hot_standby_primary_mirror);
         _ = self.write_source.withPreparedHotStandbyMirror(hot_standby_primary_mirror);
         if (comptime linked_storage) {
             _ = self.kernel_owner_source.?.withHotStandbyControls(self.hotStandbyWriteGate(), hot_standby_primary_mirror);
@@ -7783,7 +7783,7 @@ pub const DataServer = struct {
 
     fn hotStandbyStandbyReplicationExecutor(
         self: *DataServer,
-        cfg: HAStandbyReplicationConfig,
+        cfg: HotStandbyStandbyReplicationConfig,
     ) !antfly.common.http.RequestExecutor {
         if (cfg.executor) |executor| return executor;
         if (self.hot_standby_standby_replication_http_executor == null) {
@@ -7846,10 +7846,10 @@ pub const DataServer = struct {
     fn hotStandbyPublicGateStateChangedCallback(ptr: *anyopaque) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         // The admin server invokes this hook while it still owns
-        // ha_state_mutex. Adopt a durable promotion in that same transition so
+        // hot_standby_state_mutex. Adopt a durable promotion in that same transition so
         // the successful promotion response cannot race the standalone
         // runtime's next polling round. Adoption failures remain fail-closed
-        // and are retried by runHAStandbyReplicationRound.
+        // and are retried by runHotStandbyStandbyReplicationRound.
         if (self.hot_standby_cfg.standby_replication) |cfg| {
             if (self.openPromotedPrimaryFromStandbyIfReady(cfg) catch |err| {
                 _ = self.hot_standby_standby_replication_failure_count.fetchAdd(1, .monotonic);
@@ -7867,7 +7867,7 @@ pub const DataServer = struct {
 
     fn hotStandbyPrimaryFenceStartedCallback(ptr: *anyopaque) void {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
-        // Called while ha_state_mutex is held. HA WAL mirror/ack paths take
+        // Called while hot_standby_state_mutex is held. HA WAL mirror/ack paths take
         // the same mutex, so publishing the fence here establishes a strict
         // linearization point before the durable primary tail is sampled.
         self.hot_standby_public_gate_state.publishPrimaryFence(true);
@@ -7924,15 +7924,15 @@ pub const DataServer = struct {
         return self.hot_standby_public_gate_state.ownerJobsCanRun();
     }
 
-    fn defaultHotStandbySeedSnapshotProvider(self: *DataServer) HASeedSnapshotProvider {
+    fn defaultHotStandbySeedSnapshotProvider(self: *DataServer) HotStandbySeedSnapshotProvider {
         return .{ .ptr = self, .prepare_fn = prepareDefaultHotStandbySeedSnapshotCallback };
     }
 
     fn prepareDefaultHotStandbySeedSnapshotCallback(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
-        request: HASeedSnapshotRequest,
-    ) !HASeedPreparedSnapshot {
+        request: HotStandbySeedSnapshotRequest,
+    ) !HotStandbySeedPreparedSnapshot {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         return try self.prepareDefaultHotStandbySeedSnapshot(alloc, request);
     }
@@ -7940,8 +7940,8 @@ pub const DataServer = struct {
     fn prepareDefaultHotStandbySeedSnapshot(
         self: *DataServer,
         alloc: std.mem.Allocator,
-        request: HASeedSnapshotRequest,
-    ) !HASeedPreparedSnapshot {
+        request: HotStandbySeedSnapshotRequest,
+    ) !HotStandbySeedPreparedSnapshot {
         const catalog_path = self.replica_catalog_path orelse return error.HASeedCaptureCatalogMissing;
         const snapshots_root = try std.fmt.allocPrint(alloc, "{s}.runtime-snapshots", .{request.capture_root});
         defer alloc.free(snapshots_root);
@@ -8056,7 +8056,7 @@ pub const DataServer = struct {
             }
         }.lessThan);
 
-        var topology_replicas = std.ArrayListUnmanaged(HASeedSnapshotTopologyReplica).empty;
+        var topology_replicas = std.ArrayListUnmanaged(HotStandbySeedSnapshotTopologyReplica).empty;
         defer {
             for (topology_replicas.items) |replica| {
                 alloc.free(replica.snapshot_path);
@@ -8124,7 +8124,7 @@ pub const DataServer = struct {
             });
         }
 
-        var topology_extension_artifacts = std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact).empty;
+        var topology_extension_artifacts = std.ArrayListUnmanaged(HotStandbySeedSnapshotExtensionArtifact).empty;
         defer freeHotStandbySeedSnapshotExtensionArtifacts(alloc, &topology_extension_artifacts);
         try self.captureHotStandbySeedExtensionArtifacts(
             alloc,
@@ -8135,7 +8135,7 @@ pub const DataServer = struct {
             null,
         );
 
-        var topology_auth_artifact: ?HASeedSnapshotAuthArtifact = null;
+        var topology_auth_artifact: ?HotStandbySeedSnapshotAuthArtifact = null;
         var auth_digest_owned: ?[]u8 = null;
         defer if (auth_digest_owned) |digest| alloc.free(digest);
         if (request.auth_artifact_json) |auth_json| {
@@ -8159,9 +8159,9 @@ pub const DataServer = struct {
         }
 
         const compact_native = try @import("../storage/hot_standby/restore_owner_registry.zig").compact(projection_alloc, native_projection.owners);
-        const metadata_artifact: ?HASeedSnapshotAuthArtifact = if (self.status_source.standalone_hot_standby) |metadata_ha| blk: {
+        const metadata_artifact: ?HotStandbySeedSnapshotAuthArtifact = if (self.status_source.standalone_hot_standby) |metadata_hot_standby| blk: {
             const path = try std.fs.path.join(projection_alloc, &.{ building_root, antfly.hot_standby.seed_materialization.standalone_metadata_name });
-            const checkpoint = try metadata_ha.captureCheckpoint(io, path);
+            const checkpoint = try metadata_hot_standby.captureCheckpoint(io, path);
             break :blk .{
                 .path = antfly.hot_standby.seed_materialization.standalone_metadata_name,
                 .size_bytes = checkpoint.size_bytes,
@@ -8170,7 +8170,7 @@ pub const DataServer = struct {
         } else null;
         const terminal_path = try std.fs.path.join(projection_alloc, &.{ building_root, @import("../storage/hot_standby/restore_terminal_ledger.zig").artifact_name });
         const terminal_artifact = try terminal_snapshot.exportFile(io, terminal_path);
-        const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
+        const topology_json = try std.json.Stringify.valueAlloc(alloc, HotStandbySeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
                 .epoch = metadata_snapshot.epoch,
@@ -8218,12 +8218,12 @@ pub const DataServer = struct {
         return .{ .root = published_root };
     }
 
-    fn prepareStandaloneMetadataStartup(metadata_ha: @import("../api/standalone_hot_standby.zig").Port) !void {
+    fn prepareStandaloneMetadataStartup(metadata_hot_standby: @import("../api/standalone_hot_standby.zig").Port) !void {
         // Recover missing log appends from the durable metadata outbox before
         // serving, but do not require a remote acknowledgement to start the
         // listener the standby needs for catch-up. The pending outbox remains
         // authoritative and subsequent writes/checkpoints still drain it.
-        metadata_ha.prepareCheckpoint() catch |err| switch (err) {
+        metadata_hot_standby.prepareCheckpoint() catch |err| switch (err) {
             error.HASyncCommitWouldBlock => {},
             else => return err,
         };
@@ -8236,7 +8236,7 @@ pub const DataServer = struct {
     /// The bounded verification inside DB.snapshotWithMaintenanceDeadline closes the remaining
     /// race and converts it into a retryable busy result.
     fn prepareDefaultHotStandbySeedSnapshotMaintenance(self: *DataServer) !void {
-        if (self.status_source.standalone_hot_standby) |metadata_ha| try metadata_ha.prepareCheckpoint();
+        if (self.status_source.standalone_hot_standby) |metadata_hot_standby| try metadata_hot_standby.prepareCheckpoint();
         var metadata_snapshot = try self.write_source.catalog.adminSnapshot();
         defer self.write_source.catalog.freeAdminSnapshot(&metadata_snapshot);
         if ((metadata_snapshot.tables.len == 0) != (metadata_snapshot.ranges.len == 0))
@@ -8288,8 +8288,8 @@ pub const DataServer = struct {
     fn captureHotStandbyPrivateProvisioning(self: *DataServer, alloc: std.mem.Allocator, public: anytype) !?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningProjection) {
         const Projection = @import("../metadata/restore_staging.zig").ProvisioningProjection;
         const epoch = if (@hasField(@TypeOf(public.*), "epoch")) public.epoch else public.status.metadata_epoch;
-        if (self.status_source.standalone_hot_standby) |metadata_ha| {
-            var private = (try metadata_ha.capturePrivate(alloc, epoch)) orelse return null;
+        if (self.status_source.standalone_hot_standby) |metadata_hot_standby| {
+            var private = (try metadata_hot_standby.capturePrivate(alloc, epoch)) orelse return null;
             errdefer private.deinit();
             var arena = std.heap.ArenaAllocator.init(alloc);
             defer arena.deinit();
@@ -8352,8 +8352,8 @@ pub const DataServer = struct {
         io: std.Io,
         building_root: []const u8,
         packages: []const antfly.extensions.PackageManifest,
-        artifacts: *std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact),
-        probe: ?HASeedExtensionCaptureProbe,
+        artifacts: *std.ArrayListUnmanaged(HotStandbySeedSnapshotExtensionArtifact),
+        probe: ?HotStandbySeedExtensionCaptureProbe,
     ) !void {
         const store_root = self.api_server_cfg.extension_package_store_dir orelse {
             if (packages.len != 0) return error.HASeedExtensionCatalogMismatch;
@@ -8444,8 +8444,8 @@ pub const DataServer = struct {
             });
         }
 
-        std.mem.sort(HASeedSnapshotExtensionArtifact, artifacts.items, {}, struct {
-            fn lessThan(_: void, left: HASeedSnapshotExtensionArtifact, right: HASeedSnapshotExtensionArtifact) bool {
+        std.mem.sort(HotStandbySeedSnapshotExtensionArtifact, artifacts.items, {}, struct {
+            fn lessThan(_: void, left: HotStandbySeedSnapshotExtensionArtifact, right: HotStandbySeedSnapshotExtensionArtifact) bool {
                 return std.mem.order(u8, left.path, right.path) == .lt;
             }
         }.lessThan);
@@ -8471,7 +8471,7 @@ pub const DataServer = struct {
             const package = packages[catalog_index_by_entry[entry_index]];
             const artifact_path = try std.fs.path.join(alloc, &.{ "extensions", entry.path });
             defer alloc.free(artifact_path);
-            var found: ?HASeedSnapshotExtensionArtifact = null;
+            var found: ?HotStandbySeedSnapshotExtensionArtifact = null;
             for (artifacts.items) |artifact| {
                 if (std.mem.eql(u8, artifact.path, artifact_path) and
                     std.mem.eql(u8, artifact.package_name, package.name) and
@@ -8516,7 +8516,7 @@ pub const DataServer = struct {
         );
         defer alloc.free(topology_json);
         var parsed = std.json.parseFromSlice(
-            HASeedSnapshotTopology,
+            HotStandbySeedSnapshotTopology,
             alloc,
             topology_json,
             .{ .ignore_unknown_fields = false },
@@ -8755,7 +8755,7 @@ pub const DataServer = struct {
         };
     }
 
-    fn attachHaExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
+    fn attachHotStandbyExecutors(self: *DataServer, api_server_cfg: *antfly.public_api.http_server.ApiHttpServerConfig) void {
         const hot_standby_admin_bearer_token = api_server_cfg.hot_standby_admin_bearer_token orelse
             self.hot_standby_cfg.admin_bearer_token orelse
             api_server_cfg.admin_bearer_token;
@@ -9365,7 +9365,7 @@ pub const DataServer = struct {
         if (self.hot_standby_standby_replication_http_executor) |*executor| executor.deinit();
         // Safe only now: every replication round has been quiesced above, so
         // no in-flight round can still hold an unlocked copy of a retired
-        // upstream/slot pair. See `ha_standby_upstream_retired`.
+        // upstream/slot pair. See `hot_standby_standby_upstream_retired`.
         if (self.hot_standby_standby_upstream_owned) |owned| {
             self.alloc.free(owned.upstream_url);
             self.alloc.free(owned.slot_name);
@@ -9606,7 +9606,7 @@ pub const DataServer = struct {
     }
 
     fn clearHotStandbyStandbyReplicationError(self: *DataServer) void {
-        self.hot_standby_standby_replication_last_error.store(@intFromEnum(HAStandbyReplicationErrorCode.none), .release);
+        self.hot_standby_standby_replication_last_error.store(@intFromEnum(HotStandbyStandbyReplicationErrorCode.none), .release);
     }
 
     fn hotStandbyStandbyReplicationRetryDue(self: *DataServer, now_ns: u64) bool {
@@ -9638,7 +9638,7 @@ pub const DataServer = struct {
     }
 
     fn hotStandbyStandbyReplicationLastError(self: *DataServer) ?[]const u8 {
-        const code: HAStandbyReplicationErrorCode = @enumFromInt(self.hot_standby_standby_replication_last_error.load(.acquire));
+        const code: HotStandbyStandbyReplicationErrorCode = @enumFromInt(self.hot_standby_standby_replication_last_error.load(.acquire));
         return hotStandbyStandbyReplicationErrorName(code);
     }
 
@@ -23942,7 +23942,7 @@ pub const DataServer = struct {
             .provisioned_index_repair_max_activation_gap_sequences = cfg.index_repair_max_activation_gap_sequences,
             .provisioned_index_repair_max_convergence_rounds = cfg.index_repair_max_convergence_rounds,
             .provisioned_index_repair_max_activation_pause_ms = cfg.index_repair_max_activation_pause_ms,
-            .hot_standby_cfg = cfg.ha,
+            .hot_standby_cfg = cfg.hot_standby,
             .query_async_limit = cfg.query_async_limit,
             .work_cost_port = cfg.work_cost_port,
             .backend_runtime = backend_runtime,
@@ -24080,7 +24080,9 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .record_digest = @splat(3),
         } };
         try std.testing.expectEqual(data_raft_batch.merge_proof_adoption_protocol_version, DataServer.requiredRaftBatchProtocolVersion(adoption));
-        try std.testing.expect(data_raft_batch.protocol_version < data_raft_batch.merge_proof_adoption_protocol_version);
+        // The current decoder must support this feature's stable activation
+        // floor, including after later features raise the advertised version.
+        try std.testing.expect(data_raft_batch.protocol_version >= data_raft_batch.merge_proof_adoption_protocol_version);
         const unbound_vector_page: antfly.db.types.BatchRequest = .{ .merge_page = .{
             .source = online_checkpoint.merge_checkpoint.?.page_source.?,
             .sequence = 1,
@@ -29064,7 +29066,7 @@ fn findTableById(
     return null;
 }
 
-const HAReplicationRecordRoute = struct {
+const HotStandbyReplicationRecordRoute = struct {
     group_id: u64,
     table_name: []const u8,
 };
@@ -29086,7 +29088,7 @@ fn isWholeInstanceHotStandbyControlRecord(record: antfly.hot_standby.replication
 fn resolveHotStandbyReplicationRecordRoute(
     snapshot: *const antfly.metadata_api.AdminSnapshot,
     record: antfly.hot_standby.replication_record.RecordView,
-) !HAReplicationRecordRoute {
+) !HotStandbyReplicationRecordRoute {
     if (record.table_id == 0) return error.HAReplicationRecordMissingTableId;
     if (record.shard_id == 0) return error.HAReplicationRecordMissingShardId;
     const table = findTableById(snapshot.tables, record.table_id) orelse return error.HAReplicationRecordUnknownTable;
@@ -31639,20 +31641,20 @@ const ProvisioningControlMetadataForTest = struct {
     }
 };
 
-const TestHASeedSnapshotProvider = struct {
+const TestHotStandbySeedSnapshotProvider = struct {
     db_path: []const u8,
     calls: usize = 0,
     unsupported: bool = false,
 
-    fn iface(self: *@This()) HASeedSnapshotProvider {
+    fn iface(self: *@This()) HotStandbySeedSnapshotProvider {
         return .{ .ptr = self, .prepare_fn = prepare };
     }
 
     fn prepare(
         ptr: *anyopaque,
         alloc: std.mem.Allocator,
-        request: HASeedSnapshotRequest,
-    ) !HASeedPreparedSnapshot {
+        request: HotStandbySeedSnapshotRequest,
+    ) !HotStandbySeedPreparedSnapshot {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         self.calls += 1;
         if (self.unsupported) return error.HASeedSnapshotUnsupportedBackend;
@@ -31708,7 +31710,7 @@ const TestHASeedSnapshotProvider = struct {
             snapshot_manifest_digest_hex[index * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
         }
 
-        const topology_json = try std.json.Stringify.valueAlloc(alloc, HASeedSnapshotTopology{
+        const topology_json = try std.json.Stringify.valueAlloc(alloc, HotStandbySeedSnapshotTopology{
             .generation = request.generation,
             .catalog = .{
                 .system_catalog = .{},
@@ -35249,7 +35251,7 @@ fn consumerTests() type {
         test "data server keeps upstream replication availability failures nonfatal" {
             try std.testing.expect(isHotStandbyStandbyUpstreamTransportError(error.UnexpectedEof));
             try std.testing.expect(isNonFatalHotStandbyStandbyReplicationError(error.UnexpectedEof));
-            try std.testing.expectEqual(HAStandbyReplicationErrorCode.InvalidResponse, hotStandbyStandbyReplicationErrorCode(error.UnexpectedEof));
+            try std.testing.expectEqual(HotStandbyStandbyReplicationErrorCode.InvalidResponse, hotStandbyStandbyReplicationErrorCode(error.UnexpectedEof));
             inline for (.{
                 error.HttpConnectionClosing,
                 error.ConnectionResetByPeer,
@@ -41558,7 +41560,7 @@ fn consumerTests() type {
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .primary = &primary,
                         .primary_node_id = "primary-a",
@@ -41700,7 +41702,7 @@ fn consumerTests() type {
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .primary = &primary,
                         .primary_node_id = "primary-a",
@@ -41848,7 +41850,7 @@ fn consumerTests() type {
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = fixture.path(),
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .primary = &primary,
                         .primary_node_id = "primary-a",
@@ -41997,7 +41999,7 @@ fn consumerTests() type {
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = &standby,
                         .standby_node_id = "standby-a",
@@ -42223,7 +42225,7 @@ fn consumerTests() type {
             var authenticated_executor = AuthenticatedExecutor{ .upstream = primary_internal.executor() };
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = &standby,
                         .standby_node_id = "standby-a",
@@ -42432,7 +42434,7 @@ fn consumerTests() type {
             var blocking_executor = BlockingExecutor{ .upstream = primary_internal.executor() };
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = &standby,
                         .standby_node_id = "standby-a",
@@ -42599,7 +42601,7 @@ fn consumerTests() type {
                     .hot_standby_failover_safe_mutations_only = true,
                     .hot_standby_remote_apply_mutations_enabled = true,
                 },
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = if (standby) |*handle| handle else null,
                         .standby_node_id = "standby-a",
@@ -42811,7 +42813,7 @@ fn consumerTests() type {
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = if (standby) |*handle| handle else null,
                         .standby_node_id = "standby-a",
@@ -43003,7 +43005,7 @@ fn consumerTests() type {
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = &standby,
                         .standby_node_id = "standby-a",
@@ -43020,7 +43022,7 @@ fn consumerTests() type {
             {
                 var unconfigured = DataServer.initFromLocalMetadataSources(alloc, .{
                     .replica_root_dir = replica_root,
-                    .ha = .{
+                    .hot_standby = .{
                         .admin_context = .{
                             .standby = &standby,
                             .standby_node_id = "standby-a",
@@ -43030,7 +43032,7 @@ fn consumerTests() type {
                 defer unconfigured.deinit();
                 try std.testing.expectError(
                     error.HAStandbyNotConfigured,
-                    unconfigured.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", identity),
+                    unconfigured.setHotStandbyStandbyUpstream("http://primary-b.internal.test", "standby-a", identity),
                 );
             }
 
@@ -43038,7 +43040,7 @@ fn consumerTests() type {
             {
                 var promoted = DataServer.initFromLocalMetadataSources(alloc, .{
                     .replica_root_dir = replica_root,
-                    .ha = .{
+                    .hot_standby = .{
                         .admin_context = .{},
                         .standby_replication = .{
                             .upstream_base_uri = "http://primary-a.internal.test",
@@ -43049,7 +43051,7 @@ fn consumerTests() type {
                 defer promoted.deinit();
                 try std.testing.expectError(
                     error.HAStandbyAlreadyPromoted,
-                    promoted.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", identity),
+                    promoted.setHotStandbyStandbyUpstream("http://primary-b.internal.test", "standby-a", identity),
                 );
             }
 
@@ -43059,12 +43061,12 @@ fn consumerTests() type {
             wrong_identity.shard_id = identity.shard_id + 1;
             try std.testing.expectError(
                 error.WrongShard,
-                server.setHAStandbyUpstream("http://primary-b.internal.test", "standby-a", wrong_identity),
+                server.setHotStandbyStandbyUpstream("http://primary-b.internal.test", "standby-a", wrong_identity),
             );
 
             // Idempotent retry: requesting the already-effective upstream and
             // slot reports changed=false without mutating anything.
-            const unchanged = try server.setHAStandbyUpstream("http://primary-a.internal.test", "standby-a", identity);
+            const unchanged = try server.setHotStandbyStandbyUpstream("http://primary-a.internal.test", "standby-a", identity);
             try std.testing.expect(!unchanged.changed);
             try std.testing.expectEqualStrings("http://primary-a.internal.test", server.hot_standby_cfg.standby_replication.?.upstream_base_uri);
 
@@ -43081,8 +43083,8 @@ fn consumerTests() type {
 
             // A second swap must retire (not free) the first swap's owned
             // strings, since a round may still be reading them; see
-            // `ha_standby_upstream_retired`.
-            const swapped_again = try server.setHAStandbyUpstream("http://primary-c.internal.test", "standby-c", identity);
+            // `hot_standby_standby_upstream_retired`.
+            const swapped_again = try server.setHotStandbyStandbyUpstream("http://primary-c.internal.test", "standby-c", identity);
             try std.testing.expect(swapped_again.changed);
             try std.testing.expectEqualStrings("http://primary-b.internal.test", swapped_again.previous.?.upstream_url);
             try std.testing.expectEqual(@as(usize, 1), server.hot_standby_standby_upstream_retired.items.len);
@@ -43223,7 +43225,7 @@ fn consumerTests() type {
 
                 var server = DataServer.initFromLocalMetadataSources(alloc, .{
                     .replica_root_dir = replica_root,
-                    .ha = .{
+                    .hot_standby = .{
                         .admin_context = .{
                             .standby = &standby,
                             .standby_node_id = "standby-a",
@@ -43279,7 +43281,7 @@ fn consumerTests() type {
 
                 var server = DataServer.initFromLocalMetadataSources(alloc, .{
                     .replica_root_dir = replica_root,
-                    .ha = .{
+                    .hot_standby = .{
                         .admin_context = .{
                             .standby = &standby,
                             .standby_node_id = "standby-a",
@@ -43435,7 +43437,7 @@ fn consumerTests() type {
             var failing_executor = FailingExecutor{};
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = &standby,
                         .standby_node_id = "standby-a",
@@ -43629,7 +43631,7 @@ fn consumerTests() type {
             var primary_internal = antfly.hot_standby.http_internal.Server.init(alloc, &primary);
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = &standby,
                         .standby_node_id = "standby-a",
@@ -46463,7 +46465,7 @@ fn implementationTests() type {
             );
             defer alloc.free(topology_json);
             var topology = try std.json.parseFromSlice(
-                HASeedSnapshotTopology,
+                HotStandbySeedSnapshotTopology,
                 alloc,
                 topology_json,
                 .{ .ignore_unknown_fields = false },
@@ -46626,7 +46628,7 @@ fn implementationTests() type {
                 }
                 const metadata_topology_path = try std.fs.path.join(scratch, &.{ raw_absolute, hot_standby_seed_snapshot_topology_name });
                 const metadata_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), metadata_topology_path, scratch, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes));
-                var metadata_topology = try std.json.parseFromSlice(HASeedSnapshotTopology, alloc, metadata_topology_json, .{});
+                var metadata_topology = try std.json.parseFromSlice(HotStandbySeedSnapshotTopology, alloc, metadata_topology_json, .{});
                 defer metadata_topology.deinit();
                 try std.testing.expect(metadata_topology.value.standalone_metadata != null);
                 var corrupt_metadata_topology = metadata_topology.value;
@@ -46805,7 +46807,7 @@ fn implementationTests() type {
                 }
                 {
                     const next_replica_root = try std.fs.path.join(scratch, &.{ reseed_live, "data/replicas" });
-                    var next_standby = DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = next_replica_root, .replica_catalog_path = reseeded_catalog_path, .api_server_cfg = .{ .deployment_mode = .standalone }, .ha = .{ .restore_owner_metadata_root = registry_root } }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
+                    var next_standby = DataServer.initFromLocalMetadataSources(alloc, .{ .replica_root_dir = next_replica_root, .replica_catalog_path = reseeded_catalog_path, .api_server_cfg = .{ .deployment_mode = .standalone }, .hot_standby = .{ .restore_owner_metadata_root = registry_root } }, FakeMetadata.catalogSource(), FakeMetadata.statusSource());
                     defer next_standby.deinit();
                     const next_capture = try std.fs.path.join(scratch, &.{ parent_absolute, "next-offline-capture" });
                     var next_seed = try next_standby.prepareDefaultHotStandbySeedSnapshot(alloc, .{ .capture_root = next_capture, .generation = "second-offline-reseed" });
@@ -46890,7 +46892,7 @@ fn implementationTests() type {
                     try DataServer.validateHotStandbySeedPreparedSnapshot(alloc, capture_absolute, generation, empty_seed.root);
                     const empty_topology_path = try std.fs.path.join(scratch, &.{ empty_seed.root, hot_standby_seed_snapshot_topology_name });
                     const empty_topology_bytes = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), empty_topology_path, scratch, .limited(antfly.hot_standby.seed_materialization.max_topology_bytes));
-                    var parsed_topology = try std.json.parseFromSlice(HASeedSnapshotTopology, alloc, empty_topology_bytes, .{});
+                    var parsed_topology = try std.json.parseFromSlice(HotStandbySeedSnapshotTopology, alloc, empty_topology_bytes, .{});
                     defer parsed_topology.deinit();
                     try std.testing.expectEqual(@as(usize, 0), parsed_topology.value.catalog.tables.len);
                     try std.testing.expectEqual(@as(usize, if (has_private) 1 else 0), parsed_topology.value.replicas.len);
@@ -53674,7 +53676,7 @@ fn implementationTests() type {
             );
             defer alloc.free(topology_json);
             var topology = try std.json.parseFromSlice(
-                HASeedSnapshotTopology,
+                HotStandbySeedSnapshotTopology,
                 alloc,
                 topology_json,
                 .{ .ignore_unknown_fields = false },
@@ -53914,7 +53916,7 @@ fn implementationTests() type {
 
             var fake_status = FakeStatus{};
             var fake_catalog = FakeCatalog{ .status = &fake_status };
-            var seed_snapshot_provider = TestHASeedSnapshotProvider{ .db_path = replica_db_path };
+            var seed_snapshot_provider = TestHotStandbySeedSnapshotProvider{ .db_path = replica_db_path };
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
                 .replica_catalog_path = replica_catalog_path,
@@ -53923,7 +53925,7 @@ fn implementationTests() type {
                     .extension_package_store_dir = extension_store_root,
                     .admin_bearer_token = "runtime-secret-token",
                 },
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .primary = &primary,
                         .primary_node_id = "primary-a",
@@ -54168,7 +54170,7 @@ fn implementationTests() type {
                 }
             };
             var extension_race_probe = ExtensionRaceProbe{ .runtime_path = extension_runtime_path };
-            var raced_artifacts = std.ArrayListUnmanaged(HASeedSnapshotExtensionArtifact).empty;
+            var raced_artifacts = std.ArrayListUnmanaged(HotStandbySeedSnapshotExtensionArtifact).empty;
             defer freeHotStandbySeedSnapshotExtensionArtifacts(alloc, &raced_artifacts);
             try std.testing.expectError(error.HASeedExtensionChangedDuringCapture, server.captureHotStandbySeedExtensionArtifacts(
                 alloc,
@@ -54233,7 +54235,7 @@ fn implementationTests() type {
             defer alloc.free(auth_topology_path);
             const auth_topology_json = try std.Io.Dir.cwd().readFileAlloc(io_impl.io(), auth_topology_path, alloc, .limited(16 * 1024 * 1024));
             defer alloc.free(auth_topology_json);
-            var auth_topology = try std.json.parseFromSlice(HASeedSnapshotTopology, alloc, auth_topology_json, .{ .ignore_unknown_fields = false });
+            var auth_topology = try std.json.parseFromSlice(HotStandbySeedSnapshotTopology, alloc, auth_topology_json, .{ .ignore_unknown_fields = false });
             defer auth_topology.deinit();
             try std.testing.expect(auth_topology.value.auth_enabled);
             try std.testing.expect(auth_topology.value.auth_artifact != null);
@@ -55251,7 +55253,7 @@ fn implementationTests() type {
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = replica_root,
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .primary = &primary,
                         .primary_node_id = "primary-a",
@@ -55376,7 +55378,7 @@ fn implementationTests() type {
 
             var server = DataServer.initFromLocalMetadataSources(alloc, .{
                 .replica_root_dir = fixture.path(),
-                .ha = .{
+                .hot_standby = .{
                     .admin_context = .{
                         .standby = &standby,
                         .standby_node_id = "standby-a",

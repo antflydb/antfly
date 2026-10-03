@@ -328,7 +328,7 @@ test "admin routes define storage-neutral maintenance paths" {
 }
 
 test "admin routes match generated OpenAPI HA operations" {
-    for (expected_ha_routes) |route| {
+    for (expected_hot_standby_routes) |route| {
         try expectGeneratedRoute(route.operation_id, route.method, route.full_path);
     }
     try expectEveryGeneratedHotStandbyRouteCovered();
@@ -403,7 +403,7 @@ const ExpectedRoute = struct {
     full_path: []const u8,
 };
 
-const expected_ha_routes = [_]ExpectedRoute{
+const expected_hot_standby_routes = [_]ExpectedRoute{
     .{ .operation_id = "getHAPrimaryStatus", .method = "GET", .full_path = hot_standby_primary_status },
     .{ .operation_id = "getHAWatchdogProof", .method = "GET", .full_path = hot_standby_watchdog_proof },
     .{ .operation_id = "getHAStandbyStatus", .method = "GET", .full_path = hot_standby_standby_status },
@@ -469,7 +469,7 @@ fn expectNoHardCodedHotStandbyAdminPath(label: []const u8, source: []const u8) !
 }
 
 fn expectedHotStandbyRoute(generated: openapi.server.Route) ?ExpectedRoute {
-    for (expected_ha_routes) |expected| {
+    for (expected_hot_standby_routes) |expected| {
         if (!std.mem.eql(u8, generated.operation_id, expected.operation_id)) continue;
         if (!std.mem.eql(u8, generated.method, expected.method)) continue;
         if (!std.mem.startsWith(u8, expected.full_path, base)) continue;

@@ -1673,7 +1673,7 @@ pub const AntflyApiHandler = struct {
             else => return textResponse(ctx, 405, "method not allowed"),
         };
         const body = (try ctx.body()) orelse "";
-        var response = (try self.api_server.executeHaRoute(.{
+        var response = (try self.api_server.executeHotStandbyRoute(.{
             .method = method,
             .target = ctx.request.uri.raw,
             .authorization = ctx.header("authorization"),

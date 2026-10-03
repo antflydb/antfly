@@ -3113,7 +3113,7 @@ pub const ProvisionedTableWriteCache = struct {
                 inference_api_url: ?[]const u8,
                 policy_table_name: []const u8,
             ) !OpenedDb {
-                const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(open_mode, hot_standby_async_mirror);
+                const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(open_mode, hot_standby_async_mirror);
                 var db = if (indexes_json) |managed_indexes_json|
                     try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                         allocator,
@@ -3135,9 +3135,9 @@ pub const ProvisionedTableWriteCache = struct {
                             .schema_json_before_index_load = schema_json,
                             .inference_api_url = inference_api_url,
                             .replication_write_gate = replication_write_gate,
-                            .replication_async_effect_mirror = effective_ha_mirror,
-                            .replication_async_batch_mirror = effective_ha_mirror,
-                            .replication_async_metadata_mirror = effective_ha_mirror,
+                            .replication_async_effect_mirror = effective_hot_standby_mirror,
+                            .replication_async_batch_mirror = effective_hot_standby_mirror,
+                            .replication_async_metadata_mirror = effective_hot_standby_mirror,
                         },
                     )
                 else
@@ -3150,9 +3150,9 @@ pub const ProvisionedTableWriteCache = struct {
                         .identity_namespace = identity_namespace,
                         .prefer_existing_identity_namespace = identity_namespace != null,
                         .replication_write_gate = replication_write_gate,
-                        .replication_async_effect_mirror = effective_ha_mirror,
-                        .replication_async_batch_mirror = effective_ha_mirror,
-                        .replication_async_metadata_mirror = effective_ha_mirror,
+                        .replication_async_effect_mirror = effective_hot_standby_mirror,
+                        .replication_async_batch_mirror = effective_hot_standby_mirror,
+                        .replication_async_metadata_mirror = effective_hot_standby_mirror,
                         .open_mode = switch (open_mode) {
                             .default => .writer,
                             .default_async, .writer_no_replay => .writer_no_replay,
@@ -3785,12 +3785,12 @@ pub const ProvisionedTableWriteCache = struct {
                 i += 1;
                 continue;
             }
-            const stale_ha_write_gate = !self.entryHotStandbyWriteGateCurrent(entry);
-            if (entry.lsm_root_generation == lsm_root_generation and !stale_ha_write_gate) {
+            const stale_hot_standby_write_gate = !self.entryHotStandbyWriteGateCurrent(entry);
+            if (entry.lsm_root_generation == lsm_root_generation and !stale_hot_standby_write_gate) {
                 i += 1;
                 continue;
             }
-            if (!stale_ha_write_gate and self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) {
+            if (!stale_hot_standby_write_gate and self.adoptSeededEntryGenerationLocked(entry, lsm_root_generation)) {
                 i += 1;
                 continue;
             }
@@ -7630,7 +7630,7 @@ pub const ProvisionedTableWriteSource = struct {
         return self;
     }
 
-    /// Publishes a mirror after `prepareHAConfigTransition` has succeeded.
+    /// Publishes a mirror after `prepareHotStandbyConfigTransition` has succeeded.
     /// Entry installation preserves the retirement-capacity invariant while
     /// the preflight lock is released, so this path cannot allocate after an
     /// irreversible HA ownership handoff.
@@ -12469,7 +12469,7 @@ pub const ProvisionedTableWriteSource = struct {
                 prepared_open.?.schema_json = metadata.schema_json;
             }
 
-            const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(mode, self.hot_standby_async_mirror);
+            const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(mode, self.hot_standby_async_mirror);
             var effective_open_options = managed_open_options;
             effective_open_options.private_restore_bootstrap = if (preloaded_metadata) |metadata| metadata.restore_reservation != null else false;
             effective_open_options.drain_resolver_backfill = false;
@@ -12481,9 +12481,9 @@ pub const ProvisionedTableWriteSource = struct {
             effective_open_options.dense_native_migration_policy_source = cache.dense_native_migration_policy_source;
             effective_open_options.remote_capability_cache = self.remote_capability_cache;
             effective_open_options.replication_write_gate = self.replication_write_gate;
-            effective_open_options.replication_async_effect_mirror = effective_ha_mirror;
-            effective_open_options.replication_async_batch_mirror = effective_ha_mirror;
-            effective_open_options.replication_async_metadata_mirror = effective_ha_mirror;
+            effective_open_options.replication_async_effect_mirror = effective_hot_standby_mirror;
+            effective_open_options.replication_async_batch_mirror = effective_hot_standby_mirror;
+            effective_open_options.replication_async_metadata_mirror = effective_hot_standby_mirror;
             effective_open_options.identity_validation = identity_validation;
             effective_open_options.transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly or mode == .status_only)
                 .{}
@@ -12543,9 +12543,9 @@ pub const ProvisionedTableWriteSource = struct {
                         .identity_namespace = identity_namespace,
                         .prefer_existing_identity_namespace = identity_namespace != null,
                         .replication_write_gate = self.replication_write_gate,
-                        .replication_async_effect_mirror = effective_ha_mirror,
-                        .replication_async_batch_mirror = effective_ha_mirror,
-                        .replication_async_metadata_mirror = effective_ha_mirror,
+                        .replication_async_effect_mirror = effective_hot_standby_mirror,
+                        .replication_async_batch_mirror = effective_hot_standby_mirror,
+                        .replication_async_metadata_mirror = effective_hot_standby_mirror,
                         .open_mode = switch (mode) {
                             .default => .writer,
                             .default_async, .writer_no_replay => .writer_no_replay,
@@ -13842,7 +13842,7 @@ pub const ProvisionedTableWriteSource = struct {
         const identity_namespace = metadata.identity_namespace orelse
             return error.DocIdentityNamespaceUnavailable;
         const lsm_root_generation = self.visibleRootGeneration(group_id);
-        const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(.default, self.hot_standby_async_mirror);
+        const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(.default, self.hot_standby_async_mirror);
         const direct_schema = if (metadata.indexes_json == null)
             try prepareManagedSchemaBeforeIndexLoad(alloc, .default, metadata.schema_json)
         else
@@ -13868,9 +13868,9 @@ pub const ProvisionedTableWriteSource = struct {
                     .dense_native_migration_policy_source = self.dense_native_migration_policy_source,
                     .schema_json_before_index_load = metadata.schema_json,
                     .replication_write_gate = self.replication_write_gate,
-                    .replication_async_effect_mirror = effective_ha_mirror,
-                    .replication_async_batch_mirror = effective_ha_mirror,
-                    .replication_async_metadata_mirror = effective_ha_mirror,
+                    .replication_async_effect_mirror = effective_hot_standby_mirror,
+                    .replication_async_batch_mirror = effective_hot_standby_mirror,
+                    .replication_async_metadata_mirror = effective_hot_standby_mirror,
                     .identity_validation = metadata.identity_validation,
                 },
             )
@@ -13884,9 +13884,9 @@ pub const ProvisionedTableWriteSource = struct {
                 .identity_namespace = identity_namespace,
                 .prefer_existing_identity_namespace = true,
                 .replication_write_gate = self.replication_write_gate,
-                .replication_async_effect_mirror = effective_ha_mirror,
-                .replication_async_batch_mirror = effective_ha_mirror,
-                .replication_async_metadata_mirror = effective_ha_mirror,
+                .replication_async_effect_mirror = effective_hot_standby_mirror,
+                .replication_async_batch_mirror = effective_hot_standby_mirror,
+                .replication_async_metadata_mirror = effective_hot_standby_mirror,
             });
         errdefer db.close();
         try validateProvisionedDbIdentityNamespaceWithPolicy(
@@ -14367,7 +14367,7 @@ pub const ProvisionedTableWriteSource = struct {
                 break :db_blk cached_db.?.db;
             }
 
-            const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(startup_open_mode, self.hot_standby_async_mirror);
+            const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(startup_open_mode, self.hot_standby_async_mirror);
             uncached_db = if (indexes_json) |value|
                 openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                     alloc,
@@ -14389,9 +14389,9 @@ pub const ProvisionedTableWriteSource = struct {
                         .schema_json_before_index_load = metadata.schema_json,
                         .inference_api_url = self.inference_api_url,
                         .replication_write_gate = self.replication_write_gate,
-                        .replication_async_effect_mirror = effective_ha_mirror,
-                        .replication_async_batch_mirror = effective_ha_mirror,
-                        .replication_async_metadata_mirror = effective_ha_mirror,
+                        .replication_async_effect_mirror = effective_hot_standby_mirror,
+                        .replication_async_batch_mirror = effective_hot_standby_mirror,
+                        .replication_async_metadata_mirror = effective_hot_standby_mirror,
                     },
                 ) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
@@ -14418,9 +14418,9 @@ pub const ProvisionedTableWriteSource = struct {
                     .identity_namespace = identity_namespace,
                     .prefer_existing_identity_namespace = identity_namespace != null,
                     .replication_write_gate = self.replication_write_gate,
-                    .replication_async_effect_mirror = effective_ha_mirror,
-                    .replication_async_batch_mirror = effective_ha_mirror,
-                    .replication_async_metadata_mirror = effective_ha_mirror,
+                    .replication_async_effect_mirror = effective_hot_standby_mirror,
+                    .replication_async_batch_mirror = effective_hot_standby_mirror,
+                    .replication_async_metadata_mirror = effective_hot_standby_mirror,
                 }) catch |err| {
                     if (err == error.LsmRootWriterAlreadyOpen) return self.deferredStartupCatchUpResult(table_name, group_id, metadata.advance_index_repairs, busy_result);
                     if (isTerminalStartupCatchUpOpenFailure(err)) {
@@ -15482,7 +15482,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// passed the public HA gate. The reservation remains held through
     /// preflight and capture, preventing a continuous workload from retiring
     /// a cache owner in the gap before the exclusive mutation freeze.
-    pub const HASeedTableRequestAdmissionLease = struct {
+    pub const HotStandbySeedTableRequestAdmissionLease = struct {
         source: *ProvisionedTableWriteSource,
         active: bool = true,
 
@@ -15498,7 +15498,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
-    pub fn acquireHotStandbySeedTableRequestAdmissionLease(self: *ProvisionedTableWriteSource) !HASeedTableRequestAdmissionLease {
+    pub fn acquireHotStandbySeedTableRequestAdmissionLease(self: *ProvisionedTableWriteSource) !HotStandbySeedTableRequestAdmissionLease {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         errdefer self.table_activity_mutex.unlock(io);
@@ -15528,7 +15528,7 @@ pub const ProvisionedTableWriteSource = struct {
     /// Holds the remaining table-activity admission mutex for the full HA snapshot.
     /// Existing activity fails closed; new structural/group operations cannot
     /// begin after the preflight while the global mutation barrier is held.
-    pub const HASeedCaptureActivityLease = struct {
+    pub const HotStandbySeedCaptureActivityLease = struct {
         source: *ProvisionedTableWriteSource,
         active: bool = true,
 
@@ -15539,7 +15539,7 @@ pub const ProvisionedTableWriteSource = struct {
         }
     };
 
-    pub fn acquireHotStandbySeedCaptureActivityLease(self: *ProvisionedTableWriteSource) !HASeedCaptureActivityLease {
+    pub fn acquireHotStandbySeedCaptureActivityLease(self: *ProvisionedTableWriteSource) !HotStandbySeedCaptureActivityLease {
         const io = self.tableActivityIo();
         self.table_activity_mutex.lockUncancelable(io);
         errdefer self.table_activity_mutex.unlock(io);
@@ -15648,7 +15648,7 @@ pub const ProvisionedTableWriteSource = struct {
         // no cache operation remains to perform the close.
         //
         // Serialize the cold open with both serving and startup caches. Pending
-        // closes must have been drained by prepareHASeedReplicaSnapshot before
+        // closes must have been drained by prepareHotStandbySeedReplicaSnapshot before
         // the runtime acquired its exclusive HA mutation barrier: DB.close()
         // can itself need a shared mutation lease while retiring generated
         // index state, so draining here would recursively deadlock the capture.
@@ -20548,7 +20548,7 @@ pub const ProvisionedTableWriteSource = struct {
             }
             const seed_create_table_writer = self.seed_create_table_writers and self.write_cache != null;
             const open_mode: ManagedDbOpenMode = if (seed_create_table_writer) .default else .startup_catch_up;
-            const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(open_mode, self.hot_standby_async_mirror);
+            const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(open_mode, self.hot_standby_async_mirror);
             var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
                 path,
@@ -20568,9 +20568,9 @@ pub const ProvisionedTableWriteSource = struct {
                     .drain_resolver_backfill = false,
                     .schema_json_before_index_load = schema_json,
                     .replication_write_gate = self.replication_write_gate,
-                    .replication_async_effect_mirror = effective_ha_mirror,
-                    .replication_async_batch_mirror = effective_ha_mirror,
-                    .replication_async_metadata_mirror = effective_ha_mirror,
+                    .replication_async_effect_mirror = effective_hot_standby_mirror,
+                    .replication_async_batch_mirror = effective_hot_standby_mirror,
+                    .replication_async_metadata_mirror = effective_hot_standby_mirror,
                     .transaction_recovery = if (open_mode == .startup_catch_up or open_mode == .restore_repair or open_mode == .query_readonly or open_mode == .status_only)
                         .{}
                     else
@@ -25436,7 +25436,7 @@ pub const HostedProvisionedTableWriteSource = struct {
             prepared_open.?.schema_json = metadata.schema_json;
         }
 
-        const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(mode, cache.write_cache.hot_standby_async_mirror);
+        const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(mode, cache.write_cache.hot_standby_async_mirror);
         var opened: ?db_mod.DB = if (prepared_open.?.indexes_json) |value|
             try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 cache.write_cache.alloc,
@@ -25461,9 +25461,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                     .inference_api_url = cache.write_cache.inference_api_url,
                     .remote_capability_cache = &cache.remote_capability_cache,
                     .replication_write_gate = cache.write_cache.replication_write_gate,
-                    .replication_async_effect_mirror = effective_ha_mirror,
-                    .replication_async_batch_mirror = effective_ha_mirror,
-                    .replication_async_metadata_mirror = effective_ha_mirror,
+                    .replication_async_effect_mirror = effective_hot_standby_mirror,
+                    .replication_async_batch_mirror = effective_hot_standby_mirror,
+                    .replication_async_metadata_mirror = effective_hot_standby_mirror,
                     .transaction_recovery = if (mode == .startup_catch_up or mode == .restore_repair or mode == .query_readonly or mode == .status_only)
                         .{}
                     else
@@ -25480,9 +25480,9 @@ pub const HostedProvisionedTableWriteSource = struct {
                 .identity_namespace = identity_namespace,
                 .prefer_existing_identity_namespace = identity_namespace != null,
                 .replication_write_gate = cache.write_cache.replication_write_gate,
-                .replication_async_effect_mirror = effective_ha_mirror,
-                .replication_async_batch_mirror = effective_ha_mirror,
-                .replication_async_metadata_mirror = effective_ha_mirror,
+                .replication_async_effect_mirror = effective_hot_standby_mirror,
+                .replication_async_batch_mirror = effective_hot_standby_mirror,
+                .replication_async_metadata_mirror = effective_hot_standby_mirror,
                 .open_mode = switch (mode) {
                     .default => .writer,
                     .default_async, .writer_no_replay => .writer_no_replay,
@@ -27965,7 +27965,7 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
     identity_namespace_override: ?doc_identity.Namespace,
 ) !db_mod.DB {
-    const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(.default, hot_standby_async_mirror);
+    const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(.default, hot_standby_async_mirror);
     const identity_namespace = identity_namespace_override orelse
         try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id);
     const indexes_json = (try loadTableIndexesJson(alloc, catalog, table_name)) orelse {
@@ -27978,9 +27978,9 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
             .identity_namespace = identity_namespace,
             .prefer_existing_identity_namespace = identity_namespace != null,
             .replication_write_gate = replication_write_gate,
-            .replication_async_effect_mirror = effective_ha_mirror,
-            .replication_async_batch_mirror = effective_ha_mirror,
-            .replication_async_metadata_mirror = effective_ha_mirror,
+            .replication_async_effect_mirror = effective_hot_standby_mirror,
+            .replication_async_batch_mirror = effective_hot_standby_mirror,
+            .replication_async_metadata_mirror = effective_hot_standby_mirror,
         });
         errdefer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
@@ -28004,9 +28004,9 @@ fn openManagedDbForTableGroupWithCacheAndRuntimeAndHotStandbyWriteGateAndIdentit
         identity_namespace,
         .{
             .replication_write_gate = replication_write_gate,
-            .replication_async_effect_mirror = effective_ha_mirror,
-            .replication_async_batch_mirror = effective_ha_mirror,
-            .replication_async_metadata_mirror = effective_ha_mirror,
+            .replication_async_effect_mirror = effective_hot_standby_mirror,
+            .replication_async_batch_mirror = effective_hot_standby_mirror,
+            .replication_async_metadata_mirror = effective_hot_standby_mirror,
         },
     );
 }
@@ -32290,7 +32290,7 @@ fn openManagedDbForReplicatedApply(
     };
     const indexes_json = if (metadata) |owned| owned.indexes_json else null;
     const schema_json = if (metadata) |owned| owned.schema_json else null;
-    const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(.default_async, hot_standby_async_mirror);
+    const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(.default_async, hot_standby_async_mirror);
     const direct_schema = if (indexes_json == null)
         try prepareManagedSchemaBeforeIndexLoad(alloc, .default_async, schema_json)
     else
@@ -32316,9 +32316,9 @@ fn openManagedDbForReplicatedApply(
                 .schema_json_before_index_load = schema_json,
                 .reconcile_for_replicated_apply = true,
                 .replication_write_gate = replication_write_gate,
-                .replication_async_effect_mirror = effective_ha_mirror,
-                .replication_async_batch_mirror = effective_ha_mirror,
-                .replication_async_metadata_mirror = effective_ha_mirror,
+                .replication_async_effect_mirror = effective_hot_standby_mirror,
+                .replication_async_batch_mirror = effective_hot_standby_mirror,
+                .replication_async_metadata_mirror = effective_hot_standby_mirror,
             },
         )
     else
@@ -32328,9 +32328,9 @@ fn openManagedDbForReplicatedApply(
             .identity_namespace = namespace,
             .prefer_existing_identity_namespace = true,
             .replication_write_gate = replication_write_gate,
-            .replication_async_effect_mirror = effective_ha_mirror,
-            .replication_async_batch_mirror = effective_ha_mirror,
-            .replication_async_metadata_mirror = effective_ha_mirror,
+            .replication_async_effect_mirror = effective_hot_standby_mirror,
+            .replication_async_batch_mirror = effective_hot_standby_mirror,
+            .replication_async_metadata_mirror = effective_hot_standby_mirror,
             .open_mode = .writer_no_replay,
             .index_open_parallelism = 1,
         });
@@ -32347,16 +32347,16 @@ fn openPreparedTransitionDbForReplicatedApply(
     hot_standby_async_mirror: ?db_mod.ReplicationAsyncEffectMirror,
     identity_namespace: doc_identity.Namespace,
 ) !db_mod.DB {
-    const effective_ha_mirror = hotStandbyMirrorForManagedDbOpenMode(.default_async, hot_standby_async_mirror);
+    const effective_hot_standby_mirror = hotStandbyMirrorForManagedDbOpenMode(.default_async, hot_standby_async_mirror);
     var db = try db_mod.DB.open(alloc, path, .{
         .backend_runtime = backend_runtime,
         .primary_backend = existingPrimaryBackend(),
         .identity_namespace = identity_namespace,
         .prefer_existing_identity_namespace = true,
         .replication_write_gate = replication_write_gate,
-        .replication_async_effect_mirror = effective_ha_mirror,
-        .replication_async_batch_mirror = effective_ha_mirror,
-        .replication_async_metadata_mirror = effective_ha_mirror,
+        .replication_async_effect_mirror = effective_hot_standby_mirror,
+        .replication_async_batch_mirror = effective_hot_standby_mirror,
+        .replication_async_metadata_mirror = effective_hot_standby_mirror,
         .open_mode = .writer_no_replay,
         .index_open_parallelism = 1,
     });

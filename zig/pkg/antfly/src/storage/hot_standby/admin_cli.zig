@@ -1429,7 +1429,7 @@ const Cursor = struct {
     }
 };
 
-const HAPathField = enum {
+const HotStandbyPathField = enum {
     manifest,
     content_root,
 };
@@ -1453,7 +1453,7 @@ fn validateHotStandbyNodeID(raw: []const u8) ![]const u8 {
     return raw;
 }
 
-fn validateHotStandbyPath(raw: []const u8, field: HAPathField) ![]const u8 {
+fn validateHotStandbyPath(raw: []const u8, field: HotStandbyPathField) ![]const u8 {
     switch (validation.classifyHotStandbyString(raw)) {
         .ok => {},
         .missing => return switch (field) {
@@ -1466,7 +1466,7 @@ fn validateHotStandbyPath(raw: []const u8, field: HAPathField) ![]const u8 {
     return raw;
 }
 
-fn hotStandbyPathInvalidError(field: HAPathField) anyerror {
+fn hotStandbyPathInvalidError(field: HotStandbyPathField) anyerror {
     return switch (field) {
         .manifest => error.ManifestPathInvalid,
         .content_root => error.ContentRootInvalid,

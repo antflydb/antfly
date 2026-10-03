@@ -174,7 +174,7 @@ pub const Server = struct {
     /// Runtime-owned hook that repoints the standby's continuous-replication
     /// puller at a new upstream primary without a restart. Modeled on
     /// `SeedCaptureHook` above: the callback runs synchronously while this
-    /// request already holds `ha_state_mutex` (see `AuthOptions.state_mutex`
+    /// request already holds `hot_standby_state_mutex` (see `AuthOptions.state_mutex`
     /// and `handleOperation`), so the implementation MUST NOT try to acquire
     /// that mutex again — `std.atomic.Mutex` is not reentrant.
     pub const StandbyUpstreamHook = struct {
@@ -1659,12 +1659,12 @@ fn requestFromLegacy(req: http_common.HttpRequest) http_operation.Request {
 
 const bearer_prefix = "Bearer ";
 
-const AdminHAPathField = enum {
+const AdminHotStandbyPathField = enum {
     manifest,
     content_root,
 };
 
-fn validateAdminHotStandbyPath(raw: []const u8, field: AdminHAPathField) ![]const u8 {
+fn validateAdminHotStandbyPath(raw: []const u8, field: AdminHotStandbyPathField) ![]const u8 {
     switch (validation.classifyHotStandbyString(raw)) {
         .ok => {},
         .missing => return switch (field) {
@@ -1677,7 +1677,7 @@ fn validateAdminHotStandbyPath(raw: []const u8, field: AdminHAPathField) ![]cons
     return raw;
 }
 
-fn adminHotStandbyPathInvalidError(field: AdminHAPathField) anyerror {
+fn adminHotStandbyPathInvalidError(field: AdminHotStandbyPathField) anyerror {
     return switch (field) {
         .manifest => error.ManifestPathInvalid,
         .content_root => error.ContentRootInvalid,
@@ -2354,7 +2354,7 @@ fn adminFenceRequestFromOpenApi(request: admin_api.FenceAcquireRequest) !fencing
         // allocates the next generation itself" (see the doc comment on
         // `fencing.FenceRequest.generation`). The fence route already runs
         // under `primary_fence_barrier`'s exclusive lease and
-        // `ha_state_mutex` (see `handleOperation`), so the fencing store's
+        // `hot_standby_state_mutex` (see `handleOperation`), so the fencing store's
         // read-modify-write allocation of the next generation is serialized
         // with any concurrent fence/promotion request.
         .generation = if (request.generation) |value| try positiveUint64FromJson(value) else 0,

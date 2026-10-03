@@ -83,7 +83,7 @@ pub const Owners = struct {
         self.io.sleep(.fromNanoseconds(@intCast(ns)), .awake) catch unreachable;
     }
 
-    pub fn primaryConfig(self: *Owners) runtime.DataServerHAConfig {
+    pub fn primaryConfig(self: *Owners) runtime.DataServerHotStandbyConfig {
         const primary = &self.primary.?;
         return .{
             .admin_context = .{ .primary = primary, .primary_node_id = "primary", .fence_store = &self.fences.? },
@@ -119,7 +119,7 @@ pub const Owners = struct {
             .replica_root_dir = self.primary_root,
             .backend_runtime = backend,
             .api_server_cfg = .{ .admin_bearer_token = token },
-            .ha = self.primaryConfig(),
+            .hot_standby = self.primaryConfig(),
         }, self.catalogSource(), self.statusSource());
         try self.primary_server.?.startPublicHttp();
         self.primary_uri = try self.primary_server.?.baseUri(self.alloc);
@@ -148,7 +148,7 @@ pub const Owners = struct {
             .replica_root_dir = self.replica_root,
             .api_server_cfg = .{},
             .backend_runtime = backend,
-            .ha = .{
+            .hot_standby = .{
                 .admin_context = .{ .standby = &self.standby.?, .standby_node_id = "standby", .fence_store = &self.fences.? },
                 .standby_owner = &self.standby,
                 .admin_bearer_token = token,

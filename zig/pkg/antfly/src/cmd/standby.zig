@@ -2113,7 +2113,7 @@ fn resolveHotStandbyPodUID() !?[]const u8 {
     return pod_uid;
 }
 
-const HAPathField = enum {
+const HotStandbyPathField = enum {
     primary_log,
     primary_slots,
     standby_log,
@@ -2123,7 +2123,7 @@ const HAPathField = enum {
     data_dir,
 };
 
-fn validateHotStandbyPath(path: []const u8, field: HAPathField) ![]const u8 {
+fn validateHotStandbyPath(path: []const u8, field: HotStandbyPathField) ![]const u8 {
     switch (hot_standby_validation.classifyHotStandbyString(path)) {
         .ok => {},
         .missing => return switch (field) {
@@ -2141,7 +2141,7 @@ fn validateHotStandbyPath(path: []const u8, field: HAPathField) ![]const u8 {
     return path;
 }
 
-fn hotStandbyPathInvalidError(field: HAPathField) anyerror {
+fn hotStandbyPathInvalidError(field: HotStandbyPathField) anyerror {
     return switch (field) {
         .primary_log => error.HAPrimaryLogInvalid,
         .primary_slots => error.HAPrimarySlotsInvalid,
@@ -2153,12 +2153,12 @@ fn hotStandbyPathInvalidError(field: HAPathField) anyerror {
     };
 }
 
-const HANodeIDField = enum {
+const HotStandbyNodeIDField = enum {
     primary,
     standby,
 };
 
-fn validateHotStandbyNodeID(node_id: []const u8, field: HANodeIDField) ![]const u8 {
+fn validateHotStandbyNodeID(node_id: []const u8, field: HotStandbyNodeIDField) ![]const u8 {
     switch (hot_standby_validation.classifyHotStandbyString(node_id)) {
         .ok => {},
         .missing, .padded => return hotStandbyNodeIDInvalidError(field),
@@ -2167,7 +2167,7 @@ fn validateHotStandbyNodeID(node_id: []const u8, field: HANodeIDField) ![]const 
     return node_id;
 }
 
-fn hotStandbyNodeIDInvalidError(field: HANodeIDField) anyerror {
+fn hotStandbyNodeIDInvalidError(field: HotStandbyNodeIDField) anyerror {
     return switch (field) {
         .primary => error.HAPrimaryNodeIdInvalid,
         .standby => error.HAStandbyNodeIdInvalid,
@@ -2657,12 +2657,12 @@ test "standby cmd validates remote bearer token env name" {
 }
 
 test "standby cmd classifies HA strings before field-specific validation" {
-    try std.testing.expectEqual(hot_standby_validation.HAStringValidation.missing, hot_standby_validation.classifyHotStandbyString(null));
-    try std.testing.expectEqual(hot_standby_validation.HAStringValidation.missing, hot_standby_validation.classifyHotStandbyString(""));
-    try std.testing.expectEqual(hot_standby_validation.HAStringValidation.missing, hot_standby_validation.classifyHotStandbyString(" \t\r\n"));
-    try std.testing.expectEqual(hot_standby_validation.HAStringValidation.padded, hot_standby_validation.classifyHotStandbyString(" primary-a"));
-    try std.testing.expectEqual(hot_standby_validation.HAStringValidation.padded, hot_standby_validation.classifyHotStandbyString("primary-a\n"));
-    try std.testing.expectEqual(hot_standby_validation.HAStringValidation.ok, hot_standby_validation.classifyHotStandbyString("primary-a"));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.missing, hot_standby_validation.classifyHotStandbyString(null));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.missing, hot_standby_validation.classifyHotStandbyString(""));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.missing, hot_standby_validation.classifyHotStandbyString(" \t\r\n"));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.padded, hot_standby_validation.classifyHotStandbyString(" primary-a"));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.padded, hot_standby_validation.classifyHotStandbyString("primary-a\n"));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.ok, hot_standby_validation.classifyHotStandbyString("primary-a"));
 }
 
 test "standby cmd rejects padded or invalid HA local option strings" {

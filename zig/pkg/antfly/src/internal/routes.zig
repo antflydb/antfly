@@ -81,7 +81,7 @@ test "internal routes define standby replication paths and their legacy aliases"
 }
 
 test "internal routes match generated OpenAPI standby replication operations" {
-    for (expected_ha_replication_routes) |route| {
+    for (expected_hot_standby_replication_routes) |route| {
         try expectGeneratedRoute(route.operation_id, route.method, route.full_path);
     }
     try expectEveryGeneratedHotStandbyReplicationRouteCovered();
@@ -93,7 +93,7 @@ const ExpectedRoute = struct {
     full_path: []const u8,
 };
 
-const expected_ha_replication_routes = [_]ExpectedRoute{
+const expected_hot_standby_replication_routes = [_]ExpectedRoute{
     .{ .operation_id = "identifyHAReplicationSystem", .method = "GET", .full_path = standby_replication_identify },
     .{ .operation_id = "createHAReplicationStreamingSlot", .method = "POST", .full_path = standby_replication_slots },
     .{ .operation_id = "startHAReplication", .method = "POST", .full_path = standby_replication_start },
@@ -129,7 +129,7 @@ fn expectEveryGeneratedHotStandbyReplicationRouteCovered() !void {
 }
 
 fn expectedHotStandbyReplicationRoute(generated: openapi.server.Route) ?ExpectedRoute {
-    for (expected_ha_replication_routes) |expected| {
+    for (expected_hot_standby_replication_routes) |expected| {
         if (!std.mem.eql(u8, generated.operation_id, expected.operation_id)) continue;
         if (!std.mem.eql(u8, generated.method, expected.method)) continue;
         if (!std.mem.startsWith(u8, expected.full_path, base)) continue;

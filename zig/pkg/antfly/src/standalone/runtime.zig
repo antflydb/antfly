@@ -110,12 +110,12 @@ const StandaloneHttpContext = struct {
     cors_config: ?*const antfly.common.config.Config.CorsConfig = null,
 };
 
-const HALeaseAPIEndpoint = struct {
+const HotStandbyLeaseAPIEndpoint = struct {
     host: []const u8,
     port: []const u8,
 };
 
-fn hotStandbyLeaseAPIEndpoint(env: *const std.process.Environ.Map) !HALeaseAPIEndpoint {
+fn hotStandbyLeaseAPIEndpoint(env: *const std.process.Environ.Map) !HotStandbyLeaseAPIEndpoint {
     return .{
         .host = env.get(hot_standby_lease_api_host_env) orelse hot_standby_lease_default_api_host,
         .port = env.get("KUBERNETES_SERVICE_PORT_HTTPS") orelse env.get("KUBERNETES_SERVICE_PORT") orelse return error.HALeaseAPIPortMissing,
@@ -5173,7 +5173,7 @@ pub fn runFromIterator(
             .session_max_record_bytes = if (loaded_config) |*cfg| cfg.transaction_sessions.max_record_bytes else standalone_session_max_record_bytes,
             .session_savepoint_limit = if (loaded_config) |*cfg| cfg.transaction_sessions.max_savepoints else standalone_session_savepoint_limit,
         },
-        .ha = if (hot_standby_primary != null or hot_standby_standby != null or hot_standby_fence_store != null or hot_standby_former_primary_log != null) .{
+        .hot_standby = if (hot_standby_primary != null or hot_standby_standby != null or hot_standby_fence_store != null or hot_standby_former_primary_log != null) .{
             .restore_owner_metadata_root = std.fs.path.dirname(resolved.local_metadata_catalog_path) orelse return error.InvalidHASeedSnapshotRoot,
             .admin_context = .{
                 .primary = if (hot_standby_primary) |*primary| primary else null,
@@ -7494,14 +7494,14 @@ fn optionalHotStandbyStartupDigest(value: ?[]const u8) !?[]const u8 {
     return digest;
 }
 
-fn hotStandbyStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HAStandbyReplicationConfig {
+fn hotStandbyStandbyReplicationConfigFromCli(cli: CliConfig) !?antfly.data.runtime.HotStandbyStandbyReplicationConfig {
     return try hotStandbyStandbyReplicationConfigFromCliWithBearerToken(cli, null);
 }
 
 fn hotStandbyStandbyReplicationConfigFromCliWithBearerToken(
     cli: CliConfig,
     bearer_token: ?[]const u8,
-) !?antfly.data.runtime.HAStandbyReplicationConfig {
+) !?antfly.data.runtime.HotStandbyStandbyReplicationConfig {
     if (cli.hot_standby_standby_upstream_url == null and cli.hot_standby_standby_slot == null) return null;
     const upstream = try requireHotStandbyString(cli.hot_standby_standby_upstream_url, error.HAStandbyUpstreamUrlMissing, error.HAStandbyUpstreamUrlInvalid);
     const slot = try requireHotStandbyIdentifier(cli.hot_standby_standby_slot, error.HAStandbySlotMissing, error.HAStandbySlotInvalid);
@@ -7521,17 +7521,17 @@ fn isHotStandbyReplicationUpstreamScheme(parsed: std.Uri) bool {
     return std.mem.eql(u8, parsed.scheme, "http") or std.mem.eql(u8, parsed.scheme, "https");
 }
 
-const OwnedHASyncPolicy = struct {
+const OwnedHotStandbySyncPolicy = struct {
     policy: antfly.hot_standby.primary.SyncPolicy = .{},
     standby_names: []const []const u8 = &.{},
 
-    fn deinit(self: *OwnedHASyncPolicy, alloc: std.mem.Allocator) void {
+    fn deinit(self: *OwnedHotStandbySyncPolicy, alloc: std.mem.Allocator) void {
         if (self.standby_names.len > 0) alloc.free(self.standby_names);
         self.* = undefined;
     }
 };
 
-fn hotStandbySyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHASyncPolicy {
+fn hotStandbySyncPolicyFromCli(alloc: std.mem.Allocator, cli: CliConfig) !OwnedHotStandbySyncPolicy {
     if (!hotStandbySyncPolicyRequested(cli)) return .{};
     if (!hotStandbyPrimaryRequested(cli) and !hotStandbyStandbyRequested(cli)) return error.HASyncPolicyRequiresPrimary;
 
@@ -10090,7 +10090,7 @@ test "deprecated --ha-* flags remain aliases for --hot-standby-* flags" {
         try std.testing.expectEqualDeep(@field(canonical_cfg, pair.field), @field(legacy_cfg, pair.field));
     }
 
-    // ha_sync_standby_names is list-appended rather than assigned, so it is
+    // hot_standby_sync_standby_names is list-appended rather than assigned, so it is
     // checked separately from the scalar/string table above.
     var canonical_sync_standby_argv = [_][*:0]const u8{ "--hot-standby-sync-standby", "standby-a" };
     var canonical_sync_standby_iter = std.process.Args.Iterator.init(.{ .vector = canonical_sync_standby_argv[0..] });
@@ -10166,12 +10166,12 @@ test "standalone HA standby replication flags require upstream and slot" {
 }
 
 test "standalone HA string classifier distinguishes missing padded and valid values" {
-    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHotStandbyString(null));
-    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHotStandbyString(""));
-    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.missing, antfly.hot_standby.validation.classifyHotStandbyString(" \t\r\n"));
-    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.padded, antfly.hot_standby.validation.classifyHotStandbyString(" standby-a"));
-    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.padded, antfly.hot_standby.validation.classifyHotStandbyString("standby-a\n"));
-    try std.testing.expectEqual(antfly.hot_standby.validation.HAStringValidation.ok, antfly.hot_standby.validation.classifyHotStandbyString("standby-a"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HotStandbyStringValidation.missing, antfly.hot_standby.validation.classifyHotStandbyString(null));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HotStandbyStringValidation.missing, antfly.hot_standby.validation.classifyHotStandbyString(""));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HotStandbyStringValidation.missing, antfly.hot_standby.validation.classifyHotStandbyString(" \t\r\n"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HotStandbyStringValidation.padded, antfly.hot_standby.validation.classifyHotStandbyString(" standby-a"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HotStandbyStringValidation.padded, antfly.hot_standby.validation.classifyHotStandbyString("standby-a\n"));
+    try std.testing.expectEqual(antfly.hot_standby.validation.HotStandbyStringValidation.ok, antfly.hot_standby.validation.classifyHotStandbyString("standby-a"));
 
     try std.testing.expectError(error.HAStandbySlotMissing, requireHotStandbyString(null, error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
     try std.testing.expectError(error.HAStandbySlotMissing, requireHotStandbyString(" \t", error.HAStandbySlotMissing, error.HAStandbySlotInvalid));
@@ -12760,7 +12760,7 @@ test "standalone shared public HA table backup and restore use one coordinated e
         .snapshot_root_dir = try std.fmt.allocPrint(a, "{s}/snapshots", .{root}),
         .backend_runtime = runtime.ptr(),
         .store_registration = .{ .node_id = 1, .store_id = 1, .api_url = "http://localhost", .role = "data" },
-        .ha = .{ .admin_context = .{ .primary = &primary }, .internal_primary = &primary },
+        .hot_standby = .{ .admin_context = .{ .primary = &primary }, .internal_primary = &primary },
         .api_server_cfg = .{ .deployment_mode = .standalone, .node_config = &config, .hot_standby_failover_safe_mutations_only = true },
     }, metadata.catalogSource(), metadata.statusSource());
     defer data.deinit();
@@ -13795,7 +13795,7 @@ test "standalone catalog journal preserves imported policy publication as fail c
     try std.testing.expect(preserved.value.policy_publication.phase == .pending_install);
 }
 
-fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
+fn exerciseStandalonePolicyPublication(use_hot_standby: bool) !void {
     if (comptime control_only_storage_sources) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const policies = @import("../system_catalog/policies.zig");
@@ -13812,7 +13812,7 @@ fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
     defer alloc.free(log);
     const slots = try std.fmt.allocPrintSentinel(alloc, "{s}/policy-primary-slots", .{root}, 0);
     defer alloc.free(slots);
-    var primary: ?antfly.hot_standby.primary.Primary = if (use_ha)
+    var primary: ?antfly.hot_standby.primary.Primary = if (use_hot_standby)
         try antfly.hot_standby.primary.Primary.open(alloc, log, slots, .{ .cluster_id = 77, .timeline_id = 1, .epoch = 1 }, .{})
     else
         null;
@@ -13842,24 +13842,24 @@ fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
         .mutation = .{ .action = .set_tablespace, .kind = .table, .name = "policy_rows" },
     } });
     alloc.free(binding);
-    const baseline = if (use_ha) try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(std.testing.io, checkpoint) else null;
+    const baseline = if (use_hot_standby) try metadata.lifecycle_store.?.exportHotStandbyCheckpoint(std.testing.io, checkpoint) else null;
     var server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
         .replica_root_dir = root,
         .replica_catalog_path = path,
         .backend_runtime = backend.ptr(),
-        .ha = if (use_ha) .{ .admin_context = .{ .primary = &primary.? }, .internal_primary = &primary.? } else .{},
+        .hot_standby = if (use_hot_standby) .{ .admin_context = .{ .primary = &primary.? }, .internal_primary = &primary.? } else .{},
         .api_server_cfg = .{
             .deployment_mode = .standalone,
             .trusted_principal_secret = "standalone-test-principal-secret-32",
             .trusted_principal_issuer = "standalone-test",
             .secret_store = &secret_store,
-            .hot_standby_failover_safe_mutations_only = use_ha,
+            .hot_standby_failover_safe_mutations_only = use_hot_standby,
         },
     }, metadata.catalogSource(), metadata.statusSource());
     var server_open = true;
     defer if (server_open) server.deinit();
     server.write_source.write_cache = &server.provisioned_storage.write_cache;
-    if (use_ha) metadata.hot_standby_catalog_server = &server;
+    if (use_hot_standby) metadata.hot_standby_catalog_server = &server;
     try server.initApiServer();
     metadata.data_server = &server;
     try std.testing.expect(metadata.localPolicyPublicationSupported());
@@ -13946,7 +13946,7 @@ fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
     const proof = try authority.sign(alloc, "standalone-test-principal-secret-32", "standalone-test", roles, scope, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
     defer alloc.free(proof);
     try std.testing.expect((try reads.lookupGroupLocal(alloc, owner_group, table_name, "absent", .{ .row_policy_principal_proof = proof, .row_policy_database = "main" }, .read_index)) == null);
-    if (use_ha) {
+    if (use_hot_standby) {
         const standby_root = try std.fmt.allocPrint(alloc, "{s}/policy-standby-metadata", .{root});
         defer alloc.free(standby_root);
         var standby = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = standby_root });
@@ -14046,18 +14046,18 @@ fn exerciseStandalonePolicyPublication(use_ha: bool) !void {
         .replica_root_dir = root,
         .replica_catalog_path = path,
         .backend_runtime = backend.ptr(),
-        .ha = if (use_ha) .{ .admin_context = .{ .primary = &primary.? }, .internal_primary = &primary.? } else .{},
+        .hot_standby = if (use_hot_standby) .{ .admin_context = .{ .primary = &primary.? }, .internal_primary = &primary.? } else .{},
         .api_server_cfg = .{
             .deployment_mode = .standalone,
             .trusted_principal_secret = "standalone-test-principal-secret-32",
             .trusted_principal_issuer = "standalone-test",
             .secret_store = &secret_store,
-            .hot_standby_failover_safe_mutations_only = use_ha,
+            .hot_standby_failover_safe_mutations_only = use_hot_standby,
         },
     }, reopened.catalogSource(), reopened.statusSource());
     defer reopened_server.deinit();
     reopened_server.write_source.write_cache = &reopened_server.provisioned_storage.write_cache;
-    if (use_ha) reopened.hot_standby_catalog_server = &reopened_server;
+    if (use_hot_standby) reopened.hot_standby_catalog_server = &reopened_server;
     try reopened_server.initApiServer();
     reopened.data_server = &reopened_server;
     const recovered_reads = reopened_server.read_source.source();

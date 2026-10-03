@@ -7837,7 +7837,7 @@ pub const ApiHttpServer = struct {
         };
     }
 
-    pub const HaRouteRequest = struct {
+    pub const HotStandbyRouteRequest = struct {
         method: contextual_operations.Method,
         target: []const u8,
         authorization: ?[]const u8,
@@ -7845,7 +7845,7 @@ pub const ApiHttpServer = struct {
         body: []const u8,
     };
 
-    pub fn executeHaRoute(self: *ApiHttpServer, request: HaRouteRequest) !?hot_standby_http_operation.OwnedResponse {
+    pub fn executeHotStandbyRoute(self: *ApiHttpServer, request: HotStandbyRouteRequest) !?hot_standby_http_operation.OwnedResponse {
         const path = splitTarget(request.target).path;
         const operation_request = hot_standby_http_operation.Request{
             .method = switch (request.method) {
@@ -7859,7 +7859,7 @@ pub const ApiHttpServer = struct {
             .content_type = request.content_type,
             .body = request.body,
         };
-        if (isHaAdminPath(path)) {
+        if (isHotStandbyAdminPath(path)) {
             const expected = (self.cfg.hot_standby_admin_bearer_token orelse self.cfg.admin_bearer_token) orelse
                 return try hotStandbyOperationTextResponse(self.alloc, 403, "HA admin API disabled without authentication");
             if (expected.len == 0)
@@ -7873,7 +7873,7 @@ pub const ApiHttpServer = struct {
             const hot_standby_exec = self.cfg.hot_standby_admin_executor orelse return null;
             return try hot_standby_exec.execute(operation_request);
         }
-        if (isHaInternalPath(path)) {
+        if (isHotStandbyInternalPath(path)) {
             const expected = self.cfg.admin_bearer_token orelse
                 return try hotStandbyOperationTextResponse(self.alloc, 403, "HA internal API disabled without authentication");
             if (expected.len == 0)
@@ -25476,7 +25476,7 @@ fn extensionDependencyExists(dependencies: []const extension_domain.ExtensionDep
 
 pub fn requiresAdminPermission(path: []const u8) bool {
     if (std.mem.eql(u8, path, "/settings")) return true;
-    if (isHaAdminPath(path)) return true;
+    if (isHotStandbyAdminPath(path)) return true;
     if (isStorageMaintenancePath(path)) return true;
     if (std.mem.eql(u8, path, admin_routes.raft) or std.mem.startsWith(u8, path, admin_routes.raft ++ "/")) return true;
     if (isExtensionPath(path)) return true;
@@ -25489,7 +25489,7 @@ pub fn requiresAdminPermission(path: []const u8) bool {
     return std.mem.eql(u8, path, routes.Routes.users) or std.mem.startsWith(u8, path, routes.Routes.users_prefix);
 }
 
-fn isHaAdminPath(path: []const u8) bool {
+fn isHotStandbyAdminPath(path: []const u8) bool {
     // Canonical `/admin/v1/standby` plus the pre-0.3 `/admin/v1/ha` alias.
     return std.mem.eql(u8, path, admin_routes.standby) or std.mem.startsWith(u8, path, admin_routes.standby ++ "/") or
         std.mem.eql(u8, path, admin_routes.legacy_standby_prefix) or std.mem.startsWith(u8, path, admin_routes.legacy_standby_prefix ++ "/");
@@ -25514,7 +25514,7 @@ fn storageRuntimeStatus(status: @import("../storage/maintenance.zig").Status) me
     };
 }
 
-fn isHaInternalPath(path: []const u8) bool {
+fn isHotStandbyInternalPath(path: []const u8) bool {
     return std.mem.eql(u8, path, internal_api_routes.standby) or std.mem.startsWith(u8, path, internal_api_routes.standby ++ "/") or
         std.mem.eql(u8, path, internal_api_routes.legacy_standby) or std.mem.startsWith(u8, path, internal_api_routes.legacy_standby ++ "/");
 }
@@ -34219,14 +34219,14 @@ test "transaction principals bind sessions to credential identity" {
     try std.testing.expectEqualStrings("trusted-token", forwarded[0].value);
 }
 
-fn executeHaRouteForTest(
+fn executeHotStandbyRouteForTest(
     server: *ApiHttpServer,
     method: contextual_operations.Method,
     target: []const u8,
     authorization: ?[]const u8,
     body: []const u8,
 ) !hot_standby_http_operation.OwnedResponse {
-    return (try server.executeHaRoute(.{
+    return (try server.executeHotStandbyRoute(.{
         .method = method,
         .target = target,
         .authorization = authorization,
@@ -34293,7 +34293,7 @@ test "typed HA route operation dispatches admin and internal executors" {
     }, source.iface(), null, null);
     defer server.deinit();
 
-    var admin_resp = try executeHaRouteForTest(
+    var admin_resp = try executeHotStandbyRouteForTest(
         &server,
         .get,
         admin_routes.hot_standby_primary_status ++ "?max_lag_lsn=0",
@@ -34307,7 +34307,7 @@ test "typed HA route operation dispatches admin and internal executors" {
     try std.testing.expectEqual(hot_standby_http_operation.Method.get, admin_exec.last_method.?);
     try std.testing.expectEqualStrings(admin_routes.hot_standby_primary_status ++ "?max_lag_lsn=0", admin_exec.last_uri.?);
 
-    var internal_resp = try executeHaRouteForTest(
+    var internal_resp = try executeHotStandbyRouteForTest(
         &server,
         .post,
         internal_api_routes.hot_standby_replication_status,
@@ -34322,14 +34322,14 @@ test "typed HA route operation dispatches admin and internal executors" {
     try std.testing.expectEqualStrings(internal_api_routes.hot_standby_replication_status, internal_exec.last_uri.?);
     try std.testing.expectEqualStrings("{\"slot_name\":\"standby-a\"}", internal_exec.last_body.?);
 
-    var missing = try executeHaRouteForTest(&server, .get, admin_routes.standby, null, "");
+    var missing = try executeHotStandbyRouteForTest(&server, .get, admin_routes.standby, null, "");
     defer missing.deinit();
     try std.testing.expectEqual(@as(u16, 401), missing.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
 
     // The pre-0.3 prefix reaches the same gate: unauthenticated is 401, not
     // an unrouted 404.
-    var legacy_missing = try executeHaRouteForTest(&server, .get, admin_routes.legacy_standby_prefix ++ "/primary/status", null, "");
+    var legacy_missing = try executeHotStandbyRouteForTest(&server, .get, admin_routes.legacy_standby_prefix ++ "/primary/status", null, "");
     defer legacy_missing.deinit();
     try std.testing.expectEqual(@as(u16, 401), legacy_missing.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
@@ -34403,26 +34403,26 @@ test "typed HA route operation requires exact bearer token for internal replicat
         .hot_standby_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
 
-    var unauthorized = try executeHaRouteForTest(&server, .get, admin_routes.hot_standby_primary_status, null, "");
+    var unauthorized = try executeHotStandbyRouteForTest(&server, .get, admin_routes.hot_standby_primary_status, null, "");
     defer unauthorized.deinit();
     try std.testing.expectEqual(@as(u16, 401), unauthorized.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
     const reader_auth = try encodeBasicAuthorization(alloc, "reader", "reader");
     defer alloc.free(reader_auth);
-    var forbidden = try executeHaRouteForTest(&server, .get, admin_routes.hot_standby_primary_status, reader_auth, "");
+    var forbidden = try executeHotStandbyRouteForTest(&server, .get, admin_routes.hot_standby_primary_status, reader_auth, "");
     defer forbidden.deinit();
     try std.testing.expectEqual(@as(u16, 401), forbidden.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
     const admin_auth = try encodeBasicAuthorization(alloc, "admin", "admin");
     defer alloc.free(admin_auth);
-    var native_admin_rejected = try executeHaRouteForTest(&server, .get, admin_routes.hot_standby_primary_status, admin_auth, "");
+    var native_admin_rejected = try executeHotStandbyRouteForTest(&server, .get, admin_routes.hot_standby_primary_status, admin_auth, "");
     defer native_admin_rejected.deinit();
     try std.testing.expectEqual(@as(u16, 401), native_admin_rejected.status);
     try std.testing.expectEqual(@as(usize, 0), admin_exec.calls);
 
-    var authorized = try executeHaRouteForTest(&server, .get, admin_routes.hot_standby_primary_status, "Bearer ha-internal-secret", "");
+    var authorized = try executeHotStandbyRouteForTest(&server, .get, admin_routes.hot_standby_primary_status, "Bearer ha-internal-secret", "");
     defer authorized.deinit();
     try std.testing.expectEqual(@as(u16, 200), authorized.status);
     try std.testing.expectEqual(@as(usize, 1), admin_exec.calls);
@@ -34434,18 +34434,18 @@ test "typed HA route operation requires exact bearer token for internal replicat
         internal_api_routes.hot_standby_replication_status,
     };
     for (internal_routes) |path| {
-        var internal_missing = try executeHaRouteForTest(&server, .get, path, null, "");
+        var internal_missing = try executeHotStandbyRouteForTest(&server, .get, path, null, "");
         defer internal_missing.deinit();
         try std.testing.expectEqual(@as(u16, 401), internal_missing.status);
         try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
 
-        var internal_wrong = try executeHaRouteForTest(&server, .get, path, "Bearer wrong-token", "");
+        var internal_wrong = try executeHotStandbyRouteForTest(&server, .get, path, "Bearer wrong-token", "");
         defer internal_wrong.deinit();
         try std.testing.expectEqual(@as(u16, 401), internal_wrong.status);
         try std.testing.expectEqual(@as(usize, 0), internal_exec.calls);
     }
 
-    var internal = try executeHaRouteForTest(&server, .get, internal_api_routes.hot_standby_replication_identify, "Bearer ha-internal-secret", "");
+    var internal = try executeHotStandbyRouteForTest(&server, .get, internal_api_routes.hot_standby_replication_identify, "Bearer ha-internal-secret", "");
     defer internal.deinit();
     try std.testing.expectEqual(@as(u16, 200), internal.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
@@ -34454,7 +34454,7 @@ test "typed HA route operation requires exact bearer token for internal replicat
         .hot_standby_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
     defer disabled_server.deinit();
-    var disabled = try executeHaRouteForTest(&disabled_server, .get, internal_api_routes.hot_standby_replication_identify, "Bearer ha-internal-secret", "");
+    var disabled = try executeHotStandbyRouteForTest(&disabled_server, .get, internal_api_routes.hot_standby_replication_identify, "Bearer ha-internal-secret", "");
     defer disabled.deinit();
     try std.testing.expectEqual(@as(u16, 403), disabled.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);
@@ -34464,7 +34464,7 @@ test "typed HA route operation requires exact bearer token for internal replicat
         .hot_standby_internal_executor = internal_exec.executor(),
     }, source.iface(), null, null);
     defer empty_token_server.deinit();
-    var empty_token = try executeHaRouteForTest(&empty_token_server, .get, internal_api_routes.hot_standby_replication_identify, "Bearer ", "");
+    var empty_token = try executeHotStandbyRouteForTest(&empty_token_server, .get, internal_api_routes.hot_standby_replication_identify, "Bearer ", "");
     defer empty_token.deinit();
     try std.testing.expectEqual(@as(u16, 403), empty_token.status);
     try std.testing.expectEqual(@as(usize, 1), internal_exec.calls);

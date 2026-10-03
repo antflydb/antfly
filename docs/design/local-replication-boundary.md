@@ -67,9 +67,13 @@ both paths without renumbering or renaming the wire detail.
 
 ## Naming and enforcement
 
-Internal `ha_`, `ha...`, and declared `...HA...` helpers use `hot_standby`,
+Authored runtime helpers, types, and DataServer configuration use `hot_standby`,
 `hotStandby`, or `HotStandby`. Legacy `--ha-*` CLI aliases, serialized field
-names, persisted key strings, published runtime status enum names, and established server error tags remain compatible.
+names, persisted key strings, deprecated OpenAPI aliases and configuration keys,
+published ABI declarations and runtime status enum names, and established
+server error tags remain compatible. Comments referring to internal symbols
+follow the authored names; compatibility tests retain the legacy vocabulary
+they exercise.
 Raft keeps its own name in server coordination.
 
 The source boundary audit rejects both server imports and server policy fields

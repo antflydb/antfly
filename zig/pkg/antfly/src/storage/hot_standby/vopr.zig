@@ -561,29 +561,29 @@ fn finish(state: anytype, events: *vopr.event.Sink, allocator: std.mem.Allocator
 }
 
 fn runRecordReplay(comptime budget: u64, seed: u64) !void {
-    const HaScenario = Scenario(budget);
+    const HotStandbyScenario = Scenario(budget);
     var seeded = vopr.choice.Seeded.init(seed);
-    var artifact = try vopr.runner.run(HaScenario, std.testing.allocator, seeded.source(), .{
+    var artifact = try vopr.runner.run(HotStandbyScenario, std.testing.allocator, seeded.source(), .{
         .system = "antfly",
         .seed = seed,
         .transition_budget = budget + 1,
     });
     defer artifact.deinit();
     try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
-    var replayed = try vopr.replay.exact(HaScenario, std.testing.allocator, &artifact);
+    var replayed = try vopr.replay.exact(HotStandbyScenario, std.testing.allocator, &artifact);
     replayed.deinit();
 }
 
 fn runScripted(comptime budget: u64, selections: []const vopr.id.StableId) !vopr.trace.Trace {
-    const HaScenario = Scenario(budget);
+    const HotStandbyScenario = Scenario(budget);
     var scripted = vopr.choice.Scripted{ .selections = selections };
-    var artifact = try vopr.runner.run(HaScenario, std.testing.allocator, scripted.source(), .{
+    var artifact = try vopr.runner.run(HotStandbyScenario, std.testing.allocator, scripted.source(), .{
         .system = "antfly",
         .transition_budget = selections.len,
     });
     errdefer artifact.deinit();
     try std.testing.expectEqual(@as(u64, 0), artifact.summary.?.property_failures);
-    var replayed = try vopr.replay.exact(HaScenario, std.testing.allocator, &artifact);
+    var replayed = try vopr.replay.exact(HotStandbyScenario, std.testing.allocator, &artifact);
     replayed.deinit();
     return artifact;
 }
@@ -601,9 +601,9 @@ test "standby VOPR replays crash standby fencing retention backup and promotion 
 }
 
 test "standby VOPR bounded standby apply uses the virtual WAL clock" {
-    const HaScenario = Scenario(32);
-    var world = try HaScenario.init(std.testing.allocator);
-    defer HaScenario.deinit(&world, std.testing.allocator);
+    const HotStandbyScenario = Scenario(32);
+    var world = try HotStandbyScenario.init(std.testing.allocator);
+    defer HotStandbyScenario.deinit(&world, std.testing.allocator);
     const state = world.state;
     for (0..6) |_| {
         _ = try state.primary.append(.{ .payload = "document" });
@@ -630,16 +630,16 @@ test "standby VOPR bounded standby apply uses the virtual WAL clock" {
 }
 
 test "standby VOPR preserves exact progress and property streams across fresh worlds" {
-    const HaScenario = Scenario(20);
+    const HotStandbyScenario = Scenario(20);
     var seeded = vopr.choice.Seeded.init(0xA17F_AA13);
-    var artifact = try vopr.runner.run(HaScenario, std.testing.allocator, seeded.source(), .{
+    var artifact = try vopr.runner.run(HotStandbyScenario, std.testing.allocator, seeded.source(), .{
         .system = "antfly",
         .seed = 0xA17F_AA13,
         .transition_budget = 21,
     });
     defer artifact.deinit();
     for (0..5) |_| {
-        var replayed = try vopr.replay.exact(HaScenario, std.testing.allocator, &artifact);
+        var replayed = try vopr.replay.exact(HotStandbyScenario, std.testing.allocator, &artifact);
         replayed.deinit();
     }
 }
