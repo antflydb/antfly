@@ -22,7 +22,7 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 
 const admin_api = antfly.admin;
 const ha = antfly.hot_standby;
-const ha_validation = ha.validation;
+const hot_standby_validation = ha.validation;
 const http_common = antfly.common.http.http_common;
 const control_only_storage_sources = storage_source_options.control_only;
 
@@ -284,11 +284,11 @@ const ArtifactFlag = enum {
     target_root,
     capture_root,
     slot_activation_receipt,
-    ha_cluster_id,
-    ha_shard_id,
-    ha_table_id,
-    ha_timeline_id,
-    ha_epoch,
+    hot_standby_cluster_id,
+    hot_standby_shard_id,
+    hot_standby_table_id,
+    hot_standby_timeline_id,
+    hot_standby_epoch,
     minimum_checkpoint_lsn,
     topology_id,
     topology_generation,
@@ -496,7 +496,7 @@ fn runArtifactArgv(alloc: std.mem.Allocator, io: std.Io, argv: []const []const u
                     .target_local_node_id = target_local_node_id,
                     .target_replica_id = target_replica_id,
                 },
-                .pod_uid = try resolveHAPodUID(),
+                .pod_uid = try resolveHotStandbyPodUID(),
             };
             if (comptime control_only_storage_sources) {
                 const request_json = try std.json.Stringify.valueAlloc(alloc, request, .{});
@@ -635,11 +635,11 @@ fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Artifa
             .target_root => options.target_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
             .capture_root => options.capture_root = try absoluteArtifactPath(try artifactValue(argv, &idx)),
             .slot_activation_receipt => options.slot_activation_receipt_path = try absoluteArtifactPath(try artifactValue(argv, &idx)),
-            .ha_cluster_id => options.identity.cluster_id = try parseU64(try artifactValue(argv, &idx)),
-            .ha_shard_id => options.identity.shard_id = try parseU64(try artifactValue(argv, &idx)),
-            .ha_table_id => options.identity.table_id = try parseU64(try artifactValue(argv, &idx)),
-            .ha_timeline_id => options.identity.timeline_id = try parseU64(try artifactValue(argv, &idx)),
-            .ha_epoch => options.identity.epoch = try parseU64(try artifactValue(argv, &idx)),
+            .hot_standby_cluster_id => options.identity.cluster_id = try parseU64(try artifactValue(argv, &idx)),
+            .hot_standby_shard_id => options.identity.shard_id = try parseU64(try artifactValue(argv, &idx)),
+            .hot_standby_table_id => options.identity.table_id = try parseU64(try artifactValue(argv, &idx)),
+            .hot_standby_timeline_id => options.identity.timeline_id = try parseU64(try artifactValue(argv, &idx)),
+            .hot_standby_epoch => options.identity.epoch = try parseU64(try artifactValue(argv, &idx)),
             .minimum_checkpoint_lsn => options.minimum_checkpoint_lsn = try parseU64(try artifactValue(argv, &idx)),
             .topology_id => {
                 const raw = try artifactValue(argv, &idx);
@@ -666,7 +666,7 @@ fn parseArtifactArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Artifa
             },
             .protect_generation => {
                 const generation = try artifactValue(argv, &idx);
-                if (!ha_validation.isIdentifier(generation)) return error.InvalidProtectedSeedGeneration;
+                if (!hot_standby_validation.isIdentifier(generation)) return error.InvalidProtectedSeedGeneration;
                 if (protected_generations.items.len >= 256) return error.TooManyProtectedSeedGenerations;
                 for (protected_generations.items) |previous| {
                     if (std.mem.eql(u8, previous, generation)) return error.DuplicateProtectedSeedGeneration;
@@ -700,11 +700,11 @@ fn artifactFlag(raw: []const u8) ?ArtifactFlag {
         .{ "--target-root", .target_root },
         .{ "--capture-root", .capture_root },
         .{ "--slot-activation-receipt", .slot_activation_receipt },
-        .{ "--ha-cluster-id", .ha_cluster_id },
-        .{ "--ha-shard-id", .ha_shard_id },
-        .{ "--ha-table-id", .ha_table_id },
-        .{ "--ha-timeline-id", .ha_timeline_id },
-        .{ "--ha-epoch", .ha_epoch },
+        .{ "--ha-cluster-id", .hot_standby_cluster_id },
+        .{ "--ha-shard-id", .hot_standby_shard_id },
+        .{ "--ha-table-id", .hot_standby_table_id },
+        .{ "--ha-timeline-id", .hot_standby_timeline_id },
+        .{ "--ha-epoch", .hot_standby_epoch },
         .{ "--minimum-checkpoint-lsn", .minimum_checkpoint_lsn },
         .{ "--topology-id", .topology_id },
         .{ "--topology-generation", .topology_generation },
@@ -737,7 +737,7 @@ fn artifactFlagAllowed(action: ArtifactAction, flag: ArtifactFlag) bool {
         .target_root => action == .activate or action == .gc_target,
         .capture_root => action == .gc_source,
         .slot_activation_receipt => action == .gc_target,
-        .ha_cluster_id, .ha_shard_id, .ha_table_id, .ha_timeline_id, .ha_epoch, .minimum_checkpoint_lsn => action == .restore or action == .verify or action == .activate,
+        .hot_standby_cluster_id, .hot_standby_shard_id, .hot_standby_table_id, .hot_standby_timeline_id, .hot_standby_epoch, .minimum_checkpoint_lsn => action == .restore or action == .verify or action == .activate,
         .topology_id, .topology_generation => action == .publish or action == .restore or action == .verify or action == .activate or action == .delete_prefix,
         .node_id, .target_pvc_name, .target_pvc_uid => action == .publish or action == .restore or action == .verify or action == .activate,
         .target_local_node_id, .target_replica_id => action == .activate,
@@ -755,7 +755,7 @@ fn artifactValue(argv: []const []const u8, idx: *usize) ![]const u8 {
 }
 
 fn absoluteArtifactPath(path: []const u8) ![]const u8 {
-    if (!ha_validation.isAbsoluteNormalizedPath(path)) return error.InvalidSeedArtifactPath;
+    if (!hot_standby_validation.isAbsoluteNormalizedPath(path)) return error.InvalidSeedArtifactPath;
     return path;
 }
 
@@ -1107,17 +1107,17 @@ fn parseSwitchoverArgs(alloc: std.mem.Allocator, argv: []const []const u8) !Swit
         const arg = argv[idx];
         idx += 1;
         if (std.mem.eql(u8, arg, "--to")) {
-            to = try validateHAAdminURL(try value(argv, &idx, arg));
+            to = try validateHotStandbyAdminURL(try value(argv, &idx, arg));
         } else if (std.mem.eql(u8, arg, "--new-upstream-url")) {
-            options.new_upstream_url = try validateHAAdminURL(try value(argv, &idx, arg));
+            options.new_upstream_url = try validateHotStandbyAdminURL(try value(argv, &idx, arg));
         } else if (std.mem.eql(u8, arg, "--follower")) {
             const raw = try value(argv, &idx, arg);
             const split = std.mem.indexOfScalar(u8, raw, '=') orelse return error.SwitchoverFollowerInvalid;
             const slot_name = raw[0..split];
-            if (!ha_validation.isIdentifier(slot_name)) return error.SwitchoverFollowerInvalid;
+            if (!hot_standby_validation.isIdentifier(slot_name)) return error.SwitchoverFollowerInvalid;
             try followers.append(alloc, .{
                 .slot_name = slot_name,
-                .url = try validateHAAdminURL(raw[split + 1 ..]),
+                .url = try validateHotStandbyAdminURL(raw[split + 1 ..]),
             });
         } else if (std.mem.eql(u8, arg, "--generation")) {
             const generation = try parseU64(try value(argv, &idx, arg));
@@ -1798,42 +1798,42 @@ fn parseLocalArgs(alloc: std.mem.Allocator, argv: []const []const u8) !ParsedArg
             break;
         } else if (flagMatches(arg, &.{ "--admin-url", "--ha-url" })) {
             command_start += 1;
-            options.remote_url = try validateHAAdminURL(try value(argv, &command_start, arg));
+            options.remote_url = try validateHotStandbyAdminURL(try value(argv, &command_start, arg));
         } else if (flagMatches(arg, &.{ "--admin-token-env", "--ha-token-env" })) {
             command_start += 1;
-            options.remote_token_env = try validateHAAdminTokenEnvName(try value(argv, &command_start, arg));
+            options.remote_token_env = try validateHotStandbyAdminTokenEnvName(try value(argv, &command_start, arg));
         } else if (flagMatches(arg, &.{ "--admin-token", "--admin-token-file", "--ha-token", "--ha-token-file", "--token" })) {
             return error.HAAdminRawTokenFlagUnsupported;
         } else if (std.mem.eql(u8, arg, "--data-dir")) {
             command_start += 1;
-            options.data_dir = try validateHAPath(try value(argv, &command_start, arg), .data_dir);
+            options.data_dir = try validateHotStandbyPath(try value(argv, &command_start, arg), .data_dir);
         } else if (std.mem.eql(u8, arg, "--config")) {
             command_start += 1;
             options.config_path = try validateConfigPath(try value(argv, &command_start, arg));
         } else if (std.mem.eql(u8, arg, "--primary-log")) {
             command_start += 1;
-            options.primary_log = try validateHAPath(try value(argv, &command_start, arg), .primary_log);
+            options.primary_log = try validateHotStandbyPath(try value(argv, &command_start, arg), .primary_log);
         } else if (std.mem.eql(u8, arg, "--primary-slots")) {
             command_start += 1;
-            options.primary_slots = try validateHAPath(try value(argv, &command_start, arg), .primary_slots);
+            options.primary_slots = try validateHotStandbyPath(try value(argv, &command_start, arg), .primary_slots);
         } else if (std.mem.eql(u8, arg, "--primary-node-id")) {
             command_start += 1;
-            options.primary_node_id = try validateHANodeID(try value(argv, &command_start, arg), .primary);
+            options.primary_node_id = try validateHotStandbyNodeID(try value(argv, &command_start, arg), .primary);
         } else if (std.mem.eql(u8, arg, "--standby-log")) {
             command_start += 1;
-            options.standby_log = try validateHAPath(try value(argv, &command_start, arg), .standby_log);
+            options.standby_log = try validateHotStandbyPath(try value(argv, &command_start, arg), .standby_log);
         } else if (std.mem.eql(u8, arg, "--standby-progress")) {
             command_start += 1;
-            options.standby_progress = try validateHAPath(try value(argv, &command_start, arg), .standby_progress);
+            options.standby_progress = try validateHotStandbyPath(try value(argv, &command_start, arg), .standby_progress);
         } else if (std.mem.eql(u8, arg, "--standby-node-id")) {
             command_start += 1;
-            options.standby_node_id = try validateHANodeID(try value(argv, &command_start, arg), .standby);
+            options.standby_node_id = try validateHotStandbyNodeID(try value(argv, &command_start, arg), .standby);
         } else if (std.mem.eql(u8, arg, "--fence-wal")) {
             command_start += 1;
-            options.fence_wal = try validateHAPath(try value(argv, &command_start, arg), .fence_wal);
+            options.fence_wal = try validateHotStandbyPath(try value(argv, &command_start, arg), .fence_wal);
         } else if (std.mem.eql(u8, arg, "--former-primary-log")) {
             command_start += 1;
-            options.former_primary_log = try validateHAPath(try value(argv, &command_start, arg), .former_primary_log);
+            options.former_primary_log = try validateHotStandbyPath(try value(argv, &command_start, arg), .former_primary_log);
         } else if (flagMatches(arg, &.{ "--cluster-id", "--ha-cluster-id" })) {
             command_start += 1;
             options.identity.cluster_id = try parseU64(try value(argv, &command_start, arg));
@@ -1982,7 +1982,7 @@ fn applyDataDir(alloc: std.mem.Allocator, io: std.Io, options: *LocalOptions) !v
 }
 
 fn validateConfigPath(path: []const u8) ![]const u8 {
-    return switch (ha_validation.classifyHAString(path)) {
+    return switch (hot_standby_validation.classifyHotStandbyString(path)) {
         .ok => path,
         .missing => error.HAConfigPathMissing,
         .padded => error.HAConfigPathInvalid,
@@ -1999,32 +1999,32 @@ fn applyConfigDefaults(alloc: std.mem.Allocator, io: std.Io, options: *LocalOpti
     const path = options.config_path orelse return null;
     var cfg = try antfly.common.config.loadFromPathWithSecretsForDeploymentWithIo(alloc, io, path, null, .standalone);
     errdefer cfg.deinit();
-    const ha_cfg = cfg.ha orelse return cfg;
+    const hot_standby_cfg = cfg.ha orelse return cfg;
 
     const no_target = options.remote_url == null and options.data_dir == null and !options.hasLocalHandles();
     if (no_target) {
-        if (ha_cfg.admin_url) |url| {
-            options.remote_url = try validateHAAdminURL(url);
+        if (hot_standby_cfg.admin_url) |url| {
+            options.remote_url = try validateHotStandbyAdminURL(url);
         } else {
-            if (ha_cfg.primary_log) |v| options.primary_log = try validateHAPath(v, .primary_log);
-            if (ha_cfg.primary_slots) |v| options.primary_slots = try validateHAPath(v, .primary_slots);
-            if (ha_cfg.primary_node_id) |v| options.primary_node_id = try validateHANodeID(v, .primary);
-            if (ha_cfg.standby_log) |v| options.standby_log = try validateHAPath(v, .standby_log);
-            if (ha_cfg.standby_progress) |v| options.standby_progress = try validateHAPath(v, .standby_progress);
-            if (ha_cfg.standby_node_id) |v| options.standby_node_id = try validateHANodeID(v, .standby);
-            if (ha_cfg.fence_wal) |v| options.fence_wal = try validateHAPath(v, .fence_wal);
-            if (ha_cfg.former_primary_log) |v| options.former_primary_log = try validateHAPath(v, .former_primary_log);
+            if (hot_standby_cfg.primary_log) |v| options.primary_log = try validateHotStandbyPath(v, .primary_log);
+            if (hot_standby_cfg.primary_slots) |v| options.primary_slots = try validateHotStandbyPath(v, .primary_slots);
+            if (hot_standby_cfg.primary_node_id) |v| options.primary_node_id = try validateHotStandbyNodeID(v, .primary);
+            if (hot_standby_cfg.standby_log) |v| options.standby_log = try validateHotStandbyPath(v, .standby_log);
+            if (hot_standby_cfg.standby_progress) |v| options.standby_progress = try validateHotStandbyPath(v, .standby_progress);
+            if (hot_standby_cfg.standby_node_id) |v| options.standby_node_id = try validateHotStandbyNodeID(v, .standby);
+            if (hot_standby_cfg.fence_wal) |v| options.fence_wal = try validateHotStandbyPath(v, .fence_wal);
+            if (hot_standby_cfg.former_primary_log) |v| options.former_primary_log = try validateHotStandbyPath(v, .former_primary_log);
         }
     }
     if (options.remote_url != null and options.remote_token_env == null) {
-        if (ha_cfg.admin_token_env) |name| options.remote_token_env = try validateHAAdminTokenEnvName(name);
+        if (hot_standby_cfg.admin_token_env) |name| options.remote_token_env = try validateHotStandbyAdminTokenEnvName(name);
     }
     if (options.hasLocalHandles()) {
-        if (options.identity.cluster_id == null) options.identity.cluster_id = ha_cfg.cluster_id;
-        if (options.identity.shard_id == null) options.identity.shard_id = ha_cfg.shard_id;
-        if (options.identity.table_id == null) options.identity.table_id = ha_cfg.table_id;
-        if (options.identity.timeline_id == null) options.identity.timeline_id = ha_cfg.timeline_id;
-        if (options.identity.epoch == null) options.identity.epoch = ha_cfg.epoch;
+        if (options.identity.cluster_id == null) options.identity.cluster_id = hot_standby_cfg.cluster_id;
+        if (options.identity.shard_id == null) options.identity.shard_id = hot_standby_cfg.shard_id;
+        if (options.identity.table_id == null) options.identity.table_id = hot_standby_cfg.table_id;
+        if (options.identity.timeline_id == null) options.identity.timeline_id = hot_standby_cfg.timeline_id;
+        if (options.identity.epoch == null) options.identity.epoch = hot_standby_cfg.epoch;
     }
     return cfg;
 }
@@ -2069,7 +2069,7 @@ fn nonEmptyEnv(env: EnvLookup, name: [:0]const u8) ?[]const u8 {
 fn applyEnvironmentDefaults(options: *LocalOptions, env: EnvLookup) !void {
     if (options.remote_url == null and options.data_dir == null and !options.hasLocalHandles()) {
         const raw = nonEmptyEnv(env, default_admin_url_env) orelse nonEmptyEnv(env, legacy_admin_url_env);
-        if (raw) |trimmed| options.remote_url = try validateHAAdminURL(trimmed);
+        if (raw) |trimmed| options.remote_url = try validateHotStandbyAdminURL(trimmed);
     }
     if (options.remote_url != null and options.remote_token_env == null) {
         if (nonEmptyEnv(env, default_admin_token_env) != null) {
@@ -2095,7 +2095,7 @@ fn value(argv: []const []const u8, idx: *usize, flag: []const u8) ![]const u8 {
 }
 
 fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[]u8 {
-    const env_var = try validateHAAdminTokenEnvName(options.remote_token_env orelse return null);
+    const env_var = try validateHotStandbyAdminTokenEnvName(options.remote_token_env orelse return null);
 
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
@@ -2106,14 +2106,14 @@ fn resolveRemoteBearerToken(alloc: std.mem.Allocator, options: LocalOptions) !?[
     return try alloc.dupe(u8, token);
 }
 
-fn resolveHAPodUID() !?[]const u8 {
+fn resolveHotStandbyPodUID() !?[]const u8 {
     const raw_z = std.c.getenv("ANTFLY_POD_UID") orelse return null;
     const pod_uid = std.mem.trim(u8, std.mem.span(raw_z), " \t\r\n");
-    if (!ha_validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
+    if (!hot_standby_validation.isIdentifier(pod_uid)) return error.HAPodUIDInvalid;
     return pod_uid;
 }
 
-const HAPathField = enum {
+const HotStandbyPathField = enum {
     primary_log,
     primary_slots,
     standby_log,
@@ -2123,8 +2123,8 @@ const HAPathField = enum {
     data_dir,
 };
 
-fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
-    switch (ha_validation.classifyHAString(path)) {
+fn validateHotStandbyPath(path: []const u8, field: HotStandbyPathField) ![]const u8 {
+    switch (hot_standby_validation.classifyHotStandbyString(path)) {
         .ok => {},
         .missing => return switch (field) {
             .primary_log => error.PrimaryLogMissing,
@@ -2135,13 +2135,13 @@ fn validateHAPath(path: []const u8, field: HAPathField) ![]const u8 {
             .former_primary_log => error.FormerPrimaryLogMissing,
             .data_dir => error.HADataDirMissing,
         },
-        .padded => return haPathInvalidError(field),
+        .padded => return hotStandbyPathInvalidError(field),
     }
-    if (!ha_validation.isAbsoluteNormalizedPath(path)) return haPathInvalidError(field);
+    if (!hot_standby_validation.isAbsoluteNormalizedPath(path)) return hotStandbyPathInvalidError(field);
     return path;
 }
 
-fn haPathInvalidError(field: HAPathField) anyerror {
+fn hotStandbyPathInvalidError(field: HotStandbyPathField) anyerror {
     return switch (field) {
         .primary_log => error.HAPrimaryLogInvalid,
         .primary_slots => error.HAPrimarySlotsInvalid,
@@ -2153,44 +2153,44 @@ fn haPathInvalidError(field: HAPathField) anyerror {
     };
 }
 
-const HANodeIDField = enum {
+const HotStandbyNodeIDField = enum {
     primary,
     standby,
 };
 
-fn validateHANodeID(node_id: []const u8, field: HANodeIDField) ![]const u8 {
-    switch (ha_validation.classifyHAString(node_id)) {
+fn validateHotStandbyNodeID(node_id: []const u8, field: HotStandbyNodeIDField) ![]const u8 {
+    switch (hot_standby_validation.classifyHotStandbyString(node_id)) {
         .ok => {},
-        .missing, .padded => return haNodeIDInvalidError(field),
+        .missing, .padded => return hotStandbyNodeIDInvalidError(field),
     }
-    if (!ha_validation.isIdentifier(node_id)) return haNodeIDInvalidError(field);
+    if (!hot_standby_validation.isIdentifier(node_id)) return hotStandbyNodeIDInvalidError(field);
     return node_id;
 }
 
-fn haNodeIDInvalidError(field: HANodeIDField) anyerror {
+fn hotStandbyNodeIDInvalidError(field: HotStandbyNodeIDField) anyerror {
     return switch (field) {
         .primary => error.HAPrimaryNodeIdInvalid,
         .standby => error.HAStandbyNodeIdInvalid,
     };
 }
 
-fn validateHAAdminURL(raw_url: []const u8) ![]const u8 {
-    switch (ha_validation.classifyHAString(raw_url)) {
+fn validateHotStandbyAdminURL(raw_url: []const u8) ![]const u8 {
+    switch (hot_standby_validation.classifyHotStandbyString(raw_url)) {
         .ok => {},
         .missing => return error.HAAdminURLMissing,
         .padded => return error.HAAdminURLInvalid,
     }
-    if (!ha_validation.isHTTPURLWithHostNoHiddenWhitespace(raw_url)) return error.HAAdminURLInvalid;
+    if (!hot_standby_validation.isHTTPURLWithHostNoHiddenWhitespace(raw_url)) return error.HAAdminURLInvalid;
     return raw_url;
 }
 
-fn validateHAAdminTokenEnvName(raw_env_var: []const u8) ![]const u8 {
-    switch (ha_validation.classifyHAString(raw_env_var)) {
+fn validateHotStandbyAdminTokenEnvName(raw_env_var: []const u8) ![]const u8 {
+    switch (hot_standby_validation.classifyHotStandbyString(raw_env_var)) {
         .ok => {},
         .missing => return error.HAAdminTokenEnvMissing,
         .padded => return error.HAAdminTokenEnvInvalid,
     }
-    if (!ha_validation.isEnvVarName(raw_env_var)) return error.HAAdminTokenEnvInvalid;
+    if (!hot_standby_validation.isEnvVarName(raw_env_var)) return error.HAAdminTokenEnvInvalid;
     return raw_env_var;
 }
 
@@ -2657,12 +2657,12 @@ test "standby cmd validates remote bearer token env name" {
 }
 
 test "standby cmd classifies HA strings before field-specific validation" {
-    try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(null));
-    try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(""));
-    try std.testing.expectEqual(ha_validation.HAStringValidation.missing, ha_validation.classifyHAString(" \t\r\n"));
-    try std.testing.expectEqual(ha_validation.HAStringValidation.padded, ha_validation.classifyHAString(" primary-a"));
-    try std.testing.expectEqual(ha_validation.HAStringValidation.padded, ha_validation.classifyHAString("primary-a\n"));
-    try std.testing.expectEqual(ha_validation.HAStringValidation.ok, ha_validation.classifyHAString("primary-a"));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.missing, hot_standby_validation.classifyHotStandbyString(null));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.missing, hot_standby_validation.classifyHotStandbyString(""));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.missing, hot_standby_validation.classifyHotStandbyString(" \t\r\n"));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.padded, hot_standby_validation.classifyHotStandbyString(" primary-a"));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.padded, hot_standby_validation.classifyHotStandbyString("primary-a\n"));
+    try std.testing.expectEqual(hot_standby_validation.HotStandbyStringValidation.ok, hot_standby_validation.classifyHotStandbyString("primary-a"));
 }
 
 test "standby cmd rejects padded or invalid HA local option strings" {
@@ -2738,7 +2738,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "0",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_replication_slots);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_replication_slots);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "--table",
@@ -2749,7 +2749,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "0",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_replication_slots);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_replication_slots);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "slot",
@@ -2757,7 +2757,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "standby-table",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .PUT, admin_api.routes.ha_replication_slot_prefix ++ "standby-table" ++ admin_api.routes.ha_replication_slot_pause_suffix);
+    try expectTypedRoute(&recorder, .PUT, admin_api.routes.hot_standby_replication_slot_prefix ++ "standby-table" ++ admin_api.routes.hot_standby_replication_slot_pause_suffix);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "slot",
@@ -2765,7 +2765,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "standby-table",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .PUT, admin_api.routes.ha_replication_slot_prefix ++ "standby-table" ++ admin_api.routes.ha_replication_slot_resume_suffix);
+    try expectTypedRoute(&recorder, .PUT, admin_api.routes.hot_standby_replication_slot_prefix ++ "standby-table" ++ admin_api.routes.hot_standby_replication_slot_resume_suffix);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "slot",
@@ -2773,7 +2773,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "standby-table",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .DELETE, admin_api.routes.ha_replication_slot_prefix ++ "standby-table");
+    try expectTypedRoute(&recorder, .DELETE, admin_api.routes.hot_standby_replication_slot_prefix ++ "standby-table");
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "seed",
@@ -2784,7 +2784,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "base-standby-json-1",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_base_backups);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_base_backups);
 
     try std.testing.expectEqual(@as(u64, 2), try primary.append(.{ .payload = "during-copy" }));
     const manifest_path = try writeSeedManifestFiles(alloc, paths.backup_root, testIdentity(), "base-standby-json-1", 1, 2);
@@ -2797,7 +2797,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         manifest_path,
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_base_backups_finish);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_base_backups_finish);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "seed",
@@ -2808,7 +2808,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         paths.backup_root,
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_standby_bootstrap);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_standby_bootstrap);
     // Production bootstrap keeps the seed slot in the seeding lifecycle until
     // the target has durably published its activation receipt. Model that
     // explicit transition before asking the standby to consume later WAL.
@@ -2825,7 +2825,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "1000000",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_primary_status);
     try expectContains(recorder.last_uri.?, "max_lag_lsn=4");
     try expectContains(recorder.last_uri.?, "max_retained_bytes=4096");
     try expectContains(recorder.last_uri.?, "max_retained_age_ns=1000000");
@@ -2838,7 +2838,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "metrics",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_primary_status);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "slot",
@@ -2849,7 +2849,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "2000000",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_primary_status);
     try expectContains(recorder.last_uri.?, "max_retained_bytes=8192");
     try expectContains(recorder.last_uri.?, "max_retained_age_ns=2000000");
 
@@ -2860,7 +2860,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "4",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_standby_status);
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_standby_status);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
@@ -2872,7 +2872,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "4",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_standby_status);
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_standby_status);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "commit",
@@ -2883,7 +2883,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "async",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_commit_append);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_commit_append);
 
     // Fence acquisition upgrades the caller's stale observation to the former
     // primary's live durable tail. Catch the standby up before promotion so the
@@ -2904,7 +2904,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "async",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_commit_check);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_commit_check);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "read",
@@ -2913,7 +2913,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "0",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_read_check);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_read_check);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "write",
@@ -2922,7 +2922,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "primary",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_write_check);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_write_check);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "owner-job",
@@ -2933,7 +2933,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "retention-advance",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_owner_job_check);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_owner_job_check);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "fence",
@@ -2966,14 +2966,14 @@ test "standby cmd remote commands prefer typed admin routes" {
         "operator-approved",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_fence);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_fence);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "fence",
         "current",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_fence_current);
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_fence_current);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "promote",
@@ -2983,14 +2983,14 @@ test "standby cmd remote commands prefer typed admin routes" {
         "--fencing-confirmed",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion_assess);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_promotion_assess);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "promote",
         "--current-fence",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion_current_fence);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_promotion_current_fence);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "--prometheus",
@@ -3001,7 +3001,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "--fencing-confirmed",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion_assess);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_promotion_assess);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "rejoin",              "assess",
@@ -3015,7 +3015,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "--retained-from-lsn", "8",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_assess);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_rejoin_assess);
 
     // Route selection is under test; this server has no matching former-primary log.
     try std.testing.expectError(error.HaCommandConflict, runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
@@ -3040,7 +3040,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "--fence-token",              "ha-fence:10:20:30:2:3:1:standby-a",
     }, recorder.executor()));
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_rewind);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_rejoin_rewind);
 
     try runRemoteArgv(alloc, std.testing.io, "http://ha-admin.test", &.{
         "slot",
@@ -3072,7 +3072,7 @@ test "standby cmd remote commands prefer typed admin routes" {
         "--fence-token",              "ha-fence:10:20:30:2:3:1:standby-a",
     }, recorder.executor()));
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_rejoin_reseed);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_rejoin_reseed);
 }
 
 test "standby cmd remote sends bearer token to authenticated admin route" {
@@ -3097,7 +3097,7 @@ test "standby cmd remote sends bearer token to authenticated admin route" {
         "status",
         "primary",
     }, recorder.executor(), .{}));
-    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_primary_status);
     try std.testing.expect(recorder.last_authorization == null);
 
     try runRemoteArgvWithOptions(alloc, std.testing.io, "http://ha-admin.test", &.{
@@ -3107,7 +3107,7 @@ test "standby cmd remote sends bearer token to authenticated admin route" {
         .bearer_token = "secret-token",
     });
 
-    try expectTypedRoute(&recorder, .GET, admin_api.routes.ha_primary_status);
+    try expectTypedRoute(&recorder, .GET, admin_api.routes.hot_standby_primary_status);
     try std.testing.expectEqualStrings("Bearer secret-token", recorder.last_authorization.?);
 }
 
@@ -3161,7 +3161,7 @@ test "standby cmd remote direct promotion uses typed admin route" {
         "operator-approved",
     }, recorder.executor());
 
-    try expectTypedRoute(&recorder, .POST, admin_api.routes.ha_promotion);
+    try expectTypedRoute(&recorder, .POST, admin_api.routes.hot_standby_promotion);
 }
 
 test "standby cmd remote rejects legacy command fallback for production admin operations" {
@@ -3538,9 +3538,9 @@ test "standby cmd derives local handles and identity from the data dir" {
     defer alloc.free(data_dir);
     std.Io.Dir.cwd().deleteTree(io, data_dir) catch {};
     defer std.Io.Dir.cwd().deleteTree(io, data_dir) catch {};
-    const ha_dir = try std.fmt.allocPrint(alloc, "{s}/ha", .{data_dir});
-    defer alloc.free(ha_dir);
-    try std.Io.Dir.cwd().createDirPath(io, ha_dir);
+    const hot_standby_dir = try std.fmt.allocPrint(alloc, "{s}/ha", .{data_dir});
+    defer alloc.free(hot_standby_dir);
+    try std.Io.Dir.cwd().createDirPath(io, hot_standby_dir);
 
     // An empty data dir has no HA state to open.
     {

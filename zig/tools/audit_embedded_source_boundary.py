@@ -235,6 +235,40 @@ def server_source(relative: str) -> bool:
     )
 
 
+def check_replication_contract(relative: str, source: str) -> None:
+    """Reject server policy leaking back through the engine's borrowed ports."""
+    if relative not in {
+        "storage/db/replication_contract.zig",
+        "storage/db/commit_integration.zig",
+        "storage/db/db.zig",
+    }:
+        return
+    source = mask_literals(production_source(source))
+    forbidden = {
+        "sync_policy",
+        "standby_names",
+        "sync_wait_fn",
+        "sync_wait_ctx",
+        "failure_count",
+        "last_gate_action",
+        "sync_reject_count",
+        "sync_degraded_count",
+        "is_standby",
+        "isStandbyRole",
+        "fenced_primary",
+        "FencedWriteGate",
+        "RaftAppliedEntryIdentity",
+        "raft_applied_entry_marker",
+        "HAMirrorUnavailable",
+        "primary_ha",
+    }
+    found = forbidden.intersection(re.findall(r"\b\w+\b", source))
+    if found:
+        raise ValueError(
+            f"{relative} exposes server replication policy: {', '.join(sorted(found))}"
+        )
+
+
 def audit(root: Path, entries: list[str]) -> dict[str, list[str]]:
     root = root.resolve()
     pending = collections.deque(root / entry for entry in entries)
@@ -252,8 +286,10 @@ def audit(root: Path, entries: list[str]) -> dict[str, list[str]]:
             raise ValueError(
                 "engine imports server coordination: " + " -> ".join(reversed(chain))
             )
+        source = path.read_text()
+        check_replication_contract(relative, source)
         dependencies = []
-        for imported in production_imports(path.read_text()):
+        for imported in production_imports(source):
             dependency = (path.parent / imported).resolve()
             if not dependency.is_relative_to(root):
                 raise ValueError(
@@ -302,6 +338,10 @@ def audit_modules(
             raise ValueError(
                 "embedded module imports server coordination: "
                 + " -> ".join(chain + [str(path)])
+            )
+        if path.is_relative_to(source_root):
+            check_replication_contract(
+                path.relative_to(source_root).as_posix(), path.read_text()
             )
         # Exempt only dependency-owned modules declared by the build, never
         # Antfly-generated sources merely because their cache is external.

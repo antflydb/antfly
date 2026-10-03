@@ -93,7 +93,6 @@ pub const PromotionOwner = promotion_runtime.PromotionOwner;
 pub const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 pub const SearchWithDenseProfileResult = @import("antfly_source_root").antfly_sources.physical_db.SearchWithDenseProfileResult;
 pub const OrderedApplyReceipt = @import("antfly_source_root").antfly_sources.physical_db.OrderedApplyReceipt;
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 pub const LsmOwnerKind = DB.LsmOwnerKind;
 pub const LsmOwnerStats = DB.LsmOwnerStats;
 pub const documentExtractionStoredUnitFingerprintAlloc = @import("antfly_source_root").antfly_sources.physical_db.documentExtractionStoredUnitFingerprintAlloc;

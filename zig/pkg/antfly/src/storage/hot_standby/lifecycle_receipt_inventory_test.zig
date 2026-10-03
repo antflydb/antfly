@@ -306,7 +306,7 @@ test "storage.hot_standby lifecycle receipt route is authenticated read only fen
     var fence_store = try fencedStore(alloc, root);
     defer fence_store.close();
     var changed = ChangedCounter{};
-    const route = admin_api.routes.ha_seed_lifecycle_receipts;
+    const route = admin_api.routes.hot_standby_seed_lifecycle_receipts;
 
     var server = http_admin.Server.initWithOptions(alloc, admin_exec.Context{ .fence_store = &fence_store }, .{
         .bearer_token = "runtime-token",
@@ -382,7 +382,7 @@ test "storage.hot_standby lifecycle receipt route rejects ambiguous or malformed
     var ledger = try ledger_mod.Ledger.open(alloc, root, .{ .wal_options = walOptions() });
     _ = try recordCapture(&ledger, alloc, root, "capture-001", 41, 101);
     ledger.close();
-    const route = admin_api.routes.ha_seed_lifecycle_receipts;
+    const route = admin_api.routes.hot_standby_seed_lifecycle_receipts;
     var server = http_admin.Server.initWithOptions(alloc, .{}, .{
         .bearer_token = "runtime-token",
         .lifecycle_receipts = .{ .capture_root = root, .activation_root = root, .wal_options = walOptions() },

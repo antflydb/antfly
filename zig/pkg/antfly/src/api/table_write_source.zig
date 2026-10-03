@@ -102,7 +102,7 @@ pub const TableWriteSource = struct {
             table_name: []const u8,
             req: db_mod.types.BatchRequest,
             metadata_prepared: bool,
-            entry: ?db_mod.types.RaftAppliedEntryIdentity,
+            entry: ?db_mod.types.OrderedApplyReceipt,
         ) anyerror!?void = null,
 
         create_table: ?*const fn (
@@ -981,7 +981,7 @@ pub const TableWriteSource = struct {
         table_name: []const u8,
         req: db_mod.types.BatchRequest,
         metadata_prepared: bool,
-        entry: ?db_mod.types.RaftAppliedEntryIdentity,
+        entry: ?db_mod.types.OrderedApplyReceipt,
     ) !?void {
         const callback = self.vtable.replicated_batch_group_local orelse return null;
         return try BoundaryAbi.call("replicated_batch_group_local", self.boundary_dispatch, callback, .{

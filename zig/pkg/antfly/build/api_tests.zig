@@ -67,6 +67,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const public_api_parity_default_filters = [_][]const u8{
         "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",
+        "online merge private standalone rewrite port pins authority and never fabricates Raft coordinates",
         "online merge private port fences owners cancellation and deadlines before dispatch",
         "online merge private port preserves source recovery errors through foreign runtime dispatch",
         "join planning",
