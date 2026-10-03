@@ -96,10 +96,12 @@ pub fn loadExamples(allocator: std.mem.Allocator, path: []const u8, split: ?[]co
 
     const first_path = resolved.paths[0];
 
+    const owned_result_examples = try examples.toOwnedSlice(arena_alloc);
+    const owned_result_dataset_root = try arena_alloc.dupe(u8, std.fs.path.dirname(first_path) orelse ".");
     return .{
         .arena = arena,
-        .dataset_root = try arena_alloc.dupe(u8, std.fs.path.dirname(first_path) orelse "."),
-        .examples = try examples.toOwnedSlice(arena_alloc),
+        .dataset_root = owned_result_dataset_root,
+        .examples = owned_result_examples,
     };
 }
 

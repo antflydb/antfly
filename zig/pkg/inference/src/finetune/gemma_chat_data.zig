@@ -82,10 +82,11 @@ pub fn loadExamples(allocator: std.mem.Allocator, path: []const u8, split: ?[]co
     }
     if (examples.items.len == 0) return error.NoExamples;
 
+    const owned_result_examples = try examples.toOwnedSlice(arena_alloc);
     return .{
         .arena = arena,
         .dataset_root = dataset_root,
-        .examples = try examples.toOwnedSlice(arena_alloc),
+        .examples = owned_result_examples,
     };
 }
 

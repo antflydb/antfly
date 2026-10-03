@@ -297,7 +297,10 @@ pub const Plan = struct {
             }
             if (commands.items.len + parents.items.len > storage.max_commands) return error.TransactionTooLarge;
         }
-        return .{ .arena = arena, .commands = try commands.toOwnedSlice(owned), .parents = try parents.toOwnedSlice(owned), .partials = try partials.toOwnedSlice(owned) };
+        const owned_result_commands = try commands.toOwnedSlice(owned);
+        const owned_result_parents = try parents.toOwnedSlice(owned);
+        const owned_result_partials = try partials.toOwnedSlice(owned);
+        return .{ .arena = arena, .commands = owned_result_commands, .parents = owned_result_parents, .partials = owned_result_partials };
     }
 };
 

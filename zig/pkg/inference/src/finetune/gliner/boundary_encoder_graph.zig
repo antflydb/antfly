@@ -735,7 +735,8 @@ fn bindPreparedInternal(allocator: Allocator, built: *const Built, config: *cons
         try fillDropout(descriptor, replay, values);
         try list.append(a, .{ .node = descriptor.node, .shape = descriptor.shape, .values = .{ .f32 = values } });
     };
-    return .{ .allocator = allocator, .arena = arena, .bindings = try list.toOwnedSlice(a) };
+    const owned_result_bindings = try list.toOwnedSlice(a);
+    return .{ .allocator = allocator, .arena = arena, .bindings = owned_result_bindings };
 }
 
 fn testConfig() boundary.Config {

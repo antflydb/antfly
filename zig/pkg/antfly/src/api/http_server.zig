@@ -20073,7 +20073,10 @@ pub const ApiHttpServer = struct {
             if (join) |*value_join| try applyAuthenticatedIdentityToJoinRequest(a, value, &value_join.join);
         }
         const label = try target.displayNameAlloc(a);
-        if (self.source.vtable.system_catalog == null) return .{ .arena = arena, .physical = try a.dupe(u8, logical), .label = label, .join = join };
+        if (self.source.vtable.system_catalog == null) {
+            const owned_result_physical = try a.dupe(u8, logical);
+            return .{ .arena = arena, .physical = owned_result_physical, .label = label, .join = join };
+        }
         // Primary and every native RHS resolve under the same metadata read
         // transaction. Keep this owned binding for all execution retries.
         var targets: std.ArrayList(system_catalog.Target) = .empty;
@@ -20088,7 +20091,10 @@ pub const ApiHttpServer = struct {
                 try references.append(a, reference);
             }
         }
-        if (targets.items.len == 0) return .{ .arena = arena, .physical = try a.dupe(u8, logical), .label = label, .join = join };
+        if (targets.items.len == 0) {
+            const owned_result_physical = try a.dupe(u8, logical);
+            return .{ .arena = arena, .physical = owned_result_physical, .label = label, .join = join };
+        }
         var local_resolver = CatalogQueryResolver{ .arena = a };
         const result = try self.resolveQueryCatalog(shared_resolver orelse &local_resolver, context, targets.items, true);
         if (result.tables.len != targets.items.len) return error.InvalidCatalogRecord;

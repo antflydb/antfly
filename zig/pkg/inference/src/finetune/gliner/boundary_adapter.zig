@@ -462,7 +462,8 @@ pub fn importBytes(a: Allocator, config_bytes: []const u8, tensor_bytes: []const
     const modules = try validateTensors(scratch, config, tensors, limits, control);
     const receipt = try makeReceipt(binding, config, modules, config_bytes, tensor_bytes, control);
     if (receipt_bytes) |raw| try verifyReceipt(a, receipt, raw, limits);
-    return .{ .arena = arena, .config = config, .config_bytes = try scratch.dupe(u8, config_bytes), .tensors = tensors, .modules = modules, .receipt = receipt, .receipt_digest = if (receipt_bytes) |raw| try digestBytes(raw, control) else null };
+    const owned_result_config_bytes = try scratch.dupe(u8, config_bytes);
+    return .{ .arena = arena, .config = config, .config_bytes = owned_result_config_bytes, .tensors = tensors, .modules = modules, .receipt = receipt, .receipt_digest = if (receipt_bytes) |raw| try digestBytes(raw, control) else null };
 }
 pub fn importDirectory(a: Allocator, directory: []const u8, binding: Binding, limits: Limits, control: ?Control) !Loaded {
     try check(control);

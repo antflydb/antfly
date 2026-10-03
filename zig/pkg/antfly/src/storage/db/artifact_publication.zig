@@ -1012,7 +1012,12 @@ pub fn prepareBaseVectors(alloc: std.mem.Allocator, command: Command, catalogs: 
         } else try deleted.append(scratch, artifact_key);
         for (consumers.items) |consumer| try coverage.append(scratch, .{ .index_name = consumer.name, .generation = consumer.generation, .document_key = identity.doc_key, .artifact_names = consumer.artifact_names });
     }
-    return .{ .arena = arena, .coverage = try coverage.toOwnedSlice(scratch), .batch = .{ .dense_embeddings = try dense.toOwnedSlice(scratch), .sparse_embeddings = try sparse.toOwnedSlice(scratch), .changed_artifact_keys = try changed.toOwnedSlice(scratch), .deleted_keys = try deleted.toOwnedSlice(scratch) } };
+    const owned_result_coverage = try coverage.toOwnedSlice(scratch);
+    const owned_result_dense = try dense.toOwnedSlice(scratch);
+    const owned_result_sparse = try sparse.toOwnedSlice(scratch);
+    const owned_result_changed = try changed.toOwnedSlice(scratch);
+    const owned_result_deleted = try deleted.toOwnedSlice(scratch);
+    return .{ .arena = arena, .coverage = owned_result_coverage, .batch = .{ .dense_embeddings = owned_result_dense, .sparse_embeddings = owned_result_sparse, .changed_artifact_keys = owned_result_changed, .deleted_keys = owned_result_deleted } };
 }
 
 /// Point-only accounting in the final writer snapshot. Counter migration is

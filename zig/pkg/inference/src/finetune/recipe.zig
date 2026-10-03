@@ -3719,9 +3719,10 @@ fn loadDpoTextRows(
         try rows.append(aa, try std.json.parseFromSliceLeaky(DpoTextRow, aa, line, .{ .ignore_unknown_fields = true }));
     }
     if (rows.items.len == 0) return error.EmptyBatch;
+    const owned_result_rows = try rows.toOwnedSlice(aa);
     return .{
         .arena = arena,
-        .rows = try rows.toOwnedSlice(aa),
+        .rows = owned_result_rows,
     };
 }
 

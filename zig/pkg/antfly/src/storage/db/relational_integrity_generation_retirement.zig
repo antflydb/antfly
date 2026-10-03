@@ -717,7 +717,8 @@ pub fn prepareGcPage(alloc: std.mem.Allocator, txn: anytype, max_records: usize,
         .tombstones = progress.tombstones or complete,
         .complete = complete and progress.tombstones,
     }).encode(owned);
-    return .{ .arena = arena, .expected = expected, .next = next, .deletions = try deletions.toOwnedSlice(owned), .inspected = inspected };
+    const owned_result_deletions = try deletions.toOwnedSlice(owned);
+    return .{ .arena = arena, .expected = expected, .next = next, .deletions = owned_result_deletions, .inspected = inspected };
 }
 
 /// Called only in deterministic owner apply. Exact progress and value checks

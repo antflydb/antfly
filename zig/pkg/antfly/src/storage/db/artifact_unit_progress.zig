@@ -254,7 +254,8 @@ pub fn prepare(alloc: std.mem.Allocator, root: u128, session: anytype, limits: c
     const encoded = try encodeAlloc(owned, &selected, record);
     // Decode the owned bytes so no borrowed cursor survives its read snapshot.
     const owned_record = (try decode(&selected, encoded)).record;
-    return .{ .arena = arena, .selected = selected, .expected = if (old) |value| value.stamp else null, .catalog_stamp = try catalogStamp(txn), .encoded = encoded, .document = try owned.dupe(u8, document), .record = owned_record, .duplicate = duplicate, .limits = limits };
+    const owned_result_document = try owned.dupe(u8, document);
+    return .{ .arena = arena, .selected = selected, .expected = if (old) |value| value.stamp else null, .catalog_stamp = try catalogStamp(txn), .encoded = encoded, .document = owned_result_document, .record = owned_record, .duplicate = duplicate, .limits = limits };
 }
 
 pub fn prepareCommand(alloc: std.mem.Allocator, txn: anytype, root: u128, command: publication.Command, plan: *const @import("catalog/index_manager.zig").IndexManager.WritePlanSnapshot) !Prepared {

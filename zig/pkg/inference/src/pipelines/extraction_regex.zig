@@ -302,7 +302,9 @@ pub fn compile(allocator: Allocator, pattern: []const u8, raw_flags: u32, option
     const end = try builder.emit(.accept);
     const start = try builder.build(root, end, 0);
     if (options.control) |control| try control.check();
-    return .{ .arena = arena, .pattern = copy, .raw_flags = raw_flags, .cache_key = std.hash.Wyhash.hash(raw_flags, copy), .flags = flags, .states = try builder.states.toOwnedSlice(owned), .classes = try parser.classes.toOwnedSlice(owned), .start = start, .compile_steps = work.steps };
+    const owned_result_states = try builder.states.toOwnedSlice(owned);
+    const owned_result_classes = try parser.classes.toOwnedSlice(owned);
+    return .{ .arena = arena, .pattern = copy, .raw_flags = raw_flags, .cache_key = std.hash.Wyhash.hash(raw_flags, copy), .flags = flags, .states = owned_result_states, .classes = owned_result_classes, .start = start, .compile_steps = work.steps };
 }
 
 const Parser = struct {

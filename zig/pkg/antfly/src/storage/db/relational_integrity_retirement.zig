@@ -136,10 +136,12 @@ pub const Page = struct {
         progress.rows_scanned = std.math.add(u64, progress.rows_scanned, page_rows.rows.len) catch return error.InvalidConstraintRetirement;
         progress.cursor = if (page_rows.more) try owned.dupe(u8, reader.after.items) else "";
         if (!page_rows.more) progress.phase = if (phase == .foreign_keys) .unique else .ready;
+        const owned_result_routing_key = try activation.routingKey(owned, &reader.read);
+        const owned_result_next_progress = try progress.encode(owned);
         return .{ .arena = arena, .rows = page_rows, .phase = phase, .command = .{
-            .routing_key = try activation.routingKey(owned, &reader.read),
+            .routing_key = owned_result_routing_key,
             .expected = expected,
-            .next = try progress.encode(owned),
+            .next = owned_result_next_progress,
         } };
     }
 };

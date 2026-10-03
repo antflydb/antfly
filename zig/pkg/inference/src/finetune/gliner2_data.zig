@@ -1159,10 +1159,12 @@ pub fn loadExamples(allocator: std.mem.Allocator, path: []const u8, split: ?[]co
         try loadExamplesFromFile(arena_alloc, resolved_path, &examples);
     }
 
+    const owned_result_examples = try examples.toOwnedSlice(arena_alloc);
+    const owned_result_dataset_root = try arena_alloc.dupe(u8, std.fs.path.dirname(resolved.base_dir) orelse resolved.base_dir);
     return .{
         .arena = arena,
-        .dataset_root = try arena_alloc.dupe(u8, std.fs.path.dirname(resolved.base_dir) orelse resolved.base_dir),
-        .examples = try examples.toOwnedSlice(arena_alloc),
+        .dataset_root = owned_result_dataset_root,
+        .examples = owned_result_examples,
     };
 }
 
@@ -1180,10 +1182,12 @@ pub fn loadTrainingRecords(allocator: std.mem.Allocator, path: []const u8, split
         try loadTrainingRecordsFromFile(arena_alloc, resolved_path, &records);
     }
 
+    const owned_result_dataset_root = try arena_alloc.dupe(u8, std.fs.path.dirname(resolved.base_dir) orelse resolved.base_dir);
+    const owned_result_records = try records.toOwnedSlice(arena_alloc);
     return .{
         .arena = arena,
-        .dataset_root = try arena_alloc.dupe(u8, std.fs.path.dirname(resolved.base_dir) orelse resolved.base_dir),
-        .records = try records.toOwnedSlice(arena_alloc),
+        .dataset_root = owned_result_dataset_root,
+        .records = owned_result_records,
     };
 }
 
@@ -2751,9 +2755,10 @@ fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: ?[]c
     if (stat.kind == .file) {
         const one = try arena_alloc.alloc([]const u8, 1);
         one[0] = try arena_alloc.dupe(u8, path);
+        const owned_result_file_base_dir = try arena_alloc.dupe(u8, std.fs.path.dirname(path) orelse ".");
         return .{
             .arena = arena,
-            .base_dir = try arena_alloc.dupe(u8, std.fs.path.dirname(path) orelse "."),
+            .base_dir = owned_result_file_base_dir,
             .paths = one,
         };
     }
@@ -2775,10 +2780,12 @@ fn resolveJsonlFiles(allocator: std.mem.Allocator, path: []const u8, split: ?[]c
     }
     if (paths.items.len == 0) return error.NoJsonlFilesForSplit;
     std.mem.sort([]const u8, paths.items, {}, lessThanString);
+    const owned_result_directory_base_dir = try arena_alloc.dupe(u8, path);
+    const owned_result_paths = try paths.toOwnedSlice(arena_alloc);
     return .{
         .arena = arena,
-        .base_dir = try arena_alloc.dupe(u8, path),
-        .paths = try paths.toOwnedSlice(arena_alloc),
+        .base_dir = owned_result_directory_base_dir,
+        .paths = owned_result_paths,
     };
 }
 
