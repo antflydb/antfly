@@ -292,14 +292,16 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
         try appendUniqueString(alloc, &changed_doc_keys, ref.doc_key);
     }
 
-    return .{
-        .sequence = sequence,
-        .changed_doc_keys = try changed_doc_keys.toOwnedSlice(alloc),
-        .deleted_doc_keys = try deleted_doc_keys.toOwnedSlice(alloc),
-        .overwritten_doc_keys = try overwritten_doc_keys.toOwnedSlice(alloc),
-        .changed_artifact_keys = try changed_artifact_keys.toOwnedSlice(alloc),
-        .target_hints = try target_hints.toOwnedSlice(alloc),
-    };
+    // Transfer each list into a record that already has a cleanup owner.
+    // Later shrinking allocations may fail after earlier fields transferred.
+    var record: Record = .{ .sequence = sequence };
+    errdefer deinitRecord(alloc, &record);
+    record.changed_doc_keys = try changed_doc_keys.toOwnedSlice(alloc);
+    record.deleted_doc_keys = try deleted_doc_keys.toOwnedSlice(alloc);
+    record.overwritten_doc_keys = try overwritten_doc_keys.toOwnedSlice(alloc);
+    record.changed_artifact_keys = try changed_artifact_keys.toOwnedSlice(alloc);
+    record.target_hints = try target_hints.toOwnedSlice(alloc);
+    return record;
 }
 
 /// Build the normal key lists from a derived batch while explicitly narrowing

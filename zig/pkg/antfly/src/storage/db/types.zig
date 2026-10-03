@@ -5124,6 +5124,8 @@ pub const GraphEndpointCleanupStatus = struct {
 /// Cleanup is a private, effect-bearing command, never a flag that can be
 /// attached to a public mutation or a lifecycle control.
 pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
+    for (req.graph_writes) |write| try @import("../../graph/mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
+    for (req.graph_deletes) |delete| try @import("../../graph/mutation_identity.zig").validate(delete.edge_id, delete.owner_document, delete.owner);
     if (!req.graph_endpoint_cleanup) {
         if (req.graph_endpoint_cleanup_planned or req.graph_endpoint_cleanup_guards.len != 0) return error.InvalidBatchRequest;
         return;

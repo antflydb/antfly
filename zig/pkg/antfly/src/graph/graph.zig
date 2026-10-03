@@ -7396,11 +7396,11 @@ pub const GraphIndex = struct {
         // so live writes and primary-artifact reconstruction have one identity.
         var redundant_owner = false;
         for (writes) |write| {
-            if (write.owner_document.len > 0 and write.edge_id.len == 0) return error.InvalidGraphEdges;
+            try @import("mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
             redundant_owner = redundant_owner or (write.owner_document.len > 0 and std.mem.eql(u8, write.owner_document, write.source));
         }
         for (deletes) |delete| {
-            if (delete.owner_document.len > 0 and delete.edge_id.len == 0) return error.InvalidGraphEdges;
+            try @import("mutation_identity.zig").validate(delete.edge_id, delete.owner_document, delete.owner);
             redundant_owner = redundant_owner or (delete.owner_document.len > 0 and std.mem.eql(u8, delete.owner_document, delete.source));
         }
         if (redundant_owner) {
@@ -7422,7 +7422,7 @@ pub const GraphIndex = struct {
         // direction or create records that the public graph wire contract
         // cannot represent.
         for (writes) |write| {
-            if (write.owner_document.len > 0 and write.edge_id.len == 0) return error.InvalidGraphEdges;
+            try @import("mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
             try edge_type_mod.validateStored(write.edge_type);
             try edge_weight.validateStored(write.weight);
         }

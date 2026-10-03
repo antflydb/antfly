@@ -1533,7 +1533,7 @@ fn parseBatchRequestWithOptions(
         for (result_value.req.deletes) |key| if (keys.isGraphEndpointCleanupControlKey(key)) return error.InvalidBatchRequest;
         for (result_value.req.transforms) |transform| if (keys.isGraphEndpointCleanupControlKey(transform.key)) return error.InvalidBatchRequest;
     }
-    try db_mod.types.validateGraphEndpointCleanupCommand(result_value.req);
+    try validateGraphBatchCommand(result_value.req);
     try db_mod.types.validateMergeArtifacts(result_value.req);
     try merge_pages.validateRequest(result_value.req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(result_value.req);
@@ -1565,6 +1565,15 @@ pub fn requiresRowSemanticsEnvelope(writes: anytype, predicates: []const db_mod.
     for (writes) |write| if (write.json_null_fields.len != 0) return true;
     for (predicates) |predicate| if (predicate.unique_absence) return true;
     return false;
+}
+
+// Native mutation validation uses a specific graph error; the wire codec
+// retains its invalid-request contract for malformed ownership combinations.
+fn validateGraphBatchCommand(req: db_mod.types.BatchRequest) !void {
+    db_mod.types.validateGraphEndpointCleanupCommand(req) catch |err| switch (err) {
+        error.InvalidGraphEdges => return error.InvalidBatchRequest,
+        else => return err,
+    };
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
@@ -1600,7 +1609,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     }
     if (req.relational_topology != null and (req.transaction != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
     if (req.relational_generation_gc != null and (req.transaction != null or req.relational_topology != null or req.row_policy_publication != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
-    try db_mod.types.validateGraphEndpointCleanupCommand(req);
+    try validateGraphBatchCommand(req);
     if (req.relational_generation_gc) |gc| try gc.validate();
     if (req.relational_topology != null and (req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.relational_repair)) return error.InvalidBatchRequest;
     if (req.integrity.len != 0 and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
@@ -3156,7 +3165,7 @@ test "internal batch graph endpoint cleanup command isolates planned effects" {
     const keys = @import("../storage/internal_keys.zig");
     const job = try keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
     defer alloc.free(job);
-    const encoded = try encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "hub", .generation = 0 }}, .deletes = &.{job}, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .edge_id = "id", .owner = "owner" }} });
+    const encoded = try encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "hub", .generation = 0 }}, .deletes = &.{job}, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .owner = "owner" }} });
     defer alloc.free(encoded);
     var parsed = try parseInternalBatchRequest(alloc, encoded);
     defer parsed.deinit(alloc);
@@ -3168,6 +3177,8 @@ test "internal batch graph endpoint cleanup command isolates planned effects" {
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_endpoint_cleanup_guards = &.{ .{ .endpoint = "hub", .generation = 1 }, .{ .endpoint = "hub", .generation = 2 } } }));
     try std.testing.expectEqualStrings(job, parsed.req.deletes[0]);
     try std.testing.expectEqualStrings("owner", parsed.req.graph_deletes[0].owner);
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "fact", .owner = "fact" }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_graph_deletes\":[{\"index_name\":\"g\",\"source\":\"a\",\"target\":\"b\",\"edge_type\":\"R\",\"edge_id\":\"fact\",\"owner\":\"fact\"}]}"));
     try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup_planned = true }));
     try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .writes = &.{.{ .key = "document", .value = "{}" }} }));

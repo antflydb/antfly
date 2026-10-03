@@ -61,6 +61,12 @@ pub const GraphEdgeDelete = struct {
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
+    pub fn retainedBytes(self: @This()) usize {
+        var bytes: usize = @sizeOf(@This());
+        inline for (identity_fields) |field| bytes +|= @field(self, field).len;
+        return bytes;
+    }
+
     pub fn producingDocument(self: @This()) []const u8 {
         return if (self.owner_document.len > 0) self.owner_document else if (self.owner.len > 0) self.owner else self.source;
     }
