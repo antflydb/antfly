@@ -883,8 +883,11 @@ pub fn storageOwnerContextMetrics(
     context: ?*anyopaque,
     out_result: *kernel_owner_abi.ContextMetricsResult,
 ) callconv(.c) kernel_owner_abi.Status {
-    out_result.* = .{};
     const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    // The result has grown across ABI versions. Read only the leading version
+    // word, which every revision shares, and reject a caller built against
+    // another layout before writing: it may have reserved a smaller struct.
+    if (out_result.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const stats = owner_context.resources.lsm_cache.snapshotStats();
     out_result.* = .{
         .lsm_cache_used_bytes = @intCast(stats.used_bytes),

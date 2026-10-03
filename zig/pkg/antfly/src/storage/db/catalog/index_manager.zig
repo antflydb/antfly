@@ -15791,7 +15791,7 @@ pub const IndexManager = struct {
     /// HBC-over-LSM, where one write transaction owns a copy of every point
     /// read until it commits: the measured working set is about 57 KiB per
     /// 1536-dimension vector, not 6 KiB.
-    fn denseReplayWorkingSetFactor(self: *const IndexManager) u64 {
+    pub fn denseReplayWorkingSetFactor(self: *const IndexManager) u64 {
         if (self.configuredDenseNativePostingStoreSupported() and
             nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return 1;
         return dense_lsm_posting_apply_working_set_factor;

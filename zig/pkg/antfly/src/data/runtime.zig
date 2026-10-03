@@ -6576,6 +6576,13 @@ pub const DataServer = struct {
         if (kernel.hard_limit_bytes != 0) stats.hard_limit_bytes = kernel.hard_limit_bytes;
         stats.soft_limit_events +|= kernel.soft_limit_events;
         stats.hard_limit_rejections +|= kernel.hard_limit_rejections;
+        // Pressure follows the merged ledger: the combined usage against the
+        // limits now reported, never lower than either manager's own state.
+        const merged = resource_manager_mod.pressureFor(.{
+            .soft_limit_bytes = stats.soft_limit_bytes,
+            .hard_limit_bytes = stats.hard_limit_bytes,
+        }, stats.used_bytes);
+        if (@intFromEnum(merged) > @intFromEnum(stats.pressure)) stats.pressure = merged;
     }
 
     fn storageOwnerLsmCacheStatsBestEffort(self: *DataServer) lsm_backend_mod.CacheStats {
@@ -55774,4 +55781,20 @@ comptime {
         _ = consumer_tests;
         _ = implementation_tests;
     }
+}
+
+test "merged storage-owner budget stats report pressure from the combined ledger" {
+    var memory: resource_manager_mod.MemoryStats = .{};
+    DataServer.mergeStorageOwnerBudgetStats(&memory, .{ .used_bytes = 90, .soft_limit_bytes = 75, .hard_limit_bytes = 100 });
+    try std.testing.expectEqual(resource_manager_mod.Pressure.soft, memory.pressure);
+
+    // Node usage and kernel usage together cross the kernel's hard limit.
+    var slice: resource_manager_mod.SliceStats = .{ .name = "slice", .used_bytes = 10 };
+    DataServer.mergeStorageOwnerBudgetStats(&slice, .{ .used_bytes = 95, .soft_limit_bytes = 50, .hard_limit_bytes = 100 });
+    try std.testing.expectEqual(resource_manager_mod.Pressure.hard, slice.pressure);
+
+    // A node-level state above what the merged numbers imply is kept.
+    var node_hard: resource_manager_mod.MemoryStats = .{ .pressure = .hard };
+    DataServer.mergeStorageOwnerBudgetStats(&node_hard, .{});
+    try std.testing.expectEqual(resource_manager_mod.Pressure.hard, node_hard.pressure);
 }

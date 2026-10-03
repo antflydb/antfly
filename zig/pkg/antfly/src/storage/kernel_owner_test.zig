@@ -2633,11 +2633,21 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     var context: ?*anyopaque = null;
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{}, &context));
     try std.testing.expect(context != null);
-    var metrics: abi.ContextMetricsResult = undefined;
+    var metrics: abi.ContextMetricsResult = .{};
     try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_context_metrics(null, &metrics));
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(abi.abi_version, metrics.version);
     try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
+    {
+        // A caller built against ABI 71 reserved the 304-byte result. The
+        // kernel must reject it without writing past the version word.
+        var old_caller: [@sizeOf(abi.ContextMetricsResult)]u8 align(@alignOf(abi.ContextMetricsResult)) = @splat(0xaa);
+        std.mem.writeInt(u32, old_caller[0..4], 71, .native);
+        const as_result: *abi.ContextMetricsResult = @ptrCast(&old_caller);
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_metrics(context, as_result));
+        try std.testing.expectEqual(@as(u32, 71), std.mem.readInt(u32, old_caller[0..4], .native));
+        for (old_caller[4..]) |byte| try std.testing.expectEqual(@as(u8, 0xaa), byte);
+    }
     try std.testing.expectEqual(
         abi.Status.invalid_argument,
         abi.antfly_storage_context_attach_inference_provider(context, null),

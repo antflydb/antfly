@@ -428,6 +428,7 @@ pub const DerivedRuntime = if (builtin.os.tag == .freestanding) struct {
                 .name = undefined,
                 .kind = kind.kind,
                 .estimated_dense_vector_bytes = kind.estimated_dense_vector_bytes,
+                .dense_replay_working_set_factor = kind.dense_replay_working_set_factor,
             },
             .applied_sequence = applied_sequence,
             .persisted_sequence = applied_sequence,
@@ -1684,6 +1685,36 @@ test "io threaded deferred source capture advances empty targets only through co
     try std.testing.expectEqual(@as(u64, 0), capture.apply_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), capture.finish_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+}
+
+test "io threaded worker keeps the dense replay working-set factor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrintSentinel(alloc, ".zig-cache/tmp/{s}/working-set-factor", .{tmp.sub_path}, 0);
+    defer alloc.free(path);
+    var journal = try change_journal_mod.Journal.open(path, testThreadedRuntimeJournalOpenOptions());
+    defer journal.close();
+    var manager = resource_manager_mod.ResourceManager.init(.{});
+    defer manager.deinit(alloc);
+    var capture: TestThreadedRuntimeCapture = .{};
+    var runtime = try DerivedRuntime.init(alloc, replay_source_mod.Source.fromJournal(&journal), &capture, testThreadedRuntimeApply, testThreadedRuntimePersist, testThreadedRuntimeTruncate, testThreadedRuntimeBeginCatchUp, testThreadedRuntimeFinishCatchUp, null, null, &manager);
+    defer runtime.deinit();
+    const kind: index_manager_mod.ManagedIndexRef = .{
+        .name = "dense",
+        .kind = .dense_vector,
+        .estimated_dense_vector_bytes = 8 * 1536 * @sizeOf(f32),
+        .dense_replay_working_set_factor = 8,
+    };
+    try runtime.addWorker("dense", kind, 0);
+    const worker = runtime.workers.items[0];
+    try std.testing.expectEqual(@as(u64, 8), worker.kind.dense_replay_working_set_factor);
+    // The policy the worker replays under pairs the scaled estimate with the
+    // scaled ceiling, exactly as the catalog's index reference does.
+    const from_worker = catch_up_policy.forIndex(worker.kind, null);
+    const from_catalog = catch_up_policy.forIndex(kind, null);
+    try std.testing.expectEqual(from_catalog.max_chunk_bytes, from_worker.max_chunk_bytes);
+    try std.testing.expectEqual(from_catalog.estimated_dense_vector_bytes, from_worker.estimated_dense_vector_bytes);
 }
 
 test "io threaded scheduled terminal pass releases its retained session" {
