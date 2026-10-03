@@ -30,6 +30,7 @@ const pattern_filter_contract = @import("../../../search/pattern_filter_contract
 const regex_mod = @import("../../../search/regex.zig");
 const wildcard_mod = @import("../../../search/wildcard.zig");
 const rfc3339 = @import("../../../common/rfc3339.zig");
+const owned_json = @import("../../../common/owned_json.zig");
 const doc_set = @import("../doc_set.zig");
 const pathfact_mod = @import("../algebraic/pathfact.zig");
 const relational_row_codec = @import("../algebraic/relational_row_codec.zig");
@@ -2649,12 +2650,9 @@ pub const PreparedPatternFilter = struct {
         };
         errdefer out.arena.deinit();
         const arena_alloc = out.arena.allocator();
-        const owned_filter_query = try std.json.parseFromValueLeaky(
-            std.json.Value,
-            arena_alloc,
-            filter_query,
-            .{ .allocate = .alloc_always },
-        );
+        // Parsing an existing Value returns it unchanged, even with alloc_always.
+        // Compiled predicates must outlive the caller's JSON parser.
+        const owned_filter_query = try owned_json.clone(arena_alloc, filter_query);
         out.compiled = try compilePatternFilter(arena_alloc, owned_filter_query);
         return out;
     }
