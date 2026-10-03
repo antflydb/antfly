@@ -2886,6 +2886,10 @@ pub const IndexManager = struct {
     pub const SparseCompactionResult = sparse_mod.SparseIndex.SegmentCompactionResult;
 
     pub const GraphIndex = struct {
+        /// Volatile source refresh frontier for enrichment adjacency. Protected
+        /// by apply_mutex; never certifies consumer completion or replay retention.
+        /// A recreated/reopened generation starts from its durable checkpoint.
+        neighbor_source_sequence: u64 = 0,
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
@@ -6574,6 +6578,7 @@ pub const IndexManager = struct {
 
         pub fn reset(self: *@This(), index_name: []const u8) !void {
             const entry = self.manager.graphIndex(index_name) orelse return error.IndexNotFound;
+            entry.neighbor_source_sequence = 0;
             try entry.index.resetForArtifactRebuild();
             entry.index.reconcileOwnershipRange(self.manager.byte_range.start, self.manager.byte_range.end);
         }
@@ -25150,6 +25155,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
+        if (keys.len > 0) entry.neighbor_source_sequence = 0;
         // The graph index owns the relationship identity and ownership rules.
         // Reuse its cleanup path for both endpoint and fact-document deletion.
         try entry.index.deleteOwnedEdgesForDocs(keys);
@@ -25331,6 +25337,11 @@ pub const IndexManager = struct {
             });
         }
 
+        // Ordinary replay can temporarily withdraw an owner in an older
+        // window before replaying its latest artifacts. A producer must refresh
+        // again rather than treating that intermediate sidecar as current.
+        if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
+            entry.neighbor_source_sequence = 0;
         try entry.index.batchApply(batch_writes.items, batch_deletes.items);
         if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
             const primary = self.primary_store orelse return error.MissingPrimaryStore;

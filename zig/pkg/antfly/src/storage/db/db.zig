@@ -7961,6 +7961,11 @@ pub const DB = struct {
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
         };
 
+        runtime_cfg.neighbor_context_graph_source = .{
+            .ptr = append_ctx,
+            .acquire_fn = acquireNeighborContextGraphSource,
+        };
+
         const runtime = try self.runtime_alloc.create(enrichment_runtime_mod.EnrichmentRuntime);
         errdefer self.runtime_alloc.destroy(runtime);
         runtime.* = try enrichment_runtime_mod.EnrichmentRuntime.init(
@@ -13447,13 +13452,15 @@ pub const DB = struct {
             materialized_derived_batch.?.generated_enrichment_refs = precomputed_generated.generated_enrichment_refs;
             precomputed_generated.generated_enrichment_refs = &.{};
             materialized_derived_batch.?.sequence = sequence;
-            const payload = try encodeDirectChangeRecordPayload(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, self.local_execution.row_policy_table_name);
+            var record = try prepareDirectChangeRecord(&self.batchContext(), materialized_derived_batch.?, sequence, effective_req, self.local_execution.row_policy_table_name);
+            defer change_journal_mod.deinitRecord(self.alloc, &record);
+            const payload = try change_journal_mod.encodeRecord(self.alloc, record);
             errdefer self.alloc.free(payload);
             if (write_plan_snapshot == null or write_plan_snapshot.?.plan().has_text_consumers or splitShadowRequiresMaterializedDerivedBatch(self))
                 try attachPreparedUpsertDocumentProjections(preparation_alloc, &materialized_derived_batch.?, effective_req, extracted[0..extracted_initialized]);
 
             const collect_sync_targets_start_ns = monotonicTimeNs();
-            sync_targets = try collectManagedSyncTargets(self.alloc, self.core.index_manager, materialized_derived_batch.?);
+            sync_targets = try collectManagedSyncTargetsForRecordWithBatch(self.alloc, self.core.index_manager, record, materialized_derived_batch.?);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.collect_sync_targets_ns, collect_sync_targets_start_ns);
             break :blk payload;
         };
@@ -15490,7 +15497,7 @@ pub const DB = struct {
         path: transform_mod.GraphProjectionPath,
         value_json: []const u8,
     ) !void {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidGraphEdges;
 
@@ -15567,7 +15574,7 @@ pub const DB = struct {
         path: transform_mod.GraphProjectionPath,
         value_json: []const u8,
     ) !void {
-        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .parse_numbers = false });
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidGraphEdges;
         const target_value = parsed.value.object.get("target") orelse return error.InvalidGraphEdges;
@@ -33546,8 +33553,9 @@ pub const DB = struct {
         defer self.core.unlockApplyShared();
         try self.requireGraphEndpointCleanupReady();
         if (!self.core.index_manager.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
-        // The algebraic shortcut cannot represent a custom frontier limit.
-        if (!options.edge_filter.active() and options.node_admission == null and options.work_budget == null and options.max_intermediate_states == (paths_mod.PathFindOptions{}).max_intermediate_states) {
+        // Use the shortcut only when every semantic option has an equivalent
+        // representation in its unqualified, default-clock execution plan.
+        if (algebraicShortestPathOptionsSupported(options)) {
             if (try self.findAlgebraicShortestPath(alloc, index_name, source, target, options.edge_types, options.direction, options.weight_mode, options.max_depth, options.min_weight, options.max_weight)) |path| return path;
         }
         const entry = self.core.index_manager.graphIndex(index_name) orelse {
@@ -52254,15 +52262,100 @@ fn directGraphNeighborContextHintsAlloc(
     return .{ .keys = try keys.toOwnedSlice(alloc) };
 }
 
-fn encodeDirectChangeRecordPayload(
+const NeighborContextGraphSourceLease = struct {
+    alloc: Allocator,
+    publication: index_manager_mod.IndexManager.GraphPrimaryPublicationLease,
+    apply_guard: index_manager_mod.IndexManager.ManagedIndexApplyGuard,
+    snapshot: ?snapshot_admission_mod.SnapshotAdmission.MutationLease,
+
+    fn release(ptr: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.apply_guard.unlock();
+        self.publication.release();
+        if (self.snapshot) |*lease| lease.release();
+        const alloc = self.alloc;
+        alloc.destroy(self);
+    }
+};
+
+/// Bring committed primary graph effects into the sampled sidecar without
+/// advancing consumer coverage. Coverage can depend on the very producer
+/// sampling this graph, so waiting for it here would create a dependency cycle.
+/// Reuse authoritative artifact replay (including contender arbitration and
+/// deletions), with bounded pages and a per-generation volatile frontier.
+fn acquireNeighborContextGraphSource(ptr: *anyopaque, index_name: []const u8) !enrichment_runtime_mod.NeighborContextGraphSource.Lease {
+    const append_ctx: *EnrichmentAppendContext = @ptrCast(@alignCast(ptr));
+    const ctx = append_ctx.async_context orelse return error.EnrichmentRetryInProgress;
+    const lease = try ctx.alloc.create(NeighborContextGraphSourceLease);
+    errdefer ctx.alloc.destroy(lease);
+    var snapshot = try acquireSnapshotReplayAsyncContext(ctx);
+    errdefer if (snapshot) |*value| value.release();
+    var publication = ctx.index_manager.beginGraphSourceReplay();
+    errdefer publication.release();
+    if (ctx.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
+    const ref = index_manager_mod.ManagedIndexRef{ .name = index_name, .kind = .graph };
+    var guard = try ctx.index_manager.lockManagedIndexApply(ref);
+    errdefer guard.unlock();
+    if (ctx.index_manager.graph_artifact_rebuild_pending or !ctx.index_manager.graphRetirementAdmissionOpen())
+        return error.GraphMaintenanceInProgress;
+    const entry = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
+    const tip = ctx.store.lastReplaySequence(0);
+    const applied = try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, ref);
+    const from = @max(@max(applied, entry.neighbor_source_sequence), try entry.index.artifactRebuildSequence());
+    if (from < tip) {
+        var cursor = try append_ctx.replay_source.openMatchingCursor(ctx.alloc, from, .graph);
+        defer cursor.deinit(ctx.alloc);
+        const Refresh = struct {
+            ctx: *const AsyncContext,
+            index_name: []const u8,
+            tip: u64,
+            records: usize = 0,
+
+            fn consume(raw: *anyopaque, sequence: u64, payload: []const u8) !void {
+                const state: *@This() = @ptrCast(@alignCast(raw));
+                if (sequence > state.tip) return error.StopReplayChunk;
+                state.records += 1;
+                if (state.records > graph_pattern_mod.default_max_explored_edges) return error.GraphExploredEdgesBudgetExceeded;
+                var decoded = try change_journal_mod.decodeRecord(state.ctx.alloc, payload);
+                defer decoded.deinit();
+                // Only committed effects: do not run asset producers/materialize
+                // missing generated effects, and do not publish their checkpoint.
+                try state.ctx.index_manager.deleteGraphDocsByName(state.index_name, decoded.record.deleted_doc_keys);
+                try applyGraphArtifactMutationPages(state.ctx, state.index_name, decoded.record.changed_artifact_keys, &.{}, sequence);
+            }
+        };
+        var refresh = Refresh{ .ctx = ctx, .index_name = index_name, .tip = tip };
+        while (true) {
+            const stats = try cursor.forEachNext(64, &refresh, Refresh.consume);
+            if (stats.last_sequence == 0 or stats.last_sequence >= tip) break;
+        }
+        entry.neighbor_source_sequence = tip;
+    }
+    lease.* = .{ .alloc = ctx.alloc, .publication = publication, .apply_guard = guard, .snapshot = snapshot };
+    return .{ .ptr = lease, .release_fn = NeighborContextGraphSourceLease.release };
+}
+
+fn algebraicShortestPathOptionsSupported(options: paths_mod.PathFindOptions) bool {
+    // Both expansion modes are safe: the algebraic engine independently rejects
+    // any collected cross-table edge before returning a nontrivial path.
+    // Keep ordinary unqualified callers eligible for this optimized plan.
+    return !options.edge_filter.active() and
+        options.source_table == null and options.target_table == null and
+        options.owning_table.len == 0 and
+        options.ttl_now_ns == null and options.node_admission == null and
+        options.work_budget == null and
+        options.max_intermediate_states == (paths_mod.PathFindOptions{}).max_intermediate_states;
+}
+
+fn prepareDirectChangeRecord(
     ctx: *const BatchExecutionContext,
     batch: derived_types.DerivedBatch,
     sequence: u64,
     req: types.BatchRequest,
     owning_table: ?[]const u8,
-) ![]u8 {
+) !change_journal_mod.Record {
     var record = try change_journal_mod.recordFromDerivedBatch(ctx.alloc, batch, sequence);
-    defer change_journal_mod.deinitRecord(ctx.alloc, &record);
+    errdefer change_journal_mod.deinitRecord(ctx.alloc, &record);
     var hints = try directGraphNeighborContextHintsAlloc(ctx.alloc, req, ctx.index_manager, owning_table);
     defer hints.deinit(ctx.alloc);
     if (hints.keys.len > 0) {
@@ -52285,6 +52378,18 @@ fn encodeDirectChangeRecordPayload(
             record.target_hints = targets;
         }
     }
+    return record;
+}
+
+fn encodeDirectChangeRecordPayload(
+    ctx: *const BatchExecutionContext,
+    batch: derived_types.DerivedBatch,
+    sequence: u64,
+    req: types.BatchRequest,
+    owning_table: ?[]const u8,
+) ![]u8 {
+    var record = try prepareDirectChangeRecord(ctx, batch, sequence, req, owning_table);
+    defer change_journal_mod.deinitRecord(ctx.alloc, &record);
     return try change_journal_mod.encodeRecord(ctx.alloc, record);
 }
 
@@ -75035,6 +75140,15 @@ fn collectManagedSyncTargets(
     index_manager: *index_manager_mod.IndexManager,
     batch: derived_types.DerivedBatch,
 ) !ManagedSyncTargets {
+    return collectManagedSyncTargetsWithGeneratedSource(alloc, index_manager, batch, batchContainsSourceUpsert(batch) and index_manager.hasGeneratedEnrichmentTargets());
+}
+
+fn collectManagedSyncTargetsWithGeneratedSource(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    batch: derived_types.DerivedBatch,
+    generated_source_advanced: bool,
+) !ManagedSyncTargets {
     // Decode artifact identities once for the commit plan. Previously every
     // dense and sparse index reparsed and allocated the same identity for every
     // changed artifact while the primary apply fence was held.
@@ -75049,8 +75163,6 @@ fn collectManagedSyncTargets(
         try changed_embedding_names.put(alloc, try routing_arena.allocator().dupe(u8, identity.embedding_name), {});
     }
 
-    const generated_source_advanced = batchContainsSourceUpsert(batch) and
-        index_manager.hasGeneratedEnrichmentTargets();
     const managed_indexes = try collectManagedIndexCandidates(
         alloc,
         index_manager,
@@ -75092,7 +75204,10 @@ fn collectManagedSyncTargets(
                 alloc,
                 &target_identities,
                 candidate.config,
-                managedIndexBatchServingSetEffect(index_manager, batch, candidate.ref),
+                if (generated_source_advanced and candidate.consumes_generated_enrichment)
+                    .may_reduce
+                else
+                    managedIndexBatchServingSetEffect(index_manager, batch, candidate.ref),
                 &target_scope_known,
             );
         }
@@ -75105,6 +75220,19 @@ fn collectManagedSyncTargets(
         &target_identities,
         target_scope_known,
     );
+}
+
+fn collectManagedSyncTargetsForRecordWithBatch(
+    alloc: Allocator,
+    index_manager: *index_manager_mod.IndexManager,
+    record: change_journal_mod.Record,
+    batch: derived_types.DerivedBatch,
+) !ManagedSyncTargets {
+    // The journal's scheduling decision is authoritative for generated
+    // consumers. Keep batch operation detail and predecoded artifact routing
+    // for direct consumers, avoiding irrelevant text work or O(indexes*artifacts)
+    // embedding identity decoding in the materialized commit path.
+    return collectManagedSyncTargetsWithGeneratedSource(alloc, index_manager, batch, replayRecordHasTargetHint(record, .enrichment));
 }
 
 fn collectManagedSyncTargetsForRecord(
@@ -75154,7 +75282,12 @@ fn collectManagedSyncTargetsForRecord(
                 alloc,
                 &target_identities,
                 candidate.config,
-                managedIndexRecordServingSetEffect(index_manager, record, candidate.ref),
+                // Producer reruns can replace or remove generated relationships,
+                // postings, and vectors even when the direct mutation only adds.
+                if (generated_source_advanced and candidate.consumes_generated_enrichment)
+                    .may_reduce
+                else
+                    managedIndexRecordServingSetEffect(index_manager, record, candidate.ref),
                 &target_scope_known,
             );
         }
@@ -153053,4 +153186,174 @@ test "db graph fact neighbor replay releases partial allocations" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "db graph fact transform preserves exact metadata" {
+    const alloc = std.testing.allocator;
+    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
+    defer {
+        for (writes.items) |*w| DB.deinitOwnedGraphEdgeWrite(alloc, w);
+        writes.deinit(alloc);
+    }
+    var deletes = std.ArrayListUnmanaged(types.GraphEdgeDelete).empty;
+    defer deletes.deinit(alloc);
+    try DB.appendGraphTransformWrite(alloc, &writes, &deletes, "a", .{ .index_name = "g", .edge_type = "R" }, "{\"target\":\"b\",\"edge_id\":\"f\",\"metadata\":{\"n\":1.5000000000000001}}");
+    try std.testing.expect(std.mem.indexOf(u8, writes.items[0].metadata_json, "1.5000000000000001") != null);
+
+    var tmp = try TestDirectory.init("transform-exact-numbers");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{}" }}, .sync_level = .full_index });
+    try db.batch(.{
+        .transforms = &.{.{ .key = "a", .operations = &.{.{ .op = .push, .path = "$._edges.g.R", .value_json = "{\"target\":\"b\",\"edge_id\":\"f\",\"weight\":2.25,\"metadata\":{\"n\":1.5000000000000001,\"large\":9007199254740993}}" }} }},
+        .sync_level = .full_index,
+    });
+    const path = try db.findShortestPathWithOptions(alloc, "g", "a", "b", .{
+        .edge_filter = .{ .properties = &.{
+            .{ .field = "/metadata/n", .op = .eq, .value_json = "1.5000000000000001" },
+            .{ .field = "/metadata/large", .op = .eq, .value_json = "9007199254740993" },
+        } },
+    });
+    defer if (path) |value| paths_mod.freePath(alloc, value);
+    try std.testing.expect(path != null);
+    try std.testing.expectEqual(@as(f64, 2.25), path.?.total_weight);
+}
+
+test "db graph fact materialized scopes match journal" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-scope");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    try db.addIndex(.{ .name = "h", .kind = .graph, .config_json = "{\"sources\":[{\"artifact\":\"context\"}]}" });
+    try db.addIndex(.{ .name = "plain", .kind = .full_text, .config_json = "{}" });
+    const req: types.BatchRequest = .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f" }} };
+    const batch: derived_types.DerivedBatch = .{ .graph_writes = req.graph_writes };
+    const payload = try encodeDirectChangeRecordPayload(&db.batchContext(), batch, 1, req, null);
+    defer alloc.free(payload);
+    var record = try change_journal_mod.decodeRecord(alloc, payload);
+    defer record.deinit();
+    var planned = try prepareDirectChangeRecord(&db.batchContext(), batch, 1, req, null);
+    defer change_journal_mod.deinitRecord(alloc, &planned);
+    var from_batch = try collectManagedSyncTargetsForRecordWithBatch(alloc, db.core.index_manager, planned, batch);
+    defer from_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), from_batch.full_text_indexes.len);
+    var from_record = try collectManagedSyncTargetsForRecord(alloc, db.core.index_manager, record.record);
+    defer from_record.deinit(alloc);
+    var has_batch = false;
+    for (from_batch.target_identities) |identity| try std.testing.expect(!std.mem.eql(u8, identity.index_name, "plain"));
+    for (from_batch.target_identities) |i| {
+        if (std.mem.eql(u8, i.index_name, "h")) {
+            has_batch = true;
+            try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, i.serving_set_effect);
+        }
+    }
+    var has_record = false;
+    for (from_record.target_identities) |i| {
+        if (std.mem.eql(u8, i.index_name, "h")) has_record = true;
+    }
+    try std.testing.expect(has_record);
+    try std.testing.expectEqual(has_record, has_batch);
+
+    const Observer = struct {
+        saw_generated_consumer: bool = false,
+        scope_known: bool = false,
+        fn changed(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (event.target_sequence == null) return;
+            self.scope_known = event.target_scope_known;
+            for (event.target_indexes) |identity| {
+                if (std.mem.eql(u8, identity.index_name, "h") and identity.serving_set_effect == .may_reduce)
+                    self.saw_generated_consumer = true;
+            }
+        }
+    };
+    var observer = Observer{};
+    db.setQueryVisibilityHook(.{ .ptr = &observer, .table_name = "docs", .on_change = Observer.changed });
+    defer db.setQueryVisibilityHook(null);
+    try db.batch(.{ .graph_writes = req.graph_writes, .sync_level = .write });
+    try std.testing.expect(observer.scope_known);
+    try std.testing.expect(observer.saw_generated_consumer);
+}
+
+test "db graph fact enrichment observes pending graph replay" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-neighbor-order");
+    defer tmp.cleanup();
+    var producer = GateAssetProducer{};
+    producer.allowAll();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "context", .kind = .asset, .field = "body", .content_type = "text/plain", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"mock\"}}", .neighbor_context = .{ .graph_index = "g", .direction = .out } });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
+    try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"body\":\"Alice\"}" }}, .sync_level = .write });
+    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    const previous = producer.successful_requests.load(.acquire);
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f" }}, .sync_level = .write });
+    const pending = db.core.nextDerivedSequence();
+    const graph_checkpoint = try db.core.loadAppliedSequence(alloc, "g");
+    try db.enrichment_runtime.?.catchUpUntilForDrain(pending);
+    // Source refresh must not certify this consumer while its producer runs.
+    try std.testing.expectEqual(graph_checkpoint, try db.core.loadAppliedSequence(alloc, "g"));
+    try std.testing.expect(producer.successful_requests.load(.acquire) > previous);
+    const RefreshAllocationFixture = struct {
+        fn run(failing_alloc: Allocator, resident: *DB) !void {
+            var ctx = resident.async_context.*;
+            ctx.alloc = failing_alloc;
+            var append_ctx = resident.enrichment_append_context.?.*;
+            append_ctx.async_context = &ctx;
+            resident.core.index_manager.graphIndex("g").?.neighbor_source_sequence = 0;
+            const lease = try acquireNeighborContextGraphSource(&append_ctx, "g");
+            defer lease.release();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, RefreshAllocationFixture.run, .{&db});
+    // Simulate an older consumer window withdrawing this owner after a source
+    // refresh. Invalidation must make the next sample restore current primary
+    // effects even though no new primary revision has arrived.
+    try db.core.index_manager.deleteGraphDocsByName("g", &.{"f"});
+    try std.testing.expectEqual(@as(u64, 0), db.core.index_manager.graphIndex("g").?.neighbor_source_sequence);
+    {
+        const source_cap = db.enrichment_runtime.?.config.neighbor_context_graph_source.?;
+        const lease = try source_cap.acquire_fn(source_cap.ptr, "g");
+        defer lease.release();
+        const restored = try db.core.index_manager.graphIndex("g").?.index.getEdges(alloc, "a", "R", .out);
+        defer graph_mod.GraphIndex.freeEdges(alloc, restored);
+        try std.testing.expectEqual(@as(usize, 1), restored.len);
+    }
+    try db.runDerivedUntil(db.core.nextDerivedSequence());
+    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    const current = producer.successful_requests.load(.acquire);
+
+    try std.testing.expect(current > previous);
+
+    try db.batch(.{ .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "f", .owner_document = "f" }}, .sync_level = .write });
+    try db.enrichment_runtime.?.catchUpUntilForDrain(db.core.nextDerivedSequence());
+    try std.testing.expect(producer.successful_requests.load(.acquire) > current);
+    const edges = try db.core.index_manager.graphIndex("g").?.index.getEdges(alloc, "a", "R", .out);
+    defer graph_mod.GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 0), edges.len);
+}
+
+test "db graph fact qualified path bypasses algebraic shortcut" {
+    const alloc = std.testing.allocator;
+    var tmp = try TestDirectory.init("review-qualified-path");
+    defer tmp.cleanup();
+    var db = try DB.open(alloc, tmp.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\",\"enabled\":true}}}" });
+    try db.batch(.{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R" }}, .sync_level = .full_index });
+    const path = try db.findShortestPathWithOptions(alloc, "g", "a", "b", .{ .target_table = "foreign", .max_depth = 3 });
+    defer if (path) |value| paths_mod.freePath(alloc, value);
+    try std.testing.expect(path == null);
+    const paths = try db.findKShortestPathsWithOptions(alloc, "g", "a", "b", 1, .{ .target_table = "foreign", .max_depth = 3 });
+    defer paths_mod.freePaths(alloc, paths);
+    try std.testing.expectEqual(@as(usize, 0), paths.len);
 }

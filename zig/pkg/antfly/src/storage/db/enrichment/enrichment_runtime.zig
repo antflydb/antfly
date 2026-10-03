@@ -111,7 +111,23 @@ fn getenv(name: [*:0]const u8) ?[]const u8 {
 
 pub const ChunkProvider = chunk_provider.Provider;
 
+/// Resident DB capability: refresh committed graph effects independently of
+/// consumer coverage, and pin that graph generation throughout sampling.
+pub const NeighborContextGraphSource = struct {
+    pub const Lease = struct {
+        ptr: *anyopaque,
+        release_fn: *const fn (*anyopaque) void,
+
+        pub fn release(self: Lease) void {
+            self.release_fn(self.ptr);
+        }
+    };
+    ptr: *anyopaque,
+    acquire_fn: *const fn (*anyopaque, []const u8) anyerror!Lease,
+};
+
 pub const Config = struct {
+    neighbor_context_graph_source: ?NeighborContextGraphSource = null,
     owner_id: []const u8 = "local",
     /// Injected by the resident DB, never borrowed from restored producer
     /// metadata or caller configuration. Ordered checkpoint-backed work fails
@@ -4373,6 +4389,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .deadline_clock = config.clock orelse platform_clock.Clock.real(),
             .activity_epoch = newActivityEpoch(config, config.clock orelse platform_clock.Clock.real()),
             .config = .{
+                .neighbor_context_graph_source = config.neighbor_context_graph_source,
                 .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -4896,6 +4913,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
             .deadline_clock = config.clock orelse backend_runtime.monotonicClock(),
             .activity_epoch = newActivityEpoch(config, config.clock orelse backend_runtime.clock()),
             .config = .{
+                .neighbor_context_graph_source = config.neighbor_context_graph_source,
                 .root_incarnation = config.root_incarnation,
                 .lease_ttl_ms = config.lease_ttl_ms,
                 .dense_embedder = config.dense_embedder,
@@ -11960,8 +11978,9 @@ fn processAsset(
     // Neighbor context is producer input: compose it before the skip-state
     // value below is computed so a changed adjacency re-runs the producer
     // exactly like a changed source field. Only this shard's local graph
-    // state is sampled; a graph index without state for the document renders
-    // empty neighbors (fail open at runtime — admission closed the reference).
+    // state is sampled after refreshing committed source effects; a graph
+    // index without edges for the document renders empty neighbors. Read
+    // failures remain retry/repair debt, never a successful empty sample.
     // Admission also restricts the option to prompt-consuming producers, and
     // the guard here keeps a legacy catalog from ever corrupting a reader or
     // transcriber media locator.
@@ -12046,6 +12065,17 @@ fn neighborContextBlockAlloc(
     };
     defer config.deinit(runtime.alloc);
 
+    const source_lease = if (runtime.config.neighbor_context_graph_source) |source|
+        source.acquire_fn(source.ptr, config.graph_index) catch |err| switch (err) {
+            // Lifecycle/publication readiness is dependency debt, not a
+            // failed provider invocation that can exhaust its retry budget.
+            error.GraphMaintenanceInProgress, error.ReplicationPublisherUnavailable => return error.ArtifactPublicationPending,
+            else => return err,
+        }
+    else
+        null;
+    defer if (source_lease) |lease| lease.release();
+
     // Bounded streaming selection: a high-degree node must not make this
     // "bounded" enrichment input materialize (or sort) its complete
     // adjacency. Edges are read in bounded pages and folded into a
@@ -12075,23 +12105,17 @@ fn neighborContextBlockAlloc(
         };
         var cursor: ?graph_mod.EdgeScanCursor = null;
         defer if (cursor) |*value| value.deinit(alloc);
-        scan: while (true) {
+        while (true) {
             if (remaining_scanned_rows == 0) return error.GraphExploredEdgesBudgetExceeded;
             page_limits.max_scanned_rows = @min(4096, remaining_scanned_rows);
-            var page = entry.index.getEdgesByTypesPage(
+            var page = try entry.index.getEdgesByTypesPage(
                 alloc,
                 request.doc_key,
                 config.edge_types,
                 direction,
                 cursor,
                 page_limits,
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return err,
-                error.GraphExploredEdgesBudgetExceeded => return err,
-                // Unreadable local graph state renders empty neighbors rather
-                // than parking the producer behind a sidecar dependency.
-                else => break :scan,
-            };
+            );
             defer graph_mod.GraphIndex.freeEdges(alloc, page.edges);
             remaining_scanned_rows -= page.scanned_rows;
             for (page.edges) |edge| {
