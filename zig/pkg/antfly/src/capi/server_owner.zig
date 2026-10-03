@@ -905,24 +905,13 @@ pub fn storageOwnerContextMetrics(
     out_result.heap_allocated_bytes_total = heap.allocated_bytes_total;
     out_result.heap_allocations_total = heap.allocations_total;
     const resources = owner_context.resources.resource_manager.snapshot();
-    out_result.resource_memory = storageOwnerContextResourceBudgetStats(resources.memory);
+    out_result.resource_memory = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(resources.memory);
     const slice_count = @min(resources.slices.len, kernel_owner_abi.context_resource_slice_capacity);
     out_result.resource_slice_count = @intCast(slice_count);
     for (resources.slices[0..slice_count], out_result.resource_slices[0..slice_count]) |slice, *out| {
-        out.* = storageOwnerContextResourceBudgetStats(slice);
+        out.* = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(slice);
     }
     return .ok;
-}
-
-fn storageOwnerContextResourceBudgetStats(stats: anytype) kernel_owner_abi.ContextResourceBudgetStats {
-    return .{
-        .used_bytes = stats.used_bytes,
-        .peak_bytes = stats.peak_bytes,
-        .soft_limit_bytes = stats.soft_limit_bytes,
-        .hard_limit_bytes = stats.hard_limit_bytes,
-        .soft_limit_events = stats.soft_limit_events,
-        .hard_limit_rejections = stats.hard_limit_rejections,
-    };
 }
 
 pub fn storageOwnerContextInvalidateCaches(context: ?*anyopaque) callconv(.c) kernel_owner_abi.Status {

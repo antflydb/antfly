@@ -6576,6 +6576,8 @@ pub const DataServer = struct {
         if (kernel.hard_limit_bytes != 0) stats.hard_limit_bytes = kernel.hard_limit_bytes;
         stats.soft_limit_events +|= kernel.soft_limit_events;
         stats.hard_limit_rejections +|= kernel.hard_limit_rejections;
+        if (comptime @hasField(@TypeOf(stats.*), "oversized_single_grants")) stats.oversized_single_grants +|= kernel.oversized_single_grants;
+        if (comptime @hasField(@TypeOf(stats.*), "accounting_errors")) stats.accounting_errors +|= kernel.accounting_errors;
         // Pressure follows the merged ledger: the combined usage against the
         // limits now reported, never lower than either manager's own state.
         const merged = resource_manager_mod.pressureFor(.{
@@ -55797,4 +55799,47 @@ test "merged storage-owner budget stats report pressure from the combined ledger
     var node_hard: resource_manager_mod.MemoryStats = .{ .pressure = .hard };
     DataServer.mergeStorageOwnerBudgetStats(&node_hard, .{});
     try std.testing.expectEqual(resource_manager_mod.Pressure.hard, node_hard.pressure);
+}
+
+test "merged storage-owner metrics preserve accounting counters in Prometheus output" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    const slice_index = @intFromEnum(resource_manager_mod.Slice.text_merge_buffers);
+    budgets[slice_index] = .{ .soft_limit_bytes = 8, .hard_limit_bytes = 10 };
+    var node = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer node.deinit(std.testing.allocator);
+    var kernel = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer kernel.deinit(std.testing.allocator);
+    // Generate actual slice grants and fail-closed stale-release events in
+    // each ledger, then exercise the same projection, merge, and renderer.
+    for (0..7) |i| {
+        if (i < 3) {
+            var grant = try node.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2);
+            var stale = grant;
+            grant.release();
+            if (i < 2) stale.release();
+        }
+        var grant = try kernel.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2);
+        var stale = grant;
+        grant.release();
+        if (i < 5) stale.release();
+    }
+    var snapshot = node.snapshot();
+    const kernel_snapshot = kernel.snapshot();
+    DataServer.mergeStorageOwnerBudgetStats(&snapshot.memory, kernel_owner_client.ContextResourceBudgetStats.fromResourceStats(kernel_snapshot.memory));
+    DataServer.mergeStorageOwnerBudgetStats(&snapshot.slices[slice_index], kernel_owner_client.ContextResourceBudgetStats.fromResourceStats(kernel_snapshot.slices[slice_index]));
+
+    var buffer: [262144]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeResourceMetricsSnapshot(&writer, snapshot);
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\nantfly_resource_host_memory_accounting_errors_total 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\nantfly_resource_oversized_single_grants_total{slice=\"text_merge.buffers\"} 10\n") != null);
+
+    // Long-lived cumulative counters must retain their saturating semantics.
+    var memory: resource_manager_mod.MemoryStats = .{ .accounting_errors = std.math.maxInt(u64) - 1 };
+    DataServer.mergeStorageOwnerBudgetStats(&memory, .{ .accounting_errors = 2 });
+    try std.testing.expectEqual(std.math.maxInt(u64), memory.accounting_errors);
+    var slice: resource_manager_mod.SliceStats = .{ .name = "slice", .oversized_single_grants = std.math.maxInt(u64) - 1 };
+    DataServer.mergeStorageOwnerBudgetStats(&slice, .{ .oversized_single_grants = 2 });
+    try std.testing.expectEqual(std.math.maxInt(u64), slice.oversized_single_grants);
 }

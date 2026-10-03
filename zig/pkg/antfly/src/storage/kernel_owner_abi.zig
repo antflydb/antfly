@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 72;
+pub const abi_version: u32 = 73;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -435,6 +435,23 @@ pub const ContextResourceBudgetStats = extern struct {
     hard_limit_bytes: u64 = 0,
     soft_limit_events: u64 = 0,
     hard_limit_rejections: u64 = 0,
+    oversized_single_grants: u64 = 0,
+    accounting_errors: u64 = 0,
+
+    /// Project aggregate or slice counters without importing the storage
+    /// implementation across this ABI. Inapplicable counters remain zero.
+    pub fn fromResourceStats(stats: anytype) ContextResourceBudgetStats {
+        return .{
+            .used_bytes = stats.used_bytes,
+            .peak_bytes = stats.peak_bytes,
+            .soft_limit_bytes = stats.soft_limit_bytes,
+            .hard_limit_bytes = stats.hard_limit_bytes,
+            .soft_limit_events = stats.soft_limit_events,
+            .hard_limit_rejections = stats.hard_limit_rejections,
+            .oversized_single_grants = if (@hasField(@TypeOf(stats), "oversized_single_grants")) stats.oversized_single_grants else 0,
+            .accounting_errors = if (@hasField(@TypeOf(stats), "accounting_errors")) stats.accounting_errors else 0,
+        };
+    }
 };
 
 /// Process-owned data-Raft apply/projection store. Requests are deliberately
