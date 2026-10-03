@@ -10,13 +10,17 @@ class SummaryTests(unittest.TestCase):
         trace += f"now\t0\t10\t{9 * GIB // 1024}\t9216\tzig build-lib --name antfly-storage-kernel\t1\n"
         report = summarize(trace)
         self.assertEqual(report["sampled_compiler_aggregate_peak_bytes"], 12 * GIB)
-        self.assertEqual(report["units"]["storage_kernel"]["minimum_reservation_gib"], 12)
+        self.assertEqual(
+            report["units"]["storage_kernel"]["minimum_reservation_gib"], 12
+        )
         self.assertEqual(report["units"]["inference"]["minimum_reservation_gib"], 5)
         self.assertTrue(report["aggregate_is_same_poll"])
         self.assertFalse(report["qualification"])
 
     def test_legacy_trace_marks_aggregate_as_approximate(self):
-        report = summarize("header\nnow\t0\t10\t1024\t1\tzig build-lib --name antfly-runtime-cli\n")
+        report = summarize(
+            "header\nnow\t0\t10\t1024\t1\tzig build-lib --name antfly-runtime-cli\n"
+        )
         self.assertFalse(report["aggregate_is_same_poll"])
         self.assertEqual(report["units"]["cli"]["minimum_reservation_gib"], 1)
 
