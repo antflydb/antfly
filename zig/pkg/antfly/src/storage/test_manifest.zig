@@ -34,6 +34,7 @@ comptime {
     _ = @import("hot_standby/native_topology_receipt_integration_test.zig");
     _ = @import("hot_standby/online_source_integration_test.zig");
     _ = @import("hot_standby/db_integration_test.zig");
+    _ = @import("hot_standby/graph_endpoint_cleanup_test.zig");
     _ = @import("antfly_local_sources").storage_portable_wal;
     _ = @import("antfly_local_sources").storage_relational_index;
     _ = @import("antfly_local_sources").storage_db_relational_index_keys;
@@ -274,6 +275,7 @@ comptime {
     _ = @import("hot_standby/replication_api.zig");
     _ = @import("hot_standby/replication_log.zig");
     _ = @import("antfly_local_sources").storage_db_replication_record;
+    _ = @import("antfly_local_sources").storage_db_primary_effect;
     _ = @import("hot_standby/seed_activation.zig");
     _ = @import("hot_standby/seed_artifact.zig");
     _ = @import("hot_standby/seed_capture.zig");

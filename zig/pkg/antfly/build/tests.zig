@@ -102,7 +102,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const httpx_mod = options.antfly_imports.httpx;
     const structlog_mod = options.antfly_imports.structlog;
     const openapi_root_check = options.openapi_root_check;
-    const handlebars_mod = options.antfly_imports.handlebars;
     const platform_mod = options.antfly_imports.platform;
     const bloom_mod = options.antfly_imports.bloom;
     const vector_mod = options.antfly_imports.vector;
@@ -119,9 +118,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const reranking_mod = options.antfly_imports.reranking;
     const image_mod = options.antfly_imports.image;
     const pdf_mod = options.antfly_imports.pdf;
-    const font_mod = options.antfly_imports.font;
-    const inference_api_mod = options.antfly_imports.inference_api;
-    const inference_chunker_mod = options.antfly_imports.inference_chunker;
     const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
     const test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{ .runtime = antfly_imports, .vopr = options.vopr, .lmdb_engine = options.lmdb_engine };
@@ -583,6 +579,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "export and import asset artifacts round trip with public artifact ids",
             "export and import resolution artifacts round trip with public artifact ids",
             "portable graph conversion accepts generation-less v1 edge artifacts",
+            "export and import graph edge artifacts round trip with arbitrary ids",
+            "portable relationships preserve parallel identities and arbitrary endpoints",
+            "relationship key value decoding releases truncated and failed allocations",
+            "AFB2 relationship inventory requires reader version three",
             "document batch round-trip",
             "file reader detects same-size archive replacement between passes",
             "AFB2 manifest separates representation from snapshot mode",
@@ -1412,6 +1412,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "traverse counts only target-admitted nodes toward result limit",
         "graph query engine shares traversal work across start nodes",
         "stored graph weights are finite and non-negative",
+        "relationship predicates",
+        "graph relationship protocol gates",
+        "canonical and legacy graph metadata responses",
+        "graph algebraic provenance",
+        "distributed graph identity hashing",
+        "JSON decimal comparison",
+        "traversal decimal weight filters",
+        "fact temporal predicates",
+        "derived worker pause",
+        "exact two-edge pattern preserves same type parallel relationship matches",
         "canonical graph admission preserves and validates weight bounds",
         "graph edge type policy is byte-bounded UTF-8",
         "graph durable writes reject invalid edge types before mutation",
@@ -1426,6 +1436,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "retained lease rejects allocation replacement peak without leaking",
         "traversal preflights live frontier admission before ownership transfer",
         "traversal ancestry and returned paths share retained state budget",
+        "traversal selected fact relationships are allocation failure safe",
+        "graph metadata table routing",
+        "graph endpoint routing ignores nested tags",
         "projected MATCH rows reserve and release retained output bytes",
         "shortest path preflights live frontier admission",
         "shortest path retained payloads use the shared request budget",
@@ -1435,6 +1448,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "anchor-only aggregate fails closed at the shared anchor scan ceiling",
         "k shortest paths preserve parallel typed edge identities",
         "k shortest paths share one cumulative work budget across spur searches",
+        "conjunctive reverse expansion",
         "conjunctive fixed edges preserve self loops while variable paths remain node simple",
         "conjunctive match supports branches anti joins inequality and optional nulls",
         "conjunctive validation rejects disconnected and unused aliases",
@@ -2132,9 +2146,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"virtual http network"},
     });
     const run_raft_queued_transport_tests = addFilteredTestRunArtifact(b, raft_queued_transport_tests);
+    const graph_cleanup_runtime_tests = b.addTest(.{
+        .root_module = data_implementation_module,
+        .filters = &.{ "graph endpoint cleanup routing", "raft batch round trips guarded graph owner replay afterimages" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+    });
+    b.step("graph-cleanup-runtime-test", "Run cleanup routing scalability and protocol regressions").dependOn(&addFilteredTestRunArtifact(b, graph_cleanup_runtime_tests).step);
+
     const data_runtime_vopr_tests = b.addTest(.{
         .root_module = data_implementation_module,
         .filters = &.{
+            "graph endpoint cleanup routing",
             "DataServer LSM maintenance",
             "DataServer store status",
             "data runtime runRound backs off retryable provision metadata failures",
@@ -5190,45 +5212,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod, hash_mod);
-    antfly_imports.configureRuntimeContracts(db_test_mod);
-    db_test_mod.addImport("antfly_inference_execution_context", antfly_imports.inference_execution_context);
-    db_test_mod.addImport("antfly_sparse_embedding", antfly_imports.sparse_embedding);
-    db_test_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
-    db_test_mod.addImport("antfly_template_content", antfly_imports.template_content);
-    db_test_mod.addImport("antfly_schema_openapi", antfly_imports.schema_openapi);
-    antfly_imports.configureLocalDatabaseContracts(db_test_mod);
-    antfly_imports.storage_boundary.configureProfile(db_test_mod, false, false, .all);
-    db_test_mod.addImport("runtime_failure_abi", antfly_imports.storage_boundary.failure);
+    // Use the local owner constructor and keep ordered application in the
+    // server adapter; broad DB fixtures still need the shared storage imports.
+    antfly_imports.configureEmbedded(b, db_test_mod, true);
+    antfly_imports.storage_boundary.configureSources(db_test_mod, false, false);
     const transcribing_db_test_stub_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
         .target = target,
         .optimize = optimize,
     });
     transcribing_db_test_stub_mod.addImport("httpx", httpx_mod);
-    addSnowballModule(b, db_test_mod);
-    db_test_mod.addImport("bloom", bloom_mod);
-    db_test_mod.addImport("handlebars", handlebars_mod);
-    db_test_mod.addImport("antfly_fst", fst_mod);
-    db_test_mod.addImport("antfly_vector", vector_mod);
-    db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    db_test_mod.addImport("antfly_matcher", matcher_mod);
-    db_test_mod.addImport("antfly_resolver", resolver_mod);
-    db_test_mod.addImport("antfly_chunking", chunking_mod);
-    db_test_mod.addImport("antfly_regex", regex_mod);
-    db_test_mod.addImport("antfly-json", json_mod);
-    db_test_mod.addImport("raft_engine", raft_engine_mod);
-    db_test_mod.addImport("inference_chunker", inference_chunker_mod);
-    db_test_mod.addImport("inference_api", inference_api_mod);
-    db_test_mod.addImport("antfly_reranking", reranking_mod);
-    db_test_mod.addImport("antfly_scraping", scraping_mod);
-    db_test_mod.addImport("antfly_reader_config", reader_config_mod);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
-    db_test_mod.addImport("httpx", httpx_mod);
-    db_test_mod.addImport("antfly_pdf", pdf_mod);
-    db_test_mod.addImport("objectstore", antfly_imports.objectstore);
-    db_test_mod.addImport("antfly_image", image_mod);
-    db_test_mod.addImport("antfly_font", font_mod);
-    db_test_mod.addImport("structlog", structlog_mod);
     db_test_mod.addImport("vopr", vopr_mod);
 
     const db_split_workload_default_filters = [_][]const u8{
@@ -5544,20 +5538,36 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     relational_index_lifecycle_step.dependOn(&addFilteredTestRunArtifact(b, relational_index_lifecycle_tests).step);
 
     const graph_runtime_filters = [_][]const u8{
+        "graph endpoint cleanup bulk retirement mask releases ownership on decoding failure",
+        "db graph endpoint cleanup",
+        "db graph owner revival",
+        "db graph qualified cleanup",
+        "db graph fact",
+        "change journal graph refresh cursor",
+        "enrichment runtime graph indexed keys",
+        "enrichment runtime graph stage recovery",
+        "change journal graph indexed record",
+        "ordered artifact inventory graph publication",
+        "db graph projected endpoint retirement",
+        "graph replay node clears",
+
+        "graph owned cleanup",
+        "graph replay target clears",
+        "graph replay producer clear",
+        "db graph cleanup lookup",
+        "db rewriteEntityEdges",
+
         "db storage kernel graph edges retain typed filters and physical scan budgets",
         "graph artifact rebuild lease drains scheduler pins",
         "db direct merge import",
         "db paged merge",
         "db graph primary publication",
         "db graph ttl",
-        "HA primary effect",
+        "primary effect",
         "storage.hot_standby db mirrors appended derived replay records",
         "storage.hot_standby durable outbox recovery",
         "db relational ttl cleanup preserves physical mode",
         "db enrichment graph ttl",
-        "db replicated merge artifacts preserve graph ttl",
-        "db replicated merge imports graph source asset",
-        "db replicated merge keeps expired graph source",
         "graph edge ttl lifetime key follows owner and index",
         "storage.db.graph_runtime.test.",
         "graph untimed contributor order survives reopen and owner withdrawal",
@@ -5590,6 +5600,20 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     );
     const graph_runtime_test_step = b.step("graph-runtime-test", "Run graph artifact replay, repair, and traversal integration tests");
     graph_runtime_test_step.dependOn(&run_graph_runtime_tests.step);
+    // Ordered dispatch fixtures moved to the server owner in PR 958. Keep the
+    // graph gate exercising them through that owner, not through the local DB.
+    const graph_ordered_runtime_filters = [_][]const u8{
+        "db replicated merge artifacts preserve graph ttl",
+        "db replicated merge imports graph source asset",
+        "db replicated merge keeps expired graph source",
+        "server ordered graph cleanup",
+    };
+    const graph_ordered_runtime_tests = b.addTest(.{
+        .root_module = server_db_test_mod,
+        .filters = &graph_ordered_runtime_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
+    });
+    graph_runtime_test_step.dependOn(&addCuratedTestRunArtifact(b, graph_ordered_runtime_tests, &graph_ordered_runtime_filters).step);
 
     const resolver_backfill_tests = b.addTest(.{
         .root_module = db_test_mod,

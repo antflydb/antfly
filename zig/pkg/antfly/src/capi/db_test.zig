@@ -4302,3 +4302,180 @@ test "storage owner runtime status bulk recovery bridge preserves identities cap
 // These callbacks are installed only by the private server owner. Public Lite
 // handles share the registry and destruction ordering without importing server
 // context, recovery, or coordination implementations.
+
+test "capi fact relationships preserve identities and filter before ranking" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-facts");
+    defer directory.cleanup();
+    const path = try tempTestPath(alloc, directory.path(), "facts");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer antfly_db_close(handle_ptr);
+    const handle = asHandle(handle_ptr).?;
+    try handle.db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{}" });
+    try handle.db.batch(.{
+        .writes = &.{
+            .{ .key = "a", .value = "{}" },            .{ .key = "b", .value = "{}" },
+            .{ .key = "fact:one", .value = "{}" },     .{ .key = "fact:two", .value = "{}" },
+            .{ .key = "fact:expired", .value = "{}" },
+        },
+        .graph_writes = &.{
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 1, .metadata_json = "{\"value\":1.0000000000000001}" },
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "two", .owner_document = "fact:two", .weight = 2, .metadata_json = "{}" },
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "expired", .owner_document = "fact:expired", .weight = 0.1, .metadata_json = "{\"invalid_at\":\"2020-01-01T00:00:00Z\"}" },
+        },
+        .sync_level = .full_index,
+    });
+    var edge_output: capi.Buffer = .{};
+    defer freeRawBuffer(edge_output.ptr, edge_output.len);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_get_edges_json(handle_ptr, .{ .ptr = "facts", .len = 5 }, .{ .ptr = "a", .len = 1 }, .{ .ptr = "R", .len = 1 }, 0, &edge_output));
+    const edge_bytes = edge_output.ptr.?[0..edge_output.len];
+    try std.testing.expect(std.mem.indexOf(u8, edge_bytes, "\"edge_id_b64\":\"b25l\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, edge_bytes, "\"owner_document_b64\":\"ZmFjdDpvbmU=\"") != null);
+    const requests = [_][]const u8{
+        \\{"index_name":"facts","start_key_b64":"YQ==","max_depth":1,"deduplicate_nodes":false,"include_paths":true,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","weight_mode":"min_weight","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","weight_mode":"min_weight","k":3,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}
+        ,
+        \\{"graph_queries":[{"name":"walk","type":"traverse","index_name":"facts","start_nodes":{"keys":["YQ=="]},"deduplicate":false,"include_paths":true,"max_depth":1,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}],"named_sets":[]}
+        ,
+    };
+    for (requests, 0..) |request, i| {
+        var output: capi.Buffer = .{};
+        defer freeRawBuffer(output.ptr, output.len);
+        const slice = capi.Slice{ .ptr = request.ptr, .len = request.len };
+        const status = switch (i) {
+            0 => antfly_db_traverse_edges_json(handle_ptr, slice, &output),
+            1 => antfly_db_find_shortest_path_json(handle_ptr, slice, &output),
+            2 => antfly_db_find_k_shortest_paths_json(handle_ptr, slice, &output),
+            else => antfly_db_execute_graph_queries_json(handle_ptr, slice, &output),
+        };
+        try std.testing.expectEqual(capi.ErrorCode.ok, status);
+        const bytes = output.ptr.?[0..output.len];
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"b25l\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"owner_document_b64\":\"ZmFjdDpvbmU=\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "ZXhwaXJlZA==") == null);
+        if (i != 1) try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"dHdv\"") != null);
+    }
+    const decimal_requests = [_][]const u8{
+        \\{"index_name":"facts","start_key_b64":"YQ==","max_depth":1,"include_paths":true,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"index_name":"facts","source_b64":"YQ==","target_b64":"Yg==","k":2,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}
+        ,
+        \\{"graph_queries":[{"name":"walk","type":"traverse","index_name":"facts","start_nodes":{"keys":["YQ=="]},"include_paths":true,"max_depth":1,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}],"named_sets":[]}
+        ,
+    };
+    for (decimal_requests, 0..) |request, i| {
+        var output: capi.Buffer = .{};
+        defer freeRawBuffer(output.ptr, output.len);
+        const slice = capi.Slice{ .ptr = request.ptr, .len = request.len };
+        const status = switch (i) {
+            0 => antfly_db_traverse_edges_json(handle_ptr, slice, &output),
+            1 => antfly_db_find_shortest_path_json(handle_ptr, slice, &output),
+            2 => antfly_db_find_k_shortest_paths_json(handle_ptr, slice, &output),
+            else => antfly_db_execute_graph_queries_json(handle_ptr, slice, &output),
+        };
+        try std.testing.expectEqual(capi.ErrorCode.ok, status);
+        const bytes = output.ptr.?[0..output.len];
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"b25l\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"edge_id_b64\":\"dHdv\"") == null);
+    }
+    for ([_][]const u8{
+        "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":true}",
+        "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":[]}",
+        "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":42}",
+    }) |malformed| {
+        var rejected: capi.Buffer = .{};
+        try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_traverse_edges_json(handle_ptr, .{ .ptr = malformed.ptr, .len = malformed.len }, &rejected));
+    }
+    const bad = "{\"index_name\":\"facts\",\"start_key_b64\":\"YQ==\",\"edge_filter\":{\"known_at\":\"bad\"}}";
+    var output: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_db_traverse_edges_json(handle_ptr, .{ .ptr = bad.ptr, .len = bad.len }, &output));
+}
+
+test "capi fact path serialization and parsing release partial allocations" {
+    const alloc = std.testing.allocator;
+    const edge = paths_mod.PathEdge{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one\xff", .owner_document = "fact\x00", .weight = 1, .metadata = "{\"tenant\":\"g\"}", .traversal_direction = .out };
+    const Case = struct {
+        fn serialize(a: Allocator, value: paths_mod.PathEdge) !void {
+            var encoded = try JsonPathEdge.init(a, value);
+            defer encoded.deinit(a);
+            const decoded_id = try decodeBase64Alloc(a, encoded.edge_id_b64.?);
+            defer a.free(decoded_id);
+            try std.testing.expectEqualStrings(value.edge_id, decoded_id);
+            try std.testing.expectEqualStrings(value.metadata, encoded.metadata_json);
+        }
+        fn parse(a: Allocator) !void {
+            var parsed = try std.json.parseFromSlice(std.json.Value, a, "{\"properties\":[{\"field\":\"/metadata/tenant\",\"op\":\"eq\",\"value\":\"g\"}]}", .{});
+            defer parsed.deinit();
+            var query = try parseGraphQueryRequestOwned(a, .{ .name = "walk", .type = "traverse", .index_name = "facts", .start_nodes = .{ .keys = &.{"YQ=="} }, .edge_types = &.{"R"}, .edge_filter = parsed.value });
+            defer deinitOwnedGraphQuery(a, &query);
+            try std.testing.expect(query.params.edge_filter.active());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.serialize, .{edge});
+    try std.testing.checkAllAllocationFailures(alloc, Case.parse, .{});
+}
+
+test "capi fact algebraic paths retain provenance and respect frontier limits" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("capi-fact-algebraic");
+    defer directory.cleanup();
+    const path = try tempTestPath(alloc, directory.path(), "facts");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer antfly_db_close(handle_ptr);
+    const handle = asHandle(handle_ptr).?;
+    try handle.db.addIndex(.{ .name = "facts", .kind = .graph, .config_json = "{\"algebraic_planning\":{\"bounded_traversal\":{\"law\":\"provenance_semiring\"}}}" });
+    try handle.db.batch(.{
+        .writes = &.{ .{ .key = "a", .value = "{}" }, .{ .key = "b", .value = "{}" }, .{ .key = "c", .value = "{}" }, .{ .key = "d", .value = "{}" }, .{ .key = "fact:one", .value = "{}" } },
+        .graph_writes = &.{
+            .{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 2, .metadata_json = "{\"fact\":1}" },
+            .{ .index_name = "facts", .source = "a", .target = "c", .edge_type = "R", .edge_id = "two" },
+            .{ .index_name = "facts", .source = "b", .target = "d", .edge_type = "R", .edge_id = "three" },
+        },
+        .sync_level = .full_index,
+    });
+    for ([_]usize{ (paths_mod.PathFindOptions{}).max_intermediate_states, 8 }) |frontier_limit| {
+        for ([_]graph_mod.EdgeDirection{ .out, .in, .both }) |direction| {
+            const source: []const u8 = if (direction == .in) "b" else "a";
+            const target: []const u8 = if (direction == .in) "a" else "b";
+            const result = (try handle.db.findShortestPathWithOptions(alloc, "facts", source, target, .{ .direction = direction, .weight_mode = .min_hops, .max_depth = 2, .max_intermediate_states = frontier_limit })).?;
+            defer paths_mod.freePath(alloc, result);
+            try std.testing.expectEqualStrings("one", result.edges[0].edge_id);
+            try std.testing.expectEqualStrings("fact:one", result.edges[0].owner_document);
+            try std.testing.expectEqualStrings("{\"fact\":1}", result.edges[0].metadata);
+            try std.testing.expectEqual(if (direction == .in) graph_mod.EdgeDirection.in else graph_mod.EdgeDirection.out, result.edges[0].traversal_direction.?);
+        }
+    }
+    const queries = [_][]const u8{
+        \\{"graph_queries":[{"name":"walk","type":"traverse","index_name":"facts","start_nodes":{"keys":["YQ=="]},"include_paths":true,"max_depth":1}],"named_sets":[]}
+        ,
+        \\{"graph_queries":[{"name":"path","type":"shortest_path","index_name":"facts","start_nodes":{"keys":["YQ=="]},"target_nodes":{"keys":["Yg=="]},"weight_mode":"min_hops","max_depth":2}],"named_sets":[]}
+        ,
+    };
+    for (queries) |query| {
+        var output: capi.Buffer = .{};
+        defer freeRawBuffer(output.ptr, output.len);
+        try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_execute_graph_queries_json(handle_ptr, .{ .ptr = query.ptr, .len = query.len }, &output));
+        const bytes = output.ptr.?[0..output.len];
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "fact:one") != null or std.mem.indexOf(u8, bytes, "ZmFjdDpvbmU=") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\\\"fact\\\":1") != null);
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "\"traversal_direction\":0") != null);
+    }
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, handle.db.findKShortestPathsWithOptions(alloc, "facts", "a", "d", 1, .{ .weight_mode = .min_hops, .max_depth = 2, .max_intermediate_states = 1 }));
+    try std.testing.expectError(error.GraphWorkBudgetExceeded, handle.db.findShortestPathWithOptions(alloc, "facts", "a", "d", .{ .weight_mode = .min_hops, .max_depth = 2, .max_intermediate_states = 1 }));
+}
+
+test "capi fact edge cleanup releases the owned array exactly once" {
+    const alloc = std.testing.allocator;
+    const edges = try alloc.alloc(graph_mod.Edge, 1);
+    edges[0] = .{ .source = "", .target = "", .edge_type = "", .weight = 1, .created_at = 0, .updated_at = 0, .metadata = "" };
+    graphFreeEdges(alloc, edges);
+}

@@ -2886,6 +2886,18 @@ pub const IndexManager = struct {
     pub const SparseCompactionResult = sparse_mod.SparseIndex.SegmentCompactionResult;
 
     pub const GraphIndex = struct {
+        /// Volatile source refresh frontier for enrichment adjacency. Protected
+        /// by apply_mutex; never certifies consumer completion or replay retention.
+        /// A recreated/reopened generation starts from its durable checkpoint.
+        neighbor_source_sequence: u64 = 0,
+        neighbor_refresh: struct {
+            sequence: u64 = 0,
+            cursor: @import("../derived/change_journal.zig").GraphRefreshCursor = .{},
+            cleanup_phase: u8 = 0,
+            cleanup_cursor: ?[]u8 = null,
+        } = .{},
+        neighbor_refresh_applying: bool = false,
+
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
@@ -2895,6 +2907,16 @@ pub const IndexManager = struct {
         ttl_duration_ns: u64 = 0,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
+
+        pub fn invalidateNeighborSource(self: *@This()) void {
+            self.neighbor_source_sequence = 0;
+            if (!self.neighbor_refresh_applying) self.clearNeighborRefresh();
+        }
+
+        pub fn clearNeighborRefresh(self: *@This()) void {
+            if (self.neighbor_refresh.cleanup_cursor) |key| self.index.alloc.free(key);
+            self.neighbor_refresh = .{};
+        }
     };
 
     const OpenedIndex = union(types.IndexKind) {
@@ -6574,6 +6596,7 @@ pub const IndexManager = struct {
 
         pub fn reset(self: *@This(), index_name: []const u8) !void {
             const entry = self.manager.graphIndex(index_name) orelse return error.IndexNotFound;
+            entry.invalidateNeighborSource();
             try entry.index.resetForArtifactRebuild();
             entry.index.reconcileOwnershipRange(self.manager.byte_range.start, self.manager.byte_range.end);
         }
@@ -6734,6 +6757,7 @@ pub const IndexManager = struct {
     }
 
     fn deinitGraphIndexEntry(self: *IndexManager, entry: *GraphIndex, abandon_after_crash: bool) void {
+        entry.clearNeighborRefresh();
         if (abandon_after_crash) {
             entry.index.abandonAfterCrash();
         } else {
@@ -9853,7 +9877,7 @@ pub const IndexManager = struct {
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) {
             const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, 0);
             errdefer self.alloc.free(entries);
@@ -10305,7 +10329,7 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedSchedulerSweepResult {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) return .{};
         return try self.runGraphMetricPlannedCoordinatorSweepUnlocked(options);
     }
@@ -11734,6 +11758,7 @@ pub const IndexManager = struct {
                 );
             }
         }
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
             try self.persistEnrichmentCatalog(store);
@@ -11808,6 +11833,7 @@ pub const IndexManager = struct {
             try opened.append(self.alloc, cfg.name);
         }
 
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
             try self.persistEnrichmentCatalog(store);
@@ -12476,6 +12502,7 @@ pub const IndexManager = struct {
                 if (!should_delete) should_delete = cleanupRecordMatchesEmbedding(state.record, candidate);
                 if (!should_delete) if (state.graph_index_name) |index_name| {
                     should_delete = internal_keys.matchesGraphEdgeIndexName(candidate, index_name) or
+                        internal_keys.matchesGraphRetirementIndexName(candidate, index_name) or
                         internal_keys.matchesGraphAssetStateIndexName(candidate, index_name) or
                         internal_keys.matchesGraphEdgeContenderIndexName(candidate, index_name) or
                         internal_keys.matchesGraphGlobalEdgeContenderIndexName(candidate, index_name);
@@ -13656,6 +13683,13 @@ pub const IndexManager = struct {
         }
     };
 
+    pub fn hasAssetNeighborContext(self: *const IndexManager) bool {
+        for (self.enrichments.items) |entry| {
+            if (entry.kind == .asset and entry.neighbor_context_json.len != 0) return true;
+        }
+        return false;
+    }
+
     /// Read-only scheduling lookup for graph-edge mutations: does any
     /// admitted asset enrichment sample `neighbor_context` adjacency from the
     /// named graph index, and in which orientations? An edge write or delete
@@ -13988,6 +14022,17 @@ pub const IndexManager = struct {
         return out;
     }
 
+    fn artifactRequiresCommittedGraph(self: *const IndexManager, name: []const u8) bool {
+        var current = name;
+        var hops: usize = 0;
+        while (current.len != 0 and hops <= self.enrichments.items.len) : (hops += 1) {
+            const cfg = self.getEnrichmentByName(current) orelse return false;
+            if (cfg.neighbor_context_json.len != 0) return true;
+            current = cfg.source_artifact_name;
+        }
+        return false;
+    }
+
     pub fn planGeneratedEnrichments(
         self: *const IndexManager,
         alloc: Allocator,
@@ -14309,6 +14354,11 @@ pub const IndexManager = struct {
                     if (request.embedding_name.len > 0) request.embedding_name else request.index_name,
                 ),
             };
+        }
+        for (requests.items) |*request| {
+            request.requires_committed_graph = request.neighbor_context_json.len != 0 or
+                self.artifactRequiresCommittedGraph(request.upstream_artifact_name) or
+                (request.input_kind != .document and self.artifactRequiresCommittedGraph(request.artifact_name));
         }
         return try requests.toOwnedSlice(alloc);
     }
@@ -17341,7 +17391,9 @@ pub const IndexManager = struct {
     }
 
     pub fn graphRetirementAdmissionOpen(self: *const IndexManager) bool {
-        return !self.graph_retirement_closed.load(.acquire);
+        if (self.graph_retirement_closed.load(.acquire)) return false;
+        if (self.primary_store) |store| if (store.graphEndpointCleanupBlocksReads() catch true) return false;
+        return true;
     }
 
     /// Call only while holding catalog_mutex exclusively. The Raft apply
@@ -21867,6 +21919,37 @@ pub const IndexManager = struct {
                 }
             },
         }
+        try self.validateNeighborDependencyGraph(cfg);
+    }
+
+    /// Neighbor sampling adds graph-source dependencies to the ordinary asset
+    /// DAG. Reject feedback through generated graph sources, including indirect
+    /// asset/chunk chains, before publication can schedule endpoint producers.
+    fn validateNeighborDependencyGraph(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig) !void {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        try self.visitNeighborDependencies(root, root, &seen);
+    }
+
+    fn visitNeighborDependencies(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig, cfg: enrichment_catalog.EnrichmentConfig, seen: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (seen.contains(cfg.name)) return;
+        try seen.put(self.alloc, cfg.name, {});
+        if (cfg.source_artifact_name.len != 0)
+            try self.visitNeighborArtifact(root, cfg.source_artifact_name, seen);
+        if (cfg.neighbor_context_json.len != 0) {
+            var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
+            defer context.deinit(self.alloc);
+            for (self.graph_indexes.items) |entry| {
+                if (!std.mem.eql(u8, entry.config.name, context.graph_index)) continue;
+                for (entry.artifact_sources) |source|
+                    try self.visitNeighborArtifact(root, source.artifact_name, seen);
+            }
+        }
+    }
+
+    fn visitNeighborArtifact(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig, name: []const u8, seen: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (std.mem.eql(u8, root.name, name)) return error.InvalidEnrichmentConfig;
+        if (self.getEnrichmentByName(name)) |cfg| try self.visitNeighborDependencies(root, cfg.*, seen);
     }
 
     fn validateEnrichmentCatalogGraph(self: *const IndexManager) !void {
@@ -25146,32 +25229,11 @@ pub const IndexManager = struct {
         return try doc_ids.toOwnedSlice(alloc);
     }
 
-    fn deleteGraphDocsEntry(self: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
-        var deletes = std.ArrayListUnmanaged(graph_mod.BatchDelete).empty;
-        defer {
-            for (deletes.items) |delete| {
-                self.alloc.free(@constCast(delete.source));
-                self.alloc.free(@constCast(delete.target));
-                self.alloc.free(@constCast(delete.edge_type));
-            }
-            deletes.deinit(self.alloc);
-        }
-
-        for (keys) |key| {
-            const edges = try entry.index.getPhysicalEdgesForDeletion(self.alloc, key, "", .both);
-            defer graph_mod.GraphIndex.freeEdges(self.alloc, edges);
-
-            for (edges) |edge| {
-                try deletes.append(self.alloc, .{
-                    .source = try self.alloc.dupe(u8, edge.source),
-                    .target = try self.alloc.dupe(u8, edge.target),
-                    .edge_type = try self.alloc.dupe(u8, edge.edge_type),
-                    .clear_all_private_state = true,
-                });
-            }
-        }
-
-        try entry.index.batchApply(&.{}, deletes.items);
+    fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
+        if (keys.len > 0) entry.invalidateNeighborSource();
+        // The graph index owns the relationship identity and ownership rules.
+        // Reuse its cleanup path for both endpoint and fact-document deletion.
+        try entry.index.deleteOwnedEdgesForDocs(keys);
     }
 
     fn applyGraphWritesEntry(self: *IndexManager, entry: *GraphIndex, writes: []const types.GraphEdgeWrite) !void {
@@ -25232,6 +25294,8 @@ pub const IndexManager = struct {
                     parsed.edge_type,
                     parsed.target_doc_key,
                     parsed.doc_key,
+                    parsed.edge_id,
+                    if (parsed.edge_id.len > 0 and parsed.logical_source.len > 0) parsed.doc_key else "",
                     &snapshots,
                 );
                 try state.entry.index.replaceContributionSnapshots(snapshots.items);
@@ -25317,18 +25381,14 @@ pub const IndexManager = struct {
         defer batch_deletes.deinit(self.alloc);
 
         for (writes) |write| {
-            // Range admission follows the OWNING document, exactly like the
-            // artifact key: an entity-sourced edge's canonical source key
-            // (write.owner non-empty) can hash into a different shard range
-            // than the producing document, and filtering by it would make
-            // the owner's shard silently drop the mutation.
-            const range_key = if (write.owner.len > 0) write.owner else write.source;
-            if (!self.keyInRange(range_key)) continue;
+            if (!self.keyInRange(if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source)) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             try batch_writes.append(self.alloc, .{
                 .source = write.source,
                 .target = write.target,
                 .edge_type = write.edge_type,
+                .edge_id = write.edge_id,
+                .owner_document = write.owner_document,
                 .weight = write.weight,
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
@@ -25339,18 +25399,24 @@ pub const IndexManager = struct {
         }
 
         for (deletes) |delete| {
-            const range_key = if (delete.owner.len > 0) delete.owner else delete.source;
-            if (!self.keyInRange(range_key)) continue;
+            if (!self.keyInRange(if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source)) continue;
             if (!std.mem.eql(u8, delete.index_name, entry.config.name)) continue;
             try batch_deletes.append(self.alloc, .{
                 .source = delete.source,
                 .target = delete.target,
                 .edge_type = delete.edge_type,
+                .edge_id = delete.edge_id,
+                .owner_document = delete.owner_document,
                 .owner = delete.owner,
-                .preserve_if_member = snapshot_mode == .retire_owner and delete.owner.len == 0,
+                .preserve_if_member = snapshot_mode == .retire_owner and delete.owner.len == 0 and delete.edge_id.len == 0,
             });
         }
 
+        // Ordinary replay can temporarily withdraw an owner in an older
+        // window before replaying its latest artifacts. A producer must refresh
+        // again rather than treating that intermediate sidecar as current.
+        if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
+            entry.invalidateNeighborSource();
         try entry.index.batchApply(batch_writes.items, batch_deletes.items);
         if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
             const primary = self.primary_store orelse return error.MissingPrimaryStore;
@@ -25359,7 +25425,7 @@ pub const IndexManager = struct {
             const arena = arena_state.allocator();
             var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
             for (batch_writes.items) |write| {
-                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, &snapshots);
+                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
             }
             for (batch_deletes.items) |delete| {
                 if (snapshot_mode == .retire_owner) {
@@ -25367,11 +25433,13 @@ pub const IndexManager = struct {
                         .source = delete.source,
                         .target = delete.target,
                         .edge_type = delete.edge_type,
-                        .owner = if (delete.owner.len > 0) delete.owner else delete.source,
+                        .edge_id = delete.edge_id,
+                        .owner_document = delete.owner_document,
+                        .owner = if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source,
                         .contributions = &.{},
                     });
                 } else {
-                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, &snapshots);
+                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
                 }
             }
             try entry.index.replaceContributionSnapshots(snapshots.items);
@@ -25386,9 +25454,11 @@ pub const IndexManager = struct {
         edge_type: []const u8,
         target: []const u8,
         owner: []const u8,
+        edge_id: []const u8,
+        owner_document: []const u8,
         snapshots: *std.ArrayListUnmanaged(graph_mod.ContributionSnapshot),
     ) !void {
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source, edge_id);
         const raw = primary.get(alloc, artifact_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -25434,7 +25504,9 @@ pub const IndexManager = struct {
             .source = source,
             .edge_type = edge_type,
             .target = target,
-            .owner = if (owner.len > 0) owner else source,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
+            .owner = if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source,
             .contributions = try contributors.toOwnedSlice(alloc),
         });
     }
@@ -30814,6 +30886,8 @@ pub const GraphNodeModel = enum {
 
 pub const GraphArtifactMapping = struct {
     node_model: GraphNodeModel = .document,
+    source_template: []u8 = "",
+    edge_id_template: []u8 = "",
     target_template: []u8 = "",
     edge_type_template: []u8 = "",
     weight_template: []u8 = "",
@@ -30821,30 +30895,24 @@ pub const GraphArtifactMapping = struct {
     context_doc_fields: []const []u8 = &.{},
 
     pub fn clone(alloc: Allocator, mapping: GraphArtifactMapping) !GraphArtifactMapping {
-        const context_doc_fields: [][]u8 = if (mapping.context_doc_fields.len > 0)
-            try alloc.alloc([]u8, mapping.context_doc_fields.len)
-        else
-            @constCast(&.{});
-        var initialized: usize = 0;
-        errdefer {
-            for (context_doc_fields[0..initialized]) |field| alloc.free(field);
-            if (context_doc_fields.len > 0) alloc.free(context_doc_fields);
+        var result = GraphArtifactMapping{ .node_model = mapping.node_model };
+        errdefer result.deinit(alloc);
+        inline for ([_][]const u8{ "source_template", "edge_id_template", "target_template", "edge_type_template", "weight_template", "metadata_template_json" }) |field| {
+            const value = @field(mapping, field);
+            if (value.len > 0) @field(result, field) = try alloc.dupe(u8, value);
         }
-        for (mapping.context_doc_fields, 0..) |field, i| {
-            context_doc_fields[i] = try alloc.dupe(u8, field);
-            initialized += 1;
+        if (mapping.context_doc_fields.len > 0) {
+            const fields = try alloc.alloc([]u8, mapping.context_doc_fields.len);
+            @memset(fields, @constCast(""));
+            result.context_doc_fields = fields;
+            for (mapping.context_doc_fields, fields) |field, *owned| owned.* = try alloc.dupe(u8, field);
         }
-        return .{
-            .node_model = mapping.node_model,
-            .target_template = if (mapping.target_template.len > 0) try alloc.dupe(u8, mapping.target_template) else "",
-            .edge_type_template = if (mapping.edge_type_template.len > 0) try alloc.dupe(u8, mapping.edge_type_template) else "",
-            .weight_template = if (mapping.weight_template.len > 0) try alloc.dupe(u8, mapping.weight_template) else "",
-            .metadata_template_json = if (mapping.metadata_template_json.len > 0) try alloc.dupe(u8, mapping.metadata_template_json) else "",
-            .context_doc_fields = context_doc_fields,
-        };
+        return result;
     }
 
     pub fn deinit(self: *GraphArtifactMapping, alloc: Allocator) void {
+        if (self.source_template.len > 0) alloc.free(self.source_template);
+        if (self.edge_id_template.len > 0) alloc.free(self.edge_id_template);
         if (self.target_template.len > 0) alloc.free(self.target_template);
         if (self.edge_type_template.len > 0) alloc.free(self.edge_type_template);
         if (self.weight_template.len > 0) alloc.free(self.weight_template);
@@ -30867,13 +30935,13 @@ pub const GraphArtifactSource = struct {
     mention_edge_type: []u8 = "",
 
     pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {
-        return .{
-            .artifact_name = try alloc.dupe(u8, source.artifact_name),
-            .path = if (source.path.len > 0) try alloc.dupe(u8, source.path) else "",
-            .format = source.format,
-            .mapping = try GraphArtifactMapping.clone(alloc, source.mapping),
-            .mention_edge_type = if (source.mention_edge_type.len > 0) try alloc.dupe(u8, source.mention_edge_type) else "",
-        };
+        var result = GraphArtifactSource{ .artifact_name = @constCast(""), .format = source.format };
+        errdefer result.deinit(alloc);
+        result.artifact_name = try alloc.dupe(u8, source.artifact_name);
+        if (source.path.len > 0) result.path = try alloc.dupe(u8, source.path);
+        result.mapping = try GraphArtifactMapping.clone(alloc, source.mapping);
+        if (source.mention_edge_type.len > 0) result.mention_edge_type = try alloc.dupe(u8, source.mention_edge_type);
+        return result;
     }
 
     pub fn deinit(self: *GraphArtifactSource, alloc: Allocator) void {
@@ -32110,7 +32178,7 @@ pub fn graphConfigConsumesArtifact(alloc: Allocator, raw: []const u8, artifact_n
 }
 
 pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
@@ -32133,10 +32201,13 @@ pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     if (root.object.get("sources") != null and root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
     const max_edges_per_document: u32 = if (root.object.get("max_edges_per_document")) |value| blk: {
-        if (value != .integer or value.integer < 0 or value.integer > @as(i64, graph_asset_state.hard_max_edges_per_document)) {
-            return error.InvalidIndexConfig;
-        }
-        break :blk @intCast(value.integer);
+        const count = switch (value) {
+            .integer => |v| v,
+            .number_string => |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidIndexConfig,
+            else => return error.InvalidIndexConfig,
+        };
+        if (count < 0 or count > @as(i64, graph_asset_state.hard_max_edges_per_document)) return error.InvalidIndexConfig;
+        break :blk @intCast(count);
     } else 0;
     const artifact_sources: []GraphArtifactSource = if (root.object.get("sources") != null)
         try parseGraphArtifactSources(alloc, root)
@@ -32348,6 +32419,7 @@ fn jsonNumberAsF64(value: std.json.Value) !f64 {
     return switch (value) {
         .integer => |v| @floatFromInt(v),
         .float => |v| v,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch error.InvalidIndexConfig,
         else => error.InvalidIndexConfig,
     };
 }
@@ -32356,6 +32428,10 @@ fn jsonNumberAsU32(value: std.json.Value) !u32 {
     return switch (value) {
         .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else error.InvalidIndexConfig,
         .float => |v| if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @intFromFloat(v) else error.InvalidIndexConfig,
+        .number_string => |text| blk: {
+            const v = std.fmt.parseFloat(f64, text) catch return error.InvalidIndexConfig;
+            break :blk if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @as(u32, @intFromFloat(v)) else error.InvalidIndexConfig;
+        },
         else => error.InvalidIndexConfig,
     };
 }
@@ -32486,7 +32562,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
 
     if (root.object.get("nodes")) |nodes| {
         if (nodes != .object) return error.InvalidIndexConfig;
-        if (nodes.object.get("source") != null) return error.InvalidIndexConfig;
+        mapping.source_template = try parseOptionalGraphTemplate(alloc, nodes, "source");
         if (nodes.object.get("model")) |model| {
             if (model != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, model.string, "document")) {
@@ -32503,6 +32579,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
     if (root.object.get("edge")) |edge| {
         if (edge != .object) return error.InvalidIndexConfig;
         mapping.edge_type_template = try parseOptionalGraphTemplate(alloc, edge, "type");
+        mapping.edge_id_template = try parseOptionalGraphTemplate(alloc, edge, "edge_id");
         mapping.weight_template = try parseOptionalGraphTemplate(alloc, edge, "weight");
         if (edge.object.get("metadata")) |metadata| {
             mapping.metadata_template_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
@@ -32514,6 +32591,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
         mapping.context_doc_fields = try parseGraphContextDocFields(alloc, context);
     }
 
+    if (mapping.source_template.len > 0 and mapping.edge_id_template.len == 0) return error.InvalidIndexConfig;
     try validateGraphMappingTemplates(mapping);
     return mapping;
 }
@@ -32545,6 +32623,8 @@ fn parseGraphContextDocFields(alloc: Allocator, context: std.json.Value) ![]cons
 }
 
 fn validateGraphMappingTemplates(mapping: GraphArtifactMapping) !void {
+    try validateGraphTemplateDocFields(mapping.source_template, mapping.context_doc_fields);
+    try validateGraphTemplateDocFields(mapping.edge_id_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.target_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.edge_type_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.weight_template, mapping.context_doc_fields);
@@ -32843,7 +32923,7 @@ test "graph config parses artifact mapping templates and context fields" {
     try std.testing.expect(std.mem.indexOf(u8, mapping.metadata_template_json, "_item.evidence") != null);
 }
 
-test "graph config rejects source owner overrides undeclared doc fields and unsupported paths" {
+test "graph config rejects source mappings without ids undeclared doc fields and unsupported paths" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1"},"edge":{"type":"{{ _doc.value.tenant_id }}"}}
@@ -45092,6 +45172,51 @@ test "exact sparse vector generation remains eligible for mutation capture befor
     try std.testing.expect(!IndexManager.vectorBlockGenerationReadyAtSequence(generation, 0));
 }
 const StoreBatchOptions = backend_types.BatchOptions;
+
+test "graph artifact mapping and source clones release partial allocations" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const mapping = GraphArtifactMapping{
+                .source_template = @constCast("{{ _item.source }}"),
+                .edge_id_template = @constCast("{{ _doc.key }}"),
+                .target_template = @constCast("{{ _item.target }}"),
+                .edge_type_template = @constCast("RELATES_TO"),
+                .weight_template = @constCast("{{ _item.weight }}"),
+                .metadata_template_json = @constCast("{\"group_id\":\"g\"}"),
+                .context_doc_fields = &.{ @constCast("group_id"), @constCast("valid_at"), @constCast("") },
+            };
+            var copy = try GraphArtifactMapping.clone(alloc, mapping);
+            defer copy.deinit(alloc);
+            try std.testing.expectEqualStrings(mapping.edge_id_template, copy.edge_id_template);
+            var source = try GraphArtifactSource.clone(alloc, .{
+                .artifact_name = @constCast("facts"),
+                .path = @constCast("$.relations"),
+                .mapping = mapping,
+                .mention_edge_type = @constCast("MENTIONS"),
+            });
+            defer source.deinit(alloc);
+            try std.testing.expectEqualStrings(mapping.source_template, source.mapping.source_template);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "graph projection preserves numeric literals in configured templates" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"max_edges_per_document":10,"metrics":{"pagerank":{"damping":0.8,"tolerance":0.00001,"max_iterations":20}},"source":{"artifact":"facts","nodes":{"source":"{{ _item.source }}"},"edge":{"edge_id":18446744073709551615,"metadata":{"score":1.0000000000000001,"large":18446744073709551615}}}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 10), cfg.max_edges_per_document);
+    try std.testing.expectEqual(@as(u32, 20), cfg.metric_configs[0].max_iterations);
+    try std.testing.expectEqual(@as(f64, 0.8), cfg.metric_configs[0].damping);
+    try std.testing.expectEqual(@as(f64, 0.00001), cfg.metric_configs[0].tolerance);
+    try std.testing.expectEqualStrings("18446744073709551615", cfg.artifact_sources[0].mapping.edge_id_template);
+    try std.testing.expectEqualStrings("{\"score\":1.0000000000000001,\"large\":18446744073709551615}", cfg.artifact_sources[0].mapping.metadata_template_json);
+    for ([_][]const u8{ "{\"max_edges_per_document\":-1}", "{\"max_edges_per_document\":1.5}", "{\"max_edges_per_document\":1000001}", "{\"metrics\":{\"pagerank\":{\"max_iterations\":1.5}}}" }) |raw| {
+        try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, raw));
+    }
+}
 
 test "replay matrix reads exact native base plus captured updates and fences deletes and newer generations" {
     const alloc = std.testing.allocator;

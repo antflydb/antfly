@@ -6,6 +6,7 @@ pub const implementation_tests_only = true;
 pub const storage_backend_erased = @import("antfly_local_sources").storage_backend_erased;
 pub const lsm_backend = @import("antfly_local_sources").storage_lsm_backend;
 comptime {
+    _ = @import("data/graph_cleanup_sweep.zig");
     _ = @import("data/runtime.zig").implementation_tests;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;
     _ = @import("storage/hot_standby/restore_terminal_ledger.zig");

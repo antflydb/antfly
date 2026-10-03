@@ -3874,6 +3874,40 @@ test "storage and shard query contracts preserve search effort" {
     }
 }
 
+test "storage query contract embedding numbers preserve relationship precision" {
+    const alloc = std.testing.allocator;
+    const query = @import("antfly_local_sources").api_query_contract;
+    const body =
+        \\{"embeddings":{"dense":[1,0.5,1e-3],"sparse":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8=","k":4}},"indexes":["dense","sparse"],"limit":9,"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+    ;
+    var public = try query.parsePublicQueryRequest(alloc, null, "docs", body);
+    defer public.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0.5, 0.001 }, public.req.dense_queries[0].query.vector);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 5 }, public.req.sparse_queries[0].query.indices);
+    try std.testing.expectEqual(@as(u32, 4), public.req.sparse_queries[0].query.k);
+    try std.testing.expectEqualStrings("1.0000000000000001", public.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+    const contract = @import("antfly_local_sources").api_local_query_contract;
+    const wire = try contract.encodeStorageKernelQueryRequest(alloc, public.req);
+    defer alloc.free(wire);
+    var internal = try query.parseQueryRequest(alloc, null, "docs", wire);
+    defer internal.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, public.req.dense_queries[0].query.vector, internal.req.dense_queries[0].query.vector);
+    try std.testing.expectEqual(@as(u32, 4), internal.req.sparse_queries[0].query.k);
+    try std.testing.expectEqualStrings("1.0000000000000001", internal.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+    for ([_][]const u8{
+        \\{"embeddings":{"s":{"indices":[-1],"values":[1]}}}
+        ,
+        \\{"embeddings":{"s":{"indices":[1],"values":[1],"k":4294967296}}}
+        ,
+        \\{"embeddings":{"d":[1e100]}}
+        ,
+        \\{"embeddings":{"d":"AACAfw=="}}
+        ,
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidQueryRequest, query.parsePublicQueryRequest(alloc, null, "docs", invalid));
+    }
+}
+
 test "storage query contract preserves each vector candidate budget" {
     const alloc = std.testing.allocator;
     const contract = @import("antfly_local_sources").api_local_query_contract;

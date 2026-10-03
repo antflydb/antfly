@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const relationship_filter = @import("../graph/relationship_filter.zig");
 const builtin = @import("builtin");
 const ant_json = @import("antfly-json");
 const db_mod = @import("../storage/db/selected_root.zig").db;
@@ -31,6 +32,7 @@ const rfc3339 = @import("../common/rfc3339.zig");
 const fusion_mod = @import("../search/fusion.zig");
 const aggregations_mod = @import("../storage/db/aggregations_contract.zig");
 const public_search_request_mod = @import("public_search_request.zig");
+const public_embedding_query_mod = @import("public_embedding_query.zig");
 const public_text_query_mod = @import("public_text_query.zig");
 const public_query_string_mod = @import("public_query_string.zig");
 const public_limits = @import("antfly_public_limits");
@@ -2708,7 +2710,7 @@ pub fn parseQueryRequestWithDeadline(
         metadata_openapi.StatefulQueryRequest,
         alloc,
         body_for_contract,
-        .{},
+        .{ .parse_numbers = false },
     ) catch return classifyPublicFilterContractErrorAlloc(alloc, effective_body);
     defer parsed.deinit();
     try ensureQueryDeadline(execution_deadline_ns);
@@ -3556,8 +3558,11 @@ fn cloneFastDenseQueryAlloc(
     const owned_index_name = try alloc.dupe(u8, index_name);
     errdefer alloc.free(owned_index_name);
     const vector = switch (embedding) {
-        .@"packed" => |encoded| vector_codec.decodePackedF32Base64Alloc(alloc, encoded) catch return error.InvalidQueryRequest,
-        .dense => |dense| try alloc.dupe(f32, dense),
+        .@"packed" => |encoded| try public_embedding_query_mod.decodePackedF32Alloc(alloc, encoded),
+        .dense => |dense| blk: {
+            try public_embedding_query_mod.validateF32Values(dense);
+            break :blk try alloc.dupe(f32, dense);
+        },
     };
     return .{
         .name = name,
@@ -5629,6 +5634,8 @@ fn toOpenApiPathEdges(
             .source = edge.source,
             .target = edge.target,
             .type = edge.edge_type,
+            .edge_id = if (edge.edge_id.len > 0) edge.edge_id else null,
+            .owner_document = if (edge.owner_document.len > 0) edge.owner_document else null,
             .weight = edge.weight,
             .metadata = try pathEdgeMetadataObjectMap(alloc, edge.metadata),
         };
@@ -5670,7 +5677,7 @@ fn toOpenApiGraphPathEdges(
         } else if (connects_in_order != connects_in_reverse)
             (if (connects_in_order) .out else .in)
         else
-            try graphPathEdgeDirectionForEqualKeys(node_tables, i, edge.metadata);
+            try graphPathEdgeDirectionForEqualKeys(alloc, node_tables, i, edge.metadata);
         out[i] = .{
             .from = .{
                 .key = left_key,
@@ -5682,6 +5689,8 @@ fn toOpenApiGraphPathEdges(
             },
             .direction = direction,
             .type = edge.edge_type,
+            .edge_id = if (edge.edge_id.len > 0) edge.edge_id else null,
+            .owner_document = if (edge.owner_document.len > 0) edge.owner_document else null,
             .weight = edge.weight,
             .metadata = try pathEdgeMetadataObjectMap(alloc, edge.metadata),
         };
@@ -5690,6 +5699,7 @@ fn toOpenApiGraphPathEdges(
 }
 
 fn graphPathEdgeDirectionForEqualKeys(
+    alloc: std.mem.Allocator,
     node_tables: []const ?[]const u8,
     edge_index: usize,
     metadata: []const u8,
@@ -5701,7 +5711,9 @@ fn graphPathEdgeDirectionForEqualKeys(
         const left_table = node_tables[edge_index];
         const right_table = node_tables[edge_index + 1];
         if (!optionalStringEqual(left_table, right_table)) {
-            const target_table = graph_traversal_mod.metadataTargetTable(metadata) orelse
+            var table_scratch = graph_traversal_mod.MetadataScratch.init(alloc, null);
+            defer table_scratch.deinit();
+            const target_table = (try graph_traversal_mod.metadataTargetTable(&table_scratch, metadata)) orelse
                 return error.InvalidRemoteResponse;
             var left_is_target = optionalStringEqualsValue(left_table, target_table);
             var right_is_target = optionalStringEqualsValue(right_table, target_table);
@@ -5732,7 +5744,7 @@ fn optionalStringEqualsValue(optional: ?[]const u8, value: []const u8) bool {
 
 fn pathEdgeMetadataJsonValue(alloc: std.mem.Allocator, metadata: []const u8) !?std.json.Value {
     if (metadata.len == 0) return null;
-    return std.json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch .{ .string = try alloc.dupe(u8, metadata) };
+    return std.json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{ .parse_numbers = false }) catch .{ .string = try alloc.dupe(u8, metadata) };
 }
 
 /// Canonical GraphPathEdge metadata is object-shaped. New writes enforce this
@@ -5744,7 +5756,7 @@ fn pathEdgeMetadataObjectMap(
     metadata: []const u8,
 ) !?std.json.ArrayHashMap(std.json.Value) {
     if (metadata.len == 0) return null;
-    const value = ant_json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{}) catch return null;
+    const value = ant_json.parseFromSliceLeaky(std.json.Value, alloc, metadata, .{ .parse_numbers = false }) catch return null;
     return if (value == .object) .{ .map = value.object } else null;
 }
 
@@ -5798,8 +5810,13 @@ fn graphNodeEvidenceObjectMap(
 
             if (metadata_value == .object) {
                 if (metadata_value.object.get("mention_count")) |value| {
-                    if (value == .integer) {
-                        mention_count += value.integer;
+                    const count: ?i64 = switch (value) {
+                        .integer => |number| number,
+                        .number_string => |raw| std.fmt.parseInt(i64, raw, 10) catch null,
+                        else => null,
+                    };
+                    if (count) |number| {
+                        mention_count = std.math.add(i64, mention_count, number) catch return error.InvalidRemoteResponse;
                         saw_rollup = true;
                     }
                 }
@@ -9293,6 +9310,7 @@ fn parseLegacyPatternSteps(
             alloc.free(step.alias);
             freePatternNodeFilter(alloc, step.node_filter);
             freeOwnedStringSlice(alloc, step.edge.types);
+            step.edge.edge_filter.deinit(alloc);
         }
         alloc.free(steps);
     }
@@ -9305,6 +9323,8 @@ fn parseLegacyPatternSteps(
         graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
         const edge_types = try cloneFields(alloc, requested_edge_types);
         errdefer freeOwnedStringSlice(alloc, edge_types);
+        const edge_filter = if (step.edge) |edge| if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{} else relationship_filter.Filter{};
+        errdefer edge_filter.deinit(alloc);
         steps[i] = .{
             .alias = try alloc.dupe(u8, step.alias orelse ""),
             .node_filter = try parseLegacyPatternNodeFilter(alloc, step.node_filter),
@@ -9319,6 +9339,7 @@ fn parseLegacyPatternSteps(
                 .min_weight = legacyWeightBound(edge.min_weight),
                 .max_weight = legacyWeightBound(edge.max_weight),
                 .types = edge_types,
+                .edge_filter = edge_filter,
             } else .{ .types = edge_types },
         };
         if (step.edge != null and (steps[i].edge.min_hops == 0 or
@@ -9362,8 +9383,12 @@ fn parseLegacyGraphQueryParams(
     const requested_edge_types = value.edge_types orelse &.{};
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
+    errdefer freeOwnedStringSlice(alloc, edge_types);
+    const edge_filter = if (value.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    errdefer edge_filter.deinit(alloc);
     return .{
         .edge_types = edge_types,
+        .edge_filter = edge_filter,
         .direction = if (value.direction) |direction| switch (direction) {
             .out => .out,
             .in => .in,
@@ -9398,6 +9423,8 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
+    const edge_filter = if (traversal.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    errdefer edge_filter.deinit(alloc);
     const filter = try parseGraphFilterValue(alloc, traversal.filter);
     errdefer freePatternNodeFilter(alloc, filter);
     const fields = if (traversal.fields) |items| try cloneFields(alloc, items) else &.{};
@@ -9427,6 +9454,7 @@ fn parseGraphTraverseQuery(alloc: std.mem.Allocator, value: indexes_openapi.Grap
         .start_nodes = start,
         .params = .{
             .edge_types = edge_types,
+            .edge_filter = edge_filter,
             .direction = parseGraphDirection(traversal.direction),
             .max_depth = try parseGraphBoundedU32(traversal.max_depth, 1, 1, 64),
             .max_results = try parseGraphBoundedU32(traversal.limit, 100, 1, 10_000),
@@ -9470,6 +9498,8 @@ fn parseGraphPathQuery(
     graph_query_mod.validateEdgeTypes(requested_edge_types) catch return error.InvalidQueryRequest;
     const edge_types = try cloneFields(alloc, requested_edge_types);
     errdefer freeOwnedStringSlice(alloc, edge_types);
+    const edge_filter = if (path.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+    errdefer edge_filter.deinit(alloc);
     const filter = try parseGraphFilterValue(alloc, path.filter);
     errdefer freePatternNodeFilter(alloc, filter);
     const fields = if (path.fields) |items| try cloneFields(alloc, items) else &.{};
@@ -9482,6 +9512,7 @@ fn parseGraphPathQuery(
         .k = k,
         .params = .{
             .edge_types = edge_types,
+            .edge_filter = edge_filter,
             .direction = parseGraphDirection(path.direction),
             .max_depth = try parseGraphBoundedU32(path.max_depth, 10, 1, 64),
             .min_weight = weight_bounds.min,
@@ -9670,6 +9701,7 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
             alloc.free(edge.from);
             alloc.free(edge.to);
             freeOwnedStringSlice(alloc, edge.step.types);
+            edge.step.edge_filter.deinit(alloc);
         }
         alloc.free(edges);
     }
@@ -9686,11 +9718,14 @@ fn parseGraphMatchEdges(alloc: std.mem.Allocator, value: []const indexes_openapi
         graph_query_mod.validateEdgeTypes(requested_types) catch return error.InvalidQueryRequest;
         const types = try cloneFields(alloc, requested_types);
         errdefer freeOwnedStringSlice(alloc, types);
+        const edge_filter = if (edge.edge_filter) |predicate| relationship_filter.parsePublicAlloc(alloc, predicate) catch |err| return if (err == error.OutOfMemory) err else error.InvalidQueryRequest else relationship_filter.Filter{};
+        errdefer edge_filter.deinit(alloc);
         edges[i] = .{
             .from = from,
             .to = to,
             .step = .{
                 .types = types,
+                .edge_filter = edge_filter,
                 .direction = parseGraphDirection(edge.direction),
                 .min_hops = try parseGraphBoundedU32(edge.min_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
                 .max_hops = try parseGraphBoundedU32(edge.max_hops, 1, 1, graph_pattern_mod.max_pattern_hops),
@@ -10162,6 +10197,7 @@ fn freePatternSteps(alloc: std.mem.Allocator, steps: []const graph_pattern_mod.P
         freePatternNodeFilter(alloc, step.node_filter);
         for (step.edge.types) |edge_type| alloc.free(edge_type);
         if (step.edge.types.len > 0) alloc.free(step.edge.types);
+        step.edge.edge_filter.deinit(alloc);
     }
     if (steps.len > 0) alloc.free(steps);
 }
@@ -11177,7 +11213,7 @@ fn maybeExpandPublicDocFilterBindingsWithLimitAlloc(
     deadline_ns: ?u64,
 ) !?[]u8 {
     if (max_expanded_bytes == 0) return error.InvalidQueryRequest;
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     try ensureQueryDeadline(deadline_ns);
     if (parsed.value != .object) return error.InvalidQueryRequest;
@@ -11356,7 +11392,7 @@ fn queryBodyForGeneratedContractAlloc(
 ) !?[]u8 {
     if (!options.strip_internal_shard_fields and !options.strip_public_doc_filter_bindings and !options.strip_public_hierarchy_controls and !options.strip_query_timeout and !options.strip_graph_metric) return null;
 
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.InvalidQueryRequest;
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false }) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.InvalidQueryRequest;
 
@@ -12361,6 +12397,7 @@ fn freeGraphMatchEdges(alloc: std.mem.Allocator, edges: []const graph_pattern_mo
         alloc.free(edge.from);
         alloc.free(edge.to);
         freeOwnedStringSlice(alloc, edge.step.types);
+        edge.step.edge_filter.deinit(alloc);
     }
     if (edges.len > 0) alloc.free(edges);
 }
@@ -12417,6 +12454,7 @@ fn freeGraphQueryParams(alloc: std.mem.Allocator, params: graph_query_mod.QueryP
     for (params.edge_types) |edge_type| alloc.free(edge_type);
     if (params.edge_types.len > 0) alloc.free(params.edge_types);
     freePatternNodeFilter(alloc, params.node_filter);
+    params.edge_filter.deinit(alloc);
 }
 
 fn freeTextQueryList(alloc: std.mem.Allocator, items: []const db_mod.types.TextQuery) void {
@@ -14027,6 +14065,18 @@ fn consumerTests() type {
             try std.testing.expectEqual(indexes_openapi.GraphPathEdgeDirection.in, encoded_reverse[0].direction);
         }
 
+        test "canonical and legacy graph metadata responses preserve exact numbers" {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const alloc = arena.allocator();
+            const metadata = "{\"value\":1.00000000000000000000000000000000001,\"tiny\":1e-9999}";
+            const object = (try pathEdgeMetadataObjectMap(alloc, metadata)).?;
+            const canonical = try std.json.Stringify.valueAlloc(alloc, object, .{});
+            try std.testing.expectEqualStrings(metadata, canonical);
+            const legacy = (try pathEdgeMetadataJsonValue(alloc, metadata)).?;
+            try std.testing.expectEqualStrings(metadata, try std.json.Stringify.valueAlloc(alloc, legacy, .{}));
+        }
+
         test "canonical graph path metadata safely reads legacy non-object records" {
             var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
             defer arena_state.deinit();
@@ -14096,7 +14146,7 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("entities", encoded[0].path_edges.?[0].to.table.?);
             try std.testing.expectEqualStrings("e", encoded[0].path_edges.?[0].type);
             try std.testing.expectEqual(@as(f64, 3.0), encoded[0].path_edges.?[1].weight);
-            try std.testing.expectEqual(@as(i64, 2), encoded[0].path_edges.?[0].metadata.?.map.get("mention_count").?.integer);
+            try std.testing.expectEqualStrings("2", encoded[0].path_edges.?[0].metadata.?.map.get("mention_count").?.number_string);
             try std.testing.expectEqual(@as(usize, 2), encoded[0].provenance.?.len);
             try std.testing.expectEqualStrings("A\x1fe\x1fB", encoded[0].provenance.?[0]);
             try std.testing.expectEqualStrings("B\x1fe\x1fC", encoded[0].provenance.?[1]);
@@ -14105,7 +14155,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(usize, 1), evidence.get("path_edges").?.array.items.len);
             const edge_evidence = evidence.get("path_edges").?.array.items[0].object;
             try std.testing.expectEqualStrings("A", edge_evidence.get("source").?.string);
-            try std.testing.expectEqual(@as(i64, 2), edge_evidence.get("metadata").?.object.get("mention_count").?.integer);
+            try std.testing.expectEqualStrings("2", edge_evidence.get("metadata").?.object.get("mention_count").?.number_string);
             const mention_rollup = evidence.get("mention_rollup").?.object;
             try std.testing.expectEqual(@as(i64, 2), mention_rollup.get("mention_count").?.integer);
             try std.testing.expectEqual(@as(usize, 2), mention_rollup.get("mention_artifact_keys").?.array.items.len);
@@ -16746,6 +16796,49 @@ fn consumerTests() type {
                     parsePublicQueryRequest(std.testing.allocator, null, "docs", body),
                 );
             }
+        }
+
+        test "canonical relationship predicates parse for every graph operation and fail closed" {
+            const alloc = std.testing.allocator;
+            const bodies = [_][]const u8{
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"valid_at":"2022-01-01T00:00:00Z","known_at":"2023-01-01T00:00:00Z","properties":[{"field":"/metadata/group_id","op":"eq","value":"g"}]}}}}}
+                ,
+                \\{"graph_queries":{"path":{"index":"g","shortest_path":{"from":{"key":"Alice"},"to":{"key":"Acme"},"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}}}}
+                ,
+                \\{"graph_queries":{"paths":{"index":"g","k_shortest_paths":{"from":{"key":"Alice"},"to":{"key":"Acme"},"k":2,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}}}}
+                ,
+            };
+            for (bodies) |body| {
+                var owned = try parsePublicQueryRequest(alloc, null, "docs", body);
+                defer owned.deinit(alloc);
+                try std.testing.expect(owned.req.graph_queries[0].query.params.edge_filter.active());
+            }
+            for ([_][]const u8{
+                \\{"timeout_ms":10000,"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+                ,
+                \\{"graph_queries":{"path":{"index":"g","shortest_path":{"from":{"key":"Alice"},"to":{"key":"Acme"},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+                ,
+                \\{"graph_queries":{"paths":{"index":"g","k_shortest_paths":{"from":{"key":"Alice"},"to":{"key":"Acme"},"k":2,"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+                ,
+            }) |body| {
+                var owned = try parsePublicQueryRequest(alloc, null, "docs", body);
+                defer owned.deinit(alloc);
+                try std.testing.expectEqualStrings("1.0000000000000001", owned.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+            }
+            var matched = try parsePublicQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"facts":{"index":"g","match":{"anchor":"a","nodes":{"a":{},"b":{}},"edges":[{"from":"a","to":"b","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]},"return":{"aggregates":{"facts":{"count":"*"}}}}}}
+            );
+            defer matched.deinit(alloc);
+            try std.testing.expect(matched.req.graph_queries[0].query.match_pattern.?.edges[0].step.edge_filter.active());
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/x","op":"eq","value":null}]}}}}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_types":["R"],"edge_filter":{"valid_at":"yesterday"}}}}}
+            ));
+            try std.testing.expectError(error.InvalidQueryRequest, parsePublicQueryRequest(alloc, null, "docs",
+                \\{"graph_queries":{"path":{"index":"g","shortest_path":{"from":{"key":"Alice"},"to":{"key":"Acme"},"edge_types":["R"],"edge_filter":{"valid_at":"yesterday"}}}}}
+            ));
         }
 
         test "canonical graph traversal and paths preserve requested direction" {

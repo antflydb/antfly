@@ -1290,6 +1290,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph edge reader routes outgoing and fans out incoming adjacency",
             "distributed graph edges response round trips owned edges",
             "distributed graph retries once on topology change and succeeds",
+            "distributed K path identity preserves same type fact ids",
+            "distributed graph identity hashing",
+            "distributed weighted fact paths",
+            "distributed graph expand request preserves algebraic semiring planning flag",
+            "canonical relationship predicates",
+            "projected graph endpoint routing recognizes every source form",
+            "distributed graph edge reader finds fact owners outside the source endpoint shard",
+            "distributed graph edges response round trips owned edges",
+            "internal batch parser owns and round trips graph mutations",
+            "internal batch graph endpoint cleanup command",
+            "graph cleanup owner replay afterimages",
+            "Yen scratch reservations fail before allocation and release exactly",
             "graph workers report retired ranges as topology unavailability",
             "distributed graph incoming probe expands only positive source shards",
             "graph hydrate incoming probe wire carries pinned clock and physical allowance",
@@ -1626,14 +1638,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const rewrite_admission_contract_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn rewrite admission", "relational integrity restore staging rewrite intent" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-rewrite-admission-contract-test", "Verify scoped rewrite admission and durable intent binding")
         .dependOn(&addFilteredTestRunArtifact(b, rewrite_admission_contract_tests).step);
     const row_semantics_codec_tests = b.addTest(.{
         .root_module = api_transactions_docid_test_mod,
         .filters = &.{ "distributed txn prepare preserves JSON null", "distributed txn prepare JSON null", "internal batch JSON null", "distributed txn range guard wire" },
-        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-row-semantics-codec-test", "Verify fail-closed row semantics envelopes and allocation failure cleanup")
         .dependOn(&addFilteredTestRunArtifact(b, row_semantics_codec_tests).step);
