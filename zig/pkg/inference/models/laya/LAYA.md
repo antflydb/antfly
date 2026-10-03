@@ -1768,13 +1768,31 @@ How the numbers got here, all on the same machine and checkpoint:
   Metal and 740 ms on CPU. Removing the trunk's zero query rows brought it to
   66 ms and 331 ms.
 
-**Device scoring for packed rows (2026-09-25, reverted).** Scoring on the
-device instead of reading the hidden state back saved 2–4% at 16–64
-questions (for example 12 sentences, 64 questions: 406.8 → 399.5 ms packed)
-and nothing measurable below. It was reverted after it raced on Metal (see
-open issues). Either way, the packed Metal path is bound by encoder GPU work
-that the fused resident kernels would compute the same way, so routing
-packed rows through them (step 1c) is not expected to pay off on Metal.
+**Device scoring for packed rows (2026-09-25, restored 2026-10-03).**
+Scoring on the device instead of reading the hidden state back saved 2–4% at
+16–64 questions (for example 12 sentences, 64 questions: 406.8 → 399.5 ms
+packed) and nothing measurable below. It was reverted after intermittent
+wrong outputs on Metal, then restored once the cause, a stale embedding-table
+cache, was fixed (see below). Either way, the packed Metal path is bound by
+encoder GPU work that the fused resident kernels would compute the same way,
+so routing packed rows through them (step 1c) is not expected to pay off on
+Metal.
+
+**Stale embedding-table cache (fixed 2026-10-03).** The Metal device
+scoring failure was not a race. Metal's embedding lookup copied each table
+into a device cache keyed by the table's buffer identity (device buffer
+handle or host address) and shape. Gathering marker and anchor rows from the
+hidden state put activations into that cache. Once the buffer pool handed a
+later table of the same shape the same buffer, the lookup returned the
+earlier rows. The batching test failed in 3 of 24 Metal runs with a
+probability error up to 0.059. A regression test that reuses a pooled table
+fails on every run without the fix.
+
+Device tables are now read in place, and the host-address cache only keeps
+immutable model storage. With device scoring back on:
+- the regression test passes;
+- the batching test passes 40 of 40 runs;
+- the Laya parity tests pass on Metal against fresh PyTorch fixtures.
 
 The full raw output of every run is in
 [`work-log/completed/inference/laya/2026-09-24-tree-packing.md`](../../../../../work-log/completed/inference/laya/2026-09-24-tree-packing.md).
@@ -2255,7 +2273,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 0. Qualify packed accuracy | fine-tune | question mode **fails** the gate: 0.450 packed vs 0.621 unpacked over three seeds at equal budget (0.471 vs 0.671 on a larger recipe); distillation does not help (0.451); a question-aware trunk (`trunk_sees: "questions"`) reaches 0.554. 33× more data (Open-Jev, soft CE) leaves it at 0.464. A same-data control shows the packed layout itself learns slowly: on Open-Jev validation, unpacked 0.701 vs packed 0.607 at 16k decisions. Per-question upper layers, question-first positions and a pointer head do not close it (best 0.621). Candidate mode: Banking77 0.819 mean over two seeds with soft CE | Packed within noise of unpacked at equal budget on accuracy, soft CE, and ECE, over several seeds |
 | 1a. State cache across rows and requests | no | done (CPU and Metal) | Exact against the full row and the oracle; follow-up questions skip trunk projections and feed-forward work |
 | 1b. Segment attention | no | done (CPU and Metal); multi-row batching done (CPU and Metal, question and candidate modes) | Work proportional to visible keys; no `[L, L]` masks; physical cap raised to 32,768; cached rows compute branch queries only. Several rows per call: exact against running each row alone, isolated by construction; not yet composed with the trunk cache |
-| 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates; device scoring gave 2–4% and was reverted after a race). CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
+| 1c. Metal and CUDA packed kernels | no | Metal: fused kernels not pursued (encoder GPU work dominates); device scoring gives 2–4%. CUDA: not started | CUDA needs a segment-attention kernel, per-token RoPE, and admission of packed configs before any packed row can run there |
 | 1d. Weight quantization (q8_0) | no | done (CPU and Metal). After the CPU kernel fix (dequant+SGEMM), q8_0 matches dense speed on both backends over 760 decisions (CPU 497 vs 491 s, Metal 48 vs 49 s) and saves 37% of Metal memory | Labels identical and probabilities within 2e-2 of dense on the fixture. CPU footprint is still higher than dense (mmap'd dense weights vs allocated quantized bytes; see step 1d), not lower as hoped; a weight-storage-only footprint breakdown is open |
 | 2a. Long-context teacher (Qwen3-14B) | labels only | done; see [Long-context teacher (step 2a)](#long-context-teacher-step-2a) | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | implemented and measured; **negative result** | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. On Banking77, stage 2 made accuracy *worse* than stage 1 alone on the same checkpoint (0.8475 → 0.8350 mean over 2 seeds), despite 99%+ top-8 recall. Not adopted; see [Two-stage choice](#two-stage-choice-roadmap-2b) |
@@ -2269,16 +2287,6 @@ layers make their attention cost comparable to the decoder's. The decoder only
 pulls ahead well beyond 32k, where Laya's encoder was not pretrained anyway.
 
 Other open items:
-
-- **Metal race in device-side scoring:** gathering marker and anchor rows,
-  running the scorer and concatenating action features on the device
-  (reverted in 41b198338a) made `laya packed pipeline batches many small
-  states into fewer session calls` fail in 3 of 24 Metal runs with a
-  probability error up to 0.059, with no other GPU work. Host scoring passed
-  20 of 20. The failing sequence (row gather by host indices, linears,
-  readback, second gather, last-dimension concat with a host tensor) likely
-  exposes an ordering bug in one of those Metal primitives that other models
-  could hit too.
 
 - **Very many options:** candidate branches cannot compare options before the
   softmax. Two-stage choice (step 2b) adds that comparison but currently
