@@ -12849,7 +12849,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try context.ensureActive();
             // This fixture has no row-policy publication. The production
             // admission path treats that absence as an unprotected table.
-            if (input == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (input == .policy_publication_status) return a.dupe(u8, "null");
             self.calls += 1;
             if (self.replace_after_open and self.calls == 3) return error.CatalogGenerationChanged;
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = self.schema }, .{});
@@ -14007,7 +14007,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
         }
         fn catalog(_: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try context.ensureActive();
-            if (input == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (input == .policy_publication_status) return a.dupe(u8, "null");
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = schema_json }, .{});
             if (input != .resolve_many) return error.UnexpectedCatalogCall;
             if (input.resolve_many.targets.len != 1 or !std.mem.eql(u8, input.resolve_many.targets[0].table, "usage_records")) return error.UnexpectedCatalogCall;
@@ -14440,11 +14440,11 @@ test "httpx lookup revalidates missing catalog bindings across restore" {
         fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             // This fixture has no row policy publication. The catalog still
             // authoritatively answers the policy probe before the row lookup.
-            if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             const self: *@This() = @ptrCast(@alignCast(ptr));
             // This fixture has no row-policy publication. The production
             // admission path treats that absence as an unprotected table.
-            if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             const target = switch (call) {
                 .resolve => |target| target,
                 else => return error.UnexpectedTestCall,

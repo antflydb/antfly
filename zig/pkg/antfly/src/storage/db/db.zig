@@ -53901,6 +53901,7 @@ const DocumentExtractionEmbeddingView = struct {
         self.* = undefined;
     }
 
+    /// Takes ownership of consumer_indexes on success; the caller owns them on failure.
     fn cloneFromEnrichment(alloc: Allocator, entry: anytype, consumer_indexes: [][]u8) !DocumentExtractionEmbeddingView {
         const name = try alloc.dupe(u8, entry.name);
         errdefer alloc.free(name);
@@ -53976,25 +53977,22 @@ fn buildDocumentExtractionEmbeddingViews(
     for (db.core.index_manager.enrichments.items) |entry| {
         if (entry.kind != .embedding) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, chunk_artifact_name)) continue;
-        if (entry.expected_dims > 0) {
-            const consumer_indexes = try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims);
+        // cloneFromEnrichment takes ownership only on success. End the
+        // consumer cleanup scope before the view becomes the sole owner.
+        var view = blk: {
+            const consumers = if (entry.expected_dims > 0)
+                try db.core.index_manager.denseIndexesForEmbedding(alloc, entry.name, entry.expected_dims)
+            else
+                try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
             errdefer {
-                for (consumer_indexes) |name| alloc.free(name);
-                alloc.free(consumer_indexes);
+                for (consumers) |name| alloc.free(name);
+                alloc.free(consumers);
             }
-            var view = try DocumentExtractionEmbeddingView.cloneFromEnrichment(alloc, entry, consumer_indexes);
-            errdefer view.deinit(alloc);
-            try dense.append(alloc, view);
-        } else {
-            const consumer_indexes = try db.core.index_manager.sparseIndexesForEmbedding(alloc, entry.name);
-            errdefer {
-                for (consumer_indexes) |name| alloc.free(name);
-                alloc.free(consumer_indexes);
-            }
-            var view = try DocumentExtractionEmbeddingView.cloneFromEnrichment(alloc, entry, consumer_indexes);
-            errdefer view.deinit(alloc);
-            try sparse.append(alloc, view);
-        }
+            break :blk try DocumentExtractionEmbeddingView.cloneFromEnrichment(alloc, entry, consumers);
+        };
+        errdefer view.deinit(alloc);
+        const target = if (entry.expected_dims > 0) dense else sparse;
+        try target.append(alloc, view);
     }
 }
 
@@ -54015,43 +54013,33 @@ fn buildDocumentExtractionCatalogView(
         if (entry.kind != .chunk) continue;
         if (!std.mem.eql(u8, entry.source_artifact_name, artifact_name)) continue;
 
-        const name = try alloc.dupe(u8, entry.name);
-        errdefer alloc.free(name);
-        const source_field = try alloc.dupe(u8, entry.source_field);
-        errdefer alloc.free(source_field);
-        const chunker_json = if (entry.chunker_json.len > 0) try alloc.dupe(u8, entry.chunker_json) else "";
-        errdefer if (chunker_json.len > 0) alloc.free(@constCast(chunker_json));
-
+        var chunk = DocumentExtractionChunkView{};
+        errdefer chunk.deinit(alloc);
+        chunk.name = try alloc.dupe(u8, entry.name);
+        chunk.source_field = try alloc.dupe(u8, entry.source_field);
+        chunk.chunker_json = if (entry.chunker_json.len > 0) try alloc.dupe(u8, entry.chunker_json) else "";
+        chunk.chunk_size = entry.chunk_size;
+        chunk.chunk_overlap = entry.chunk_overlap;
         const include_default_full_text = entry.full_text_index or
             try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, entry.chunker_json);
-        const text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
-        errdefer {
-            for (text_indexes) |index_name| alloc.free(index_name);
-            alloc.free(text_indexes);
-        }
+        chunk.text_indexes = try db.core.index_manager.textIndexesForChunk(alloc, entry.name, include_default_full_text);
 
         var dense = std.ArrayListUnmanaged(DocumentExtractionEmbeddingView).empty;
-        errdefer {
+        defer {
             for (dense.items) |*embedding| embedding.deinit(alloc);
             dense.deinit(alloc);
         }
         var sparse = std.ArrayListUnmanaged(DocumentExtractionEmbeddingView).empty;
-        errdefer {
+        defer {
             for (sparse.items) |*embedding| embedding.deinit(alloc);
             sparse.deinit(alloc);
         }
         try buildDocumentExtractionEmbeddingViews(alloc, db, entry.name, &dense, &sparse);
-
-        try chunks.append(alloc, .{
-            .name = name,
-            .source_field = source_field,
-            .chunker_json = chunker_json,
-            .chunk_size = entry.chunk_size,
-            .chunk_overlap = entry.chunk_overlap,
-            .text_indexes = text_indexes,
-            .dense_embeddings = try dense.toOwnedSlice(alloc),
-            .sparse_embeddings = try sparse.toOwnedSlice(alloc),
-        });
+        // Each detached slice moves directly into the chunk's cleanup scope,
+        // including failures in the second detach or in the outer append.
+        chunk.dense_embeddings = try dense.toOwnedSlice(alloc);
+        chunk.sparse_embeddings = try sparse.toOwnedSlice(alloc);
+        try chunks.append(alloc, chunk);
     }
     return .{ .chunks = try chunks.toOwnedSlice(alloc) };
 }
@@ -80802,6 +80790,7 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         .query = .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } },
         .limit = 3,
         .search_effort = 1.0,
+        .return_mode = .member,
     });
     defer dense_members.deinit();
     try std.testing.expectEqual(@as(usize, 3), dense_members.hits.len);
@@ -80863,6 +80852,7 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         .query = .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } },
         .limit = 3,
         .search_effort = 1.0,
+        .return_mode = .member,
     });
     defer sparse_members.deinit();
     try std.testing.expectEqual(@as(usize, 3), sparse_members.hits.len);
@@ -153276,3 +153266,74 @@ pub const test_support = if (builtin.is_test) struct {
     pub const ensureDurableReplicationStartupBarrier = fixture_owner.DB.ensureDurableReplicationStartupBarrier;
     pub const flushDurableReplicationOutboxes = fixture_owner.DB.flushDurableReplicationOutboxes;
 } else struct {};
+
+test "document extraction catalog snapshot releases every allocation on failure" {
+    const Harness = struct {
+        const Entry = struct {
+            kind: enum { chunk, embedding },
+            name: []const u8,
+            source_artifact_name: []const u8,
+            source_field: []const u8 = "text",
+            expected_dims: u32 = 0,
+            producer_json: []const u8 = "{\"model\":\"test\"}",
+            chunker_json: []const u8 = "{}",
+            full_text_index: bool = true,
+            chunk_size: u32 = 10,
+            chunk_overlap: u32 = 2,
+        };
+        const Lock = struct {
+            held: bool = false,
+            fn lockShared(self: *@This()) void {
+                std.debug.assert(!self.held);
+                self.held = true;
+            }
+            fn unlockShared(self: *@This()) void {
+                std.debug.assert(self.held);
+                self.held = false;
+            }
+        };
+        const Manager = struct {
+            catalog_mutex: Lock = .{},
+            enrichments: struct { items: []const Entry } = .{ .items = &.{
+                .{ .kind = .chunk, .name = "chunks", .source_artifact_name = "asset" },
+                .{ .kind = .embedding, .name = "dense", .source_artifact_name = "chunks", .expected_dims = 2 },
+                .{ .kind = .embedding, .name = "sparse", .source_artifact_name = "chunks" },
+                .{ .kind = .chunk, .name = "other_chunks", .source_artifact_name = "asset" },
+                .{ .kind = .embedding, .name = "other_dense", .source_artifact_name = "other_chunks", .expected_dims = 2 },
+                .{ .kind = .embedding, .name = "other_sparse", .source_artifact_name = "other_chunks" },
+            } },
+            fn indexes(self: *@This(), alloc: Allocator) ![][]u8 {
+                std.debug.assert(self.catalog_mutex.held);
+                const names = try alloc.alloc([]u8, 1);
+                errdefer alloc.free(names);
+                names[0] = try alloc.dupe(u8, "consumer");
+                return names;
+            }
+            fn denseIndexesForEmbedding(self: *@This(), alloc: Allocator, _: []const u8, _: u32) ![][]u8 {
+                return self.indexes(alloc);
+            }
+            fn sparseIndexesForEmbedding(self: *@This(), alloc: Allocator, _: []const u8) ![][]u8 {
+                return self.indexes(alloc);
+            }
+            fn textIndexesForChunk(self: *@This(), alloc: Allocator, _: []const u8, _: bool) ![][]u8 {
+                return self.indexes(alloc);
+            }
+        };
+        fn run(alloc: Allocator) !void {
+            var manager = Manager{};
+            defer std.debug.assert(!manager.catalog_mutex.held);
+            const db = .{ .core = .{ .index_manager = &manager } };
+            var snapshot = try buildDocumentExtractionCatalogView(alloc, db, "asset");
+            defer snapshot.deinit(alloc);
+            try std.testing.expectEqual(@as(usize, 2), snapshot.chunks.len);
+            for (snapshot.chunks) |chunk| {
+                try std.testing.expectEqual(@as(usize, 1), chunk.dense_embeddings.len);
+                try std.testing.expectEqual(@as(usize, 1), chunk.sparse_embeddings.len);
+                try std.testing.expectEqualStrings("consumer", chunk.text_indexes[0]);
+                try std.testing.expectEqualStrings("consumer", chunk.dense_embeddings[0].consumer_indexes[0]);
+                try std.testing.expectEqualStrings("consumer", chunk.sparse_embeddings[0].consumer_indexes[0]);
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}

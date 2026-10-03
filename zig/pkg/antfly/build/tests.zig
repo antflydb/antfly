@@ -275,7 +275,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-system-catalog-report-bench", "Run opt-in report apply, repair and selected admission workloads").dependOn(&run_admission_bench.step);
     const system_catalog_api_tests = b.addTest(.{
         .root_module = api_http_runtime_test_mod,
-        .filters = &.{ "system catalog", "ordinary read needs no principal without policy but active policy fails closed", "FK publication upgrade response excludes unknown mutation outcomes", "FK publication reports missing setting authority as service unavailable", "prepared query routing", "routing session pins every table", "metadata.table status encoder", "metadata.table detail encoder", "public table constraint lifecycle accepts explicit epoch zero" },
+        .filters = &.{ "system catalog", "ordinary reads and writes distinguish absent policy from unavailable authority", "FK publication upgrade response excludes unknown mutation outcomes", "FK publication reports missing setting authority as service unavailable", "prepared query routing", "routing session pins every table", "metadata.table status encoder", "metadata.table detail encoder", "public table constraint lifecycle accepts explicit epoch zero" },
     });
     const system_catalog_api_step = b.step("antfly-system-catalog-api-test", "Run qualified catalog HTTP authorization and protocol tests");
     system_catalog_api_step.dependOn(&b.addRunArtifact(system_catalog_api_tests).step);

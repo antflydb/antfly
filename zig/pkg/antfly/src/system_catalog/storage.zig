@@ -200,14 +200,11 @@ pub fn loadPolicyPublication(alloc: std.mem.Allocator, txn: *docstore.DocStore.T
     return parsed;
 }
 
-pub fn loadPolicyPublicationStamp(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !policies.PublicationStamp {
+pub fn loadPolicyPublicationStamp(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, table_id: u64) !?policies.PublicationStamp {
     const key = try policyPublicationStampKeyAlloc(alloc, group_id, table_id);
     defer alloc.free(key);
     const bytes = txn.get(key) catch |err| switch (err) {
-        // No stamp row at all means this table never had row-policy install
-        // authority provisioned (same convention as loadServingPolicyInstallSnapshot's
-        // missing-publication case), not that the catalog changed underfoot.
-        error.NotFound => return error.RowPolicyUnsupported,
+        error.NotFound => return null,
         else => return err,
     };
     var parsed = try std.json.parseFromSlice(policies.PublicationStamp, alloc, bytes, .{});

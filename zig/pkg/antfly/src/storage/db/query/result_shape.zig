@@ -554,19 +554,6 @@ pub fn reshapeChunkBackedResult(
         for (parents.items) |*hit| hit.deinit(alloc);
         parents.deinit(alloc);
     }
-    // Multiple named sources (e.g. two direct document-level embeddings) can
-    // resolve to the same parent id without being chunk fragments of one
-    // another. Folding them into one representative would silently drop a
-    // real member. Set the loser aside here instead and append it as its own
-    // independent hit once primary grouping is complete, so a page asking
-    // for more hits than there are distinct parents still surfaces every
-    // source rather than truncating early.
-    var extra_direct_members = std.ArrayListUnmanaged(types.SearchHit).empty;
-    errdefer {
-        for (extra_direct_members.items) |*hit| hit.deinit(alloc);
-        extra_direct_members.deinit(alloc);
-    }
-
     for (raw.hits, 0..) |chunk_hit, chunk_index| {
         var unit_identity = if (group_by_unit)
             try resolveHitUnitIdentity(
@@ -624,17 +611,6 @@ pub fn reshapeChunkBackedResult(
 
         const parent_hit = &parents.items[gop.value_ptr.*];
         if (parent_hit.doc_ordinal == null) parent_hit.doc_ordinal = chunk_hit.doc_ordinal;
-        if (gop.found_existing and !group_by_unit and
-            !try hitHasChunkIdentity(alloc, chunk_hit) and
-            !try hitHasChunkIdentity(alloc, .{ .id = parent_hit.id, .artifact_ref = parent_hit.artifact_ref }))
-        {
-            // Neither this hit nor the existing representative is a chunk
-            // fragment, so they are independent members that merely share a
-            // resolved parent (e.g. two direct embedding sources on the same
-            // document). Preserve this one instead of folding it away.
-            try extra_direct_members.append(alloc, try chunk_hit.clone(alloc));
-            continue;
-        }
         if (parent_hit.score == null or (chunk_hit.score != null and chunk_hit.score.? > parent_hit.score.?)) {
             parent_hit.score = chunk_hit.score;
             parent_hit.distance = chunk_hit.distance;
@@ -667,12 +643,6 @@ pub fn reshapeChunkBackedResult(
             });
             parent_hit.chunk_hits = try chunks.toOwnedSlice(alloc);
         }
-    }
-
-    {
-        const extras = try extra_direct_members.toOwnedSlice(alloc);
-        defer alloc.free(extras);
-        try parents.appendSlice(alloc, extras);
     }
 
     if (parents.items.len > 0) {
@@ -1846,16 +1816,9 @@ pub fn postprocessVectorSearchResult(
         .filter_many = processor.filter_visible_many,
     });
     errdefer filtered.deinit();
-    // Artifact-backed vector indexes retain one independent member for every
-    // (artifact, source key). Raw member modes therefore deduplicate by the
-    // complete artifact identity, not by the resolved document key. Grouped
-    // document-level search still folds chunk fragments down to one hit per
-    // parent, but two differently-sourced direct members (same resolved id,
-    // different artifact) are not chunk fragments of one another and must
-    // stay distinct going into reshapeChunkBackedResult, which is what
-    // actually decides whether same-id members fold together or remain
-    // independent hits (hitHasChunkIdentity). Chunk members remain distinct
-    // until hierarchy grouping.
+    // Preserve complete member identity before hierarchy grouping. Raw modes
+    // expose each member; source/unit modes subsequently fold all members
+    // sharing that hierarchy identity and keep the best relevance score.
     if (req.return_mode == .member or req.return_mode == .chunk or chunk_backed) {
         try dedupeSearchHitsByMemberIdentity(alloc, &filtered);
     } else {
@@ -2966,10 +2929,6 @@ test "reshapeChunkBackedResult orders equal-score parent hits by doc id" {
 test "reshapeChunkBackedResult uses the best descendant relevance score and distance" {
     const alloc = std.testing.allocator;
 
-    // A real chunk hit always carries a chunk artifact_ref (or an
-    // artifact-encoded id hitHasChunkIdentity can decode); mark these the
-    // same way so same-parent folding doesn't mistake them for independent
-    // direct members of one document (#931's multi-source guard).
     var raw_hits = try alloc.alloc(types.SearchHit, 2);
     raw_hits[0] = .{
         .id = try alloc.dupe(u8, "doc:a#0"),
@@ -3456,4 +3415,57 @@ test "externalizeSearchResultArtifactIds externalizes nested unit chunk hits" {
     try std.testing.expectEqual(types.ArtifactKind.chunk, artifact_ref.kind);
     try std.testing.expectEqual(@as(?u32, 0), artifact_ref.chunk_id);
     try std.testing.expectEqualStrings("page:000001", artifact_ref.unit_id.?);
+}
+
+test "reshapeChunkBackedResult source grouping folds assets embeddings and mixed members before paging" {
+    const alloc = std.testing.allocator;
+    for (0..3) |variant| {
+        for ([_]types.ReturnMode{ .parent, .parent_with_chunks, .member, .chunk }) |mode| {
+            for (0..2) |offset| {
+                const hits = try alloc.alloc(types.SearchHit, 3);
+                for (hits, 0..) |*hit, i| {
+                    const document_id: []const u8 = if (i == 1) "doc:b" else "doc:a";
+                    hit.* = .{
+                        .id = try std.fmt.allocPrint(alloc, "{s}#{d}", .{ document_id, i }),
+                        .doc_ordinal = if (i == 1) 8 else 7,
+                        .score = if (i == 0) 0.2 else if (i == 1) 0.7 else 0.9,
+                        .distance = if (i == 0) 0.8 else if (i == 1) 0.3 else 0.1,
+                        .artifact_ref = .{
+                            .document_id = try alloc.dupe(u8, document_id),
+                            .name = try alloc.dupe(u8, if (i == 0) "first" else "second"),
+                            .kind = if (variant == 0) .asset else if (variant == 1 or i == 0) .embedding else .chunk,
+                            .unit_id = if (variant == 0) try std.fmt.allocPrint(alloc, "page:{d}", .{i}) else null,
+                            .chunk_id = if (variant == 2 and i != 0) @intCast(i) else null,
+                        },
+                    };
+                }
+                var result = try reshapeChunkBackedResult(alloc, .{
+                    .return_mode = mode,
+                    .offset = if (mode == .member or mode == .chunk) 0 else @intCast(offset),
+                    .limit = if (mode == .member or mode == .chunk) 3 else 1,
+                    .include_stored = false,
+                }, .{ .alloc = alloc, .hits = hits, .total_hits = 3 }, .{
+                    .ctx = null,
+                    .resolve_parent_id = TestChunkParentShaper.resolveParentId,
+                    .load_parent_stored = TestChunkParentShaper.loadParentStored,
+                });
+                defer result.deinit();
+                if (mode == .member or mode == .chunk) {
+                    // Raw modes retain every distinct source/unit identity.
+                    try std.testing.expectEqual(@as(u32, 3), result.total_hits);
+                    try std.testing.expectEqual(@as(usize, 3), result.hits.len);
+                } else {
+                    try std.testing.expectEqual(@as(u32, 2), result.total_hits);
+                    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+                    const hit = result.hits[0];
+                    try std.testing.expectEqualStrings(if (offset == 0) "doc:a" else "doc:b", hit.id);
+                    try std.testing.expectEqual(@as(?f32, if (offset == 0) 0.9 else 0.7), hit.score);
+                    try std.testing.expectEqual(@as(?f32, if (offset == 0) 0.1 else 0.3), hit.distance);
+                    if (mode == .parent_with_chunks) {
+                        try std.testing.expectEqual(@as(usize, if (variant == 2) 1 else 0), hit.chunk_hits.len);
+                    }
+                }
+            }
+        }
+    }
 }
