@@ -770,7 +770,13 @@ pub fn transferOwnerLeadership(io: std.Io, first: *data_runtime.DataServer, peer
     try std.testing.expect(candidate_status.applied_index >= first_status.hard.commit_index);
     // A follower campaign cannot displace a healthy lease-holding leader.
     // Request the Raft protocol's explicit, caught-up leadership transfer.
-    try leader.data_raft.?.host.http_host.transferLeader(group_id, candidate_status.id);
+    {
+        // The mounted service's progress driver owns this runtime too.
+        // Serialize the direct fixture command with its ready pass.
+        platform.sync.lockYielding(&leader.data_raft_mutex);
+        defer leader.data_raft_mutex.unlock();
+        try leader.data_raft.?.host.http_host.transferLeader(group_id, candidate_status.id);
+    }
     const deadline = platform.time.monotonicNs() +| 20 * std.time.ns_per_s;
     while (platform.time.monotonicNs() < deadline) {
         const a = raftStatus(first, group_id);
