@@ -744,6 +744,7 @@ fn awaitBuilderCatalogReadiness(alloc: std.mem.Allocator, io: std.Io, metadata: 
         if (builderOwnerReadReady(alloc, metadata, table_name)) |_| return else |err| {
             switch (err) {
                 error.StorageReadTemporarilyUnavailable,
+                error.GroupLeaderUnavailable,
                 error.IntegrityCatalogUnavailable,
                 error.IntegrityTopologyBusy,
                 error.OwnerIdentityNotReady,
