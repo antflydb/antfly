@@ -62627,7 +62627,14 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     // Probe each member's own row. Ancestor hydration may belong to another
     // range; an absent local source/unit is not proof this member is missing.
     for (hits, 0..) |hit, i| {
-        try pending.append(scratch, .{ .key = try encodeStoreLookupKeyAlloc(self, scratch, hit.id), .hit_index = i });
+        // Named vector members resolve their public hit id to the source
+        // document/chunk, which may be shared by several embeddings. The
+        // artifact reference retains the member's authoritative stored key.
+        const key = if (hit.artifact_ref) |artifact_ref|
+            try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
+        else
+            try encodeStoreLookupKeyAlloc(self, scratch, hit.id);
+        try pending.append(scratch, .{ .key = key, .hit_index = i });
     }
     std.mem.sort(ProbeKey, pending.items, {}, struct {
         fn lessThan(_: void, a: ProbeKey, b: ProbeKey) bool {
@@ -81032,6 +81039,60 @@ test "db vector indexes combine direct document and chunk-backed artifact source
         .search_effort = 1.0,
         .return_mode = .unit_with_chunks,
     }));
+
+    // Removing an embedding row leaves its ANN/posting member behind until
+    // retirement catches up. The source still exists and must not establish
+    // presence for that member or merge its score into the surviving one.
+    try db.core.store.delete(direct_dense);
+    try db.core.store.delete(direct_sparse);
+    for ([_]bool{ false, true }) |include_stored| {
+        for ([_]bool{ false, true }) |is_sparse| {
+            const index_name = if (is_sparse) "mixed_sparse" else "mixed_dense";
+            const missing_name = if (is_sparse) "title_sparse_v1" else "title_dense_v1";
+            const surviving_name = if (is_sparse) "summary_sparse_v1" else "summary_dense_v1";
+            const query: types.Query = if (is_sparse)
+                .{ .sparse_knn = .{ .indices = &.{1}, .values = &.{1.0}, .k = 3 } }
+            else
+                .{ .dense_knn = .{ .vector = &.{ 0.0, 0.0 }, .k = 3 } };
+            var req = types.SearchRequest{ .index_name = index_name, .query = query, .limit = 3, .return_mode = .member, .include_stored = include_stored, .search_effort = 1.0 };
+            var members = try db.search(alloc, req);
+            defer members.deinit();
+            try std.testing.expectEqual(@as(usize, 2), members.hits.len);
+            try std.testing.expectEqual(@as(u32, 2), members.total_hits);
+            for (members.hits) |hit| try std.testing.expect(!std.mem.eql(u8, hit.artifact_ref.?.name, missing_name));
+
+            req.limit = 1;
+            var page = try db.search(alloc, req);
+            defer page.deinit();
+            try std.testing.expectEqual(@as(usize, 1), page.hits.len);
+            try std.testing.expectEqualStrings(surviving_name, page.hits[0].artifact_ref.?.name);
+            req.offset = 1;
+            var tail = try db.search(alloc, req);
+            defer tail.deinit();
+            try std.testing.expectEqual(@as(usize, 1), tail.hits.len);
+            try std.testing.expect(!std.mem.eql(u8, tail.hits[0].artifact_ref.?.name, missing_name));
+
+            var composed_req = types.SearchRequest{ .limit = 3, .return_mode = .member, .include_stored = include_stored, .search_effort = 1.0 };
+            if (is_sparse) {
+                composed_req.sparse_queries = &.{
+                    .{ .name = "first", .index_name = index_name, .query = query.sparse_knn },
+                    .{ .name = "second", .index_name = index_name, .query = query.sparse_knn },
+                };
+            } else {
+                composed_req.dense_queries = &.{
+                    .{ .name = "first", .index_name = index_name, .query = query.dense_knn },
+                    .{ .name = "second", .index_name = index_name, .query = query.dense_knn },
+                };
+            }
+            var composed = try db.search(alloc, composed_req);
+            defer composed.deinit();
+            try std.testing.expectEqual(@as(usize, 2), composed.hits.len);
+            for (composed.hits) |hit| {
+                try std.testing.expect(!std.mem.eql(u8, hit.artifact_ref.?.name, missing_name));
+                try std.testing.expectEqual(@as(usize, 2), hit.index_scores.len);
+            }
+        }
+    }
 }
 
 fn expectDenseEmbeddingArtifactValue(alloc: Allocator, value: []const u8, source_hash: ?u64, dims: usize) !void {
@@ -106423,18 +106484,32 @@ test "db query drops full text hits whose stored document row was deleted direct
     try db.core.store.put(remote_member_key, "{}");
     defer db.core.store.delete(remote_member_key) catch {};
 
+    // An embedding member can exist locally even when its source chunk,
+    // unit and document belong to another range. Canonical artifact identity,
+    // rather than its source/public id, must drive the probe under OOM too.
+    const remote_source_key = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc:off-shard", "remote_chunks", "document:000001", 0);
+    defer alloc.free(remote_source_key);
+    const remote_embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, remote_source_key, "remote_dense");
+    defer alloc.free(remote_embedding_key);
+    try db.core.store.put(remote_embedding_key, "{}");
+    defer db.core.store.delete(remote_embedding_key) catch {};
+    var remote_embedding_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, remote_embedding_key)).?;
+    defer remote_embedding_ref.deinit(alloc);
+
     const PresenceAllocationCheck = struct {
-        fn run(test_alloc: Allocator, active_db: *DB, remote_key: []u8) !void {
+        fn run(test_alloc: Allocator, active_db: *DB, remote_key: []u8, embedding_ref: types.ArtifactRef) !void {
             const keep = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
                 .{ .id = @constCast("doc:a") },
                 .{ .id = @constCast("doc:b") },
                 .{ .id = remote_key },
+                .{ .id = @constCast("doc:off-shard"), .artifact_ref = embedding_ref },
+                .{ .id = @constCast("doc:b"), .artifact_ref = .{ .document_id = @constCast("doc:b"), .name = @constCast("absent_embedding"), .kind = .embedding } },
             });
             defer test_alloc.free(keep);
-            try std.testing.expectEqualSlices(bool, &.{ false, true, true }, keep);
+            try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, keep);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key });
+    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_embedding_ref });
 
     // Presence is a candidate visibility rule, including IDs-only and count
     // requests. Apply it before offset/limit, and refill an orphaned top hit.

@@ -599,6 +599,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "postprocessTextSearchResult preserves exact upstream total when page is unchanged",
             "unit relevance grouping rejects source-backed text and vector results",
             "postprocessTextSearchResult forwards batch stored loader to pattern filters",
+            "parent field filter cache owns allocation failures and preserves input",
             "normalizeChunkArtifactForQuery strips private unit revision metadata",
             "db lookup includes chunk artifacts when _chunks is requested",
             "db lookup includes unified artifact projection when _artifacts is requested",

@@ -1535,7 +1535,10 @@ pub fn applyStoredSearchPatternFilters(
                 defer alloc.free(parent_id);
                 if (parent_stored_cache.get(parent_id)) |cached| break :pblk cached;
                 const loaded = try executor.load_parent_stored.?(executor.ctx, alloc, unprojected_parent_req, parent_id);
+                errdefer if (loaded) |bytes| alloc.free(bytes);
                 const owned_key = try alloc.dupe(u8, parent_id);
+                errdefer alloc.free(owned_key);
+                // Transfer both allocations only after insertion succeeds.
                 try parent_stored_cache.put(alloc, owned_key, loaded);
                 break :pblk loaded;
             } else if (hit.stored_data) |stored|
@@ -3363,4 +3366,39 @@ test "reshapeChunkBackedResult source grouping folds assets embeddings and mixed
             }
         }
     }
+}
+
+test "parent field filter cache owns allocation failures and preserves input" {
+    const Harness = struct {
+        fn run(alloc: Allocator) !void {
+            const ids = [_][]const u8{ "doc:a#0", "doc:a#1", "doc:b#0", "doc:c#0", "doc:c#1" };
+            var raw = types.SearchResult{ .alloc = alloc, .hits = &.{}, .total_hits = ids.len };
+            defer raw.deinit();
+            raw.hits = try alloc.alloc(types.SearchHit, ids.len);
+            for (raw.hits) |*hit| hit.* = .{ .id = &.{} };
+            for (raw.hits, ids) |*hit, id| hit.id = try alloc.dupe(u8, id);
+            var loader = TestParentFieldFilterLoader{};
+            var result = applyStoredSearchPatternFilters(alloc, .{
+                .return_mode = .member,
+                .filter_query_json = "{\"term\":{\"category\":\"garden\"}}",
+            }, raw, .{
+                .ctx = &loader,
+                .load_stored = TestParentFieldFilterLoader.loadStored,
+                .resolve_parent_id = TestParentFieldFilterLoader.resolveParentId,
+                .load_parent_stored = TestParentFieldFilterLoader.loadParentStored,
+            }) catch |err| {
+                // A failed cache/load/filter operation must leave the input
+                // owned by the caller, including every member identity.
+                try std.testing.expectEqual(@as(usize, ids.len), raw.hits.len);
+                for (raw.hits, ids) |hit, id| try std.testing.expectEqualStrings(id, hit.id);
+                return err;
+            };
+            raw = .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 2), result.hits.len);
+            try std.testing.expectEqual(@as(usize, 3), loader.load_parent_calls);
+            try std.testing.expectEqual(@as(usize, 0), loader.load_stored_calls);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
