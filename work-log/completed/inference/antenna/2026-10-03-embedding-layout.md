@@ -1,8 +1,10 @@
 # Antenna embedding layout and classification targets, 2026-10-03
 
 Follows 2026-09-26-native-distillation.md. Two questions:
-- **Embedding layout.** Can the shared Antenna trunk produce embeddings (ANTENNA.md, "Why embeddings force a layout decision", plan step 7)?
-- **Classification targets.** Do GLiNER2.5-Decide's soft targets close the classification gap left after stage 3?
+- **Embedding layout.** Can the shared Antenna trunk produce embeddings
+  (ANTENNA.md, "Why embeddings force a layout decision", plan step 7)?
+- **Classification targets.** Do GLiNER2.5-Decide's soft targets close the
+  classification gap left after stage 3?
 
 All runs use the clean recipe, with permissively licensed data only. The
 student is run21, the clean distilled trunk.
@@ -33,8 +35,12 @@ A second distillation epoch from run21's student is the remaining lever
 
 **Setup**
 - **Features:** the frozen trunk's mean-pooled final states.
-- **Head:** a linear or MLP head, trained on cached features with symmetric in-batch InfoNCE (temperature 0.05) over 30,000 SQuAD (question, paragraph) pairs, with or without cosine distillation toward granite-embedding-english-r2 (Apache 2.0, ModernBERT-base, CLS pooling).
-- **Evaluation:** the 10,570 SQuAD validation questions retrieving their paragraph among all 2,067 validation paragraphs.
+- **Head:** a linear or MLP head, trained on cached features with symmetric
+  in-batch InfoNCE (temperature 0.05) over 30,000 SQuAD (question, paragraph)
+  pairs, with or without cosine distillation toward
+  granite-embedding-english-r2 (Apache 2.0, ModernBERT-base, CLS pooling).
+- **Evaluation:** the 10,570 SQuAD validation questions retrieving their
+  paragraph among all 2,067 validation paragraphs.
 
 | Model | R@1 | R@10 | NDCG@10 |
 | --- | --- | --- | --- |
@@ -48,17 +54,25 @@ A second distillation epoch from run21's student is the remaining lever
 
 **Findings**
 - The best frozen-trunk head reaches 55% of the teacher's NDCG@10.
-- The extraction-distilled trunk's pooled states carry almost no retrieval signal on their own (0.013), less than untrained ModernBERT-base's.
-- Head capacity and the distillation target don't help, so the trunk itself would have to be trained for embeddings.
+- The extraction-distilled trunk's pooled states carry almost no retrieval
+  signal on their own (0.013), less than untrained ModernBERT-base's.
+- Head capacity and the distillation target don't help, so the trunk itself
+  would have to be trained for embeddings.
 
 ## Embedding: training the top of the trunk
 
 `scripts/antenna/embedding_unfreeze_probe.py`.
 
 **Setup**
-- **Training:** fine-tune the top k trunk layers and the final norm (learning rate 2e-5) plus a linear head (1e-3) on 20,000 SQuAD pairs for one epoch, with InfoNCE.
-- **Anchor:** optionally anchored by the z-space MSE between the updated and the original trunk's final states on paragraph tokens (weight 1).
-- **Evaluation:** retrieval as above. Extraction is the GLiNER neck and heads on the updated trunk, scored with `baselines.py` against the unchanged student. These are distilled students before stage 3, so the numbers compare with each other, not with stage-3 results.
+- **Training:** fine-tune the top k trunk layers and the final norm (learning
+  rate 2e-5) plus a linear head (1e-3) on 20,000 SQuAD pairs for one epoch,
+  with InfoNCE.
+- **Anchor:** optionally anchored by the z-space MSE between the updated and
+  the original trunk's final states on paragraph tokens (weight 1).
+- **Evaluation:** retrieval as above. Extraction is the GLiNER neck and heads
+  on the updated trunk, scored with `baselines.py` against the unchanged
+  student. These are distilled students before stage 3, so the numbers compare
+  with each other, not with stage-3 results.
 
 | Setting | Retrieval NDCG@10 | All NER sets | Held-out NER | All classification sets |
 | --- | --- | --- | --- | --- |
@@ -70,8 +84,11 @@ A second distillation epoch from run21's student is the remaining lever
 
 **Findings**
 - Four layers buy nothing over the frozen head.
-- Eight reach 69% of the teacher and cost about 0.05 NER F1. The anchor keeps half the NER but gives back most of the retrieval gain.
-- Longer training would raise retrieval, but every gain from the shared trunk is paid for in extraction quality, and it starts far below a dedicated embedder.
+- Eight reach 69% of the teacher and cost about 0.05 NER F1. The anchor keeps
+  half the NER but gives back most of the retrieval gain.
+- Longer training would raise retrieval, but every gain from the shared trunk
+  is paid for in extraction quality, and it starts far below a dedicated
+  embedder.
 
 ## Proposed step-7 decision: a separate embedding pass
 
@@ -96,5 +113,7 @@ extraction-trained trunk, not the target.
 
 **Still open**
 - **Decision:** owner sign-off.
-- **Chunk-boundary head:** whether it can share the trunk. It is a token-level task, closer to extraction, and untested.
-- **Comparison:** Qwen3-Embedding-0.6B on the same SQuAD probe, for a direct comparison with granite.
+- **Chunk-boundary head:** whether it can share the trunk. It is a token-level
+  task, closer to extraction, and untested.
+- **Comparison:** Qwen3-Embedding-0.6B on the same SQuAD probe, for a direct
+  comparison with granite.

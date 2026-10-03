@@ -627,10 +627,13 @@ different sizes; see the report for caveats).
   fine-tune. The trunk stays bit-identical, so it keeps serving the GLiNER
   heads.
 - **Embeddings (step 7):** the shared trunk does not embed well.
-  - A head on the frozen trunk reaches 55% of granite-embedding-english-r2's SQuAD retrieval NDCG@10 (0.454 against 0.823).
+  - A head on the frozen trunk reaches 55% of granite-embedding-english-r2's
+    SQuAD retrieval NDCG@10 (0.454 against 0.823).
   - Training the top eight layers reaches 69% and costs about 0.05 NER F1.
-  - Proposed: option 3, a separate pass with the embedder Antfly already ships (Qwen3-Embedding-0.6B).
-  - Details: [work-log/completed/inference/antenna/2026-10-03-embedding-layout.md](../../../../../work-log/completed/inference/antenna/2026-10-03-embedding-layout.md).
+  - Proposed: option 3, a separate pass with the embedder Antfly already ships
+    (Qwen3-Embedding-0.6B).
+  - Details:
+    [work-log/completed/inference/antenna/2026-10-03-embedding-layout.md](../../../../../work-log/completed/inference/antenna/2026-10-03-embedding-layout.md).
 
 ### Step 2: fused ModernBERT training attention (done)
 
