@@ -72612,14 +72612,8 @@ fn decodeEmbeddingArtifactWriteIdentityAlloc(
         defer identity.deinit(alloc);
         if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) return null;
 
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        const parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
-        return .{
-            .doc_key = doc_key,
-            .parent_doc_key = parent_doc_key,
-        };
+        const keys = identity.takeDocumentKeys();
+        return .{ .doc_key = keys.doc_key, .parent_doc_key = keys.parent_doc_key };
     } else |err| switch (err) {
         error.InvalidInternalUserKey => {},
         else => return err,
@@ -72646,11 +72640,8 @@ fn decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(
         defer identity.deinit(alloc);
         if (!managedIndexConsumesEmbeddingName(index_manager, index_ref, identity.embedding_name)) return null;
 
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        const parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
-        return .{ .doc_key = doc_key, .parent_doc_key = parent_doc_key };
+        const keys = identity.takeDocumentKeys();
+        return .{ .doc_key = keys.doc_key, .parent_doc_key = keys.parent_doc_key };
     } else |err| switch (err) {
         error.InvalidInternalUserKey => {},
         else => return err,
@@ -72857,6 +72848,9 @@ fn collectSparseFieldWritesProfiled(
         defer if (owned_logical_value) |owned| alloc.free(owned);
         const value = if (read_values[i]) |store_value| blk: {
             if (profile) |p| p.store_hits += 1;
+            // Numeric outputs own their storage. Ordinary JSON only needs to
+            // remain borrowed until extraction completes inside this txn.
+            if (!internal_keys.isRelationalRowKey(item.store_key)) break :blk store_value;
             const logical = if (index_manager) |manager|
                 try manager.materializeStoredValueAlloc(alloc, item.store_key, store_value)
             else
@@ -157989,7 +157983,7 @@ test "db generated write read fences detect artifact mutations and ABA independe
 
 test "db document lookup allocation benchmark" {
     const Counter = @import("../../allocation_bench_support.zig").Counter;
-    const Case = enum { short, long, missing, sparse, text, text_asset, text_asset_large, text_asset_escaped, text_mixed, text_missing, delete_set, relational, json_numbers, json_media };
+    const Case = enum { short, long, missing, sparse, sparse_large, text_large, embedding_identity, embedding_identity_chunk, text, text_asset, text_asset_large, text_asset_escaped, text_mixed, text_missing, delete_set, relational, json_numbers, json_media };
     const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
     const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
     // Setup is outside measurement. Use the C allocator here to avoid
@@ -158002,16 +157996,31 @@ test "db document lookup allocation benchmark" {
     if (batch_size == 0) return error.InvalidBenchmarkBatch;
     if (fixture == .json_numbers or fixture == .json_media)
         return jsonOutputAllocationBenchmark(case_name, count, batch_size);
+    if (fixture == .embedding_identity or fixture == .embedding_identity_chunk)
+        return embeddingIdentityAllocationBenchmark(case_name, count, batch_size);
     var backend = mem_backend_mod.Backend.init(alloc, .{});
     defer backend.close();
     var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
     defer store.close();
     var directory = try TestDirectory.init("collector-benchmark");
     defer directory.cleanup();
-    const text_fixture = fixture == .text or fixture == .text_asset or fixture == .text_asset_large or fixture == .text_asset_escaped or fixture == .text_mixed or fixture == .text_missing;
+    const text_fixture = fixture == .text_large or fixture == .text or fixture == .text_asset or fixture == .text_asset_large or fixture == .text_asset_escaped or fixture == .text_mixed or fixture == .text_missing;
     var db: ?DB = if (text_fixture or fixture == .relational) try DB.open(alloc, directory.path(), .{ .start_index_workers = false }) else null;
     defer if (db) |*database| database.close();
-    const value = if (fixture == .sparse) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}" else "{\"title\":\"document value\"}";
+    const sparse_fixture = fixture == .sparse or fixture == .sparse_large;
+    const value_bytes = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_VALUE_BYTES")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 4096;
+    var large_value: ?[]u8 = null;
+    defer if (large_value) |bytes| alloc.free(bytes);
+    if (fixture == .text_large or fixture == .sparse_large) {
+        const prefix = if (sparse_fixture) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]},\"padding\":\"" else "{\"title\":\"";
+        const len = try std.math.add(usize, prefix.len + 2, value_bytes);
+        const bytes = try alloc.alloc(u8, len);
+        @memcpy(bytes[0..prefix.len], prefix);
+        @memset(bytes[prefix.len..][0..value_bytes], 'x');
+        @memcpy(bytes[len - 2 ..], "\"}");
+        large_value = bytes;
+    }
+    const value = large_value orelse if (sparse_fixture) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}" else "{\"title\":\"document value\"}";
     const relational_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":false}}}}";
     var packed_value: ?[]u8 = null;
     defer if (packed_value) |packed_bytes| alloc.free(packed_bytes);
@@ -158080,7 +158089,7 @@ test "db document lookup allocation benchmark" {
                         checksum +%= byte;
                     };
                     output_count += end - offset;
-                } else if (fixture == .sparse) {
+                } else if (sparse_fixture) {
                     var writes = try collectSparseFieldWritesProfiled(run_alloc, &store, null, docs[offset..end], .{ .start = "", .end = "" }, "vec", .{}, null);
                     defer writes.deinit();
                     try std.testing.expectEqual(end - offset, writes.items.len);
@@ -158122,6 +158131,32 @@ test "db document lookup allocation benchmark" {
             if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ @tagName(fixture), count, batch_size, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
         }
     }
+}
+
+fn embeddingIdentityAllocationBenchmark(case_name: []const u8, count: usize, batch: usize) !void {
+    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const setup = std.heap.c_allocator;
+    const chunk = std.mem.eql(u8, case_name, "embedding_identity_chunk");
+    const doc_key = if (chunk) try internal_keys.documentUnitChunkArtifactKeyAlloc(setup, "doc\x00id", "chunks", "page:1", 3) else try setup.dupe(u8, "doc\x00id");
+    defer setup.free(doc_key);
+    const key = if (chunk) try internal_keys.derivedEmbeddingArtifactKeyAlloc(setup, doc_key, "dense") else try internal_keys.embeddingArtifactKeyForDocumentAlloc(setup, doc_key, "dense");
+    defer setup.free(key);
+    for (0..2) |measurement| for (0..2) |sample| {
+        var counter: Counter = .{};
+        const alloc = if (measurement == 0) counter.allocator() else std.heap.smp_allocator;
+        var checksum: usize = 0;
+        const started = monotonicTimeNs();
+        for (0..count) |_| {
+            var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, key, "dense")).?;
+            defer identity.deinit(alloc);
+            try std.testing.expectEqualStrings(doc_key, identity.doc_key);
+            if (chunk) try std.testing.expectEqualStrings("doc\x00id", identity.parent_doc_key.?) else try std.testing.expect(identity.parent_doc_key == null);
+            for (identity.doc_key) |byte| checksum +%= byte;
+        }
+        const elapsed = monotonicTimeNs() - started;
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+        if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ case_name, count, batch, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
+    };
 }
 
 fn renderJsonOutputBenchmark(alloc: Allocator, media: bool, batch: usize, data: []const u8) ![]u8 {
@@ -158415,4 +158450,107 @@ test "document collectors JSON media encoding preserves padding escaping and fai
         defer alloc.free(expected);
         try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ @as([]const u8, bytes[0..len]), @as([]const u8, expected) });
     }
+}
+
+fn sparseCollectorOwnershipSweep(alloc: Allocator, store: *docstore_mod.DocStore, manager: ?*index_manager_mod.IndexManager, docs: []const derived_types.DerivedDocument, relational: bool) !void {
+    var result = try collectSparseFieldWritesProfiled(alloc, store, manager, docs, .{ .start = "", .end = "" }, "vec", .{ .relational_base_rows = relational }, null);
+    defer result.deinit();
+    try std.testing.expectEqual(docs.len, result.items.len);
+    for (result.items) |write| {
+        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, write.vec.indices);
+        try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25 }, write.vec.values);
+    }
+}
+
+test "document collectors sparse borrowed JSON owns numeric outputs and cleans every failure" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const values = [_][]const u8{
+        "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}",
+        "{\"v\\u0065c\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}",
+        "{\"vec\":{\"metadata\":{},\"indices\":[1,3],\"values\":[0.5,0.25]}}",
+    };
+    const ids = [_][]const u8{ "raw", "escaped", "metadata" };
+    var docs: [3]derived_types.DerivedDocument = undefined;
+    for (ids, values, &docs) |id, value, *doc| {
+        const key = try internal_keys.documentKeyAlloc(alloc, id);
+        defer alloc.free(key);
+        try store.put(key, value);
+        doc.* = .{ .key = id, .action = .upsert };
+    }
+    try std.testing.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ &store, @as(?*index_manager_mod.IndexManager, null), @as([]const derived_types.DerivedDocument, &docs), false });
+    var result = try collectSparseFieldWritesProfiled(alloc, &store, null, &docs, .{ .start = "", .end = "" }, "vec", .{}, null);
+    defer result.deinit();
+    // Returned numeric arrays outlive the collector's read transaction.
+    for (ids) |id| {
+        const key = try internal_keys.documentKeyAlloc(alloc, id);
+        defer alloc.free(key);
+        try store.put(key, "{}");
+    }
+    for (result.items) |write| {
+        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, write.vec.indices);
+        try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25 }, write.vec.values);
+    }
+    var absent = try collectSparseFieldWritesProfiled(alloc, &store, null, &docs, .{ .start = "", .end = "" }, "vec", .{}, null);
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(usize, 0), absent.items.len);
+    const key = try internal_keys.documentKeyAlloc(alloc, ids[0]);
+    defer alloc.free(key);
+    try store.put(key, "{\"vec\":{\"indices\":[1,3],\"values\":[0.5]}}");
+    try std.testing.expectError(error.InvalidSparseVector, collectSparseFieldWritesProfiled(alloc, &store, null, docs[0..1], .{ .start = "", .end = "" }, "vec", .{}, null));
+}
+
+test "document collectors sparse relational rows still decode under allocation failures" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("sparse-relational-ownership");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"vec\":{\"type\":\"json\"}},\"additionalProperties\":false}}}}";
+    try db.setSchemaJson(alloc, schema_json);
+    var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, schema);
+    var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}", .{});
+    defer parsed_value.deinit();
+    const packed_row = try mapper.buildRelationalRowValueForSchemaFromParsedAlloc(alloc, parsed_value.value, schema);
+    defer alloc.free(packed_row);
+    const key = try relational_store.keyAlloc(alloc, "row");
+    defer alloc.free(key);
+    try db.core.store.put(key, packed_row);
+    const docs = [_]derived_types.DerivedDocument{.{ .key = "row", .action = .upsert }};
+    try std.testing.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ db.core.store, @as(?*index_manager_mod.IndexManager, db.core.index_manager), @as([]const derived_types.DerivedDocument, &docs), true });
+}
+
+fn embeddingWriteIdentitySweep(alloc: Allocator, key: []const u8, expected: []const u8, manager: ?*index_manager_mod.IndexManager) !void {
+    var identity = (if (manager) |m| try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, m, .{ .name = "dense", .kind = .dense_vector }, key) else try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, key, expected)) orelse return;
+    defer identity.deinit(alloc);
+    try std.testing.expect(identity.doc_key.len > 0);
+}
+
+test "document collectors embedding identity accepted and rejected keys clean every failure" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("embedding-write-identity");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+    const chunk = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc\x00id", "chunks", "unit", 3);
+    defer alloc.free(chunk);
+    const doc = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc\x00id", "dense");
+    defer alloc.free(doc);
+    const derived = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "dense");
+    defer alloc.free(derived);
+    const rejected = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "other");
+    defer alloc.free(rejected);
+    for ([_][]const u8{ doc, derived, rejected }) |key| {
+        for ([_]?*index_manager_mod.IndexManager{ null, db.core.index_manager }) |manager|
+            try std.testing.checkAllAllocationFailures(alloc, embeddingWriteIdentitySweep, .{ key, @as([]const u8, "dense"), manager });
+    }
+    try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, rejected, "dense"));
+    try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, db.core.index_manager, .{ .name = "dense", .kind = .dense_vector }, rejected));
 }

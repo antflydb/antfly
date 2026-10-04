@@ -89,6 +89,7 @@ def main():
     )
     parser.add_argument("--document-lookup-only", action="store_true")
     parser.add_argument("--document-batches", nargs="+", type=int, default=[256])
+    parser.add_argument("--document-value-bytes", type=int, default=4096)
     parser.add_argument(
         "--document-cases",
         nargs="+",
@@ -97,6 +98,10 @@ def main():
             "long",
             "missing",
             "sparse",
+            "sparse_large",
+            "text_large",
+            "embedding_identity",
+            "embedding_identity_chunk",
             "text",
             "text_asset",
             "text_asset_large",
@@ -123,6 +128,7 @@ def main():
             *args.documents_per_record,
             *args.batches,
             *args.document_batches,
+            args.document_value_bytes,
             args.repetitions,
         )
         <= 0
@@ -321,6 +327,9 @@ def main():
                 child_env["ANTFLY_DOCUMENT_BENCH_CASE"] = fixture
                 child_env["ANTFLY_DOCUMENT_BENCH_BATCH"] = str(batch)
                 child_env["ANTFLY_DOCUMENT_BENCH_DOCUMENTS"] = str(args.documents)
+                child_env["ANTFLY_DOCUMENT_BENCH_VALUE_BYTES"] = str(
+                    args.document_value_bytes
+                )
                 lines = run(
                     label, [binaries[variant] / "document-lookup-bench"], child_env
                 )
@@ -349,6 +358,7 @@ def main():
                         dict(
                             workload="document",
                             source="primary",
+                            value_bytes=args.document_value_bytes,
                             variant=variant,
                             pair=pair,
                             **data,

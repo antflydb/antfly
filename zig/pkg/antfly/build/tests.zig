@@ -155,7 +155,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_allocation_tests = b.addTest(.{
         .root_module = replay_allocation_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "storage.db.derived.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves" },
+        .filters = &.{ "storage.db.derived.", "storage.db.artifact_ids.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves" },
     });
     b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
         .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
@@ -5595,6 +5595,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = db_test_mod,
         .filters = &.{
             "document collectors release",
+            "document collectors sparse",
+            "document collectors embedding identity",
             "document collectors duplicate delete",
             "document collectors asset projection",
             "document collectors ordinary slab",
