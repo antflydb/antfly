@@ -559,6 +559,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     defer index.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), index.status);
     try awaitIndex(alloc, io, transport, &headers, base);
+    try recovery_fixture.awaitIntegrityCatalog(alloc, io, &metadata, &data, old_id);
     var inserted = try request(alloc, transport, &headers, base, "/db/v1/tables/docs/batch", .POST, "{\"inserts\":{\"doc-a\":{\"id\":1,\"graph_target\":\"graph-target\"},\"graph-target\":{\"id\":99}},\"sync_level\":\"full_index\"}");
     defer inserted.deinit(alloc);
     if (inserted.status != 201) std.debug.print("graph seed status={d} body={s}\n", .{ inserted.status, inserted.body[0..@min(inserted.body.len, 2048)] });
@@ -640,12 +641,15 @@ fn mountedGraphTruncate(faults: bool) !void {
     defer created_child.deinit(alloc);
     try std.testing.expect(created_child.status == 200 or created_child.status == 202);
     const old_child_id = try awaitNamedTableId(alloc, io, transport, &headers, restarted_base, "children", null, null);
+    try recovery_fixture.awaitIntegrityCatalog(alloc, io, &metadata, &data, new_id);
+    try recovery_fixture.awaitIntegrityCatalog(alloc, io, &metadata, &data, old_child_id);
     var parent_insert = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/docs/batch", .POST, "{\"inserts\":{\"doc-b\":{\"id\":2}},\"sync_level\":\"full_text\"}");
     defer parent_insert.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), parent_insert.status);
     var pre_fk_child = try request(alloc, transport, &headers, restarted_base, "/db/v1/tables/children/batch", .POST, "{\"inserts\":{\"child-b\":{\"id\":7,\"parent_id\":2}},\"sync_level\":\"full_text\"}");
     defer pre_fk_child.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), pre_fk_child.status);
+    try recovery_fixture.awaitMetadataRead(io, &metadata);
     var add_fk = try sql(alloc, transport, &admin_headers, metadata_uri, "ALTER TABLE children ADD CONSTRAINT child_parent FOREIGN KEY (parent_id) REFERENCES docs(id)");
     defer add_fk.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 202), add_fk.status);
