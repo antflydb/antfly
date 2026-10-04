@@ -445,7 +445,7 @@ pub const Aggregate = struct {
     }
 
     pub fn finish(self: *const Aggregate) !Datum {
-        if (self.kind == .count) return Datum.json(.{ .integer = @intCast(self.count) });
+        if (self.kind == .count) return Datum.json(.{ .integer = std.math.cast(i64, self.count) orelse return error.SqlNumericOutOfRange });
         if (self.kind == .pattern_set) return Datum.json(.{ .array = self.patterns.?.values });
         if (self.count == 0) return .{};
         return switch (self.kind) {
@@ -857,6 +857,7 @@ pub const Grouped = struct {
     pub fn addGlobalCount(self: *Grouped, count: u64) !void {
         if (self.failed or self.finished or self.groups.items.len != 1 or self.key_count != 0 or self.rows_seen != 0) return error.InvalidSqlBackendResponse;
         for (self.specs) |spec| if (spec.kind != .count or spec.distinct) return error.InvalidSqlBackendResponse;
+        if (count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
         for (self.state_columns) |*column| column.values.counts.items[0] = count;
     }
 

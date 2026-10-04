@@ -112,6 +112,18 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         sql = "SELECT amount, label FROM lake_events WHERE amount >= 1197 ORDER BY amount DESC"
         expected = [["1199", "row-1199"], ["1198", "row-1198"], ["1197", None]]
         assert request("POST", "/sql", {"statement": sql})["rows"] == expected
+        # Blocking derived tables drain through the statement result cursor.
+        for inner in (
+            "SELECT amount FROM lake_events ORDER BY amount DESC",
+            "SELECT amount, COUNT(*) AS n FROM lake_events GROUP BY amount",
+            "SELECT amount, ROW_NUMBER() OVER (ORDER BY amount) AS n FROM lake_events",
+        ):
+            assert request(
+                "POST", "/sql", {"statement": f"SELECT COUNT(*) FROM ({inner}) AS q"}
+            )["rows"] == [[str(count)]]
+        assert request(
+            "POST", "/sql", {"statement": "SELECT COUNT(*), COUNT(*) FROM lake_events"}
+        )["rows"] == [[str(count), str(count)]]
         projected = request(
             "POST",
             "/sql",

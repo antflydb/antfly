@@ -437,6 +437,7 @@ pub const Context = struct {
         var metadata_counted = false;
         if (statement.count_all and statement.predicate == null and !predicates.empty) {
             if (try scan_state.count(self, table_def, .{ .fields = native_fields.items, .limit = self.limits.page_rows })) |exact_count| {
+                _ = std.math.cast(i64, exact_count) orelse return error.SqlNumericOutOfRange;
                 scanned = std.math.cast(usize, exact_count) orelse return error.SqlNumericOutOfRange;
                 metadata_counted = true;
             }
@@ -623,7 +624,7 @@ pub const Context = struct {
         }
         if (statement.count_all and offset == 0) {
             const cells = try self.arena.alloc(Json, 1);
-            cells[0] = try self.outputValue(.{ .integer = @intCast(scanned) });
+            cells[0] = try self.outputValue(.{ .integer = std.math.cast(i64, scanned) orelse return error.SqlNumericOutOfRange });
             try rows.append(self.arena, cells);
             const nulls = try self.arena.alloc(bool, 1);
             nulls[0] = false;
@@ -1304,6 +1305,7 @@ const TestBackend = struct {
     pages: usize = 0,
     writes: usize = 0,
     row_count: usize = 2,
+    metadata_count: ?u64 = null,
     cancelled: bool = false,
     ambiguous: bool = false,
     outcome: catalog.MutationOutcome = .committed,
@@ -3107,4 +3109,82 @@ test "SQL snapshot estimates change build side without changing residual outer j
         try std.testing.expectEqualDeep(before.output.rows, after.output.rows);
         try std.testing.expectEqualDeep(before.output.sql_nulls, after.output.sql_nulls);
     }
+}
+
+test "SQL nested blocking results drain within the shared statement budget" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT COUNT(*) FROM (SELECT _id FROM things ORDER BY _id) AS q",
+        "WITH q AS (SELECT _id FROM things ORDER BY _id DESC) SELECT COUNT(*) FROM q",
+        "SELECT COUNT(*) FROM (SELECT _id, COUNT(*) AS n FROM things GROUP BY _id) AS q",
+        "SELECT COUNT(*) FROM (SELECT _id, ROW_NUMBER() OVER (ORDER BY _id) AS n FROM things) AS q",
+    }) |sql| {
+        var fixture: TestBackend = .{ .row_count = 5000 };
+        var backend = fixture.coordinated();
+        backend.execution_io = std.testing.io;
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        // Track statement admission without retaining debug-allocator quarantine for thousands of spill frames.
+        var result = try execute(std.heap.page_allocator, backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("5000", result.output.rows[0][0].string);
+        try std.testing.expect(result.state.budget.peak <= 256 * 1024);
+        try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+    }
+}
+
+test "SQL metadata counts enforce BIGINT bounds for simple and grouped outputs" {
+    const Metadata = struct {
+        fn open(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            return .{ .ptr = ptr, .next = next, .close = close, .count_rows = count };
+        }
+        fn next(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return error.UnexpectedRowScan;
+        }
+        fn close(_: *anyopaque) void {}
+        fn count(ptr: *anyopaque) !?u64 {
+            const fixture: *TestBackend = @ptrCast(@alignCast(ptr));
+            return fixture.metadata_count;
+        }
+    };
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "SELECT COUNT(*) FROM things", "SELECT COUNT(*), COUNT(*) FROM things" }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var fixture: TestBackend = .{ .metadata_count = @as(u64, std.math.maxInt(i64)) + 1 };
+        var backend = fixture.iface();
+        var vtable = backend.vtable.*;
+        vtable.open_scan = Metadata.open;
+        backend.vtable = &vtable;
+        try std.testing.expectError(error.SqlNumericOutOfRange, execute(a, backend, &compiled, &.{}, .{}));
+        try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+        try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+        fixture.metadata_count = std.math.maxInt(i64);
+        var result = try execute(a, backend, &compiled, &.{}, .{});
+        defer result.deinit();
+        for (result.output.rows[0]) |value| try std.testing.expectEqualStrings("9223372036854775807", value.string);
+        try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+    }
+    const grouped = try operators.Grouped.create(a, &.{.{ .kind = .count }}, .{});
+    defer grouped.deinit();
+    try grouped.ensureGlobalGroup();
+    try std.testing.expectError(error.SqlNumericOutOfRange, grouped.addGlobalCount(@as(u64, std.math.maxInt(i64)) + 1));
+    const invalid: operators.Aggregate = .{ .alloc = a, .input_type = .integer, .kind = .count, .count = @as(u64, std.math.maxInt(i64)) + 1 };
+    try std.testing.expectError(error.SqlNumericOutOfRange, invalid.finish());
+}
+
+test "SQL nested blocking result ownership unwinds allocation failures" {
+    const Scenario = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var fixture: TestBackend = .{ .row_count = 5 };
+            var backend = fixture.coordinated();
+            backend.execution_io = std.testing.io;
+            var compiled = try compiler.compile(a, "SELECT COUNT(*) FROM (SELECT _id FROM things ORDER BY _id) q", .{});
+            defer compiled.deinit();
+            var result = try execute(a, backend, &compiled, &.{}, .{ .page_rows = 2 });
+            defer result.deinit();
+            try std.testing.expectEqualStrings("5", result.output.rows[0][0].string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
 }

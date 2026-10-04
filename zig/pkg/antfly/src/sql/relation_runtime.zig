@@ -289,6 +289,7 @@ fn Engine(comptime Context: type) type {
             unmatched_index: usize = 0,
             output: ?@import("runtime.zig").Output = null,
             output_index: usize = 0,
+            result_cursor: ?*@import("result_cursor.zig").Cursor = null,
             query_fields: ?[]const []const u8 = null,
             query_skip: usize = 0,
             query_remaining: usize = 0,
@@ -340,6 +341,7 @@ fn Engine(comptime Context: type) type {
                 return self;
             }
             fn deinit(self: *Iterator) void {
+                if (self.result_cursor) |cursor| cursor.close();
                 if (self.page) |page| page.deinit();
                 if (self.left) |left| left.deinit();
                 if (self.right) |right| right.deinit();
@@ -419,6 +421,7 @@ fn Engine(comptime Context: type) type {
                         // nodes retain their bounded operator-specific state.
                         if (query.binding.aggregate == null and query.binding.window == null and !query.statement.count_all and query.binding.order_keys.len == 0)
                             break :blk try self.nextQuery(alloc, query);
+                        if (self.result_cursor) |cursor| break :blk try cursor.next(alloc);
                         if (self.output == null) {
                             var adapter: Adapter = .{ .engine = self.engine, .iterator = self.left.?, .table = query.binding.table.? };
                             var context = self.engine.context;
@@ -428,6 +431,30 @@ fn Engine(comptime Context: type) type {
                             context.binding.relation = null;
                             context.arena = self.arena.allocator();
                             context.limits.result_rows = context.limits.scan_rows;
+                            if (context.spill) |manager| {
+                                const Cursor = @import("result_cursor.zig").Cursor;
+                                const cursor = try Cursor.create(context.alloc, manager, self.node.columns.len);
+                                errdefer cursor.close();
+                                context.typed_output = true;
+                                context.sink = .{ .ptr = cursor, .append = Cursor.append, .take_sorted = Cursor.takeSorted };
+                                const output = try context.select(query.statement);
+                                // Constant/count paths can return a small ordinary result.
+                                var scratch = std.heap.ArenaAllocator.init(context.alloc);
+                                defer scratch.deinit();
+                                for (output.rows, 0..) |row, index| {
+                                    _ = scratch.reset(.free_all);
+                                    const values = try scratch.allocator().alloc(Datum, row.len);
+                                    for (row, values, 0..) |value, *cell, column| cell.* = .{
+                                        .value = value,
+                                        .sql_null = if (output.sql_nulls) |flags| flags[index][column] else value == .null,
+                                        .patterns = if (output.pattern_sources) |sources| sources[index][column] else null,
+                                    };
+                                    try Cursor.append(cursor, values);
+                                }
+                                const first = try cursor.next(alloc);
+                                self.result_cursor = cursor;
+                                break :blk first;
+                            }
                             self.output = try context.select(query.statement);
                         }
                         const output = self.output.?;
