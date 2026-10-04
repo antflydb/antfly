@@ -9527,3 +9527,75 @@ test "parquet exact decimal128 cached binary dictionaries preserve nulls and 38 
         try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0 }, decoded.nulls);
     }
 }
+
+test "external lake speculative page prefetch defers errors and preserves request cancellation" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(a);
+    try appendPlainI64DataPage(&bytes, a, &.{1});
+    const next_offset: u64 = bytes.items.len;
+    const values: [32]i64 = @splat(2);
+    try appendPlainI64DataPage(&bytes, a, &values);
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    var chunks = [_]external_source.ColumnChunk{.{ .column_id = @constCast("n"), .file_offset = 0, .compressed_len = bytes.items.len, .uncompressed_len = bytes.items.len, .physical_type = @constCast("int64"), .encoding = @constCast("plain") }};
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 33, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 33, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const shared = @import("lake_serving_cache.zig");
+    const Mode = enum { disabled, budget, provider, canceled, expired };
+    const Fault = struct {
+        base: storage.ObjectStorage,
+        offset: u64,
+        mode: Mode,
+        signal: std.atomic.Value(bool) = .init(false),
+        reader: ?*shared.Reader = null,
+        vtable: storage.ObjectStorage.VTable,
+        fn iface(self: *@This()) storage.ObjectStorage {
+            self.vtable.get_object = get;
+            return .{ .allocator = self.base.allocator, .ptr = self, .vtable = &self.vtable };
+        }
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (options.range) |range| if (range.offset == self.offset) switch (self.mode) {
+                .provider => return error.ProviderUnavailable,
+                .canceled => {
+                    self.signal.store(true, .release);
+                    return error.Canceled;
+                },
+                .expired => {
+                    self.reader.?.context.deadline_ns = 0;
+                    return error.ProviderUnavailable;
+                },
+                else => {},
+            };
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    for ([_]Mode{ .disabled, .budget, .provider, .canceled, .expired }) |mode| {
+        var cache = shared.Cache.init(a);
+        defer cache.deinit();
+        var fault: Fault = .{ .base = client, .offset = next_offset, .mode = mode, .vtable = client.vtable.* };
+        var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(fault.iface()), .scope = @splat(0), .context = .{ .io = std.testing.io, .cancellation = storage.CancellationToken.fromAtomic(&fault.signal) } };
+        fault.reader = &reader;
+        defer reader.drain(true);
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{"n"}, .{ .max_input_bytes = if (mode == .disabled or mode == .budget) 128 else 4096 });
+        defer cursor.deinit();
+        if (mode != .disabled) cursor.shared_reader = &reader;
+        if (mode == .canceled or mode == .expired) {
+            try std.testing.expectError(if (mode == .canceled) error.Canceled else error.DeadlineExceeded, cursor.next());
+            continue;
+        }
+        const batch = (try cursor.next()).?;
+        try std.testing.expectEqual(@as(i64, 1), batch.columns[0].values.i64[0]);
+        try std.testing.expectEqual(@as(usize, 1), cursor.pages_decoded);
+        try std.testing.expectError(if (mode == .provider) error.ProviderUnavailable else error.ParquetPageTooLarge, cursor.next());
+    }
+}

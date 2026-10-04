@@ -207,6 +207,66 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     )
                 ]
                 assert seen == list(reversed(range(count)))
+        # LIMIT must not fail because speculative lookahead sees an oversized
+        # later page; consuming that page must still enforce the decode budget.
+        large_root = tmp_path / "large_pages"
+        large_objects = large_root / "buckets" / "antfly" / "objects"
+        large_objects.mkdir(parents=True)
+        large_input = tmp_path / "large.parquet"
+        pq.write_table(
+            pa.table({"label": ["first", "x" * (40 * 1024 * 1024)]}),
+            large_input,
+            compression=None,
+            use_dictionary=False,
+            data_page_size=1,
+            write_batch_size=1,
+            write_statistics=False,
+        )
+        large_payload = large_input.read_bytes()
+        large_envelope = (
+            b"AFOBJ001"
+            + struct.pack("<QI", len(large_payload), 0)
+            + hashlib.sha256(large_payload).hexdigest().encode()
+        )
+        (large_objects / "part.parquet").write_bytes(large_envelope + large_payload)
+        del large_payload
+        request(
+            "POST",
+            "/tables/lake_large_pages",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "large-pages",
+                        "format": "parquet",
+                        "uri": large_root.as_uri(),
+                    },
+                },
+            },
+        )
+        deadline = time.monotonic() + 30
+        while True:
+            first = requests.post(
+                server.api_url + "/sql",
+                json={"statement": "SELECT label FROM lake_large_pages LIMIT 1"},
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
+            )
+            if first.ok:
+                assert first.json()["rows"] == [["first"]]
+                break
+            assert first.status_code in (404, 409, 503), first.text
+            assert time.monotonic() < deadline, first.text
+            time.sleep(0.1)
+        oversized = requests.post(
+            server.api_url + "/sql",
+            json={"statement": "SELECT label FROM lake_large_pages LIMIT 1 OFFSET 1"},
+            auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+            timeout=60,
+        )
+        assert oversized.status_code >= 400
         response = requests.post(
             server.api_url + "/sql",
             json={"statement": "DELETE FROM lake_events"},

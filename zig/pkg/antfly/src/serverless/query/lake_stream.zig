@@ -199,6 +199,14 @@ pub const Stream = struct {
     fn prefetchNext(self: *Stream) !void {
         const reader = self.source.scanner.shared_reader orelse return;
         if (reader.context.io == null) return;
+        try self.context.ensureActive();
+        self.planPrefetchNext(reader) catch {
+            // Next-group/file lookahead follows the same speculative contract
+            // as page prefetch; required reads validate these ranges later.
+            try self.context.ensureActive();
+        };
+    }
+    fn planPrefetchNext(self: *Stream, reader: *@import("lake_serving_cache.zig").Reader) !void {
         const plan = &self.discovered.?;
         const file = plan.inventory.files[0];
         for (plan.row_group_plan.row_groups[self.group_index..]) |input| {

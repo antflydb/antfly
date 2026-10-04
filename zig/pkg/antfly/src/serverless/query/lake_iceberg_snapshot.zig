@@ -646,6 +646,11 @@ fn appendEqualityDeleteRowRefsAlloc(
     out: *std.ArrayListUnmanaged(rowsource.RowRef),
 ) !void {
     if (request.delete_plan.activeEqualityDeleteFileCount() == 0) return;
+    // Equality identity must remain lossless regardless of a caller's legacy
+    // row-delivery representation. Fixed-scale decimal text also normalizes
+    // INT32, INT64 and binary encodings without floating-point conversion.
+    var materialization_limits = request.materialization_limits;
+    materialization_limits.decimal_representation = .exact_string;
     const processed = try alloc.alloc(bool, request.delete_plan.files.len);
     defer alloc.free(processed);
     @memset(processed, false);
@@ -693,7 +698,7 @@ fn appendEqualityDeleteRowRefsAlloc(
                     request.coalesce_options,
                 );
             defer delete_source.deinit(alloc);
-            delete_source.materialization_limits = request.materialization_limits;
+            delete_source.materialization_limits = materialization_limits;
             const delete_row_source = delete_source.rowSource();
             while (try delete_row_source.next(alloc)) |batch| {
                 try budget.admitBatch(batch.rowCount());
@@ -758,7 +763,7 @@ fn appendEqualityDeleteRowRefsAlloc(
                 request.coalesce_options,
             );
         defer data_source.deinit(alloc);
-        data_source.materialization_limits = request.materialization_limits;
+        data_source.materialization_limits = materialization_limits;
         const data_row_source = data_source.rowSource();
         while (try data_row_source.next(alloc)) |batch| {
             try budget.admitBatch(batch.rowCount());
@@ -2841,4 +2846,46 @@ test "iceberg equality deletes resolve renamed data and delete fields by ID" {
     try std.testing.expectEqual(@as(u64, 0), refs[0].external.row_ordinal);
     try std.testing.expectEqualStrings(data_file_path, refs[1].external.file_id);
     try std.testing.expectEqual(@as(u64, 1), refs[1].external.row_ordinal);
+}
+
+test "external lake equality deletes preserve exact decimal keys across physical encodings" {
+    const Reader = struct {
+        data: []const u8,
+        deleted: []const u8,
+        fn read(ptr: *anyopaque, a: Allocator, _: []const u8, key: []const u8, offset: u64, len: usize) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const body = if (std.mem.eql(u8, key, "data")) self.data else self.deleted;
+            const start = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > body.len or len > body.len - start) return error.InvalidLakeRangeRead;
+            return a.dupe(u8, body[start..][0..len]);
+        }
+    };
+    for ([_]enum { integral, mixed, decimal128 }{ .integral, .mixed, .decimal128 }) |encoding| {
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const first: i128 = if (encoding == .decimal128) 99999999999999999999999999999999999998 else 9007199254740992;
+        var binary: [2][16]u8 = undefined;
+        std.mem.writeInt(i128, &binary[0], first, .big);
+        std.mem.writeInt(i128, &binary[1], first + 1, .big);
+        const precision: i32 = if (encoding == .decimal128) 38 else 18;
+        const scale: i32 = if (encoding == .decimal128) 9 else 2;
+        const data = if (encoding == .decimal128)
+            try lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "amount", .values = &.{ &binary[0], &binary[1] }, .field_id = 1, .converted_type = 5, .decimal_precision = precision, .decimal_scale = scale }})
+        else
+            try lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .values = &.{ @intCast(first), @intCast(first + 1) }, .field_id = 1, .converted_type = 5, .decimal_precision = precision, .decimal_scale = scale }});
+        const deleted = if (encoding == .integral)
+            try lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "deleted_amount", .values = &.{@intCast(first + 1)}, .field_id = 1, .converted_type = 5, .decimal_precision = precision, .decimal_scale = scale }})
+        else
+            try lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{}, &.{.{ .column_id = "deleted_amount", .values = &.{&binary[1]}, .field_id = 1, .converted_type = 5, .decimal_precision = precision, .decimal_scale = scale }});
+        var reader: Reader = .{ .data = data, .deleted = deleted };
+        var files = [_]external_source.FileEntry{.{ .file_id = @constCast("s3://bucket/data"), .object_uri = @constCast("s3://bucket/data"), .version_id = @constCast("iceberg:v1:data_seq=5:file_seq=6"), .byte_len = data.len, .row_count = 2, .data_sequence_number = 5, .partition_spec_id = 0, .row_groups = &.{} }};
+        const inventory: external_source.Inventory = .{ .format = .iceberg, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket/t"), .snapshot_id = @constCast("12"), .schema_fingerprint = @constCast("iceberg-schema:7"), .files = &files };
+        var names = [_][]u8{@constCast("amount")};
+        var ids = [_]i32{1};
+        var delete_files = [_]IcebergDeleteFile{.{ .content = .equality_deletes, .file_path = @constCast("s3://bucket/deleted"), .file_format = @constCast("PARQUET"), .snapshot_id = 12, .data_sequence_number = 7, .file_sequence_number = 8, .equality_ids = &ids, .equality_columns = &names, .record_count = 1, .file_size_in_bytes = deleted.len }};
+        const refs = try readDeleteRowRefsAlloc(a, .{ .reader = .{ .ctx = &reader, .read_range_alloc = Reader.read }, .data_inventory = inventory, .delete_plan = .{ .files = &delete_files } });
+        try std.testing.expectEqual(@as(usize, 1), refs.len);
+        try std.testing.expectEqual(@as(u64, 1), refs[0].external.row_ordinal);
+    }
 }

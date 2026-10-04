@@ -139,6 +139,16 @@ pub const Cursor = struct {
     fn prefetchPages(self: *Cursor) !void {
         const reader = self.shared_reader orelse return;
         if (reader.context.io == null or self.position == self.group.row_count) return;
+        try reader.context.ensureActive();
+        self.planPrefetchPages(reader) catch {
+            // Lookahead must not reject a page already decoded successfully.
+            // Required advance() will report its own provider/format/budget
+            // errors if this page is actually consumed. Cancellation remains
+            // authoritative even when the failing read was speculative.
+            try reader.context.ensureActive();
+        };
+    }
+    fn planPrefetchPages(self: *Cursor, reader: *@import("lake_serving_cache.zig").Reader) !void {
         var reads: [4]ranges.RangeRead = undefined;
         var count: usize = 0;
         for (self.columns) |*column| {
