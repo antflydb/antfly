@@ -147,6 +147,8 @@ fn joining(partitioned: bool, count: usize) !struct { ns: i96, first_ns: i96, pe
     defer if (grace) |join| join.close();
     const hash = if (!partitioned) try operators.HashJoin.create(a, .{ .bytes = bytes / 4, .rows = count * 2, .spill = &manager }) else null;
     defer if (hash) |join| join.deinit();
+    var match_arena = std.heap.ArenaAllocator.init(a);
+    defer match_arena.deinit();
     const started = now();
     for (0..count) |i| {
         const key = Datum.json(.{ .integer = @intCast(i % (count / 2)) });
@@ -164,7 +166,8 @@ fn joining(partitioned: bool, count: usize) !struct { ns: i96, first_ns: i96, pe
             while (try probe.next()) |match| {
                 if (matches == 0) first_ns = now() - started;
                 matches += 1;
-                checksum += match.row.values[0].value.integer;
+                _ = match_arena.reset(.retain_capacity);
+                checksum += (try match.materializeKeys(match_arena.allocator()))[0].value.integer;
             }
         }
     }
@@ -180,7 +183,64 @@ fn joining(partitioned: bool, count: usize) !struct { ns: i96, first_ns: i96, pe
     return .{ .ns = now() - started, .first_ns = first_ns, .peak = budget.peak, .written = manager.written_bytes, .reads = manager.read_calls, .writes = manager.write_calls, .allocations = counted.allocations, .matches = matches, .checksum = checksum, .filtered = if (grace) |join| join.filtered_rows else 0 };
 }
 
+fn typedState(count: usize) !void {
+    var counted: CountingAllocator = .{};
+    var budget: @import("memory_budget.zig") = .{ .backing = counted.allocator(), .limit = 64 * 1024 * 1024 };
+    const a = budget.allocator();
+    var join_ns: i96 = 0;
+    var join_peak: usize = 0;
+    var join_allocations: usize = 0;
+    {
+        const join = try operators.HashJoin.create(a, .{ .bytes = 32 * 1024 * 1024, .rows = count });
+        defer join.deinit();
+        const started = now();
+        for (0..count) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i) });
+            try join.add(&.{ key, Datum.json(.{ .float = @as(f64, @floatFromInt(i)) / 8 }), Datum.json(.{ .bool = i % 2 == 0 }), Datum.json(.{ .string = "owned" }) }, &.{key});
+        }
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        for (0..count) |i| {
+            _ = arena.reset(.retain_capacity);
+            var probe = try join.probe(&.{Datum.json(.{ .integer = @intCast(i) })});
+            const match = (try probe.next()).?;
+            const values = try match.materializeValues(arena.allocator());
+            try std.testing.expectEqual(@as(i64, @intCast(i)), values[0].value.integer);
+            try std.testing.expectEqualStrings("owned", values[3].value.string);
+            try std.testing.expect((try probe.next()) == null);
+        }
+        join_ns = now() - started;
+        join_peak = budget.peak;
+        join_allocations = counted.allocations;
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    budget.peak = 0;
+    counted.allocations = 0;
+    {
+        const specs = [_]operators.AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .min, .input_type = .string }, .{ .kind = .bool_or, .input_type = .boolean } };
+        const grouped = try operators.Grouped.create(a, &specs, .{ .groups = count, .bytes = 32 * 1024 * 1024 });
+        defer grouped.deinit();
+        const started = now();
+        for (0..count * 2) |i| {
+            const key = Datum.json(.{ .integer = @intCast(i % count) });
+            try grouped.add(&.{key}, &.{ key, key, Datum.json(.{ .string = "selected" }), Datum.json(.{ .bool = i % 2 == 0 }) });
+        }
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        for (0..count) |i| {
+            _ = arena.reset(.retain_capacity);
+            const result = (try grouped.nextResult(arena.allocator())).?;
+            try std.testing.expectEqual(@as(i64, 2), result.aggregates[0].value.integer);
+            try std.testing.expectEqual(@as(i64, @intCast(i * 2)), result.aggregates[1].value.integer);
+            try std.testing.expectEqualStrings("selected", result.aggregates[2].value.string);
+        }
+        std.debug.print("native_refinement {{\"case\":\"typed_join_group_state\",\"rows\":{d},\"join_ns\":{d},\"join_peak_bytes\":{d},\"join_allocations\":{d},\"group_ns\":{d},\"group_peak_bytes\":{d},\"group_allocations\":{d}}}\n", .{ count, join_ns, join_peak, join_allocations, now() - started, budget.peak, counted.allocations });
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
 test "native refinements benchmark" {
+    for ([_]usize{ 8192, 32768 }) |count| try typedState(count);
     const a = std.testing.allocator;
     var compiled = try @import("compiler.zig").compileScalar(a, "(n + 1.25) * 2.0 - 3.0", .{});
     defer compiled.deinit();

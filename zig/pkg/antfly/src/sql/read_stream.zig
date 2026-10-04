@@ -459,7 +459,7 @@ pub const Stream = struct {
         return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
     }
     fn columnProgram(self: *Stream, a: std.mem.Allocator, program: *const @import("scalar.zig").Program, page: catalog.ColumnPage) ![]const @import("scalar.zig").Datum {
-        if (try @import("vector_eval.zig").evaluateColumns(a, program, page, self.context.binding.scalars.columns, self.context.parameters)) |values| return values;
+        if (try @import("vector_eval.zig").evaluateColumnsScheduled(a, program, page, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io)) |values| return values;
         const values = try a.alloc(@import("scalar.zig").Datum, page.selection.len);
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
         defer scratch.deinit();

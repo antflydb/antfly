@@ -93,7 +93,7 @@ pub const Reader = struct {
     base: ObjectReader,
     scope: [32]u8,
     context: Context,
-    pending: [4]?std.Io.Future(anyerror!void) = @splat(null),
+    pending: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = @splat(null),
     prefetch_bytes: usize = 0,
     prefetch_cancelled: std.atomic.Value(bool) = .init(false),
     /// One lookahead batch, four concurrent ranges, at most 32 MiB in flight.
@@ -107,7 +107,7 @@ pub const Reader = struct {
         for (reads[0..@min(reads.len, self.pending.len)], 0..) |read, i| {
             if (read.range.len > 32 * 1024 * 1024 -| self.prefetch_bytes) break;
             self.prefetch_bytes += @intCast(read.range.len);
-            self.pending[i] = io.concurrent(warm, .{ self, read }) catch break;
+            self.pending[i] = @import("../../sql/parallel_scheduler.zig").global().submit(io, @intCast(read.range.len *| 2), warm, .{ self, read }) orelse break;
         }
     }
     fn warm(self: *Reader, read: ranges.RangeRead) anyerror!void {

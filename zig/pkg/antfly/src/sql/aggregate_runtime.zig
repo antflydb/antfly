@@ -85,7 +85,7 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
 // scalar instructions construct a temporary input row; retained aggregate
 // inputs contain the computed values, never the complete input row matrix.
 fn columnValues(context: anytype, bound: *const binding.Bound, a: std.mem.Allocator, page: catalog.ColumnPage, program: *const scalar.Program) ![]const Datum {
-    if (try @import("vector_eval.zig").evaluateColumns(a, program, page, bound.input.columns, context.parameters)) |values| return values;
+    if (try @import("vector_eval.zig").evaluateColumnsScheduled(a, program, page, bound.input.columns, context.parameters, context.backend.execution_io)) |values| return values;
     const values = try a.alloc(Datum, page.selection.len);
     for (values, 0..) |*value, index| value.* = try context.evaluate(a, program.*, try bound.input.columnCells(a, page, index));
     return values;

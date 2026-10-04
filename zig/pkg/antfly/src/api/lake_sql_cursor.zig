@@ -109,7 +109,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
     }
-    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .close = Owner.close };
+    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {
@@ -172,6 +172,8 @@ pub fn matches(row: catalog.Row, conditions: []const catalog.Condition) !bool {
 }
 
 const Owner = struct {
+    dynamic: ?*const @import("../sql/dynamic_filter.zig").Filter = null,
+    started: bool = false,
     alloc: Allocator,
     arena: std.heap.ArenaAllocator,
     stream: @import("../serverless/query/lake_stream.zig").Stream,
@@ -188,7 +190,7 @@ const Owner = struct {
 
     fn countRows(raw: *anyopaque) !?u64 {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        if (self.conditions.len != 0 or self.after != null or self.before != null or self.primary_key != null or self.batch != null) return null;
+        if (self.dynamic != null or self.conditions.len != 0 or self.after != null or self.before != null or self.primary_key != null or self.batch != null) return null;
         if (self.stream.source.inventory.deleted_row_groups.len != 0) return null;
         if (self.stream.source.scanner.iceberg_delete_plan) |plan| if (plan.files.len != 0) return null;
         return self.stream.countAll() catch |err| switch (err) {
@@ -196,8 +198,38 @@ const Owner = struct {
             else => return err,
         };
     }
+    fn setDynamicFilter(raw: *anyopaque, filter: *const @import("../sql/dynamic_filter.zig").Filter) !bool {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.started or self.dynamic != null or !filter.sealed) return false;
+        try self.context.ensureActive();
+        const a = self.arena.allocator();
+        var predicates: std.ArrayList(@import("../serverless/query/lake_stream.zig").Predicate) = .empty;
+        try predicates.appendSlice(a, self.stream.predicates);
+        for (filter.columns, filter.domains) |key, domain| {
+            const column = try self.table.column(key.name);
+            if (domain.minimum == null) continue;
+            for ([_]bool{ true, false }) |lower| {
+                const value = if (lower) domain.minimum.?.value else domain.maximum.?.value;
+                const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
+                const physical: @FieldType(Predicate, "value") = switch (value) {
+                    .integer => |integer| if (column.type == .integer) .{ .integer = integer } else continue,
+                    .string => |bytes| if (column.type == .string) .{ .bytes = bytes } else continue,
+                    .bool => |boolean| if (column.type == .boolean) .{ .boolean = boolean } else continue,
+                    else => continue,
+                };
+                try predicates.append(a, .{ .column = column.path, .op = if (lower) .gte else .lte, .value = physical });
+            }
+        }
+        self.stream.predicates = predicates.items;
+        self.dynamic = filter;
+        return true;
+    }
     fn nextColumns(raw: *anyopaque, alloc: Allocator, limit: u32) !catalog.ColumnPage {
         const self: *Owner = @ptrCast(@alignCast(raw));
+        self.started = true;
+        if (self.dynamic) |filter| {
+            if (filter.rows == 0) self.exhausted = true;
+        }
         if (limit == 0 or limit > 4096) return error.SqlLimitExceeded;
         try self.context.ensureActive();
         while (!self.exhausted) {
@@ -240,6 +272,14 @@ const Owner = struct {
                     if (self.after) |after| if (std.mem.order(u8, id, after) != .gt) continue;
                     if (self.before) |before| if (std.mem.order(u8, id, before) != .lt) continue;
                     if (self.primary_key) |key| if (!std.mem.eql(u8, id, key)) continue;
+                }
+                if (self.dynamic) |filter| {
+                    const keys = try a.alloc(scalar.Datum, filter.columns.len);
+                    for (filter.columns, keys) |key, *value| {
+                        const cell = try one.cell(a, 0, key.name);
+                        value.* = .{ .value = if (cell.sql_null) .null else try @import("../sql/describe.zig").coerceAlloc(a, cell.value, key.type), .sql_null = cell.sql_null };
+                    }
+                    if (!try filter.contains(keys)) continue;
                 }
                 if (!try matchesColumns(one, a, self.conditions)) continue;
                 selected[count] = index;
@@ -700,4 +740,43 @@ test "lake SQL Iceberg field identities govern renames name reuse and pruning" {
     const invalid = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 3 }, .{}, &lake.source);
     defer invalid.close(invalid.ptr);
     try std.testing.expectError(error.ExternalLakeSchemaMismatch, invalid.next(invalid.ptr, a, 3));
+}
+
+test "lake SQL dynamic scan filters prune groups before decoding and filter selected cells" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 3, &.{ 1, 2, 3, 4, 5 });
+    defer lake.deinit(a);
+    const Filter = @import("../sql/dynamic_filter.zig").Filter;
+    const filter = try Filter.create(a, &.{.{ .name = "amount", .type = .integer }}, 128);
+    defer filter.close();
+    try filter.add(&.{scalar.Datum.json(.{ .integer = 3 })});
+    filter.sealed = true;
+    const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 2 }, .{}, &lake.source);
+    defer cursor.close(cursor.ptr);
+    try std.testing.expect(try cursor.set_dynamic_filter.?(cursor.ptr, filter));
+    try std.testing.expectEqual(@as(?u64, null), try cursor.count_rows.?(cursor.ptr));
+    var seen: usize = 0;
+    while (true) {
+        const page = try cursor.next(cursor.ptr, a, 2);
+        defer page.deinit();
+        for (page.rows) |row| try std.testing.expectEqual(@as(i64, 3), row.value.object.get("amount").?.integer);
+        seen += page.rows.len;
+        if (page.after == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+    try std.testing.expect(!try cursor.set_dynamic_filter.?(cursor.ptr, filter));
+    const missing = try Filter.create(a, &.{.{ .name = "amount", .type = .integer }}, 128);
+    defer missing.close();
+    try missing.add(&.{scalar.Datum.json(.{ .integer = 100 })});
+    missing.sealed = true;
+    const pruned = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 2 }, .{}, &lake.source);
+    defer pruned.close(pruned.ptr);
+    try std.testing.expect(try pruned.set_dynamic_filter.?(pruned.ptr, missing));
+    const empty = try pruned.next(pruned.ptr, a, 2);
+    defer empty.deinit();
+    const owner: *Owner = @ptrCast(@alignCast(pruned.ptr));
+    try std.testing.expectEqual(@as(usize, 0), empty.rows.len);
+    try std.testing.expectEqual(@as(usize, 3), owner.stream.stats.groups_pruned);
+    try std.testing.expectEqual(@as(usize, 0), owner.stream.stats.groups_decoded);
 }

@@ -22,8 +22,44 @@ const Binary = @import("ast.zig").Scalar.Binary;
 pub fn evaluate(a: std.mem.Allocator, program: *const scalar.Program, rows: []const []const Datum, parameters: []const std.json.Value) !?[]const Datum {
     return evaluateInput(a, program, RowInput{ .rows = rows, .count = rows.len }, parameters);
 }
-pub fn evaluateColumns(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) !?[]const Datum {
+pub fn evaluateColumns(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value) anyerror!?[]const Datum {
     return evaluateInput(a, program, ColumnInput{ .page = page, .columns = columns, .count = page.selection.len }, parameters);
+}
+pub fn evaluateColumnsScheduled(a: std.mem.Allocator, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column, parameters: []const std.json.Value, io: ?std.Io) !?[]const Datum {
+    if (io == null or page.selection.len < 1024) return evaluateColumns(a, program, page, columns, parameters);
+    const scheduling = @import("parallel_scheduler.zig");
+    var allocator: scheduling.LockedAllocator = .{ .backing = a };
+    const worker_alloc = allocator.allocator();
+    var pending: [4]?scheduling.Task(anyerror!?[]const Datum) = @splat(null);
+    var outputs: [4]?[]const Datum = @splat(null);
+    defer for (&pending) |*task| if (task.*) |*active| {
+        _ = active.cancel(io.?) catch {};
+    };
+    defer for (outputs) |output| if (output) |values| worker_alloc.free(values);
+    const count = @min(pending.len, (page.selection.len + 1023) / 1024);
+    var failure: ?anyerror = null;
+    for (0..count) |lane| {
+        var part = page;
+        part.selection = page.selection[lane * page.selection.len / count .. (lane + 1) * page.selection.len / count];
+        const reservation = (program.instructions.len +| 1) *| part.selection.len *| @sizeOf(Datum);
+        pending[lane] = scheduling.global().submit(io.?, reservation, evaluateColumns, .{ worker_alloc, program, part, columns, parameters });
+        if (pending[lane] == null) outputs[lane] = evaluateColumns(worker_alloc, program, part, columns, parameters) catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+    }
+    for (pending[0..count], 0..) |*task, lane| if (task.*) |*active| {
+        outputs[lane] = active.await(io.?) catch |err| blk: {
+            failure = failure orelse err;
+            break :blk null;
+        };
+        task.* = null;
+    };
+    if (failure) |err| return err;
+    for (outputs[0..count]) |output| if (output == null) return null;
+    const result = try a.alloc(Datum, page.selection.len);
+    for (outputs[0..count], 0..) |output, lane| @memcpy(result[lane * page.selection.len / count .. (lane + 1) * page.selection.len / count], output.?);
+    return result;
 }
 const RowInput = struct {
     rows: []const []const Datum,
@@ -414,5 +450,39 @@ test "SQL direct column kernels preserve physical selection and SQL nulls" {
             const input = if (nulls[index] != 0) Datum{} else Datum.json(.{ .integer = numbers[index] });
             try std.testing.expectEqualDeep(try program.evaluate(arena.allocator(), &.{input}, &.{}, .{}), actual);
         }
+    }
+}
+
+test "SQL shared scheduled column kernels match scalar values over permuted nullable pages" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "(n + 2) * 3", .{});
+    defer compiled.deinit();
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+    defer program.deinit();
+    const count = 2048;
+    const values = try a.alloc(i64, count);
+    defer a.free(values);
+    const nulls = try a.alloc(u8, count);
+    defer a.free(nulls);
+    const selection = try a.alloc(usize, count);
+    defer a.free(selection);
+    for (values, nulls, selection, 0..) |*value, *is_null, *index, i| {
+        value.* = @as(i64, @intCast(i)) - 1024;
+        is_null.* = @intFromBool(i % 17 == 0);
+        index.* = count - i - 1;
+    }
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{}, .columns = &.{.{ .name = "n", .nulls = .{ .bytes = nulls }, .values = .{ .i64 = values } }} }, .selection = selection };
+    // ColumnBatch.rowCount is defined by row_refs; identities are not decoded.
+    var complete = page;
+    const refs = try a.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
+    defer a.free(refs);
+    complete.batch.row_refs = refs;
+    const scheduled = (try evaluateColumnsScheduled(a, &program, complete, &definitions, &.{}, std.testing.io)).?;
+    defer a.free(scheduled);
+    for (scheduled, selection) |actual, physical| {
+        const source: Datum = if (nulls[physical] != 0) .{} else Datum.json(.{ .integer = values[physical] });
+        const expected = try program.evaluate(a, &.{source}, &.{}, .{});
+        try std.testing.expectEqualDeep(expected, actual);
     }
 }

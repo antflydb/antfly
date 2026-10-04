@@ -67,7 +67,9 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
     }
     input.close();
     input_owned = false;
-    for (bound.sorts, 0..) |specification, sort_index| {
+    const roots = try @import("ordering_reuse.zig").plan(context.arena, bound);
+    for (bound.sorts, 0..) |specification, root| {
+        if (roots[root] != root) continue;
         var arena = std.heap.ArenaAllocator.init(context.alloc);
         defer arena.deinit();
         const a = arena.allocator();
@@ -111,27 +113,30 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
                 }
                 try partition.append(try rows.row(std.math.cast(usize, candidate.values[0].value.integer) orelse return error.InvalidSqlSpill));
             }
-            var starts = try disk.Integers.init(manager);
-            defer starts.deinit();
-            var ends = try disk.Integers.init(manager);
-            defer ends.deinit();
-            var groups = try disk.Integers.init(manager);
-            defer groups.deinit();
-            var position: usize = 0;
-            while (position < partition.len) {
-                var end = position + 1;
-                while (end < partition.len and try window.equal(&partition, position, end, specification.order)) : (end += 1) try context.checkpoint();
-                try groups.append(position);
-                for (position..end) |_| {
-                    try starts.append(position);
-                    try ends.append(end);
-                }
-                position = end;
-            }
-            try groups.append(partition.len);
             try partition.enableColumnUpdates(bound.input.columns.len);
-            const indices = disk.Identity{ .len = partition.len };
-            for (bound.specs, 0..) |spec, column| if (spec.sort == sort_index) try window.evaluate(context, &partition, indices, specification, spec, bound.input.columns.len + column, &starts, &ends, &groups);
+            for (bound.sorts, 0..) |requirement, sort_index| {
+                if (roots[sort_index] != root) continue;
+                var starts = try disk.Integers.init(manager);
+                defer starts.deinit();
+                var ends = try disk.Integers.init(manager);
+                defer ends.deinit();
+                var groups = try disk.Integers.init(manager);
+                defer groups.deinit();
+                var position: usize = 0;
+                while (position < partition.len) {
+                    var end = position + 1;
+                    while (end < partition.len and try window.equal(&partition, position, end, requirement.order)) : (end += 1) try context.checkpoint();
+                    try groups.append(position);
+                    for (position..end) |_| {
+                        try starts.append(position);
+                        try ends.append(end);
+                    }
+                    position = end;
+                }
+                try groups.append(partition.len);
+                const indices = disk.Identity{ .len = partition.len };
+                for (bound.specs, 0..) |spec, column| if (spec.sort == sort_index) try window.evaluate(context, &partition, indices, requirement, spec, bound.input.columns.len + column, &starts, &ends, &groups);
+            }
             for (0..partition.len) |index| try next.append(try partition.row(index));
         }
         rows.deinit();

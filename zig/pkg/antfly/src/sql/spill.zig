@@ -123,7 +123,7 @@ pub const File = struct {
         buffer: []u8,
         len: usize,
         offset: u64,
-        future: ?std.Io.Future(anyerror!void) = null,
+        future: ?@import("parallel_scheduler.zig").Task(anyerror!void) = null,
         fn write(job: *WriteJob) anyerror!void {
             try job.file.writePositionalAll(job.io, job.buffer[0..job.len], job.offset);
         }
@@ -149,7 +149,7 @@ pub const File = struct {
                 break :blk created;
             };
             job.* = .{ .io = self.manager.io, .file = self.file, .buffer = self.write_buffer, .len = self.write_len, .offset = self.write_start };
-            const future = self.manager.io.concurrent(WriteJob.write, .{job}) catch {
+            const future = @import("parallel_scheduler.zig").global().submit(self.manager.io, job.buffer.len, WriteJob.write, .{job}) orelse {
                 try WriteJob.write(job);
                 self.manager.write_calls += 1;
                 self.write_len = 0;
@@ -486,7 +486,9 @@ pub const Sort = struct {
             arena.deinit();
         }
     }
-    pub fn add(self: *Sort, row: Row) !void {
+    pub fn add(self: *Sort, input: Row) !void {
+        var row = input;
+        row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
         if (self.finished or row.keys.len != self.orders.len) return error.InvalidSqlBackendResponse;
         for (row.keys) |key| if (!key.sql_null) {
             _ = try scalar.compare(key.value, key.value);
@@ -503,7 +505,7 @@ pub const Sort = struct {
         const keys = try a.alloc(Datum, row.keys.len);
         for (row.values, values) |v, *out| out.* = try operators.cloneDatum(a, v);
         for (row.keys, keys) |v, *out| out.* = try operators.cloneDatum(a, v);
-        try self.rows.append(self.a, .{ .values = values, .keys = keys, .ordinal = row.ordinal });
+        try self.rows.append(self.a, .{ .values = values, .keys = keys, .ordinal = row.ordinal, .normalized = row.normalized });
         self.estimated += bytes;
         self.total += 1;
     }
@@ -545,6 +547,11 @@ pub const Sort = struct {
         }
         return error.SqlProgramLimitExceeded;
     }
+    fn readRun(self: *Sort, file: *File, a: Allocator, offset: u64) !Decoded {
+        var decoded = try file.read(a, offset);
+        decoded.row.normalized = @import("sort_key.zig").encode(decoded.row.keys, self.orders);
+        return decoded;
+    }
     fn merge(self: *Sort, left: *File, right: *File) !File {
         var output = try self.manager.create();
         errdefer output.close();
@@ -554,20 +561,20 @@ pub const Sort = struct {
         defer ra.deinit();
         var lp: u64 = 0;
         var rp: u64 = 0;
-        var l: ?Decoded = if (left.size != 0) try left.read(la.allocator(), 0) else null;
-        var r: ?Decoded = if (right.size != 0) try right.read(ra.allocator(), 0) else null;
+        var l: ?Decoded = if (left.size != 0) try self.readRun(left, la.allocator(), 0) else null;
+        var r: ?Decoded = if (right.size != 0) try self.readRun(right, ra.allocator(), 0) else null;
         while (l != null or r != null) {
             try self.manager.check();
             if (r == null or (l != null and (try operators.compareRows(l.?.row, r.?.row, self.orders)) != .gt)) {
                 _ = try output.append(l.?.row, none);
                 lp = l.?.following;
                 _ = la.reset(.retain_capacity);
-                l = if (lp < left.size) try left.read(la.allocator(), lp) else null;
+                l = if (lp < left.size) try self.readRun(left, la.allocator(), lp) else null;
             } else {
                 _ = try output.append(r.?.row, none);
                 rp = r.?.following;
                 _ = ra.reset(.retain_capacity);
-                r = if (rp < right.size) try right.read(ra.allocator(), rp) else null;
+                r = if (rp < right.size) try self.readRun(right, ra.allocator(), rp) else null;
             }
         }
         self.manager.merges += 1;
@@ -609,7 +616,7 @@ pub const Sort = struct {
         for (self.head_arenas[0..self.output_count]) |*arena| arena.* = std.heap.ArenaAllocator.init(self.a);
         errdefer for (self.head_arenas[0..self.output_count]) |*arena| arena.deinit();
         for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count], self.heads[0..self.output_count]) |*file, *arena, *head| {
-            head.* = if (file.*.?.size != 0) try file.*.?.read(arena.allocator(), 0) else null;
+            head.* = if (file.*.?.size != 0) try self.readRun(&file.*.?, arena.allocator(), 0) else null;
         }
         self.finished = true;
     }
@@ -627,7 +634,7 @@ pub const Sort = struct {
             for (head.row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
             for (head.row.keys, keys) |value, *out| out.* = try operators.cloneDatum(a, value);
             _ = self.head_arenas[index].reset(.retain_capacity);
-            self.heads[index] = if (head.following < self.outputs[index].?.size) try self.outputs[index].?.read(self.head_arenas[index].allocator(), head.following) else null;
+            self.heads[index] = if (head.following < self.outputs[index].?.size) try self.readRun(&self.outputs[index].?, self.head_arenas[index].allocator(), head.following) else null;
             return .{ .values = values, .keys = keys, .ordinal = head.row.ordinal };
         }
         if (self.offset < self.rows.items.len) {

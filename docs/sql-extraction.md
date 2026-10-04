@@ -178,7 +178,7 @@ lets long expressions run without retaining one vector per instruction.
 
 The regression fixture scans 131,072 and 1,048,576 integer rows in 65,536-row
 Parquet groups under a 32 MiB tracking allocator. Peak tracked allocations are
-7,081,695 and 7,081,809 bytes respectively: input growth adds file metadata rather
+7,081,703 and 7,081,817 bytes respectively: input growth adds file metadata rather
 than retaining all rows. This measures cursor memory for that fixture, not
 process memory or query latency. Tests also verify lazy first-page I/O, warm
 range reuse, pruning without decoded pages, changed-object rejection, exact
@@ -194,7 +194,7 @@ The independent-file integration fixtures are written by PyArrow, with Snappy,
 SQL nulls, multiple row groups, and dictionary and plain encodings. Native tests
 infer and decode every row. The production end-to-end test additionally creates
 an attachment without an explicit schema, checks HTTP projections, aggregates,
-joins and windows, streams all rows with psycopg, checks read-only rejection,
+joins (including a dynamically filtered probe) and compatible windows, streams all rows with psycopg, checks read-only rejection,
 and repeats reads after a cold process restart. Run it from `zig/` with:
 
 ```sh
@@ -206,12 +206,51 @@ Antfly's existing object-store envelope; `file://` is that provider's namespace.
 Iceberg rename tests separately verify equality deletes resolve field IDs in
 both data and delete files rather than trusting physical column names.
 
-The native batch interface is internal, not Apache Arrow. Joins and general
-keyed aggregate state still use tagged Datum cells. Further optimizations include
-compact normalized sort keys, fully typed join/group state and batch probing,
-scan-level dynamic filters, broader ordering reuse across windows, a shared parallel operator
-scheduler, and richer statistics-driven planning. These require their own
-semantic and memory-budget validation; the current bounded fallbacks remain.
+The native batch interface is internal, not Apache Arrow. Retained join payloads,
+join keys and grouping keys use typed primitive columns with packed SQL-null
+validity. Rows are reconstructed at candidate/expression/result boundaries.
+Complex JSON and heterogeneous columns retain native JSON values rather than
+converting exact integers to doubles. Aggregate state uses one compact vector
+per aggregate: counts, i128 sums, compensated floating sums/means, booleans and
+typed extrema. DISTINCT, pattern sets and complex extrema retain their explicit
+dynamic ownership. Legacy variable-width join inputs preserve their row widths.
+
+Sort and top-K comparisons cache fixed 32-byte normalized prefixes. Signed
+integers, finite floats, booleans and escaped byte strings use memcomparable
+encodings; NULL placement and direction remain explicit. Exact type-layout
+metadata prevents mixed integer/float shortcuts, signed zero is canonicalized,
+and truncated/complex comparisons fall back to the scalar comparator. Original
+keys remain available for exact ties, peer detection and spill interoperability.
+
+Nonrecursive equijoins install immutable composite Bloom/range evidence in a
+supported direct probe scan after the build completes and before its first
+pull. Filters are skipped on preserved probe sides of outer joins and for
+computed keys. Lake cursors apply Bloom evidence before producing selected
+cells; range evidence also prunes files, row groups and Iceberg partitions
+through the existing field-ID-aware planner. Unknown physical statistics remain
+residual. Empty builds need no probe data decoding. The exact hash join and ON
+residual still decide every returned match, and borrowed evidence outlives pulls.
+
+Window requirements with compatible ORDER BY prefixes and identical partition
+keys share the strongest permutation when their consumers are peer-invariant.
+Each weaker requirement builds its own peer/group boundaries. Navigation,
+ROWS frames, order-sensitive exclusions, floating sums and complex extrema
+retain independent stable tie ordering. Both in-memory and spilled execution
+use the same compatibility plan.
+
+Expression stripes, Parquet decoding, speculative prefetch and spill writers
+share one native admission scheduler: at most eight asynchronous tasks and
+64 MiB of reserved staging/workspace across statements. Expression pages of at
+least 1,024 selected rows split into at most four independent stripes. Required
+work executes inline under saturation; speculative prefetch yields. Allocator
+admission is serialized, and task leases release only after await/cancel joins
+workers, including cancellation before start. Statement memory/disk budgets
+remain separate from this global concurrency allowance. This uses the existing
+I/O runtime rather than creating independent pools for each operator.
+
+Further tuning includes richer statistics-driven costing, runtime filters
+through derived/computed scan mappings, and more parallel aggregate/join
+pipelines. Current scalar and spill fallbacks preserve supported SQL semantics.
 
 `EXPLAIN` identifies `Lake Scan`; verbose plans include the source format and
 configured snapshot selector without opening the source. Unsupported Parquet

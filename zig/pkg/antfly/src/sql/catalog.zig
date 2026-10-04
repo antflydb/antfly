@@ -172,6 +172,8 @@ pub const Cursor = struct {
     close: *const fn (*anyopaque) void,
     /// Optional native column path; consumers may fall back to next().
     next_columns: ?*const fn (*anyopaque, std.mem.Allocator, u32) anyerror!ColumnPage = null,
+    /// Borrow immutable filter evidence before any pull; false declines it.
+    set_dynamic_filter: ?*const fn (*anyopaque, *const @import("dynamic_filter.zig").Filter) anyerror!bool = null,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,

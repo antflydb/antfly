@@ -151,6 +151,26 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             },
         )["rows"]
         assert joined == expected
+        filtered_join = request(
+            "POST",
+            "/sql",
+            {
+                "statement": "SELECT p.amount FROM lake_events p JOIN (SELECT amount FROM lake_events WHERE amount >= 1197 LIMIT 3) b ON p.amount = b.amount ORDER BY p.amount DESC"
+            },
+        )
+        assert filtered_join["rows"] == [["1199"], ["1198"], ["1197"]]
+        shared_windows = request(
+            "POST",
+            "/sql",
+            {
+                "statement": "SELECT amount, rank() OVER (ORDER BY amount % 3), rank() OVER (ORDER BY amount % 3, amount), sum(amount) OVER (ORDER BY amount % 3) FROM lake_events WHERE amount >= 1197 ORDER BY amount"
+            },
+        )
+        assert shared_windows["rows"] == [
+            ["1197", "1", "1", "1197"],
+            ["1198", "2", "2", "2395"],
+            ["1199", "3", "3", "3594"],
+        ]
         for restart in (False, True):
             if restart:
                 server.restart()

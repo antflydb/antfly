@@ -13,10 +13,11 @@ const Json = std.json.Value;
 const MemoryBudget = @import("memory_budget.zig");
 
 pub const Order = struct { descending: bool = false, nulls_first: ?bool = null };
-pub const Row = struct { values: []const Datum, keys: []const Datum, ordinal: u64 };
+pub const Row = struct { values: []const Datum, keys: []const Datum, ordinal: u64, normalized: ?@import("sort_key.zig").Key = null };
 
 pub fn compareRows(left: Row, right: Row, orders: []const Order) !std.math.Order {
     if (left.keys.len != orders.len or right.keys.len != orders.len) return error.InvalidSqlBackendResponse;
+    if (left.normalized) |l| if (right.normalized) |r| if (@import("sort_key.zig").compare(l, r)) |order| return if (order == .eq) std.math.order(left.ordinal, right.ordinal) else order;
     for (left.keys, right.keys, orders) |a, b, order| {
         if (a.sql_null or b.sql_null) {
             if (a.sql_null and b.sql_null) continue;
@@ -39,10 +40,10 @@ const OwnedRow = struct {
         const keys = try owned.alloc(Datum, row.keys.len);
         for (row.values, values) |value, *out| out.* = try cloneDatum(owned, value);
         for (row.keys, keys) |value, *out| out.* = try cloneDatum(owned, value);
-        return .{ .values = values, .keys = keys, .ordinal = row.ordinal };
+        return .{ .values = values, .keys = keys, .ordinal = row.ordinal, .normalized = row.normalized };
     }
 
-    fn init(alloc: Allocator, row: Row) !OwnedRow {
+    pub fn init(alloc: Allocator, row: Row) !OwnedRow {
         var arena = std.heap.ArenaAllocator.init(alloc);
         errdefer arena.deinit();
         const cloned = try cloneInto(&arena, row);
@@ -196,7 +197,9 @@ pub const TopK = struct {
         return compareRows(a, b, self.orders);
     }
 
-    pub fn add(self: *TopK, row: Row) !void {
+    pub fn add(self: *TopK, input: Row) !void {
+        var row = input;
+        row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
         if (self.external) |sort| return sort.add(row);
         self.addInMemory(row) catch |err| {
             if (self.spill_manager == null or (err != error.SqlProgramLimitExceeded and err != error.OutOfMemory)) return err;
@@ -463,31 +466,25 @@ pub const GroupResult = struct { keys: []const Datum, aggregates: []const Datum,
 /// from one native page; only the build relation occupies retained memory.
 pub const HashJoin = struct {
     pub const Limits = struct { rows: usize = 100000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null };
-    const PackedRow = struct {
-        width: usize,
-        values: []const Datum,
-        ordinals: []const u32,
-        keys: []const Datum,
-    };
-    const Entry = struct { row: PackedRow, next: ?usize, matched: bool = false };
+    const Entry = struct { next: ?usize, width: usize, matched: bool = false };
     pub const Match = struct {
         index: usize,
-        row: PackedRow,
+        values: []const Datum = &.{},
+        keys: []const Datum = &.{},
         transient: bool = false,
+        owner: ?*HashJoin = null,
 
-        /// Expand positional NULL slots only for the current candidate. Cell
-        /// payloads continue to borrow the immutable packed build relation.
+        /// Reconstruct row-boundary values from stable typed columns. Disk
+        /// candidates are copied before the next probe reuses decode storage.
+        pub fn materializeKeys(self: Match, alloc: Allocator) ![]const Datum {
+            return if (self.owner) |owner| owner.key_columns.row(alloc, self.index) else self.keys;
+        }
         pub fn materializeValues(self: Match, alloc: Allocator) ![]const Datum {
-            if (self.row.values.len == self.row.width) {
-                const result = try alloc.dupe(Datum, self.row.values);
-                if (self.transient) {
-                    for (result) |*value| value.* = try cloneDatum(alloc, value.*);
-                }
-                return result;
+            if (self.owner) |owner| return owner.value_columns.rowWidth(alloc, self.index, owner.entries.items[self.index].width);
+            const result = try alloc.dupe(Datum, self.values);
+            if (self.transient) {
+                for (result) |*value| value.* = try cloneDatum(alloc, value.*);
             }
-            const result = try alloc.alloc(Datum, self.row.width);
-            @memset(result, .{});
-            for (self.row.ordinals, self.row.values) |ordinal, value| result[ordinal] = value;
             return result;
         }
     };
@@ -508,19 +505,14 @@ pub const HashJoin = struct {
                     equal = false;
                     break;
                 };
-                if (equal) return .{ .index = index, .row = .{ .width = decoded.row.values.len, .values = decoded.row.values, .ordinals = &.{}, .keys = decoded.row.keys }, .transient = true };
+                if (equal) return .{ .index = index, .values = decoded.row.values, .keys = decoded.row.keys, .transient = true };
             };
             if (self.owner.disk != null) return null;
             while (self.cursor) |index| {
                 const entry = &self.owner.entries.items[index];
                 self.cursor = entry.next;
                 self.owner.probes += 1;
-                var equal = true;
-                for (entry.row.keys, self.keys) |left, right| if ((try scalar.compare(left.value, right.value)) != .eq) {
-                    equal = false;
-                    break;
-                };
-                if (equal) return .{ .index = index, .row = entry.row };
+                if (try self.owner.key_columns.equal(self.owner.backing, index, self.keys, false)) return .{ .index = index, .owner = self.owner };
             }
             return null;
         }
@@ -529,9 +521,10 @@ pub const HashJoin = struct {
     backing: Allocator,
     budget: MemoryBudget,
     limits: Limits,
-    // Build rows share an append-only arena: per-row arenas amplify small
-    // projections and waste quota on thousands of tiny allocation headers.
-    rows: std.heap.ArenaAllocator,
+    // Primitive payload/key columns retain typed vectors and packed validity;
+    // only variable-width bytes and native JSON need owned arena payloads.
+    value_columns: @import("typed_store.zig").Store,
+    key_columns: @import("typed_store.zig").Store,
     entries: std.ArrayList(Entry) = .empty,
     heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     key_count: ?usize = null,
@@ -551,17 +544,20 @@ pub const HashJoin = struct {
         @memset(heads, @import("spill.zig").none);
         var file = try manager.create();
         errdefer file.close();
-        for (self.entries.items, 0..) |entry, ordinal| {
+        for (self.entries.items, 0..) |_, ordinal| {
             var arena = std.heap.ArenaAllocator.init(self.backing);
             defer arena.deinit();
-            const values = try (Match{ .index = ordinal, .row = entry.row }).materializeValues(arena.allocator());
-            const hashed = try keyHash(entry.row.keys);
+            const values = try self.value_columns.rowWidth(arena.allocator(), ordinal, self.entries.items[ordinal].width);
+            const keys = try self.key_columns.row(arena.allocator(), ordinal);
+            const hashed = try keyHash(keys);
             const bucket = if (hashed) |value| value & (heads.len - 1) else 0;
-            const offset = try file.append(.{ .values = values, .keys = entry.row.keys, .ordinal = ordinal }, if (hashed != null) heads[bucket] else @import("spill.zig").none);
+            const offset = try file.append(.{ .values = values, .keys = keys, .ordinal = ordinal }, if (hashed != null) heads[bucket] else @import("spill.zig").none);
             if (hashed != null) heads[bucket] = offset;
         }
-        self.rows.deinit();
-        self.rows = std.heap.ArenaAllocator.init(alloc);
+        self.value_columns.deinit();
+        self.key_columns.deinit();
+        self.value_columns = .init(alloc);
+        self.key_columns = .init(alloc);
         self.entries.clearAndFree(alloc);
         self.heads.clearAndFree(alloc);
         self.disk_heads = heads;
@@ -576,8 +572,9 @@ pub const HashJoin = struct {
     pub fn create(alloc: Allocator, limits: Limits) !*HashJoin {
         if (limits.bytes < @sizeOf(HashJoin)) return error.SqlProgramLimitExceeded;
         const self = try alloc.create(HashJoin);
-        self.* = .{ .backing = alloc, .budget = .{ .backing = alloc, .limit = limits.bytes - @sizeOf(HashJoin) }, .limits = limits, .rows = undefined };
-        self.rows = std.heap.ArenaAllocator.init(self.budget.allocator());
+        self.* = .{ .backing = alloc, .budget = .{ .backing = alloc, .limit = limits.bytes - @sizeOf(HashJoin) }, .limits = limits, .value_columns = undefined, .key_columns = undefined };
+        self.value_columns = .init(self.budget.allocator());
+        self.key_columns = .init(self.budget.allocator());
         self.disk_arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         return self;
     }
@@ -586,7 +583,8 @@ pub const HashJoin = struct {
         if (self.disk) |*file| file.close();
         self.disk_arena.deinit();
         alloc.free(self.disk_heads);
-        self.rows.deinit();
+        self.value_columns.deinit();
+        self.key_columns.deinit();
         self.entries.deinit(alloc);
         self.heads.deinit(alloc);
         std.debug.assert(self.budget.live == 0);
@@ -629,22 +627,9 @@ pub const HashJoin = struct {
         try self.entries.ensureUnusedCapacity(alloc, 1);
         if (key_hash != null) try self.heads.ensureUnusedCapacity(alloc, 1);
         const index = self.entries.items.len;
-        const owned = self.rows.allocator();
-        var present: usize = 0;
-        for (values) |value| present += @intFromBool(!value.sql_null);
-        const sparse = present != values.len;
-        const present_values = try owned.alloc(Datum, present);
-        const ordinals: []u32 = if (sparse) try owned.alloc(u32, present) else &.{};
-        var position: usize = 0;
-        for (values, 0..) |value, ordinal| if (!value.sql_null) {
-            present_values[position] = try cloneDatum(owned, value);
-            if (sparse) ordinals[position] = std.math.cast(u32, ordinal) orelse return error.SqlProgramLimitExceeded;
-            position += 1;
-        };
-        const key_values = try owned.alloc(Datum, keys.len);
-        for (keys, key_values) |key, *value| value.* = try cloneDatum(owned, key);
-        const row: PackedRow = .{ .width = values.len, .values = present_values, .ordinals = ordinals, .keys = key_values };
-        self.entries.appendAssumeCapacity(.{ .row = row, .next = if (key_hash) |hashed| self.heads.get(hashed) else null });
+        _ = try self.value_columns.appendRagged(values);
+        _ = try self.key_columns.append(keys);
+        self.entries.appendAssumeCapacity(.{ .width = values.len, .next = if (key_hash) |hashed| self.heads.get(hashed) else null });
         if (key_hash) |hashed| self.heads.putAssumeCapacity(hashed, index);
     }
     pub fn probe(self: *HashJoin, keys: []const Datum) !Probe {
@@ -671,7 +656,7 @@ pub const HashJoin = struct {
                 _ = self.disk_arena.reset(.free_all);
                 const row = try file.read(self.disk_arena.allocator(), offset);
                 next.* = @intCast(row.following);
-                if (!row.matched) return .{ .index = offset, .row = .{ .width = row.row.values.len, .values = row.row.values, .ordinals = &.{}, .keys = row.row.keys }, .transient = true };
+                if (!row.matched) return .{ .index = offset, .values = row.row.values, .keys = row.row.keys, .transient = true };
             }
             return null;
         }
@@ -679,7 +664,7 @@ pub const HashJoin = struct {
             const index = next.*;
             next.* += 1;
             const entry = self.entries.items[index];
-            if (!entry.matched) return .{ .index = index, .row = entry.row };
+            if (!entry.matched) return .{ .index = index, .owner = self };
         }
         return null;
     }
@@ -690,12 +675,15 @@ pub const HashJoin = struct {
 /// pointers valid through map growth and result handoff.
 pub const Grouped = struct {
     pub const Limits = struct { groups: usize = 10000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null };
-    const Group = struct { keys: OwnedRow, states: []Aggregate, next: ?usize };
+    const Group = struct { next: ?usize };
     backing: Allocator,
     budget: MemoryBudget,
     specs: []AggregateSpec,
     limits: Limits,
     groups: std.ArrayList(Group) = .empty,
+    key_columns: @import("typed_store.zig").Store,
+    state_columns: []@import("aggregate_state.zig").Column,
+    results: std.heap.ArenaAllocator,
     heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     rows_seen: u64 = 0,
     hash_probes: u64 = 0,
@@ -707,11 +695,12 @@ pub const Grouped = struct {
     result_cursor: usize = 0,
     fn clearGroups(self: *Grouped) void {
         const alloc = self.budget.allocator();
-        for (self.groups.items) |*group| {
-            group.keys.deinit();
-            for (group.states) |*state| state.deinit();
-            alloc.free(group.states);
+        for (self.state_columns) |*column| {
+            column.clear(alloc);
         }
+        self.key_columns.deinit();
+        self.key_columns = .init(alloc);
+        _ = self.results.reset(.free_all);
         self.groups.clearAndFree(alloc);
         self.heads.clearAndFree(alloc);
     }
@@ -721,7 +710,15 @@ pub const Grouped = struct {
         errdefer self.backing.destroy(external);
         external.* = try @import("spill_grouped.zig").Grouped.init(self.backing, manager, self.specs, self.key_count orelse 0, self.limits.bytes);
         errdefer external.deinit();
-        for (self.groups.items) |group| try external.partial(group.keys.row.values, group.states, group.keys.row.ordinal);
+        var scratch = std.heap.ArenaAllocator.init(self.backing);
+        defer scratch.deinit();
+        for (0..self.groups.items.len) |index| {
+            _ = scratch.reset(.retain_capacity);
+            const a = scratch.allocator();
+            const states = try a.alloc(Aggregate, self.specs.len);
+            for (self.state_columns, states) |column, *state| state.* = try column.snapshot(a, index);
+            try external.partial(try self.key_columns.row(a, index), states, index);
+        }
         self.clearGroups();
         self.external = external;
     }
@@ -741,8 +738,12 @@ pub const Grouped = struct {
         if (limits.bytes < @sizeOf(Grouped) or specs.len > 256) return error.SqlProgramLimitExceeded;
         const self = try alloc.create(Grouped);
         errdefer alloc.destroy(self);
-        self.* = .{ .backing = alloc, .budget = .{ .backing = alloc, .limit = limits.bytes - @sizeOf(Grouped) }, .specs = undefined, .limits = limits };
+        self.* = .{ .backing = alloc, .budget = .{ .backing = alloc, .limit = limits.bytes - @sizeOf(Grouped) }, .specs = undefined, .limits = limits, .key_columns = undefined, .state_columns = &.{}, .results = .init(alloc) };
+        self.key_columns = .init(self.budget.allocator());
         self.specs = self.budget.allocator().dupe(AggregateSpec, specs) catch |err| return if (self.budget.exhausted) error.SqlProgramLimitExceeded else err;
+        errdefer self.budget.allocator().free(self.specs);
+        self.state_columns = try self.budget.allocator().alloc(@import("aggregate_state.zig").Column, specs.len);
+        for (self.state_columns, specs) |*column, spec| column.* = .init(spec);
         return self;
     }
 
@@ -753,6 +754,9 @@ pub const Grouped = struct {
         }
         const alloc = self.budget.allocator();
         self.clearGroups();
+        self.key_columns.deinit();
+        self.results.deinit();
+        alloc.free(self.state_columns);
         alloc.free(self.specs);
         std.debug.assert(self.budget.live == 0);
         self.backing.destroy(self);
@@ -812,7 +816,9 @@ pub const Grouped = struct {
         }
         errdefer self.failed = true;
         const remaining = inputs[1..];
-        for (self.groups.items[0].states, 0..) |*state, column| {
+        for (self.state_columns, 0..) |*states, column| {
+            var snapshot = try states.snapshot(self.backing, 0);
+            const state = &snapshot;
             var index: usize = 0;
             while (index < remaining.len) {
                 var counts: [4]u64 = @splat(0);
@@ -834,6 +840,7 @@ pub const Grouped = struct {
                 if (state.kind == .bool_or) state.boolean = state.boolean or @reduce(.Or, @as(@Vector(4, bool), booleans));
                 index += count;
             }
+            states.set(0, snapshot);
         }
         self.rows_seen = std.math.add(u64, self.rows_seen, remaining.len) catch return error.SqlNumericOutOfRange;
     }
@@ -850,7 +857,7 @@ pub const Grouped = struct {
     pub fn addGlobalCount(self: *Grouped, count: u64) !void {
         if (self.failed or self.finished or self.groups.items.len != 1 or self.key_count != 0 or self.rows_seen != 0) return error.InvalidSqlBackendResponse;
         for (self.specs) |spec| if (spec.kind != .count or spec.distinct) return error.InvalidSqlBackendResponse;
-        for (self.groups.items[0].states) |*state| state.count = count;
+        for (self.state_columns) |*column| column.values.counts.items[0] = count;
     }
 
     pub fn groupCount(self: *const Grouped) usize {
@@ -860,11 +867,10 @@ pub const Grouped = struct {
     pub fn resultAt(self: *Grouped, alloc: Allocator, index: usize) !GroupResult {
         if (self.failed or index >= self.groups.items.len) return error.InvalidSqlBackendResponse;
         self.finished = true;
-        const group = &self.groups.items[index];
-        const values = try alloc.alloc(Datum, group.states.len);
+        const values = try alloc.alloc(Datum, self.specs.len);
         errdefer alloc.free(values);
-        for (group.states, values) |*state, *value| value.* = try state.finish();
-        return .{ .keys = group.keys.row.values, .aggregates = values, .ordinal = index };
+        for (self.state_columns, values) |*column, *value| value.* = try column.finish(index);
+        return .{ .keys = try self.key_columns.row(self.results.allocator(), index), .aggregates = values, .ordinal = index };
     }
 
     fn update(self: *Grouped, keys: []const Datum, inputs: []const Datum) !void {
@@ -882,18 +888,11 @@ pub const Grouped = struct {
         while (slot) |index| {
             self.hash_probes += 1;
             const group = &self.groups.items[index];
-            var equal = true;
-            for (group.keys.row.values, keys) |stored, key| {
-                if (stored.sql_null != key.sql_null or (!key.sql_null and (try scalar.compare(stored.value, key.value)) != .eq)) {
-                    equal = false;
-                    break;
-                }
-            }
-            if (equal) break;
+            if (try self.key_columns.equal(self.backing, index, keys, true)) break;
             slot = group.next;
         }
         if (slot == null) slot = try self.appendGroup(keys, hash);
-        for (self.groups.items[slot.?].states, inputs) |*state, value| try state.update(value);
+        for (self.state_columns, inputs) |*column, value| try column.update(self.budget.allocator(), slot.?, value);
         self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
     }
 
@@ -902,19 +901,10 @@ pub const Grouped = struct {
         const alloc = self.budget.allocator();
         try self.groups.ensureUnusedCapacity(alloc, 1);
         try self.heads.ensureUnusedCapacity(alloc, 1);
-        var owned = try OwnedRow.init(alloc, .{ .values = keys, .keys = &.{}, .ordinal = self.groups.items.len });
-        errdefer owned.deinit();
-        const states = try alloc.alloc(Aggregate, self.specs.len);
-        errdefer alloc.free(states);
-        var initialized: usize = 0;
-        errdefer for (states[0..initialized]) |*state| state.deinit();
-        for (states, self.specs) |*state, spec| {
-            state.* = try Aggregate.init(alloc, spec.kind, spec.input_type);
-            state.distinct = spec.distinct;
-            initialized += 1;
-        }
+        _ = try self.key_columns.append(keys);
+        for (self.state_columns) |*column| try column.append(alloc);
         const index = self.groups.items.len;
-        self.groups.appendAssumeCapacity(.{ .keys = owned, .states = states, .next = self.heads.get(hash) });
+        self.groups.appendAssumeCapacity(.{ .next = self.heads.get(hash) });
         self.heads.putAssumeCapacity(hash, index);
         return index;
     }
@@ -930,11 +920,9 @@ pub const Grouped = struct {
             for (result[0..initialized]) |group| alloc.free(group.aggregates);
             alloc.free(result);
         }
-        for (self.groups.items, result, 0..) |*group, *output, i| {
-            const values = try alloc.alloc(Datum, group.states.len);
-            output.* = .{ .keys = group.keys.row.values, .aggregates = values, .ordinal = i };
+        for (result, 0..) |*output, i| {
+            output.* = try self.resultAt(alloc, i);
             initialized += 1;
-            for (group.states, values) |*state, *value| value.* = try state.finish();
         }
         return result;
     }
@@ -1205,7 +1193,7 @@ test "SQL hash join packs sparse five thousand row build under the default quota
     try std.testing.expect((try probe.next()) == null);
 }
 
-test "SQL packed hash join preserves SQL NULL and JSON null through allocation failures" {
+test "SQL typed hash join preserves SQL NULL and JSON null through allocation failures" {
     const Harness = struct {
         fn run(alloc: Allocator) !void {
             const join = try HashJoin.create(alloc, .{});

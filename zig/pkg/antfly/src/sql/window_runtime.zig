@@ -647,44 +647,49 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
 }
 pub fn evaluateCells(context: anytype, statement: ast.Select, cells: [][]Datum) !@import("runtime.zig").Output {
     const bound = context.binding.window.?;
-    for (bound.sorts, 0..) |sort, sort_index| {
+    const roots = try @import("ordering_reuse.zig").plan(context.arena, bound);
+    for (bound.sorts, 0..) |strong, root| {
+        if (roots[root] != root) continue;
         try context.checkpoint();
         var sorted = std.heap.ArenaAllocator.init(context.alloc);
         defer sorted.deinit();
         const indices = try sorted.allocator().alloc(usize, cells.len);
         for (indices, 0..) |*index, i| index.* = i;
-        var sorter = Sorter(@TypeOf(context)){ .context = context, .cells = cells, .spec = sort };
+        var sorter = Sorter(@TypeOf(context)){ .context = context, .cells = cells, .spec = strong };
         std.mem.sort(usize, indices, &sorter, @TypeOf(sorter).less);
         if (sorter.failure) |err| return err;
         const peer_starts = try sorted.allocator().alloc(usize, cells.len);
         const peer_ends = try sorted.allocator().alloc(usize, cells.len);
-        const needs_groups = for (bound.specs) |spec| {
-            if (spec.sort == sort_index and spec.frame != null and spec.frame.?.mode == .groups) break true;
-        } else false;
-        const group_starts = try sorted.allocator().alloc(usize, if (needs_groups) cells.len + 1 else 0);
-        var start: usize = 0;
-        while (start < indices.len) {
-            var end = start + 1;
-            while (end < indices.len and try equal(cells, indices[start], indices[end], sort.partition)) : (end += 1) {
-                if (end % 256 == 0) try context.checkpoint();
-            }
-            const partition = indices[start..end];
-            var peer: usize = 0;
-            var group_count: usize = 0;
-            while (peer < partition.len) {
-                if (needs_groups) group_starts[group_count] = peer;
-                group_count += 1;
-                var peer_end = peer + 1;
-                while (peer_end < partition.len and try equal(cells, partition[peer], partition[peer_end], sort.order)) : (peer_end += 1) {
-                    if (peer_end % 256 == 0) try context.checkpoint();
+        for (bound.sorts, 0..) |sort, sort_index| {
+            if (roots[sort_index] != root) continue;
+            const needs_groups = for (bound.specs) |spec| {
+                if (spec.sort == sort_index and spec.frame != null and spec.frame.?.mode == .groups) break true;
+            } else false;
+            const group_starts = try sorted.allocator().alloc(usize, if (needs_groups) cells.len + 1 else 0);
+            var start: usize = 0;
+            while (start < indices.len) {
+                var end = start + 1;
+                while (end < indices.len and try equal(cells, indices[start], indices[end], sort.partition)) : (end += 1) {
+                    if (end % 256 == 0) try context.checkpoint();
                 }
-                @memset(peer_starts[peer..peer_end], peer);
-                @memset(peer_ends[peer..peer_end], peer_end);
-                peer = peer_end;
+                const partition = indices[start..end];
+                var peer: usize = 0;
+                var group_count: usize = 0;
+                while (peer < partition.len) {
+                    if (needs_groups) group_starts[group_count] = peer;
+                    group_count += 1;
+                    var peer_end = peer + 1;
+                    while (peer_end < partition.len and try equal(cells, partition[peer], partition[peer_end], sort.order)) : (peer_end += 1) {
+                        if (peer_end % 256 == 0) try context.checkpoint();
+                    }
+                    @memset(peer_starts[peer..peer_end], peer);
+                    @memset(peer_ends[peer..peer_end], peer_end);
+                    peer = peer_end;
+                }
+                if (needs_groups) group_starts[group_count] = partition.len;
+                for (bound.specs, 0..) |spec, index| if (spec.sort == sort_index) try evaluate(context, cells, partition, sort, spec, bound.input.columns.len + index, peer_starts[0..partition.len], peer_ends[0..partition.len], group_starts[0..if (needs_groups) group_count + 1 else 0]);
+                start = end;
             }
-            if (needs_groups) group_starts[group_count] = partition.len;
-            for (bound.specs, 0..) |spec, index| if (spec.sort == sort_index) try evaluate(context, cells, partition, sort, spec, bound.input.columns.len + index, peer_starts[0..partition.len], peer_ends[0..partition.len], group_starts[0..if (needs_groups) group_count + 1 else 0]);
-            start = end;
         }
     }
     return finishCells(context, statement, cells);

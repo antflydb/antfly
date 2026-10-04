@@ -154,40 +154,7 @@ pub const Cursor = struct {
         if (count != 0) try reader.prefetch(reads[0..count]);
     }
     const DecodeStats = struct { pages: usize, dictionaries: usize };
-    const DecodeAllocator = struct {
-        backing: A,
-        mutex: std.atomic.Mutex = .unlocked,
-        fn allocator(self: *DecodeAllocator) A {
-            return .{ .ptr = self, .vtable = &.{ .alloc = allocate, .resize = resize, .remap = remap, .free = free } };
-        }
-        fn lock(self: *DecodeAllocator) void {
-            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-        }
-        fn allocate(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-            const self: *DecodeAllocator = @ptrCast(@alignCast(raw));
-            self.lock();
-            defer self.mutex.unlock();
-            return self.backing.rawAlloc(len, alignment, ra);
-        }
-        fn resize(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
-            const self: *DecodeAllocator = @ptrCast(@alignCast(raw));
-            self.lock();
-            defer self.mutex.unlock();
-            return self.backing.rawResize(bytes, alignment, len, ra);
-        }
-        fn remap(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
-            const self: *DecodeAllocator = @ptrCast(@alignCast(raw));
-            self.lock();
-            defer self.mutex.unlock();
-            return self.backing.rawRemap(bytes, alignment, len, ra);
-        }
-        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
-            const self: *DecodeAllocator = @ptrCast(@alignCast(raw));
-            self.lock();
-            defer self.mutex.unlock();
-            self.backing.rawFree(bytes, alignment, ra);
-        }
-    };
+    const DecodeAllocator = @import("../../sql/parallel_scheduler.zig").LockedAllocator;
     fn decode(template: Cursor, column: *Column, a: A) anyerror!DecodeStats {
         // A worker mutates its own column only. The scoped allocator serializes
         // admission/arena mutations, while provider I/O and decoding overlap.
@@ -205,7 +172,7 @@ pub const Cursor = struct {
             return;
         }
         var allocator: DecodeAllocator = .{ .backing = self.a };
-        var pending: [4]?std.Io.Future(anyerror!DecodeStats) = @splat(null);
+        var pending: [4]?@import("../../sql/parallel_scheduler.zig").Task(anyerror!DecodeStats) = @splat(null);
         // Every worker joins on all error/cancellation paths before the scoped
         // allocator or the cursor metadata can leave scope.
         defer for (&pending) |*future| if (future.*) |*active| {
@@ -218,7 +185,7 @@ pub const Cursor = struct {
                 while (next_column < self.columns.len and self.columns[next_column].consumed != self.columns[next_column].count) next_column += 1;
                 if (next_column == self.columns.len) break;
                 const column = &self.columns[next_column];
-                future.* = io.?.concurrent(decode, .{ self.*, column, allocator.allocator() }) catch {
+                future.* = @import("../../sql/parallel_scheduler.zig").global().submit(io.?, (self.limits.max_input_bytes +| self.limits.max_decoded_bytes) / self.columns.len, decode, .{ self.*, column, allocator.allocator() }) orelse {
                     const stats = try decode(self.*, column, allocator.allocator());
                     self.pages_decoded += stats.pages;
                     self.dictionary_decodes += stats.dictionaries;

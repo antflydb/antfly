@@ -1,0 +1,97 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+//! Immutable build-side evidence installed before a probe scan is pulled.
+//! Bloom collisions retain candidates; exact join/residual checks remain.
+const std = @import("std");
+const scalar = @import("scalar.zig");
+const Datum = scalar.Datum;
+const A = std.mem.Allocator;
+pub const Column = struct { name: []const u8, type: @import("ast.zig").ColumnType };
+pub const Domain = struct {
+    minimum: ?Datum = null,
+    maximum: ?Datum = null,
+    min_owner: std.heap.ArenaAllocator,
+    max_owner: std.heap.ArenaAllocator,
+    fn add(self: *Domain, value: Datum) !void {
+        if (value.sql_null) return;
+        if (self.minimum == null or (try scalar.compare(value.value, self.minimum.?.value)) == .lt) {
+            _ = self.min_owner.reset(.free_all);
+            self.minimum = try @import("operators.zig").cloneDatum(self.min_owner.allocator(), value);
+        }
+        if (self.maximum == null or (try scalar.compare(value.value, self.maximum.?.value)) == .gt) {
+            _ = self.max_owner.reset(.free_all);
+            self.maximum = try @import("operators.zig").cloneDatum(self.max_owner.allocator(), value);
+        }
+    }
+};
+pub const Filter = struct {
+    a: A,
+    columns: []Column,
+    domains: []Domain,
+    bits: []u64,
+    rows: usize = 0,
+    sealed: bool = false,
+    failed: bool = false,
+    pub fn create(a: A, columns: []const Column, bytes: usize) !*Filter {
+        const self = try a.create(Filter);
+        errdefer a.destroy(self);
+        const keys = try a.dupe(Column, columns);
+        errdefer a.free(keys);
+        const domains = try a.alloc(Domain, columns.len);
+        errdefer a.free(domains);
+        const bits = try a.alloc(u64, @max(16, @min(8192, bytes / 8)));
+        @memset(bits, 0);
+        for (domains) |*domain| domain.* = .{ .min_owner = .init(a), .max_owner = .init(a) };
+        self.* = .{ .a = a, .columns = keys, .domains = domains, .bits = bits };
+        return self;
+    }
+    pub fn close(self: *Filter) void {
+        for (self.domains) |*domain| {
+            domain.min_owner.deinit();
+            domain.max_owner.deinit();
+        }
+        self.a.free(self.domains);
+        self.a.free(self.columns);
+        self.a.free(self.bits);
+        self.a.destroy(self);
+    }
+    fn mask(self: *const Filter, hash: u64) struct { index: usize, bit: u64 } {
+        const position = hash % (self.bits.len * 64);
+        return .{ .index = @intCast(position / 64), .bit = @as(u64, 1) << @as(u6, @intCast(position % 64)) };
+    }
+    pub fn add(self: *Filter, values: []const Datum) !void {
+        if (self.failed or self.sealed or values.len != self.columns.len) return error.InvalidSqlBackendResponse;
+        errdefer self.failed = true;
+        const hash = (try @import("operators.zig").HashJoin.keyHash(values)) orelse return;
+        for (self.domains, values) |*domain, value| try domain.add(value);
+        const first = self.mask(hash);
+        const second = self.mask(std.math.rotr(u64, hash, 23));
+        self.bits[first.index] |= first.bit;
+        self.bits[second.index] |= second.bit;
+        self.rows += 1;
+    }
+    pub fn contains(self: *const Filter, values: []const Datum) !bool {
+        if (self.failed or !self.sealed or values.len != self.columns.len) return error.InvalidSqlBackendResponse;
+        if (self.rows == 0) return false;
+        const hash = (try @import("operators.zig").HashJoin.keyHash(values)) orelse return false;
+        const first = self.mask(hash);
+        const second = self.mask(std.math.rotr(u64, hash, 23));
+        if (self.bits[first.index] & first.bit == 0 or self.bits[second.index] & second.bit == 0) return false;
+        for (self.domains, values) |domain, value| {
+            if ((try scalar.compare(value.value, domain.minimum.?.value)) == .lt or (try scalar.compare(value.value, domain.maximum.?.value)) == .gt) return false;
+        }
+        return true;
+    }
+};
+test "SQL scan dynamic filters preserve composite numeric equality and SQL nulls" {
+    const a = std.testing.allocator;
+    const filter = try Filter.create(a, &.{ .{ .name = "n", .type = .integer }, .{ .name = "s", .type = .string } }, 256);
+    defer filter.close();
+    for (0..1000) |i| try filter.add(&.{ Datum.json(.{ .integer = @intCast(i * 3) }), Datum.json(.{ .string = "x" }) });
+    try filter.add(&.{ .{}, Datum.json(.{ .string = "null" }) });
+    filter.sealed = true;
+    for (0..1000) |i| try std.testing.expect(try filter.contains(&.{ Datum.json(.{ .float = @floatFromInt(i * 3) }), Datum.json(.{ .string = "x" }) }));
+    try std.testing.expect(!try filter.contains(&.{ .{}, Datum.json(.{ .string = "x" }) }));
+    try std.testing.expect(!try filter.contains(&.{ Datum.json(.{ .integer = 4000 }), Datum.json(.{ .string = "x" }) }));
+    try std.testing.expectError(error.InvalidSqlBackendResponse, filter.add(&.{ .{}, .{} }));
+}

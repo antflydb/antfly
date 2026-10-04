@@ -283,6 +283,7 @@ fn Engine(comptime Context: type) type {
             hash_join: ?*operators.HashJoin = null,
             partition_join: ?*@import("partition_join.zig").Join = null,
             probe: ?operators.HashJoin.Probe = null,
+            scan_filter: ?*@import("dynamic_filter.zig").Filter = null,
             left_values: ?[]const Datum = null,
             left_matched: bool = false,
             unmatched_index: usize = 0,
@@ -344,6 +345,7 @@ fn Engine(comptime Context: type) type {
                 if (self.right) |right| right.deinit();
                 if (self.values_leaf) |leaf| leaf.deinit();
                 if (self.partition_join) |join| join.close();
+                if (self.scan_filter) |filter| filter.close();
                 if (!self.borrowed_hash) if (self.hash_join) |join| join.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
@@ -660,6 +662,26 @@ fn Engine(comptime Context: type) type {
                 }
                 return null;
             }
+            fn prepareScanFilter(self: *Iterator, programs: []const scalar.Program) !void {
+                const probe = self.left.?;
+                if (probe.node.operation != .scan or programs.len == 0) return;
+                const scan = probe.node.operation.scan;
+                const cursor = self.engine.cursors[scan.index];
+                if (cursor.set_dynamic_filter == null) return;
+                const columns = try self.engine.context.alloc.alloc(@import("dynamic_filter.zig").Column, programs.len);
+                defer self.engine.context.alloc.free(columns);
+                for (programs, columns) |program, *column| {
+                    if (program.instructions.len != 1 or program.instructions[program.root].operation != .column) return;
+                    const instruction = program.instructions[program.root];
+                    const kind = instruction.type.kind orelse return;
+                    switch (kind) {
+                        .integer, .number, .string, .boolean => {},
+                        else => return,
+                    }
+                    column.* = .{ .name = scan.source_columns[instruction.operation.column], .type = kind };
+                }
+                self.scan_filter = try @import("dynamic_filter.zig").Filter.create(self.engine.context.alloc, columns, self.engine.context.limits.retained_bytes / 32);
+            }
             fn nextJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
                 const kind = if (self.flipped_join) switch (join.kind) {
                     .right => .left,
@@ -674,12 +696,19 @@ fn Engine(comptime Context: type) type {
                 if (self.partition_join != null) return self.nextPartitionJoin(alloc, join);
                 if (self.hash_join == null) {
                     self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .spill = self.engine.context.spill });
+                    if (!shared and kind != .left and kind != .full) try self.prepareScanFilter(if (self.flipped_join) join.right_keys else join.left_keys);
                     var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                     defer scratch.deinit();
                     while (try self.right.?.next(scratch.allocator())) |values| {
                         const key_values = try self.keys(scratch.allocator(), if (self.flipped_join) join.left_keys else join.right_keys, values);
                         try self.hash_join.?.add(values, key_values);
+                        if (self.scan_filter) |filter| try filter.add(key_values);
                         _ = scratch.reset(.free_all);
+                    }
+                    if (self.scan_filter) |filter| {
+                        filter.sealed = true;
+                        const cursor = self.engine.cursors[self.left.?.node.operation.scan.index];
+                        _ = try cursor.set_dynamic_filter.?(cursor.ptr, filter);
                     }
                     if (!shared and self.hash_join.?.disk != null and self.engine.context.spill != null) {
                         const owner = try @import("partition_join.zig").Join.create(self.engine.context.alloc, self.engine.context.spill.?, self.engine.context.limits.retained_bytes, self.engine.context.limits.scan_rows, self.hash_join.?.disk.?.size, kind == .left or kind == .full, kind == .right or kind == .full);
@@ -688,7 +717,7 @@ fn Engine(comptime Context: type) type {
                         var index: usize = 0;
                         while (try self.hash_join.?.unmatched(&index)) |match| {
                             _ = scratch.reset(.free_all);
-                            try owner.add(true, try match.materializeValues(scratch.allocator()), match.row.keys, @intCast(match.index));
+                            try owner.add(true, try match.materializeValues(scratch.allocator()), try match.materializeKeys(scratch.allocator()), @intCast(match.index));
                         }
                         var ordinal: usize = 0;
                         while (try self.left.?.next(scratch.allocator())) |values| {
