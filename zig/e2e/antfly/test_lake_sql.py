@@ -221,6 +221,7 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             data_page_size=1,
             write_batch_size=1,
             write_statistics=False,
+            data_page_version="2.0",
         )
         large_payload = large_input.read_bytes()
         large_envelope = (
@@ -257,7 +258,9 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             if first.ok:
                 assert first.json()["rows"] == [["first"]]
                 break
-            assert first.status_code in (404, 409, 503), first.text
+            assert first.status_code in (404, 409, 503), (
+                first.text + "\n" + server.log_path.read_text()[-8000:]
+            )
             assert time.monotonic() < deadline, first.text
             time.sleep(0.1)
         oversized = requests.post(
