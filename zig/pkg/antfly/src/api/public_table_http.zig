@@ -6582,7 +6582,7 @@ test "public table graph metric action handler returns status response" {
             };
         }
 
-        fn executeGraphMetricAction(
+        pub fn executeGraphMetricAction(
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,

@@ -118,7 +118,7 @@ const ParentRoute = struct {
     group_id: u64,
     table_name: []u8,
 
-    fn deinit(self: ParentRoute, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ParentRoute, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
     }
 };

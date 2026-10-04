@@ -81,7 +81,7 @@ pub const Token = struct {
         // once for each inherited neighbor. Repeated proofs allocate nothing.
         for (self.reads.items) |*guard| guard.source_index = ordinals[guard.source_index];
         for (self.preconditions.items) |*guard| guard.source_index = ordinals[guard.source_index];
-        self.inherited_sources = .{ .items = merged, .capacity = merged.len };
+        self.inherited_sources = .{ .items = merged, .capacity = merged.len, .pointer_stability = .{} };
         self.read_key_bytes += added_bytes;
     }
 

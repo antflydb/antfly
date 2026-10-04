@@ -228,7 +228,7 @@ const PrimaryStoreMatchingCursor = struct {
     fallback_all: bool = false,
     hint_exhausted: bool = false,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.cursor) |*cursor| cursor.close();
         if (self.scan_txn) |*txn| txn.abort();
         self.* = undefined;
@@ -431,7 +431,7 @@ fn primaryStoreOpenMatchingCursor(
     _ = alloc;
     const store: *docstore_mod.DocStore = @ptrCast(@alignCast(ptr));
 
-    const kind_ordinal: u8 = @intCast(@intFromEnum(hint));
+    const kind_ordinal: u8 = @intCast(@backingInt(hint));
     var out = MatchingCursor{
         .state = .{
             .primary_store = .{
@@ -546,7 +546,7 @@ fn primaryStoreForEachMatchingRecord(
     };
     callback_ctx.stats.scan_batches = 1;
     const replay_stats = store.forEachReplayLaneFrom(
-        @intCast(@intFromEnum(hint)),
+        @intCast(@backingInt(hint)),
         from_sequence + 1,
         max_matched_entries,
         &callback_ctx,

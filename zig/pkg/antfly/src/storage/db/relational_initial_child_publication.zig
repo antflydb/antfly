@@ -91,7 +91,7 @@ pub const Record = struct {
         var bytes: [encoded_len]u8 = @splat(0);
         @memcpy(bytes[0..4], magic);
         bytes[4] = version;
-        bytes[5] = @intFromEnum(self.phase);
+        bytes[5] = @backingInt(self.phase);
         @memcpy(bytes[8..24], &self.plan_id);
         @memcpy(bytes[24..56], &self.plan_digest);
         std.mem.writeInt(u64, bytes[56..64], self.namespace.table_id, .little);

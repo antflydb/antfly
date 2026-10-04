@@ -931,7 +931,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             }
         };
         try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ session, unit_key });
-        try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.authorize, .{ &current, request, plan.plan() });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.authorize, .{ &current, request, plan.plan() });
     }
     {
         var current = try db.core.store.beginReadTxn();
@@ -1306,7 +1306,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             for (admission.jobs) |job| _ = try unit_jobs.Job.decode(job.key, job.value);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, JobAllocationCheck.run, .{ &txn, db.root_incarnation, &dispatch_missing });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, JobAllocationCheck.run, .{ &txn, db.root_incarnation, &dispatch_missing });
     var missing_admission = try unit_jobs.prepare(alloc, &txn, db.root_incarnation, &dispatch_missing, .{});
     defer missing_admission.deinit();
     try std.testing.expectEqual(.admitted, try missing_admission.stage(&txn, db.root_incarnation));

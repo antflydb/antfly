@@ -87,7 +87,7 @@ pub const SharedModules = struct {
 pub const Config = struct {
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     paths: Paths,
     backend: BackendOptions,
     shared: SharedModules,
@@ -95,6 +95,7 @@ pub const Config = struct {
 };
 
 pub const Graph = struct {
+    c_bindings: CBindings,
     build_info_mod: *std.Build.Module,
     build_info_object: *std.Build.Step.Compile,
     identities: jit_identity.Modules,
@@ -367,6 +368,8 @@ pub fn create(config: Config) Graph {
     inference_mod.addImport("antfly_extracting", extracting_mod);
     inference_mod.addImport("antfly_transcribing", transcribing_mod);
     configureRuntimeLinks(b, inference_mod, target, backend, paths);
+    const c_bindings = createCBindings(b, target, backend, paths);
+    applyCBindings(inference_mod, c_bindings);
     inference_mod.link_libc = backend.link_libc;
 
     const inference_internal_mod = b.createModule(.{
@@ -392,6 +395,7 @@ pub fn create(config: Config) Graph {
     inference_internal_mod.addImport("onnx_graph", onnx.graph);
     inference_internal_mod.addImport("onnx_data", onnx.data);
     configureRuntimeLinks(b, inference_internal_mod, target, backend, paths);
+    applyCBindings(inference_internal_mod, c_bindings);
     inference_internal_mod.link_libc = backend.link_libc;
 
     inference_mod.addImport("inference_internal", inference_mod);
@@ -440,10 +444,51 @@ pub fn create(config: Config) Graph {
         .reader_config_mod = reader_config_mod,
         .inference_mod = inference_mod,
         .inference_internal_mod = inference_internal_mod,
+        .c_bindings = c_bindings,
     };
 }
 
-pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
+pub const CBindings = struct {
+    onnx: *std.Build.Module,
+    ortgenai: *std.Build.Module,
+};
+
+fn createCBindings(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    backend: BackendOptions,
+    paths: Paths,
+) CBindings {
+    const empty = b.createModule(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/c_empty.zig")),
+        .target = target,
+    });
+    if (!backend.enable_onnx) return .{ .onnx = empty, .ortgenai = empty };
+
+    const include_dir = b.fmt("{s}/include", .{backend.onnx_root});
+    const onnx = b.addTranslateC(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
+        .target = target,
+        .optimize = .debug,
+        .link_libc = true,
+    });
+    onnx.addIncludePath(b.graph.cwdRelativePath(include_dir));
+    const ortgenai = b.addTranslateC(.{
+        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
+        .target = target,
+        .optimize = .debug,
+        .link_libc = true,
+    });
+    ortgenai.addIncludePath(b.graph.cwdRelativePath(include_dir));
+    return .{ .onnx = onnx.createModule(), .ortgenai = ortgenai.createModule() };
+}
+
+pub fn applyCBindings(module: *std.Build.Module, bindings: CBindings) void {
+    module.addImport("onnx_c", bindings.onnx);
+    module.addImport("ortgenai_c", bindings.ortgenai);
+}
+
+pub fn addStandaloneExecutable(b: *std.Build, graph: Graph, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize, inference_root: []const u8, link_libc: bool) *std.Build.Step.Compile {
     const exe = b.addExecutable(.{
         .name = "antfly-inference",
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 10 else 7) * 1024 * 1024 * 1024,
@@ -570,7 +615,7 @@ pub fn addInferenceApiOverride(
 ) ?std.Build.LazyPath {
     const spec = b.option([]const u8, "inference-openapi-spec", "Path to the inference OpenAPI YAML spec used to generate inference_api") orelse return null;
     return openapi_build.addGeneratedDirectory(b, .{
-        .compiler = compiler orelse b.dependency("openapi", .{ .target = b.graph.host, .optimize = .ReleaseSafe }).artifact("openapi-zig"),
+        .compiler = compiler orelse b.dependency("openapi", .{ .target = b.graph.host, .optimize = .safe }).artifact("openapi-zig"),
         .scripts_root = scripts_root,
         .spec = b.path(spec),
         .package_name = "inference_api",
@@ -586,7 +631,7 @@ pub fn addInferenceApiOverride(
 fn addInferenceApiModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     httpx_mod: *std.Build.Module,
     skip_openapi: bool,
     paths: Paths,
@@ -653,7 +698,7 @@ fn addInferenceApiModule(
 fn addChunkingApiOpenApiModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     paths: Paths,
     generating_openapi_mod: *std.Build.Module,
 ) *std.Build.Module {
@@ -669,7 +714,7 @@ fn addChunkingApiOpenApiModule(
 fn addExtractionOpenApiModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     paths: Paths,
     generating_openapi_mod: *std.Build.Module,
 ) *std.Build.Module {
@@ -732,9 +777,9 @@ pub fn configureSystemBlas(
         return;
     }
     if (blas_root) |root| {
-        module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{root}) });
-        module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
-        module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{root}) });
+        module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{root})));
+        module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
+        module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{root})));
     }
     module.linkSystemLibrary("openblas", .{});
 }
@@ -748,11 +793,11 @@ pub fn configureOnnxRuntime(
     if (!enable_onnx) return;
     // Declare dependencies on the consuming module. Missing installations fail
     // its compile/link step without blocking configuration of unrelated targets.
-    module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{onnx_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
-    module.addRPath(.{ .cwd_relative = b.fmt("{s}/lib", .{onnx_root}) });
+    module.addIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/include", .{onnx_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
+    module.addRPath(b.graph.cwdRelativePath(b.fmt("{s}/lib", .{onnx_root})));
     if (std.mem.startsWith(u8, onnx_root, "pkg/")) {
-        module.addRPath(.{ .cwd_relative = b.fmt("zig/{s}/lib", .{onnx_root}) });
+        module.addRPath(b.graph.cwdRelativePath(b.fmt("zig/{s}/lib", .{onnx_root})));
     }
     module.linkSystemLibrary("onnxruntime", .{});
     module.linkSystemLibrary("onnxruntime-genai", .{});
@@ -775,13 +820,14 @@ pub fn configureMetal(
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
-        std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
-        return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
+        // xcrun observes the selected Xcode installation outside configure inputs.
+        b.graph.poisonCache();
+        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
+    };
+    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }
 
 fn pathJoin(b: *std.Build, root: []const u8, relative_path: []const u8) []const u8 {

@@ -150,7 +150,7 @@ pub const ParentIterator = struct {
 };
 
 fn appendU32LE(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), val: u32) !void {
-    try out.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, val))));
+    try out.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, val))));
 }
 
 // ============================================================================

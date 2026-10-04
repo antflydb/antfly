@@ -65,7 +65,7 @@ const Fake = struct {
         self.live -= 1;
     }
     fn dtype(raw: *anyopaque, value: ops.CT) anyerror!DType {
-        return @enumFromInt(@intFromEnum((try from(raw).get(value)).shape.dtype));
+        return @fromBackingInt(@intCast(@backingInt((try from(raw).get(value)).shape.dtype)));
     }
     fn shapeOf(dims: []const i32) ml.Shape {
         var result = ml.Shape{ .dtype = .f32, .rank_ = @intCast(dims.len) };
@@ -187,7 +187,7 @@ const Epoch = struct {
     fn guard(self: *Epoch) state.EpochGuard {
         return .{ .context = self, .expected = self.owner.step_count, .validate = validate };
     }
-    fn validate(raw: ?*const anyopaque, expected: u64) !void {
+    pub fn validate(raw: ?*const anyopaque, expected: u64) !void {
         const self: *const Epoch = @ptrCast(@alignCast(raw.?));
         if (self.owner.step_count != expected) return error.TrainingStateIdentityMismatch;
         if (self.fail_download) |at| if (self.fake.?.downloads >= at) return error.TrainingStateIdentityMismatch;

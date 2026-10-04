@@ -388,7 +388,7 @@ fn callBytesOperation(
     return try alloc.dupe(u8, if (result.byte_count == 0) &.{} else result.bytes.?[0..result.byte_count]);
 }
 
-fn readImages(
+pub fn readImages(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
@@ -434,7 +434,7 @@ fn cloneReaderResults(alloc: std.mem.Allocator, parsed: []const readers.Result) 
     return results;
 }
 
-fn transcribeAudio(
+pub fn transcribeAudio(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
@@ -457,7 +457,7 @@ fn transcribeAudio(
     return try cloneTranscriptionResponse(alloc, parsed);
 }
 
-fn extract(
+pub fn extract(
     handle: *anyopaque,
     alloc: std.mem.Allocator,
     model: []const u8,
@@ -604,7 +604,7 @@ fn acceptFailure(
     };
     if (status == .ok) return;
     if (failure.boundary != .inference_runtime or
-        failure.operation != @intFromEnum(expected_operation))
+        failure.operation != @backingInt(expected_operation))
     {
         logMalformedFailure(status, failure);
         return error.InvalidBoundaryFailureIdentity;
@@ -674,7 +674,7 @@ fn logMalformedFailure(status: bridge.Status, failure: *const bridge.FailureIden
         .{
             @tagName(status),
             @tagName(failure.status),
-            @intFromEnum(failure.boundary),
+            @backingInt(failure.boundary),
             failure.boundary_version,
             failure.operation,
             failure.boundedErrorName(),
@@ -742,7 +742,7 @@ const MockDenseProvider = struct {
                 error.InvalidArgument,
                 .inference_runtime,
                 bridge.abi_version,
-                @intFromEnum(bridge.Operation.embed_dense_texts),
+                @backingInt(bridge.Operation.embed_dense_texts),
             );
             return out_failure.status;
         }
@@ -791,7 +791,7 @@ test "dense adapter preserves registered failure identity and rejects wrong orig
             case.err,
             .inference_runtime,
             bridge.abi_version,
-            @intFromEnum(bridge.Operation.embed_dense_texts),
+            @backingInt(bridge.Operation.embed_dense_texts),
         );
         try std.testing.expectEqual(case.status, declared.status);
         try std.testing.expectEqualStrings(@errorName(case.err), declared.errorName());
@@ -805,7 +805,7 @@ test "dense adapter preserves registered failure identity and rejects wrong orig
         error.ModelNotFound,
         .inference_runtime,
         bridge.abi_version,
-        @intFromEnum(bridge.Operation.embed_dense_texts),
+        @backingInt(bridge.Operation.embed_dense_texts),
     );
     declared.boundary = .storage_owner;
     try std.testing.expectError(
@@ -827,7 +827,7 @@ test "simple inference operations retain their distinct failure origins" {
             error.ModelNotFound,
             .inference_runtime,
             bridge.abi_version,
-            @intFromEnum(operation),
+            @backingInt(operation),
         );
         try std.testing.expectError(
             error.ModelNotFound,
@@ -841,7 +841,7 @@ test "generation ABI preserves domain errors and rich message JSON" {
         error.InvalidGenerationRequest,
         .inference_runtime,
         bridge.abi_version,
-        @intFromEnum(bridge.Operation.generate_text),
+        @backingInt(bridge.Operation.generate_text),
     );
     try std.testing.expectError(
         error.InvalidGenerationRequest,
@@ -914,7 +914,7 @@ test "media and extraction operations preserve distinct failure identity" {
             case.err,
             .inference_runtime,
             bridge.abi_version,
-            @intFromEnum(case.operation),
+            @backingInt(case.operation),
         );
         try std.testing.expectError(case.err, acceptFailure(case.status, &failure, case.operation));
     }

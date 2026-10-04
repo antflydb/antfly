@@ -357,7 +357,7 @@ const OcfMetadata = struct {
     schema_json: []u8,
     codec: AvroCodec = .null,
 
-    fn deinit(self: *OcfMetadata, alloc: Allocator) void {
+    pub fn deinit(self: *OcfMetadata, alloc: Allocator) void {
         alloc.free(self.schema_json);
         self.* = undefined;
     }
@@ -367,7 +367,7 @@ const DecodedBlock = struct {
     bytes: []const u8,
     owned: ?[]u8 = null,
 
-    fn deinit(self: DecodedBlock, alloc: Allocator) void {
+    pub fn deinit(self: DecodedBlock, alloc: Allocator) void {
         if (self.owned) |owned| alloc.free(owned);
     }
 };
@@ -586,8 +586,9 @@ fn primitiveForName(name: []const u8) !AvroPrimitive {
 }
 
 fn knownFieldForName(name: []const u8) KnownField {
-    inline for (@typeInfo(KnownField).@"enum".fields) |field| {
-        if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    const info = @typeInfo(KnownField).@"enum";
+    inline for (info.field_names, info.field_values) |reflected_name, field_value| {
+        if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(@intCast(field_value));
     }
     return .unknown;
 }
@@ -607,7 +608,7 @@ const EntryScratch = struct {
     existing_rows_count: u64 = 0,
     deleted_rows_count: u64 = 0,
 
-    fn deinit(self: *EntryScratch, alloc: Allocator) void {
+    pub fn deinit(self: *EntryScratch, alloc: Allocator) void {
         if (self.manifest_path) |path| alloc.free(path);
         self.* = undefined;
     }
@@ -720,7 +721,7 @@ const DataManifestScratch = struct {
     file_sequence_number: ?i64 = null,
     data_file: ?DataFileScratch = null,
 
-    fn deinit(self: *DataManifestScratch, alloc: Allocator) void {
+    pub fn deinit(self: *DataManifestScratch, alloc: Allocator) void {
         if (self.data_file) |*file| file.deinit(alloc);
         self.* = undefined;
     }
@@ -736,7 +737,7 @@ const DataFileScratch = struct {
     record_count: u64 = 0,
     file_size_in_bytes: u64 = 0,
 
-    fn deinit(self: *DataFileScratch, alloc: Allocator) void {
+    pub fn deinit(self: *DataFileScratch, alloc: Allocator) void {
         if (self.file_path) |path| alloc.free(path);
         if (self.file_format) |format| alloc.free(format);
         for (self.partition_values) |*partition| partition.deinit(alloc);
@@ -1426,7 +1427,7 @@ fn appendManifestRecord(
     try appendString(alloc, out, path);
     try appendLong(alloc, out, 111);
     try appendLong(alloc, out, 3);
-    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, @backingInt(content));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, sequence_number);
     try appendLong(alloc, out, 1);
@@ -1604,14 +1605,14 @@ fn appendDataManifestRecord(
     record_count: i64,
     file_size_in_bytes: i64,
 ) !void {
-    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, @backingInt(status));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 123);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 44);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 45);
-    try appendLong(alloc, out, @intFromEnum(DataFileContent.data));
+    try appendLong(alloc, out, @backingInt(DataFileContent.data));
     try appendString(alloc, out, file_path);
     try appendString(alloc, out, file_format);
     try appendString(alloc, out, "us-west");
@@ -1633,14 +1634,14 @@ fn appendDataManifestRecordWithContentAndEqualityIds(
     file_size_in_bytes: i64,
     equality_ids: []const i32,
 ) !void {
-    try appendLong(alloc, out, @intFromEnum(status));
+    try appendLong(alloc, out, @backingInt(status));
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 123);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 44);
     try appendLong(alloc, out, 1);
     try appendLong(alloc, out, 45);
-    try appendLong(alloc, out, @intFromEnum(content));
+    try appendLong(alloc, out, @backingInt(content));
     try appendString(alloc, out, file_path);
     try appendString(alloc, out, file_format);
     try appendString(alloc, out, "us-west");

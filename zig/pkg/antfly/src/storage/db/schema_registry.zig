@@ -161,7 +161,7 @@ pub const Registry = struct {
     mutex: std.Io.Mutex = .init,
     /// Coalesce same-version faults without serializing unrelated epochs.
     /// Whole-store publication acquires all lanes in index order.
-    historical_fault_mutexes: [16]std.Io.Mutex = [_]std.Io.Mutex{.init} ** 16,
+    historical_fault_mutexes: [16]std.Io.Mutex = @as([16]std.Io.Mutex, @splat(.init)),
     current: std.atomic.Value(?*Epoch) = .init(null),
     /// Readers publish a short acquisition hazard without entering a mutex or
     /// suspending the current std.Io task. Replacement flips banks, then waits
@@ -169,9 +169,7 @@ pub const Registry = struct {
     /// references and never delay publication or reclamation admission.
     acquisition_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     acquisition_readers: [acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe =
-        [_][acquisition_stripe_count]AcquisitionStripe{
-            [_]AcquisitionStripe{.{}} ** acquisition_stripe_count,
-        } ** acquisition_bank_count,
+        @as([acquisition_bank_count][acquisition_stripe_count]AcquisitionStripe, @splat(@as([acquisition_stripe_count]AcquisitionStripe, @splat(.{})))),
     namespace_generation: @import("antfly_platform").atomic.Value(u64) = .init(0),
     pending_publications: usize = 0,
     historical_clock: u64 = 0,

@@ -27,7 +27,7 @@ pub const Bound = struct {
 
 pub fn aggregateKind(name: []const u8) ?operators.Aggregate.Kind {
     if (std.mem.eql(u8, name, "$pattern_set")) return .pattern_set;
-    inline for (std.meta.fields(operators.Aggregate.Kind)) |field| if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(operators.Aggregate.Kind).@"enum".field_names, @typeInfo(operators.Aggregate.Kind).@"enum".field_values) |reflected_name, field_value| if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     return null;
 }
 pub fn contains(node: *const ast.Scalar) bool {

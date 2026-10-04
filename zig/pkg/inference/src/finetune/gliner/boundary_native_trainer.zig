@@ -295,8 +295,8 @@ pub const Trainer = struct {
         self.run_plan = try run.Plan.init(run_config, source, .{ .train_sha256 = dataset.sha256, .schema_sha256 = dataset.schemas_sha256, .calibration_sha256 = options.calibration_sha256, .test_sha256 = options.test_sha256, .examples = std.math.cast(u32, dataset.index.len) orelse return error.BoundaryTrainingRunLimitExceeded }, options.limits.run);
         // Validate the actual schedule before reading or updating any batch.
         _ = try objectives.scales(config.head, .{ .optimizer_step = 0, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction });
-        inline for (std.meta.fields(objectives.Weights)) |field| {
-            const weight = @field(options.weights, field.name);
+        inline for (comptime std.meta.fieldNames(objectives.Weights)) |reflected_name| {
+            const weight = @field(options.weights, reflected_name);
             if (!std.math.isFinite(weight) or weight < 0) return error.InvalidBoundaryTrainingRun;
         }
         if (options.distillation) |value| {

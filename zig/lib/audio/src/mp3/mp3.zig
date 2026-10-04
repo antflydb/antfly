@@ -2189,8 +2189,8 @@ test "joint stereo mono output helper averages stereo pcm" {
 }
 
 test "lsf intensity stereo long-band helper applies scalefac-compress table 0" {
-    var left = [_]f32{0} ** 576;
-    var right = [_]f32{0} ** 576;
+    var left = @as([576]f32, @splat(0));
+    var right = @as([576]f32, @splat(0));
     // Band 20 of the 22.05 kHz long table spans 464..522, so a coefficient at
     // 550 sits in a band this granule does not declare and is left alone.
     left[500] = 2.0;
@@ -2238,8 +2238,8 @@ test "lsf intensity stereo long-band helper applies scalefac-compress table 0" {
 }
 
 test "lsf intensity stereo long-band helper applies scalefac-compress table 1" {
-    var left = [_]f32{0} ** 576;
-    var right = [_]f32{0} ** 576;
+    var left = @as([576]f32, @splat(0));
+    var right = @as([576]f32, @splat(0));
     // Band 20 of the 22.05 kHz long table spans 464..522, so a coefficient at
     // 550 sits in a band this granule does not declare and is left alone.
     left[500] = 2.0;

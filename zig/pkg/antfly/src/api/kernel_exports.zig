@@ -1140,17 +1140,17 @@ test "API kernel create enforces owner I/O capabilities and preserves their life
     try std.testing.expect(handle == null);
     borrow = abi.native_abi.IoBorrow.init(&std.testing.io);
     const Dispatch = @FieldType(abi.native_abi.IoBorrow, "dispatch");
-    const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".params;
+    const Parameters = @typeInfo(@typeInfo(Dispatch).pointer.child).@"fn".param_types;
     const Forward = struct {
         var owner_dispatch: Dispatch = undefined;
 
         fn dispatch(
-            owner: Parameters[0].type.?,
-            operation: Parameters[1].type.?,
-            arguments: Parameters[2].type.?,
-            out_value: Parameters[3].type.?,
-            reader: Parameters[4].type.?,
-            error_names: Parameters[5].type.?,
+            owner: Parameters[0].?,
+            operation: Parameters[1].?,
+            arguments: Parameters[2].?,
+            out_value: Parameters[3].?,
+            reader: Parameters[4].?,
+            error_names: Parameters[5].?,
         ) callconv(.c) void {
             owner_dispatch(owner, operation, arguments, out_value, reader, error_names);
         }

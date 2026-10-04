@@ -180,7 +180,7 @@ pub fn writeHeader(buf: *ArrayList(u8), alloc: Allocator, h: FileHeader) !void {
 pub fn writeBlock(buf: *ArrayList(u8), alloc: Allocator, block_type: BlockType, payload: []const u8) !void {
     if (payload.len > max_block_payload_bytes) return error.BackupBlockTooLarge;
     var env_header: [6]u8 = undefined;
-    env_header[0] = @intFromEnum(block_type);
+    env_header[0] = @backingInt(block_type);
     env_header[1] = 0; // no compression
     std.mem.writeInt(u32, env_header[2..6], @intCast(payload.len), .little);
 
@@ -224,7 +224,7 @@ pub fn writeBlockPartsTo(writer: *std.Io.Writer, block_type: BlockType, parts: [
     if (payload_len > max_block_payload_bytes or payload_len > std.math.maxInt(u32))
         return error.BackupBlockTooLarge;
     var env_header: [6]u8 = undefined;
-    env_header[0] = @intFromEnum(block_type);
+    env_header[0] = @backingInt(block_type);
     env_header[1] = 0;
     std.mem.writeInt(u32, env_header[2..6], @intCast(payload_len), .little);
     var crc = Crc32.init();
@@ -289,7 +289,7 @@ pub const SliceReader = struct {
 
     pub fn readBlock(self: *SliceReader, alloc: Allocator) !Block {
         const env = try self.readExact(6);
-        const block_type: BlockType = @enumFromInt(env[0]);
+        const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
@@ -411,7 +411,7 @@ pub const FileReader = struct {
     pub fn readBlock(self: *FileReader, alloc: Allocator) !Block {
         var env: [6]u8 = undefined;
         try self.readExact(&env);
-        const block_type: BlockType = @enumFromInt(env[0]);
+        const block_type: BlockType = @fromBackingInt(@intCast(env[0]));
         const flags = env[1];
         const payload_len = std.mem.readInt(u32, env[2..6], .little);
         if (payload_len > max_block_payload_bytes) return error.BackupBlockTooLarge;
@@ -1028,7 +1028,7 @@ test "header CRC validation" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -1049,7 +1049,7 @@ test "block round-trip uncompressed" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -1076,7 +1076,7 @@ test "block CRC validation" {
         .format_version = format_version,
         .flags = 0,
         .created_at_ns = 0,
-        .backup_id = .{0} ** 16,
+        .backup_id = @splat(0),
         .table_count = 1,
         .shard_count = 1,
     });
@@ -1143,7 +1143,7 @@ test "document batch round-trip" {
     try std.testing.expectError(error.TrailingData, documentBatchEntryCount(with_trailing));
     try std.testing.expectError(error.TrailingData, decodeDocumentBatchBorrowed(alloc, with_trailing));
 
-    var impossible_count = [_]u8{0} ** 4;
+    var impossible_count = @as([4]u8, @splat(0));
     std.mem.writeInt(u32, &impossible_count, std.math.maxInt(u32), .little);
     try std.testing.expectError(error.Truncated, decodeDocumentBatchBorrowed(alloc, &impossible_count));
 

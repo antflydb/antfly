@@ -453,7 +453,7 @@ pub const IncomingSourceGroupCache = struct {
         cache_key: []u8,
         groups: []u64,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.cache_key);
             if (self.groups.len > 0) alloc.free(self.groups);
             self.* = undefined;
@@ -930,7 +930,7 @@ pub const IncomingSourceGroupCache = struct {
             job.cache.flushPendingDurableWrites();
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const job: *@This() = @ptrCast(@alignCast(ptr));
             job.cache.alloc.destroy(job);
         }
@@ -1507,7 +1507,7 @@ const GraphExpandFanoutSlot = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     }
 
-    fn deinit(self: *GraphExpandFanoutSlot) void {
+    pub fn deinit(self: *GraphExpandFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1522,7 +1522,7 @@ const GraphHydrateFanoutSlot = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     }
 
-    fn deinit(self: *GraphHydrateFanoutSlot) void {
+    pub fn deinit(self: *GraphHydrateFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1537,7 +1537,7 @@ const GraphEdgesFanoutSlot = struct {
         return .{ .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator) };
     }
 
-    fn deinit(self: *GraphEdgesFanoutSlot) void {
+    pub fn deinit(self: *GraphEdgesFanoutSlot) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1997,7 +1997,7 @@ const QueryState = struct {
         self.seen_retained_bytes = 0;
     }
 
-    fn deinit(self: *QueryState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *QueryState, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         for (self.nodes.items) |*node| node.deinit(alloc);
         self.nodes.deinit(alloc);
@@ -2105,7 +2105,7 @@ const TargetNodeSet = struct {
             self.exact.contains(.{ .table = table, .key = key });
     }
 
-    fn deinit(self: *TargetNodeSet, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *TargetNodeSet, alloc: std.mem.Allocator) void {
         self.exact.deinit(alloc);
         var it = self.wildcard_keys.keyIterator();
         while (it.next()) |key| alloc.free(key.*);
@@ -2133,7 +2133,7 @@ const GraphAdmissionTableState = struct {
     requires_hydration: bool,
     decisions: std.StringHashMapUnmanaged(bool) = .empty,
 
-    fn deinit(self: *GraphAdmissionTableState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphAdmissionTableState, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         if (self.logical_name) |name| alloc.free(name);
         if (self.filter_query_json.len > 0) alloc.free(self.filter_query_json);
@@ -2208,7 +2208,7 @@ const GraphNodeAdmissionContext = struct {
         };
     }
 
-    fn deinit(self: *GraphNodeAdmissionContext) void {
+    pub fn deinit(self: *GraphNodeAdmissionContext) void {
         for (self.tables.values()) |*state| state.deinit(self.alloc);
         self.tables.deinit(self.alloc);
         self.* = undefined;
@@ -2379,7 +2379,7 @@ const GraphNodeAdmissionContext = struct {
             keys: std.ArrayListUnmanaged([]const u8) = .empty,
             seen: std.StringHashMapUnmanaged(void) = .empty,
 
-            fn deinit(self_inner: *@This(), alloc_inner: std.mem.Allocator) void {
+            pub fn deinit(self_inner: *@This(), alloc_inner: std.mem.Allocator) void {
                 self_inner.keys.deinit(alloc_inner);
                 self_inner.seen.deinit(alloc_inner);
             }
@@ -2479,7 +2479,7 @@ const PathState = struct {
     incoming_edge: ?graph_query_mod.PathEdgeInfo = null,
     retained_lease: graph_work_budget.RetainedLease = .{},
 
-    fn deinit(self: *PathState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PathState, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         if (self.incoming_edge) |edge| freeOwnedPathEdge(alloc, edge);
@@ -2497,7 +2497,7 @@ const FrontierState = struct {
     path_state_id: ?u32 = null,
     retained_lease: graph_work_budget.RetainedLease = .{},
 
-    fn deinit(self: *FrontierState, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *FrontierState, alloc: std.mem.Allocator) void {
         alloc.free(self.key);
         if (self.table) |table| alloc.free(table);
         self.retained_lease.deinit();
@@ -2520,7 +2520,7 @@ const PathCostLabels = struct {
         return .{ .max_depth = max_depth, .work_budget = work_budget };
     }
 
-    fn deinit(self: *PathCostLabels, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PathCostLabels, alloc: std.mem.Allocator) void {
         var it = self.values.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.values.deinit(alloc);
@@ -3219,7 +3219,7 @@ const CanonicalGraphStep = struct {
         return self.nodes[0..self.node_count];
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.nodes[0..self.node_count]) |*node| {
             for (node.metrics) |*metric| metric.deinit(alloc);
             if (node.metrics.len > 0) alloc.free(node.metrics);
@@ -3973,7 +3973,7 @@ const DistributedPatternFilterEvaluator = struct {
     admission: *GraphNodeAdmissionContext,
     contexts: std.StringArrayHashMapUnmanaged(GraphNodeAdmissionContext) = .empty,
 
-    fn evaluate(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
+    pub fn evaluate(ctx: ?*anyopaque, node: graph_node_identity.Ref, filter: graph_pattern_mod.NodeFilter) anyerror!bool {
         const self: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
         if (filter.filter_query_json == null) return true;
         const scoped = try self.contextFor(filter);
@@ -4026,7 +4026,7 @@ const DistributedPatternFilterEvaluator = struct {
         return self.contexts.getPtr(encoded).?;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.contexts.values()) |*context| context.deinit();
         self.contexts.deinit(self.admission.alloc);
         self.* = undefined;
@@ -5186,7 +5186,7 @@ const ShortestPathResult = struct {
     path: db_mod.types.GraphPath,
     retained_lease: graph_work_budget.RetainedLease,
 
-    fn deinit(self: *ShortestPathResult, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ShortestPathResult, alloc: std.mem.Allocator) void {
         graph_paths_mod.freePath(alloc, self.path);
         self.retained_lease.deinit();
         self.* = undefined;
@@ -5206,7 +5206,7 @@ const BudgetedGraphPath = struct {
     path: db_mod.types.GraphPath,
     retained_lease: graph_work_budget.RetainedLease,
 
-    fn deinit(self: *BudgetedGraphPath, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *BudgetedGraphPath, alloc: std.mem.Allocator) void {
         graph_paths_mod.freePath(alloc, self.path);
         self.retained_lease.deinit();
         self.* = undefined;
@@ -7351,7 +7351,7 @@ fn hydrateHitsForResultNodes(
     const HydratedBucket = struct {
         hits: []db_mod.types.SearchHit,
 
-        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), a: std.mem.Allocator) void {
             for (self.hits) |*hit| hit.deinit(a);
             if (self.hits.len > 0) a.free(self.hits);
         }
@@ -15083,8 +15083,8 @@ test "distributed graph retries once on topology change and succeeds" {
         phase: u32 = 0,
         expand_calls: u32 = 0,
         hydrate_calls: u32 = 0,
-        lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".fields.len]u32 =
-            .{0} ** @typeInfo(LifecyclePhase).@"enum".fields.len,
+        lifecycle_counts: [@typeInfo(LifecyclePhase).@"enum".field_names.len]u32 =
+            @splat(0),
         lifecycle_valid: bool = true,
     };
 
@@ -15147,7 +15147,7 @@ test "distributed graph retries once on topology change and succeeds" {
 
         fn reachLifecycle(ptr: *anyopaque, event: LifecycleEvent) void {
             const state: *TestState = @ptrCast(@alignCast(ptr));
-            state.lifecycle_counts[@intFromEnum(event.phase)] += 1;
+            state.lifecycle_counts[@backingInt(event.phase)] += 1;
             switch (event.phase) {
                 // This fixture deliberately uses the scalar identity stamp,
                 // so it has no per-shard snapshot vector to count.
@@ -15277,12 +15277,12 @@ test "distributed graph retries once on topology change and succeeds" {
     try std.testing.expectEqualStrings("doc:b", results[0].nodes[0].key);
     try std.testing.expectEqual(@as(usize, 1), results[0].hits.len);
     try std.testing.expectEqualStrings("doc:b", results[0].hits[0].id);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.source_snapshot_acquired)]);
-    try std.testing.expectEqual(@as(u32, 2), state.lifecycle_counts[@intFromEnum(LifecyclePhase.snapshot_validated)]);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.attempt_failed)]);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.expand_round_completed)]);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_started)]);
-    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@intFromEnum(LifecyclePhase.hydration_completed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.source_snapshot_acquired)]);
+    try std.testing.expectEqual(@as(u32, 2), state.lifecycle_counts[@backingInt(LifecyclePhase.snapshot_validated)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.attempt_failed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.expand_round_completed)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.hydration_started)]);
+    try std.testing.expectEqual(@as(u32, 1), state.lifecycle_counts[@backingInt(LifecyclePhase.hydration_completed)]);
     try std.testing.expect(state.lifecycle_valid);
 }
 

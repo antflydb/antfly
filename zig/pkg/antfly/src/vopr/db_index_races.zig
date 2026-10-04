@@ -762,7 +762,7 @@ const ManagedReadinessFixture = struct {
         self.db = try self.openDb();
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.db.close();
         self.allocator.destroy(self.embedder);
         self.repair_storage.deinit();
@@ -1043,7 +1043,7 @@ pub const ManagedReadinessScenario = struct {
             self.stage = .finalize;
         }
 
-        fn finalize(self: *@This()) !void {
+        pub fn finalize(self: *@This()) !void {
             var repaired = false;
             for (0..64) |_| {
                 const result = try self.fixture.db.advanceIndexRepairIntent(
@@ -1163,7 +1163,7 @@ pub const ManagedReadinessScenario = struct {
                 if (selected.id == id) {
                     state.mode = mode;
                     state.stage = .seed;
-                    try events.emitNamed(allocator, .domain, selected.name, @intFromEnum(mode));
+                    try events.emitNamed(allocator, .domain, selected.name, @backingInt(mode));
                     return .applied();
                 }
             }
@@ -1178,7 +1178,7 @@ pub const ManagedReadinessScenario = struct {
 
     pub fn observe(world: *World, builder: *vopr.observation.Builder, allocator: std.mem.Allocator) !void {
         const state = world.state;
-        try builder.addNamed(allocator, name ++ ".stage", @intFromEnum(state.stage));
+        try builder.addNamed(allocator, name ++ ".stage", @backingInt(state.stage));
         try builder.addNamed(allocator, name ++ ".progress", @intCast(state.progress));
         try builder.addNamed(allocator, name ++ ".initial-fail-closed", @intFromBool(state.initial_fail_closed));
         try builder.addNamed(allocator, name ++ ".partial-queryable", @intFromBool(state.progressive_partial_queryable));

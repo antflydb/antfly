@@ -101,7 +101,7 @@ fn createLocked(alloc: Allocator, io: std.Io, root_dir: []const u8, path: []cons
 
 fn privateFilePermissions() std.Io.File.Permissions {
     if (comptime @import("builtin").os.tag == .windows) return .default_file;
-    return @enumFromInt(0o600);
+    return @fromBackingInt(0o600);
 }
 
 fn loadPath(alloc: Allocator, io: std.Io, path: []const u8, expected_root: u128) !State {
@@ -236,7 +236,7 @@ test "root signing identity refuses a world-readable restored checkpoint" {
     _ = try loadOrCreate(alloc, std.testing.io, path);
     const checkpoint = try checkpointPathAlloc(alloc, path);
     defer alloc.free(checkpoint);
-    try std.Io.Dir.cwd().setFilePermissions(std.testing.io, checkpoint, @enumFromInt(0o644), .{});
+    try std.Io.Dir.cwd().setFilePermissions(std.testing.io, checkpoint, @fromBackingInt(0o644), .{});
     try std.testing.expectError(error.InsecureRootSigningIdentity, load(alloc, std.testing.io, path));
 }
 

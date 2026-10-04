@@ -24,7 +24,7 @@ const ordered = @import("mem_ordered.zig");
 const State = struct {
     tree: ordered.Tree = .empty,
 
-    fn deinit(self: *State, allocator: Allocator) void {
+    pub fn deinit(self: *State, allocator: Allocator) void {
         self.tree.release(allocator);
         self.* = .{};
     }

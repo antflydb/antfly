@@ -565,7 +565,7 @@ pub const Session = struct {
         try request_.check();
         const raw = try load(self.source.context, alloc, identity, request_);
         const snapshot = struct {
-            fn read(ptr: *anyopaque, _: std.mem.Allocator, _: settings_catalog.Scope) !settings_catalog.RawSnapshot {
+            pub fn read(ptr: *anyopaque, _: std.mem.Allocator, _: settings_catalog.Scope) !settings_catalog.RawSnapshot {
                 return @as(*settings_catalog.RawSnapshot, @ptrCast(@alignCast(ptr))).*;
             }
         };
@@ -1410,7 +1410,7 @@ pub const Session = struct {
     }
 
     fn ready(self: *Session) !void {
-        try self.message('Z', &.{@intFromEnum(self.status)});
+        try self.message('Z', &.{@backingInt(self.status)});
     }
 
     fn command(self: *Session, tag: []const u8) !void {

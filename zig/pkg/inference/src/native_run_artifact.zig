@@ -231,7 +231,7 @@ const LoadedTokenizerAssets = struct {
         unreachable;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.hf_tok) |tok| {
             tok.deinitSelf();
         }
@@ -1157,7 +1157,7 @@ const FullModelRunResult = struct {
     token_id: usize,
     compare_summary: []u8,
 
-    fn deinit(self: @This(), allocator: std.mem.Allocator) void {
+    pub fn deinit(self: @This(), allocator: std.mem.Allocator) void {
         if (self.compare_summary.len > 0) allocator.free(self.compare_summary);
     }
 };
@@ -1395,7 +1395,7 @@ fn compareLastLogitsSummary(
 const OwnedTensorInfoList = struct {
     items: []backends.TensorInfo,
 
-    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         for (self.items) |info| {
             allocator.free(info.name);
             allocator.free(info.shape);
@@ -1818,7 +1818,7 @@ const MaterializedPartitionInputs = struct {
     runtime_inputs: []interpreter.RuntimeInput,
     graph: ?ml.graph.Graph = null,
 
-    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         var capture = interpreter.CapturedValuesResult{ .values = self.values, .allocator = allocator };
         capture.deinit(&self.cb);
         for (self.runtime_inputs) |ri| self.cb.free(ri.value);
@@ -1834,7 +1834,7 @@ const PartitionRunResult = struct {
     output_shapes_summary: []u8,
     compare_summary: []u8,
 
-    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         allocator.free(self.output_shapes_summary);
         allocator.free(self.compare_summary);
         self.* = undefined;

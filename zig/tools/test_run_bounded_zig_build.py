@@ -70,12 +70,15 @@ class BoundedZigBuildTest(unittest.TestCase):
             encoding="utf-8"
         )
         claim = re.search(
-            r"\.storage_kernel => (?P<gib>\d+) \* 1024 \* 1024 \* 1024",
+            r"\.storage_kernel => @as\(usize, if \(target\.os\.tag == \.macos\) "
+            r"\d+ else (?P<gib>\d+)\) \* 1024 \* 1024 \* 1024",
             build,
         )
         self.assertIsNotNone(
             claim, "update this contract when storage claims change shape"
         )
+        # These CI caps apply to Linux; the separate macOS reservation is
+        # checked by the runtime profile tests above.
         # Physical storage is its own archive. The distributed reservation no
         # longer includes DB codegen and cannot establish this admission check.
         required = int(claim.group("gib")) * 1024**3
@@ -176,7 +179,7 @@ class BoundedZigBuildTest(unittest.TestCase):
     def test_command_adds_missing_scheduler_options(self):
         command = launcher.build_command(
             "zig",
-            ["build", "antfly-unit-test", "-Doptimize=Debug"],
+            ["build", "antfly-unit-test", "-Doptimize=debug"],
             Path("/tmp/patched-runner.zig"),
             10_000,
         )
@@ -186,7 +189,7 @@ class BoundedZigBuildTest(unittest.TestCase):
                 "zig",
                 "build",
                 "antfly-unit-test",
-                "-Doptimize=Debug",
+                "-Doptimize=debug",
                 "--build-runner",
                 "/tmp/patched-runner.zig",
                 "--maxrss",

@@ -759,9 +759,9 @@ test "serverless filesystem retired attempt cleanup removes only owned canonical
     defer a.free(old_path);
     const fresh_path = try pathForArtifactIdAlloc(a, std.mem.span(path), fresh.artifact_id);
     defer a.free(fresh_path);
-    const old_temp = try std.fmt.allocPrint(a, "{s}.tmp-{s}", .{ old_path, "ab" ** 16 });
+    const old_temp = try std.fmt.allocPrint(a, "{s}.tmp-{s}", .{ old_path, z17RepeatString("ab", 16) });
     defer a.free(old_temp);
-    const fresh_temp = try std.fmt.allocPrint(a, "{s}.tmp-{s}", .{ fresh_path, "cd" ** 16 });
+    const fresh_temp = try std.fmt.allocPrint(a, "{s}.tmp-{s}", .{ fresh_path, z17RepeatString("cd", 16) });
     defer a.free(fresh_temp);
     const unrelated = try std.fmt.allocPrint(a, "{s}.tmp-not-a-canonical-nonce", .{old_path});
     defer a.free(unrelated);
@@ -986,4 +986,15 @@ test "fs artifact store delete removes unreachable artifact" {
     defer meta.deinit(std.testing.allocator);
     try runtime.delete(meta.artifact_id);
     try std.testing.expectError(error.FileNotFound, runtime.getAlloc(meta.artifact_id));
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

@@ -50,12 +50,34 @@ currently live under `pkg/inference/`.
 
 ## Build Requirements
 
-- Zig `0.16.0` or newer.
+- Zig `0.17.0` (the official release pinned by CI and container builds).
+- Supported native toolchain hosts include macOS 15+ and Linux 5.10+.
+  Zig 0.17 raises the macOS standard-library minimum from 13 to 15; the
+  macOS packaging workflow already uses a macOS 15 runner.
 - `uv` for Python e2e suites and repository helper scripts.
 - Optional native runtime dependencies for some inference features, such as
   ONNX Runtime, FFmpeg, CUDA, or Metal. The build detects available local
   support and exposes flags such as `-Dmetal=...`, `-Dcuda=...`, and
   `-Donnx=...`.
+
+The [0.17 release notes](https://ziglang.org/download/0.17.0/release-notes.html)
+also describe changes that can compile successfully while changing behavior:
+
+- Array/vector `@bitCast` now uses logical bits independently of host byte
+  order. Binary encoders must not combine array bitcasts with `nativeToLittle`
+  or `nativeToBig`; use explicit `std.mem.writeInt` byte order, or logical
+  bitcasts with `@byteSwap` for big-endian output. Protobuf and HBC key tests
+  evaluate real encoders at compile time so cross-compilation checks bytes too.
+- Stack-first allocations use the release's `std.heap.BufferFirstAllocator`
+  with caller-owned, aligned buffers. The release notes call this redesigned
+  API `StackFallbackAllocator`.
+- Configure-time macOS SDK discovery through `xcrun` poisons the configuration
+  cache so switching Xcode cannot silently retain a previous SDK path.
+- LLVM loop vectorization remains disabled in 0.17. Keep explicit SIMD kernels
+  and benchmark inference performance before attributing changes to the upgrade.
+- Incremental compilation with `-fincremental --watch` is an optional Linux
+  x86_64 development workflow. Release/qualification builds retain their
+  existing compiler and linker settings.
 
 ## Common Builds
 
@@ -107,10 +129,13 @@ zig build raft-vopr-test
 zig build inference-test
 ```
 
-The Make targets run aggregate tests with the patched Zig 0.16 scheduler and an
+Build with the official [Zig 0.17.0 release](https://ziglang.org/download/0.17.0/release-notes.html).
+The Make targets run aggregate tests with Zig’s scheduler and an
 RSS budget of 80% of the detected cgroup or host memory. Set
 `ANTFLY_ZIG_MAX_RSS` to an explicit byte count when a smaller local budget is
 needed. From the repository root, use `make zig-test` or `make zig-unit-test`.
+Use `-Dtest-filter="pattern"` for compile-time selection; arguments after `--`
+are forwarded to the selected executable or runtime test runner.
 
 Native API and model fixtures use `integration_test.zig` or
 `*_integration_test.zig`: they exercise mounted services or model pipelines
@@ -164,7 +189,7 @@ Artifact targets build and install into `zig-out/bin`. Run binaries directly,
 so a comparison can build once and execute several workloads:
 
 ```sh
-zig build antfly-graph-bench antfly-storage-bench -Doptimize=ReleaseFast
+zig build antfly-graph-bench antfly-storage-bench -Doptimize=fast
 ./zig-out/bin/antfly-graph-bench pattern --mode exact --fanout 10000 --target-degree 100000
 ./zig-out/bin/antfly-graph-bench pattern --mode generic --fanout 10000 --target-degree 100000
 ```
@@ -186,9 +211,9 @@ external `search-benchmark-game` harness. It delegates to the root
 Build the native PDF machinery without the Antfly server or storage kernel:
 
 ```sh
-zig build lib-pdf-bench -Dpdf-optimize=Debug -j1
+zig build lib-pdf-bench -Dpdf-optimize=debug -j1
 ./zig-out/bin/lib-pdf-bench dump-text input.pdf output.txt
-zig build lib-pdf-test -Doptimize=Debug -j1
+zig build lib-pdf-test -Doptimize=debug -j1
 ```
 
 `dump-text` writes native UTF-8 text using the same page-text/region extraction API
@@ -196,7 +221,7 @@ as the production document pipeline, without OCR or server postprocessing. It
 propagates page extraction errors rather than silently skipping failed pages.
 Create the output directory first.
 
-The isolated executable defaults to `ReleaseFast`; use `-Dpdf-optimize=Debug`
+The isolated executable defaults to `fast`; use `-Dpdf-optimize=debug`
 for short edit/build/debug cycles, and omit it for optimized benchmark runs.
 `--prefix /path/to/run` installs a separate `bin/lib-pdf-bench` so baseline and
 candidate executables can be retained independently. Also use a separate

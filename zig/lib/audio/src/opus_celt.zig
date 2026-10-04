@@ -290,7 +290,7 @@ pub const Decoder = struct {
 
         try unquantCoarseEnergy(start, end, old_band_e, intra_ener, dec, len, c_count, lm);
 
-        var tf_res: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
+        var tf_res: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
         try tfDecode(start, end, is_transient, &tf_res, lm, dec, len);
 
         tell = @intCast(dec.tell());
@@ -300,7 +300,7 @@ pub const Decoder = struct {
         var cap: [nb_ebands]i32 = undefined;
         for (0..nb_ebands) |i| cap[i] = bandCap(lm, c_count, i);
 
-        var offsets: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
+        var offsets: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
         var dynalloc_logp: u5 = 6;
         total_bits <<= bitres;
         var tell_frac: i32 = @intCast(dec.tellFrac());
@@ -328,9 +328,9 @@ pub const Decoder = struct {
         const anti_collapse_rsv: i32 = if (is_transient and lm >= 2 and bits >= (@as(i32, lm) + 2) << bitres) @as(i32, 1) << bitres else 0;
         bits -= anti_collapse_rsv;
 
-        var pulses: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
-        var fine_quant: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
-        var fine_priority: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
+        var pulses: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
+        var fine_quant: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
+        var fine_priority: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
         var intensity: i32 = 0;
         var dual_stereo: i32 = 0;
         var balance: i32 = 0;
@@ -346,7 +346,7 @@ pub const Decoder = struct {
 
         var x_storage: [2 * max_frame]f32 = undefined;
         const x_all = x_storage[0 .. c_count * n];
-        var collapse_masks: [2 * nb_ebands]u8 = [_]u8{0} ** (2 * nb_ebands);
+        var collapse_masks: [2 * nb_ebands]u8 = @as([(2 * nb_ebands)]u8, @splat(0));
         var seed = self.rng;
         try quantAllBands(
             start,
@@ -892,10 +892,10 @@ fn computeAllocation(
             total -= dual_stereo_rsv;
         }
     }
-    var bits1: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
-    var bits2: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
-    var thresh: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
-    var trim_offset: [nb_ebands]i32 = [_]i32{0} ** nb_ebands;
+    var bits1: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
+    var bits2: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
+    var thresh: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
+    var trim_offset: [nb_ebands]i32 = @as([nb_ebands]i32, @splat(0));
     for (start..end) |j| {
         const width = e_bands[j + 1] - e_bands[j];
         thresh[j] = @max(c << bitres, ((3 * width) << lm << bitres) >> 4);
@@ -1895,9 +1895,9 @@ test "mdct backward produces a bounded sinusoid for a single coefficient" {
     const t = sharedTables();
     for ([_]usize{ 0, 1, 2, 3 }) |shift| {
         const n2 = ((2 * max_frame) >> @intCast(shift)) / 2;
-        var in: [max_frame]f32 = [_]f32{0} ** max_frame;
+        var in: [max_frame]f32 = @as([max_frame]f32, @splat(0));
         in[7] = 1.0;
-        var out: [max_frame + overlap]f32 = [_]f32{0} ** (max_frame + overlap);
+        var out: [max_frame + overlap]f32 = @as([(max_frame + overlap)]f32, @splat(0));
         mdctBackward(t, in[0..n2], 0, 1, out[0..], shift);
         var energy: f64 = 0;
         for (out[0 .. overlap / 2 + n2]) |v| {

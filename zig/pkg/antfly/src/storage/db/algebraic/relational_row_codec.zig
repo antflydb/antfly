@@ -2433,7 +2433,7 @@ test "ordinal rows bind layout support projection checksum and canonical bytes" 
         .{ .ordinal = 3, .path = "payload", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "{\"x\":1}" } },
     };
 
-    const semantic_hash = [_]u8{0x5a} ** semantic_hash_len;
+    const semantic_hash = @as([semantic_hash_len]u8, @splat(0x5a));
     const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, semantic_hash);
     defer alloc.free(encoded);
     try std.testing.expectEqual(@as(usize, 99), encoded.len);
@@ -2532,7 +2532,7 @@ test "ordinal rows use sparse slots for wide optional schemas" {
     const cells = [_]Cell{
         .{ .ordinal = 15, .path = "c15", .value_type = .i64_val, .value = .{ .i64_val = 42 } },
     };
-    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0x33} ** semantic_hash_len);
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, @as([semantic_hash_len]u8, @splat(0x33)));
     defer alloc.free(encoded);
     try std.testing.expectEqual(capability_sparse_slots, std.mem.readInt(u32, encoded[12..16], .little));
     try std.testing.expectEqual(
@@ -2546,7 +2546,7 @@ test "ordinal rows use sparse slots for wide optional schemas" {
     const null_cells = [_]Cell{
         .{ .ordinal = 15, .path = "c15", .value_type = .i64_val, .is_null = true, .value = .{ .i64_val = 0 } },
     };
-    const encoded_null = try serializeOrdinal(alloc, schema.version, &columns, &null_cells, [_]u8{0x44} ** semantic_hash_len);
+    const encoded_null = try serializeOrdinal(alloc, schema.version, &columns, &null_cells, @as([semantic_hash_len]u8, @splat(0x44)));
     defer alloc.free(encoded_null);
     try std.testing.expectEqual(
         ordinal_header_len + @sizeOf(u32) + sparse_entry_len + @sizeOf(u32) + checksum_len,
@@ -2580,7 +2580,7 @@ test "ordinal typed projection preserves SQL types null absence and exact JSON" 
         .{ .ordinal = 6, .path = "n", .value_type = .bytes_val, .is_null = true, .value = .{ .bytes_val = "" } },
         .{ .ordinal = 8, .path = "json_null", .value_type = .bytes_val, .is_json = true, .value = .{ .bytes_val = "null" } },
     };
-    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0} ** semantic_hash_len);
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, @as([semantic_hash_len]u8, @splat(0)));
     defer alloc.free(encoded);
     var layout = try PhysicalLayout.init(alloc, schema);
     defer layout.deinit();
@@ -2635,7 +2635,7 @@ test "ordinal root materialization preserves exact nested JSON numbers" {
         .is_json = true,
         .value = .{ .bytes_val = "{\"exact\":9007199254740993}" },
     }};
-    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0x41} ** semantic_hash_len);
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, @as([semantic_hash_len]u8, @splat(0x41)));
     defer alloc.free(encoded);
     var layout = try PhysicalLayout.init(alloc, schema);
     defer layout.deinit();
@@ -2732,7 +2732,7 @@ test "ordinal rows store dense vectors as canonical binary values" {
         .{ .ordinal = 1, .path = "name", .value_type = .bytes_val, .value = .{ .bytes_val = "alpha" } },
     };
 
-    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, [_]u8{0x44} ** semantic_hash_len);
+    const encoded = try serializeOrdinal(alloc, schema.version, &columns, &cells, @as([semantic_hash_len]u8, @splat(0x44)));
     defer alloc.free(encoded);
     const projected = (try findCellByOrdinal(encoded, schema, 0)).?;
     try std.testing.expect(projected.is_dense_vector);
@@ -2767,6 +2767,6 @@ test "ordinal rows store dense vectors as canonical binary values" {
     }};
     try std.testing.expectError(
         error.InvalidRelationalRow,
-        serializeOrdinal(alloc, schema.version, &columns, &invalid_cells, [_]u8{0x55} ** semantic_hash_len),
+        serializeOrdinal(alloc, schema.version, &columns, &invalid_cells, @as([semantic_hash_len]u8, @splat(0x55))),
     );
 }

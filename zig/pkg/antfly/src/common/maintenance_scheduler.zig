@@ -12,7 +12,7 @@ const Io = std.Io;
 
 pub const Scheduler = struct {
     pub const Class = enum { maintenance, producer, derived, propagation };
-    const class_count = @typeInfo(Class).@"enum".fields.len;
+    const class_count = @typeInfo(Class).@"enum".field_names.len;
 
     /// Callbacks may wait for work in another class. Preserve one progress
     /// slot per class even when fractional CPU quota permits no parallel CPU
@@ -102,7 +102,7 @@ pub const Scheduler = struct {
             scheduler.mutex.lockUncancelable(scheduler.io);
             if (running) {
                 scheduler.active -= 1;
-                scheduler.active_by_class[@intFromEnum(task.class)] -= 1;
+                scheduler.active_by_class[@backingInt(task.class)] -= 1;
             }
             scheduler.changed.set(scheduler.io);
             scheduler.drained.broadcast(scheduler.io);
@@ -196,7 +196,7 @@ pub const Scheduler = struct {
                     task.future.?.await(self.io);
                     task.future = null;
                     self.active -= 1;
-                    self.active_by_class[@intFromEnum(task.class)] -= 1;
+                    self.active_by_class[@backingInt(task.class)] -= 1;
                     task.due_ms = if (task.delay_ms) |delay| timestamp +| delay else std.math.maxInt(u64);
                 }
             }
@@ -209,7 +209,7 @@ pub const Scheduler = struct {
                 const task = self.tasks.items[index];
                 if (task.future != null) continue;
                 if (task.notified) task.due_ms = 0;
-                const class_index = @intFromEnum(task.class);
+                const class_index = @backingInt(task.class);
                 // Producer passes may wait for derived publication. Reserved
                 // class capacity prevents every runnable slot being occupied
                 // by those waiters while their dependencies sit in the queue.

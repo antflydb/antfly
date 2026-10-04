@@ -106,7 +106,7 @@ const PreparedTransformOp = struct {
     path: NormalizedJsonPath,
     value: PreparedValue = .none,
 
-    fn deinit(self: *PreparedTransformOp, alloc: Allocator) void {
+    pub fn deinit(self: *PreparedTransformOp, alloc: Allocator) void {
         if (self.value == .json) freeJsonValue(alloc, &self.value.json);
         self.* = undefined;
     }
@@ -131,7 +131,7 @@ const PreparedTransformOp = struct {
 const PreparedDocumentTransform = struct {
     operations: []PreparedTransformOp,
 
-    fn deinit(self: *PreparedDocumentTransform, alloc: Allocator) void {
+    pub fn deinit(self: *PreparedDocumentTransform, alloc: Allocator) void {
         for (self.operations) |*op| op.deinit(alloc);
         if (self.operations.len > 0) alloc.free(self.operations);
         self.* = undefined;

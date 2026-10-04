@@ -61,8 +61,8 @@ const CompactType = enum(u4) {
 };
 
 fn decodeCompactType(raw: u8) !CompactType {
-    if (raw > @intFromEnum(CompactType.struct_)) return error.InvalidParquetMetadata;
-    return @enumFromInt(raw);
+    if (raw > @backingInt(CompactType.struct_)) return error.InvalidParquetMetadata;
+    return @fromBackingInt(@intCast(raw));
 }
 
 pub const ParsedFooter = struct {
@@ -505,7 +505,7 @@ const SchemaElement = struct {
     decimal_scale: i32 = 0,
     field_id: ?i32 = null,
 
-    fn deinit(self: *SchemaElement, alloc: Allocator) void {
+    pub fn deinit(self: *SchemaElement, alloc: Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         if (self.logical_type.len > 0) alloc.free(self.logical_type);
         self.* = undefined;
@@ -521,7 +521,7 @@ const SchemaColumn = struct {
     decimal_scale: i32 = 0,
     field_id: ?i32 = null,
 
-    fn deinit(self: *SchemaColumn, alloc: Allocator) void {
+    pub fn deinit(self: *SchemaColumn, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
         if (self.logical_type.len > 0) alloc.free(self.logical_type);
         self.* = undefined;
@@ -873,7 +873,7 @@ const ColumnMetadata = struct {
     stats_min_f64: ?f64 = null,
     stats_max_f64: ?f64 = null,
 
-    fn deinit(self: *ColumnMetadata, alloc: Allocator) void {
+    pub fn deinit(self: *ColumnMetadata, alloc: Allocator) void {
         if (self.column_id.len > 0) alloc.free(self.column_id);
         if (self.compression_codec.len > 0) alloc.free(self.compression_codec);
         if (self.encoding.len > 0) alloc.free(self.encoding);
@@ -956,7 +956,7 @@ const RawColumnStatistics = struct {
     min: ?[]u8 = null,
     max: ?[]u8 = null,
 
-    fn deinit(self: *RawColumnStatistics, alloc: Allocator) void {
+    pub fn deinit(self: *RawColumnStatistics, alloc: Allocator) void {
         if (self.min) |value| alloc.free(value);
         if (self.max) |value| alloc.free(value);
         self.* = undefined;
@@ -1146,7 +1146,7 @@ const LogicalTypeAnnotation = struct {
     decimal_precision: i32 = 0,
     decimal_scale: i32 = 0,
 
-    fn deinit(self: *LogicalTypeAnnotation, alloc: Allocator) void {
+    pub fn deinit(self: *LogicalTypeAnnotation, alloc: Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         self.* = undefined;
     }
@@ -1421,9 +1421,9 @@ fn zigzagDecode(raw: u64) i64 {
 fn appendField(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, previous: *i16, id: i16, field_type: CompactType) !void {
     const delta = id - previous.*;
     if (delta > 0 and delta <= 15) {
-        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @intFromEnum(field_type));
+        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @backingInt(field_type));
     } else {
-        try out.append(alloc, @intFromEnum(field_type));
+        try out.append(alloc, @backingInt(field_type));
         try appendI16(out, alloc, id);
     }
     previous.* = id;
@@ -1435,9 +1435,9 @@ fn appendStop(out: *std.ArrayListUnmanaged(u8), alloc: Allocator) !void {
 
 fn appendListHeader(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, elem_type: CompactType, len: usize) !void {
     if (len < 15) {
-        try out.append(alloc, (@as(u8, @intCast(len)) << 4) | @as(u8, @intFromEnum(elem_type)));
+        try out.append(alloc, (@as(u8, @intCast(len)) << 4) | @as(u8, @backingInt(elem_type)));
     } else {
-        try out.append(alloc, 0xf0 | @as(u8, @intFromEnum(elem_type)));
+        try out.append(alloc, 0xf0 | @as(u8, @backingInt(elem_type)));
         try appendVarint(out, alloc, len);
     }
 }
@@ -1456,7 +1456,7 @@ fn appendI64(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: i64) !vo
 
 fn appendZigzag(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: anytype) !void {
     const Int = @TypeOf(value);
-    const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(Int));
+    const Unsigned = @Int(.unsigned, @bitSizeOf(Int));
     const encoded: Unsigned = @bitCast((value << 1) ^ (value >> (@bitSizeOf(Int) - 1)));
     try appendVarint(out, alloc, encoded);
 }

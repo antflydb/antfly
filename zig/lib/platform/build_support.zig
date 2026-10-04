@@ -18,7 +18,7 @@ pub const ModuleOptions = struct {
     root_source_file: std.Build.LazyPath,
     filesystem_capacity_source_file: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     link_libc: bool,
     single_threaded: ?bool = null,
 };
@@ -71,7 +71,7 @@ fn configureModule(module: *std.Build.Module, options: ModuleOptions) *std.Build
 pub fn addTests(b: *std.Build, options: struct {
     root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     link_libc: bool,
 }) struct {
     unit: *std.Build.Step.Run,
@@ -160,13 +160,11 @@ pub fn canRunNativeProcess(b: *std.Build, fixture: *std.Build.Step.Compile) bool
     // on the host. Zig defaults musl executables to static linkage.
     const dynamic_libc = (fixture.root_module.link_libc orelse false) and
         fixture.linkage != .static and (!target.isMuslLibC() or fixture.linkage == .dynamic);
-    const executor = std.zig.system.getExternalExecutor(b.graph.io, &b.graph.host.result, &target, .{
+    const executor = std.zig.system.getExternalExecutor(b.graph.io, &target, .{
         .link_libc = dynamic_libc,
-        .allow_rosetta = false,
-        .allow_qemu = false,
-        .allow_wine = false,
-        .allow_wasmtime = false,
-        .allow_darling = false,
+        .link_mode = fixture.linkage orelse if (target.isMuslLibC()) .static else .dynamic,
+        .host_cpu_arch = b.graph.host.result.cpu.arch,
+        .host_os_tag = b.graph.host.result.os.tag,
     });
     return executor == .native;
 }
@@ -174,32 +172,21 @@ pub fn canRunNativeProcess(b: *std.Build, fixture: *std.Build.Step.Compile) bool
 pub fn addNativeProcessTest(b: *std.Build, fixture: *std.Build.Step.Compile, script: std.Build.LazyPath) *std.Build.Step {
     if (canRunNativeProcess(b, fixture)) {
         const run = b.addSystemCommand(&.{"python3"});
-        run.addFileArg(script);
-        run.addArtifactArg(fixture);
+        run.addFileArg2(script, .{ .make_absolute = true });
+        run.addArtifactArg2(fixture, .{ .make_absolute = true });
         return &run.step;
     }
-    const skipped = b.allocator.create(std.Build.Step) catch @panic("OOM");
-    skipped.* = std.Build.Step.init(.{
-        .id = .custom,
-        .name = b.fmt("skip {s} process checks (requires a native host target)", .{fixture.name}),
-        .owner = b,
-        .makeFn = struct {
-            fn make(_: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-                return error.MakeSkipped;
-            }
-        }.make,
-    });
+    const skipped = b.step(b.fmt("skip {s} process checks (requires a native host target)", .{fixture.name}), "Requires a native executor");
     skipped.dependOn(&fixture.step);
     return skipped;
 }
 
 pub fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
     if (target.result.os.tag != .macos) return;
-    const sdk_root = b.sysroot orelse
-        b.graph.environ_map.get("SDK_PATH") orelse
+    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse
         std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse
         return;
-    module.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk_root}) });
-    module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
-    module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
+    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
+    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
+    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
 }

@@ -90,7 +90,7 @@ pub const Scope = struct {
         std.mem.writeInt(u64, bytes[168..176], self.copy_attempt.donor_term, .little);
         std.mem.writeInt(u64, bytes[176..184], self.copy_attempt.sequence, .little);
         bytes[184] = self.version;
-        bytes[185] = @intFromEnum(self.authority);
+        bytes[185] = @backingInt(self.authority);
         return bytes;
     }
     pub fn decode(bytes: []const u8) !Scope {
@@ -102,7 +102,7 @@ pub const Scope = struct {
     pub fn pin(self: Scope) [32]u8 {
         var h = std.crypto.hash.sha2.Sha256.init(.{});
         h.update("antfly-online-source-consumer-v2");
-        h.update(&.{ self.version, @intFromEnum(self.authority) });
+        h.update(&.{ self.version, @backingInt(self.authority) });
         const fence = self.fence.encode() catch unreachable;
         h.update(&fence);
         h.update(&namespaceBytes(self.receiver_namespace));

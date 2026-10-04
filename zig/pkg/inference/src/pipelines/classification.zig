@@ -902,5 +902,5 @@ const FakeClassificationTokenizer = struct {
         return 256;
     }
 
-    fn deinit(_: *anyopaque) void {}
+    pub fn deinit(_: *anyopaque) void {}
 };

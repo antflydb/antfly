@@ -300,7 +300,7 @@ def main() -> int:
         "test-gliner2-backend-grad-parity",
         "-Dcuda=true",
         f"-Dcuda-artifacts={args.cuda_artifacts}",
-        "-Doptimize=ReleaseSafe",
+        "-Doptimize=safe",
         "--verbose",
     ]
     required_env = dict(os.environ)

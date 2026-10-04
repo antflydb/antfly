@@ -163,7 +163,7 @@ pub fn main(init: std.process.Init) !void {
         }
 
         const outcome = try probeOneFile(alloc, root_dir, relative_path, print_success, quiet_failure);
-        std.process.exit(@intFromEnum(toExitCode(outcome)));
+        std.process.exit(@backingInt(toExitCode(outcome)));
     }
 
     if (std.mem.eql(u8, subcommand, "triage-djpeg")) {
@@ -400,7 +400,7 @@ fn compareOneWithDjpeg(alloc: Allocator, root_dir: []const u8, relative_path: []
     const compare_len = @min(decoded_rgba.len, djpeg_rgba.len);
     var diff_count: usize = 0;
     var first_diff: ?usize = null;
-    var channel_diff_counts = [_]usize{0} ** 4;
+    var channel_diff_counts = @as([4]usize, @splat(0));
     var bbox: ?DiffBoundingBox = null;
     const block_cols = divCeil(metadata.width, 8);
     const block_rows = divCeil(metadata.height, 8);
@@ -696,9 +696,9 @@ fn runProbeOneChild(alloc: Allocator, config: Config, relative_path: []const u8)
     const term = try child.wait(io_impl.io());
     return switch (term) {
         .exited => |code| switch (code) {
-            @intFromEnum(ProbeExitCode.success) => .success,
-            @intFromEnum(ProbeExitCode.parse_failed) => .parse_failed,
-            @intFromEnum(ProbeExitCode.decode_failed) => .decode_failed,
+            @backingInt(ProbeExitCode.success) => .success,
+            @backingInt(ProbeExitCode.parse_failed) => .parse_failed,
+            @backingInt(ProbeExitCode.decode_failed) => .decode_failed,
             else => blk: {
                 std.debug.print("CRASH\t{s}\texit_code={d}\n", .{ relative_path, code });
                 break :blk .crashed;

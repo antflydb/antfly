@@ -75,7 +75,7 @@ fn encode(alloc: Allocator, id: records.Id, phase: Phase, after: []const u8) ![]
     if (after.len > max_cursor) return error.InvalidRelationalIndexGcProgress;
     const value = try alloc.alloc(u8, 40 + after.len);
     @memcpy(value[0..8], "ARGC\x03\x00\x00\x00");
-    value[5] = @intFromEnum(phase);
+    value[5] = @backingInt(phase);
     @memcpy(value[8..][0..after.len], after);
     @memcpy(value[value.len - 32 ..], &checksum(id, value[0 .. value.len - 32]));
     return value;

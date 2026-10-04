@@ -114,7 +114,7 @@ pub const TableSchema = struct {
     }
 
     fn nativeEnum(comptime T: type, wire: anytype) T {
-        inline for (@typeInfo(T).@"enum".fields) |field| if (std.mem.eql(u8, @tagName(wire), field.name)) return @field(T, field.name);
+        inline for (@typeInfo(T).@"enum".field_names) |reflected_name| if (std.mem.eql(u8, @tagName(wire), reflected_name)) return @field(T, reflected_name);
         unreachable;
     }
 
@@ -575,7 +575,7 @@ const RuntimeValidationContext = struct {
     root_property: ?*const DocumentProperty = null,
     require_physical_encoding: bool = false,
     physical_numeric_kind: ?RelationalNumericKind = null,
-    active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
+    active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0, .pointer_stability = .{} },
 
     fn findProperty(self: *const RuntimeValidationContext, properties: []const DocumentProperty, name: []const u8) ?DocumentProperty {
         if (self.compiled) |compiled| return compiled.findProperty(properties, name);
@@ -592,7 +592,7 @@ const RuntimeValidationContext = struct {
         };
     }
 
-    fn deinit(self: *RuntimeValidationContext) void {
+    pub fn deinit(self: *RuntimeValidationContext) void {
         self.active_root_ref_values.deinit(self.alloc);
         self.* = undefined;
     }
@@ -854,14 +854,14 @@ pub const RelationalRestorePlan = struct {
         const defaults = DocumentSchema{ .name = "" };
         // Explicitly account for each root keyword we can discharge through
         // the closed physical layout. New keywords default to full validation.
-        inline for (std.meta.fields(DocumentSchema)) |field| {
-            if (comptime !std.mem.eql(u8, field.name, "name") and
-                !std.mem.eql(u8, field.name, "properties") and
-                !std.mem.eql(u8, field.name, "required_fields") and
-                !std.mem.eql(u8, field.name, "include_in_all_fields") and
-                !std.mem.eql(u8, field.name, "additional_properties_allowed"))
+        inline for (comptime std.meta.fieldNames(DocumentSchema)) |reflected_name| {
+            if (comptime !std.mem.eql(u8, reflected_name, "name") and
+                !std.mem.eql(u8, reflected_name, "properties") and
+                !std.mem.eql(u8, reflected_name, "required_fields") and
+                !std.mem.eql(u8, reflected_name, "include_in_all_fields") and
+                !std.mem.eql(u8, reflected_name, "additional_properties_allowed"))
             {
-                if (!restoreFieldIsDefault(@field(document, field.name), @field(defaults, field.name))) return .{};
+                if (!restoreFieldIsDefault(@field(document, reflected_name), @field(defaults, reflected_name))) return .{};
             }
         }
         for (document.properties) |property| {
@@ -899,13 +899,13 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
     if (!physical_scalar) return false;
     if (property.integer_only and !std.mem.eql(u8, kind, "integer")) return false;
     const defaults = DocumentProperty{ .name = "" };
-    inline for (std.meta.fields(DocumentProperty)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "name") and
-            !std.mem.eql(u8, field.name, "field_type") and
-            !std.mem.eql(u8, field.name, "integer_only") and
-            !std.mem.eql(u8, field.name, "allows_null"))
+    inline for (comptime std.meta.fieldNames(DocumentProperty)) |reflected_name| {
+        if (comptime !std.mem.eql(u8, reflected_name, "name") and
+            !std.mem.eql(u8, reflected_name, "field_type") and
+            !std.mem.eql(u8, reflected_name, "integer_only") and
+            !std.mem.eql(u8, reflected_name, "allows_null"))
         {
-            if (!restoreFieldIsDefault(@field(property, field.name), @field(defaults, field.name))) return false;
+            if (!restoreFieldIsDefault(@field(property, reflected_name), @field(defaults, reflected_name))) return false;
         }
     }
     return true;

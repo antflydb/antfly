@@ -96,7 +96,7 @@ pub const ReplicationFrame = struct {
     payload_codec: replication_record.PayloadCodec,
     encoded: []const u8,
 
-    fn deinit(self: *ReplicationFrame, alloc: Allocator) void {
+    pub fn deinit(self: *ReplicationFrame, alloc: Allocator) void {
         alloc.free(self.encoded);
         self.* = undefined;
     }
@@ -332,7 +332,7 @@ const TestPaths = struct {
     primary_log: [:0]u8,
     primary_slots: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
     }
@@ -351,8 +351,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), primary_slots) catch {};
 
     return .{
-        .primary_log = try alloc.dupeZ(u8, primary_log),
-        .primary_slots = try alloc.dupeZ(u8, primary_slots),
+        .primary_log = try alloc.dupeSentinel(u8, primary_log, 0),
+        .primary_slots = try alloc.dupeSentinel(u8, primary_slots, 0),
     };
 }
 

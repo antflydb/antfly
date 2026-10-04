@@ -885,7 +885,7 @@ test "inverse wavelet cancellation is observed between reconstruction rows" {
         }
     };
 
-    var data = [_]i32{0} ** (64 * 64);
+    var data = @as([(64 * 64)]i32, @splat(0));
     var probe_state = ProbeState{ .cancel_after = 2 };
     try std.testing.expectError(
         error.Canceled,

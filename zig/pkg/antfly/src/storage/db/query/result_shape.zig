@@ -572,7 +572,7 @@ const ChunkUnitIdentity = struct {
     key: []u8,
     fingerprint: ?[]u8 = null,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.key);
         if (self.fingerprint) |fingerprint| alloc.free(fingerprint);
         self.* = undefined;
@@ -890,7 +890,7 @@ const ChunkAncestorInfo = struct {
     parent_doc_key: []u8,
     unit_key: ?[]u8 = null,
 
-    fn deinit(self: *ChunkAncestorInfo, alloc: Allocator) void {
+    pub fn deinit(self: *ChunkAncestorInfo, alloc: Allocator) void {
         alloc.free(self.parent_doc_key);
         if (self.unit_key) |key| alloc.free(key);
         self.* = undefined;
@@ -1269,7 +1269,7 @@ const ResolvedPatternDocIds = struct {
     all: bool = false,
     owned: bool = false,
 
-    fn deinit(self: *ResolvedPatternDocIds, alloc: Allocator) void {
+    pub fn deinit(self: *ResolvedPatternDocIds, alloc: Allocator) void {
         if (self.ordinal_set) |*set| set.deinit(alloc);
         if (self.owned) freeResolvedDocIds(alloc, self.ids);
         self.* = .{};

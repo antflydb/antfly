@@ -102,21 +102,12 @@ jobs:
         uses: ./.github/actions/load-toolchain-policy
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Install official Zig release
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
-      - name: Install glibc-linked Zig
-        env:
-          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
-          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
-        run: |
-          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
       - name: Test soak orchestration
         run: |
           python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
@@ -157,21 +148,12 @@ jobs:
         uses: ./.github/actions/load-toolchain-policy
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Install official Zig release
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
-      - name: Install glibc-linked Zig
-        env:
-          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
-          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
-        run: |
-          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
       - name: Restore the pinned runner for this revision
         id: runner_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -183,7 +165,7 @@ jobs:
         working-directory: zig
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=safe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
       - name: Retain runner build disk measurements
         if: always()
@@ -389,27 +371,18 @@ jobs:
         uses: ./.github/actions/load-toolchain-policy
       - name: Install build tools and native debugger
         run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config ca-certificates git curl xz-utils file gdb
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Install official Zig release
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
-      - name: Install glibc-linked Zig
-        env:
-          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
-          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
-        run: |
-          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
+
       - name: Build production executable and qualify owner publication
         id: production-build
         working-directory: zig
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/production-e2e-soak/build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=safe --summary all \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
           sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
           tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
@@ -417,7 +390,7 @@ jobs:
         working-directory: zig
         run: |
           for iteration in $(seq 1 20); do
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=safe --summary all \
               > "$RUNNER_TEMP/production-e2e-soak/owner-$iteration.log" 2>&1
           done
       - name: Retain production binary and build evidence

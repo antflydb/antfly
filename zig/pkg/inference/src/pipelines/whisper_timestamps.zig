@@ -239,7 +239,7 @@ pub fn chooseFromStats(stats: *const ops.WhisperLogitsStatsRaw, timestamps_on: b
 /// shape `ruleWindow` sees it. `advanceGrammar` is the host mirror of the
 /// kernel's update.
 pub fn grammarState(rules: Rules, generated: []const i32, vocab: usize, rules_active: bool) ops.WhisperGrammarState {
-    var state: ops.WhisperGrammarState = [_]u32{0} ** 8;
+    var state: ops.WhisperGrammarState = @as([8]u32, @splat(0));
     if (!rules_active) {
         state[0] = 1;
         state[1] = @intCast(vocab);
@@ -302,7 +302,7 @@ pub fn statsProbeProbability(stats: *const ops.WhisperLogitsStatsRaw) f32 {
 /// Reference implementation of the device statistics kernel, used to check
 /// its contract against `applyRules` and as documentation of the layout.
 pub fn hostLogitsStats(logits: []const f32, params: ops.WhisperLogitsParams, suppress: []const i32) ops.WhisperLogitsStatsRaw {
-    var out: ops.WhisperLogitsStatsRaw = [_]f32{0} ** 16;
+    var out: ops.WhisperLogitsStatsRaw = @as([16]f32, @splat(0));
     var best: ?u32 = null;
     var text: ?u32 = null;
     var ts: ?u32 = null;

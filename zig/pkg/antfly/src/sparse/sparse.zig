@@ -98,15 +98,15 @@ pub const WriteProfile = struct {
 
     pub fn delta(after: WriteProfile, before: WriteProfile) WriteProfile {
         var out: WriteProfile = .{};
-        inline for (std.meta.fields(WriteProfile)) |field| {
-            @field(out, field.name) = @field(after, field.name) -| @field(before, field.name);
+        inline for (comptime std.meta.fieldNames(WriteProfile)) |reflected_name| {
+            @field(out, reflected_name) = @field(after, reflected_name) -| @field(before, reflected_name);
         }
         return out;
     }
 
     pub fn add(self: *WriteProfile, other: WriteProfile) void {
-        inline for (std.meta.fields(WriteProfile)) |field| {
-            @field(self.*, field.name) += @field(other, field.name);
+        inline for (comptime std.meta.fieldNames(WriteProfile)) |reflected_name| {
+            @field(self.*, reflected_name) += @field(other, reflected_name);
         }
     }
 };
@@ -202,7 +202,7 @@ const RetainedChunk = struct {
     meta_bytes: []u8,
     max_weight: f32,
 
-    fn deinit(self: *RetainedChunk, alloc: Allocator) void {
+    pub fn deinit(self: *RetainedChunk, alloc: Allocator) void {
         alloc.free(self.chunk_bytes);
         alloc.free(self.meta_bytes);
         self.* = undefined;
@@ -499,7 +499,7 @@ const SegmentTermPayload = struct {
     term_id: u32,
     bytes: []u8,
 
-    fn deinit(self: *SegmentTermPayload, alloc: Allocator) void {
+    pub fn deinit(self: *SegmentTermPayload, alloc: Allocator) void {
         alloc.free(self.bytes);
         self.* = undefined;
     }
@@ -518,7 +518,7 @@ const CollectedSparseDocs = struct {
     term_ids: std.ArrayListUnmanaged(u32) = .empty,
     selected_doc_nums: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.writes.items) |write| {
             self.alloc.free(@constCast(write.doc_id));
             self.alloc.free(@constCast(write.vec.indices));
@@ -829,7 +829,7 @@ const SelectedDocLookup = struct {
         return lookup;
     }
 
-    fn deinit(self: *SelectedDocLookup, alloc: Allocator) void {
+    pub fn deinit(self: *SelectedDocLookup, alloc: Allocator) void {
         if (self.dense_doc_ids.len > 0) alloc.free(self.dense_doc_ids);
         self.owned_map.deinit(alloc);
         self.* = undefined;
@@ -1161,7 +1161,7 @@ const IncarnationCache = struct {
     current: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     segments: std.AutoHashMapUnmanaged([2]u64, u64) = .empty,
     const max_entries = 4096;
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.current.deinit(alloc);
         self.segments.deinit(alloc);
     }
@@ -1433,7 +1433,7 @@ pub const SparseIndex = struct {
             self.* = .none;
         }
 
-        fn sync(self: *StoreOwner, force: bool) !void {
+        pub fn sync(self: *StoreOwner, force: bool) !void {
             switch (self.*) {
                 .none, .mem => {},
                 .lsm => |*handle| try handle.backend.sync(force),
@@ -1833,7 +1833,7 @@ pub const SparseIndex = struct {
         data: []u8,
         incarnations: []CapturedIncarnation,
 
-        fn deinit(self: @This(), alloc: Allocator) void {
+        pub fn deinit(self: @This(), alloc: Allocator) void {
             alloc.free(self.data);
             for (self.incarnations) |entry| if (entry.doc_id) |bytes| alloc.free(bytes);
             alloc.free(self.incarnations);
@@ -4053,7 +4053,7 @@ pub const SparseIndex = struct {
             doc_num: u64,
             doc_id: []u8,
 
-            fn deinit(doc: *@This(), allocator: Allocator) void {
+            pub fn deinit(doc: *@This(), allocator: Allocator) void {
                 allocator.free(doc.doc_id);
                 doc.* = undefined;
             }
@@ -4859,7 +4859,7 @@ test "sparse incarnation budget denial precedes capture and bulk mutation" {
     try std.testing.expectError(error.ResourceBudgetExceeded, index.batchWithOptions(&.{.{ .doc_id = "c", .doc_num = 3, .vec = .{ .indices = &.{1}, .values = &.{4} } }}, &.{}, bulk));
     try std.testing.expectEqual(@as(usize, 2), try index.segmentCount());
     try std.testing.expectEqual(@as(u64, 2), index.stats().doc_count);
-    const stats = manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.sparse_apply_working_set)];
+    const stats = manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.sparse_apply_working_set)];
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
     index.resource_manager = null;
     try expectIncarnationSearch(&index, 1, &.{ .{ .id = "a", .score = 2 }, .{ .id = "b", .score = 3 } }, false);
@@ -5124,7 +5124,7 @@ test "sparse bulk append accounts resource working set" {
         .assume_new_doc_ids = true,
     });
 
-    const resource_stats = manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.sparse_apply_working_set)];
+    const resource_stats = manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.sparse_apply_working_set)];
     try std.testing.expectEqual(@as(u64, 0), resource_stats.used_bytes);
     try std.testing.expect(resource_stats.peak_bytes > 0);
 }

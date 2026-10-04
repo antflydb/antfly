@@ -452,7 +452,7 @@ test "boundary native trainer allocation failures distinguish phase limits resiz
     try std.testing.expectEqual(error.OutOfMemory, failures.translate(error.OutOfMemory));
     try std.testing.expectEqual(.backing_allocator, failures.snapshot().?.allocation.kind);
     try std.testing.expectEqual(@as(usize, 16), failures.snapshot().?.allocation.live_bytes);
-    try std.testing.expectEqualSlices(u8, &([_]u8{7} ** 16), bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(7))), bytes);
 
     // A recovered terminal failure in one domain cannot hide a later backing
     // failure in the other: the shared operation record observes actual order.
@@ -687,7 +687,7 @@ const NeckedFixture = struct {
         }
     }
 
-    fn deinit(self: *NeckedFixture) void {
+    pub fn deinit(self: *NeckedFixture) void {
         self.store.deinitOwned();
         self.arena.deinit();
         self.samples.deinit();

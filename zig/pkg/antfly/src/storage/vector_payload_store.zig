@@ -345,7 +345,7 @@ pub const Store = struct {
         bytes: u64 = 0,
         initialized: bool = false,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.counts.deinit(alloc);
             self.wal.deinit(alloc);
             self.wal_events.deinit(alloc);
@@ -408,7 +408,7 @@ pub const Store = struct {
                 self.wal_head = 0;
             }
         }
-        fn sync(self: *@This(), alloc: Allocator, previous: ?*const native.Opened, next: *const native.Opened, rows: *u64) !void {
+        pub fn sync(self: *@This(), alloc: Allocator, previous: ?*const native.Opened, next: *const native.Opened, rows: *u64) !void {
             // Any partial cache edit is discarded. A failed post-publication
             // install must reopen durable authority before accepting writes.
             errdefer self.deinit(alloc);
@@ -695,7 +695,7 @@ pub const Store = struct {
         retired_view: ?*ReadView = null,
         retirement: ?native.Store.PreparedPublication = null,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             std.debug.assert(!self.validation_running);
             if (self.retirement) |*prepared| {
                 prepared.reclaimObsolete();
@@ -776,7 +776,7 @@ pub const Store = struct {
             } else _ = self.tail.remove(digest);
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             std.debug.assert(!self.running);
             if (self.segment_stats) |stats| alloc.free(stats);
             self.source.deinit();
@@ -1734,8 +1734,9 @@ pub const Store = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var metadata_buffer = std.heap.stackFallback(2048, self.alloc);
-        var metadata: PreparationMetadata = .{ .alloc = metadata_buffer.get() };
+        var metadata_buffer_storage: [2048]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+        var metadata_buffer: std.heap.BufferFirstAllocator = .init(&metadata_buffer_storage, self.alloc);
+        var metadata: PreparationMetadata = .{ .alloc = metadata_buffer.allocator() };
         defer metadata.deinit();
         const records = &metadata.records;
         const sequence = try std.math.add(u64, self.opened.store.covered_source_sequence, 1);
@@ -1939,8 +1940,8 @@ pub const Store = struct {
         timings.bytes = vectors.len * @sizeOf(f32);
         timings.positional_batches = 1;
         timings.positional_bytes = physical.physical_bytes;
-        inline for (std.meta.fields(native.ReadDispatchStats)) |field| {
-            @field(timings, "read_" ++ field.name) = @field(physical.dispatch, field.name);
+        inline for (comptime std.meta.fieldNames(native.ReadDispatchStats)) |reflected_name| {
+            @field(timings, "read_" ++ reflected_name) = @field(physical.dispatch, reflected_name);
         }
         return timings;
     }
@@ -2180,8 +2181,8 @@ pub const Store = struct {
     fn statsLocked(self: *Store) Stats {
         var stats = self.stats;
         stats.active_sessions = self.active_sessions.load(.acquire);
-        inline for (std.meta.fields(ReadStats)) |field| {
-            @field(stats, field.name) += @field(self.read_stats, field.name).load(.monotonic);
+        inline for (comptime std.meta.fieldNames(ReadStats)) |reflected_name| {
+            @field(stats, reflected_name) += @field(self.read_stats, reflected_name).load(.monotonic);
         }
         stats.prepare_requests = self.prepare_requests.load(.monotonic);
         stats.source_segments = self.opened.readers.len;
@@ -2394,7 +2395,7 @@ pub const Store = struct {
         // DB.apply merely to avoid a scan. Startup and explicit collection
         // require the complete proof and cannot trust this process-local lease.
         const now = time.monotonicNs();
-        const ann_digest = if (!self.checkpoint_receipts) [_]u8{0} ** 32 else if (background) self.annScopeDigest() else try self.annAuthorityDigest();
+        const ann_digest = if (!self.checkpoint_receipts) @as([32]u8, @splat(0)) else if (background) self.annScopeDigest() else try self.annAuthorityDigest();
         if (self.receipt) |receipt| {
             const hint_valid = !background or (self.last_mark_completed_ns != 0 and
                 now -| self.last_mark_completed_ns < 5 * std.time.ns_per_min);
@@ -3225,7 +3226,7 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
     if (positional) try std.testing.expect(source.opened.shared_catalog != null);
     const copied_before_reads = source.statsSnapshot().catalog_metadata_bytes_copied;
     const shared_before_reads = source.statsSnapshot().catalog_metadata_bytes_shared;
-    const repeated = [_][]const u8{key} ** 70;
+    const repeated = @as([70][]const u8, @splat(key));
     var values: [70]?[]const u8 = undefined;
     const stats = try old.consumeDenseManySorted(alloc, &repeated, &values, 3, sink.sink());
     try std.testing.expectEqual(@as(u64, 3), stats.batches);
@@ -3249,7 +3250,7 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
     try std.testing.expectEqual(@as(u64, 2), low_memory.vectors);
     {
         var budgets = resources.Options.defaultBudgets();
-        budgets[@intFromEnum(resources.Slice.dense_apply_working_set)] = .{ .soft_limit_bytes = 24, .hard_limit_bytes = 24 };
+        budgets[@backingInt(resources.Slice.dense_apply_working_set)] = .{ .soft_limit_bytes = 24, .hard_limit_bytes = 24 };
         var manager = resources.ResourceManager.init(.{ .budgets = budgets });
         defer manager.deinit(alloc);
         // Model an already-full cache/scratch claim. Optional batching must
@@ -3265,7 +3266,7 @@ fn checkDenseBatchReads(positional: bool, encoding: vector_block.Encoding) !void
     }
     if (positional and encoding == .float32) {
         var budgets = resources.Options.defaultBudgets();
-        budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
+        budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
         var manager = resources.ResourceManager.init(.{ .budgets = budgets });
         defer manager.deinit(alloc);
         var resident = try manager.reserve(.dense_source_payload_state, 1);
@@ -4775,7 +4776,7 @@ test "source vector payloads elapsed marking budget yields before the row cap an
             const wal_before = source.statsSnapshot().wal_bytes_written;
             const tail_capacity = source.marking.?.tail.capacity();
             const pending_capacity = source.marking.?.pending_tail.capacity;
-            const repeats = [_]payload.Prepared{.{ .reference = ref, .artifact = artifact }} ** 256;
+            const repeats = @as([256]payload.Prepared, @splat(.{ .reference = ref, .artifact = artifact }));
             try Store.prepare(&source, &repeats);
             try std.testing.expectEqual(tail_capacity, source.marking.?.tail.capacity());
             try std.testing.expectEqual(pending_capacity, source.marking.?.pending_tail.capacity);
@@ -4864,7 +4865,7 @@ test "source vector payloads rescued preparations cannot certify an unchanged pr
         try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
         const bytes = source.stats.wal_bytes_written;
         const tail_capacity = source.marking.?.tail.capacity();
-        const repeats = [_]payload.Prepared{.{ .reference = ref, .artifact = old }} ** 256;
+        const repeats = @as([256]payload.Prepared, @splat(.{ .reference = ref, .artifact = old }));
         try Store.prepare(&source, &repeats);
         try std.testing.expectEqual(tail_capacity, source.marking.?.tail.capacity());
         try std.testing.expectEqual(@as(usize, 1), source.marking.?.rescued.count());
@@ -5131,7 +5132,7 @@ test "source vector payloads mark workspace admission releases snapshots and res
         defer raw.deinit();
         var budgets = resources.Options.defaultBudgets();
         const limit = 16 * 1024 * 1024;
-        budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+        budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
         var manager = resources.ResourceManager.init(.{ .budgets = budgets });
         defer manager.deinit(alloc);
         var source = try Store.openManaged(alloc, &manager, memory.storage(), "/mark-admission", false);
@@ -5246,7 +5247,7 @@ fn testPublicationMemoryPressure(selective: bool) !void {
     defer raw.deinit();
     var budgets = resources.Options.defaultBudgets();
     const limit = 32 * 1024 * 1024;
-    budgets[@intFromEnum(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
+    budgets[@backingInt(resources.Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = limit };
     var manager = resources.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var source = try Store.openManaged(alloc, &manager, memory.storage(), "/publication-memory", false);
@@ -5269,7 +5270,7 @@ fn testPublicationMemoryPressure(selective: bool) !void {
     try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
     while (!source.marking.?.scan_done) try source.advanceMarkingSnapshot();
     const prefix_bytes = source.marking.?.boundary.committed_bytes;
-    const vector = [_]f32{1} ** 256;
+    const vector = @as([256]f32, @splat(1));
     const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 3, &vector);
     defer alloc.free(artifact);
     for (0..1024) |i| {
@@ -5441,7 +5442,7 @@ test "source vector payloads WAL admission cancels unpublished marks and retains
     defer alloc.free(value);
     try store.put(key, value);
     try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
-    const vector = [_]f32{2} ** 2048;
+    const vector = @as([2048]f32, @splat(2));
     const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 2, &vector);
     defer alloc.free(artifact);
     MarkInterleaving.entered.store(false, .release);
@@ -5665,8 +5666,8 @@ test "source vector payloads delta inventory retires only cut WAL events and pre
     const alloc = allocator_state.allocator();
     var inventory: Store.Inventory = .{ .delta = true };
     defer inventory.deinit(alloc);
-    const first: payload.Digest = [_]u8{1} ** 32;
-    const second: payload.Digest = [_]u8{2} ** 32;
+    const first: payload.Digest = @as([32]u8, @splat(1));
+    const second: payload.Digest = @as([32]u8, @splat(2));
     // Batch zero is real. Reappearance in a later batch must keep the single
     // WAL contribution when an earlier occurrence crosses the checkpoint cut.
     try inventory.addWal(alloc, &first, 2, 0);
@@ -6430,7 +6431,7 @@ test "source vector payloads GC scan preserves snapshots without admitting prima
         errdefer txn.abort();
         for (0..96) |i| {
             var buf: [32]u8 = undefined;
-            try txn.put(try std.fmt.bufPrint(&buf, "scalar-{d:0>8}", .{i}), "x" ** 1024);
+            try txn.put(try std.fmt.bufPrint(&buf, "scalar-{d:0>8}", .{i}), z17RepeatString("x", 1024));
         }
         try txn.commit();
     }
@@ -6506,8 +6507,8 @@ test "source vector payloads GC identity validation rejects missing tombstone di
     var writer = try native.Store.open(a, memory.storage(), "/gc-identities");
     defer writer.deinit();
     try writer.publishEmptyBase(1, 0, .{ .shard_count = 16, .encoding = .float32 });
-    const digest = [_]u8{1} ** 32;
-    const missing = [_]u8{2} ** 32;
+    const digest = @as([32]u8, @splat(1));
+    const missing = @as([32]u8, @splat(2));
     try writer.appendBatch(1, &.{.{ .kind = .upsert, .key = &digest, .source_sequence = 1, .revision = 1, .vector = &.{ 1, 2, 3 } }}, 1, .{});
     var old = try native.Store.openReadOnlyWithBlocks(a, memory.storage(), "/gc-identities");
     defer old.deinit();
@@ -6762,9 +6763,21 @@ test "source vector payloads detached reader failure retains authority and retri
     try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
 }
 
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
+}
+
 fn preparationMetadataFailures(alloc: Allocator) !void {
-    var buffer = std.heap.stackFallback(2048, alloc);
-    var metadata: PreparationMetadata = .{ .alloc = buffer.get() };
+    var buffer_storage: [2048]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var buffer: std.heap.BufferFirstAllocator = .init(&buffer_storage, alloc);
+    var metadata: PreparationMetadata = .{ .alloc = buffer.allocator() };
     defer metadata.deinit();
     for (0..128) |i| {
         var digest: payload.Digest = @splat(0);
@@ -6777,8 +6790,9 @@ fn preparationMetadataFailures(alloc: Allocator) !void {
 
 test "source vector payloads preparation metadata grows only with eligible unique records" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var buffer = std.heap.stackFallback(2048, failing.allocator());
-    var metadata: PreparationMetadata = .{ .alloc = buffer.get() };
+    var buffer_storage: [2048]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var buffer: std.heap.BufferFirstAllocator = .init(&buffer_storage, failing.allocator());
+    var metadata: PreparationMetadata = .{ .alloc = buffer.allocator() };
     defer metadata.deinit();
     try std.testing.expect(try metadata.append(@splat(0), .{ .kind = .upsert, .key = "one", .source_sequence = 1, .revision = 1 }));
     try std.testing.expectEqual(@as(usize, 1), metadata.records.items.len);

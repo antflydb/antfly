@@ -90,20 +90,21 @@ fn BoundaryImpl(comptime VTable: type) type {
             args: *const anyopaque,
             output: ?*anyopaque,
         ) callconv(.c) error_abi.Status {
-            @setEvalBranchQuota(64 * std.meta.fields(VTable).len);
+            @setEvalBranchQuota(64 * @typeInfo(VTable).@"struct".field_names.len);
             if (contract.version != native_abi.abi_version)
                 return error_abi.statusFromError(error.UnsupportedVersion);
-            inline for (std.meta.fields(VTable)) |field| {
-                if (contract.method_id == native_abi.stableId(field.name)) {
-                    if (comptime isCallbackField(field.type)) {
-                        const Callback = callbackType(field.type);
+            const info = @typeInfo(VTable).@"struct";
+            inline for (info.field_names, info.field_types) |reflected_name, Field| {
+                if (contract.method_id == native_abi.stableId(reflected_name)) {
+                    if (comptime isCallbackField(Field)) {
+                        const Callback = callbackType(Field);
                         const Function = functionType(Callback);
                         const Args = std.meta.ArgsTuple(Function);
                         const Payload = payloadType(Callback);
-                        const expected = native_abi.CallContract.of(field.name, Callback, Args, Payload);
+                        const expected = native_abi.CallContract.of(reflected_name, Callback, Args, Payload);
                         if (!contract.matches(expected))
                             return error_abi.statusFromError(error.InvalidArgument);
-                        return invoke(field.name, field.type, callback, args, output);
+                        return invoke(reflected_name, Field, callback, args, output);
                     }
                     return error_abi.statusFromError(error.InvalidArgument);
                 }

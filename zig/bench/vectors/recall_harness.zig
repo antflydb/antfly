@@ -536,7 +536,7 @@ const BuiltHBC = struct {
     query_owned: common.OwnedVectorSet,
     idx: hbc.HBCIndex,
 
-    fn deinit(self: *BuiltHBC) void {
+    pub fn deinit(self: *BuiltHBC) void {
         const alloc = self.idx.alloc;
         self.idx.close();
         self.tp.cleanup();

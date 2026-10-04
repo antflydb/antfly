@@ -235,10 +235,10 @@ pub fn compile(a: Allocator, layout: Layout, records: []const targets.RecordTarg
     }
     var hash = std.crypto.hash.sha2.Sha256.init(.{});
     hash.update("antfly.gliner2.5.record-targets.v1");
-    for ([_]usize{ layout.structure, layout.group, @intFromEnum(layout.mode), layout.word_count, nf, nc, ni, ng }) |n| hashInt(&hash, n);
+    for ([_]usize{ layout.structure, layout.group, @backingInt(layout.mode), layout.word_count, nf, nc, ni, ng }) |n| hashInt(&hash, n);
     for (layout.fields) |field| {
         hashInt(&hash, field.query);
-        hashInt(&hash, @intFromEnum(field.cardinality));
+        hashInt(&hash, @backingInt(field.cardinality));
     }
     for (layout.candidate_spans, layout.candidate_valid) |span, valid| {
         try work.tick();

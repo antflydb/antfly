@@ -532,7 +532,7 @@ test "boundary training dataset rejects invalid rows duplicates version schema o
         }
     };
     try std.testing.expectError(error.Cancelled, Dataset.fromBytes(a, simple_row, .{}, .{ .check_fn = cancelled.check }, null));
-    try std.testing.expectError(error.BoundaryTrainingDatasetLimitExceeded, Dataset.fromBytes(a, "[" ** 65 ++ "0" ++ "]" ** 65, .{}, null, null));
+    try std.testing.expectError(error.BoundaryTrainingDatasetLimitExceeded, Dataset.fromBytes(a, z17RepeatString("[", 65) ++ "0" ++ z17RepeatString("]", 65), .{}, null, null));
     try validateDepth("{\"text\":\"[\\\"{{]\"}", 1, null);
     try std.testing.expectError(error.InvalidUtf8Boundary, Dataset.fromBytes(a, "{\"version\":1,\"id\":\"x\",\"text\":\"é\",\"schema\":{\"entities\":[\"person\"]},\"entities\":[{\"id\":\"a\",\"type\":\"person\",\"span\":{\"start\":1,\"end\":2}}]}", .{}, null, null));
 }
@@ -639,4 +639,15 @@ test "boundary dataset carries soft classification probabilities in declared lab
             return error.TestExpectedError;
         } else |_| {}
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

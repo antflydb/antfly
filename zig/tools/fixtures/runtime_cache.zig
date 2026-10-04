@@ -116,7 +116,7 @@ pub fn build(b: *std.Build) void {
             // yacc-zig also has an installed, product-configured executable.
             // Select the instance actually used for SQL generation.
             if (std.mem.eql(u8, name, "yacc-zig") and !isSqlGenerator(b, artifact)) continue;
-            if (artifact.root_module.optimize != .ReleaseSafe or
+            if (artifact.root_module.optimize != .safe or
                 !artifact.root_module.resolved_target.?.query.eql(b.graph.host.query))
                 std.debug.panic("{s} inherits product configuration", .{name});
             if (artifact.root_module.import_table.contains("build_options"))
@@ -140,8 +140,8 @@ pub fn build(b: *std.Build) void {
     wasm.root_module.root_source_file = sources.add("wasm_profile.zig",
         \\export fn profile_ok() void {
         \\    comptime {
-        \\        if (@import("httpx_profile").cache_test_profile != .ReleaseSafe or
-        \\            @import("json_profile").cache_test_profile != .ReleaseSafe)
+        \\        if (@import("httpx_profile").cache_test_profile != .safe or
+        \\            @import("json_profile").cache_test_profile != .safe)
         \\            @compileError("WASM dependencies must use ReleaseSafe");
         \\    }
         \\}
@@ -174,7 +174,7 @@ pub fn build(b: *std.Build) void {
         b.step(probe[0], "Read actual configured backend options").dependOn(&b.addRunArtifact(executable).step);
     }
     inline for (std.meta.tags(runtime.RuntimeLibraryUnit)) |unit| {
-        const artifact = artifacts.runtime.runtime_library_artifacts[@intFromEnum(unit)].?;
+        const artifact = artifacts.runtime.runtime_library_artifacts[@backingInt(unit)].?;
         var seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
         if (unit != .inference) {
             var identity_seen = std.AutoHashMap(*std.Build.Module, void).init(b.allocator);
@@ -285,7 +285,7 @@ fn findSourceModule(module: *std.Build.Module, suffix: []const u8, seen: *std.Au
 
 fn inspectWasmProfile(module: *std.Build.Module, target: std.Build.ResolvedTarget, seen: *std.AutoHashMap(*std.Build.Module, void)) void {
     if ((seen.getOrPut(module) catch @panic("OOM")).found_existing) return;
-    if (module.optimize) |optimize| if (optimize != .ReleaseSafe) @panic("WASM module inherits native optimization");
+    if (module.optimize) |optimize| if (optimize != .safe) @panic("WASM module inherits native optimization");
     if (module.resolved_target) |actual| {
         if (!std.Target.Query.fromTarget(&actual.result).eql(std.Target.Query.fromTarget(&target.result)))
             @panic("WASM module inherits a foreign runtime target");

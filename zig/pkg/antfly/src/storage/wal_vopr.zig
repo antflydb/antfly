@@ -78,7 +78,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             dropped_sync_outcomes: u64 = 0,
             device_full_outcomes: u64 = 0,
 
-            fn deinit(self: *State) void {
+            pub fn deinit(self: *State) void {
                 if (self.wal_open) self.wal.close();
                 for (self.model.items) |entry| self.allocator.free(entry.data);
                 self.model.deinit(self.allocator);
@@ -549,7 +549,7 @@ fn modelDigest(entries: []const Entry) u64 {
     for (entries) |entry| {
         digest = vopr.id.derive("storage.wal.model.lsn", digest, entry.lsn);
         digest = vopr.id.derive("storage.wal.model.data", digest, vopr.id.digest(entry.data));
-        digest = vopr.id.derive("storage.wal.model.durability", digest, @intFromEnum(entry.durability));
+        digest = vopr.id.derive("storage.wal.model.durability", digest, @backingInt(entry.durability));
     }
     return digest;
 }

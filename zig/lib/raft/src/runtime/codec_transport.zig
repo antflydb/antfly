@@ -55,7 +55,7 @@ const OwnedEndpoint = struct {
         };
     }
 
-    fn deinit(self: *OwnedEndpoint, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *OwnedEndpoint, alloc: std.mem.Allocator) void {
         alloc.free(self.address);
         alloc.free(self.metadata);
         self.* = undefined;
@@ -107,7 +107,7 @@ const PendingRetry = struct {
     attempts: u32,
     retry_round: u64,
 
-    fn deinit(self: *PendingRetry, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PendingRetry, alloc: std.mem.Allocator) void {
         alloc.free(self.frame.bytes);
         self.* = undefined;
     }

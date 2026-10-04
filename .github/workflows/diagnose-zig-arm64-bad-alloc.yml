@@ -47,7 +47,7 @@ jobs:
       (inputs.pr_number == '' ||
       github.run_attempt == 1) }}
     needs: admission
-    name: Darwin ARM64 ReleaseFast archive
+    name: Darwin ARM64 fast archive
     runs-on: arc-antfly-publish
     timeout-minutes: 180
     steps:
@@ -77,22 +77,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates time file
 
-      - name: Install Nix
-        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
+      - name: Install official Zig release
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         with:
-          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ steps.toolchain.outputs.zig_nixpkgs_revision }}.tar.gz
-
-      - name: Install glibc-linked Zig
-        env:
-          ZIG_VERSION: ${{ steps.toolchain.outputs.zig_version }}
-          ZIG_NIX_ATTRIBUTE: ${{ steps.toolchain.outputs.zig_nix_attribute }}
-        run: |
-          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
-          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
-          compiler_description="$(file "$zig_path/bin/zig")"
-          echo "$compiler_description"
-          grep -q 'dynamically linked' <<<"$compiler_description"
-          echo "$zig_path/bin" >> "$GITHUB_PATH"
+          version: ${{ steps.toolchain.outputs.zig_version }}
+          use-cache: false
 
       - name: Install pinned macOS cross-compilation SDK
         env:
@@ -121,7 +110,7 @@ jobs:
             scripts/packaging/build_zig_release_archive.sh \
             --version 0.0.0-diagnostic \
             --target aarch64-macos \
-            --optimize ReleaseFast \
+            --optimize fast \
             --archive-name antfly_diagnostic_Darwin_arm64.tar.gz \
             --out-dir dist/release-archives \
             --metal true \
@@ -150,7 +139,7 @@ jobs:
           # standalone inference runtime by default (see COMPILATION.md's
           # "C API composition" section), which is a deliberate product
           # decision, not a regression. 60MiB leaves headroom over the
-          # measured ~48MiB stripped ReleaseFast size.
+          # measured ~48MiB stripped fast size.
           if [ "$library_size" -ge 62914560 ]; then
             echo "libantfly.dylib exceeded the 60MiB retained-code budget: $library_size bytes" >&2
             exit 1

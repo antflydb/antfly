@@ -550,7 +550,7 @@ pub const Scenario = struct {
             resource_manager.Slice.lsm_compaction_work,
             resource_manager.Slice.inference_scratch_working_set,
             resource_manager.Slice.lake_range_cache_queue,
-        }) |slice| options.budgets[@intFromEnum(slice)] = .{ .soft_limit_bytes = 480_000, .hard_limit_bytes = 640_000 };
+        }) |slice| options.budgets[@backingInt(slice)] = .{ .soft_limit_bytes = 480_000, .hard_limit_bytes = 640_000 };
         return options;
     }
 

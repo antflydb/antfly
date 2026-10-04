@@ -79,9 +79,9 @@ fn matches(comptime T: type, expected: T, actual: std.json.Value) bool {
         },
         .@"struct" => |info| blk: {
             if (actual != .object) break :blk false;
-            inline for (info.fields) |field| {
-                const item = actual.object.get(field.name) orelse break :blk false;
-                if (!matches(field.type, @field(expected, field.name), item)) break :blk false;
+            inline for (info.field_names, info.field_types) |reflected_name, field_type| {
+                const item = actual.object.get(reflected_name) orelse break :blk false;
+                if (!matches(field_type, @field(expected, reflected_name), item)) break :blk false;
             }
             break :blk true;
         },
@@ -109,18 +109,18 @@ pub fn decodeAlloc(alloc: Allocator, raw: []const u8, expected: Identity) !Owned
     if (provenance_value != .object) return error.InvalidDocumentExtractionManifest;
     const provenance = provenance_value.object;
     var unit: extraction.Unit = .{ .unit_id = undefined, .unit_type = undefined, .text = undefined, .method = undefined };
-    inline for (@typeInfo(extraction.Unit).@"struct".fields) |field| {
-        const root = comptime std.mem.eql(u8, field.name, "unit_id") or std.mem.eql(u8, field.name, "unit_type") or std.mem.eql(u8, field.name, "text");
-        if (root and provenance.contains(field.name)) return error.InvalidDocumentExtractionManifest;
-        const selected = (if (root) object else provenance).get(field.name);
+    inline for (@typeInfo(extraction.Unit).@"struct".field_names, @typeInfo(extraction.Unit).@"struct".field_types, @typeInfo(extraction.Unit).@"struct".field_attrs) |reflected_name, field_type, field_attrs| {
+        const root = comptime std.mem.eql(u8, reflected_name, "unit_id") or std.mem.eql(u8, reflected_name, "unit_type") or std.mem.eql(u8, reflected_name, "text");
+        if (root and provenance.contains(reflected_name)) return error.InvalidDocumentExtractionManifest;
+        const selected = (if (root) object else provenance).get(reflected_name);
         if (selected) |entry| {
-            if (comptime std.mem.eql(u8, field.name, "transcript_spans")) {
+            if (comptime std.mem.eql(u8, reflected_name, "transcript_spans")) {
                 // The persisted empty representation is null; Unit uses [].
-                if (entry != .null) unit.transcript_spans = try decodeField(field.type, owned, entry);
-            } else @field(unit, field.name) = try decodeField(field.type, owned, entry);
-        } else if (comptime field.default_value_ptr == null) return error.InvalidDocumentExtractionManifest;
-        if (!root) if (object.get(field.name)) |mirror| {
-            if (!matches(field.type, @field(unit, field.name), mirror)) return error.InvalidDocumentExtractionManifest;
+                if (entry != .null) unit.transcript_spans = try decodeField(field_type, owned, entry);
+            } else @field(unit, reflected_name) = try decodeField(field_type, owned, entry);
+        } else if (comptime field_attrs.default_value_ptr == null) return error.InvalidDocumentExtractionManifest;
+        if (!root) if (object.get(reflected_name)) |mirror| {
+            if (!matches(field_type, @field(unit, reflected_name), mirror)) return error.InvalidDocumentExtractionManifest;
         };
     }
     if (unit.unit_type.len == 0 or unit.method.len == 0) return error.InvalidDocumentExtractionManifest;
@@ -152,12 +152,12 @@ fn validateFormatMirrors(object: std.json.ObjectMap, provenance: std.json.Object
     for ([_]std.json.ObjectMap{ object, provenance, format }) |mirror| {
         if (!matches(?f64, confidence, mirror.get("confidence") orelse return error.InvalidDocumentExtractionManifest)) return error.InvalidDocumentExtractionManifest;
     }
-    inline for (@typeInfo(extraction.Unit).@"struct".fields) |field| {
-        const excluded = comptime std.mem.eql(u8, field.name, "unit_id") or std.mem.eql(u8, field.name, "unit_type") or
-            std.mem.eql(u8, field.name, "text") or std.mem.eql(u8, field.name, "method") or
-            std.mem.eql(u8, field.name, "char_start") or std.mem.eql(u8, field.name, "char_end") or std.mem.eql(u8, field.name, "transcript_spans");
+    inline for (@typeInfo(extraction.Unit).@"struct".field_names, @typeInfo(extraction.Unit).@"struct".field_types) |reflected_name, field_type| {
+        const excluded = comptime std.mem.eql(u8, reflected_name, "unit_id") or std.mem.eql(u8, reflected_name, "unit_type") or
+            std.mem.eql(u8, reflected_name, "text") or std.mem.eql(u8, reflected_name, "method") or
+            std.mem.eql(u8, reflected_name, "char_start") or std.mem.eql(u8, reflected_name, "char_end") or std.mem.eql(u8, reflected_name, "transcript_spans");
         if (!excluded) {
-            if (!matches(field.type, @field(unit, field.name), format.get(field.name) orelse return error.InvalidDocumentExtractionManifest)) return error.InvalidDocumentExtractionManifest;
+            if (!matches(field_type, @field(unit, reflected_name), format.get(reflected_name) orelse return error.InvalidDocumentExtractionManifest)) return error.InvalidDocumentExtractionManifest;
         }
     }
 }

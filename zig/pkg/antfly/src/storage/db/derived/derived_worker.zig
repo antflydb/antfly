@@ -516,7 +516,7 @@ const ReplayChunkBuilder = struct {
         };
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.documents.len > 0) self.alloc.free(self.documents);
         self.changed_doc_keys.deinit(self.alloc);
         self.deleted_doc_keys.deinit(self.alloc);
@@ -984,7 +984,7 @@ const TestApplyCapture = struct {
     sequences: std.ArrayListUnmanaged(u64) = .empty,
     last_batch: ?derived_types.DerivedBatch = null,
 
-    fn deinit(self: *TestApplyCapture) void {
+    pub fn deinit(self: *TestApplyCapture) void {
         if (self.last_batch) |*batch| derived_types.deinitDerivedBatch(self.alloc, batch);
         self.sequences.deinit(self.alloc);
         self.* = undefined;
@@ -1007,7 +1007,7 @@ const TestPersistOrderHooks = struct {
     alloc: Allocator,
     order: std.ArrayListUnmanaged(u8) = .empty,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.order.deinit(self.alloc);
         self.* = undefined;
     }
@@ -1108,11 +1108,11 @@ test "catchUpIndex batches dense replay records before applying" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-batched-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-batched-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1238,7 +1238,7 @@ test "catchUpIndex window hooks fire once per replay window" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-window-hooks-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1293,7 +1293,7 @@ test "catchUpIndex refuses to open an apply window after its deadline" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-expired-deadline-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
     defer journal.close();
@@ -1319,7 +1319,7 @@ test "catchUpIndex can stop after bounded replay windows" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-window-limit-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1405,7 +1405,7 @@ test "catchUpIndex catch-up hooks fire once per replay run" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-catch-up-hooks-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1460,7 +1460,7 @@ test "catchUpIndex persists replay progress after finishing replay window" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-persist-order-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1504,11 +1504,11 @@ test "catchUpIndex removes pending chunk dense vectors by parent document" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-parent-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-parent-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1559,7 +1559,7 @@ test "catchUpIndex chunks large replay windows" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1607,7 +1607,7 @@ test "catchUpIndex chunks replay by byte budget" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-byte-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1657,7 +1657,7 @@ test "catchUpIndex chunks dense replay by item budget" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-item-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1707,7 +1707,7 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-full-text-item-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1719,7 +1719,7 @@ test "catchUpIndex subchunks one oversized full text record before advancing its
     });
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 2048 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 2048 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
@@ -1750,7 +1750,7 @@ test "catchUpIndex chunks dense replay by estimated vector byte budget" {
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-vector-byte-chunked-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1804,11 +1804,11 @@ test "catchUpIndex batches full-text replay records before applying" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-unbatched-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-unbatched-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1862,11 +1862,11 @@ test "catchUpIndex batches sparse replay records before applying" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-sparse-batched-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-sparse-batched-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1919,11 +1919,11 @@ test "catchUpIndex batches graph artifact journal records before applying" {
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-graph-journal-log", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-graph-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -1969,7 +1969,7 @@ test "catchUpIndex batches resolution artifact graph journal records before appl
 
     const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-resolution-graph-journal", .{tmp.sub_path});
     defer alloc.free(journal_path);
-    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    const journal_path_z = try alloc.dupeSentinel(u8, journal_path, 0);
     defer alloc.free(journal_path_z);
 
     var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
@@ -2049,7 +2049,7 @@ test "replay batch cleans up every allocation failure before borrowed publicatio
 test "replay batch budget denial rolls back key ownership" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 1, .hard_limit_bytes = 1 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     {
@@ -2086,7 +2086,7 @@ test "catchUpIndex admits document descriptors during collection and progresses 
     for ([_]db_types.IndexKind{ .full_text, .algebraic, .dense_vector, .sparse_vector }) |kind| {
         for ([_]bool{ false, true }) |aggregate_limited| {
             var budgets = resource_manager_mod.Options.defaultBudgets();
-            budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 1000, .hard_limit_bytes = if (aggregate_limited) 0 else 1000 };
+            budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 1000, .hard_limit_bytes = if (aggregate_limited) 0 else 1000 };
             var manager = resource_manager_mod.ResourceManager.init(.{
                 .budgets = budgets,
                 .memory_budget = .{ .hard_limit_bytes = if (aggregate_limited) 1000 else 0 },
@@ -2122,7 +2122,7 @@ test "catchUpIndex yields collected window on lookahead admission and preserves 
         for (&keys, &names, 0..) |*key, *name, i| key.* = try std.fmt.bufPrint(name, "key{d}", .{i});
         try appendChangeJournalRecord(&log, alloc, .{ .sequence = 2, .changed_doc_keys = &keys, .target_hints = &.{.full_text} });
         var budgets = resource_manager_mod.Options.defaultBudgets();
-        budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 2000, .hard_limit_bytes = 2000 };
+        budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 2000, .hard_limit_bytes = 2000 };
         var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
         defer manager.deinit(alloc);
         var capture = TestApplyCapture{ .alloc = alloc };
@@ -2136,7 +2136,7 @@ test "catchUpIndex yields collected window on lookahead admission and preserves 
         const snapshot = manager.snapshot();
         try std.testing.expectEqual(@as(u64, 0), snapshot.memory.used_bytes);
         try std.testing.expectEqual(@as(u64, 0), snapshot.memory.accounting_errors);
-        if (max_items != 0) try std.testing.expectEqual(@as(u64, 0), snapshot.slices[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)].hard_limit_rejections);
+        if (max_items != 0) try std.testing.expectEqual(@as(u64, 0), snapshot.slices[@backingInt(resource_manager_mod.Slice.derived_replay_window)].hard_limit_rejections);
         // A record that cannot fit even in an empty window remains a hard
         // admission error, without bypassing the limit or consuming its cursor.
         try std.testing.expectError(error.ResourceBudgetExceeded, catchUpIndexFromMatchingCursor(alloc, &cursor, index, &capture, testApplyCapture, .{ .resource_manager = &manager }));
@@ -2155,7 +2155,7 @@ test "catchUpIndex yields collected window on lookahead admission and preserves 
 test "replay batch descriptor admission is deduplicated and finish needs no new credit" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 1000 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 1000 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 1000);
@@ -2183,7 +2183,7 @@ test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
     try appendChangeJournalRecord(&log, alloc, .{ .sequence = 1, .deleted_doc_keys = &deleted, .target_hints = &.{.full_text} });
     try appendChangeJournalRecord(&log, alloc, .{ .sequence = 2, .changed_doc_keys = &.{ "u0", "u1", "u2", "u3", "u4", "u5", "u6", "u7" }, .target_hints = &.{.full_text} });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 2000 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 2000 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
@@ -2195,7 +2195,10 @@ test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
     try std.testing.expectEqual(@as(usize, 20), capture.applied_deleted_keys);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(usize, 2), retry.scanned_entries);
-    try std.testing.expectEqual(@as(usize, 2), retry.replay_scan_batches);
+    // ArrayList growth may require one bounded fresh-scratch retry between
+    // these record shapes. Both records must still fit the hard memory limit.
+    try std.testing.expect(retry.replay_scan_batches >= 2 and retry.replay_scan_batches <= 3);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 2000);
     try std.testing.expectEqual(@as(u64, 2), retry.last_applied_sequence);
     try std.testing.expectEqual(@as(usize, 8), capture.applied_documents);
 }
@@ -2203,7 +2206,7 @@ test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
 test "replay key blocks admit their header and spare capacity and roll back failed allocations" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 64 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 64 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
@@ -2236,7 +2239,7 @@ test "catchUpIndex drops key block slack before rejecting an otherwise fitting r
     var budgets = resource_manager_mod.Options.defaultBudgets();
     // A one-key scratch list, output list, dedup map, descriptor and exact key
     // block fit. The preferred block's unused bytes do not fit.
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 580 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 580 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
@@ -2256,7 +2259,7 @@ test "catchUpIndex no-op records do not disable compact key admission" {
     try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 2, .changed_doc_keys = &.{"a"}, .target_hints = &.{.full_text} });
     try appendChangeJournalRecord(&journal, alloc, .{ .sequence = 3, .target_hints = &.{.full_text} });
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 580 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 580 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
@@ -2278,7 +2281,7 @@ test "catchUpIndex compact fallback shares one key block per record" {
     const record: change_journal_mod.Record = .{ .sequence = 1, .changed_doc_keys = &.{ "a", "b" }, .target_hints = &.{.full_text} };
     try appendChangeJournalRecord(&journal, alloc, record);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 750 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 750 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var capture = TestApplyCapture{ .alloc = alloc };
@@ -2294,12 +2297,12 @@ test "catchUpIndex compact fallback shares one key block per record" {
 test "replay metadata hint cannot reject a duplicate-heavy record under a hard budget" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 600 };
+    budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .hard_limit_bytes = 600 };
     var manager = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var builder = ReplayChunkBuilder.init(alloc, .{ .name = "text", .kind = .full_text }, &manager, 0);
     defer builder.deinit();
-    const repeated = [_][]const u8{"a"} ** 128;
+    const repeated = @as([128][]const u8, @splat("a"));
     try builder.appendRecord(.{ .changed_doc_keys = &repeated });
     const batch = try builder.finishBorrowed(1);
     try std.testing.expectEqual(@as(usize, 1), batch.documents.len);

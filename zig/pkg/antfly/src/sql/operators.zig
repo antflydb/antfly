@@ -49,7 +49,7 @@ const OwnedRow = struct {
         return .{ .arena = arena, .row = cloned };
     }
 
-    fn deinit(self: *OwnedRow) void {
+    pub fn deinit(self: *OwnedRow) void {
         self.arena.deinit();
     }
 
@@ -707,7 +707,7 @@ test "SQL top K encoding releases retained rows incrementally" {
     const alloc = std.testing.allocator;
     var top = try TopK.init(alloc, 2, &.{.{}}, 128 * 1024);
     defer top.deinit();
-    const text = [_]u8{'x'} ** 16384;
+    const text = @as([16384]u8, @splat('x'));
     for (0..2) |i| try top.add(.{ .values = &.{Datum.json(.{ .string = &text })}, .keys = &.{Datum.json(.{ .integer = @intCast(i) })}, .ordinal = i });
     const result = try top.finish(alloc);
     defer alloc.free(result);
@@ -885,7 +885,7 @@ test "SQL hash join streams duplicate matches and preserves unmatched SQL NULL r
 test "SQL hash join packs sparse five thousand row build under the default quota" {
     const join = try HashJoin.create(std.testing.allocator, .{});
     defer join.deinit();
-    var values = [_]Datum{Datum{}} ** 12;
+    var values = @as([12]Datum, @splat(Datum{}));
     for (0..5000) |i| {
         values[0] = Datum.json(.{ .integer = @intCast(i) });
         try join.add(&values, values[0..1]);

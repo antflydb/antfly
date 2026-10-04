@@ -205,7 +205,7 @@ const HistoricalProjection = struct {
         cover: ?covering.Source = null,
         predicate: ?partial.Source = null,
 
-        fn deinit(self: *ProjectedIndex) void {
+        pub fn deinit(self: *ProjectedIndex) void {
             if (self.tuple) |*tuple| tuple.deinit();
             if (self.cover) |*cover| cover.deinit();
             if (self.predicate) |*predicate| predicate.deinit();
@@ -229,7 +229,7 @@ const HistoricalProjection = struct {
         return .{ .alloc = alloc, .source = retained, .indexes = indexes };
     }
 
-    fn deinit(self: *HistoricalProjection) void {
+    pub fn deinit(self: *HistoricalProjection) void {
         for (self.indexes) |*index| index.deinit();
         self.alloc.free(self.indexes);
         self.source.release();
@@ -555,7 +555,7 @@ test "relational index plan rejects foreign prepared epochs and rolls back late 
     try std.testing.expectEqual(@as(usize, 1), batch.row_count);
     try std.testing.expectEqualSlices(u8, original, batch.bytes.items);
 
-    const large_json = "{\"id\":9,\"label\":\"" ++ "x" ** 4096 ++ "\"}";
+    const large_json = "{\"id\":9,\"label\":\"" ++ z17RepeatString("x", 4096) ++ "\"}";
     var large = try mapper.PreparedRelationalWrite.init(alloc, "row", large_json, null, schema_view.tableSchema().*, schema_view.physicalLayout());
     defer large.deinit(alloc);
     // First index fits; the second runs out of space. No partial row survives.
@@ -574,4 +574,15 @@ test "relational index plan rejects foreign prepared epochs and rolls back late 
 
 test "relational index plan releases partially initialized snapshots and batches on allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, testPlanAllocations, .{});
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

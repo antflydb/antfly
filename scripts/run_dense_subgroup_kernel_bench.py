@@ -1,4 +1,4 @@
-"""Record standalone ReleaseFast representative kernel evidence, not QPS."""
+"""Record standalone fast representative kernel evidence, not QPS."""
 
 import argparse
 import hashlib

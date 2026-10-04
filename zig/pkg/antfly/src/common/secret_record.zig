@@ -158,7 +158,7 @@ pub fn open(alloc: std.mem.Allocator, provider: KeyProvider, expected: Identity,
 
 // Test-only authenticated wrapping provider; never used as a production key source.
 const TestProvider = struct {
-    key: DataKey = [_]u8{7} ** 32,
+    key: DataKey = @as([32]u8, @splat(7)),
     unavailable: bool = false,
     unwrap_calls: usize = 0,
     fn provider(self: *@This()) KeyProvider {

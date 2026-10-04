@@ -81,7 +81,7 @@ const TestPaths = struct {
     standby_log: [:0]u8,
     standby_progress: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.primary_log);
         alloc.free(self.primary_slots);
         alloc.free(self.standby_log);
@@ -108,10 +108,10 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress) catch {};
 
     return .{
-        .primary_log = try alloc.dupeZ(u8, primary_log),
-        .primary_slots = try alloc.dupeZ(u8, primary_slots),
-        .standby_log = try alloc.dupeZ(u8, standby_log),
-        .standby_progress = try alloc.dupeZ(u8, standby_progress),
+        .primary_log = try alloc.dupeSentinel(u8, primary_log, 0),
+        .primary_slots = try alloc.dupeSentinel(u8, primary_slots, 0),
+        .standby_log = try alloc.dupeSentinel(u8, standby_log, 0),
+        .standby_progress = try alloc.dupeSentinel(u8, standby_progress, 0),
     };
 }
 
@@ -165,7 +165,7 @@ const ApplyCapture = struct {
     alloc: Allocator,
     payloads: std.ArrayListUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *ApplyCapture) void {
+    pub fn deinit(self: *ApplyCapture) void {
         for (self.payloads.items) |payload| self.alloc.free(payload);
         self.payloads.deinit(self.alloc);
         self.* = undefined;

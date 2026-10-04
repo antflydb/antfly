@@ -52,12 +52,9 @@ pub const EnrichmentExecutor = struct {
     }
 };
 
-// TODO: Re-enable Linux evented enrichment once std.Io.Evented/std.Io.Uring is
-// stable enough for this code path. In Zig 0.16, instantiating std.Io.Uring
-// trips stdlib error-set mismatches: std/Io/Uring.zig's dirOpenDir and
-// dirRealPathFile propagate openat's error.ReadOnlyFileSystem into std/Io/Dir.zig
-// error sets that do not include it.
-const supports_evented_executor = false;
+// std.Io.Evented uses io_uring on Linux. Keep other targets on Threaded until
+// their evented backends have the same production coverage as this path.
+const supports_evented_executor = builtin.os.tag == .linux;
 
 pub const Metrics = struct {
     gained_events: u64 = 0,

@@ -29,7 +29,7 @@ class LayaPerformanceTest(unittest.TestCase):
     def output(self, rows):
         return (
             "Laya qualification backend=cuda load_ms=1\n"
-            "Laya benchmark build mode=ReleaseSafe cpu=x86_64_v3 artifacts=fatbin\n"
+            "Laya benchmark build mode=safe cpu=x86_64_v3 artifacts=fatbin\n"
             + "\n".join("Laya benchmark " + json.dumps(row) for row in rows)
             + "\n1 selected; 1 passed; 0 skipped\n"
         )

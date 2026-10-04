@@ -55,7 +55,7 @@ const Manifest = struct {
     /// Trained candidate-span width; 0 when the manifest predates the field.
     max_span_width: usize = 0,
 
-    fn deinit(self: *Manifest, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Manifest, allocator: std.mem.Allocator) void {
         for (self.lora_targets) |item| allocator.free(item);
         allocator.free(self.lora_targets);
         for (self.entity_labels) |item| allocator.free(item);
@@ -137,7 +137,7 @@ pub const NativeTaskPrediction = struct {
     classifications: []NativeClassificationPrediction,
     fields: []NativeFieldPrediction,
 
-    fn deinit(self: *NativeTaskPrediction, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *NativeTaskPrediction, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
         for (self.classifications) |prediction| allocator.free(prediction.label);
         allocator.free(self.classifications);
@@ -198,7 +198,7 @@ const OwnedOptions = struct {
     owned_label_thresholds: []const LabelThreshold = &.{},
     owned_label_score_biases: []const LabelScoreBias = &.{},
 
-    fn deinit(self: *OwnedOptions, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *OwnedOptions, allocator: std.mem.Allocator) void {
         if (self.owned_entity_types_csv) |value| allocator.free(value);
         for (self.owned_label_thresholds) |entry| allocator.free(entry.label);
         allocator.free(self.owned_label_thresholds);
@@ -896,7 +896,7 @@ const SchemaOnlyTasks = struct {
     tasks: []gliner2_data.UpstreamTask,
     derived_schema_fields: []?[][]const u8,
 
-    fn deinit(self: *SchemaOnlyTasks, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SchemaOnlyTasks, allocator: std.mem.Allocator) void {
         for (self.derived_schema_fields) |fields| if (fields) |items| allocator.free(items);
         allocator.free(self.derived_schema_fields);
         allocator.free(self.tasks);
@@ -1772,7 +1772,7 @@ fn evalSavedAdapter(allocator: std.mem.Allocator, owned_opts: OwnedOptions) !Eva
 fn loadManifest(allocator: std.mem.Allocator, adapter_dir: []const u8) !Manifest {
     const manifest_path = try std.fs.path.join(allocator, &.{ adapter_dir, "training_manifest.json" });
     defer allocator.free(manifest_path);
-    const data = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(4 * 1024 * 1024));
+    const data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(4 * 1024 * 1024));
     defer allocator.free(data);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, data, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -2172,11 +2172,11 @@ const DebertaJsonConfig = struct {
 fn loadDebertaGraphConfig(allocator: std.mem.Allocator, model_dir: []const u8) !deberta_graph.Config {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "encoder_config", "config.json" });
     defer allocator.free(config_path);
-    const bytes = compat.cwd().readFileAlloc(compat.io(), config_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), config_path, allocator, .limited(8 * 1024 * 1024)) catch |err| switch (err) {
         error.FileNotFound => blk: {
             const fallback_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
             defer allocator.free(fallback_path);
-            break :blk try compat.cwd().readFileAlloc(compat.io(), fallback_path, allocator, .limited(8 * 1024 * 1024));
+            break :blk try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), fallback_path, allocator, .limited(8 * 1024 * 1024));
         },
         else => return err,
     };

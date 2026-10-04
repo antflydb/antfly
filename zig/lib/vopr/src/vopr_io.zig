@@ -67,7 +67,7 @@ pub const CapabilitySet = struct {
     }
 
     fn bit(capability: Capability) u64 {
-        return @as(u64, 1) << @intFromEnum(capability);
+        return @as(u64, 1) << @backingInt(capability);
     }
 };
 
@@ -932,6 +932,21 @@ fn operate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable
             request.data_buffer,
             request.flags,
         ) },
+        .net_send => |request| .{ .net_send = self.network.send(request.socket_handle, request.messages) },
+        .net_read => |request| blk: {
+            const n = self.network.read(request.socket_handle, request.data) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => break :blk .{ .net_read = @errorCast(err) },
+            };
+            break :blk .{ .net_read = .{ .data_len = n } };
+        },
+        .net_write => |request| blk: {
+            const n = self.network.write(request.socket_handle, request.header, request.data, request.splat) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => break :blk .{ .net_write = @errorCast(err) },
+            };
+            break :blk .{ .net_write = n };
+        },
         .device_io_control => {
             self.latch(.operation_batch);
             return error.Canceled;
@@ -1393,9 +1408,11 @@ fn netWriteFile(userdata: ?*anyopaque, _: std.Io.net.Socket.Handle, _: []const u
     return error.NetworkDown;
 }
 
-fn netClose(userdata: ?*anyopaque, handles: []const std.Io.net.Socket.Handle) void {
+fn netClose(userdata: ?*anyopaque, sockets: []const std.Io.net.Socket) void {
     const self = state(userdata);
-    if (!self.network.close(handles)) self.latch(.network_close);
+    for (sockets) |socket| {
+        if (!self.network.close(&.{socket.handle})) self.latch(.network_close);
+    }
 }
 
 fn netShutdown(userdata: ?*anyopaque, handle: std.Io.net.Socket.Handle, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
@@ -1508,7 +1525,7 @@ fn executeReady(ptr: *anyopaque, transition_id: ids.StableId, sink: *event.Sink,
     });
 }
 
-fn quiescent(ptr: *anyopaque) bool {
+pub fn quiescent(ptr: *anyopaque) bool {
     const self: *VoprIo = @ptrCast(@alignCast(ptr));
     return self.atomic_runtime.scheduler().quiescent() and self.tasks.isQuiescent() and self.network.isQuiescent();
 }
@@ -1607,9 +1624,7 @@ const vtable: std.Io.VTable = blk: {
     result.processSetCurrentDir = processSetCurrentDir;
     result.processSetCurrentPath = processSetCurrentPath;
     result.processReplace = processReplace;
-    result.processReplacePath = processReplacePath;
     result.processSpawn = processSpawn;
-    result.processSpawnPath = processSpawnPath;
     result.childWait = childWait;
     result.childKill = childKill;
     result.now = now;
@@ -1624,9 +1639,6 @@ const vtable: std.Io.VTable = blk: {
     result.netListenUnix = netListenUnix;
     result.netConnectUnix = netConnectUnix;
     result.netSocketCreatePair = netSocketCreatePair;
-    result.netSend = netSend;
-    result.netRead = netRead;
-    result.netWrite = netWrite;
     result.netWriteFile = netWriteFile;
     result.netClose = netClose;
     result.netShutdown = netShutdown;
@@ -1717,10 +1729,10 @@ test "VoprIo vtable contains no std.Io.Threaded handlers" {
     defer threaded.deinit();
     const host_io = threaded.io();
 
-    inline for (@typeInfo(std.Io.VTable).@"struct".fields) |field| {
+    inline for (comptime std.meta.fieldNames(std.Io.VTable)) |reflected_name| {
         try std.testing.expect(
-            @intFromPtr(@field(io.vtable, field.name)) !=
-                @intFromPtr(@field(host_io.vtable, field.name)),
+            @intFromPtr(@field(io.vtable, reflected_name)) !=
+                @intFromPtr(@field(host_io.vtable, reflected_name)),
         );
     }
     const info = metadata();
@@ -1842,7 +1854,7 @@ test "VoprIo teardown drains executor work and stream closes after fibers finish
 test "VoprIo scheduler controls nested futures and virtual sleep" {
     const Shared = struct {
         io: std.Io,
-        order: [5]u8 = [_]u8{0} ** 5,
+        order: [5]u8 = @as([5]u8, @splat(0)),
         len: usize = 0,
 
         fn push(self: *@This(), value: u8) void {

@@ -311,7 +311,7 @@ test "local query identity relay preserves origin and attributes protocol defect
         error.InvalidQueryRequest,
         .local_query,
         abi.abi_version,
-        @intFromEnum(abi.LocalQueryOperation.parse_internal_request),
+        @backingInt(abi.LocalQueryOperation.parse_internal_request),
     );
     var forwarded: abi.FailureIdentity = .{};
     try local_query_client.acceptProviderFailure(
@@ -339,7 +339,7 @@ test "local query identity relay preserves origin and attributes protocol defect
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, replacement.boundary);
     try std.testing.expectEqual(abi.abi_version, replacement.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.validate_provider_response),
+        @backingInt(abi.LocalQueryOperation.validate_provider_response),
         replacement.operation,
     );
     try std.testing.expectEqualStrings("InvalidBoundaryFailureIdentity", replacement.errorName());
@@ -781,7 +781,7 @@ test "opaque owner exports exact backup seals and reclaims pins without opening 
         const destination = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ root, @tagName(format) });
         defer alloc.free(destination);
         var exported = try owner.backupWithControl(.{
-            .format = @intFromEnum(format),
+            .format = @backingInt(format),
             .table_name = .fromSlice("docs"),
             .backup_root = .fromSlice(destination),
             .backup_id = .fromSlice("cut"),
@@ -1018,7 +1018,7 @@ test "opaque portable and native restore preserve bounded range through captured
     inline for (.{ abi.BackupFormat.portable, abi.BackupFormat.native }) |format| {
         const backup_id = "bounded-" ++ @tagName(format);
         var exported = try source.backupWithControl(.{
-            .format = @intFromEnum(format),
+            .format = @backingInt(format),
             .table_name = .fromSlice("docs"),
             .backup_root = .fromSlice(root),
             .backup_id = .fromSlice(backup_id),
@@ -1272,7 +1272,7 @@ test "opaque WAL preserves durable operations and exact failure identity" {
     cleanup(root);
     defer cleanup(root);
 
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
     var wal = try wal_client.WAL.open(path_z.ptr, TestWalOptions{});
     defer wal.close();
@@ -1303,13 +1303,13 @@ test "opaque WAL preserves durable operations and exact failure identity" {
     try std.testing.expectEqual(@as(u64, 3), stats.logical_entries);
     try std.testing.expectError(error.Overflow, wal.truncateAfter(std.math.maxInt(u64)));
 
-    const bootstrap_z = try std.testing.allocator.dupeZ(u8, bootstrap_path);
+    const bootstrap_z = try std.testing.allocator.dupeSentinel(u8, bootstrap_path, 0);
     defer std.testing.allocator.free(bootstrap_z);
     var bootstrap = try wal_client.WAL.open(bootstrap_z.ptr, TestWalOptions{});
     defer bootstrap.close();
     try std.testing.expectEqual(@as(u64, 7), try bootstrap.appendAt(7, "timeline"));
 
-    const read_only_z = try std.testing.allocator.dupeZ(u8, read_only_path);
+    const read_only_z = try std.testing.allocator.dupeSentinel(u8, read_only_path, 0);
     defer std.testing.allocator.free(read_only_z);
     {
         var writable = try wal_client.WAL.open(read_only_z.ptr, TestWalOptions{});
@@ -1507,7 +1507,7 @@ test "opaque storage owner preserves source-vector policy and status across reop
     try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_owner_open(&.{
         .path = .fromSlice(path),
         .table_name = .fromSlice("docs"),
-        .dense_embedding_storage = @enumFromInt(999),
+        .dense_embedding_storage = @fromBackingInt(999),
     }, &invalid_owner));
     try std.testing.expect(invalid_owner == null);
 }
@@ -1981,7 +1981,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_query_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, invalid_query_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.parse_internal_request),
+        @backingInt(abi.LocalQueryOperation.parse_internal_request),
         invalid_query_failure.operation,
     );
     try std.testing.expectEqualStrings("InvalidQueryRequest", invalid_query_failure.errorName());
@@ -2001,7 +2001,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(invalid_abi_status, invalid_abi_failure.status);
     try std.testing.expectEqual(abi.FailureBoundary.local_query, invalid_abi_failure.boundary);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.validate_request),
+        @backingInt(abi.LocalQueryOperation.validate_request),
         invalid_abi_failure.operation,
     );
     try std.testing.expectEqualStrings("InvalidAbiVersion", invalid_abi_failure.errorName());
@@ -2022,7 +2022,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.algebraic_partials),
+        @backingInt(abi.LocalQueryOperation.algebraic_partials),
         operation_failure.operation,
     );
     try std.testing.expect(operation_failure.error_name_hash != 0);
@@ -2038,7 +2038,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.text_stats),
+        @backingInt(abi.LocalQueryOperation.text_stats),
         operation_failure.operation,
     );
     try std.testing.expect(operation_failure.error_name_hash != 0);
@@ -2054,7 +2054,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.preflight),
+        @backingInt(abi.LocalQueryOperation.preflight),
         operation_failure.operation,
     );
     try std.testing.expect(operation_failure.error_name_hash != 0);
@@ -2070,7 +2070,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expectEqual(abi.FailureBoundary.local_query, operation_failure.boundary);
     try std.testing.expectEqual(abi.abi_version, operation_failure.boundary_version);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.parse_graph_expand),
+        @backingInt(abi.LocalQueryOperation.parse_graph_expand),
         operation_failure.operation,
     );
     try std.testing.expect(operation_failure.error_name_hash != 0);
@@ -2083,7 +2083,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
     try std.testing.expect(invalid_aggregation_status != .ok);
     try std.testing.expectEqual(abi.FailureBoundary.storage_owner, operation_failure.boundary);
     try std.testing.expectEqual(
-        @intFromEnum(abi.LocalQueryOperation.parse_aggregation),
+        @backingInt(abi.LocalQueryOperation.parse_aggregation),
         operation_failure.operation,
     );
 
@@ -3454,7 +3454,7 @@ test "opaque metadata staging authority and binary receipts survive compiled pro
 
     var binary_digest: staging.Digest = @splat(255);
     binary_digest[0] = 0;
-    const utf8_digest: staging.Digest = ([_]u8{ 0xc3, 0xa9, 0, 127 } ** 8);
+    const utf8_digest: staging.Digest = (z17RepeatArray([_]u8{ 0xc3, 0xa9, 0, 127 }, 8));
     const plan_digest = try plan.digest(alloc);
     try Helper.apply(&store, group, .{ .id = plan.id, .action = .imported, .expected_revision = 1, .receipt = .{ .group_id = 701, .range_id = 701, .plan_digest = plan_digest, .completion_digest = binary_digest } });
     const imported = (try store.loadRestoreStagingProgress(alloc, group, plan.id)).?;
@@ -3758,7 +3758,7 @@ test "storage kernel status registry is unique and lossless" {
             expected,
             .local_query,
             abi.abi_version,
-            @intFromEnum(abi.LocalQueryOperation.execute_internal_query),
+            @backingInt(abi.LocalQueryOperation.execute_internal_query),
         );
         var forwarded: abi.FailureIdentity = .{};
         try local_query_client.acceptProviderFailure(failure.status, failure, .validate_provider_response, &forwarded);
@@ -3769,7 +3769,7 @@ test "storage kernel status registry is unique and lossless" {
         try std.testing.expectEqual(expected, received);
         const public_status = runtime_error.statusFromError(received);
         const expected_code: runtime_error.Code = if (expected == error.TableTopologyProtocolUpgradeRequired) .unavailable else .retryable;
-        try std.testing.expectEqual(@intFromEnum(expected_code), public_status.code);
+        try std.testing.expectEqual(@backingInt(expected_code), public_status.code);
         try std.testing.expectEqual(expected, runtime_error.errorFromStatus(public_status));
     }
 }
@@ -4213,4 +4213,10 @@ test "opaque metadata secret collection preserves binary ciphertext across owner
     var opened = try records.open(alloc, keys.provider(), identity, decoded.entries[0].envelope);
     defer opened.deinit(alloc);
     try std.testing.expectEqualSlices(u8, "\x00\xff\xfe\x01", opened.bytes);
+}
+
+fn z17RepeatArray(comptime array: anytype, comptime repetitions: usize) [array.len * repetitions]@TypeOf(array[0]) {
+    var result: [array.len * repetitions]@TypeOf(array[0]) = undefined;
+    for (0..repetitions) |i| @memcpy(result[i * array.len ..][0..array.len], &array);
+    return result;
 }

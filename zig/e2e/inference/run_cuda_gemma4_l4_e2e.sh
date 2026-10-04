@@ -208,10 +208,10 @@ nvcc --version
   cd "$inference_dir"
   "$zig_bin" build quant-kernel-codegen \
     -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
-    -Doptimize=ReleaseFast -- --check
+    -Doptimize=fast -- --check
   bash scripts/regen-cuda-artifacts.sh --check --all
   "$zig_bin" build -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
-    -Doptimize=ReleaseFast -j4
+    -Doptimize=fast -j4
 )
 require_file "ANTFLY_BIN" "$antfly_bin"
 
@@ -220,7 +220,7 @@ require_file "ANTFLY_BIN" "$antfly_bin"
   "$antfly_bin" cuda-info --smoke
   "$zig_bin" build quant-kernel-cuda-ffn-diff \
     -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
-    -Doptimize=ReleaseFast -- --json
+    -Doptimize=fast -- --json
   python3 scripts/gemma4/validate_gemma4_cuda_candidate.py \
     --kernel-id cuda.attention.gqa.decode.score_prework \
     --qualification-profile screening \
@@ -236,7 +236,7 @@ require_file "ANTFLY_BIN" "$antfly_bin"
     --output-dir "$evidence_dir/score-prework-screening"
   "$zig_bin" build quant-kernel-cuda-paged-attention-diff \
     -Dcuda=true -Dmetal=false -Dcuda-artifacts=sm89 \
-    -Doptimize=ReleaseFast -- \
+    -Doptimize=fast -- \
     --candidate-hd256 src/ops/cuda/artifacts/inference_cuda_kernels.fatbin \
     --candidate-hd512 src/ops/cuda/artifacts/inference_cuda_kernels.fatbin \
     --kv-len 1024 --pattern all --key-format all --json \

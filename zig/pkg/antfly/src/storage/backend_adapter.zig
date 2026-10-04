@@ -459,7 +459,7 @@ test "write transaction and batch adapters reuse concrete methods" {
             self.value = null;
         }
 
-        fn openCursor(_: *@This()) !MockCursorAdapter {
+        pub fn openCursor(_: *@This()) !MockCursorAdapter {
             return MockCursorAdapter.init(.{});
         }
     };

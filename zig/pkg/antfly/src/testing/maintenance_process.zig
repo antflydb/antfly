@@ -1495,7 +1495,7 @@ const ProcessHarnessApiRuntime = struct {
         return runtime;
     }
 
-    fn deinit(self: *ProcessHarnessApiRuntime) void {
+    pub fn deinit(self: *ProcessHarnessApiRuntime) void {
         const alloc = self.alloc;
         self.listener_task.shutdown(30_000);
         self.listener_task.join() catch |err| {

@@ -16,9 +16,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 var freestanding_counter: u64 = 0;
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 
 pub fn sleepNs(ns: u64) void {
-    if (comptime builtin.os.tag == .freestanding) return;
+    if (comptime is_hostless) return;
 
     var req = std.posix.timespec{
         .sec = @intCast(ns / std.time.ns_per_s),
@@ -62,7 +63,7 @@ pub fn awakeNs(io: std.Io) u64 {
 }
 
 pub fn monotonicNs() u64 {
-    if (comptime builtin.os.tag == .freestanding) {
+    if (comptime is_hostless) {
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
@@ -91,7 +92,7 @@ pub fn authorityNs() u64 {
 }
 
 pub fn realtimeNs() u64 {
-    if (comptime builtin.os.tag == .freestanding) {
+    if (comptime is_hostless) {
         freestanding_counter +%= 1;
         return freestanding_counter;
     }
@@ -126,7 +127,7 @@ test "thread CPU clock is monotonic where supported" {
 }
 
 pub fn residentBytes() usize {
-    if (comptime builtin.os.tag == .freestanding) return 0;
+    if (comptime is_hostless) return 0;
 
     const usage = std.posix.getrusage(std.posix.rusage.SELF);
     if (usage.maxrss <= 0) return 0;

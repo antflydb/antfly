@@ -22,7 +22,7 @@ const reader_config = @import("antfly_reader_config");
 // large Antfly unit-test root prevents the Zig compiler and test process from
 // approaching the 15 GiB CI runner limit. Production builds and the PDF/OCR
 // E2E binary still use the full implementation.
-const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     struct {
         pub const reader = struct {
             pub const DecodeLimits = struct {
@@ -313,21 +313,21 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.is_test or build_opti
     }
 else
     @import("antfly_pdf");
-const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("../scraping_stub.zig")
 else
     @import("antfly_scraping");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_remote_stub.zig")
 else
     @import("../../../template_remote.zig");
 
 const Allocator = std.mem.Allocator;
 
-pub const pdf_runtime_available = builtin.os.tag != .freestanding and !builtin.is_test and !build_options.bench_minimal_deps;
+pub const pdf_runtime_available = builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !builtin.is_test and !build_options.bench_minimal_deps;
 
 pub fn effectiveRemoteContentMaxDownloadSize(remote_content: ?*const scraping.RemoteContentConfig) u64 {
-    if (comptime builtin.os.tag != .freestanding and !build_options.bench_minimal_deps) {
+    if (comptime builtin.os.tag != .freestanding and builtin.os.tag != .wasi and !build_options.bench_minimal_deps) {
         if (remote_content) |remote| {
             var snapshot = remote.acquire();
             defer snapshot.deinit();
@@ -1693,7 +1693,7 @@ const PendingOcrMetadata = struct {
         return metadata;
     }
 
-    fn deinit(self: *PendingOcrMetadata, alloc: Allocator) void {
+    pub fn deinit(self: *PendingOcrMetadata, alloc: Allocator) void {
         if (self.trigger_reasons) |value| alloc.free(value);
         if (self.embedded_quality) |value| alloc.free(value);
         self.* = .{};
@@ -1746,7 +1746,7 @@ const RouteMatch = struct {
     extensions: []const []const u8 = &.{},
     magic_prefixes: []const []const u8 = &.{},
 
-    fn deinit(self: *const RouteMatch, alloc: Allocator) void {
+    pub fn deinit(self: *const RouteMatch, alloc: Allocator) void {
         if (self.content_type.len > 0) alloc.free(@constCast(self.content_type));
         if (self.content_type_prefix.len > 0) alloc.free(@constCast(self.content_type_prefix));
         for (self.extensions) |extension| alloc.free(@constCast(extension));
@@ -1761,7 +1761,7 @@ const Route = struct {
     extractor_type: ExtractorType,
     unit: []const u8 = "",
 
-    fn deinit(self: *const Route, alloc: Allocator) void {
+    pub fn deinit(self: *const Route, alloc: Allocator) void {
         self.match.deinit(alloc);
         if (self.unit.len > 0) alloc.free(@constCast(self.unit));
     }
@@ -3299,7 +3299,7 @@ fn zipEntriesAlloc(alloc: Allocator, bytes: []const u8) ![]ZipEntry {
         if (!std.mem.eql(u8, bytes[cursor .. cursor + 4], &std.zip.central_file_header_sig)) return error.ZipBadCdOffset;
         const flags = std.mem.readInt(u16, bytes[cursor + 8 ..][0..2], .little);
         if ((flags & 0x0001) != 0) return error.ZipEncryptionUnsupported;
-        const compression_method: std.zip.CompressionMethod = @enumFromInt(std.mem.readInt(u16, bytes[cursor + 10 ..][0..2], .little));
+        const compression_method: std.zip.CompressionMethod = @fromBackingInt(@intCast(std.mem.readInt(u16, bytes[cursor + 10 ..][0..2], .little)));
         const compressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 20 ..][0..4], .little);
         const uncompressed_size_u32 = std.mem.readInt(u32, bytes[cursor + 24 ..][0..4], .little);
         const name_len = std.mem.readInt(u16, bytes[cursor + 28 ..][0..2], .little);
@@ -3557,7 +3557,7 @@ const OoxmlPart = struct {
     index: usize,
     text: []u8,
 
-    fn deinit(self: *OoxmlPart, alloc: Allocator) void {
+    pub fn deinit(self: *OoxmlPart, alloc: Allocator) void {
         if (self.text.len > 0) alloc.free(self.text);
         self.* = undefined;
     }
@@ -4222,7 +4222,7 @@ const TestDownloadedContent = struct {
     content_type: []u8,
     data: []u8,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.content_type);
         alloc.free(self.data);
     }
@@ -5358,7 +5358,7 @@ test "OCR selection rejects partial transcription without rejecting whitespace r
     );
     // A shorter usable transcription can still replace genuinely undecodable
     // source text; the content-retention guard is not a blanket length rule.
-    const undecodable = "\u{fffd}" ** 200;
+    const undecodable = z17RepeatString("\u{fffd}", 200);
     try std.testing.expectEqual(
         OcrTextChoice.ocr,
         try chooseOcrTextForContentAlloc(alloc, undecodable, partial, assessOcrQuality(undecodable, config), partial_quality),
@@ -5695,4 +5695,15 @@ test "transcript timing stamps chunks with the phrases they overlap" {
     var plain = [_]TestChunk{.{ .start_offset = 0, .end_offset = 5 }};
     applyTranscriptTiming(untimed, &plain);
     try std.testing.expectEqual(@as(?f32, null), plain[0].start_time_ms);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

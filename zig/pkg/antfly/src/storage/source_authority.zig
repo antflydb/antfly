@@ -17,7 +17,7 @@ pub const State = struct {
     pub fn encode(self: State) [encoded_size]u8 {
         var bytes: [encoded_size]u8 = @splat(0);
         @memcpy(bytes[0..4], "ASA1");
-        bytes[4] = @intFromEnum(self.kind);
+        bytes[4] = @backingInt(self.kind);
         @memcpy(bytes[8..32], &self.namespace);
         std.mem.writeInt(u64, bytes[32..40], self.sequence, .little);
         std.crypto.hash.sha2.Sha256.hash(bytes[0..40], bytes[40..72], .{});

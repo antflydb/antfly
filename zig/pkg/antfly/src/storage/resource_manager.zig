@@ -74,7 +74,7 @@ fn IdentityLedger(comptime K: type, comptime V: type) type {
             return true;
         }
 
-        fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
             self.map.deinit(allocator);
             self.* = .empty;
         }
@@ -99,6 +99,8 @@ const foreground_write_maintenance_quiet_ns: u64 = 2 * std.time.ns_per_ms;
 const foreground_query_compaction_yield_max_ns: u64 = 50 * std.time.ns_per_ms;
 const soft_throttle_delay_ns: u64 = 10 * std.time.ns_per_ms;
 const supports_pressure_wait = builtin.os.tag != .freestanding and
+    builtin.os.tag != .wasi and
+    !builtin.single_threaded and
     builtin.link_libc and
     @hasDecl(std.c, "pthread_cond_wait");
 
@@ -233,7 +235,7 @@ pub const Slice = enum(u8) {
     }
 };
 
-pub const slice_count: usize = @typeInfo(Slice).@"enum".fields.len;
+pub const slice_count: usize = @typeInfo(Slice).@"enum".field_names.len;
 
 pub const Budget = struct {
     soft_limit_bytes: u64 = 0,
@@ -427,7 +429,7 @@ pub const Options = struct {
     /// owners exceed their previous high-water mark. Production owners should
     /// pass their lifetime allocator; the page allocator keeps lightweight
     /// tests source-compatible.
-    identity_allocator: std.mem.Allocator = std.heap.page_allocator,
+    identity_allocator: std.mem.Allocator = platformAllocator(),
 
     pub fn defaultBudgets() [slice_count]Budget {
         // Name every slice: additions cannot silently shift another owner's policy.
@@ -509,6 +511,13 @@ pub const Options = struct {
         }).values;
     }
 };
+
+fn platformAllocator() std.mem.Allocator {
+    if (comptime builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64) {
+        return std.heap.wasm_allocator;
+    }
+    return std.heap.page_allocator;
+}
 
 pub const SliceStats = struct {
     name: []const u8,
@@ -1062,7 +1071,7 @@ pub const ResourceManager = struct {
     reclaim_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
     reclaimed_bytes: @import("antfly_platform").atomic.Value(u64) = .init(0),
     hbc_benefit_sample_counter: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    hbc_cache_benefit: [@typeInfo(HbcCacheClass).@"enum".fields.len]HbcCacheBenefitState = .{HbcCacheBenefitState{}} ** @typeInfo(HbcCacheClass).@"enum".fields.len,
+    hbc_cache_benefit: [@typeInfo(HbcCacheClass).@"enum".field_names.len]HbcCacheBenefitState = @splat(HbcCacheBenefitState{}),
     pressure_change: PressureChange = .{},
     memory: MutableMemory,
     latency_sensitive_derived_replay_sessions: @import("antfly_platform").atomic.Value(u64) = .init(0),
@@ -1177,7 +1186,7 @@ pub const ResourceManager = struct {
             .query_embedding_cache_ttl_ns = options.query_embedding_cache_ttl_ns,
             .query_embedding_max_inflight = @max(@as(usize, 1), options.query_embedding_max_inflight),
             .dense_search_bandwidth_capacity_bytes = options.dense_search_bandwidth_capacity_bytes orelse
-                options.budgets[@intFromEnum(Slice.dense_search_working_set)].soft_limit_bytes,
+                options.budgets[@backingInt(Slice.dense_search_working_set)].soft_limit_bytes,
             .dense_read_extra_task_limit = options.dense_read_extra_task_limit orelse
                 @intCast(@min(std.math.maxInt(u32), cpu_count *| 2)),
             .dense_rerank_admission = .{ .capacity = @intCast(cpu_count) },
@@ -2082,7 +2091,7 @@ pub const ResourceManager = struct {
     fn normalizeSliceAmounts(
         amounts: []const SliceAmount,
     ) error{DuplicateResourceSlice}![slice_count]u64 {
-        var normalized = [_]u64{0} ** slice_count;
+        var normalized = @as([slice_count]u64, @splat(0));
         for (amounts) |amount| {
             if (amount.bytes == 0) continue;
             const index = sliceIndex(amount.slice);
@@ -3253,7 +3262,7 @@ pub const ResourceManager = struct {
         const projected_memory = self.memory.used_bytes +| additional_bytes;
         const memory_pressure = pressureFor(self.memory.budget, projected_memory);
         const aggregate_dominates = memory_pressure != .normal and
-            @intFromEnum(memory_pressure) >= @intFromEnum(slice_pressure);
+            @backingInt(memory_pressure) >= @backingInt(slice_pressure);
         const pressure = if (aggregate_dominates) memory_pressure else slice_pressure;
         return .{
             .pressure = pressure,
@@ -3408,10 +3417,10 @@ pub const ResourceManager = struct {
         // minima above remain intact, so noisy feedback cannot starve routing
         // state or make one observation swing the whole cache.
         const adaptive_pool = target_bytes / 4;
-        const node_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@intFromEnum(HbcCacheClass.node)].score, total_score);
-        const quantized_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@intFromEnum(HbcCacheClass.quantized)].score, total_score);
-        const vector_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@intFromEnum(HbcCacheClass.vector)].score, total_score);
-        const metadata_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@intFromEnum(HbcCacheClass.metadata)].score, total_score);
+        const node_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@backingInt(HbcCacheClass.node)].score, total_score);
+        const quantized_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@backingInt(HbcCacheClass.quantized)].score, total_score);
+        const vector_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@backingInt(HbcCacheClass.vector)].score, total_score);
+        const metadata_share = mulDivSaturating(adaptive_pool, self.hbc_cache_benefit[@backingInt(HbcCacheClass.metadata)].score, total_score);
         policy.node_protected_bytes = @min(target_bytes / 3, policy.node_protected_bytes +| node_share);
         policy.quantized_protected_bytes = @min(target_bytes / 2, policy.quantized_protected_bytes +| quantized_share);
         policy.vector_protected_bytes = @min(target_bytes / 2, vector_share);
@@ -3428,7 +3437,7 @@ pub const ResourceManager = struct {
         return ticket & 63 == 0;
     }
 
-    pub fn observeHbcCacheBenefitSampled(self: *ResourceManager, samples: [@typeInfo(HbcCacheClass).@"enum".fields.len]HbcCacheBenefitSample) void {
+    pub fn observeHbcCacheBenefitSampled(self: *ResourceManager, samples: [@typeInfo(HbcCacheClass).@"enum".field_names.len]HbcCacheBenefitSample) void {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         for (samples, 0..) |sample, i| {
@@ -3453,7 +3462,7 @@ pub const ResourceManager = struct {
     }
 
     /// Convenience entry point for non-hot-path callers and tests.
-    pub fn observeHbcCacheBenefit(self: *ResourceManager, samples: [@typeInfo(HbcCacheClass).@"enum".fields.len]HbcCacheBenefitSample) void {
+    pub fn observeHbcCacheBenefit(self: *ResourceManager, samples: [@typeInfo(HbcCacheClass).@"enum".field_names.len]HbcCacheBenefitSample) void {
         if (!self.beginHbcCacheBenefitSample()) return;
         self.observeHbcCacheBenefitSampled(samples);
     }
@@ -3701,7 +3710,7 @@ pub const BudgetedAllocator = struct {
 
     fn recordAllocationFailure(self: *BudgetedAllocator, cause: @FieldType(AllocationFailure, "cause"), bytes: usize, ret_addr: usize) void {
         const snapshot = self.reservation.manager.snapshot();
-        const slice = snapshot.slices[@intFromEnum(self.reservation.slice)];
+        const slice = snapshot.slices[@backingInt(self.reservation.slice)];
         self.last_allocation_failure = .{
             .cause = cause,
             .requested_bytes = bytes,
@@ -4012,7 +4021,7 @@ test "durable admission capacity honors both node and slice limits" {
 test "source vector payloads scratch admission accounts credits and records denial cause" {
     const alloc = std.testing.allocator;
     var budgets = Options.defaultBudgets();
-    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 4096 };
+    budgets[@backingInt(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 4096 };
     var manager = ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
@@ -4039,7 +4048,7 @@ test "source vector payloads scratch admission accounts credits and records deni
 test "budgeted allocator denial separates slice contention from own oversize demand" {
     const alloc = std.testing.allocator;
     var budgets = Options.defaultBudgets();
-    budgets[@intFromEnum(Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 4096 };
+    budgets[@backingInt(Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 4096 };
     var manager = ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
 
@@ -4061,7 +4070,7 @@ test "budgeted allocator denial separates slice contention from own oversize dem
 test "budgeted allocator denial over the node memory limit is own demand" {
     const alloc = std.testing.allocator;
     var budgets = Options.defaultBudgets();
-    budgets[@intFromEnum(Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 200 };
+    budgets[@backingInt(Slice.document_extraction_working_set)] = .{ .hard_limit_bytes = 200 };
     var manager = ResourceManager.init(.{ .budgets = budgets, .memory_budget = .{ .hard_limit_bytes = 100 } });
     defer manager.deinit(alloc);
 
@@ -4075,7 +4084,7 @@ test "budgeted allocator denial over the node memory limit is own demand" {
 test "default tokenizer cache budget is aligned with its resource slice" {
     const budgets = Options.defaultBudgets();
     const policies = Options.defaultPolicies();
-    const tokenizer_idx = @intFromEnum(Slice.inference_tokenizer_cache);
+    const tokenizer_idx = @backingInt(Slice.inference_tokenizer_cache);
     try std.testing.expectEqual(
         @as(u64, 64 * 1024 * 1024),
         budgets[tokenizer_idx].soft_limit_bytes,
@@ -4097,7 +4106,7 @@ test "default tokenizer cache budget is aligned with its resource slice" {
 test "default lake range cache queue budget is aligned with its terminal resource slice" {
     const budgets = Options.defaultBudgets();
     const policies = Options.defaultPolicies();
-    const index = @intFromEnum(Slice.lake_range_cache_queue);
+    const index = @backingInt(Slice.lake_range_cache_queue);
     try std.testing.expectEqual(slice_count - 1, index);
     try std.testing.expectEqual(@as(u64, 384 * 1024 * 1024), budgets[index].soft_limit_bytes);
     try std.testing.expectEqual(@as(u64, 512 * 1024 * 1024), budgets[index].hard_limit_bytes);
@@ -4155,7 +4164,7 @@ test "manager teardown retires live observer snapshots" {
 }
 
 fn sliceIndex(slice: Slice) usize {
-    return @intFromEnum(slice);
+    return @backingInt(slice);
 }
 
 fn pressureFor(budget: Budget, used_bytes: u64) Pressure {
@@ -5205,7 +5214,7 @@ test "adaptive HBC benefit retains miss cost through all-hit samples" {
         .{ .hits = 8, .misses = 8, .miss_service_ns = 80_000, .resident_bytes = 4096 },
         .{},
     });
-    const before = manager.hbc_cache_benefit[@intFromEnum(HbcCacheClass.vector)].score;
+    const before = manager.hbc_cache_benefit[@backingInt(HbcCacheClass.vector)].score;
     try std.testing.expect(before > 0);
 
     manager.observeHbcCacheBenefitSampled(.{
@@ -5214,7 +5223,7 @@ test "adaptive HBC benefit retains miss cost through all-hit samples" {
         .{ .hits = 16, .resident_bytes = 4096 },
         .{},
     });
-    const after = manager.hbc_cache_benefit[@intFromEnum(HbcCacheClass.vector)].score;
+    const after = manager.hbc_cache_benefit[@backingInt(HbcCacheClass.vector)].score;
     try std.testing.expect(after >= before);
 }
 
@@ -5497,7 +5506,7 @@ test "resource manager grows reclaimer registry beyond 128 owners" {
 
     var manager = ResourceManager.init(.{ .memory_budget = .{ .hard_limit_bytes = 100 } });
     defer manager.deinit(std.testing.allocator);
-    var contexts = [_]PassiveContext{.{}} ** owner_count;
+    var contexts = @as([owner_count]PassiveContext, @splat(.{}));
     var identities: [owner_count]u64 = undefined;
     for (&contexts, 0..) |*context, index| {
         identities[index] = try manager.registerReclaimer(
@@ -6136,7 +6145,7 @@ test "resource manager replay skip snapshots clean up every allocation failure" 
     const Case = struct {
         fn validate(snapshot: []const IndexReplayDocumentNotVisibleSkipped, index_count: usize) !void {
             try std.testing.expectEqual(index_count, snapshot.len);
-            var seen = [_]bool{false} ** 17;
+            var seen = @as([17]bool, @splat(false));
             for (snapshot) |entry| {
                 try std.testing.expect(std.mem.startsWith(u8, entry.index_name, "index_"));
                 const index = try std.fmt.parseUnsigned(usize, entry.index_name[6..], 10);

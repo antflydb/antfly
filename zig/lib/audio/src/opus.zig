@@ -691,7 +691,7 @@ pub fn parseHead(packet: []const u8) !Head {
         .stream_count = 0,
         .coupled_count = 0,
         .channel_mapping_len = channels,
-        .channel_mapping = [_]u8{0} ** 8,
+        .channel_mapping = @as([8]u8, @splat(0)),
     };
 
     if (header.mapping_family == 0) {
@@ -899,7 +899,7 @@ fn parseCode3FramesAlloc(allocator: std.mem.Allocator, toc: Toc, payload: []cons
         return .{ .toc = toc, .frames = frames, .allocator = allocator };
     }
 
-    var frame_lengths = [_]usize{0} ** 48;
+    var frame_lengths = @as([48]usize, @splat(0));
     var bytes_remaining = packet_end - cursor;
     for (0..frame_count - 1) |i| {
         const frame_len, const header_len = try parseCode2FrameLength(payload[cursor..packet_end]);

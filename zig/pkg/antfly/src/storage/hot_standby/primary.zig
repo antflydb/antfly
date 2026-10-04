@@ -867,7 +867,7 @@ const TestPaths = struct {
     slots: [:0]u8,
     standby_progress: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.log);
         alloc.free(self.slots);
         alloc.free(self.standby_progress);
@@ -902,9 +902,9 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), standby_progress_raw) catch {};
 
     return .{
-        .log = try alloc.dupeZ(u8, log_raw),
-        .slots = try alloc.dupeZ(u8, slots_raw),
-        .standby_progress = try alloc.dupeZ(u8, standby_progress_raw),
+        .log = try alloc.dupeSentinel(u8, log_raw, 0),
+        .slots = try alloc.dupeSentinel(u8, slots_raw, 0),
+        .standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0),
     };
 }
 

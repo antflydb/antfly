@@ -382,7 +382,7 @@ pub const Host = struct {
         group_id: u64,
         message: raft_engine.core.Message,
 
-        fn deinit(self: *PendingInboundMessage, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *PendingInboundMessage, alloc: std.mem.Allocator) void {
             self.message.deinit(alloc);
             self.* = undefined;
         }
@@ -397,7 +397,7 @@ pub const Host = struct {
         backup_id: ?[]u8 = null,
         snapshot_path: ?[]u8 = null,
 
-        fn deinit(self: *OwnedBootstrapStatus, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *OwnedBootstrapStatus, alloc: std.mem.Allocator) void {
             if (self.last_error) |msg| alloc.free(msg);
             if (self.backup_id) |value| alloc.free(value);
             if (self.snapshot_path) |value| alloc.free(value);

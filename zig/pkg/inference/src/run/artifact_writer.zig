@@ -13,10 +13,8 @@
 // limitations under the License.
 
 const std = @import("std");
-const compat = @import("../io/compat.zig");
-
-pub fn writeJsonFile(allocator: std.mem.Allocator, path: []const u8, value: anytype) !void {
+pub fn writeJsonFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, value: anytype) !void {
     const rendered = try std.json.Stringify.valueAlloc(allocator, value, .{ .whitespace = .indent_2 });
     defer allocator.free(rendered);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = rendered });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = rendered });
 }

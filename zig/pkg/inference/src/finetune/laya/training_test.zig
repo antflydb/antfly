@@ -80,7 +80,7 @@ fn exerciseGradientParity(a: std.mem.Allocator, use_fused_attention: bool) !void
     }, scratch, try files.readFile(scratch, reference_path), .{});
     const ref = reference.value;
     const examples = try scratch.alloc(train.Example, ref.sequences.len);
-    for (examples, ref.sequences, ref.targets) |*dst, seq, target| dst.* = .{ .ids = seq.ids, .markers = seq.markers, .kind = @enumFromInt(seq.qtype), .target = target[0..seq.markers.len] };
+    for (examples, ref.sequences, ref.targets) |*dst, seq, target| dst.* = .{ .ids = seq.ids, .markers = seq.markers, .kind = @fromBackingInt(seq.qtype), .target = target[0..seq.markers.len] };
     const config_path = try std.fmt.allocPrint(scratch, "{s}/model/config.json", .{root});
     const config = try modern.parseConfig(scratch, try files.readFile(scratch, config_path));
     var program = try train.Program.initFrozenFused(a, config, try train.bucketedLayout(examples, config), 0, 0, null, use_fused_attention);

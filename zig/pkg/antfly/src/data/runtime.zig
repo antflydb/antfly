@@ -128,7 +128,7 @@ else
     struct {
         handle: ?*anyopaque = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.* = .{};
         }
     };
@@ -177,12 +177,12 @@ const transition_action_lane_count: usize = 64;
 
 const TransitionActionLanes = struct {
     mutexes: [transition_action_lane_count]std.atomic.Mutex =
-        [_]std.atomic.Mutex{.unlocked} ** transition_action_lane_count,
+        @as([transition_action_lane_count]std.atomic.Mutex, @splat(.unlocked)),
 
     const Lease = struct {
         mutex: *std.atomic.Mutex,
 
-        fn deinit(self: *Lease) void {
+        pub fn deinit(self: *Lease) void {
             self.mutex.unlock();
             self.* = undefined;
         }
@@ -778,7 +778,7 @@ const IndexRepairRoute = struct {
     identity_shard_id: u64,
     identity_range_id: u64,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.* = undefined;
     }
@@ -790,7 +790,7 @@ const IndexRepairRoutingIndex = struct {
     routes: std.ArrayListUnmanaged(IndexRepairRoute) = .empty,
     by_group: std.AutoHashMapUnmanaged(u64, usize) = .empty,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.routes.items) |*entry| entry.deinit(alloc);
         self.routes.deinit(alloc);
         self.by_group.deinit(alloc);
@@ -835,7 +835,7 @@ const CliConfig = struct {
     secret_store_paths: std.ArrayListUnmanaged([]const u8) = .empty,
     help: bool = false,
 
-    fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CliConfig, alloc: std.mem.Allocator) void {
         self.secret_store_paths.deinit(alloc);
         self.metadata_apis.deinit(alloc);
         self.* = undefined;
@@ -849,7 +849,7 @@ const ResolvedPaths = struct {
     auth_store_root_dir: []u8,
     extension_package_store_dir: []u8,
 
-    fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ResolvedPaths, alloc: std.mem.Allocator) void {
         alloc.free(self.replica_root_dir);
         alloc.free(self.replica_catalog_path);
         alloc.free(self.snapshot_root_dir);
@@ -861,7 +861,7 @@ const ResolvedPaths = struct {
 const ResolvedMetadataApiUrls = struct {
     urls: []const []const u8,
 
-    fn deinit(self: ResolvedMetadataApiUrls, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ResolvedMetadataApiUrls, alloc: std.mem.Allocator) void {
         if (self.urls.len > 0) alloc.free(self.urls);
     }
 };
@@ -994,7 +994,7 @@ const DataPublicHttpRuntime = struct {
         return runtime;
     }
 
-    fn deinit(self: *DataPublicHttpRuntime) void {
+    pub fn deinit(self: *DataPublicHttpRuntime) void {
         self.deinitWithDeadline(antfly.common.runtime_lifecycle.ShutdownDeadline.afterMilliseconds(30_000));
     }
 
@@ -1084,7 +1084,7 @@ const DataDescriptorFactory = struct {
         return .{ .alloc = alloc, .fallback_store = fallback_store };
     }
 
-    fn deinit(self: *DataDescriptorFactory) void {
+    pub fn deinit(self: *DataDescriptorFactory) void {
         var store_it = self.group_stores.valueIterator();
         while (store_it.next()) |store| {
             store.*.deinit();
@@ -1328,17 +1328,17 @@ const RaftTableApplyStateMachine = struct {
         InitialChildProvisionAlreadyCommitted,
 
         fn fromError(err: anyerror) ?ExpectedApplyFailure {
-            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.?) |field| {
-                if (err == @field(@import("../storage/db/online_source_contract.zig").Rejection, field.name)) return @field(ExpectedApplyFailure, field.name);
+            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.error_names.?) |field| {
+                if (err == @field(@import("../storage/db/online_source_contract.zig").Rejection, field)) return @field(ExpectedApplyFailure, field);
             }
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-                if (err == @field(@import("../schema/relational_expression_errors.zig").Error, field.name)) return @field(ExpectedApplyFailure, field.name);
+            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
+                if (err == @field(@import("../schema/relational_expression_errors.zig").Error, field)) return @field(ExpectedApplyFailure, field);
             }
             // Share the stable typed contract with the participant HTTP path.
             // A semantic rejection must advance this committed log entry so
             // subsequent aborts, repairs and topology retries can make progress.
-            inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.?) |field| {
-                if (err == @field(@import("../api/relational_integrity_errors.zig").Error, field.name)) return @field(ExpectedApplyFailure, field.name);
+            inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.error_names.?) |field| {
+                if (err == @field(@import("../api/relational_integrity_errors.zig").Error, field)) return @field(ExpectedApplyFailure, field);
             }
             return switch (err) {
                 error.InvalidArtifactCatalogCommand => .InvalidArtifactCatalogCommand,
@@ -1380,14 +1380,14 @@ const RaftTableApplyStateMachine = struct {
         }
 
         fn toError(self: ExpectedApplyFailure) anyerror {
-            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.?) |field| {
-                if (self == @field(ExpectedApplyFailure, field.name)) return @field(@import("../storage/db/online_source_contract.zig").Rejection, field.name);
+            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../storage/db/online_source_contract.zig").Rejection, field);
             }
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-                if (self == @field(ExpectedApplyFailure, field.name)) return @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../schema/relational_expression_errors.zig").Error, field);
             }
-            inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.?) |field| {
-                if (self == @field(ExpectedApplyFailure, field.name)) return @field(@import("../api/relational_integrity_errors.zig").Error, field.name);
+            inline for (@typeInfo(@import("../api/relational_integrity_errors.zig").Error).error_set.error_names.?) |field| {
+                if (self == @field(ExpectedApplyFailure, field)) return @field(@import("../api/relational_integrity_errors.zig").Error, field);
             }
             return switch (self) {
                 .InvalidArtifactCatalogCommand => error.InvalidArtifactCatalogCommand,
@@ -1537,7 +1537,7 @@ const RaftTableApplyStateMachine = struct {
         };
     }
 
-    fn deinit(self: *RaftTableApplyStateMachine) void {
+    pub fn deinit(self: *RaftTableApplyStateMachine) void {
         self.write_source.quiesce();
         self.write_source.deinit();
         self.applied_indexes.deinit(self.alloc);
@@ -2462,7 +2462,7 @@ pub const HealthSource = struct {
             1,
         );
         if (self.supervisor) |supervisor| {
-            try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @intFromEnum(supervisor.currentState()));
+            try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_state", "gauge", "Runtime supervisor phase (0 starting, 1 ready, 2 quiescing, 3 failed, 4 stopped)", @backingInt(supervisor.currentState()));
             try health_metrics.appendPromMetric(writer, "antfly_runtime_supervisor_cancelled", "gauge", "Whether process-level runtime cancellation has been requested", @intFromBool(supervisor.token().isCancelled()));
         }
         if (self.data_server.backend_runtime) |backend_runtime| {
@@ -2620,7 +2620,7 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_planned_sequential_total", "counter", "Shard query fanout requests that the planner chose to execute sequentially", fanout_metrics.query_planned_sequential_total);
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_planned_width_total", "counter", "Sum of planner-selected shard query fanout widths", fanout_metrics.query_planned_width_total);
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_planned_width_count", "counter", "Number of shard query fanout requests contributing to the planned width total", fanout_metrics.query_planned_parallel_total + fanout_metrics.query_planned_sequential_total);
-        try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_async_limit", "gauge", "Configured std.Io async limit for the dedicated query fanout runtime", @intFromEnum(self.data_server.query_async_limit));
+        try health_metrics.appendPromMetric(writer, "antfly_data_parallel_query_fanout_async_limit", "gauge", "Configured std.Io async limit for the dedicated query fanout runtime", @backingInt(self.data_server.query_async_limit));
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_text_stats_fanout_total", "counter", "Parallel distributed text-stats fanout runs executed via std.Io", fanout_metrics.text_stats_parallel_total);
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_text_stats_fanout_ns_total", "counter", "Total monotonic nanoseconds spent in parallel distributed text-stats fanout", fanout_metrics.text_stats_parallel_ns_total);
         try health_metrics.appendPromMetric(writer, "antfly_data_parallel_text_stats_fanout_planned_parallel_total", "counter", "Distributed text-stats fanout requests that the planner chose to execute in parallel", fanout_metrics.text_stats_planned_parallel_total);
@@ -2942,7 +2942,7 @@ fn writeLsmOwnerCloneMetrics(
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_active_bytes", &labels, owner.maintenance.bulk_ingest_current_scan_clone_active_bytes);
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_owner_bulk_ingest_current_scan_clone_peak_active_bytes", &labels, owner.maintenance.bulk_ingest_current_scan_clone_peak_active_bytes);
         for (owner.maintenance.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
-            const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+            const reason: lsm_backend_mod.MutableSnapshotReason = @fromBackingInt(@intCast(i));
             const reason_labels = [_]health_metrics.PromLabel{
                 .{ .name = "table", .value = owner.table_name },
                 .{ .name = "group", .value = group },
@@ -2982,19 +2982,19 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_read_snapshot_mutable_rotation_peak_bytes", "gauge", "Peak mutable memtable bytes rotated for one broad read snapshot", stats.read_snapshot_mutable_rotation_peak_bytes);
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", "counter", "LSM mutable snapshot clone calls by reader class");
     for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
-        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const reason: lsm_backend_mod.MutableSnapshotReason = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_calls_total", &labels, reason_stats.calls);
     }
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", "counter", "Total bytes cloned into LSM mutable snapshot reads by reader class");
     for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
-        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const reason: lsm_backend_mod.MutableSnapshotReason = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_bytes_total", &labels, reason_stats.bytes_total);
     }
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_mutable_snapshot_clone_reason_peak_bytes", "gauge", "Peak bytes cloned for a single LSM mutable snapshot read by reader class");
     for (stats.mutable_snapshot_clone_by_reason, 0..) |reason_stats, i| {
-        const reason: lsm_backend_mod.MutableSnapshotReason = @enumFromInt(i);
+        const reason: lsm_backend_mod.MutableSnapshotReason = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "reason", .value = lsm_backend_mod.mutableSnapshotReasonName(reason) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_mutable_snapshot_clone_reason_peak_bytes", &labels, reason_stats.peak_bytes);
     }
@@ -3027,13 +3027,13 @@ fn writeLsmMaintenanceMetrics(writer: *std.Io.Writer, stats: lsm_backend_mod.Bac
     try health_metrics.appendPromMetric(writer, "antfly_lsm_active_readers", "gauge", "Cached write LSM readers currently retaining run or memtable snapshots", stats.active_readers);
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_active_readers_by_kind", "gauge", "Cached write LSM readers currently retaining snapshots by owner class");
     for (stats.active_readers_by_kind, 0..) |count, i| {
-        const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(i);
+        const kind: lsm_backend_mod.ReaderPinKind = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "kind", .value = lsm_backend_mod.readerPinKindName(kind) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_active_readers_by_kind", &labels, count);
     }
     try health_metrics.appendPromMetricHeader(writer, "antfly_lsm_obsolete_paths_pinned_by_reader_kind", "gauge", "Cached write LSM obsolete table paths retained by active readers by owner class");
     for (stats.obsolete_paths_pinned_by_reader_kind, 0..) |count, i| {
-        const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(i);
+        const kind: lsm_backend_mod.ReaderPinKind = @fromBackingInt(@intCast(i));
         const labels = [_]health_metrics.PromLabel{.{ .name = "kind", .value = lsm_backend_mod.readerPinKindName(kind) }};
         try health_metrics.appendPromSampleLabeled(writer, "antfly_lsm_obsolete_paths_pinned_by_reader_kind", &labels, count);
     }
@@ -3545,7 +3545,7 @@ fn writeResourceMetricFamily(
         resource_manager_mod.Slice.relational_preparation_working_set,
         resource_manager_mod.Slice.dense_vector_block_build_working_set,
     }) |slice| {
-        const stats = snapshot.slices[@intFromEnum(slice)];
+        const stats = snapshot.slices[@backingInt(slice)];
         try health_metrics.appendPromSampleLabeled(writer, name, &.{
             .{ .name = "slice", .value = slice.name() },
         }, resourceMetricValue(stats, field));
@@ -3723,13 +3723,13 @@ const LocalSplitKeyCache = struct {
         change_generation: u64,
         split_key: ?[]u8 = null,
 
-        fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
             if (self.split_key) |key| alloc.free(key);
             self.* = undefined;
         }
     };
 
-    fn deinit(self: *LocalSplitKeyCache, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *LocalSplitKeyCache, alloc: std.mem.Allocator) void {
         self.clear(alloc);
         self.entries.deinit(alloc);
         self.* = .{};
@@ -3790,7 +3790,7 @@ const LocalSplitKeyCache = struct {
     const SplitKeySnapshot = struct {
         split_key: ?[]u8,
 
-        fn deinit(self: *SplitKeySnapshot, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *SplitKeySnapshot, alloc: std.mem.Allocator) void {
             if (self.split_key) |key| alloc.free(key);
             self.* = undefined;
         }
@@ -3885,7 +3885,7 @@ const DataRaftProtocolProbePlan = struct {
     routes_complete: bool = false,
     peers: []const DataRaftProtocolPeer = &.{},
 
-    fn deinit(self: *DataRaftProtocolProbePlan, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DataRaftProtocolProbePlan, alloc: std.mem.Allocator) void {
         for (self.peers) |peer| alloc.free(peer.raft_url);
         if (self.peers.len != 0) alloc.free(self.peers);
         self.* = undefined;
@@ -4071,7 +4071,7 @@ const OwnedLocalGroupStatusRefresh = struct {
         return self.group_leadership_source;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.alloc.free(self.replica_root_dir);
         self.alloc.free(self.group_ids);
         for (self.tables) |record| antfly.metadata.table_manager.freeTable(self.alloc, record);
@@ -4122,7 +4122,7 @@ const OwnedInferredSnapshotLeadershipSource = struct {
         };
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.placement_intents) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.placement_intents);
         self.* = undefined;
@@ -5057,7 +5057,7 @@ pub const GroupMembership = struct {
     local_voter: bool = false,
     voter_count: u16 = 0,
     voter_set_known: bool = false,
-    voter_set_fingerprint: antfly.metadata.table_manager.VoterSetFingerprint = [_]u8{0} ** antfly.metadata.table_manager.voter_set_fingerprint_len,
+    voter_set_fingerprint: antfly.metadata.table_manager.VoterSetFingerprint = @as([antfly.metadata.table_manager.voter_set_fingerprint_len]u8, @splat(0)),
     joint_consensus: bool = false,
     raft_term: u64 = 0,
     raft_membership_index: u64 = 0,
@@ -5759,7 +5759,7 @@ pub const DataServer = struct {
     hot_standby_primary_mirror_sync_wait_count: std.atomic.Value(u64) = .init(0),
     hot_standby_primary_mirror_sync_degraded_count: std.atomic.Value(u64) = .init(0),
     hot_standby_standby_replication_failure_count: std.atomic.Value(u64) = .init(0),
-    hot_standby_standby_replication_last_error: std.atomic.Value(u8) = .init(@intFromEnum(HotStandbyStandbyReplicationErrorCode.none)),
+    hot_standby_standby_replication_last_error: std.atomic.Value(u8) = .init(@backingInt(HotStandbyStandbyReplicationErrorCode.none)),
     hot_standby_standby_replication_last_attempt_ns: std.atomic.Value(u64) = .init(0),
     hot_standby_standby_replication_last_success_ns: std.atomic.Value(u64) = .init(0),
     hot_standby_standby_replication_next_attempt_ns: std.atomic.Value(u64) = .init(0),
@@ -6041,7 +6041,7 @@ pub const DataServer = struct {
         catalog_token: runtime_status.TableRuntimeSnapshotCache.CatalogToken,
         snapshots: []runtime_status.TableRuntimeSnapshot,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.catalog_token.deinit();
             if (self.snapshots.len > 0) alloc.free(self.snapshots);
             self.* = undefined;
@@ -6052,7 +6052,7 @@ pub const DataServer = struct {
         group_id: u64,
         table_name: []u8,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             self.* = undefined;
         }
@@ -7742,7 +7742,7 @@ pub const DataServer = struct {
 
         const slots_path_buf = try std.fmt.allocPrint(self.alloc, "{s}.promoted-primary-slots", .{progress_path});
         defer self.alloc.free(slots_path_buf);
-        const slots_path = try self.alloc.dupeZ(u8, slots_path_buf);
+        const slots_path = try self.alloc.dupeSentinel(u8, slots_path_buf, 0);
         defer self.alloc.free(slots_path);
 
         try self.write_source.prepareHotStandbyConfigTransition();
@@ -9662,7 +9662,7 @@ pub const DataServer = struct {
     }
 
     fn clearHotStandbyStandbyReplicationError(self: *DataServer) void {
-        self.hot_standby_standby_replication_last_error.store(@intFromEnum(HotStandbyStandbyReplicationErrorCode.none), .release);
+        self.hot_standby_standby_replication_last_error.store(@backingInt(HotStandbyStandbyReplicationErrorCode.none), .release);
     }
 
     fn hotStandbyStandbyReplicationRetryDue(self: *DataServer, now_ns: u64) bool {
@@ -9690,11 +9690,11 @@ pub const DataServer = struct {
     }
 
     fn recordHotStandbyStandbyReplicationError(self: *DataServer, err: anyerror) void {
-        self.hot_standby_standby_replication_last_error.store(@intFromEnum(hotStandbyStandbyReplicationErrorCode(err)), .release);
+        self.hot_standby_standby_replication_last_error.store(@backingInt(hotStandbyStandbyReplicationErrorCode(err)), .release);
     }
 
     fn hotStandbyStandbyReplicationLastError(self: *DataServer) ?[]const u8 {
-        const code: HotStandbyStandbyReplicationErrorCode = @enumFromInt(self.hot_standby_standby_replication_last_error.load(.acquire));
+        const code: HotStandbyStandbyReplicationErrorCode = @fromBackingInt(@intCast(self.hot_standby_standby_replication_last_error.load(.acquire)));
         return hotStandbyStandbyReplicationErrorName(code);
     }
 
@@ -10378,18 +10378,34 @@ pub const DataServer = struct {
         timeout_ms: ?u32,
         cancellation: antfly.db.types.CancellationToken,
     ) anyerror!void {
-        const raft = self.data_raft orelse return error.NotLeader;
-        const apply_sm = self.data_raft_apply orelse return error.NotLeader;
-        const io = self.dataRaftIo() orelse return error.BackendRuntimeUnavailable;
+        var zig017_return_error: ?anyerror = null;
+        const raft = self.data_raft orelse return zig017_failure: {
+            zig017_return_error = error.NotLeader;
+            break :zig017_failure error.NotLeader;
+        };
+        const apply_sm = self.data_raft_apply orelse return zig017_failure: {
+            zig017_return_error = error.NotLeader;
+            break :zig017_failure error.NotLeader;
+        };
+        const io = self.dataRaftIo() orelse return zig017_failure: {
+            zig017_return_error = error.BackendRuntimeUnavailable;
+            break :zig017_failure error.BackendRuntimeUnavailable;
+        };
         const timeout_ns = @as(u64, @min(timeout_ms orelse 5_000, 5_000)) * std.time.ns_per_ms;
         const deadline_ns = self.dataRaftMonotonicNs() +| timeout_ns;
-        if (cancellation.isCancelled()) return error.Cancelled;
+        if (cancellation.isCancelled()) return zig017_failure: {
+            zig017_return_error = error.Cancelled;
+            break :zig017_failure error.Cancelled;
+        };
         _ = request_ctx;
         var context_buffer: [160]u8 = undefined;
-        const registration = try apply_sm.read_barriers.register(group_id, &context_buffer);
+        const registration = (apply_sm.read_barriers.register(group_id, &context_buffer) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         var waiter_live = true;
         defer if (waiter_live) apply_sm.read_barriers.cancel(registration.token);
-        errdefer |err| if (err == error.ReadIndexTimeout or (err == error.Cancelled and self.dataRaftMonotonicNs() +| (500 * std.time.ns_per_ms) >= deadline_ns)) {
+        errdefer if (zig017_return_error) |err| if (err == error.ReadIndexTimeout or (err == error.Cancelled and self.dataRaftMonotonicNs() +| (500 * std.time.ns_per_ms) >= deadline_ns)) {
             const needs_quorum = apply_sm.read_barriers.needsReadIndex(registration.token);
             const installed = apply_sm.read_barriers.appliedIndex(group_id);
             if (self.data_raft_mutex.tryLock()) {
@@ -10408,17 +10424,38 @@ pub const DataServer = struct {
         // a managed writer or its workers. An unbounded lock wait here defeats
         // cancellation and can keep both sides of that cycle alive forever.
         while (true) {
-            if (cancellation.isCancelled()) return error.Cancelled;
-            if (self.dataRaftMonotonicNs() >= deadline_ns) return error.ReadIndexTimeout;
+            if (cancellation.isCancelled()) return zig017_failure: {
+                zig017_return_error = error.Cancelled;
+                break :zig017_failure error.Cancelled;
+            };
+            if (self.dataRaftMonotonicNs() >= deadline_ns) return zig017_failure: {
+                zig017_return_error = error.ReadIndexTimeout;
+                break :zig017_failure error.ReadIndexTimeout;
+            };
             if (self.data_raft_mutex.tryLock()) break;
-            try io.sleep(.fromMilliseconds(1), .awake);
+            (io.sleep(.fromMilliseconds(1), .awake) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
         {
             defer self.data_raft_mutex.unlock();
-            if (cancellation.isCancelled()) return error.Cancelled;
-            if (self.dataRaftMonotonicNs() >= deadline_ns) return error.ReadIndexTimeout;
-            try self.seedCompletedDataReadIndexLocked(group_id);
-            try raft.requestReadIndex(group_id, registration.request_ctx);
+            if (cancellation.isCancelled()) return zig017_failure: {
+                zig017_return_error = error.Cancelled;
+                break :zig017_failure error.Cancelled;
+            };
+            if (self.dataRaftMonotonicNs() >= deadline_ns) return zig017_failure: {
+                zig017_return_error = error.ReadIndexTimeout;
+                break :zig017_failure error.ReadIndexTimeout;
+            };
+            (self.seedCompletedDataReadIndexLocked(group_id) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            (raft.requestReadIndex(group_id, registration.request_ctx) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
 
         // ReadIndex forwarding and responses can be lost during transport or
@@ -10428,7 +10465,10 @@ pub const DataServer = struct {
         var retry_delay_ns: u64 = 100 * std.time.ns_per_ms;
         var next_request_ns = self.dataRaftMonotonicNs() +| retry_delay_ns;
         while (self.dataRaftMonotonicNs() < deadline_ns) {
-            if (cancellation.isCancelled()) return error.Cancelled;
+            if (cancellation.isCancelled()) return zig017_failure: {
+                zig017_return_error = error.Cancelled;
+                break :zig017_failure error.Cancelled;
+            };
             if (apply_sm.read_barriers.takeCompleted(registration.token)) {
                 waiter_live = false;
                 return;
@@ -10437,15 +10477,30 @@ pub const DataServer = struct {
                 apply_sm.read_barriers.needsReadIndex(registration.token) and self.data_raft_mutex.tryLock())
             {
                 defer self.data_raft_mutex.unlock();
-                if (cancellation.isCancelled()) return error.Cancelled;
-                if (self.dataRaftMonotonicNs() >= deadline_ns) return error.ReadIndexTimeout;
-                try raft.requestReadIndex(group_id, registration.request_ctx);
+                if (cancellation.isCancelled()) return zig017_failure: {
+                    zig017_return_error = error.Cancelled;
+                    break :zig017_failure error.Cancelled;
+                };
+                if (self.dataRaftMonotonicNs() >= deadline_ns) return zig017_failure: {
+                    zig017_return_error = error.ReadIndexTimeout;
+                    break :zig017_failure error.ReadIndexTimeout;
+                };
+                (raft.requestReadIndex(group_id, registration.request_ctx) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
                 retry_delay_ns = @min(retry_delay_ns * 2, std.time.ns_per_s);
                 next_request_ns = self.dataRaftMonotonicNs() +| retry_delay_ns;
             }
-            try io.sleep(.fromMilliseconds(1), .awake);
+            (io.sleep(.fromMilliseconds(1), .awake) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
-        return error.ReadIndexTimeout;
+        return zig017_failure: {
+            zig017_return_error = error.ReadIndexTimeout;
+            break :zig017_failure error.ReadIndexTimeout;
+        };
     }
 
     const PinnedReadPeerRouter = struct {
@@ -15074,7 +15129,7 @@ pub const DataServer = struct {
             };
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.releaseLane();
             const alloc = self.alloc;
@@ -16058,7 +16113,7 @@ pub const DataServer = struct {
         else
             false;
         return antfly.data.storage.range_transition.deriveSplitStatus(
-            @as(antfly.shard.SplitPhase, @enumFromInt(@intFromEnum(observation.state.?.phase))),
+            @as(antfly.shard.SplitPhase, @fromBackingInt(@backingInt(observation.state.?.phase))),
             bootstrapped,
             observation.delta_sequence,
             if (bootstrapped) observation.acknowledgement.?.delta_sequence else 0,
@@ -24444,7 +24499,7 @@ const DataRaftPlacementInputs = struct {
         return result;
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         for (self.intents) |intent| antfly.raft.reconciler.freeIntentOwned(alloc, intent);
         alloc.free(self.intents);
         alloc.free(self.hidden_initial_group_ids);
@@ -24494,7 +24549,7 @@ const PlacementTopologyIndex = struct {
         pristine: bool = true,
         bootstrap_generation: bool = false,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             self.peers.deinit(alloc);
             self.member_rows.deinit(alloc);
             self.transition_voters.deinit(alloc);
@@ -24556,7 +24611,7 @@ const PlacementTopologyIndex = struct {
         return self;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         var it = self.groups.valueIterator();
         while (it.next()) |group| group.deinit(self.alloc);
         self.groups.deinit(self.alloc);
@@ -25062,7 +25117,7 @@ const RemoteMetadataSource = struct {
         };
     }
 
-    fn deinit(self: *RemoteMetadataSource) void {
+    pub fn deinit(self: *RemoteMetadataSource) void {
         for (&self.validation_slots) |*slot| slot.clear(self.alloc);
         for (self.http_executors) |*executor| executor.deinit();
         if (self.http_executors.len > 0) self.alloc.free(self.http_executors);
@@ -26405,7 +26460,7 @@ const RemoteMetadataSource = struct {
         snapshot: antfly.metadata_api.AdminSnapshot,
         private_snapshot: ?std.json.Parsed(@import("../metadata/restore_staging.zig").ProvisioningSnapshot),
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             freeAdminSnapshotOwned(alloc, &self.snapshot);
             if (self.private_snapshot) |*value| value.deinit();
         }
@@ -27657,15 +27712,19 @@ const RemoteMetadataSource = struct {
     }
 
     fn remoteReplaceTableDefinition(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !void {
+        var zig017_return_error: ?anyerror = null;
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        const body = try std.json.Stringify.valueAlloc(self.alloc, .{
+        const body = (std.json.Stringify.valueAlloc(self.alloc, .{
             .expected = expected,
             .definition = replacement,
-        }, .{});
+        }, .{}) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer self.alloc.free(body);
-        errdefer |err| if (err == error.MetadataMutationOutcomeUnknown)
+        errdefer if (zig017_return_error) |err| if (err == error.MetadataMutationOutcomeUnknown)
             self.invalidateCache();
-        try self.withMetadataMutationApiClient(void, struct {
+        (self.withMetadataMutationApiClient(void, struct {
             fn call(
                 _: *RemoteMetadataSource,
                 client: *antfly.metadata_http_client.MetadataHttpClient,
@@ -27675,20 +27734,27 @@ const RemoteMetadataSource = struct {
             ) !void {
                 try client.replaceTableDefinition(base_uri, ctx.table_name, ctx.body);
             }
-        }.call, .{ .table_name = replacement.name, .body = body });
+        }.call, .{ .table_name = replacement.name, .body = body }) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         self.invalidateCache();
     }
 
     fn remoteReplaceTableDefinitionStamped(ptr: *anyopaque, expected: antfly.metadata.TableRecord, replacement: antfly.metadata.TableRecord) !?antfly.metadata_api.CatalogMutationStamp {
+        var zig017_return_error: ?anyerror = null;
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
-        const body = try std.json.Stringify.valueAlloc(self.alloc, .{
+        const body = (std.json.Stringify.valueAlloc(self.alloc, .{
             .expected = expected,
             .definition = replacement,
-        }, .{});
+        }, .{}) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer self.alloc.free(body);
-        errdefer |err| if (err == error.MetadataMutationOutcomeUnknown)
+        errdefer if (zig017_return_error) |err| if (err == error.MetadataMutationOutcomeUnknown)
             self.invalidateCache();
-        const stamp = try self.withMetadataMutationApiClient(?antfly.metadata_api.CatalogMutationStamp, struct {
+        const stamp = (self.withMetadataMutationApiClient(?antfly.metadata_api.CatalogMutationStamp, struct {
             fn call(
                 _: *RemoteMetadataSource,
                 client: *antfly.metadata_http_client.MetadataHttpClient,
@@ -27698,7 +27764,10 @@ const RemoteMetadataSource = struct {
             ) !?antfly.metadata_api.CatalogMutationStamp {
                 return try client.tryReplaceTableDefinitionStamped(base_uri, ctx.table_name, ctx.body);
             }
-        }.call, .{ .table_name = replacement.name, .body = body });
+        }.call, .{ .table_name = replacement.name, .body = body }) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         self.invalidateCache();
         return stamp;
     }
@@ -28284,7 +28353,7 @@ const OwnedRestoreProgressSync = struct {
     upserts: []antfly.metadata.table_manager.RestoreProgressRecord,
     removals: []antfly.metadata.table_manager.RestoreProgressIdentity,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.upserts);
         alloc.free(self.removals);
         self.* = undefined;
@@ -28595,19 +28664,19 @@ fn localGroupStatusFingerprint(
         hasher.update(std.mem.asBytes(&record.transition_id));
         hasher.update(std.mem.asBytes(&record.source_group_id));
         hasher.update(std.mem.asBytes(&record.destination_group_id));
-        const phase: u8 = @intFromEnum(record.phase);
+        const phase: u8 = @backingInt(record.phase);
         hasher.update(&.{phase});
     }
     for (merge_transitions) |record| {
         hasher.update(std.mem.asBytes(&record.transition_id));
         hasher.update(std.mem.asBytes(&record.donor_group_id));
         hasher.update(std.mem.asBytes(&record.receiver_group_id));
-        const phase: u8 = @intFromEnum(record.phase);
+        const phase: u8 = @backingInt(record.phase);
         hasher.update(&.{phase});
     }
     for (split_observations) |record| {
         hasher.update(std.mem.asBytes(&record.transition_id));
-        const phase: u8 = @intFromEnum(record.observation.status.phase);
+        const phase: u8 = @backingInt(record.observation.status.phase);
         hasher.update(&.{phase});
         hasher.update(std.mem.asBytes(&record.observation.status.bootstrapped));
         hasher.update(std.mem.asBytes(&record.observation.status.replay_required));
@@ -28619,8 +28688,8 @@ fn localGroupStatusFingerprint(
     }
     for (merge_observations) |record| {
         hasher.update(std.mem.asBytes(&record.transition_id));
-        const donor_phase: u8 = @intFromEnum(record.observation.donor.phase);
-        const receiver_phase: u8 = @intFromEnum(record.observation.receiver.phase);
+        const donor_phase: u8 = @backingInt(record.observation.donor.phase);
+        const receiver_phase: u8 = @backingInt(record.observation.receiver.phase);
         hasher.update(&.{ donor_phase, receiver_phase });
         hasher.update(std.mem.asBytes(&record.observation.donor.replay_required));
         hasher.update(std.mem.asBytes(&record.observation.donor.replay_caught_up));
@@ -28734,19 +28803,19 @@ fn runtimeEnrichmentStatusReportFromStats(
     const active_backend = try alloc.dupe(u8, stats.active_backend.slice());
     errdefer alloc.free(active_backend);
     var report: antfly.metadata.table_manager.RuntimeEnrichmentStatusReport = .{};
-    inline for (std.meta.fields(antfly.metadata.table_manager.RuntimeEnrichmentStatusReport)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "active_model")) {
-            @field(report, field.name) = active_model;
-        } else if (comptime std.mem.eql(u8, field.name, "active_backend")) {
-            @field(report, field.name) = active_backend;
-        } else if (comptime std.mem.eql(u8, field.name, "projection_checkpoint_status")) {
-            @field(report, field.name) = projection_checkpoint_status;
-        } else if (comptime std.mem.eql(u8, field.name, "stall_reason")) {
-            @field(report, field.name) = stall_reason;
-        } else if (comptime std.mem.eql(u8, field.name, "active_phase")) {
-            @field(report, field.name) = active_phase;
+    inline for (comptime std.meta.fieldNames(antfly.metadata.table_manager.RuntimeEnrichmentStatusReport)) |reflected_name| {
+        if (comptime std.mem.eql(u8, reflected_name, "active_model")) {
+            @field(report, reflected_name) = active_model;
+        } else if (comptime std.mem.eql(u8, reflected_name, "active_backend")) {
+            @field(report, reflected_name) = active_backend;
+        } else if (comptime std.mem.eql(u8, reflected_name, "projection_checkpoint_status")) {
+            @field(report, reflected_name) = projection_checkpoint_status;
+        } else if (comptime std.mem.eql(u8, reflected_name, "stall_reason")) {
+            @field(report, reflected_name) = stall_reason;
+        } else if (comptime std.mem.eql(u8, reflected_name, "active_phase")) {
+            @field(report, reflected_name) = active_phase;
         } else {
-            @field(report, field.name) = @field(stats, field.name);
+            @field(report, reflected_name) = @field(stats, reflected_name);
         }
     }
     return report;
@@ -29856,7 +29925,7 @@ fn dataRaftStorageOwnershipFingerprint(intents: []const antfly.raft.PlacementInt
         hashU64(&hasher, intent.record.group_id);
         hashU64(&hasher, intent.record.replica_id);
         hashU64(&hasher, intent.record.local_node_id);
-        hashU64(&hasher, @intFromEnum(intent.record.bootstrap_mode));
+        hashU64(&hasher, @backingInt(intent.record.bootstrap_mode));
         hashU64(&hasher, intent.record.metadata_version);
         hashU64(&hasher, intent.store_id);
         hashU64(&hasher, intent.relocation_generation);
@@ -29925,7 +29994,7 @@ fn dataRaftLocalStatusFingerprint(
         hashU64(&hasher, 1);
         hashU64(&hasher, status.id);
         hashU64(&hasher, status.hard.current_term);
-        hashU64(&hasher, @intFromEnum(status.soft.role));
+        hashU64(&hasher, @backingInt(status.soft.role));
         if (status.soft.leader_id) |leader_id| {
             hashU64(&hasher, 1);
             hashU64(&hasher, leader_id);
@@ -31233,7 +31302,7 @@ fn resolveExtensionPackageStoreDir(
     cli_path: ?[]const u8,
     local_base: []const u8,
 ) ![]u8 {
-    const env_var_z = try alloc.dupeZ(u8, antfly.extensions.wasmtime_runtime.package_store_env);
+    const env_var_z = try alloc.dupeSentinel(u8, antfly.extensions.wasmtime_runtime.package_store_env, 0);
     defer alloc.free(env_var_z);
     return try resolveExtensionPackageStoreDirWithEnv(
         alloc,
@@ -31352,7 +31421,7 @@ fn resolveTrustedPrincipalConfigValue(
 
     const env_var = try antfly.common.secrets.envVarForKey(alloc, key);
     defer alloc.free(env_var);
-    const env_var_z = try alloc.dupeZ(u8, env_var);
+    const env_var_z = try alloc.dupeSentinel(u8, env_var, 0);
     defer alloc.free(env_var_z);
     if (platform.env.getenvSlice(env_var_z)) |value| {
         const raw = try alloc.dupe(u8, value);
@@ -31996,7 +32065,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     const DiskWork = struct {
         var syncs: std.atomic.Value(u64) = .init(0);
         var writes: std.atomic.Value(u64) = .init(0);
-        fn sync(ptr: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+        pub fn sync(ptr: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
             _ = syncs.fetchAdd(1, .monotonic);
             return std.testing.io.vtable.fileSync(ptr, file);
         }
@@ -32167,7 +32236,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     defer for (api_uris[0..api_uri_count]) |uri| alloc.free(uri);
     var hosted_http_executor: ?antfly.common.http.IoHttpExecutor = null;
     var servers: [3]DataServer = undefined;
-    var initialized = [_]bool{false} ** 3;
+    var initialized = @as([3]bool, @splat(false));
     defer {
         // Publish every node's stop before driving cancellation. HTTP request
         // leases are released by scheduler-owned tasks; joining a client from
@@ -32418,7 +32487,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
         quiescing,
         stopped,
     };
-    var node_lifecycle = [_]NodeLifecycle{.running} ** 3;
+    var node_lifecycle = @as([3]NodeLifecycle, @splat(.running));
 
     const ClusterRouter = struct {
         servers: *[3]DataServer,
@@ -33799,7 +33868,7 @@ fn consumerTests() type {
                 }
                 fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
-                    if (request.method == .GET) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataHead{ .metadata_group_id = 9, .metadata_incarnation = [_]u8{'1'} ** 32 }, .{}) };
+                    if (request.method == .GET) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataHead{ .metadata_group_id = 9, .metadata_incarnation = @as([32]u8, @splat('1')) }, .{}) };
                     _ = self.writes.fetchAdd(1, .monotonic);
                     if (self.reject_next.swap(false, .acq_rel)) return error.StoreReportBaseMismatch;
                     var update = try std.json.parseFromSlice(store_report_update.Update, alloc, request.body, .{});
@@ -33817,7 +33886,7 @@ fn consumerTests() type {
             var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://collection.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
             defer source.deinit();
             source.cached_snapshot = try cloneAdminSnapshotOwned(a, .{
-                .status = .{ .metadata_group_id = 9, .metadata_incarnation = [_]u8{'1'} ** 32, .metrics = .{} },
+                .status = .{ .metadata_group_id = 9, .metadata_incarnation = @as([32]u8, @splat('1')), .metrics = .{} },
                 .tables = &.{},
                 .ranges = &.{},
                 .stores = &.{},
@@ -34057,7 +34126,7 @@ fn consumerTests() type {
                 fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: Http.HttpRequest) !Http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     _ = self.requests.fetchAdd(1, .monotonic);
-                    if (request.method == .GET) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataHead{ .metadata_group_id = 9, .metadata_incarnation = [_]u8{'1'} ** 32 }, .{}) };
+                    if (request.method == .GET) return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataHead{ .metadata_group_id = 9, .metadata_incarnation = @as([32]u8, @splat('1')) }, .{}) };
                     self.entered.store(true, .release);
                     const cancel = request.cancellation orelse return error.MissingCancellation;
                     const until = platform_time.monotonicNs() + 10 * std.time.ns_per_s;
@@ -34118,7 +34187,7 @@ fn consumerTests() type {
                         const owner: *DataServer = @ptrCast(@alignCast(ptr));
                         _ = owner.provisioned_warmup_completed.fetchAdd(1, .release);
                     }
-                    fn deinit(_: *anyopaque) void {}
+                    pub fn deinit(_: *anyopaque) void {}
                 };
                 const runtime = server.backend_runtime.?;
                 const owner = try server.dataServerBackgroundOwnerId(runtime);
@@ -34138,7 +34207,7 @@ fn consumerTests() type {
                 calls: usize = 0,
                 repair: bool = false,
                 fn execute(_: *anyopaque, a: std.mem.Allocator, _: Http.HttpRequest) !Http.HttpResponse {
-                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, antfly.metadata_api.MetadataHead{ .metadata_group_id = 9, .metadata_incarnation = [_]u8{'1'} ** 32 }, .{}) };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(a, antfly.metadata_api.MetadataHead{ .metadata_group_id = 9, .metadata_incarnation = @as([32]u8, @splat('1')) }, .{}) };
                 }
                 fn call(source: *RemoteMetadataSource, _: *antfly.metadata_http_client.MetadataHttpClient, uri: []const u8, self: *@This()) !u32 {
                     const expected = [_][]const u8{ "http://one.invalid", "http://two.invalid", "http://three.invalid" };
@@ -34463,7 +34532,7 @@ fn consumerTests() type {
                         .status = 200,
                         .body = try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.MetadataStatus{
                             .metadata_group_id = 9,
-                            .metadata_incarnation = .{'1'} ** 32,
+                            .metadata_incarnation = @splat('1'),
                             .metadata_raft_local_node_id = if (first) 1 else 2,
                             .metadata_raft_leader_id = 2,
                             .metadata_raft_role = if (first) "follower" else "leader",
@@ -35241,7 +35310,7 @@ fn consumerTests() type {
                     }
                 }
 
-                fn deinit(_: *anyopaque) void {}
+                pub fn deinit(_: *anyopaque) void {}
             };
 
             server.provisioned_index_repair_owner_id = try runtime.ptr().allocOwnerId();
@@ -37129,10 +37198,10 @@ fn consumerTests() type {
             const participant = try antfly.public_api.distributed_txn.participantIdForGroup(alloc, "docs", group_id);
             defer alloc.free(participant);
             const participants = [_][]const u8{participant};
-            const txn_a: antfly.db.types.TxnId = .{0x0a} ** 16;
-            const txn_b: antfly.db.types.TxnId = .{0x0b} ** 16;
-            const txn_missing: antfly.db.types.TxnId = .{0x0c} ** 16;
-            const txn_version: antfly.db.types.TxnId = .{0x0d} ** 16;
+            const txn_a: antfly.db.types.TxnId = @splat(0x0a);
+            const txn_b: antfly.db.types.TxnId = @splat(0x0b);
+            const txn_missing: antfly.db.types.TxnId = @splat(0x0c);
+            const txn_version: antfly.db.types.TxnId = @splat(0x0d);
             _ = try apply_sm.write_source.applyReplicatedBatchGroupLocal(alloc, group_id, "docs", .{
                 .transaction = .{ .begin = .{
                     .txn_id = txn_a,
@@ -37351,12 +37420,12 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(?RaftTableApplyStateMachine.ExpectedApplyFailure, null), RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InvalidData));
             try std.testing.expectEqual(error.GenerationRetired, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.GenerationRetired).?.toError());
             try std.testing.expectEqual(error.InitialChildProvisionAlreadyCommitted, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(error.InitialChildProvisionAlreadyCommitted).?.toError());
-            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.?) |field| {
-                const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field.name);
+            inline for (@typeInfo(@import("../schema/relational_expression_errors.zig").Error).error_set.error_names.?) |field| {
+                const reason = @field(@import("../schema/relational_expression_errors.zig").Error, field);
                 try std.testing.expectEqual(reason, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason).?.toError());
             }
-            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.?) |field| {
-                const reason = @field(@import("../storage/db/online_source_contract.zig").Rejection, field.name);
+            inline for (@typeInfo(@import("../storage/db/online_source_contract.zig").Rejection).error_set.error_names.?) |field| {
+                const reason = @field(@import("../storage/db/online_source_contract.zig").Rejection, field);
                 try std.testing.expectEqual(reason, RaftTableApplyStateMachine.ExpectedApplyFailure.fromError(reason).?.toError());
             }
             inline for (.{ error.OutOfMemory, error.RetainedEffectsCorrupt, error.RetainedEffectsTransactionFailed, error.OnlineSourceCorrupt, error.SourceSnapshotCorrupt }) |reason|
@@ -38412,7 +38481,7 @@ fn consumerTests() type {
                     return .{ .ptr = self, .vtable = &.{ .membership = read } };
                 }
 
-                fn read(ptr: *anyopaque, _: u64) GroupMembership {
+                pub fn read(ptr: *anyopaque, _: u64) GroupMembership {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     return self.membership;
                 }
@@ -41623,15 +41692,15 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-log-{d}", .{nonce});
             defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
             defer alloc.free(primary_log);
             const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-reject-slots-{d}", .{nonce});
             defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -41679,7 +41748,7 @@ fn consumerTests() type {
 
             try std.testing.expectEqual(@as(u64, 0), primary.lastLsn());
             try std.testing.expectEqual(@as(u64, 1), server.hot_standby_primary_mirror_last_gate_lsn.load(.acquire));
-            try std.testing.expectEqual(@intFromEnum(antfly.hot_standby.commit_gate.Action.reject), server.hot_standby_primary_mirror_last_gate_action.load(.acquire));
+            try std.testing.expectEqual(@backingInt(antfly.hot_standby.commit_gate.Action.reject), server.hot_standby_primary_mirror_last_gate_action.load(.acquire));
             try std.testing.expectEqual(@as(u64, 1), server.hot_standby_primary_mirror_sync_reject_count.load(.acquire));
         }
 
@@ -41752,15 +41821,15 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-log-{d}", .{nonce});
             defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
             defer alloc.free(primary_log);
             const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-sync-block-slots-{d}", .{nonce});
             defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -41829,7 +41898,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
             try std.testing.expectEqual(@as(u64, 2), server.hot_standby_primary_mirror_last_lsn.load(.acquire));
             try std.testing.expectEqual(@as(u64, 2), server.hot_standby_primary_mirror_last_gate_lsn.load(.acquire));
-            try std.testing.expectEqual(@intFromEnum(antfly.hot_standby.commit_gate.Action.acknowledge), server.hot_standby_primary_mirror_last_gate_action.load(.acquire));
+            try std.testing.expectEqual(@backingInt(antfly.hot_standby.commit_gate.Action.acknowledge), server.hot_standby_primary_mirror_last_gate_action.load(.acquire));
             try std.testing.expectEqual(@as(u64, 2), server.hot_standby_primary_mirror_sync_wait_count.load(.acquire));
             try std.testing.expectEqual(@as(u64, 0), server.hot_standby_primary_mirror_sync_reject_count.load(.acquire));
 
@@ -42064,15 +42133,15 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-routed-apply-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -42267,23 +42336,23 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-primary-log-{d}", .{nonce});
             defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
             defer alloc.free(primary_log);
             const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-primary-slots-{d}", .{nonce});
             defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-standby-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-standby-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -42482,23 +42551,23 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-primary-log-{d}", .{nonce});
             defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
             defer alloc.free(primary_log);
             const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-primary-slots-{d}", .{nonce});
             defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-unlocked-network-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -42654,15 +42723,15 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promoted-http-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -42855,23 +42924,23 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
             const wrong_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-promote-retry-wrong-log-{d}", .{nonce});
             defer alloc.free(wrong_log_raw);
-            const wrong_log = try alloc.dupeZ(u8, wrong_log_raw);
+            const wrong_log = try alloc.dupeSentinel(u8, wrong_log_raw, 0);
             defer alloc.free(wrong_log);
             const promoted_slots_raw = try std.fmt.allocPrint(alloc, "{s}.promoted-primary-slots", .{standby_progress});
             defer alloc.free(promoted_slots_raw);
-            const promoted_slots = try alloc.dupeZ(u8, promoted_slots_raw);
+            const promoted_slots = try alloc.dupeSentinel(u8, promoted_slots_raw, 0);
             defer alloc.free(promoted_slots);
             const standby_log_alias = try std.fmt.allocPrint(alloc, "./{s}", .{standby_log});
             defer alloc.free(standby_log_alias);
@@ -43069,15 +43138,15 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-follow-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-follow-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-follow-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -43262,23 +43331,23 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-primary-log-{d}", .{nonce});
             defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
             defer alloc.free(primary_log);
             const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-primary-slots-{d}", .{nonce});
             defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-standby-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-resume-standby-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -43501,15 +43570,15 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-standby-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-http-replicate-failed-standby-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -43674,23 +43743,23 @@ fn consumerTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-primary-log-{d}", .{nonce});
             defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
             defer alloc.free(primary_log);
             const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-primary-slots-{d}", .{nonce});
             defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
             const standby_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-standby-log-{d}", .{nonce});
             defer alloc.free(standby_log_raw);
-            const standby_log = try alloc.dupeZ(u8, standby_log_raw);
+            const standby_log = try alloc.dupeSentinel(u8, standby_log_raw, 0);
             defer alloc.free(standby_log);
             const standby_progress_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-apply-failed-standby-progress-{d}", .{nonce});
             defer alloc.free(standby_progress_raw);
-            const standby_progress = try alloc.dupeZ(u8, standby_progress_raw);
+            const standby_progress = try alloc.dupeSentinel(u8, standby_progress_raw, 0);
             defer alloc.free(standby_progress);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -44568,7 +44637,7 @@ fn consumerTests() type {
                 return .{
                     .status = .{
                         .metadata_group_id = 9,
-                        .metadata_incarnation = .{'1'} ** 32,
+                        .metadata_incarnation = @splat('1'),
                         .metadata_epoch = epoch,
                         .metadata_raft_role = "leader",
                         .metrics = .{},
@@ -44588,7 +44657,7 @@ fn consumerTests() type {
                     .vtable = &.{ .execute = execute },
                 }}, io);
                 errdefer source.deinit();
-                try source.acceptMetadataIdentity(9, .{'1'} ** 32);
+                try source.acceptMetadataIdentity(9, @splat('1'));
                 source.cached_snapshot = try cloneAdminSnapshotOwned(allocator, snapshot(7));
                 source.cached_snapshot_at_ms = 1;
                 return source;
@@ -45447,7 +45516,7 @@ fn consumerTests() type {
             const Stub = struct {
                 calls: usize = 0,
                 wrong_node: bool = false,
-                incarnation: antfly.metadata_api.MetadataClusterIncarnation = .{'1'} ** 32,
+                incarnation: antfly.metadata_api.MetadataClusterIncarnation = @splat('1'),
                 fn execute(ptr: *anyopaque, allocator: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.calls += 1;
@@ -45492,7 +45561,7 @@ fn consumerTests() type {
             stub.wrong_node = true;
             try std.testing.expectError(error.InvalidRestoreStaging, api.getRestoreStagingProgress(alloc, id, .{}));
             stub.wrong_node = false;
-            stub.incarnation = .{'2'} ** 32;
+            stub.incarnation = @splat('2');
             try std.testing.expectError(error.MetadataIncarnationMismatch, api.getRestoreStagingProgress(alloc, id, .{}));
             const before = stub.calls;
             try std.testing.expectError(error.DeadlineExceeded, api.getRestoreStagingProgress(alloc, id, .{ .deadline_ns = 0 }));
@@ -46102,7 +46171,7 @@ fn consumerTests() type {
                     const owner: *DataServer = @ptrCast(@alignCast(ptr));
                     _ = owner.provisioned_warmup_completed.fetchAdd(1, .release);
                 }
-                fn deinit(_: *anyopaque) void {}
+                pub fn deinit(_: *anyopaque) void {}
             };
             const runtime = server.backend_runtime.?;
             const owner_id = try server.dataServerBackgroundOwnerId(runtime);
@@ -46757,7 +46826,7 @@ fn implementationTests() type {
                 defer metadata_topology.deinit();
                 try std.testing.expect(metadata_topology.value.standalone_metadata != null);
                 var corrupt_metadata_topology = metadata_topology.value;
-                corrupt_metadata_topology.standalone_metadata.?.sha256 = "0" ** 64;
+                corrupt_metadata_topology.standalone_metadata.?.sha256 = z17RepeatString("0", 64);
                 try std.testing.expectError(error.SeedLogicalDigestMismatch, antfly.hot_standby.seed_materialization.validateTopology(alloc, io_impl.io(), raw_absolute, "private-owner-seed", corrupt_metadata_topology));
                 const parent_absolute = try tmp.dir.realPathFileAlloc(io_impl.io(), ".", scratch);
                 const live = try std.fs.path.join(scratch, &.{ parent_absolute, "materialized-private-owner" });
@@ -46767,10 +46836,10 @@ fn implementationTests() type {
                     .live_installing_root = live,
                     .generation = "private-owner-seed",
                     .target_local_node_id = 1,
-                    .seed_receipt_sha256 = "a" ** 64,
-                    .capture_receipt_sha256 = "b" ** 64,
-                    .raw_manifest_sha256 = "c" ** 64,
-                    .raw_aggregate_sha256 = "d" ** 64,
+                    .seed_receipt_sha256 = z17RepeatString("a", 64),
+                    .capture_receipt_sha256 = z17RepeatString("b", 64),
+                    .raw_manifest_sha256 = z17RepeatString("c", 64),
+                    .raw_aggregate_sha256 = z17RepeatString("d", 64),
                 });
                 defer materialized.deinit(alloc);
                 const catalog_path = try std.fs.path.join(scratch, &.{ live, "metadata/local-metadata.json" });
@@ -46799,7 +46868,7 @@ fn implementationTests() type {
                 const mismatched_json = try std.json.Stringify.valueAlloc(scratch, mismatched_metadata_topology, .{});
                 try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = metadata_topology_path, .data = mismatched_json });
                 const mismatch_live = try std.fs.path.join(scratch, &.{ parent_absolute, "metadata-mismatch" });
-                try std.testing.expectError(error.SeedMetadataTopologyMismatch, antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = raw_absolute, .live_installing_root = mismatch_live, .generation = "private-owner-seed", .target_local_node_id = 1, .seed_receipt_sha256 = "a" ** 64, .capture_receipt_sha256 = "b" ** 64, .raw_manifest_sha256 = "c" ** 64, .raw_aggregate_sha256 = "d" ** 64 }));
+                try std.testing.expectError(error.SeedMetadataTopologyMismatch, antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = raw_absolute, .live_installing_root = mismatch_live, .generation = "private-owner-seed", .target_local_node_id = 1, .seed_receipt_sha256 = z17RepeatString("a", 64), .capture_receipt_sha256 = z17RepeatString("b", 64), .raw_manifest_sha256 = z17RepeatString("c", 64), .raw_aggregate_sha256 = z17RepeatString("d", 64) }));
                 try std.Io.Dir.cwd().writeFile(io_impl.io(), .{ .sub_path = metadata_topology_path, .data = metadata_topology_json });
                 const reopened_path = try std.fs.path.join(scratch, &.{ live, "data/replicas/group-88/table-db" });
                 var reopened = try antfly.db.DB.open(alloc, reopened_path, .{ .identity_namespace = scope.target_namespace, .start_index_workers = false, .start_optional_runtimes = false });
@@ -46887,7 +46956,7 @@ fn implementationTests() type {
                 try std.testing.expect(reseed_topology.value.restore_terminals != null);
                 const reseed_absolute = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), reseed.root, scratch);
                 var corrupt_topology = reseed_topology.value;
-                corrupt_topology.restore_terminals.?.sha256 = "0" ** 64;
+                corrupt_topology.restore_terminals.?.sha256 = z17RepeatString("0", 64);
                 try std.testing.expectError(error.SeedLogicalDigestMismatch, antfly.hot_standby.seed_materialization.validateTopology(alloc, io_impl.io(), reseed_absolute, "post-seed-owner-reseed", corrupt_topology));
                 const reseed_live = try std.fs.path.join(scratch, &.{ parent_absolute, "materialized-reseed-owner" });
                 var reseeded = try antfly.hot_standby.seed_materialization.materialize(alloc, .{
@@ -46896,10 +46965,10 @@ fn implementationTests() type {
                     .live_installing_root = reseed_live,
                     .generation = "post-seed-owner-reseed",
                     .target_local_node_id = 1,
-                    .seed_receipt_sha256 = "a" ** 64,
-                    .capture_receipt_sha256 = "b" ** 64,
-                    .raw_manifest_sha256 = "c" ** 64,
-                    .raw_aggregate_sha256 = "d" ** 64,
+                    .seed_receipt_sha256 = z17RepeatString("a", 64),
+                    .capture_receipt_sha256 = z17RepeatString("b", 64),
+                    .raw_manifest_sha256 = z17RepeatString("c", 64),
+                    .raw_aggregate_sha256 = z17RepeatString("d", 64),
                 });
                 defer reseeded.deinit(alloc);
                 const registry_root = try std.fs.path.join(scratch, &.{ reseed_live, "metadata" });
@@ -46973,7 +47042,7 @@ fn implementationTests() type {
                 var floor_seed = try standby.prepareDefaultHotStandbySeedSnapshot(alloc, .{ .capture_root = floor_seed_root, .generation = "terminal-floor-seed" });
                 defer floor_seed.deinit(alloc);
                 const floor_live = try std.fs.path.join(scratch, &.{ parent_absolute, "terminal-floor-live" });
-                var floor_materialized = try antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = floor_seed.root, .live_installing_root = floor_live, .generation = "terminal-floor-seed", .target_local_node_id = 1, .seed_receipt_sha256 = "a" ** 64, .capture_receipt_sha256 = "b" ** 64, .raw_manifest_sha256 = "c" ** 64, .raw_aggregate_sha256 = "d" ** 64 });
+                var floor_materialized = try antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = floor_seed.root, .live_installing_root = floor_live, .generation = "terminal-floor-seed", .target_local_node_id = 1, .seed_receipt_sha256 = z17RepeatString("a", 64), .capture_receipt_sha256 = z17RepeatString("b", 64), .raw_manifest_sha256 = z17RepeatString("c", 64), .raw_aggregate_sha256 = z17RepeatString("d", 64) });
                 defer floor_materialized.deinit(alloc);
                 const floor_metadata = try std.fs.path.join(scratch, &.{ floor_live, "metadata" });
                 var imported_floor_ledger = try @import("../storage/hot_standby/restore_terminal_ledger.zig").Ledger.open(alloc, io_impl.io(), floor_metadata);
@@ -47029,7 +47098,7 @@ fn implementationTests() type {
                     // its full standalone metadata checkpoint above.
                     try antfly.hot_standby.seed_materialization.validateTopology(alloc, io_impl.io(), empty_seed.root, generation, legacy_empty);
                     const empty_live = try std.fs.path.join(scratch, &.{ parent_absolute, generation });
-                    var empty_materialized = try antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = empty_seed.root, .live_installing_root = empty_live, .generation = generation, .target_local_node_id = 1, .seed_receipt_sha256 = "a" ** 64, .capture_receipt_sha256 = "b" ** 64, .raw_manifest_sha256 = "c" ** 64, .raw_aggregate_sha256 = "d" ** 64 });
+                    var empty_materialized = try antfly.hot_standby.seed_materialization.materialize(alloc, .{ .io = io_impl.io(), .raw_generation_root = empty_seed.root, .live_installing_root = empty_live, .generation = generation, .target_local_node_id = 1, .seed_receipt_sha256 = z17RepeatString("a", 64), .capture_receipt_sha256 = z17RepeatString("b", 64), .raw_manifest_sha256 = z17RepeatString("c", 64), .raw_aggregate_sha256 = z17RepeatString("d", 64) });
                     defer empty_materialized.deinit(alloc);
                     const empty_imported_path = try std.fs.path.join(scratch, &.{ empty_live, "metadata/local-state" });
                     var empty_imported = try antfly.metadata.RaftApplyStore.init(alloc, .{ .root_dir = empty_imported_path });
@@ -47487,7 +47556,7 @@ fn implementationTests() type {
                 fn status(_: *anyopaque) !antfly.metadata_api.MetadataStatus {
                     return error.UnexpectedPublicCatalogLookup;
                 }
-                fn server(allocator: std.mem.Allocator, root: []const u8) DataServer {
+                pub fn server(allocator: std.mem.Allocator, root: []const u8) DataServer {
                     return DataServer.initFromLocalMetadataSources(allocator, .{ .replica_root_dir = root }, .{ .ptr = undefined, .vtable = &.{ .admin_snapshot = admin, .free_admin_snapshot = freeAdmin } }, .{ .ptr = undefined, .vtable = &.{ .status = status } });
                 }
             };
@@ -53504,13 +53573,13 @@ fn implementationTests() type {
                 .unpublished_wal_max_batch_logical_bytes = 1537,
                 .active_readers = 6,
                 .active_readers_by_kind = blk: {
-                    var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
-                    counts[@intFromEnum(lsm_backend_mod.ReaderPinKind.compaction)] = 2;
+                    var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = @as([lsm_backend_mod.reader_pin_kind_count]u64, @splat(0));
+                    counts[@backingInt(lsm_backend_mod.ReaderPinKind.compaction)] = 2;
                     break :blk counts;
                 },
                 .obsolete_paths_pinned_by_reader_kind = blk: {
-                    var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = [_]u64{0} ** lsm_backend_mod.reader_pin_kind_count;
-                    counts[@intFromEnum(lsm_backend_mod.ReaderPinKind.compaction)] = 3;
+                    var counts: [lsm_backend_mod.reader_pin_kind_count]u64 = @as([lsm_backend_mod.reader_pin_kind_count]u64, @splat(0));
+                    counts[@backingInt(lsm_backend_mod.ReaderPinKind.compaction)] = 3;
                     break :blk counts;
                 },
                 .manifest_dirty = true,
@@ -53923,11 +53992,11 @@ fn implementationTests() type {
 
             const primary_log_raw = try std.fs.path.join(alloc, &.{ capture_fixture_root, "primary.log" });
             defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
             defer alloc.free(primary_log);
             const primary_slots_raw = try std.fs.path.join(alloc, &.{ capture_fixture_root, "primary-slots" });
             defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
             const restore_jobs_path = try std.fs.path.join(alloc, &.{ capture_fixture_root, "restore-jobs" });
             defer alloc.free(restore_jobs_path);
@@ -55356,15 +55425,15 @@ fn implementationTests() type {
             const nonce = platform_time.monotonicNs();
             const replica_root_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-root-{d}", .{nonce});
             defer alloc.free(replica_root_raw);
-            const replica_root = try alloc.dupeZ(u8, replica_root_raw);
+            const replica_root = try alloc.dupeSentinel(u8, replica_root_raw, 0);
             defer alloc.free(replica_root);
             const primary_log_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-log-{d}", .{nonce});
             defer alloc.free(primary_log_raw);
-            const primary_log = try alloc.dupeZ(u8, primary_log_raw);
+            const primary_log = try alloc.dupeSentinel(u8, primary_log_raw, 0);
             defer alloc.free(primary_log);
             const primary_slots_raw = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/data-runtime-ha-primary-mirror-slots-{d}", .{nonce});
             defer alloc.free(primary_slots_raw);
-            const primary_slots = try alloc.dupeZ(u8, primary_slots_raw);
+            const primary_slots = try alloc.dupeSentinel(u8, primary_slots_raw, 0);
             defer alloc.free(primary_slots);
 
             var io_impl = std.Io.Threaded.init(alloc, .{});
@@ -55598,7 +55667,7 @@ fn implementationTests() type {
                         try std.testing.expectEqualStrings("1000", request.header("X-Antfly-Routing-Remaining-Ms").?);
                         break :blk try std.json.Stringify.valueAlloc(allocator, antfly.metadata_api.CatalogRoutingSnapshot{
                             .metadata_group_id = 1,
-                            .metadata_incarnation = .{'1'} ** 32,
+                            .metadata_incarnation = @splat('1'),
                             .catalog_revision = 9,
                             .tables = @constCast(&[_]antfly.metadata.table_manager.TableRecord{.{ .table_id = 7, .name = "docs" }}),
                             .ranges = @constCast(&[_]antfly.metadata.table_manager.RangeRecord{.{
@@ -55675,7 +55744,7 @@ fn implementationTests() type {
                 try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.remoteTableRoutingSnapshotWithMode("docs", deadline, linearizable));
             }
             try std.testing.expectEqual(calls_before_expiry, stub.calls);
-            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.ownedTableRoutingSnapshotUntil(1, .{'1'} ** 32, 9, "docs", captured.tables, captured.ranges, deadline));
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, source.ownedTableRoutingSnapshotUntil(1, @splat('1'), 9, "docs", captured.tables, captured.ranges, deadline));
             vopr_io.monotonic_ns += metadata_snapshot_cache_ttl_ms * std.time.ns_per_ms;
             var refreshed = try source.remoteRoutingSnapshotWithMode(@intCast(vopr_io.monotonic_ns + std.time.ns_per_s), false);
             defer RemoteMetadataSource.remoteFreeRoutingSnapshot(&source, &refreshed);
@@ -55896,4 +55965,15 @@ comptime {
         _ = consumer_tests;
         _ = implementation_tests;
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

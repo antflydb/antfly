@@ -523,17 +523,17 @@ test "lsm compaction scheduler prepared membership scales for concurrent admissi
         var first = scheduler.tryAcquire(first_work, null) orelse return error.TestUnexpectedResult;
         defer first.complete();
         const started = @import("antfly_platform").time.monotonicNs();
-        const rounds = if (@import("builtin").mode == .ReleaseFast) 100 else 1;
+        const rounds = if (@import("builtin").mode == .fast) 100 else 1;
         for (0..rounds) |_| {
             var second = scheduler.tryAcquire(second_work, null) orelse return error.TestUnexpectedResult;
             second.complete();
         }
         const elapsed = @import("antfly_platform").time.monotonicNs() - started;
-        if (@import("builtin").mode == .ReleaseFast) std.debug.print("\nLSM concurrent indexed admission inputs={d} ns_per_grant={d}\n", .{ count, elapsed / rounds });
+        if (@import("builtin").mode == .fast) std.debug.print("\nLSM concurrent indexed admission inputs={d} ns_per_grant={d}\n", .{ count, elapsed / rounds });
         scheduler.options.max_concurrent_jobs = 1;
         const denied_start = @import("antfly_platform").time.monotonicNs();
         for (0..1000) |_| try std.testing.expect(scheduler.tryAcquire(second_work, null) == null);
-        if (@import("builtin").mode == .ReleaseFast) std.debug.print("LSM capacity denial inputs={d} ns_per_denial={d}\n", .{ count, (@import("antfly_platform").time.monotonicNs() - denied_start) / 1000 });
+        if (@import("builtin").mode == .fast) std.debug.print("LSM capacity denial inputs={d} ns_per_denial={d}\n", .{ count, (@import("antfly_platform").time.monotonicNs() - denied_start) / 1000 });
         // Borrowed prepared indexes must survive all grants and denials.
         try std.testing.expectEqual(@as(u32, @intCast(count)), second_index.count());
     }

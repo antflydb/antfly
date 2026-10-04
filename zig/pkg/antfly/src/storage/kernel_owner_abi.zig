@@ -1311,7 +1311,7 @@ pub const MaintenanceAction = enum(u32) {
 
 pub const MaintenanceRequest = extern struct {
     version: u32 = abi_version,
-    action: u32 = @intFromEnum(MaintenanceAction.inspect),
+    action: u32 = @backingInt(MaintenanceAction.inspect),
     table_name: BorrowedBytes = .{},
     deadline_ns: u64 = 0,
     snapshot_token: BorrowedBytes = .{},
@@ -1399,7 +1399,7 @@ pub const SyncRequest = extern struct {
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
     version: u32 = abi_version,
-    sync_level: u32 = @intFromEnum(SyncLevel.write),
+    sync_level: u32 = @backingInt(SyncLevel.write),
     table_name: BorrowedBytes = .{},
 };
 
@@ -1434,7 +1434,7 @@ pub const BackupFormat = enum(u32) {
 /// all byte slices are borrowed only for this synchronous operation.
 pub const BackupRequest = extern struct {
     version: u32 = abi_version,
-    format: u32 = @intFromEnum(BackupFormat.native),
+    format: u32 = @backingInt(BackupFormat.native),
     table_name: BorrowedBytes = .{},
     backup_root: BorrowedBytes = .{},
     backup_id: BorrowedBytes = .{},
@@ -1590,7 +1590,7 @@ pub const CancellationCheckFn = *const fn (?*anyopaque) callconv(.c) u8;
 /// Cancellation is borrowed for the synchronous call and is never retained.
 pub const ArtifactOperationRequest = extern struct {
     version: u32 = abi_version,
-    operation: u32 = @intFromEnum(ArtifactOperation.reprocess_document),
+    operation: u32 = @backingInt(ArtifactOperation.reprocess_document),
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
     cancellation_ctx: ?*anyopaque = null,

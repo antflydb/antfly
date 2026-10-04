@@ -238,7 +238,7 @@ test "embedDense decodes the numeric frame a negotiating server returns" {
     for ([_]f32{ 0.25, 0.5, 0.75, -1, 0, 1 }, 0..) |value, i| try numeric.setValue(frame, i, value);
 
     const Assert = struct {
-        fn accept(req: httpx.testing_mod.RequestInfo) anyerror!void {
+        pub fn accept(req: httpx.testing_mod.RequestInfo) anyerror!void {
             // Without this header the server has no reason to answer with a
             // frame, so the whole negotiated path would go untested.
             try std.testing.expectEqualStrings(numeric.accept, req.header("Accept") orelse return error.MissingAccept);

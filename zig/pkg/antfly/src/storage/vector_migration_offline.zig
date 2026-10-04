@@ -391,7 +391,7 @@ const CopyCrashTest = struct {
     var fail_directory: ?[]const u8 = null;
     var stop_at: ?Boundary = null;
 
-    fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
+    pub fn sync(userdata: ?*anyopaque, file: std.Io.File) std.Io.File.SyncError!void {
         const sim: *@import("vopr").vopr_io.VoprIo = @ptrCast(@alignCast(userdata.?));
         const handle = sim.files.handles.get(file.handle) orelse return error.AccessDenied;
         if (!handle.directory) return sim.files.syncFile(file);

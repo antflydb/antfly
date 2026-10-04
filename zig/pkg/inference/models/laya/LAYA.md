@@ -581,7 +581,7 @@ and job recipe in `.tmp/longstate/` (gitignored): states synthesized by
 concatenating distinct `td/train.jsonl` records to ~2k/4k/8k tokens
 (word-count estimate; actual tokenization untested), `laya.max_len` raised
 to 8192 in a copy of the released checkpoint's `config.json` and
-`rl_agent_config.json`, `zig build -Doptimize=ReleaseFast --prefix <dir>`
+`rl_agent_config.json`, `zig build -Doptimize=fast --prefix <dir>`
 once, then `/usr/bin/time -l <dir>/bin/antfly-inference finetune train laya
 job_2k.json` under the gpu lock.
 
@@ -1727,7 +1727,7 @@ sentences.
 
 ```bash
 ANTFLY_LAYA_PACKED_BENCH=/abs/models/extractors/laya [ANTFLY_LAYA_BACKEND=metal] \
-  zig build test -Doptimize=ReleaseFast -- --test-filter "laya packed benchmark"
+  zig build test -Doptimize=fast -- --test-filter "laya packed benchmark"
 ```
 
 Current code: segment attention plus the state cache. Metal's unpacked
@@ -1811,7 +1811,7 @@ forces one packed call per state (the pre-batching behavior) for comparison.
 
 ```bash
 ANTFLY_LAYA_PACKED_BENCH=/abs/models/extractors/laya [ANTFLY_LAYA_BACKEND=metal] \
-  zig build test -Doptimize=ReleaseFast -- --test-filter "laya packed benchmark"
+  zig build test -Doptimize=fast -- --test-filter "laya packed benchmark"
 ```
 
 | Backend | States | Unpacked ms | Packed, batched ms | Packed, one row per state ms | Batched calls | Unbatched calls |
@@ -1980,7 +1980,7 @@ follow-up.
 Reproduce with:
 
 ```bash
-~/bin/zig build -Doptimize=ReleaseFast --prefix <dir>
+~/bin/zig build -Doptimize=fast --prefix <dir>
 /usr/bin/time -l <dir>/bin/antfly-inference finetune eval laya \
   <laya-released-dir> <records.jsonl> --backend native   # dense
 ANTFLY_LAYA_WEIGHT_QUANT=q8_0 /usr/bin/time -l <dir>/bin/antfly-inference \

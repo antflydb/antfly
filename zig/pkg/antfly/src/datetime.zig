@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 pub const Unit = enum { year, quarter, month, week, day, hour, minute, second, milliseconds, microseconds, epoch, dow, isodow, doy };
 
 pub fn unit(text: []const u8) ?Unit {
-    inline for (std.meta.fields(Unit)) |field| if (std.ascii.eqlIgnoreCase(text, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Unit).@"enum".field_names, @typeInfo(Unit).@"enum".field_values) |reflected_name, field_value| if (std.ascii.eqlIgnoreCase(text, reflected_name)) return @fromBackingInt(field_value);
     return null;
 }
 

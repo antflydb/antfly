@@ -83,7 +83,7 @@ const selectTestFilters = @import("tests.zig").selectTestFilters;
 pub const AddEmbeddedOptions = struct {
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     strip: bool,
     antfly_imports: AntflyRootImports,
     antfly_mod: *std.Build.Module,
@@ -387,8 +387,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     capi_conformance.root_module.linkLibrary(libantfly);
     const run_capi_conformance = b.addRunArtifact(capi_conformance);
-    run_capi_conformance.addDirectoryArg(b.path("pkg/antfly/capi-conformance/cases"));
-    _ = run_capi_conformance.addOutputDirectoryArg("capi-conformance-work");
+    run_capi_conformance.addDirectoryArg2(b.path("pkg/antfly/capi-conformance/cases"), .{ .make_absolute = true });
+    _ = run_capi_conformance.addOutputDirectoryArg2("capi-conformance-work", .{ .make_absolute = true });
     const capi_conformance_step = b.step("capi-conformance", "Run the shared libantfly conformance cases against the C ABI");
     capi_conformance_step.dependOn(&run_capi_conformance.step);
 
@@ -411,17 +411,16 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     // The Python, Rust, and TypeScript bindings skip their native tests
     // when libantfly is absent; ANTFLY_LITE_REQUIRE_LIBRARY turns that into
     // a failure here, and ANTFLY_LIB_DIR points them at this build's copy.
-    const lite_lib_dir_env = b.fmt("ANTFLY_LIB_DIR={s}", .{b.getInstallPath(.lib, "")});
     const run_lite_py_tests = b.addSystemCommand(&.{
         "env",
         "ANTFLY_LITE_REQUIRE_LIBRARY=1",
-        lite_lib_dir_env,
         "uv",
         "run",
         "--locked",
         "pytest",
         "-q",
     });
+    run_lite_py_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_py_tests.setCwd(b.path("../py/packages/lite"));
     run_lite_py_tests.step.dependOn(&install_libantfly.step);
     const lite_py_test_step = b.step("lite-py-test", "Run Python Antfly Lite binding tests against libantfly");
@@ -429,7 +428,6 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
 
     const run_lite_rs_tests = b.addSystemCommand(&.{
         "env",
-        lite_lib_dir_env,
         "cargo",
         "test",
         "--locked",
@@ -440,6 +438,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "--features",
         "libantfly",
     });
+    run_lite_rs_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_rs_tests.setCwd(b.path("."));
     run_lite_rs_tests.step.dependOn(&install_libantfly.step);
     const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly Lite binding tests against libantfly");
@@ -448,11 +447,11 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const run_lite_ts_tests = b.addSystemCommand(&.{
         "env",
         "ANTFLY_LITE_REQUIRE_LIBRARY=1",
-        lite_lib_dir_env,
         "pnpm",
         "run",
         "test",
     });
+    run_lite_ts_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_ts_tests.setCwd(b.path("../ts/packages/lite"));
     run_lite_ts_tests.step.dependOn(&install_libantfly.step);
     const lite_ts_test_step = b.step("lite-ts-test", "Run TypeScript Antfly Lite binding tests against libantfly (needs pnpm install in ts/)");

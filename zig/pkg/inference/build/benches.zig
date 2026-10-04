@@ -48,9 +48,7 @@ pub fn addPagedAttention(ctx: Context) void {
     });
 
     const run_bench = ctx.addRunArtifact(bench_exe);
-    if (ctx.args) |args| {
-        run_bench.addArgs(args);
-    }
+    run_bench.addPassthruArgs();
     const bench_step = ctx.step("bench-paged-attention", "Run the native paged-attention benchmark");
     bench_step.dependOn(&run_bench.step);
 }
@@ -70,16 +68,12 @@ pub fn addTrainingAndLinalg(ctx: Context) void {
         }),
     });
     const run_training_bench = ctx.addRunArtifact(training_bench_exe);
-    if (ctx.args) |args| {
-        run_training_bench.addArgs(args);
-    }
+    run_training_bench.addPassthruArgs();
     const training_bench_step = ctx.step("bench-training", "Run the native training benchmark");
     training_bench_step.dependOn(&run_training_bench.step);
     linalg_bench_exe.root_module.addImport("inference_linalg", ctx.graph.inference_linalg_mod);
     const run_linalg_bench = ctx.addRunArtifact(linalg_bench_exe);
-    if (ctx.args) |args| {
-        run_linalg_bench.addArgs(args);
-    }
+    run_linalg_bench.addPassthruArgs();
     const linalg_bench_step = ctx.step("bench-linalg", "Run the shared linalg benchmark");
     linalg_bench_step.dependOn(&run_linalg_bench.step);
 }
@@ -113,9 +107,7 @@ pub fn addGliner(ctx: Context) void {
     gliner2_bench_exe.root_module.link_libc = true;
     runtime_build.configureOnnxRuntime(b, gliner2_bench_exe.root_module, ctx.backend.enable_onnx, ctx.backend.onnx_root);
     const run_gliner2_bench = ctx.addRunArtifact(gliner2_bench_exe);
-    if (ctx.args) |args| {
-        run_gliner2_bench.addArgs(args);
-    }
+    run_gliner2_bench.addPassthruArgs();
     const gliner2_bench_step = ctx.step("bench-gliner2-native", "Run an end-to-end GLiNER2 bench against the native backend with random weights");
     gliner2_bench_step.dependOn(&run_gliner2_bench.step);
 }
@@ -133,9 +125,7 @@ pub fn addAudio(ctx: Context) void {
     audio_bench_exe.root_module.addImport("inference_audio", ctx.graph.inference_audio_mod);
     audio_bench_exe.root_module.link_libc = true;
     const run_audio_bench = ctx.addRunArtifact(audio_bench_exe);
-    if (ctx.args) |args| {
-        run_audio_bench.addArgs(args);
-    }
+    run_audio_bench.addPassthruArgs();
     const audio_bench_step = ctx.step("bench-audio", "Run the checked-in audio decode and synthesis benchmark");
     audio_bench_step.dependOn(&run_audio_bench.step);
 }

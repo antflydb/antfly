@@ -61,7 +61,7 @@ const TrackTables = struct {
     sample_sizes: std.ArrayListUnmanaged(u32) = .empty,
     stsc_entries: std.ArrayListUnmanaged(StscEntry) = .empty,
 
-    fn deinit(self: *TrackTables, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *TrackTables, allocator: std.mem.Allocator) void {
         self.edit_entries.deinit(allocator);
         self.chunk_offsets.deinit(allocator);
         self.sample_sizes.deinit(allocator);

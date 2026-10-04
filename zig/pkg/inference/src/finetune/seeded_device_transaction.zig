@@ -189,7 +189,7 @@ fn nextAccumulation(state: State, request: Request) u32 {
 }
 pub fn validateClippingOrder(order: []const usize, slots: usize) !void {
     if (order.len != slots or slots == 0 or slots > 4096) return error.InvalidDeviceClippingOrder;
-    var seen = [_]bool{false} ** 4096;
+    var seen = @as([4096]bool, @splat(false));
     for (order) |slot| {
         if (slot >= slots or seen[slot]) return error.InvalidDeviceClippingOrder;
         seen[slot] = true;
@@ -225,9 +225,9 @@ fn validateSchedule(schedule_value: anytype) !void {
         .constant => |rate| if (!std.math.isFinite(rate) or rate < 0) return error.InvalidOptimizerGroup,
         inline else => |schedule| {
             if (schedule.total_steps == 0) return error.InvalidOptimizerGroup;
-            inline for (@typeInfo(@TypeOf(schedule)).@"struct".fields) |field| {
-                if (@typeInfo(field.type) == .float) {
-                    const value = @field(schedule, field.name);
+            inline for (@typeInfo(@TypeOf(schedule)).@"struct".field_names, @typeInfo(@TypeOf(schedule)).@"struct".field_types) |reflected_name, field_type| {
+                if (@typeInfo(field_type) == .float) {
+                    const value = @field(schedule, reflected_name);
                     if (!std.math.isFinite(value) or value < 0) return error.InvalidOptimizerGroup;
                 }
             }

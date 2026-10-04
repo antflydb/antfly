@@ -122,7 +122,7 @@ const MappedText = struct {
         return .{ .text = owned, .starts = starts, .ends = ends };
     }
 
-    fn deinit(self: MappedText, alloc: Allocator) void {
+    pub fn deinit(self: MappedText, alloc: Allocator) void {
         alloc.free(self.text);
         alloc.free(self.starts);
         alloc.free(self.ends);

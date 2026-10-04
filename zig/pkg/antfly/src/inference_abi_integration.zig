@@ -47,7 +47,7 @@ pub fn main() !void {
     const invoke_context = bridge.ProviderInvokeContext{
         .abi_version = bridge.abi_version,
         .handle = handle.?,
-        .operation = @intFromEnum(bridge.ProviderOperation.read_encoded_images),
+        .operation = @backingInt(bridge.ProviderOperation.read_encoded_images),
         .request_json = bridge.String.init(request_json),
         .deadline_ns = 0,
         .has_deadline = 0,
@@ -69,7 +69,7 @@ pub fn main() !void {
     const embedding_context = bridge.ProviderInvokeContext{
         .abi_version = bridge.abi_version,
         .handle = handle.?,
-        .operation = @intFromEnum(bridge.ProviderOperation.embed_dense_parts),
+        .operation = @backingInt(bridge.ProviderOperation.embed_dense_parts),
         .request_json = bridge.String.init(embedding_request_json),
         .deadline_ns = 0,
         .has_deadline = 0,
@@ -91,7 +91,7 @@ pub fn main() !void {
     const chunk_context = bridge.ProviderInvokeContext{
         .abi_version = bridge.abi_version,
         .handle = handle.?,
-        .operation = @intFromEnum(bridge.ProviderOperation.chunk_input),
+        .operation = @backingInt(bridge.ProviderOperation.chunk_input),
         .request_json = bridge.String.init(chunk_request_json),
         .deadline_ns = 0,
         .has_deadline = 0,

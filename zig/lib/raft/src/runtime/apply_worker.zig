@@ -22,7 +22,7 @@ const ApplyTask = struct {
     entries: []core.Entry,
     read_states: []core.ReadState,
 
-    fn deinit(self: *ApplyTask, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ApplyTask, alloc: std.mem.Allocator) void {
         if (self.snapshot) |*snapshot| snapshot.deinit(alloc);
         core.types.freeEntries(alloc, self.entries);
         for (self.read_states) |*read_state| read_state.deinit(alloc);

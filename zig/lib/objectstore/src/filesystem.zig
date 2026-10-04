@@ -640,7 +640,7 @@ const ObjectLock = struct {
     io: std.Io,
     file: std.Io.File,
 
-    fn deinit(self: *ObjectLock) void {
+    pub fn deinit(self: *ObjectLock) void {
         self.file.unlock(self.io);
         self.file.close(self.io);
         self.* = undefined;
@@ -700,7 +700,7 @@ const ObjectHeader = struct {
     etag: [64]u8,
     data_offset: u64,
 
-    fn deinit(self: *ObjectHeader, alloc: Allocator) void {
+    pub fn deinit(self: *ObjectHeader, alloc: Allocator) void {
         alloc.free(self.content_type);
         self.* = undefined;
     }

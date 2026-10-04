@@ -12,7 +12,7 @@ From the repository root, using Zig 0.16.0:
 
 ```sh
 zig build --build-file zig/pkg/inference/build.zig bench-gliner25-cuda-build \
-  -Doptimize=ReleaseFast -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false
+  -Doptimize=fast -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false
 ```
 
 The CUDA benchmark executable shares `src/bench/gliner25_cpu.zig` and the existing
@@ -133,7 +133,7 @@ zig build --build-file zig/pkg/inference/build.zig test-gliner25-cuda \
 
 ANTFLY_GLINER25_TRAINING_JOB_CUDA_MODEL_DIR=/path/to/pinned/small \
 TERMITE_REQUIRE_CUDA_TESTS=1 zig build --build-file zig/pkg/inference/build.zig test \
-  -Doptimize=ReleaseFast -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false -- 'job CUDA published small heads'
+  -Doptimize=fast -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false -- 'job CUDA published small heads'
 
 python -m unittest discover -s zig/pkg/inference/scripts/gliner25 -p test_cuda_contract.py
 ```
@@ -169,7 +169,7 @@ the diagnostic worker with the same backend flags:
 
 ```sh
 zig build --build-file zig/pkg/inference/build.zig bench-gliner25-cuda-training-build \
-  -Doptimize=ReleaseFast -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false
+  -Doptimize=fast -Dcuda=true -Dmetal=false -Donnx=false -Dpjrt=false
 
 python zig/pkg/inference/scripts/gliner25/benchmark_training_cuda.py \
   --native-bin zig/pkg/inference/zig-out/bin/antfly-inference-gliner25-cuda-training-bench \

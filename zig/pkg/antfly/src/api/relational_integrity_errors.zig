@@ -56,24 +56,24 @@ pub const Error = error{
 };
 
 pub fn classify(err: anyerror) ?Error {
-    inline for (@typeInfo(Error).error_set.?) |field| {
-        const candidate = @field(Error, field.name);
+    inline for (@typeInfo(Error).error_set.error_names.?) |field| {
+        const candidate = @field(Error, field);
         if (err == candidate) return candidate;
     }
     return null;
 }
 
 pub fn decode(bytes: []const u8) ?Error {
-    inline for (@typeInfo(Error).error_set.?) |field| {
-        if (@import("std").mem.eql(u8, bytes, field.name)) return @field(Error, field.name);
+    inline for (@typeInfo(Error).error_set.error_names.?) |field| {
+        if (@import("std").mem.eql(u8, bytes, field)) return @field(Error, field);
     }
     return null;
 }
 
 test "relational participant conflicts retain stable typed reasons" {
     const testing = @import("std").testing;
-    inline for (@typeInfo(Error).error_set.?) |field| {
-        const err = @field(Error, field.name);
+    inline for (@typeInfo(Error).error_set.error_names.?) |field| {
+        const err = @field(Error, field);
         try testing.expectEqual(err, classify(err).?);
         try testing.expectEqual(err, decode(@errorName(err)).?);
     }

@@ -237,7 +237,7 @@ test "partition census owns bounded checkpoints without replaying accumulated bo
         writes: usize = 0,
         reads: usize = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var entries = self.values.iterator();
             while (entries.next()) |entry| {
                 std.testing.allocator.free(entry.key_ptr.*);

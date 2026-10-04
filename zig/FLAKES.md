@@ -1513,7 +1513,7 @@ The same handoff probe after the fix measured **6 microseconds average / 20 wors
 for the bound lock (unbound: 7 / 29). Four snapshot admission tests pass. The
 14-test lock suite passed 200/200 fresh processes (2,800 test executions),
 including four million writes across the native bound/unbound exclusion test.
-`zig build vopr-runtime-test -Doptimize=ReleaseSafe -j1` also passes: 18
+`zig build vopr-runtime-test -Doptimize=safe -j1` also passes: 18
 storage/runtime adapter tests and seven DataServer tests, with no skips or leaks.
 
 ## 2026-09-15: multi-node Autograph promotion stalls with an untransportable read timeout
@@ -2269,7 +2269,7 @@ instrumentation. Evidence: `/private/tmp/ci694-db-core-fixed-validation`.
 Run the focused regression from `zig/`:
 
 ```sh
-zig build antfly-storage-db-test -Doptimize=Debug -- \
+zig build antfly-storage-db-test -Doptimize=debug -- \
   --test-filter 'db last external dense bulk lease finalizes covered rebuilding generations'
 ```
 
@@ -2550,7 +2550,7 @@ Regressions cover polling, cached retry, and an uncached durable record across
 successful deletion, failure before deletion, an unknown outcome after deletion,
 and leadership loss. They verify a changed request can reuse an expired key and
 creates exactly one durable job, history entry, and runnable item. Run
-`zig build antfly-api-restore-jobs-test -Doptimize=Debug`.
+`zig build antfly-api-restore-jobs-test -Doptimize=debug`.
 Short-lived E2E soaks do not exercise the retention boundary.
 
 Validation: **26 restore-store tests** (including the 12 fault combinations)
@@ -3658,7 +3658,7 @@ scripts/ci/zig-e2e-regression-loop.sh \
 ```
 
 On Linux, prefix the script with `taskset -c 0-7` when those CPUs are available.
-Build with `-Doptimize=ReleaseFast -Dstrip=false` for symbolized reproduction.
+Build with `-Doptimize=fast -Dstrip=false` for symbolized reproduction.
 Local investigation logs are retained under `/private/tmp/antfly-ci690-*`.
 
 Run the deterministic regressions from `zig/`:

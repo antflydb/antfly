@@ -22,7 +22,7 @@ const OwnedVectorSet = struct {
     count: usize,
     data: []f32,
 
-    fn deinit(self: *OwnedVectorSet, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *OwnedVectorSet, alloc: std.mem.Allocator) void {
         alloc.free(self.data);
         self.* = undefined;
     }

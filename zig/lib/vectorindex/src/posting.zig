@@ -641,7 +641,7 @@ fn getBatchVectorScratch(index: anytype, txn: anytype, vector_id: VectorId, scra
     return try index.getVectorScratch(txn, vector_id, scratch);
 }
 
-fn noteMutatedCachedQuantized(index: anytype, posting_id: PostingId) void {
+pub fn noteMutatedCachedQuantized(index: anytype, posting_id: PostingId) void {
     const Index = switch (@typeInfo(@TypeOf(index))) {
         .pointer => |ptr| ptr.child,
         else => @TypeOf(index),
@@ -655,7 +655,7 @@ pub const AssignmentMap = struct {
     pub fn put(index: anytype, txn: anytype, vector_id: VectorId, posting_id: PostingId) !void {
         var key_buf: [10]u8 = undefined;
         var val_buf: [8]u8 = undefined;
-        val_buf = @bitCast(std.mem.nativeToLittle(u64, posting_id));
+        val_buf = @bitCast(@as(u64, posting_id));
         try index.putNamespaced(txn, .vecs, hbc.encodeVecLeafKey(&key_buf, vector_id), &val_buf);
     }
 
@@ -774,11 +774,11 @@ test "posting centroid recompute uses batch transformed vector loader" {
         write_profile: Profile = .{},
         batch_calls: usize = 0,
 
-        fn hasExternalVectorLoader(_: *@This()) bool {
+        pub fn hasExternalVectorLoader(_: *@This()) bool {
             return true;
         }
 
-        fn loadPostingVectorsTransformed(self: *@This(), _: void, ids: []const u64, matrix: []f32) !void {
+        pub fn loadPostingVectorsTransformed(self: *@This(), _: void, ids: []const u64, matrix: []f32) !void {
             self.batch_calls += 1;
             for (ids, 0..) |id, i| {
                 if (self.config.metric == .cosine) {
@@ -848,7 +848,7 @@ test "quantized refresh uses batch transformed vector loader with options" {
         batch_calls: usize = 0,
         scalar_calls: usize = 0,
 
-        fn loadPostingVectorsTransformedWithOptions(
+        pub fn loadPostingVectorsTransformedWithOptions(
             self: *@This(),
             _: void,
             ids: []const u64,

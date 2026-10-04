@@ -220,7 +220,7 @@ const ManualRuntime = struct {
     backlog: backlog_tracker_mod.Tracker,
     workers: std.ArrayListUnmanaged(ManualWorker) = .empty,
 
-    fn deinit(self: *ManualRuntime) void {
+    pub fn deinit(self: *ManualRuntime) void {
         for (self.workers.items) |*worker| {
             self.alloc.free(worker.name);
         }

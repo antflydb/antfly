@@ -79,7 +79,7 @@ const Options = struct {
     labels: std.ArrayListUnmanaged([]const u8) = .empty,
     relation_labels: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    fn deinit(self: *Options, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.labels.deinit(allocator);
         self.relation_labels.deinit(allocator);
     }

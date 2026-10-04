@@ -162,7 +162,7 @@ pub const InitialGroupReservation = struct {
         @memcpy(bytes[0..4], magic);
         bytes[4] = version;
         bytes[5] = @intFromBool(self.canceled);
-        bytes[6] = @intFromEnum(self.retirement_scope);
+        bytes[6] = @backingInt(self.retirement_scope);
         @memcpy(bytes[8..24], &self.plan_id);
         std.mem.writeInt(u64, bytes[24..32], self.child_table_id, .little);
         std.mem.writeInt(u64, bytes[32..40], self.range_id, .little);
@@ -175,7 +175,7 @@ pub const InitialGroupReservation = struct {
 
     pub fn decode(bytes: []const u8) !@This() {
         if (bytes.len != encoded_len or !std.mem.eql(u8, bytes[0..4], magic) or bytes[4] != version or
-            bytes[5] > 1 or bytes[6] > @intFromEnum(InitialRetirementScope.hosted_store) or bytes[7] != 0) return error.InvalidGenerationPublication;
+            bytes[5] > 1 or bytes[6] > @backingInt(InitialRetirementScope.hosted_store) or bytes[7] != 0) return error.InvalidGenerationPublication;
         const id: Id = bytes[8..24].*;
         const table_id = std.mem.readInt(u64, bytes[24..32], .little);
         const range_id = std.mem.readInt(u64, bytes[32..40], .little);
@@ -185,7 +185,7 @@ pub const InitialGroupReservation = struct {
         var checksum: Digest = undefined;
         std.crypto.hash.Blake3.hash(bytes[0 .. encoded_len - 32], &checksum, .{});
         if (!std.mem.eql(u8, &checksum, bytes[encoded_len - 32 ..])) return error.InvalidGenerationPublication;
-        return .{ .plan_id = id, .child_table_id = table_id, .range_id = range_id, .plan_digest = digest, .retirement_scope = @enumFromInt(bytes[6]), .canceled = bytes[5] == 1 };
+        return .{ .plan_id = id, .child_table_id = table_id, .range_id = range_id, .plan_digest = digest, .retirement_scope = @fromBackingInt(bytes[6]), .canceled = bytes[5] == 1 };
     }
 };
 

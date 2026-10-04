@@ -128,7 +128,7 @@ pub const LevenshteinAutomaton = struct {
 
     fn startFn(self: *LevenshteinAutomaton) usize {
         if (self.dfa_states.items.len > 0) return 0;
-        var initial = StateBitSet.initEmpty();
+        var initial = StateBitSet.empty;
         initial.set(0); // (pos=0, edits=0)
         const start_set = self.epsilonClosure(initial);
         return self.lookupOrInsert(start_set);
@@ -154,7 +154,7 @@ pub const LevenshteinAutomaton = struct {
 
         const current = self.dfa_states.items[state];
         const d: usize = @as(usize, self.max_distance) + 1;
-        var next = StateBitSet.initEmpty();
+        var next = StateBitSet.empty;
 
         var it = current.iterator(.{});
         while (it.next()) |idx| {

@@ -57,7 +57,7 @@ pub const Source = struct {
     /// makes its own mutable copies of selected trainables.
     parameters: []run.Parameter = &.{},
     parameter_count: usize = 0,
-    blobs: [5]?Blob = .{null} ** 5,
+    blobs: [5]?Blob = @splat(null),
     header: ?safetensors.Header = null,
     tokenizer_owner: ?*HfTokenizer = null,
 
@@ -243,7 +243,7 @@ fn validateOptions(options: Options) !void {
 }
 
 const Opened = struct {
-    files: [5]?std.Io.File = .{null} ** 5,
+    files: [5]?std.Io.File = @splat(null),
     sizes: [5]usize = undefined,
     stats: [5]std.Io.File.Stat = undefined,
 
@@ -266,7 +266,7 @@ const Opened = struct {
         _ = try calculateReservation(self.sizes, limits);
         return self;
     }
-    fn deinit(self: *Opened, io: std.Io) void {
+    pub fn deinit(self: *Opened, io: std.Io) void {
         for (self.files) |file| if (file) |opened| opened.close(io);
     }
 };
@@ -279,7 +279,7 @@ fn openFileNonblocking(directory: std.Io.Dir, name: []const u8, control: ?Contro
     // The current native training source profile is Linux/macOS.
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.UnsupportedBoundaryTrainingSourcePlatform;
     var buffer: [1024]u8 = undefined;
-    const name_z = try std.fmt.bufPrintZ(&buffer, "{s}", .{name});
+    const name_z = try std.fmt.bufPrintSentinel(&buffer, "{s}", .{name}, 0);
     const fd = try std.posix.openatZ(directory.handle, name_z, .{ .ACCMODE = .RDONLY, .CLOEXEC = true, .NONBLOCK = true, .NOCTTY = true }, 0);
     return .{ .handle = fd, .flags = .{ .nonblocking = true } };
 }
@@ -288,7 +288,7 @@ const Blob = struct {
     storage: []align(64) u8,
     bytes: []u8,
     digest: bundle.Digest,
-    fn deinit(self: *Blob, a: Allocator) void {
+    pub fn deinit(self: *Blob, a: Allocator) void {
         a.free(self.storage);
     }
 };
@@ -592,7 +592,7 @@ fn validateModernBertTokenizer(a: Allocator, bytes: []const u8, config_bytes: []
     if (added != .array) return error.InvalidBoundaryTrainingTokenizer;
     var seen = std.AutoHashMapUnmanaged(i64, void){};
     defer seen.deinit(a);
-    var marker_seen = [_]bool{false} ** markers.len;
+    var marker_seen = @as([markers.len]bool, @splat(false));
     for (added.array.items) |value| {
         try check(control);
         const token = try object(value);
@@ -879,7 +879,7 @@ test "boundary training source cancellation distinguishes allocator denial and f
 test "boundary training source admission includes tokenizer overhead and validates expected identity before IO" {
     const a = std.testing.allocator;
     const pin = bundle.Digest.of("source");
-    var identity = bundle.Identity{ .backbone = .small, .precision = .q4_0, .weight = pin, .sidecars = .{pin} ** 4 };
+    var identity = bundle.Identity{ .backbone = .small, .precision = .q4_0, .weight = pin, .sidecars = @splat(pin) };
     try std.testing.expectError(error.QuantizedBoundaryTrainingUnsupported, Source.open(a, @import("../../io/compat.zig").io(), "does-not-exist", .{ .expected_identity = identity }, null));
     identity.precision = .fp32;
     identity.weight.sha256[0] = 'z';
@@ -904,7 +904,7 @@ test "boundary training source rejects FIFO artifacts without waiting for a writ
     var directory_buffer: [256]u8 = undefined;
     const directory = try std.fmt.bufPrint(&directory_buffer, ".zig-cache/tmp/{s}", .{temporary.sub_path});
     var path_buffer: [512]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/model.safetensors", .{directory});
+    const path = try std.fmt.bufPrintSentinel(&path_buffer, "{s}/model.safetensors", .{directory}, 0);
     if (Posix.mkfifo(path, 0o600) != 0) return error.TestFifoCreationFailed;
     try std.testing.expectError(error.InvalidBoundaryTrainingSourceFile, reservation(compat.io(), directory, .{}, null));
 }

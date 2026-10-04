@@ -303,7 +303,7 @@ pub const Fixture = struct {
     pub const WorkCostPorts = struct {
         data: [node_count]data_runtime.DataServerWorkCostPort,
         graph: [node_count]api_distributed_graph.WorkCostPort,
-        query_cache: [node_count]?query_embedding_cache.WorkCostPort = .{null} ** node_count,
+        query_cache: [node_count]?query_embedding_cache.WorkCostPort = @splat(null),
     };
 
     /// Keeps production listeners, Raft drivers, and storage owners live until
@@ -361,38 +361,38 @@ pub const Fixture = struct {
     data_servers: [node_count]DataServer = undefined,
     join_lifecycle_observers: [node_count]JoinLifecycleObserver = undefined,
     data_server_count: usize = 0,
-    data_server_live: [node_count]bool = .{false} ** node_count,
+    data_server_live: [node_count]bool = @splat(false),
     data_raft_listeners: [node_count]raft_transport.HttpxRuntime = undefined,
     data_raft_listener_count: usize = 0,
-    data_raft_listener_live: [node_count]bool = .{false} ** node_count,
+    data_raft_listener_live: [node_count]bool = @splat(false),
     data_api_uris: [node_count][]u8 = undefined,
     data_api_uri_count: usize = 0,
-    data_api_uri_live: [node_count]bool = .{false} ** node_count,
-    data_api_ports: [node_count]u16 = .{0} ** node_count,
+    data_api_uri_live: [node_count]bool = @splat(false),
+    data_api_ports: [node_count]u16 = @splat(0),
     data_raft_uris: [node_count][]u8 = undefined,
     data_raft_uri_count: usize = 0,
-    data_raft_uri_live: [node_count]bool = .{false} ** node_count,
-    data_raft_ports: [node_count]u16 = .{0} ** node_count,
+    data_raft_uri_live: [node_count]bool = @splat(false),
+    data_raft_ports: [node_count]u16 = @splat(0),
     transition_routers: [node_count]api_table_router.CatalogBackedGroupRouter = undefined,
     transition_adapters: [node_count]hosted_shard_ops.HostedShardOperationAdapter = undefined,
-    transition_registrations: [node_count]?shard_ops.OwnedShardOperationAdapter.Registration = .{null} ** node_count,
+    transition_registrations: [node_count]?shard_ops.OwnedShardOperationAdapter.Registration = @splat(null),
     transition_registration_count: usize = 0,
     client: api_http_client.ApiHttpClient = undefined,
     tenant_client: api_http_client.ApiHttpClient = undefined,
     driver_future: ?std.Io.Future(void) = null,
     metadata_driver_future: ?std.Io.Future(void) = null,
-    raft_driver_futures: [node_count]?std.Io.Future(void) = .{null} ** node_count,
+    raft_driver_futures: [node_count]?std.Io.Future(void) = @splat(null),
     workload_future: ?std.Io.Future(void) = null,
     driver_stop: bool = false,
     control_driver_stop: bool = false,
     driver_done: bool = false,
-    raft_driver_done: [node_count]bool = .{false} ** node_count,
-    raft_driver_active: [node_count]bool = .{false} ** node_count,
-    data_server_paused: [node_count]bool = .{false} ** node_count,
+    raft_driver_done: [node_count]bool = @splat(false),
+    raft_driver_active: [node_count]bool = @splat(false),
+    data_server_paused: [node_count]bool = @splat(false),
     driver_failure: ?anyerror = null,
     driver_rounds: u64 = 0,
     metadata_recovery_campaigns: u64 = 0,
-    raft_driver_rounds: [node_count]u64 = .{0} ** node_count,
+    raft_driver_rounds: [node_count]u64 = @splat(0),
     control_requests: std.Io.Semaphore = .{},
     control_completions: std.Io.Semaphore = .{},
     control_round_active: bool = false,
@@ -419,8 +419,8 @@ pub const Fixture = struct {
     write_body_digests: [3]u64 = .{ 0, 0, 0 },
     write_attempts: [3]u64 = .{ 0, 0, 0 },
     write_outcome_unknowns: [3]u64 = .{ 0, 0, 0 },
-    request_lifecycle_counts: [std.meta.fields(data_runtime.DataRequestLifecyclePhase).len]u64 =
-        .{0} ** std.meta.fields(data_runtime.DataRequestLifecyclePhase).len,
+    request_lifecycle_counts: [std.meta.fieldNames(data_runtime.DataRequestLifecyclePhase).len]u64 =
+        @splat(0),
     last_request_lifecycle_group: u64 = 0,
     last_request_lifecycle_index: u64 = 0,
     last_request_lifecycle_phase: data_runtime.DataRequestLifecyclePhase = .routing_started,
@@ -653,7 +653,7 @@ pub const Fixture = struct {
     socket_pressure_error_code: u16 = 0,
     socket_pressure_no_ingress: bool = false,
     socket_pressure_recovered: bool = false,
-    resource_reservations: [node_count]?resource_manager.BatchReservation = .{null} ** node_count,
+    resource_reservations: [node_count]?resource_manager.BatchReservation = @splat(null),
     resource_pressure_observed: bool = false,
     resource_denial_sound: bool = false,
     resource_denial_status: u16 = 0,
@@ -1885,7 +1885,7 @@ pub const Fixture = struct {
         event: data_runtime.DataRequestLifecycleEvent,
     ) anyerror!void {
         const self: *Fixture = @ptrCast(@alignCast(raw));
-        self.request_lifecycle_counts[@intFromEnum(event.phase)] +|= 1;
+        self.request_lifecycle_counts[@backingInt(event.phase)] +|= 1;
         self.last_request_lifecycle_group = event.group_id;
         self.last_request_lifecycle_index = event.log_index;
         self.last_request_lifecycle_phase = event.phase;
@@ -4917,7 +4917,7 @@ pub const Fixture = struct {
         if (!self.resource_pressure_observed)
             return error.ProductionDataResourceEnvelopeNotSaturated;
 
-        const proposal_phase = @intFromEnum(data_runtime.DataRequestLifecyclePhase.proposal_accepted);
+        const proposal_phase = @backingInt(data_runtime.DataRequestLifecyclePhase.proposal_accepted);
         self.resource_proposals_before = self.request_lifecycle_counts[proposal_phase];
 
         var denied = try self.client.fetchBatchResponse(
@@ -7152,13 +7152,13 @@ pub const Fixture = struct {
             // witness so terminal observations can still prove that every
             // production node received its own resource owner.
             .node_resource_managers = self.backend_runtime_owners_started,
-            .hosts = if (@intFromEnum(self.phase) >= @intFromEnum(Phase.topology_ready)) 2 else 0,
+            .hosts = if (@backingInt(self.phase) >= @backingInt(Phase.topology_ready)) 2 else 0,
             .raft_wire_requests = self.final_raft_wire_requests,
         };
     }
 
     pub fn phaseOrdinal(self: *const Fixture) u8 {
-        return @intFromEnum(self.phase);
+        return @backingInt(self.phase);
     }
 
     pub fn metadataBootstrapPhaseOrdinal(self: *const Fixture) u8 {

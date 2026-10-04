@@ -20,11 +20,11 @@ pub const Result = struct { runs: [3]*std.Build.Step.Run, benchmark: *std.Build.
 pub fn add(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     imports: AntflyRootImports,
     vopr: *std.Build.Module,
     lmdb_engine: *std.Build.Module,
-    artifacts: [std.meta.fields(runtime.RuntimeLibraryUnit).len]?*std.Build.Step.Compile,
+    artifacts: [@typeInfo(runtime.RuntimeLibraryUnit).@"enum".field_names.len]?*std.Build.Step.Compile,
 ) Result {
     const owner_filter = b.option([]const u8, "storage-owner-test-filter", "Compile and run one matching storage owner test subset");
     const source_filter = b.option([]const u8, "storage-owner-source-test-filter", "Compile and run matching provisioned storage owner tests");
@@ -75,10 +75,10 @@ pub fn add(
             tests.executable.root_module.addObject(test_metadata.object);
             runs[index] = tests.run(b);
             if (index == 2) {
-                tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
+                tests.executable.root_module.linkLibrary(artifacts[@backingInt(runtime.RuntimeLibraryUnit.enrichment_compute)].?);
             } else {
                 inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-                    tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+                    tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
             }
         } else {
             test_metadata.link(module);
@@ -86,7 +86,7 @@ pub fn add(
         }
         if (index == 3) {
             inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-                module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+                module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
         }
     }
     const physical_module = b.createModule(.{
@@ -108,7 +108,7 @@ pub fn add(
     });
     handoff_tests.executable.root_module.addObject(test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-        handoff_tests.executable.root_module.linkLibrary(artifacts[@intFromEnum(@as(runtime.RuntimeLibraryUnit, unit))].?);
+        handoff_tests.executable.root_module.linkLibrary(artifacts[@backingInt(@as(runtime.RuntimeLibraryUnit, unit))].?);
     b.step("antfly-storage-owner-handoff-reopen-test", "Run physical shared-context owner handoff receipt reopen regression")
         .dependOn(&handoff_tests.run(b).step);
     return .{ .runs = runs, .benchmark = benchmark };

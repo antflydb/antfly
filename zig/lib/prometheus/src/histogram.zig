@@ -221,7 +221,7 @@ pub fn HistogramVec(comptime V: type, comptime L: type, comptime upper_bounds: [
                     }
                 }
 
-                fn getIndex(value: V) ?usize {
+                pub fn getIndex(value: V) ?usize {
                     for (upper_bounds, 0..) |upper, i| {
                         if (value <= upper) {
                             return i;

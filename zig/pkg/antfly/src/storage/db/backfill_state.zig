@@ -72,7 +72,7 @@ const DecodedLoadResult = union(enum) {
     corrupt,
     valid: DecodedCursor,
 
-    fn deinit(self: *DecodedLoadResult, alloc: Allocator) void {
+    pub fn deinit(self: *DecodedLoadResult, alloc: Allocator) void {
         switch (self.*) {
             .valid => |cursor| alloc.free(cursor.key),
             else => {},

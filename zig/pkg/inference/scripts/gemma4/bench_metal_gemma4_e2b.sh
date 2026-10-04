@@ -229,7 +229,7 @@ fi
 
 if [[ ! -x "$ANTFLY_BIN" ]]; then
   echo "antfly inference binary not executable: $ANTFLY_BIN" >&2
-  echo "build it first: cd zig/pkg/inference && zig build -Doptimize=ReleaseFast -Dmetal=true -Donnx=false -Dpjrt=false" >&2
+  echo "build it first: cd zig/pkg/inference && zig build -Doptimize=fast -Dmetal=true -Donnx=false -Dpjrt=false" >&2
   exit 2
 fi
 

@@ -1273,7 +1273,7 @@ const RowRefLookup = struct {
         return self;
     }
 
-    fn deinit(self: *RowRefLookup, alloc: Allocator) void {
+    pub fn deinit(self: *RowRefLookup, alloc: Allocator) void {
         self.map.deinit(alloc);
         self.* = undefined;
     }
@@ -1295,7 +1295,7 @@ const RowRefMatchMap = struct {
         return self;
     }
 
-    fn deinit(self: *RowRefMatchMap, alloc: Allocator) void {
+    pub fn deinit(self: *RowRefMatchMap, alloc: Allocator) void {
         self.map.deinit(alloc);
         self.* = undefined;
     }
@@ -1866,7 +1866,7 @@ test "lake rows materialize row refs independently of source batch lifetime" {
             };
         }
 
-        fn deinit(self: *@This(), a: Allocator) void {
+        pub fn deinit(self: *@This(), a: Allocator) void {
             if (self.key) |key| a.free(key);
             self.key = null;
         }

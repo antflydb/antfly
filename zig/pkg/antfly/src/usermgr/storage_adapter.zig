@@ -120,7 +120,7 @@ pub const StorageUserStore = struct {
         try txn.commit();
     }
 
-    fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
+    pub fn deleteUser(ptr: *anyopaque, username: []const u8) !bool {
         const self: *StorageUserStore = @ptrCast(@alignCast(ptr));
         var txn = try self.store.beginWrite();
         errdefer txn.abort();
@@ -186,7 +186,7 @@ pub const StorageUserStore = struct {
         try txn.commit();
     }
 
-    fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
+    pub fn deleteApiKey(ptr: *anyopaque, key_id: []const u8) !bool {
         const self: *StorageUserStore = @ptrCast(@alignCast(ptr));
         var txn = try self.store.beginWrite();
         errdefer txn.abort();
@@ -228,7 +228,7 @@ const OwnedPortableSeedEntry = struct {
     key_base64: []u8,
     value_base64: []u8,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.namespace);
         alloc.free(self.key_base64);
         alloc.free(self.value_base64);

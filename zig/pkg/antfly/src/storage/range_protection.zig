@@ -57,12 +57,12 @@ pub fn validateRequest(req: anytype) !void {
     if (req.range_guards.len != 0 and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
     if (!req.activate_range_tracking) return;
     const defaults: @TypeOf(req) = .{};
-    inline for (std.meta.fields(@TypeOf(req))) |field| {
-        if (comptime std.mem.eql(u8, field.name, "activate_range_tracking") or std.mem.eql(u8, field.name, "timestamp_ns") or std.mem.eql(u8, field.name, "sync_level") or std.mem.eql(u8, field.name, "schema_version")) continue;
-        const value = @field(req, field.name);
-        if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+    inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime std.mem.eql(u8, reflected_name, "activate_range_tracking") or std.mem.eql(u8, reflected_name, "timestamp_ns") or std.mem.eql(u8, reflected_name, "sync_level") or std.mem.eql(u8, reflected_name, "schema_version")) continue;
+        const value = @field(req, reflected_name);
+        if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
             if (value.len != 0) return error.InvalidBatchRequest;
-        } else if (!std.meta.eql(value, @field(defaults, field.name))) return error.InvalidBatchRequest;
+        } else if (!std.meta.eql(value, @field(defaults, reflected_name))) return error.InvalidBatchRequest;
     }
 }
 
@@ -164,7 +164,7 @@ pub fn generation(txn: anytype, id: u16) !?u64 {
 /// through the normal transaction wrapper but are not primary document keys.
 pub const Mutation = struct {
     active: ?bool = null,
-    touched: std.StaticBitSet(bucket_count) = .initEmpty(),
+    touched: std.StaticBitSet(bucket_count) = .empty,
 
     pub fn touch(self: *Mutation, txn: anytype, physical_key: []const u8) anyerror!void {
         const primary = keys.isStoredDocumentRowKey(physical_key);

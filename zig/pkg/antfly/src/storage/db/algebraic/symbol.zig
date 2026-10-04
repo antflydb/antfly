@@ -152,8 +152,8 @@ test "symbol shard merge keys ignore shard local id assignment" {
     const alloc = std.testing.allocator;
     const canonical = try token.canonicalTupleAlloc(alloc, &.{ "s", "alice" });
     defer alloc.free(canonical);
-    const local_a = [_]u8{1} ** id_len;
-    const local_b = [_]u8{2} ** id_len;
+    const local_a = @as([id_len]u8, @splat(1));
+    const local_b = @as([id_len]u8, @splat(2));
 
     const merge_a = try shardMergeKeyFromResolvedSymbolAlloc(alloc, local_a[0..], canonical);
     defer alloc.free(merge_a);

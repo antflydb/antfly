@@ -102,7 +102,7 @@ test "db graph endpoint cleanup pages HA denied owners reopen and replay without
             try db.core.store.invalidateGraphDirectories();
         }
         var gate: ha_public_gate_state_mod.State = .{};
-        gate.role.store(@intFromEnum(role), .release);
+        gate.role.store(@backingInt(role), .release);
         var reopened = try DB.open(alloc, directory.path(), .{ .replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } }, .start_optional_runtimes = false, .start_index_workers = false });
         defer reopened.close();
         try std.testing.expect(try reopened.core.store.hasGraphEndpointCleanup());
@@ -146,7 +146,7 @@ test "db graph endpoint cleanup pages HA promotion requires fresh owner generati
         try db.core.store.put(job, "hub");
     }
     var gate: ha_public_gate_state_mod.State = .{};
-    gate.role.store(@intFromEnum(ha_public_gate_state_mod.Role.standby), .release);
+    gate.role.store(@backingInt(ha_public_gate_state_mod.Role.standby), .release);
     const opts: OpenOptions = .{ .replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } }, .start_optional_runtimes = false, .start_index_workers = false };
     {
         var old_owner = try DB.open(alloc, directory.path(), opts);
@@ -206,7 +206,7 @@ test "db graph owner revival HA mirrors bounded checkpoints across restart and d
     var last_lsn = @import("antfly_platform").atomic.Value(u64).init(0);
     primary.local_execution.replication_async_batch_mirror = publisher_adapter.bindMirror(&stream, .{ .last_lsn = &last_lsn });
     var gate: ha_public_gate_state_mod.State = .{};
-    gate.role.store(@intFromEnum(ha_public_gate_state_mod.Role.standby), .release);
+    gate.role.store(@backingInt(ha_public_gate_state_mod.Role.standby), .release);
     const replica_options: OpenOptions = .{ .replication_write_gate = .{ .shared = .{ .state = gate.storageWriteState() } }, .start_optional_runtimes = false, .start_index_workers = false };
     replica.local_execution.replication_write_gate = replica_options.replication_write_gate;
     var pages: usize = 0;

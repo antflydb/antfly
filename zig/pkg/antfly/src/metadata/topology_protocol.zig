@@ -157,7 +157,7 @@ pub const RangeMembership = struct {
 
 pub const RangeMembershipAccumulator = struct {
     count: u64 = 0,
-    xor_digest: [range_membership_digest_len]u8 = [_]u8{0} ** range_membership_digest_len,
+    xor_digest: [range_membership_digest_len]u8 = @as([range_membership_digest_len]u8, @splat(0)),
 
     pub fn add(self: *@This(), range_group_id: u64) !void {
         if (self.count == std.math.maxInt(u64)) return error.RangeMembershipOverflow;

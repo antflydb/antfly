@@ -665,7 +665,7 @@ pub fn invokeInferenceProviderWithBinaryContext(
     const context = inference_bridge.ProviderInvokeContext{
         .abi_version = inference_bridge.abi_version,
         .handle = handle,
-        .operation = @intFromEnum(operation),
+        .operation = @backingInt(operation),
         .request_json = inference_bridge.String.init(request_json),
         .deadline_ns = effective_deadline_ns,
         .has_deadline = 1,

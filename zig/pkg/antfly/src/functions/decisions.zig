@@ -87,7 +87,11 @@ pub fn object(v: Json) !std.json.ObjectMap {
     return if (v == .object) v.object else error.InvalidDecisionSpecification;
 }
 pub fn put(a: std.mem.Allocator, v: *Json, name: []const u8, value: Json) !void {
-    try v.object.put(a, name, value);
+    if (v.object.getPtr(name)) |existing| {
+        existing.* = value;
+    } else {
+        try v.object.put(a, name, value);
+    }
 }
 pub fn jsonObject() Json {
     return .{ .object = .empty };
