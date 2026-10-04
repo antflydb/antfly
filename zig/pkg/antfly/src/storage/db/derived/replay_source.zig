@@ -597,39 +597,40 @@ fn primaryStoreCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator
     return collectEnrichmentDocumentGroups(Source.fromPrimaryStore(@ptrCast(@alignCast(ptr)), null, null), alloc, from_sequence);
 }
 
+const EnrichmentGroupContext = struct {
+    alloc: Allocator,
+    pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
+    scratch: *change_journal_mod.BorrowedBinaryRecordScratch,
+
+    fn consume(ctx_ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+        const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+        if (change_journal_mod.looksLikeBinaryRecord(payload)) {
+            const record = try change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(ctx.alloc, payload, ctx.scratch, .{
+                .deleted_doc_keys = false,
+                .overwritten_doc_keys = false,
+                .changed_artifact_keys = false,
+            });
+            defer ctx.scratch.trimRetainedCapacity(ctx.alloc, 64 * 1024);
+            if (!recordHasEnrichmentHint(record)) return;
+            // Retain only the returned group's unique keys; input payloads
+            // and scratch descriptors are borrowed through this callback.
+            for (record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+        } else {
+            var record = try change_journal_mod.decodeRecord(ctx.alloc, payload);
+            defer record.deinit();
+            if (!recordHasEnrichmentHint(record.record)) return;
+            for (record.record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+        }
+    }
+};
+
 fn collectEnrichmentDocumentGroups(replay_source: Source, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
     var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
     errdefer cleanupPendingDocumentGroupMap(alloc, &pending);
     var scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
     defer scratch.deinit(alloc);
-    const Context = struct {
-        alloc: Allocator,
-        pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
-        scratch: *change_journal_mod.BorrowedBinaryRecordScratch,
-
-        fn consume(ctx_ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
-            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            if (change_journal_mod.looksLikeBinaryRecord(payload)) {
-                const record = try change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(ctx.alloc, payload, ctx.scratch, .{
-                    .deleted_doc_keys = false,
-                    .overwritten_doc_keys = false,
-                    .changed_artifact_keys = false,
-                });
-                if (!recordHasEnrichmentHint(record)) return;
-                // Retain only the returned group's unique keys; input payloads
-                // and scratch descriptors are borrowed through this callback.
-                for (record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
-                ctx.scratch.trimRetainedCapacity(ctx.alloc, 64 * 1024);
-            } else {
-                var record = try change_journal_mod.decodeRecord(ctx.alloc, payload);
-                defer record.deinit();
-                if (!recordHasEnrichmentHint(record.record)) return;
-                for (record.record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
-            }
-        }
-    };
-    var ctx: Context = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch };
-    _ = try replay_source.forEachMatchingRecord(alloc, from_sequence, .enrichment, 0, &ctx, Context.consume);
+    var ctx: EnrichmentGroupContext = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch };
+    _ = try replay_source.forEachMatchingRecord(alloc, from_sequence, .enrichment, 0, &ctx, EnrichmentGroupContext.consume);
     return pendingDocumentGroupsToOwnedSlice(alloc, &pending);
 }
 
@@ -1576,4 +1577,25 @@ test "replay source enrichment duplicate updates at map capacity do not allocate
     try std.testing.expectEqual(@as(u32, 8), pending.capacity());
     try std.testing.expectError(error.OutOfMemory, appendPendingDocumentGroup(failing.allocator(), &pending, 300, "g"));
     try std.testing.expectEqual(@as(u32, 6), pending.count());
+}
+
+test "replay source enrichment trims oversized scratch on filtered callback exits" {
+    const alloc = std.testing.allocator;
+    var scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    defer cleanupPendingDocumentGroupMap(alloc, &pending);
+    var ctx: EnrichmentGroupContext = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch };
+    const keys = [_][]const u8{"ignored"} ** 8192;
+    const oversized = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = &keys, .target_hints = &.{.full_text} });
+    defer alloc.free(oversized);
+    // Production scanners normally filter this record before the callback.
+    // Cleanup remains bounded even if a source supplies it directly.
+    try EnrichmentGroupContext.consume(&ctx, 1, oversized);
+    try std.testing.expectEqual(@as(u32, 0), pending.count());
+    try std.testing.expect(scratch.retainedCapacityBytes() <= 64 * 1024);
+    const ordinary = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 2, .changed_doc_keys = &.{"doc"}, .target_hints = &.{.enrichment} });
+    defer alloc.free(ordinary);
+    try EnrichmentGroupContext.consume(&ctx, 2, ordinary);
+    try std.testing.expectEqual(@as(u64, 2), pending.get("doc").?.sequence);
 }

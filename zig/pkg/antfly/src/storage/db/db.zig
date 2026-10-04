@@ -73032,8 +73032,15 @@ fn appendUniqueBorrowedKeyWithSet(
     key: []const u8,
 ) !void {
     if (key.len == 0) return;
-    const entry = try seen.getOrPut(alloc, key);
+    // Preserve the normal insertion/probing path. At capacity, getOrPut can
+    // fail while trying to grow even for an existing key; a duplicate still
+    // needs no additional storage and may succeed under that pressure.
+    const entry = seen.getOrPut(alloc, key) catch |err| {
+        if (seen.contains(key)) return;
+        return err;
+    };
     if (entry.found_existing) return;
+    errdefer _ = seen.remove(key);
     try out.append(alloc, key);
 }
 
@@ -73262,6 +73269,22 @@ fn collectTextDocumentWritesForIndex(
     const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
     try result.docs.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, result.docs.items.len, available_values));
 
+    // Reserve only bounded batches consisting entirely of public document
+    // IDs. Mixed/internal batches keep lazy growth: exact reservations there
+    // reduced heap counters but regressed production-allocator timings.
+    if (pending.items.len >= 16 and pending.items.len <= 256) {
+        const ordinary_rows = count: {
+            var rows: usize = 0;
+            for (pending.items, read_values) |candidate, visible| {
+                if (internal_keys.isInternalUserKey(candidate.doc_key)) break :count 0;
+                if (visible != null) rows += 1;
+            }
+            break :count rows;
+        };
+        if (ordinary_rows >= 16)
+            try result.materialized_documents.ensureTotalCapacityPrecise(alloc, ordinary_rows);
+    }
+
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
             if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
@@ -73337,12 +73360,21 @@ fn textualAssetFullTextProjectionAlloc(
     key: []const u8,
     raw: []const u8,
 ) !?[]u8 {
-    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, key)) orelse return null;
-    defer {
-        alloc.free(parsed.doc_key);
-        alloc.free(parsed.artifact_name);
-    }
-    const enrichment = index_manager.getEnrichment(.asset, parsed.artifact_name) orelse return null;
+    const name_body = internal_keys.assetArtifactNameBody(key) orelse return null;
+    var name_buffer = std.heap.stackFallback(256, alloc);
+    const name_alloc = name_buffer.get();
+    var name_scratch = std.ArrayListUnmanaged(u8).empty;
+    defer name_scratch.deinit(name_alloc);
+    const name = (try internal_keys.decodeBodyView(name_body)) orelse blk: {
+        // Reserve once so short escaped names fit the bounded stack buffer.
+        // Longer names fall back to the caller's accounted allocator.
+        try name_scratch.ensureTotalCapacityPrecise(name_alloc, name_body.len);
+        break :blk try internal_keys.decodeBodyIntoList(&name_scratch, name_alloc, name_body);
+    };
+    const enrichment = index_manager.getEnrichment(.asset, name) orelse return null;
+    // The lookup borrows its name only for the call; release spill storage
+    // before allocating the projected value.
+    name_scratch.clearAndFree(name_alloc);
     if (assetContentTypeIsJson(enrichment.content_type)) return null;
 
     const field = if (enrichment.source_field.len > 0) enrichment.source_field else "text";
@@ -157843,7 +157875,7 @@ test "db generated write read fences detect artifact mutations and ABA independe
 
 test "db document lookup allocation benchmark" {
     const Counter = @import("../../allocation_bench_support.zig").Counter;
-    const Case = enum { short, long, missing, sparse, text, relational };
+    const Case = enum { short, long, missing, sparse, text, text_asset, text_asset_escaped, text_mixed, text_missing, delete_set, relational };
     const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
     const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
     const alloc = std.testing.allocator;
@@ -157857,7 +157889,8 @@ test "db document lookup allocation benchmark" {
     defer store.close();
     var directory = try TestDirectory.init("collector-benchmark");
     defer directory.cleanup();
-    var db: ?DB = if (fixture == .text or fixture == .relational) try DB.open(alloc, directory.path(), .{ .start_index_workers = false }) else null;
+    const text_fixture = fixture == .text or fixture == .text_asset or fixture == .text_asset_escaped or fixture == .text_mixed or fixture == .text_missing;
+    var db: ?DB = if (text_fixture or fixture == .relational) try DB.open(alloc, directory.path(), .{ .start_index_workers = false }) else null;
     defer if (db) |*database| database.close();
     const value = if (fixture == .sparse) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}" else "{\"title\":\"document value\"}";
     const relational_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":false}}}}";
@@ -157873,7 +157906,9 @@ test "db document lookup allocation benchmark" {
         defer parsed_value.deinit();
         packed_value = try mapper.buildRelationalRowValueForSchemaFromParsedAlloc(alloc, parsed_value.value, runtime_schema);
     }
-    if (fixture == .text) try db.?.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    if (text_fixture) try db.?.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const asset_name = if (fixture == .text_asset_escaped) "cap\x00tion" else "caption";
+    if (text_fixture) try db.?.addEnrichment(.{ .name = asset_name, .kind = .asset, .field = "caption", .content_type = "text/plain" });
     const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
     const names = try alloc.alloc([544]u8, count);
     defer alloc.free(names);
@@ -157891,11 +157926,13 @@ test "db document lookup allocation benchmark" {
             name[100] = 0;
             break :blk name[0..512];
         } else prefix;
-        doc.* = .{ .key = key, .action = .upsert, .targets = &targets };
-        write.* = .{ .key = try replayDocumentStoreKeyAlloc(alloc, key, fixture == .relational), .value = packed_value orelse value };
+        const is_asset = fixture == .text_asset or fixture == .text_asset_escaped or (fixture == .text_mixed and i % 8 == 0);
+        const stored_key = if (is_asset) try internal_keys.artifactNamedPrefixAlloc(alloc, key, "asset", asset_name) else try replayDocumentStoreKeyAlloc(alloc, key, fixture == .relational);
+        doc.* = .{ .key = if (is_asset) stored_key else key, .action = .upsert, .targets = &targets };
+        write.* = .{ .key = stored_key, .value = if (is_asset) "projected value" else packed_value orelse value };
         initialized += 1;
     }
-    const expected_count = if (fixture == .missing) count / 5 else count;
+    const expected_count = if (fixture == .missing or fixture == .text_missing) count / 5 else count;
     try store.putBatch(stored[0..expected_count], &.{});
     for (0..2) |measurement| {
         for (0..2) |sample| {
@@ -157907,7 +157944,21 @@ test "db document lookup allocation benchmark" {
             var offset: usize = 0;
             while (offset < count) {
                 const end = @min(count, offset + batch_size);
-                if (fixture == .sparse) {
+                if (fixture == .delete_set) {
+                    var keys = std.ArrayListUnmanaged([]const u8).empty;
+                    defer keys.deinit(run_alloc);
+                    var seen = std.StringHashMapUnmanaged(void).empty;
+                    defer seen.deinit(run_alloc);
+                    // Exactly six keys fill the default map's first load limit.
+                    const unique = @min(@as(usize, 6), end - offset);
+                    for (docs[offset..][0..unique]) |doc| try appendUniqueBorrowedKeyWithSet(run_alloc, &keys, &seen, doc.key);
+                    for (0..128) |_| for (docs[offset..][0..unique]) |doc| try appendUniqueBorrowedKeyWithSet(run_alloc, &keys, &seen, doc.key);
+                    try std.testing.expectEqual(unique, keys.items.len);
+                    for (keys.items) |key| for (key) |byte| {
+                        checksum +%= byte;
+                    };
+                    output_count += end - offset;
+                } else if (fixture == .sparse) {
                     var writes = try collectSparseFieldWritesProfiled(run_alloc, &store, null, docs[offset..end], .{ .start = "", .end = "" }, "vec", .{}, null);
                     defer writes.deinit();
                     try std.testing.expectEqual(end - offset, writes.items.len);
@@ -157918,13 +157969,14 @@ test "db document lookup allocation benchmark" {
                         for (write.doc_id) |byte| checksum +%= byte;
                     }
                     output_count += writes.items.len;
-                } else if (fixture == .text) {
+                } else if (text_fixture) {
                     var writes = try collectTextDocumentWritesForIndex(run_alloc, &store, db.?.core.index_manager, docs[offset..end], "text", false, .{ .start = "", .end = "" }, .{});
                     defer writes.deinit();
-                    try std.testing.expectEqual(end - offset, writes.docs.items.len);
-                    for (writes.docs.items, docs[offset..end]) |write, doc| {
+                    const available = @min(end, expected_count) -| offset;
+                    try std.testing.expectEqual(available, writes.docs.items.len);
+                    for (writes.docs.items, docs[offset..][0..available]) |write, doc| {
                         try std.testing.expectEqualStrings(doc.key, write.key);
-                        try std.testing.expectEqualStrings(value, write.value);
+                        try std.testing.expectEqualStrings(if (internal_keys.isAssetArtifactKey(doc.key)) "{\"caption\":\"projected value\"}" else value, write.value);
                         for (write.key) |byte| checksum +%= byte;
                     }
                     output_count += writes.docs.items.len;
@@ -157935,7 +157987,7 @@ test "db document lookup allocation benchmark" {
                     try std.testing.expectEqual(available, writes.items.len);
                     for (writes.items, docs[offset .. offset + available]) |write, doc| {
                         try std.testing.expectEqualStrings(doc.key, write.key);
-                        try std.testing.expectEqualStrings(value, write.value);
+                        try std.testing.expectEqualStrings(if (internal_keys.isAssetArtifactKey(doc.key)) "{\"caption\":\"projected value\"}" else value, write.value);
                         for (write.key) |byte| checksum +%= byte;
                     }
                     output_count += writes.items.len;
@@ -158004,4 +158056,74 @@ test "document collectors release text projections and materialized values on al
     };
     for ([_]bool{ false, true }) |inline_values|
         try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
+}
+
+test "document collectors duplicate delete keys at map capacity do not allocate" {
+    const alloc = std.testing.allocator;
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer keys.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }) |key|
+        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
+    try std.testing.expectEqual(@as(u32, 8), seen.capacity());
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    for (0..128) |_| try appendUniqueBorrowedKeyWithSet(failing.allocator(), &keys, &seen, "a");
+    try std.testing.expectEqual(@as(usize, 6), keys.items.len);
+    try std.testing.expectEqual(@as(u32, 8), seen.capacity());
+    try std.testing.expectError(error.OutOfMemory, appendUniqueBorrowedKeyWithSet(failing.allocator(), &keys, &seen, "g"));
+    try std.testing.expectEqual(@as(usize, 6), keys.items.len);
+}
+
+test "document collectors asset projection borrows ordinary names and preserves escaped names" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("asset-name-projection");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "json", .kind = .asset, .field = "caption", .content_type = "application/json" });
+    try db.addEnrichment(.{ .name = "cap\x00tion", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    const ordinary = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc\x00id", "asset", "json");
+    defer alloc.free(ordinary);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(?[]u8, null), try textualAssetFullTextProjectionAlloc(failing.allocator(), db.core.index_manager, ordinary, "{}"));
+    const escaped = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc\x00id", "asset", "cap\x00tion");
+    defer alloc.free(escaped);
+    var long_name = [_]u8{'x'} ** 512;
+    long_name[1] = 0;
+    const long_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", &long_name);
+    defer alloc.free(long_key);
+    try std.testing.expectError(error.OutOfMemory, textualAssetFullTextProjectionAlloc(failing.allocator(), db.core.index_manager, long_key, "value"));
+    try std.testing.expectEqual(@as(?[]u8, null), try textualAssetFullTextProjectionAlloc(alloc, db.core.index_manager, long_key, "value"));
+    const Check = struct {
+        fn run(a: Allocator, manager: *index_manager_mod.IndexManager, key: []const u8) !void {
+            const result = (try textualAssetFullTextProjectionAlloc(a, manager, key, "projected value")).?;
+            defer a.free(result);
+            try std.testing.expectEqualStrings("{\"caption\":\"projected value\"}", result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ db.core.index_manager, @as([]const u8, escaped) });
+}
+
+test "document collectors materialization hints exclude projected assets" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("text-materialization-hint");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "caption", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    const asset = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "caption");
+    defer alloc.free(asset);
+    const normal = try replayDocumentStoreKeyAlloc(alloc, "normal", false);
+    defer alloc.free(normal);
+    try db.core.store.putBatch(&.{ .{ .key = asset, .value = "projected value" }, .{ .key = normal, .value = "{\"title\":\"normal\"}" } }, &.{});
+    const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
+    var docs = [_]derived_types.DerivedDocument{.{ .key = asset, .action = .upsert, .targets = &targets }} ** 32;
+    docs[31].key = "normal";
+    var result = try collectTextDocumentWritesForIndex(alloc, db.core.store, db.core.index_manager, &docs, "text", false, .{ .start = "", .end = "" }, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 32), result.docs.items.len);
+    try std.testing.expectEqual(@as(usize, 1), result.materialized_documents.items.len);
+    try std.testing.expect(result.materialized_documents.capacity <= 8);
 }

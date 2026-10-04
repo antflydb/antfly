@@ -5593,6 +5593,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = db_test_mod,
         .filters = &.{
             "document collectors release",
+            "document collectors duplicate delete",
+            "document collectors asset projection",
+            "document collectors materialization hints",
             "collectDocumentWrites batches sorted document reads",
             "collectDocumentWrites skips missing out-of-range",
         },

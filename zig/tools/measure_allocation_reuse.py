@@ -43,7 +43,7 @@ def main():
     parser.add_argument('--vector-modes', nargs='+', choices=['ingest', 'retry', 'retry-mixed', 'session-only'], default=['ingest'])
     parser.add_argument('--document-lookup-only', action='store_true')
     parser.add_argument('--document-batches', nargs='+', type=int, default=[256])
-    parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'relational'], default=['short'])
+    parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'text_asset', 'text_asset_escaped', 'text_mixed', 'text_missing', 'delete_set', 'relational'], default=['short'])
     parser.add_argument('--ordinal-case', choices=['short', 'long', 'missing'], default='short')
     args = parser.parse_args()
     if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches, *args.document_batches, args.repetitions) <= 0:
@@ -135,10 +135,16 @@ def main():
                     results.append(dict(workload='document', source='primary', variant=variant, pair=pair, **data))
                 print(label, [(x['measurement'], x['elapsed_ns']) for x in measurements], flush=True)
                 save()
-    for workload, fixture in {(x['workload'], x.get('case', 'default')) for x in results if x['workload'] in ('replay', 'document')}:
-        checksums = {x['checksum'] for x in results if x['workload'] == workload and x.get('case', 'default') == fixture}
+    def checksum_fixture(x):
+        # The delete-set microbenchmark visits six keys per batch; its checksum
+        # intentionally depends on batch size. Ordinary document/replay sums
+        # remain invariant across batching.
+        return (x['workload'], x.get('case', 'default'), x['batch'] if x.get('case') == 'delete_set' else None)
+
+    for fixture in {checksum_fixture(x) for x in results if x['workload'] in ('replay', 'document')}:
+        checksums = {x['checksum'] for x in results if x['workload'] in ('replay', 'document') and checksum_fixture(x) == fixture}
         if len(checksums) > 1:
-            raise ValueError(f'baseline and candidate checksums differ for {workload}/{fixture}')
+            raise ValueError(f'baseline and candidate checksums differ for {fixture}')
     def measurement_mode(x, workload):
         measurement = x.get('measurement', 'counted')
         return measurement + ('-budgeted' if x.get('budgeted') else '-unbudgeted') if workload == 'replay' else measurement
