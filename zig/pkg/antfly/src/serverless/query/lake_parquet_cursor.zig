@@ -88,6 +88,7 @@ pub const Cursor = struct {
             const count: usize = parsed.header.value_count;
             if (count == 0 or column.first + count > self.group.row_count) return error.ParquetRowGroupRowCountMismatch;
             var limits = self.limits;
+            limits.decimal_representation = .exact_string;
             limits.max_decoded_bytes = self.limits.max_decoded_bytes / share - dictionary_bytes;
             limits.max_struct_allocation_bytes /= @max(@as(usize, 1), self.columns.len);
             limits.page_row_count = count;

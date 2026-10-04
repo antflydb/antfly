@@ -51,6 +51,13 @@ spill quota defaults to 1 GiB and 64 open files. Private files are immediately
 unlinked and close on success/error/cancellation. Small inputs keep the existing
 in-memory paths. The exact datum codec preserves integers and SQL/JSON nulls.
 
+Native SQL and public typed lake scans decode decimal columns as lossless,
+fixed-scale strings through precision 38. INT32/INT64 and binary/fixed binary
+(up to 16 bytes), nullable pages and cached dictionaries share exact integer
+formatting. The older row-scanner numeric contract remains an explicit decoding
+mode. Timestamp predicates normalize wire strings and numeric operands to exact
+signed epoch nanoseconds; canonical SQL projections preserve pre-1970 values.
+
 Table creation can infer and persist columns/fingerprints from every Parquet
 footer or the selected Iceberg schema. Inference preserves requiredness and
 rejects incompatible or unsupported flat types; nested/binary schemas need a

@@ -178,3 +178,124 @@ test "lake SQL inferred Parquet union supplies missing nullable columns and fenc
         _ = arena.reset(.free_all);
     }
 }
+
+test "lake SQL inferred decimal128 and signed timestamps execute through Parquet and Iceberg" {
+    const a = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("lake-exact-types");
+    defer directory.cleanup();
+    var filesystem = try @import("../storage/object_storage.zig").FilesystemObjectStorage.init(a, directory.path());
+    defer filesystem.deinit();
+    var client = filesystem.client();
+    var big: [16]u8 = undefined;
+    std.mem.writeInt(i128, &big, 99999999999999999999999999999999999999, .big);
+    const parquet = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64AndByteArrayParquetObjectAlloc(a, &.{
+        .{ .column_id = "ts", .field_id = 1, .converted_type = 9, .values = &.{ -1, 0, 1 } },
+        .{ .column_id = "price", .field_id = 2, .converted_type = 5, .decimal_precision = 18, .decimal_scale = 2, .values = &.{ 9007199254740993, -1, 12300 } },
+    }, &.{.{ .column_id = "big", .field_id = 3, .converted_type = 5, .decimal_precision = 38, .decimal_scale = 2, .values = &.{ &big, &big, &big } }});
+    defer a.free(parquet);
+    var put = try client.putObject("antfly", "part.parquet", parquet, .{});
+    put.deinit(a);
+    const iceberg = @import("../serverless/query/lake_iceberg_snapshot.zig");
+    const manifest = try iceberg.buildTestDataManifestAlloc(a, &.{.{ .path = "object://antfly/part.parquet", .rows = 3, .bytes = parquet.len }});
+    defer a.free(manifest);
+    const manifest_list = try iceberg.buildTestManifestListAlloc(a, "object://antfly/metadata/data.avro", manifest.len, 1, 3);
+    defer a.free(manifest_list);
+    const metadata_json = "{\"format-version\":2,\"table-uuid\":\"events\",\"location\":\"object://antfly\",\"schemas\":[{\"schema-id\":7,\"fields\":[{\"id\":1,\"name\":\"ts\",\"required\":true,\"type\":\"timestamptz\"},{\"id\":2,\"name\":\"price\",\"required\":true,\"type\":\"decimal(18, 2)\"},{\"id\":3,\"name\":\"big\",\"required\":true,\"type\":\"decimal(38, 2)\"}]}],\"current-schema-id\":7,\"current-snapshot-id\":12,\"snapshots\":[{\"snapshot-id\":12,\"sequence-number\":42,\"timestamp-ms\":1700000000000,\"manifest-list\":\"object://antfly/metadata/snap.avro\"}]}";
+    for ([_]struct { key: []const u8, bytes: []const u8 }{
+        .{ .key = "metadata/version-hint.text", .bytes = "1\n" },
+        .{ .key = "metadata/v1.metadata.json", .bytes = metadata_json },
+        .{ .key = "metadata/data.avro", .bytes = manifest },
+        .{ .key = "metadata/snap.avro", .bytes = manifest_list },
+    }) |object| {
+        put = try client.putObject("antfly", object.key, object.bytes, .{});
+        put.deinit(a);
+    }
+    const catalog = @import("../sql/catalog.zig");
+    const Backend = struct {
+        table: catalog.Table,
+        fn resolve(raw: *anyopaque, _: A, _: @import("../sql/ast.zig").Name, _: catalog.Action) !catalog.Table {
+            return (@as(*@This(), @ptrCast(@alignCast(raw)))).table;
+        }
+        fn open(raw: *anyopaque, alloc: A, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            _ = raw;
+            return try @import("lake_sql_cursor.zig").open(alloc, table, request, .{}, .{});
+        }
+        fn scan(_: *anyopaque, _: A, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedStatelessScan;
+        }
+        fn mutate(_: *anyopaque, _: A, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .execution_io = std.testing.io, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = open, .mutate = mutate, .checkpoint = checkpoint } };
+        }
+    };
+    for ([_][]const u8{ "parquet", "iceberg" }) |format| {
+        const input = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"{s}\",\"uri\":\"file://{s}\"}}}}", .{ format, directory.path() });
+        defer a.free(input);
+        const inferred = (try prepare(a, input, .{}, .{})).?;
+        defer a.free(inferred);
+        var schema_json = try std.json.parseFromSlice(std.json.Value, a, inferred, .{});
+        defer schema_json.deinit();
+        const properties = schema_json.value.object.get("document_schemas").?.object.get("row").?.object.get("schema").?.object.get("properties").?.object;
+        try std.testing.expectEqualStrings("datetime", properties.get("ts").?.object.get("type").?.string);
+        try std.testing.expectEqualStrings("string", properties.get("price").?.object.get("type").?.string);
+        try std.testing.expectEqualStrings("string", properties.get("big").?.object.get("type").?.string);
+        var binding = (try binding_api.externalBindingFromSchemaJsonAlloc(a, inferred)).?;
+        defer binding.deinit(a);
+        var owner: Backend = .{ .table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .external_base_source = binding, .columns = &.{
+            .{ .name = "ts", .path = "ts", .type = .datetime, .nullable = false },
+            .{ .name = "price", .path = "price", .type = .string, .nullable = false },
+            .{ .name = "big", .path = "big", .type = .string, .nullable = false },
+        } } };
+        const compiler = @import("../sql/compiler.zig");
+        const runtime = @import("../sql/runtime.zig");
+        var select = try compiler.compile(a, "SELECT price, big, ts FROM events ORDER BY ts", .{});
+        defer select.deinit();
+        var result = try runtime.execute(a, owner.backend(), &select, &.{}, .{});
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 3), result.output.rows.len);
+        try std.testing.expectEqualStrings("90071992547409.93", result.output.rows[0][0].string);
+        try std.testing.expectEqualStrings("999999999999999999999999999999999999.99", result.output.rows[0][1].string);
+        try std.testing.expectEqualStrings("1969-12-31T23:59:59.999000000Z", result.output.rows[0][2].string);
+        const stream = (try @import("../sql/read_stream.zig").Stream.open(a, owner.backend(), &select, &.{}, .{ .page_rows = 1 })).?;
+        defer stream.close();
+        var delivered: usize = 0;
+        while (true) {
+            var page = try stream.next(1);
+            defer page.deinit();
+            for (page.output.rows) |row| {
+                try std.testing.expectEqualStrings(result.output.rows[delivered][0].string, row[0].string);
+                try std.testing.expectEqualStrings(result.output.rows[delivered][1].string, row[1].string);
+                try std.testing.expectEqualStrings(result.output.rows[delivered][2].string, row[2].string);
+                delivered += 1;
+            }
+            if (page.exhausted) break;
+        }
+        try std.testing.expectEqual(@as(usize, 3), delivered);
+        const cases = [_]struct { predicate: []const u8, count: usize }{
+            .{ .predicate = "ts = '1970-01-01T01:00:00.001+01:00'", .count = 1 },
+            .{ .predicate = "ts <> '1970-01-01T00:00:00.001Z'", .count = 2 },
+            .{ .predicate = "ts < '1970-01-01'", .count = 1 },
+            .{ .predicate = "ts <= '1970-01-01'", .count = 2 },
+            .{ .predicate = "ts > '1970-01-01'", .count = 1 },
+            .{ .predicate = "ts >= '1970-01-01'", .count = 2 },
+            .{ .predicate = "price = '90071992547409.93'", .count = 1 },
+        };
+        for (cases) |case| {
+            const sql = try std.fmt.allocPrint(a, "SELECT price FROM events WHERE {s}", .{case.predicate});
+            defer a.free(sql);
+            var compiled = try compiler.compile(a, sql, .{});
+            defer compiled.deinit();
+            var filtered = try runtime.execute(a, owner.backend(), &compiled, &.{}, .{});
+            defer filtered.deinit();
+            try std.testing.expectEqual(case.count, filtered.output.rows.len);
+        }
+        var prepared = try compiler.compile(a, "SELECT price FROM events WHERE ts = $1", .{});
+        defer prepared.deinit();
+        var parameter_result = try runtime.execute(a, owner.backend(), &prepared, &.{.{ .string = "1969-12-31T23:59:59.999Z" }}, .{});
+        defer parameter_result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parameter_result.output.rows.len);
+    }
+}

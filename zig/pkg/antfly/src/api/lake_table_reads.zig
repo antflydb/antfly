@@ -76,7 +76,7 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("../sy
         const page = try cursor.next(cursor.ptr, a, remaining);
         defer page.deinit();
         for (page.rows) |row| {
-            if (!try matches(row, table, input_conditions)) continue;
+            if (!try matches(a, row, table, input_conditions)) continue;
             if (request.from.len != 0 and std.mem.order(u8, row.id, request.from) != .gt) continue;
             if (request.to.len != 0 and std.mem.order(u8, row.id, request.to) != .lt) continue;
             var projected = std.json.ObjectMap.empty;
@@ -90,11 +90,12 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("../sy
     return try output.toOwnedSlice();
 }
 
-fn matches(row: catalog.Row, table: catalog.Table, conditions: []const @import("antfly_metadata_openapi").types.RelationalRowCondition) !bool {
+fn matches(a: std.mem.Allocator, row: catalog.Row, table: catalog.Table, conditions: []const @import("antfly_metadata_openapi").types.RelationalRowCondition) !bool {
     for (conditions) |condition| {
-        const cell = try row.cell(condition.column);
-        var operand = condition.value orelse .null;
-        if (operand == .string and (try table.column(condition.column)).type == .integer) operand = .{ .integer = std.fmt.parseInt(i64, operand.string, 10) catch return error.InvalidQueryRequest };
+        const stored = try row.cell(condition.column);
+        const kind = (try table.column(condition.column)).type;
+        const cell: @import("../sql/scalar.zig").Datum = .{ .value = try @import("lake_values.zig").comparisonValue(a, stored.value, kind), .sql_null = stored.sql_null };
+        const operand = if (condition.op == .is_null or condition.op == .is_not_null) std.json.Value.null else try @import("lake_values.zig").comparisonValue(a, condition.value orelse .null, kind);
         const match = switch (condition.op) {
             .is_null => cell.sql_null,
             .is_not_null => !cell.sql_null,
@@ -119,4 +120,22 @@ fn matches(row: catalog.Row, table: catalog.Table, conditions: []const @import("
         if (!match) return false;
     }
     return true;
+}
+
+test "lake SQL public rows datetime equality and distinct predicates share normalized operands" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var object = std.json.ObjectMap.empty;
+    try object.put(a, "ts", .{ .integer = -1 });
+    const table: catalog.Table = .{ .id = 1, .physical_name = "events", .schema_version = 1, .columns = &.{.{ .name = "ts", .path = "ts", .type = .datetime }} };
+    const row: catalog.Row = .{ .id = "row", .version = 0, .value = .{ .object = object }, .sql_nulls = &.{false} };
+    const conditions = [_]@import("antfly_metadata_openapi").types.RelationalRowCondition{
+        .{ .column = "ts", .op = .eq, .value = .{ .string = "1970-01-01T00:59:59.999999999+01:00" } },
+        .{ .column = "ts", .op = .is_not_distinct, .value = .{ .integer = -1 } },
+    };
+    try std.testing.expect(try matches(a, row, table, &conditions));
+    const null_row: catalog.Row = .{ .id = "null", .version = 0, .value = .{ .object = std.json.ObjectMap.empty } };
+    try std.testing.expect(try matches(a, null_row, table, &.{.{ .column = "ts", .op = .is_not_distinct }}));
+    try std.testing.expect(!try matches(a, null_row, table, &conditions));
 }

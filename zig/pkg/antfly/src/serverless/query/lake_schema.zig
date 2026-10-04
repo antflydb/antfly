@@ -31,7 +31,10 @@ pub fn readFooter(a: A, reader: parquet.ObjectRangeReader, file: external.FileEn
 }
 pub fn parquetKind(column: metadata.SchemaColumn) ![]const u8 {
     if (column.nested) return error.UnsupportedExternalLakeSchemaType;
-    if (std.mem.eql(u8, column.logical_type, "decimal")) return "string"; // preserve decimal precision
+    if (std.mem.eql(u8, column.logical_type, "decimal")) {
+        @import("lake_decimal.zig").validate(column.decimal_precision, column.decimal_scale) catch return error.UnsupportedExternalLakeSchemaType;
+        return "string";
+    }
     if (std.mem.startsWith(u8, column.logical_type, "timestamp_")) return "datetime";
     if (column.logical_type.len != 0 and !std.mem.eql(u8, column.logical_type, "string")) return error.UnsupportedExternalLakeSchemaType;
     return switch (column.physical_type orelse return error.InvalidParquetMetadata) {
@@ -120,6 +123,14 @@ pub fn icebergSchema(a: A, bytes: []const u8, snapshot: ?[]const u8) !Detected {
     for (fields, columns) |field, *column| {
         if (std.mem.eql(u8, field.name, "_id") or std.mem.indexOfScalar(u8, field.name, '.') != null) return error.UnsupportedExternalLakeSchemaType;
         const kind: []const u8 = if (std.mem.eql(u8, field.type_name, "int") or std.mem.eql(u8, field.type_name, "long")) "integer" else if (std.mem.eql(u8, field.type_name, "float") or std.mem.eql(u8, field.type_name, "double")) "number" else if (std.mem.eql(u8, field.type_name, "boolean")) "boolean" else if (std.mem.eql(u8, field.type_name, "string") or std.mem.startsWith(u8, field.type_name, "decimal(")) "string" else if (std.mem.eql(u8, field.type_name, "timestamp") or std.mem.eql(u8, field.type_name, "timestamptz")) "datetime" else return error.UnsupportedExternalLakeSchemaType;
+        if (std.mem.startsWith(u8, field.type_name, "decimal(")) {
+            const params = std.mem.trim(u8, field.type_name[8..], " ");
+            if (!std.mem.endsWith(u8, params, ")")) return error.UnsupportedExternalLakeSchemaType;
+            const comma = std.mem.indexOfScalar(u8, params, ',') orelse return error.UnsupportedExternalLakeSchemaType;
+            const precision = std.fmt.parseInt(i32, std.mem.trim(u8, params[0..comma], " "), 10) catch return error.UnsupportedExternalLakeSchemaType;
+            const scale = std.fmt.parseInt(i32, std.mem.trim(u8, params[comma + 1 .. params.len - 1], " "), 10) catch return error.UnsupportedExternalLakeSchemaType;
+            @import("lake_decimal.zig").validate(precision, scale) catch return error.UnsupportedExternalLakeSchemaType;
+        }
         column.* = .{ .name = field.name, .kind = kind, .required = field.required };
     }
     const fingerprint = try iceberg.schemaFingerprintAlloc(owned, root.object, schema_id);

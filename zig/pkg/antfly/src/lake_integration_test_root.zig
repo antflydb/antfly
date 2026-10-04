@@ -15,6 +15,7 @@
 test {
     _ = @import("api/lake_sql_cursor.zig");
     _ = @import("api/lake_schema_detection.zig");
+    _ = @import("api/lake_table_reads.zig");
     _ = @import("serverless/query/lake_schema.zig");
     _ = @import("schema/mod.zig");
     _ = @import("serverless/query/lake_read_context.zig");

@@ -65,10 +65,11 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         if (condition.value == .integer or condition.value == .float) out.value = condition.value;
         if (condition.op == .is_null or condition.op == .is_not_null or std.mem.eql(u8, condition.column, "_id")) continue;
         const column = try table.column(condition.column);
+        out.value = try @import("lake_values.zig").comparisonValue(owned, out.value, column.type);
         const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
         const value: @FieldType(Predicate, "value") = switch (out.value) {
             .integer => |v| if (column.type == .integer or column.type == .datetime) .{ .integer = v } else continue,
-            .string => |v| if (column.type == .string) .{ .bytes = v } else if (column.type == .datetime) .{ .integer = std.math.cast(i64, @import("../datetime.zig").parseRfc3339ToSignedNs(v) orelse continue) orelse continue } else continue,
+            .string => |v| if (column.type == .string) .{ .bytes = v } else continue,
             .bool => |v| if (column.type == .boolean) .{ .boolean = v } else continue,
             else => continue,
         };

@@ -36,6 +36,9 @@ const snappy = @import("../../encoding/snappy.zig");
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 pub const MaterializationLimits = struct {
+    /// Legacy row scanners retain their approximate numeric contract. Native
+    /// SQL and public typed lake rows explicitly select lossless decimal text.
+    decimal_representation: enum { approximate_number, exact_string } = .approximate_number,
     /// Internal page cursor: physical rows represented by the supplied page.
     page_row_count: ?usize = null,
     max_rows: usize = 1_000_000,
@@ -1810,6 +1813,7 @@ const DecimalMode = struct {
     nullable: bool = false,
     dictionary: bool = false,
     scale: i32 = 0,
+    precision: i32 = 0,
     type_length: usize = 0,
 };
 
@@ -2075,10 +2079,19 @@ fn buildPlainI64RowGroupBatchAlloc(
                 },
             },
             .decimal => |decimal_mode| {
-                var decoded = try scanDecimalAsF64ColumnChunkAlloc(alloc, input.bytes, compression, decimal_mode, input.dictionary);
-                decoded_columns[idx] = .{ .f64 = decoded.values };
-                null_bitmaps[idx] = decoded.nulls;
-                decoded = undefined;
+                if (limits.decimal_representation == .exact_string) {
+                    // Admit the expanded text, slice/null directories and
+                    // temporary unscaled values before allocating output.
+                    const bytes_per_row = @sizeOf([]u8) + @sizeOf(i128) + 1 + @as(usize, @intCast(decimal_mode.precision)) + 3;
+                    if (row_count > (limits.max_decoded_bytes / projected_chunks.len) / bytes_per_row) return error.ParquetRowGroupTooLarge;
+                    const decoded = try scanDecimalAsStringsAlloc(alloc, input.bytes, compression, decimal_mode, input.dictionary);
+                    decoded_columns[idx] = .{ .bytes = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                } else {
+                    const decoded = try scanDecimalAsF64ColumnChunkAlloc(alloc, input.bytes, compression, decimal_mode, input.dictionary);
+                    decoded_columns[idx] = .{ .f64 = decoded.values };
+                    null_bitmaps[idx] = decoded.nulls;
+                }
             },
             .bool => |bool_mode| switch (bool_mode) {
                 .required => {
@@ -2994,8 +3007,7 @@ fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !Suppor
 }
 
 fn decimalModeForColumnChunk(chunk: external_source.ColumnChunk) !DecimalMode {
-    if (chunk.decimal_precision <= 0) return error.UnsupportedParquetPage;
-    if (chunk.decimal_scale < 0 or chunk.decimal_scale > chunk.decimal_precision) return error.UnsupportedParquetPage;
+    try @import("lake_decimal.zig").validate(chunk.decimal_precision, chunk.decimal_scale);
     const physical: DecimalPhysical = if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int32"))
         .int32
     else if (chunk.physical_type.len == 0 or std.ascii.eqlIgnoreCase(chunk.physical_type, "int64"))
@@ -3007,7 +3019,7 @@ fn decimalModeForColumnChunk(chunk: external_source.ColumnChunk) !DecimalMode {
     else
         return error.UnsupportedParquetPage;
     const type_length: usize = if (physical == .fixed_len_byte_array) blk: {
-        if (chunk.type_length <= 0 or chunk.type_length > 8) return error.UnsupportedParquetPage;
+        if (chunk.type_length <= 0 or chunk.type_length > 16) return error.UnsupportedParquetPage;
         break :blk @intCast(chunk.type_length);
     } else 0;
     if (chunk.encoding.len == 0 or std.ascii.eqlIgnoreCase(chunk.encoding, "plain")) {
@@ -3016,6 +3028,7 @@ fn decimalModeForColumnChunk(chunk: external_source.ColumnChunk) !DecimalMode {
             .nullable = chunk.nullable,
             .dictionary = false,
             .scale = chunk.decimal_scale,
+            .precision = chunk.decimal_precision,
             .type_length = type_length,
         };
     }
@@ -3027,6 +3040,7 @@ fn decimalModeForColumnChunk(chunk: external_source.ColumnChunk) !DecimalMode {
             .nullable = chunk.nullable,
             .dictionary = true,
             .scale = chunk.decimal_scale,
+            .precision = chunk.decimal_precision,
             .type_length = type_length,
         };
     }
@@ -3148,37 +3162,31 @@ fn scanDecimalInt64UnscaledAlloc(
     };
 }
 
-fn scanDecimalByteArrayUnscaledAlloc(
-    alloc: Allocator,
-    bytes: []const u8,
-    compression: parquet_page.CompressionCodec,
-    mode: DecimalMode,
-    dictionary: ?*const parquet_page.Dictionary,
-) !parquet_page.NullableI64Values {
-    const decoded = if (mode.dictionary) blk: {
-        if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.bytes, dictionary));
-        break :blk parquet_page.NullableByteArrayValues{
-            .values = try parquet_page.scanDictionaryByteArrayColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.bytes, dictionary)),
-            .nulls = &.{},
-        };
-    } else blk: {
-        if (mode.nullable) break :blk try parquet_page.scanOptionalPlainByteArrayColumnChunkAlloc(alloc, bytes, compression);
-        break :blk parquet_page.NullableByteArrayValues{
-            .values = try parquet_page.scanPlainByteArrayColumnChunkAlloc(alloc, bytes, compression),
-            .nulls = &.{},
-        };
-    };
-    return try decimalBytesToUnscaledI64Alloc(alloc, decoded);
+fn scanDecimalByteArrayUnscaledAlloc(alloc: Allocator, bytes: []const u8, compression: parquet_page.CompressionCodec, mode: DecimalMode, dictionary: ?*const parquet_page.Dictionary) !parquet_page.NullableI64Values {
+    return decimalBytesToUnscaledI64Alloc(alloc, try scanDecimalBytesAlloc(alloc, bytes, compression, mode, dictionary));
 }
-
-fn scanDecimalFixedLenByteArrayUnscaledAlloc(
-    alloc: Allocator,
-    bytes: []const u8,
-    compression: parquet_page.CompressionCodec,
-    mode: DecimalMode,
-    dictionary: ?*const parquet_page.Dictionary,
-) !parquet_page.NullableI64Values {
+fn scanDecimalFixedLenByteArrayUnscaledAlloc(alloc: Allocator, bytes: []const u8, compression: parquet_page.CompressionCodec, mode: DecimalMode, dictionary: ?*const parquet_page.Dictionary) !parquet_page.NullableI64Values {
     if (mode.type_length == 0 or mode.type_length > 8) return error.UnsupportedParquetPage;
+    return decimalBytesToUnscaledI64Alloc(alloc, try scanDecimalBytesAlloc(alloc, bytes, compression, mode, dictionary));
+}
+fn scanDecimalBytesAlloc(alloc: Allocator, bytes: []const u8, compression: parquet_page.CompressionCodec, mode: DecimalMode, dictionary: ?*const parquet_page.Dictionary) !parquet_page.NullableByteArrayValues {
+    if (mode.physical == .byte_array) {
+        const decoded = if (mode.dictionary) blk: {
+            if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.bytes, dictionary));
+            break :blk parquet_page.NullableByteArrayValues{
+                .values = try parquet_page.scanDictionaryByteArrayColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.bytes, dictionary)),
+                .nulls = &.{},
+            };
+        } else blk: {
+            if (mode.nullable) break :blk try parquet_page.scanOptionalPlainByteArrayColumnChunkAlloc(alloc, bytes, compression);
+            break :blk parquet_page.NullableByteArrayValues{
+                .values = try parquet_page.scanPlainByteArrayColumnChunkAlloc(alloc, bytes, compression),
+                .nulls = &.{},
+            };
+        };
+        return decoded;
+    }
+    if (mode.physical != .fixed_len_byte_array or mode.type_length == 0 or mode.type_length > 16) return error.UnsupportedParquetPage;
     const decoded = if (mode.dictionary) blk: {
         if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryFixedLenByteArrayColumnChunkAllocCached(alloc, bytes, compression, mode.type_length, try parquet_page.Dictionary.values(.bytes, dictionary));
         break :blk parquet_page.NullableByteArrayValues{
@@ -3192,9 +3200,40 @@ fn scanDecimalFixedLenByteArrayUnscaledAlloc(
             .nulls = &.{},
         };
     };
-    return try decimalBytesToUnscaledI64Alloc(alloc, decoded);
+    return decoded;
 }
-
+fn scanDecimalAsStringsAlloc(alloc: Allocator, bytes: []const u8, compression: parquet_page.CompressionCodec, mode: DecimalMode, dictionary: ?*const parquet_page.Dictionary) !parquet_page.NullableByteArrayValues {
+    const decimal = @import("lake_decimal.zig");
+    if (mode.physical == .int32 or mode.physical == .int64) {
+        var input = if (mode.physical == .int32) try scanDecimalInt32UnscaledAlloc(alloc, bytes, compression, mode, dictionary) else try scanDecimalInt64UnscaledAlloc(alloc, bytes, compression, mode, dictionary);
+        defer input.deinit(alloc);
+        const values = try alloc.alloc([]u8, input.values.len);
+        errdefer alloc.free(values);
+        var initialized: usize = 0;
+        errdefer for (values[0..initialized]) |value| alloc.free(value);
+        for (input.values, values, 0..) |value, *out, index| {
+            out.* = try decimal.formatAlloc(alloc, if (input.nulls.len != 0 and input.nulls[index] != 0) 0 else value, mode.precision, mode.scale);
+            initialized += 1;
+        }
+        const nulls = input.nulls;
+        input.nulls = &.{};
+        return .{ .values = values, .nulls = nulls };
+    }
+    var input = try scanDecimalBytesAlloc(alloc, bytes, compression, mode, dictionary);
+    defer input.deinit(alloc);
+    const values = try alloc.alloc([]u8, input.values.len);
+    errdefer alloc.free(values);
+    var initialized: usize = 0;
+    errdefer for (values[0..initialized]) |value| alloc.free(value);
+    for (input.values, values, 0..) |value, *out, index| {
+        const unscaled = if (input.nulls.len != 0 and input.nulls[index] != 0) 0 else try decimal.signedBigEndian(value);
+        out.* = try decimal.formatAlloc(alloc, unscaled, mode.precision, mode.scale);
+        initialized += 1;
+    }
+    const nulls = input.nulls;
+    input.nulls = &.{};
+    return .{ .values = values, .nulls = nulls };
+}
 fn decimalBytesToUnscaledI64Alloc(
     alloc: Allocator,
     decoded: parquet_page.NullableByteArrayValues,
@@ -3767,6 +3806,10 @@ fn appendOptionalDictionaryI64DataPageV2(
 }
 
 pub const TestPlainI64Column = struct {
+    converted_type: ?i32 = null,
+    decimal_precision: i32 = 0,
+    decimal_scale: i32 = 0,
+
     column_id: []const u8,
     values: []const i64,
     field_id: ?i32 = null,
@@ -3775,11 +3818,20 @@ pub const TestPlainI64Column = struct {
 };
 
 pub const TestPlainByteArrayColumn = struct {
+    field_id: ?i32 = null,
+    converted_type: ?i32 = null,
+    decimal_precision: i32 = 0,
+    decimal_scale: i32 = 0,
+
     column_id: []const u8,
     values: []const []const u8,
 };
 
 const TestColumnFooter = struct {
+    converted_type: ?i32 = null,
+    decimal_precision: i32 = 0,
+    decimal_scale: i32 = 0,
+
     column_id: []const u8,
     column_offset: usize,
     compressed_len: usize,
@@ -3873,6 +3925,16 @@ fn appendPlainI64FooterMetadata(
             try appendI32(out, alloc, 0);
             try appendField(out, alloc, &leaf_prev, 4, .binary);
             try appendBinary(out, alloc, column.column_id);
+            if (column.converted_type) |converted| {
+                try appendField(out, alloc, &leaf_prev, 6, .i32);
+                try appendI32(out, alloc, converted);
+                if (converted == 5) {
+                    try appendField(out, alloc, &leaf_prev, 7, .i32);
+                    try appendI32(out, alloc, column.decimal_scale);
+                    try appendField(out, alloc, &leaf_prev, 8, .i32);
+                    try appendI32(out, alloc, column.decimal_precision);
+                }
+            }
             if (column.field_id) |field_id| {
                 try appendField(out, alloc, &leaf_prev, 9, .i32);
                 try appendI32(out, alloc, field_id);
@@ -3904,7 +3966,7 @@ fn appendPlainI64FooterMetadata(
 
 fn footerSchemaHasFieldIds(columns: []const TestColumnFooter) bool {
     for (columns) |column| {
-        if (column.field_id != null) return true;
+        if (column.field_id != null or column.converted_type != null) return true;
     }
     return false;
 }
@@ -4004,6 +4066,9 @@ pub fn buildTestPlainI64ParquetObjectAlloc(alloc: Allocator, columns: []const Te
             .compressed_len = chunk.items.len,
             .uncompressed_len = chunk.items.len,
             .field_id = column.field_id,
+            .converted_type = column.converted_type,
+            .decimal_precision = column.decimal_precision,
+            .decimal_scale = column.decimal_scale,
             .min_i64 = if (column.write_statistics) std.mem.min(i64, column.values) else null,
             .max_i64 = if (column.write_statistics) std.mem.max(i64, column.values) else null,
         };
@@ -4062,6 +4127,9 @@ pub fn buildTestPlainI64AndByteArrayParquetObjectAlloc(
             .uncompressed_len = chunk.items.len,
             .physical_type = 2,
             .field_id = column.field_id,
+            .converted_type = column.converted_type,
+            .decimal_precision = column.decimal_precision,
+            .decimal_scale = column.decimal_scale,
         };
         try object.appendSlice(alloc, chunk.items);
     }
@@ -4072,6 +4140,10 @@ pub fn buildTestPlainI64AndByteArrayParquetObjectAlloc(
             .compressed_len = chunk.items.len,
             .uncompressed_len = chunk.items.len,
             .physical_type = 6,
+            .field_id = column.field_id,
+            .converted_type = column.converted_type,
+            .decimal_precision = column.decimal_precision,
+            .decimal_scale = column.decimal_scale,
         };
         try object.appendSlice(alloc, chunk.items);
     }
@@ -5652,6 +5724,23 @@ test "parquet row group batch dispatches decimal columns from inventory" {
     try std.testing.expectEqualSlices(f64, &[_]f64{ 12.34, -2.5, 0 }, owned.batch.columns[3].values.f64);
     try std.testing.expectEqualSlices(f64, &[_]f64{ 12.34, 0, -2.5 }, owned.batch.columns[4].values.f64);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 0, 1, 0 }, owned.batch.columns[4].nulls.bytes);
+
+    var exact = try buildSupportedI64RowGroupBatchAllocWithLimits(alloc, inventory, "part-a.parquet", 0, &.{
+        .{ .column_id = "price", .bytes = price_chunk.items },
+        .{ .column_id = "discount", .bytes = discount_chunk.items },
+        .{ .column_id = "tax", .bytes = tax_chunk.items },
+        .{ .column_id = "rebate", .bytes = rebate_chunk.items },
+        .{ .column_id = "fee", .bytes = fee_chunk.items },
+    }, .{ .decimal_representation = .exact_string });
+    defer exact.deinit(alloc);
+    try std.testing.expectEqualStrings("12.34", exact.batch.columns[0].values.bytes[0]);
+    try std.testing.expectEqualStrings("-2.50", exact.batch.columns[0].values.bytes[1]);
+    try std.testing.expectEqualStrings("1.250", exact.batch.columns[1].values.bytes[0]);
+    try std.testing.expectEqualStrings("0.75", exact.batch.columns[2].values.bytes[0]);
+    try std.testing.expectEqualStrings("12.34", exact.batch.columns[3].values.bytes[0]);
+    try std.testing.expectEqualStrings("-2.50", exact.batch.columns[4].values.bytes[2]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0 }, exact.batch.columns[1].nulls.bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0 }, exact.batch.columns[4].nulls.bytes);
 
     var plan = try planSupportedI64ObjectRangeRowGroupsAlloc(alloc, inventory, &[_][]const u8{ "price", "discount", "tax", "rebate", "fee" });
     defer plan.deinit(alloc);
@@ -9405,3 +9494,24 @@ pub const RefinementBenchmark = if (@import("builtin").is_test) struct {
         return .{ .ns = std.Io.Clock.now(.awake, io).nanoseconds - start, .peak = budget.peak, .checksum = checksum };
     }
 } else void;
+
+test "parquet exact decimal128 cached binary dictionaries preserve nulls and 38 digit values" {
+    const a = std.testing.allocator;
+    var positive: [16]u8 = undefined;
+    var negative: [16]u8 = undefined;
+    const n: i128 = 99999999999999999999999999999999999999;
+    std.mem.writeInt(i128, &positive, n, .big);
+    std.mem.writeInt(i128, &negative, -n, .big);
+    var entries = [_][]u8{ &positive, &negative };
+    const dictionary: parquet_page.Dictionary = .{ .bytes = &entries };
+    var page: std.ArrayListUnmanaged(u8) = .empty;
+    defer page.deinit(a);
+    try appendOptionalDictionaryI64DataPageV2(&page, a, &.{ 0, null, 1 }, 1, &.{ 3, 0b10 });
+    for ([_]DecimalPhysical{ .byte_array, .fixed_len_byte_array }) |physical| {
+        var decoded = try scanDecimalAsStringsAlloc(a, page.items, .uncompressed, .{ .physical = physical, .nullable = true, .dictionary = true, .type_length = 16, .precision = 38, .scale = 2 }, &dictionary);
+        defer decoded.deinit(a);
+        try std.testing.expectEqualStrings("999999999999999999999999999999999999.99", decoded.values[0]);
+        try std.testing.expectEqualStrings("-999999999999999999999999999999999999.99", decoded.values[2]);
+        try std.testing.expectEqualSlices(u8, &.{ 0, 1, 0 }, decoded.nulls);
+    }
+}

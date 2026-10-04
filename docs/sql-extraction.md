@@ -40,7 +40,11 @@ tables are supported. The discovered columns and fingerprint are persisted
 before catalog publication, so SQL Describe and Execute use stable types.
 
 Inference supports flat booleans, integers, floating-point numbers, UTF-8 strings,
-timestamps and decimal strings that preserve precision. Nested, binary and
+timestamps and decimal strings that preserve precision. Decimal values use exact
+integer-and-scale decoding up to precision 38, including 16-byte binary values,
+and retain trailing fractional zeros. They have SQL string semantics; casts to
+floating-point numbers are explicit. Timestamp filters compare exact signed
+epoch nanoseconds, accepting timezone offsets and dates before 1970. Nested, binary and
 unsupported logical types fail explicitly. Parquet inference needs a schema-bearing
 file. Missing optional columns become SQL NULL; incompatible types and missing
 required columns fail scans. New fields do not silently expand the catalog.
