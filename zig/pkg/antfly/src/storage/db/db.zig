@@ -50369,10 +50369,41 @@ pub const DB = struct {
         chunk_backed: bool,
     ) anyerror!types.SearchResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, chunk_backed, .{
+        // Managed chunkers may omit stored chunk payloads. Their vector
+        // member is backed by the embedding artifact, not that optional row.
+        // Keep this probe identity separate from the public source identity.
+        const embedding_name: ?[]const u8 = if (!chunk_backed) null else if (self.core.index_manager.denseIndex(req.index_name)) |entry|
+            if (entry.embedding_names.len == 0) entry.embedding_name orelse entry.config.name else null
+        else if (self.core.index_manager.sparseIndex(req.index_name)) |entry|
+            if (entry.embedding_names.len == 0) entry.embedding_name orelse entry.config.name else null
+        else
+            null;
+        const Presence = struct {
+            db: *DB,
+            name: []const u8,
+            fn keepOne(context: ?*anyopaque, a: Allocator, hit: types.SearchHit) anyerror!bool {
+                const mask = try keep(context, a, &.{hit});
+                defer a.free(mask);
+                return mask[0];
+            }
+            fn keep(context: ?*anyopaque, a: Allocator, hits: []const types.SearchHit) anyerror![]bool {
+                const active: *@This() = @ptrCast(@alignCast(context.?));
+                return filterPresentSearchHitsManyWithEmbedding(active.db, a, hits, active.name);
+            }
+        };
+        var presence = Presence{ .db = self, .name = embedding_name orelse "" };
+        const present = if (embedding_name != null)
+            try db_query_result_shape.filterVisibleSearchResult(alloc, raw, .{
+                .ctx = &presence,
+                .func = Presence.keepOne,
+                .filter_many = Presence.keep,
+            })
+        else
+            raw;
+        return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, present, chunk_backed, .{
             .ctx = self,
             .is_visible = if (chunk_backed) isVisibleSearchHitCallback else isVisibleNonChunkSearchHitCallback,
-            .filter_visible_many = filterStoredSearchCandidatesManyCallback,
+            .filter_visible_many = if (embedding_name != null) filterVisibleSearchHitsManyCallback else filterStoredSearchCandidatesManyCallback,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -63534,6 +63565,10 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
 }
 
 fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
+    return filterPresentSearchHitsManyWithEmbedding(self, alloc, hits, null);
+}
+
+fn filterPresentSearchHitsManyWithEmbedding(self: *DB, alloc: Allocator, hits: []const types.SearchHit, embedding_name: ?[]const u8) ![]bool {
     const keep = try alloc.alloc(bool, hits.len);
     errdefer alloc.free(keep);
     @memset(keep, true);
@@ -63552,6 +63587,8 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
         // artifact reference retains the member's authoritative stored key.
         const key = if (hit.artifact_ref) |artifact_ref|
             try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
+        else if (embedding_name) |name|
+            try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, name)
         else
             try encodeStoreLookupKeyAlloc(self, scratch, hit.id);
         try pending.append(scratch, .{ .key = key, .hit_index = i });
@@ -63567,7 +63604,8 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     for (pending.items, 0..) |item, i| keys[i] = item.key;
     var txn = try self.core.store.beginProbeTxn();
     defer txn.abort();
-    try txn.getManySorted(keys, values);
+    // Presence only needs the primary reference, not its decoded vector.
+    try txn.getManySortedPhysical(keys, values);
     for (pending.items, values) |item, value| if (value == null) {
         keep[item.hit_index] = false;
     };
@@ -107724,7 +107762,7 @@ test "db query drops full text hits whose stored document row was deleted direct
     defer remote_embedding_ref.deinit(alloc);
 
     const PresenceAllocationCheck = struct {
-        fn run(test_alloc: Allocator, active_db: *DB, remote_key: []u8, embedding_ref: types.ArtifactRef) !void {
+        fn run(test_alloc: Allocator, active_db: *DB, remote_key: []u8, source_key: []u8, embedding_ref: types.ArtifactRef) !void {
             const keep = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
                 .{ .id = @constCast("doc:a") },
                 .{ .id = @constCast("doc:b") },
@@ -107734,9 +107772,17 @@ test "db query drops full text hits whose stored document row was deleted direct
             });
             defer test_alloc.free(keep);
             try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, keep);
+            // A single managed vector source uses chunk metadata even when
+            // store_chunks is false. Its embedding is the persisted member.
+            const single = try filterPresentSearchHitsManyWithEmbedding(active_db, test_alloc, &.{
+                .{ .id = remote_key },
+                .{ .id = source_key },
+            }, "remote_dense");
+            defer test_alloc.free(single);
+            try std.testing.expectEqualSlices(bool, &.{ false, true }, single);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_embedding_ref });
+    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_source_key, remote_embedding_ref });
 
     // Presence is a candidate visibility rule, including IDs-only and count
     // requests. Apply it before offset/limit, and refill an orphaned top hit.
@@ -120665,6 +120711,7 @@ test "db encodeThinReplayRecordPayload omits an edges-only document from full-te
         false,
         null,
         null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -120706,6 +120753,7 @@ test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full
         &.{ true, true },
         51,
         false,
+        null,
         null,
         null,
     );
@@ -120756,6 +120804,7 @@ test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full
         &.{ true, true },
         51,
         true, // include_generated_enrichment_hint: a generated-enrichment target exists somewhere on the table.
+        null,
         null,
         null,
     );

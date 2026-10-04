@@ -1647,6 +1647,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     lib_bedrock_test_step.dependOn(&run_lib_bedrock_tests.step);
 
     const api_http_runtime_default_filters = [_][]const u8{
+        "storage-kernel query request preserves final projection while raw retrieval defers it",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
         "usermgr openapi module generates extractor surface for routed endpoints",
         "generated extractors: path param structs exist",
