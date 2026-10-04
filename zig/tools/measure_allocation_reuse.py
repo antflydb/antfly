@@ -6,6 +6,11 @@ Example:
     --baseline-bin ../.worktrees/baseline/zig/zig-out/bin \
     --candidate-bin zig-out/bin --output /tmp/allocation-comparison
 
+JSON document fixtures interpret --documents as renders, and --document-batches
+as numeric fields per render (json_numbers) or input media bytes (json_media).
+Fixture setup is outside measurement and uses the C allocator; measured document
+collectors use either the diagnostic counter or the production smp allocator.
+
 Replay counted timings include diagnostic counter overhead. Replay timing runs
 use the production smp allocator without counting. Vector timing runs disable
 counting and retain the benchmark's normal allocator. Heap counts are requested
@@ -47,7 +52,7 @@ def main():
     parser.add_argument('--vector-modes', nargs='+', choices=['ingest', 'retry', 'retry-mixed', 'session-only'], default=['ingest'])
     parser.add_argument('--document-lookup-only', action='store_true')
     parser.add_argument('--document-batches', nargs='+', type=int, default=[256])
-    parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'text_asset', 'text_asset_large', 'text_asset_escaped', 'text_mixed', 'text_missing', 'delete_set', 'relational'], default=['short'])
+    parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'text_asset', 'text_asset_large', 'text_asset_escaped', 'text_mixed', 'text_missing', 'delete_set', 'relational', 'json_numbers', 'json_media'], default=['short'])
     parser.add_argument('--ordinal-case', choices=['short', 'long', 'missing'], default='short')
     args = parser.parse_args()
     if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches, *args.document_batches, args.repetitions) <= 0:

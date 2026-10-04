@@ -57474,16 +57474,18 @@ fn appendJsonFieldString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), fir
 
 fn appendJsonFieldU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: u64) !void {
     try appendJsonFieldName(alloc, out, first, name);
-    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
-    defer alloc.free(rendered);
-    try out.appendSlice(alloc, rendered);
+    try appendJsonUnsigned(alloc, out, value);
 }
 
 fn appendJsonFieldUsize(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: usize) !void {
     try appendJsonFieldName(alloc, out, first, name);
-    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
-    defer alloc.free(rendered);
-    try out.appendSlice(alloc, rendered);
+    try appendJsonUnsigned(alloc, out, value);
+}
+
+fn appendJsonUnsigned(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !void {
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, out);
+    defer out.* = writer.toArrayList();
+    writer.writer.print("{d}", .{value}) catch return error.OutOfMemory;
 }
 
 fn appendJsonFieldBool(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: bool) !void {
@@ -57793,9 +57795,7 @@ fn documentExtractionManifestPayloadAlloc(
     try out.append(alloc, '[');
     for (failed_pages[0..failed_pages_len], 0..) |page, i| {
         if (i > 0) try out.append(alloc, ',');
-        const rendered_page = try std.fmt.allocPrint(alloc, "{d}", .{page});
-        defer alloc.free(rendered_page);
-        try out.appendSlice(alloc, rendered_page);
+        try appendJsonUnsigned(alloc, &out, page);
     }
     try out.append(alloc, ']');
     try appendJsonFieldBool(alloc, &out, &first, "ocr_failed_pages_truncated", ocr_failed_count > failed_pages_len);
@@ -62349,14 +62349,19 @@ fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template_mod.ContentPa
                 try out.append(alloc, '}');
             },
             .binary => |binary| {
-                const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
-                const encoded = try alloc.alloc(u8, encoded_len);
-                defer alloc.free(encoded);
-                _ = std.base64.standard.Encoder.encode(encoded, binary.data);
                 try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
                 try appendJsonString(alloc, &out, binary.mime_type);
                 try out.appendSlice(alloc, ",\"data\":");
-                try appendJsonString(alloc, &out, encoded);
+                // Standard base64 has no JSON escape characters. Encode into
+                // the final owned buffer after reserving the complete suffix.
+                const encoded_len = try std.math.mul(usize, (try std.math.add(usize, binary.data.len, 2)) / 3, 4);
+                const suffix_len = try std.math.add(usize, encoded_len, 2);
+                try out.ensureUnusedCapacity(alloc, suffix_len);
+                out.appendAssumeCapacity('"');
+                const offset = out.items.len;
+                out.items.len += encoded_len;
+                _ = std.base64.standard.Encoder.encode(out.items[offset..], binary.data);
+                out.appendAssumeCapacity('"');
                 try out.append(alloc, '}');
             },
         }
@@ -73153,6 +73158,9 @@ const CollectedTextDocumentWrites = struct {
     alloc: Allocator,
     docs: std.ArrayListUnmanaged(mapper.MapperDoc) = .empty,
     owned_values: std.ArrayListUnmanaged([]u8) = .empty,
+    // Exact-size batch ownership for ordinary store-backed JSON. Slices in
+    // docs remain stable after the read transaction and this result move.
+    document_bytes: []u8 = &.{},
     materialized_documents: std.ArrayListUnmanaged(index_manager_mod.IndexManager.MaterializedStoredDocument) = .empty,
     missing_required: usize = 0,
 
@@ -73161,10 +73169,15 @@ const CollectedTextDocumentWrites = struct {
         self.materialized_documents.deinit(self.alloc);
         for (self.owned_values.items) |value| self.alloc.free(value);
         self.owned_values.deinit(self.alloc);
+        self.alloc.free(self.document_bytes);
         self.docs.deinit(self.alloc);
         self.* = undefined;
     }
 };
+
+fn ordinaryTextDocument(doc_key: []const u8, store_key: []const u8) bool {
+    return !internal_keys.isInternalUserKey(doc_key) and !internal_keys.isRelationalRowKey(store_key);
+}
 
 fn collectTextDocumentWritesForIndex(
     alloc: Allocator,
@@ -73278,10 +73291,22 @@ fn collectTextDocumentWritesForIndex(
     const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
     try result.docs.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, result.docs.items.len, available_values));
 
-    // Reserve only bounded batches consisting entirely of public document
-    // IDs. Mixed/internal batches keep lazy growth: exact reservations there
-    // reduced heap counters but regressed production-allocator timings.
-    if (pending.items.len >= 16 and pending.items.len <= 256) {
+    // Read-transaction bytes cannot escape. Homogeneous ordinary batches
+    // share one exact-size slab. Mixed/internal batches keep lazy per-value
+    // ownership: the slab saved allocations there but regressed smp timings.
+    const document_bytes_len: ?usize = sizing: {
+        var bytes: usize = 0;
+        for (pending.items, read_values) |item, visible| {
+            if (!ordinaryTextDocument(item.doc_key, item.store_key)) break :sizing null;
+            if (visible) |value| bytes = try std.math.add(usize, bytes, value.len);
+        }
+        break :sizing bytes;
+    };
+    if (document_bytes_len) |bytes| {
+        if (bytes != 0) result.document_bytes = try alloc.alloc(u8, bytes);
+    } else if (pending.items.len >= 16 and pending.items.len <= 256) {
+        // Preserve the existing bounded reservation for public relational
+        // rows. Sorted mixed/internal batches normally exit on the first key.
         const ordinary_rows = count: {
             var rows: usize = 0;
             for (pending.items, read_values) |candidate, visible| {
@@ -73293,6 +73318,7 @@ fn collectTextDocumentWritesForIndex(
         if (ordinary_rows >= 16)
             try result.materialized_documents.ensureTotalCapacityPrecise(alloc, ordinary_rows);
     }
+    var document_bytes_offset: usize = 0;
 
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
@@ -73328,6 +73354,14 @@ fn collectTextDocumentWritesForIndex(
         // native materialization through the pinned schema-view set.
         if (read_values[i] == null) {
             try result.docs.append(alloc, .{ .key = item.doc_key, .value = value });
+            continue;
+        }
+
+        if (document_bytes_len != null) {
+            const owned = result.document_bytes[document_bytes_offset..][0..value.len];
+            @memcpy(owned, value);
+            document_bytes_offset += value.len;
+            try result.docs.append(alloc, .{ .key = item.doc_key, .value = owned, .source_bytes = owned.len });
             continue;
         }
 
@@ -157884,14 +157918,19 @@ test "db generated write read fences detect artifact mutations and ABA independe
 
 test "db document lookup allocation benchmark" {
     const Counter = @import("../../allocation_bench_support.zig").Counter;
-    const Case = enum { short, long, missing, sparse, text, text_asset, text_asset_large, text_asset_escaped, text_mixed, text_missing, delete_set, relational };
+    const Case = enum { short, long, missing, sparse, text, text_asset, text_asset_large, text_asset_escaped, text_mixed, text_missing, delete_set, relational, json_numbers, json_media };
     const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
     const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
-    const alloc = std.testing.allocator;
+    // Setup is outside measurement. Use the C allocator here to avoid
+    // debug-allocator bookkeeping dominating large fixture construction;
+    // measured collectors use the counter or production smp allocator.
+    const alloc = std.heap.c_allocator;
     const count = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_DOCUMENTS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 50_000;
     if (count == 0) return error.InvalidBenchmarkDocuments;
     const batch_size = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_BATCH")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 256;
     if (batch_size == 0) return error.InvalidBenchmarkBatch;
+    if (fixture == .json_numbers or fixture == .json_media)
+        return jsonOutputAllocationBenchmark(case_name, count, batch_size);
     var backend = mem_backend_mod.Backend.init(alloc, .{});
     defer backend.close();
     var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
@@ -158014,6 +158053,65 @@ test "db document lookup allocation benchmark" {
     }
 }
 
+fn renderJsonOutputBenchmark(alloc: Allocator, media: bool, batch: usize, data: []const u8) ![]u8 {
+    if (media) return contentPartsJsonAlloc(alloc, &.{.{ .binary = .{ .mime_type = "application/octet-stream", .data = data } }});
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    for (0..batch) |_| try appendJsonFieldU64(alloc, &out, &first, "number", std.math.maxInt(u64));
+    try out.append(alloc, '}');
+    return out.toOwnedSlice(alloc);
+}
+
+fn jsonOutputAllocationBenchmark(case_name: []const u8, count: usize, batch: usize) !void {
+    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const media = std.mem.eql(u8, case_name, "json_media");
+    // Setup is outside measurement. Use the C allocator here to avoid
+    // debug-allocator bookkeeping dominating large fixture construction;
+    // measured collectors use the counter or production smp allocator.
+    const alloc = std.heap.c_allocator;
+    const data = try alloc.alloc(u8, batch);
+    defer alloc.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate(i);
+    // Build the reference outside measurement using the independent stdlib
+    // formatter/encoder; benchmark verification covers the complete output.
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(alloc);
+    if (media) {
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(data.len));
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, data);
+        try expected.appendSlice(alloc, "[{\"type\":\"media\",\"mime_type\":\"application/octet-stream\",\"data\":\"");
+        try expected.appendSlice(alloc, encoded);
+        try expected.appendSlice(alloc, "\"}]");
+    } else {
+        try expected.append(alloc, '{');
+        for (0..batch) |i| {
+            if (i != 0) try expected.append(alloc, ',');
+            const number = try std.fmt.allocPrint(alloc, "\"number\":{d}", .{std.math.maxInt(u64)});
+            defer alloc.free(number);
+            try expected.appendSlice(alloc, number);
+        }
+        try expected.append(alloc, '}');
+    }
+    for (0..2) |measurement| for (0..2) |sample| {
+        var counter: Counter = .{};
+        const run_alloc = if (measurement == 0) counter.allocator() else std.heap.smp_allocator;
+        var checksum: u64 = 0;
+        const started = monotonicTimeNs();
+        for (0..count) |_| {
+            const output = try renderJsonOutputBenchmark(run_alloc, media, batch, data);
+            defer run_alloc.free(output);
+            try std.testing.expectEqualStrings(expected.items, output);
+            checksum +%= std.hash.Wyhash.hash(0, output);
+        }
+        const elapsed = monotonicTimeNs() - started;
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+        if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ case_name, count, batch, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
+    };
+}
+
 fn documentCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
     var writes = try collectDocumentWritesProfiled(alloc, store, null, documents, .{ .start = "", .end = "" }, .{ .prefer_available_inline_values = inline_values }, null);
     defer writes.deinit();
@@ -158045,7 +158143,11 @@ fn textCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, ma
     var result = try collectTextDocumentWritesForIndex(alloc, store, manager, documents, "text", false, .{ .start = "", .end = "" }, .{ .prefer_inline_when_store_tip_matches_sequence = if (inline_values) 0 else null });
     defer result.deinit();
     try std.testing.expectEqual(documents.len, result.docs.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, result.docs.items[0].value, "projected") != null);
+    for (result.docs.items) |doc| {
+        if (internal_keys.isAssetArtifactKey(doc.key)) {
+            try std.testing.expect(std.mem.indexOf(u8, doc.value, "projected") != null);
+        } else try std.testing.expectEqualStrings("{\"title\":\"normal\"}", doc.value);
+    }
 }
 
 test "document collectors release text projections and materialized values on allocation failures" {
@@ -158066,8 +158168,12 @@ test "document collectors release text projections and materialized values on al
         .{ .key = asset_key, .action = .upsert, .targets = &targets, .cleaned_value = "projected value" },
         .{ .key = "normal", .action = .upsert, .targets = &targets, .cleaned_value = "{\"title\":\"normal\"}" },
     };
-    for ([_]bool{ false, true }) |inline_values|
+    for ([_]bool{ false, true }) |inline_values| {
+        // Mixed batches exercise per-value ownership; ordinary batches also
+        // exhaust failures before and after the exact-size slab allocation.
         try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
+        try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, docs[1..]), inline_values });
+    }
 }
 
 test "document collectors duplicate delete keys survive growth failure at map capacity" {
@@ -158123,7 +158229,7 @@ test "document collectors asset projection borrows ordinary names and preserves 
     try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ db.core.index_manager, @as([]const u8, escaped) });
 }
 
-test "document collectors materialization hints exclude projected assets" {
+test "document collectors ordinary slab excludes projected assets" {
     const alloc = std.testing.allocator;
     var directory = try TestDirectory.init("text-materialization-hint");
     defer directory.cleanup();
@@ -158136,14 +158242,36 @@ test "document collectors materialization hints exclude projected assets" {
     const normal = try replayDocumentStoreKeyAlloc(alloc, "normal", false);
     defer alloc.free(normal);
     try db.core.store.putBatch(&.{ .{ .key = asset, .value = "projected value" }, .{ .key = normal, .value = "{\"title\":\"normal\"}" } }, &.{});
+    const empty = try replayDocumentStoreKeyAlloc(alloc, "empty", false);
+    defer alloc.free(empty);
+    const second = try replayDocumentStoreKeyAlloc(alloc, "second", false);
+    defer alloc.free(second);
+    try db.core.store.putBatch(&.{ .{ .key = empty, .value = "" }, .{ .key = second, .value = "{\"title\":\"second document\"}" } }, &.{});
     const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
     var docs = [_]derived_types.DerivedDocument{.{ .key = asset, .action = .upsert, .targets = &targets }} ** 32;
-    docs[31].key = "normal";
-    var result = try collectTextDocumentWritesForIndex(alloc, db.core.store, db.core.index_manager, &docs, "text", false, .{ .start = "", .end = "" }, .{});
+    docs[29].key = "normal";
+    docs[30].key = "empty";
+    docs[31].key = "second";
+    var result = try collectTextDocumentWritesForIndex(alloc, db.core.store, db.core.index_manager, docs[29..], "text", false, .{ .start = "", .end = "" }, .{});
     defer result.deinit();
-    try std.testing.expectEqual(@as(usize, 32), result.docs.items.len);
-    try std.testing.expectEqual(@as(usize, 1), result.materialized_documents.items.len);
-    try std.testing.expect(result.materialized_documents.capacity <= 8);
+    try std.testing.expectEqual(@as(usize, 3), result.docs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), result.materialized_documents.items.len);
+    try std.testing.expectEqualStrings("{\"title\":\"normal\"}{\"title\":\"second document\"}", result.document_bytes);
+    // The collector has already closed its read transaction. Replacing the
+    // source document must not change the returned owned slice.
+    try db.core.store.putBatch(&.{.{ .key = normal, .value = "{}" }}, &.{});
+    try std.testing.expectEqualStrings("{\"title\":\"normal\"}", result.docs.items[1].value);
+    try std.testing.expectEqualStrings("", result.docs.items[0].value);
+    try std.testing.expectEqualStrings("{\"title\":\"second document\"}", result.docs.items[2].value);
+    try std.testing.expectEqual(result.document_bytes.ptr, result.docs.items[1].value.ptr);
+    try std.testing.expectEqual(result.document_bytes.ptr + result.docs.items[1].value.len, result.docs.items[2].value.ptr);
+    var mixed = try collectTextDocumentWritesForIndex(alloc, db.core.store, db.core.index_manager, &docs, "text", false, .{ .start = "", .end = "" }, .{});
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(usize, 32), mixed.docs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), mixed.document_bytes.len);
+    try std.testing.expectEqual(@as(usize, 3), mixed.materialized_documents.items.len);
+    try std.testing.expectEqualStrings("{}", mixed.docs.items[30].value);
+    try std.testing.expectEqualStrings("{\"caption\":\"projected value\"}", mixed.docs.items[0].value);
 }
 
 test "document collectors JSON string writing preserves escaping and output ownership on failure" {
@@ -158170,4 +158298,50 @@ test "document collectors JSON string writing preserves escaping and output owne
     try appendJsonString(failing.allocator(), &output, "quote\" newline\n");
     try std.testing.expectEqualStrings("\"quote\\\" newline\\n\"", output.items);
     try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "document collectors JSON numeric fields preserve boundaries and ownership on failure" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(a);
+            try out.append(a, '{');
+            var first = true;
+            try appendJsonFieldU64(a, &out, &first, "zero", 0);
+            try appendJsonFieldU64(a, &out, &first, "max", std.math.maxInt(u64));
+            try appendJsonFieldUsize(a, &out, &first, "size", 42);
+            try out.append(a, '}');
+            try std.testing.expectEqualStrings("{\"zero\":0,\"max\":18446744073709551615,\"size\":42}", out.items);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try out.ensureTotalCapacityPrecise(std.testing.allocator, 128);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var first = true;
+    try appendJsonFieldU64(failing.allocator(), &out, &first, "number", std.math.maxInt(u64));
+    try std.testing.expectEqualStrings("\"number\":18446744073709551615", out.items);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "document collectors JSON media encoding preserves padding escaping and failure ownership" {
+    const Check = struct {
+        fn run(a: Allocator, data: []const u8, expected: []const u8) !void {
+            const result = try contentPartsJsonAlloc(a, &.{ .{ .text = "prefix\n" }, .{ .binary = .{ .mime_type = "quoted\"type", .data = data } }, .{ .media_url = "suffix" } });
+            defer a.free(result);
+            try std.testing.expectEqualStrings(expected, result);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var bytes: [16384]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 256, 16384 }) |len| {
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(len));
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, bytes[0..len]);
+        const expected = try std.fmt.allocPrint(alloc, "[{{\"type\":\"text\",\"text\":\"prefix\\n\"}},{{\"type\":\"media\",\"mime_type\":\"quoted\\\"type\",\"data\":\"{s}\"}},{{\"type\":\"media\",\"url\":\"suffix\"}}]", .{encoded});
+        defer alloc.free(expected);
+        try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ @as([]const u8, bytes[0..len]), @as([]const u8, expected) });
+    }
 }
