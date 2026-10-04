@@ -565,7 +565,11 @@ pub const Scenario = struct {
         var sim = try vopr.vopr_io.VoprIo.init(.{
             .seed = 0x52e5_50e5,
             .required = .of(&.{ .files, .sockets, .task_scheduling, .synchronization, .clock_read }),
-            .tasks = .{ .stack_size = 8 * 1024 * 1024, .max_tasks = 4 },
+            // Same production-shaped DB-campaign headroom as the other
+            // VoprIo configs that overflowed 8 MiB under Debug codegen
+            // (data/runtime.zig, vopr/db_index_races.zig); only 4 tasks are
+            // ever live here, so the extra headroom is cheap.
+            .tasks = .{ .stack_size = 32 * 1024 * 1024, .max_tasks = 4 },
             .files = .{ .max_open_handles = 8, .capacity_bytes = 1024 * 1024 },
             .network = .{ .max_sockets = 3, .stream_capacity = 128 },
         });

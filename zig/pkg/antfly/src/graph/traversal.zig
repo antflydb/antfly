@@ -20,7 +20,9 @@
 //!   - Optional path tracking
 
 const std = @import("std");
+const relationship_filter = @import("relationship_filter.zig");
 const Allocator = std.mem.Allocator;
+const paths_mod = @import("paths.zig");
 const platform_time = @import("antfly_platform").time;
 const graph_mod = @import("graph.zig");
 const Edge = graph_mod.Edge;
@@ -38,6 +40,7 @@ const edge_stream = @import("edge_stream.zig");
 // ============================================================================
 
 pub const TraversalRules = struct {
+    edge_filter: relationship_filter.Filter = .{},
     edge_types: []const []const u8 = &.{}, // empty = all types
     direction: EdgeDirection = .out,
     max_depth: u32 = 3,
@@ -95,7 +98,7 @@ pub const TraversalResult = struct {
     /// from distance for the legacy direct traversal response.
     total_weight: f64,
     path: ?[]const []const u8, // if include_paths
-    path_edges: ?[]const PathEdge = null,
+    path_edges: ?[]const paths_mod.PathEdge = null,
     /// Table of the reached node, when the edge that reached it declared a
     /// cross-table endpoint (`target_table` in its metadata). Owned.
     target_table: ?[]const u8 = null,
@@ -103,43 +106,25 @@ pub const TraversalResult = struct {
     retained_state_bytes: usize = 0,
 };
 
-/// Extract `target_table` from an edge's metadata JSON
-/// (`{"target_table":"entities",...}`) without a full parse. Returns a slice
-/// into `metadata`; caller copies it if it must outlive the edge.
-pub fn metadataTargetTable(metadata: []const u8) ?[]const u8 {
-    const marker = "\"target_table\":\"";
-    const start = std.mem.indexOf(u8, metadata, marker) orelse return null;
-    const value_start = start + marker.len;
-    const end = std.mem.indexOfScalarPos(u8, metadata, value_start, '"') orelse return null;
-    if (end == value_start) return null;
-    return metadata[value_start..end];
+pub const resolveAdjacent = @import("metadata_tables.zig").adjacent;
+pub const MetadataScratch = @import("metadata_tables.zig").Scratch;
+
+pub fn metadataTargetTable(scratch: *MetadataScratch, metadata: []const u8) !?[]const u8 {
+    return scratch.table(metadata, "target_table");
 }
 
-/// Extract `source_table` from an edge's metadata JSON — the resolved SOURCE
-/// endpoint's home table, written by the materializer alongside
-/// `target_table` so a backward arrival at the source keeps its qualified
-/// identity.
-pub fn metadataSourceTable(metadata: []const u8) ?[]const u8 {
-    const marker = "\"source_table\":\"";
-    const start = std.mem.indexOf(u8, metadata, marker) orelse return null;
-    const value_start = start + marker.len;
-    const end = std.mem.indexOfScalarPos(u8, metadata, value_start, '"') orelse return null;
-    if (end == value_start) return null;
-    return metadata[value_start..end];
+pub fn metadataSourceTable(scratch: *MetadataScratch, metadata: []const u8) !?[]const u8 {
+    return scratch.table(metadata, "source_table");
 }
 
-/// `metadataTargetTable` canonicalized against the index-owning table: a tag
-/// naming the owning table itself is the same namespace, not a cross-table
-/// node.
-fn canonicalMetadataTargetTable(rules: *const TraversalRules, metadata: []const u8) ?[]const u8 {
-    const table = metadataTargetTable(metadata) orelse return null;
+fn canonicalMetadataTargetTable(scratch: *MetadataScratch, rules: *const TraversalRules, metadata: []const u8) !?[]const u8 {
+    const table = try metadataTargetTable(scratch, metadata) orelse return null;
     if (rules.owning_table.len > 0 and std.mem.eql(u8, table, rules.owning_table)) return null;
     return table;
 }
 
-/// Backward-arrival counterpart: the SOURCE endpoint's canonicalized table.
-fn canonicalMetadataSourceTable(rules: *const TraversalRules, metadata: []const u8) ?[]const u8 {
-    const table = metadataSourceTable(metadata) orelse return null;
+fn canonicalMetadataSourceTable(scratch: *MetadataScratch, rules: *const TraversalRules, metadata: []const u8) !?[]const u8 {
+    const table = try metadataSourceTable(scratch, metadata) orelse return null;
     if (rules.owning_table.len > 0 and std.mem.eql(u8, table, rules.owning_table)) return null;
     return table;
 }
@@ -149,10 +134,10 @@ fn canonicalMetadataSourceTable(rules: *const TraversalRules, metadata: []const 
 // ============================================================================
 
 const TraversalAncestryNode = struct {
+    incoming_edge: ?paths_mod.PathEdge = null,
     key: []const u8,
     target_table: ?[]const u8,
     parent: ?*const TraversalAncestryNode,
-    incoming_edge: ?PathEdge,
 };
 
 /// Request-local traversal storage. Queue states borrow their identity and
@@ -178,14 +163,13 @@ const TraversalAncestry = struct {
         key: []const u8,
         target_table: ?[]const u8,
         parent: ?*const TraversalAncestryNode,
-        incoming_edge: ?PathEdge,
+        incoming_edge: ?paths_mod.PathEdge,
     ) !*const TraversalAncestryNode {
         var added = std.math.add(usize, @sizeOf(TraversalAncestryNode) + @sizeOf(QueueEntry), key.len) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         if (target_table) |table| added = std.math.add(usize, added, table.len) catch
             return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
-        if (incoming_edge) |edge| added = std.math.add(usize, added, try edgeOwnedBytes(edge)) catch
-            return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
+        if (incoming_edge) |edge| added = std.math.add(usize, added, paths_mod.pathEdgeOwnedBytes(edge)) catch return self.work_budget.exhaust(.retained_state_bytes, self.work_budget.max_retained_state_bytes);
         try self.work_budget.retainStateBytes(added);
         errdefer self.work_budget.releaseStateBytes(added);
 
@@ -193,7 +177,7 @@ const TraversalAncestry = struct {
         const owned_key = try arena_alloc.dupe(u8, key);
         const owned_table = if (target_table) |table| try arena_alloc.dupe(u8, table) else null;
         const node = try arena_alloc.create(TraversalAncestryNode);
-        node.* = .{ .key = owned_key, .target_table = owned_table, .parent = parent, .incoming_edge = if (incoming_edge) |edge| try cloneEdge(arena_alloc, edge) else null };
+        node.* = .{ .key = owned_key, .target_table = owned_table, .parent = parent, .incoming_edge = if (incoming_edge) |edge| try paths_mod.clonePathEdge(arena_alloc, edge) else null };
         self.retained_bytes += added;
         return node;
     }
@@ -253,8 +237,12 @@ pub fn traverseWithEdgeReader(
         work_budget_mod.default_max_explored_edges,
     );
     var effective_rules = rules;
+    effective_rules.edge_filter = try rules.edge_filter.prepare(alloc);
+    defer if (rules.edge_filter.prepared == null) effective_rules.edge_filter.releasePrepared(alloc);
     if (effective_rules.work_budget == null) effective_rules.work_budget = &local_work_budget;
     const work_budget = effective_rules.work_budget.?;
+    var filter_lease = try work_budget_mod.RetainedLease.init(work_budget, effective_rules.edge_filter.retainedBytes());
+    defer filter_lease.deinit();
     const returned_state_budget = rules.work_budget;
 
     var results = std.ArrayListUnmanaged(TraversalResult).empty;
@@ -345,6 +333,8 @@ pub fn traverseWithEdgeReader(
             const demand = if (effective_rules.result_admission == null and effective_rules.max_results != 0) effective_rules.max_results - pending_results else edge_stream.batch_records;
             const edges = try stream.nextBudget(work_budget, demand) orelse break;
             defer edge_reader.freeEdges(alloc, edges);
+            var table_scratch = MetadataScratch.init(alloc, work_budget);
+            defer table_scratch.deinit();
             try work_budget.consumeMaterializedEdges(edges);
 
             const admitted_edges = if (effective_rules.node_admission) |admission| blk: {
@@ -358,12 +348,11 @@ pub fn traverseWithEdgeReader(
                 try candidate_indexes.ensureTotalCapacity(alloc, edges.len);
                 try candidate_nodes.ensureTotalCapacity(alloc, edges.len);
                 for (edges, 0..) |edge, edge_index| {
-                    if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
-                    const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
-                    const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                        canonicalMetadataTargetTable(&effective_rules, edge.metadata)
-                    else
-                        canonicalMetadataSourceTable(&effective_rules, edge.metadata);
+                    if (!try shouldTraverseEdge(alloc, &effective_rules, &edge)) continue;
+                    const endpoint = try resolveAdjacent(&table_scratch, edge, current.ancestry.key, current.ancestry.target_table, if (effective_rules.owning_table.len > 0) effective_rules.owning_table else null, effective_rules.direction);
+                    if (!endpoint.connected) continue;
+                    const next_key = endpoint.key;
+                    const target_table = if (endpoint.table) |table| if (std.mem.eql(u8, table, effective_rules.owning_table)) null else table else null;
                     if (effective_rules.deduplicate and visited.contains(.{
                         .table = target_table,
                         .key = next_key,
@@ -372,9 +361,7 @@ pub fn traverseWithEdgeReader(
                     candidate_nodes.appendAssumeCapacity(.{
                         .key = next_key,
                         .table = target_table,
-                        .external = std.mem.eql(u8, next_key, edge.target) and
-                            (admission.external_targets or
-                                target_table != null),
+                        .external = target_table != null or (endpoint.direction != .in and admission.external_targets),
                     });
                 }
                 const candidate_mask = try admission.filterAlloc(alloc, candidate_nodes.items);
@@ -387,17 +374,16 @@ pub fn traverseWithEdgeReader(
             defer if (admitted_edges) |mask| alloc.free(mask);
 
             for (edges, 0..) |edge, edge_index| {
-                const next_key = if (std.mem.eql(u8, current.ancestry.key, edge.source)) edge.target else edge.source;
+                const endpoint = try resolveAdjacent(&table_scratch, edge, current.ancestry.key, current.ancestry.target_table, if (effective_rules.owning_table.len > 0) effective_rules.owning_table else null, effective_rules.direction);
+                if (!endpoint.connected) continue;
+                const next_key = endpoint.key;
 
                 if (admitted_edges) |mask| {
                     if (!mask[edge_index]) continue;
                 } else {
-                    if (!shouldTraverseEdge(&effective_rules, &edge)) continue;
+                    if (!try shouldTraverseEdge(alloc, &effective_rules, &edge)) continue;
                 }
-                const target_table = if (std.mem.eql(u8, next_key, edge.target))
-                    canonicalMetadataTargetTable(&effective_rules, edge.metadata)
-                else
-                    canonicalMetadataSourceTable(&effective_rules, edge.metadata);
+                const target_table = if (endpoint.table) |table| if (std.mem.eql(u8, table, effective_rules.owning_table)) null else table else null;
                 if (effective_rules.deduplicate and !try putVisitedRetained(
                     alloc,
                     &visited,
@@ -409,14 +395,17 @@ pub fn traverseWithEdgeReader(
                 const pending_states = queue.items.len - queue_head;
                 try work_budget.checkIntermediateStates(pending_states + 1, effective_rules.max_intermediate_states);
                 try work_budget.consumeNode();
-                const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry, if (effective_rules.include_paths) .{
+                const selected_edge: ?paths_mod.PathEdge = if (effective_rules.include_paths) .{
                     .source = edge.source,
                     .target = edge.target,
                     .edge_type = edge.edge_type,
+                    .edge_id = edge.edge_id,
+                    .owner_document = edge.owner_document,
                     .weight = edge.weight,
                     .metadata = edge.metadata,
-                    .traversal_direction = if (std.mem.eql(u8, current.ancestry.key, edge.source)) .out else .in,
-                } else null);
+                    .traversal_direction = endpoint.direction,
+                } else null;
+                const next_ancestry = try ancestry.append(next_key, target_table, current.ancestry, selected_edge);
                 const total_weight = current.total_weight + edge.weight;
                 if (!std.math.isFinite(total_weight)) return error.GraphPathWeightOverflow;
                 try queue.append(alloc, .{
@@ -469,26 +458,23 @@ fn traversalResultFromQueueEntry(
         alloc.free(items);
     };
     const path_edges = if (include_path) blk: {
-        const owned = try alloc.alloc(PathEdge, entry.depth);
-        var initialized: usize = 0;
+        const owned = try alloc.alloc(paths_mod.PathEdge, entry.depth);
+        var count: usize = 0;
         errdefer {
-            for (owned[owned.len - initialized ..]) |edge| freeEdge(alloc, edge);
+            for (owned[owned.len - count ..]) |edge| paths_mod.freePathEdgeAlloc(alloc, edge);
             alloc.free(owned);
         }
         var cursor: ?*const TraversalAncestryNode = entry.ancestry;
         while (cursor) |node| : (cursor = node.parent) {
             if (node.incoming_edge) |edge| {
-                owned[owned.len - initialized - 1] = try cloneEdge(alloc, edge);
-                initialized += 1;
+                owned[owned.len - count - 1] = try paths_mod.clonePathEdge(alloc, edge);
+                count += 1;
             }
         }
-        std.debug.assert(initialized == owned.len);
+        std.debug.assert(count == owned.len);
         break :blk owned;
     } else null;
-    errdefer if (path_edges) |edges| {
-        for (edges) |edge| freeEdge(alloc, edge);
-        alloc.free(edges);
-    };
+    errdefer if (path_edges) |edges| paths_mod.freePathEdgesAlloc(alloc, edges);
     const target_table = if (entry.ancestry.target_table) |table|
         try alloc.dupe(u8, table)
     else
@@ -516,7 +502,7 @@ fn traversalResultRetainedBytes(entry: QueueEntry, include_path: bool) !usize {
         var cursor: ?*const TraversalAncestryNode = entry.ancestry;
         while (cursor) |node| : (cursor = node.parent) {
             total = try std.math.add(usize, total, node.key.len);
-            if (node.incoming_edge) |edge| total = try std.math.add(usize, total, try edgeOwnedBytes(edge));
+            if (node.incoming_edge) |edge| total = try std.math.add(usize, total, paths_mod.pathEdgeOwnedBytes(edge));
         }
     }
     return total;
@@ -598,9 +584,11 @@ pub fn startNodeAdmittedWithEdgeReader(
         try edge_reader.getEdges(alloc, start_key, .in);
     defer edge_reader.freeEdges(alloc, incoming);
     if (work_budget) |budget| try budget.consumeMaterializedEdges(incoming);
+    var table_scratch = MetadataScratch.init(alloc, work_budget);
+    defer table_scratch.deinit();
     for (incoming) |edge| {
         if (std.mem.eql(u8, edge.target, start_key) and
-            (admission.external_targets or metadataTargetTable(edge.metadata) != null))
+            (admission.external_targets or (try metadataTargetTable(&table_scratch, edge.metadata)) != null))
         {
             return true;
         }
@@ -637,19 +625,20 @@ fn getEdgesForTraversalBudget(
     return try edge_reader.getEdges(alloc, key, rules.direction);
 }
 
-fn shouldTraverseEdge(rules: *const TraversalRules, edge: *const Edge) bool {
-    // Weight filter
-    if (rules.min_weight) |min_weight| if (edge.weight < min_weight) return false;
-    if (rules.max_weight) |max_weight| if (edge.weight > max_weight) return false;
-
-    // Edge type filter
+fn shouldTraverseEdge(alloc: Allocator, rules: *const TraversalRules, edge: *const Edge) !bool {
+    if (rules.min_weight) |bound| if (edge.weight < bound) return false;
+    if (rules.max_weight) |bound| if (edge.weight > bound) return false;
     if (rules.edge_types.len > 0) {
+        var matched = false;
         for (rules.edge_types) |et| {
-            if (std.mem.eql(u8, edge.edge_type, et)) return true;
+            if (std.mem.eql(u8, edge.edge_type, et)) {
+                matched = true;
+                break;
+            }
         }
-        return false;
+        if (!matched) return false;
     }
-    return true;
+    return rules.edge_filter.matchesWithBudget(alloc, edge.*, rules.work_budget);
 }
 
 test "traversal weight filters preserve explicit zero bounds" {
@@ -658,10 +647,10 @@ test "traversal weight filters preserve explicit zero bounds" {
     const negative = Edge{ .source = "a", .target = "b", .edge_type = "e", .weight = -0.1, .created_at = 0, .updated_at = 0, .metadata = "" };
     const max_zero = TraversalRules{ .max_weight = 0 };
     const min_zero = TraversalRules{ .min_weight = 0 };
-    try std.testing.expect(shouldTraverseEdge(&max_zero, &zero));
-    try std.testing.expect(!shouldTraverseEdge(&max_zero, &positive));
-    try std.testing.expect(shouldTraverseEdge(&max_zero, &negative));
-    try std.testing.expect(!shouldTraverseEdge(&min_zero, &negative));
+    try std.testing.expect(try shouldTraverseEdge(std.testing.allocator, &max_zero, &zero));
+    try std.testing.expect(!try shouldTraverseEdge(std.testing.allocator, &max_zero, &positive));
+    try std.testing.expect(try shouldTraverseEdge(std.testing.allocator, &max_zero, &negative));
+    try std.testing.expect(!try shouldTraverseEdge(std.testing.allocator, &min_zero, &negative));
 }
 
 /// Free traversal results.
@@ -671,10 +660,7 @@ fn freeResult(alloc: Allocator, result: TraversalResult) void {
         for (path) |key| alloc.free(key);
         alloc.free(path);
     }
-    if (result.path_edges) |edges| {
-        for (edges) |edge| freeEdge(alloc, edge);
-        alloc.free(edges);
-    }
+    if (result.path_edges) |edges| paths_mod.freePathEdgesAlloc(alloc, edges);
     if (result.target_table) |table| alloc.free(table);
     if (result.retained_budget) |budget| budget.releaseStateBytes(result.retained_state_bytes);
 }
@@ -912,7 +898,7 @@ test "local traversal expands through a cross-table node when opted in" {
         1.0,
         0,
         0,
-        "{\"target_table\":\"events\"}",
+        "{\"source_table\":\"entities\",\"target_table\":\"events\"}",
     );
 
     const results = try traverse(alloc, &graph, "doc:a", .{
@@ -1091,24 +1077,116 @@ test "traversal ancestry and returned paths share retained state budget" {
     try std.testing.expectEqual(@as(usize, 0), budget.retained_state_bytes);
 }
 
+test "traversal selected fact relationships are allocation failure safe" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .weight = 0.2, .metadata_json = "{\"fact\":1}" },
+        .{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "two", .owner_document = "fact:two", .weight = 0.9, .metadata_json = "{\"fact\":2}" },
+    }, &.{});
+    const Case = struct {
+        fn run(a: Allocator, index: *GraphIndex) !void {
+            const results = try traverse(a, index, "a", .{ .max_depth = 1, .include_paths = true, .deduplicate = false });
+            defer freeOwnedResults(a, results);
+            try std.testing.expectEqual(@as(usize, 2), results.len);
+            try std.testing.expectEqualStrings("one", results[0].path_edges.?[0].edge_id);
+            try std.testing.expectEqualStrings("two", results[1].path_edges.?[0].edge_id);
+            try std.testing.expectEqual(@as(f64, 0.2), results[0].path_edges.?[0].weight);
+            try std.testing.expectEqualStrings("fact:two", results[1].path_edges.?[0].owner_document);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.run, .{&graph});
+}
+
 fn edgeOwnedBytes(edge: PathEdge) !usize {
-    var total: usize = @sizeOf(PathEdge);
-    inline for (.{ "source", "target", "edge_type", "metadata" }) |field| total = try std.math.add(usize, total, @field(edge, field).len);
-    return total;
+    return paths_mod.pathEdgeOwnedBytes(edge);
 }
 fn cloneEdge(alloc: Allocator, edge: PathEdge) !PathEdge {
-    const source = try alloc.dupe(u8, edge.source);
-    errdefer alloc.free(source);
-    const target = try alloc.dupe(u8, edge.target);
-    errdefer alloc.free(target);
-    const kind = try alloc.dupe(u8, edge.edge_type);
-    errdefer alloc.free(kind);
-    const metadata = try alloc.dupe(u8, edge.metadata);
-    return .{ .source = source, .target = target, .edge_type = kind, .weight = edge.weight, .metadata = metadata, .traversal_direction = edge.traversal_direction };
+    return paths_mod.clonePathEdge(alloc, edge);
 }
 fn freeEdge(alloc: Allocator, edge: PathEdge) void {
-    alloc.free(edge.source);
-    alloc.free(edge.target);
-    alloc.free(edge.edge_type);
-    alloc.free(edge.metadata);
+    paths_mod.freePathEdgeAlloc(alloc, edge);
+}
+
+test "traversal decimal weight filters match public stored values" {
+    const alloc = std.testing.allocator;
+    var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "weights", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.addEdge("a", "b", "R", 0.1, 0, 0, "");
+    try graph.addEdge("a", "c", "R", 0.2, 0, 0, "");
+    for ([_]relationship_filter.Operator{ .eq, .lte }) |op| {
+        const results = try traverse(alloc, &graph, "a", .{
+            .max_depth = 1,
+            .include_paths = true,
+            .edge_filter = .{ .properties = &.{.{ .field = "/weight", .op = op, .value_json = "0.1" }} },
+        });
+        defer freeOwnedResults(alloc, results);
+        try std.testing.expectEqual(@as(usize, 1), results.len);
+        try std.testing.expectEqualStrings("b", results[0].key);
+        try std.testing.expectEqual(@as(f64, 0.1), results[0].path_edges.?[0].weight);
+    }
+}
+
+test "graph endpoint routing ignores nested tags and decodes forward and reverse identities" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { metadata: []const u8, source_table: ?[]const u8, target_table: ?[]const u8 }{
+        .{ .metadata = "{\"evidence\":{\"source_table\":\"wrong\",\"target_table\":\"wrong\"}}", .source_table = null, .target_table = null },
+        .{ .metadata = "{\"source_table\" : \"\\u0065ntities\",\"target_table\" : \"\\u0063ompanies\"}", .source_table = "entities", .target_table = "companies" },
+        .{ .metadata = "{\"source_table\":\"facts\",\"target_table\":\"facts\"}", .source_table = null, .target_table = null },
+    };
+    for (cases) |case| {
+        var graph = try graph_mod.GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+        defer graph.close();
+        try graph.batchApply(&.{.{ .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact", .metadata_json = case.metadata }}, &.{});
+        for ([_]bool{ false, true }) |reverse| {
+            const start = if (reverse) "b" else "a";
+            const end = if (reverse) "a" else "b";
+            const table = if (reverse) case.source_table else case.target_table;
+            const start_table = if (reverse) case.target_table else case.source_table;
+            const results = try traverse(alloc, &graph, start, .{ .direction = if (reverse) .in else .out, .max_depth = 1, .owning_table = start_table orelse "facts", .include_paths = true });
+            defer freeOwnedResults(alloc, results);
+            try std.testing.expectEqual(@as(usize, 1), results.len);
+            try std.testing.expectEqualStrings(end, results[0].key);
+            if (table) |name| try std.testing.expectEqualStrings(name, results[0].target_table.?) else try std.testing.expect(results[0].target_table == null);
+            const path = (try paths_mod.findShortestPath(alloc, &graph, start, end, .{ .direction = if (reverse) .in else .out, .owning_table = "facts", .source_table = start_table, .expand_cross_table_local = true })).?;
+            defer paths_mod.freePath(alloc, path);
+            if (table) |name| {
+                try std.testing.expectEqual(@as(usize, 2), path.node_tables.len);
+                try std.testing.expectEqualStrings(name, path.node_tables[1].?);
+            } else {
+                try std.testing.expect(path.node_tables.len == 0 or path.node_tables[1] == null);
+            }
+        }
+    }
+}
+
+test "graph equal-key cross-table reverse traversal preserves qualified paths" {
+    const alloc = std.testing.allocator;
+    var graph = try GraphIndex.openWithPrivateStores(alloc, "unused-out", "unused-in", "facts", .{ .reverse_backend = .mem });
+    defer graph.close();
+    try graph.batchApply(&.{
+        .{ .source = "same", .target = "same", .edge_type = "R", .edge_id = "one", .owner_document = "fact", .weight = 0.5, .metadata_json = "{\"source_table\":\"people\",\"target_table\":\"companies\"}" },
+    }, &.{});
+    const Admission = struct {
+        fn filter(_: ?*anyopaque, a: Allocator, nodes: []const NodeRef) ![]bool {
+            const mask = try a.alloc(bool, nodes.len);
+            errdefer a.free(mask);
+            for (nodes) |node| if (node.table != null) try std.testing.expect(node.external);
+            @memset(mask, true);
+            return mask;
+        }
+    };
+    for ([_]EdgeDirection{ .in, .both }) |direction| {
+        const results = try traverse(alloc, &graph, "same", .{ .direction = direction, .max_depth = 1, .owning_table = "companies", .include_paths = true, .node_admission = .{ .ctx = null, .filter_many = Admission.filter } });
+        defer freeOwnedResults(alloc, results);
+        var found = false;
+        for (results) |result| {
+            if (!std.mem.eql(u8, result.key, "same")) continue;
+            found = true;
+            try std.testing.expectEqualStrings("people", result.target_table.?);
+            try std.testing.expectEqual(EdgeDirection.in, result.path_edges.?[0].traversal_direction.?);
+        }
+        try std.testing.expect(found);
+    }
 }

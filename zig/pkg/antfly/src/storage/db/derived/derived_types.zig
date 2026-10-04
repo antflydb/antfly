@@ -140,6 +140,8 @@ pub fn deinitDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEd
     alloc.free(@constCast(write.source));
     alloc.free(@constCast(write.target));
     alloc.free(@constCast(write.edge_type));
+    if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+    if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
     if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
     if (write.owner.len > 0) alloc.free(@constCast(write.owner));
 }
@@ -149,6 +151,8 @@ pub fn deinitDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.Graph
     alloc.free(@constCast(delete.source));
     alloc.free(@constCast(delete.target));
     alloc.free(@constCast(delete.edge_type));
+    if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
+    if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
     if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
 }
 
@@ -252,6 +256,10 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdg
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, write.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, write.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, write.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata_json = if (write.metadata_json.len > 0)
         try alloc.dupe(u8, write.metadata_json)
     else
@@ -263,6 +271,8 @@ pub fn cloneDerivedGraphWrite(alloc: Allocator, write: graph_edge_types.GraphEdg
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = write.weight,
         .created_at = write.created_at,
         .updated_at = write.updated_at,
@@ -281,12 +291,18 @@ pub fn cloneDerivedGraphDelete(alloc: Allocator, delete: graph_edge_types.GraphE
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, delete.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, delete.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, delete.owner_document);
+    errdefer alloc.free(owner_document);
     const owner = if (delete.owner.len > 0) try alloc.dupe(u8, delete.owner) else "";
     return .{
         .index_name = index_name,
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .owner = owner,
     };
 }
@@ -452,7 +468,8 @@ const binary_magic = "ADLG";
 // v6 adds the graph mutation owner (entity-sourced relations,
 // zig/AUTOSCHEMA.md); older records decode with an empty owner, the legacy
 // source-is-owner shape.
-const binary_version: u16 = 7;
+const binary_version: u16 = 8;
+const relationship_binary_version: u16 = 8;
 const min_supported_binary_version: u16 = 2;
 
 pub fn encodeLogRecord(alloc: Allocator, batch: DerivedBatch) ![]u8 {
@@ -466,7 +483,17 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
     out.clearRetainingCapacity();
 
     try out.appendSlice(alloc, binary_magic);
-    try appendInt(out, alloc, u16, binary_version);
+    // Preserve main's owner/TTL v7 layout unless explicit relationships require v8.
+    var version: u16 = 7;
+    for (batch.graph_writes) |write| if (write.edge_id.len > 0 or write.owner_document.len > 0) {
+        version = binary_version;
+        break;
+    };
+    for (batch.graph_deletes) |delete| if (delete.edge_id.len > 0 or delete.owner_document.len > 0) {
+        version = binary_version;
+        break;
+    };
+    try appendInt(out, alloc, u16, version);
     try appendInt(out, alloc, u64, batch.sequence);
 
     try appendInt(out, alloc, u32, @intCast(batch.documents.len));
@@ -532,6 +559,10 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try writeBytes(out, alloc, write.metadata_json);
         try writeBytes(out, alloc, write.owner);
         try appendInt(out, alloc, u64, write.ttl_created_ns);
+        if (version >= relationship_binary_version) {
+            try writeBytes(out, alloc, write.edge_id);
+            try writeBytes(out, alloc, write.owner_document);
+        }
     }
 
     try appendInt(out, alloc, u32, @intCast(batch.graph_deletes.len));
@@ -541,6 +572,10 @@ pub fn encodeLogRecordInto(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), b
         try writeBytes(out, alloc, delete.target);
         try writeBytes(out, alloc, delete.edge_type);
         try writeBytes(out, alloc, delete.owner);
+        if (version >= relationship_binary_version) {
+            try writeBytes(out, alloc, delete.edge_id);
+            try writeBytes(out, alloc, delete.owner_document);
+        }
     }
 
     return out.items;
@@ -665,6 +700,41 @@ const SliceReader = struct {
     }
 };
 
+fn decodeGraphWriteAlloc(alloc: Allocator, reader: *SliceReader, version: u32) !graph_edge_types.GraphEdgeWrite {
+    var write = graph_edge_types.GraphEdgeWrite{ .index_name = "", .source = "", .target = "", .edge_type = "" };
+    errdefer deinitDerivedGraphWrite(alloc, write);
+    write.index_name = try reader.readBytesAlloc(alloc);
+    write.source = try reader.readBytesAlloc(alloc);
+    write.target = try reader.readBytesAlloc(alloc);
+    write.edge_type = try reader.readBytesAlloc(alloc);
+    write.weight = @bitCast(try reader.readInt(u64));
+    write.created_at = try reader.readInt(u64);
+    write.updated_at = try reader.readInt(u64);
+    write.metadata_json = try reader.readBytesOrEmpty(alloc);
+    if (version >= 6) write.owner = try reader.readBytesOrEmpty(alloc);
+    if (version >= 7) write.ttl_created_ns = try reader.readInt(u64);
+    if (version >= relationship_binary_version) {
+        write.edge_id = try reader.readBytesOrEmpty(alloc);
+        write.owner_document = try reader.readBytesOrEmpty(alloc);
+    }
+    return write;
+}
+
+fn decodeGraphDeleteAlloc(alloc: Allocator, reader: *SliceReader, version: u32) !graph_edge_types.GraphEdgeDelete {
+    var deletion = graph_edge_types.GraphEdgeDelete{ .index_name = "", .source = "", .target = "", .edge_type = "" };
+    errdefer deinitDerivedGraphDelete(alloc, deletion);
+    deletion.index_name = try reader.readBytesAlloc(alloc);
+    deletion.source = try reader.readBytesAlloc(alloc);
+    deletion.target = try reader.readBytesAlloc(alloc);
+    deletion.edge_type = try reader.readBytesAlloc(alloc);
+    if (version >= 6) deletion.owner = try reader.readBytesOrEmpty(alloc);
+    if (version >= relationship_binary_version) {
+        deletion.edge_id = try reader.readBytesOrEmpty(alloc);
+        deletion.owner_document = try reader.readBytesOrEmpty(alloc);
+    }
+    return deletion;
+}
+
 fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecord {
     if (payload.len < binary_magic.len + @sizeOf(u16)) return error.EndOfStream;
     if (!std.mem.eql(u8, payload[0..binary_magic.len], binary_magic)) return error.InvalidDerivedLogRecord;
@@ -680,208 +750,187 @@ fn decodeBinaryLogRecord(alloc: Allocator, payload: []const u8) !DecodedLogRecor
     };
     errdefer deinitDerivedBatch(alloc, &batch);
 
-    const document_count = try reader.readInt(u32);
-    const documents = try alloc.alloc(DerivedDocument, document_count);
-    errdefer alloc.free(documents);
-    var initialized_docs: usize = 0;
-    errdefer {
-        for (documents[0..initialized_docs]) |doc| {
-            alloc.free(doc.key);
-            if (doc.cleaned_value) |value| alloc.free(value);
-            for (doc.targets) |target| alloc.free(target.index_name);
-            if (doc.targets.len > 0) alloc.free(doc.targets);
-        }
-    }
-    for (documents) |*doc| {
-        const key = try reader.readBytesAlloc(alloc);
-        errdefer alloc.free(key);
-        const action: DerivedAction = @fromBackingInt(@intCast(try reader.readByte()));
-        const cleaned_value = try reader.readMaybeBytesAlloc(alloc);
-        errdefer if (cleaned_value) |value| alloc.free(value);
-        const target_count = try reader.readInt(u32);
-        const targets = try alloc.alloc(DerivedTargetRef, target_count);
-        errdefer alloc.free(targets);
-        var initialized_targets: usize = 0;
+    batch.documents = collection: {
+        const document_count = try reader.readInt(u32);
+        const documents = try alloc.alloc(DerivedDocument, document_count);
+        errdefer alloc.free(documents);
+        var initialized_docs: usize = 0;
         errdefer {
-            for (targets[0..initialized_targets]) |target| alloc.free(target.index_name);
+            for (documents[0..initialized_docs]) |doc| {
+                alloc.free(doc.key);
+                if (doc.cleaned_value) |value| alloc.free(value);
+                for (doc.targets) |target| alloc.free(target.index_name);
+                if (doc.targets.len > 0) alloc.free(doc.targets);
+            }
         }
-        for (targets) |*target| {
-            target.* = .{
-                .kind = @fromBackingInt(@intCast(try reader.readByte())),
-                .index_name = try reader.readBytesAlloc(alloc),
+        for (documents) |*doc| {
+            const key = try reader.readBytesAlloc(alloc);
+            errdefer alloc.free(key);
+            const action: DerivedAction = @fromBackingInt(@intCast(try reader.readByte()));
+            const cleaned_value = try reader.readMaybeBytesAlloc(alloc);
+            errdefer if (cleaned_value) |value| alloc.free(value);
+            const target_count = try reader.readInt(u32);
+            const targets = try alloc.alloc(DerivedTargetRef, target_count);
+            errdefer alloc.free(targets);
+            var initialized_targets: usize = 0;
+            errdefer {
+                for (targets[0..initialized_targets]) |target| alloc.free(target.index_name);
+            }
+            for (targets) |*target| {
+                target.* = .{
+                    .kind = @fromBackingInt(@intCast(try reader.readByte())),
+                    .index_name = try reader.readBytesAlloc(alloc),
+                };
+                initialized_targets += 1;
+            }
+            doc.* = .{
+                .key = key,
+                .action = action,
+                .cleaned_value = cleaned_value,
+                .targets = targets,
             };
-            initialized_targets += 1;
+            initialized_docs += 1;
         }
-        doc.* = .{
-            .key = key,
-            .action = action,
-            .cleaned_value = cleaned_value,
-            .targets = targets,
-        };
-        initialized_docs += 1;
-    }
-    batch.documents = documents;
+        break :collection documents;
+    };
 
     batch.deleted_keys = try reader.readStringSliceAlloc(alloc);
     batch.overwritten_doc_keys = try reader.readStringSliceAlloc(alloc);
 
-    const clear_count = try reader.readInt(u32);
-    const graph_doc_clears = try alloc.alloc(DerivedGraphDocClear, clear_count);
-    errdefer alloc.free(graph_doc_clears);
-    var initialized_clears: usize = 0;
-    errdefer {
-        for (graph_doc_clears[0..initialized_clears]) |clear| {
-            alloc.free(clear.key);
-            for (clear.index_names) |index_name| alloc.free(index_name);
-            if (clear.index_names.len > 0) alloc.free(clear.index_names);
+    batch.graph_doc_clears = collection: {
+        const clear_count = try reader.readInt(u32);
+        const graph_doc_clears = try alloc.alloc(DerivedGraphDocClear, clear_count);
+        errdefer alloc.free(graph_doc_clears);
+        var initialized_clears: usize = 0;
+        errdefer {
+            for (graph_doc_clears[0..initialized_clears]) |clear| {
+                alloc.free(clear.key);
+                for (clear.index_names) |index_name| alloc.free(index_name);
+                if (clear.index_names.len > 0) alloc.free(clear.index_names);
+            }
         }
-    }
-    for (graph_doc_clears) |*clear| {
-        clear.* = .{
-            .key = try reader.readBytesAlloc(alloc),
-            .index_names = try reader.readStringSliceAlloc(alloc),
-        };
-        initialized_clears += 1;
-    }
-    batch.graph_doc_clears = graph_doc_clears;
+        for (graph_doc_clears) |*clear| {
+            clear.* = .{
+                .key = try reader.readBytesAlloc(alloc),
+                .index_names = try reader.readStringSliceAlloc(alloc),
+            };
+            initialized_clears += 1;
+        }
+        break :collection graph_doc_clears;
+    };
 
-    const dense_count = try reader.readInt(u32);
-    const dense_embeddings = try alloc.alloc(DerivedDenseEmbeddingWrite, dense_count);
-    errdefer alloc.free(dense_embeddings);
-    var initialized_dense: usize = 0;
-    errdefer {
-        for (dense_embeddings[0..initialized_dense]) |embedding| {
-            alloc.free(embedding.index_name);
-            if (embedding.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.vector.len > 0) alloc.free(embedding.vector);
+    batch.dense_embeddings = collection: {
+        const dense_count = try reader.readInt(u32);
+        const dense_embeddings = try alloc.alloc(DerivedDenseEmbeddingWrite, dense_count);
+        errdefer alloc.free(dense_embeddings);
+        var initialized_dense: usize = 0;
+        errdefer {
+            for (dense_embeddings[0..initialized_dense]) |embedding| {
+                alloc.free(embedding.index_name);
+                if (embedding.parent_doc_key) |parent_doc_key| alloc.free(parent_doc_key);
+                alloc.free(embedding.doc_key);
+                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+                if (embedding.vector.len > 0) alloc.free(embedding.vector);
+            }
         }
-    }
-    for (dense_embeddings) |*embedding| {
-        embedding.* = .{
-            .index_name = try reader.readBytesAlloc(alloc),
-            .doc_key = try reader.readBytesAlloc(alloc),
-            .parent_doc_key = if (version >= 3) try reader.readMaybeBytesAlloc(alloc) else null,
-            .artifact_key = try reader.readMaybeBytesAlloc(alloc),
-            .vector = try reader.readF32SliceAlloc(alloc),
-        };
-        initialized_dense += 1;
-    }
-    batch.dense_embeddings = dense_embeddings;
+        for (dense_embeddings) |*embedding| {
+            embedding.* = .{
+                .index_name = try reader.readBytesAlloc(alloc),
+                .doc_key = try reader.readBytesAlloc(alloc),
+                .parent_doc_key = if (version >= 3) try reader.readMaybeBytesAlloc(alloc) else null,
+                .artifact_key = try reader.readMaybeBytesAlloc(alloc),
+                .vector = try reader.readF32SliceAlloc(alloc),
+            };
+            initialized_dense += 1;
+        }
+        break :collection dense_embeddings;
+    };
 
-    const sparse_count = try reader.readInt(u32);
-    const sparse_embeddings = try alloc.alloc(DerivedSparseEmbeddingWrite, sparse_count);
-    errdefer alloc.free(sparse_embeddings);
-    var initialized_sparse: usize = 0;
-    errdefer {
-        for (sparse_embeddings[0..initialized_sparse]) |embedding| {
-            alloc.free(embedding.index_name);
-            alloc.free(embedding.doc_key);
-            if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
-            if (embedding.indices.len > 0) alloc.free(embedding.indices);
-            if (embedding.values.len > 0) alloc.free(embedding.values);
+    batch.sparse_embeddings = collection: {
+        const sparse_count = try reader.readInt(u32);
+        const sparse_embeddings = try alloc.alloc(DerivedSparseEmbeddingWrite, sparse_count);
+        errdefer alloc.free(sparse_embeddings);
+        var initialized_sparse: usize = 0;
+        errdefer {
+            for (sparse_embeddings[0..initialized_sparse]) |embedding| {
+                alloc.free(embedding.index_name);
+                alloc.free(embedding.doc_key);
+                if (embedding.artifact_key) |artifact_key| alloc.free(artifact_key);
+                if (embedding.indices.len > 0) alloc.free(embedding.indices);
+                if (embedding.values.len > 0) alloc.free(embedding.values);
+            }
         }
-    }
-    for (sparse_embeddings) |*embedding| {
-        embedding.* = .{
-            .index_name = try reader.readBytesAlloc(alloc),
-            .doc_key = try reader.readBytesAlloc(alloc),
-            .artifact_key = if (version >= 4) try reader.readMaybeBytesAlloc(alloc) else null,
-            .indices = try reader.readU32SliceAlloc(alloc),
-            .values = try reader.readF32SliceAlloc(alloc),
-        };
-        initialized_sparse += 1;
-    }
-    batch.sparse_embeddings = sparse_embeddings;
+        for (sparse_embeddings) |*embedding| {
+            embedding.* = .{
+                .index_name = try reader.readBytesAlloc(alloc),
+                .doc_key = try reader.readBytesAlloc(alloc),
+                .artifact_key = if (version >= 4) try reader.readMaybeBytesAlloc(alloc) else null,
+                .indices = try reader.readU32SliceAlloc(alloc),
+                .values = try reader.readF32SliceAlloc(alloc),
+            };
+            initialized_sparse += 1;
+        }
+        break :collection sparse_embeddings;
+    };
 
-    const generated_count = try reader.readInt(u32);
-    const generated_enrichment_refs = try alloc.alloc(enrichment_types.GeneratedEnrichmentRef, generated_count);
-    errdefer alloc.free(generated_enrichment_refs);
-    var initialized_generated: usize = 0;
-    errdefer {
-        for (generated_enrichment_refs[0..initialized_generated]) |request| {
-            enrichment_types.freeGeneratedRef(alloc, request);
+    batch.generated_enrichment_refs = collection: {
+        const generated_count = try reader.readInt(u32);
+        const generated_enrichment_refs = try alloc.alloc(enrichment_types.GeneratedEnrichmentRef, generated_count);
+        errdefer alloc.free(generated_enrichment_refs);
+        var initialized_generated: usize = 0;
+        errdefer {
+            for (generated_enrichment_refs[0..initialized_generated]) |request| {
+                enrichment_types.freeGeneratedRef(alloc, request);
+            }
         }
-    }
-    for (generated_enrichment_refs) |*request| {
-        request.* = .{
-            .kind = @fromBackingInt(@intCast(try reader.readByte())),
-            .index_name = try reader.readBytesAlloc(alloc),
-            .artifact_name = try reader.readBytesOrEmpty(alloc),
-            .embedding_name = try reader.readBytesOrEmpty(alloc),
-            .doc_key = try reader.readBytesAlloc(alloc),
-        };
-        if (version < 5) {
-            const source_field = try reader.readBytesAlloc(alloc);
-            defer alloc.free(source_field);
-            const source_template = try reader.readBytesOrEmpty(alloc);
-            defer if (source_template.len > 0) alloc.free(source_template);
-            _ = try reader.readInt(u32);
-            _ = try reader.readInt(u32);
-            _ = try reader.readInt(u32);
-            const chunker_json = try reader.readBytesOrEmpty(alloc);
-            defer if (chunker_json.len > 0) alloc.free(chunker_json);
+        for (generated_enrichment_refs) |*request| {
+            request.* = .{
+                .kind = @fromBackingInt(@intCast(try reader.readByte())),
+                .index_name = try reader.readBytesAlloc(alloc),
+                .artifact_name = try reader.readBytesOrEmpty(alloc),
+                .embedding_name = try reader.readBytesOrEmpty(alloc),
+                .doc_key = try reader.readBytesAlloc(alloc),
+            };
+            if (version < 5) {
+                const source_field = try reader.readBytesAlloc(alloc);
+                defer alloc.free(source_field);
+                const source_template = try reader.readBytesOrEmpty(alloc);
+                defer if (source_template.len > 0) alloc.free(source_template);
+                _ = try reader.readInt(u32);
+                _ = try reader.readInt(u32);
+                _ = try reader.readInt(u32);
+                const chunker_json = try reader.readBytesOrEmpty(alloc);
+                defer if (chunker_json.len > 0) alloc.free(chunker_json);
+            }
+            initialized_generated += 1;
         }
-        initialized_generated += 1;
-    }
-    batch.generated_enrichment_refs = generated_enrichment_refs;
+        break :collection generated_enrichment_refs;
+    };
 
-    const graph_write_count = try reader.readInt(u32);
-    const graph_writes = try alloc.alloc(graph_edge_types.GraphEdgeWrite, graph_write_count);
-    errdefer alloc.free(graph_writes);
-    var initialized_graph_writes: usize = 0;
-    errdefer {
-        for (graph_writes[0..initialized_graph_writes]) |write| {
-            alloc.free(write.index_name);
-            alloc.free(write.source);
-            alloc.free(write.target);
-            alloc.free(write.edge_type);
-            if (write.metadata_json.len > 0) alloc.free(write.metadata_json);
-            if (write.owner.len > 0) alloc.free(write.owner);
+    batch.graph_writes = writes: {
+        const count = try reader.readInt(u32);
+        const entries = try alloc.alloc(graph_edge_types.GraphEdgeWrite, count);
+        errdefer alloc.free(entries);
+        var initialized: usize = 0;
+        errdefer for (entries[0..initialized]) |entry| deinitDerivedGraphWrite(alloc, entry);
+        for (entries) |*entry| {
+            entry.* = try decodeGraphWriteAlloc(alloc, &reader, version);
+            initialized += 1;
         }
-    }
-    for (graph_writes) |*write| {
-        write.* = .{
-            .index_name = try reader.readBytesAlloc(alloc),
-            .source = try reader.readBytesAlloc(alloc),
-            .target = try reader.readBytesAlloc(alloc),
-            .edge_type = try reader.readBytesAlloc(alloc),
-            .weight = @bitCast(try reader.readInt(u64)),
-            .created_at = try reader.readInt(u64),
-            .updated_at = try reader.readInt(u64),
-            .metadata_json = try reader.readBytesOrEmpty(alloc),
-            .owner = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
-            .ttl_created_ns = if (version >= 7) try reader.readInt(u64) else 0,
-        };
-        initialized_graph_writes += 1;
-    }
-    batch.graph_writes = graph_writes;
-
-    const graph_delete_count = try reader.readInt(u32);
-    const graph_deletes = try alloc.alloc(graph_edge_types.GraphEdgeDelete, graph_delete_count);
-    errdefer alloc.free(graph_deletes);
-    var initialized_graph_deletes: usize = 0;
-    errdefer {
-        for (graph_deletes[0..initialized_graph_deletes]) |delete| {
-            alloc.free(delete.index_name);
-            alloc.free(delete.source);
-            alloc.free(delete.target);
-            alloc.free(delete.edge_type);
-            if (delete.owner.len > 0) alloc.free(delete.owner);
+        break :writes entries;
+    };
+    batch.graph_deletes = deletes: {
+        const count = try reader.readInt(u32);
+        const entries = try alloc.alloc(graph_edge_types.GraphEdgeDelete, count);
+        errdefer alloc.free(entries);
+        var initialized: usize = 0;
+        errdefer for (entries[0..initialized]) |entry| deinitDerivedGraphDelete(alloc, entry);
+        for (entries) |*entry| {
+            entry.* = try decodeGraphDeleteAlloc(alloc, &reader, version);
+            initialized += 1;
         }
-    }
-    for (graph_deletes) |*delete| {
-        delete.* = .{
-            .index_name = try reader.readBytesAlloc(alloc),
-            .source = try reader.readBytesAlloc(alloc),
-            .target = try reader.readBytesAlloc(alloc),
-            .edge_type = try reader.readBytesAlloc(alloc),
-            .owner = if (version >= 6) try reader.readBytesOrEmpty(alloc) else "",
-        };
-        initialized_graph_deletes += 1;
-    }
-    batch.graph_deletes = graph_deletes;
+        break :deletes entries;
+    };
 
     return .{
         .alloc = alloc,
@@ -943,7 +992,7 @@ test "derived log record binary round trips" {
     var decoded = try decodeLogRecord(alloc, payload);
     defer decoded.deinit();
 
-    try std.testing.expectEqual(@as(u16, binary_version), decoded.version);
+    try std.testing.expectEqual(@as(u16, 7), decoded.version);
     try std.testing.expectEqual(@as(u64, 42), decoded.batch.sequence);
     try std.testing.expectEqualStrings("doc:a", decoded.batch.documents[0].key);
     try std.testing.expectEqualStrings("dv_v1", decoded.batch.documents[0].targets[0].index_name);
@@ -1110,4 +1159,70 @@ test "derived batch clone releases every partial allocation" {
         }.run,
         .{source},
     );
+}
+
+test "derived log relationship identities select v8 and survive cloning" {
+    const alloc = std.testing.allocator;
+    const write = graph_edge_types.GraphEdgeWrite{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "RELATES_TO", .edge_id = "fact:1", .owner_document = "fact:1" };
+    const delete = graph_edge_types.GraphEdgeDelete{ .index_name = write.index_name, .source = write.source, .target = write.target, .edge_type = write.edge_type, .edge_id = write.edge_id, .owner_document = write.owner_document };
+    const payload = try encodeLogRecord(alloc, .{ .sequence = 1, .graph_writes = &.{write}, .graph_deletes = &.{delete} });
+    defer alloc.free(payload);
+    var decoded = try decodeLogRecord(alloc, payload);
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u16, 8), decoded.version);
+    try std.testing.expectEqualStrings("fact:1", decoded.batch.graph_writes[0].edge_id);
+    try std.testing.expectEqualStrings("fact:1", decoded.batch.graph_deletes[0].owner_document);
+    var cloned = try cloneBatch(alloc, decoded.batch);
+    defer deinitDerivedBatch(alloc, &cloned);
+    try std.testing.expectEqualStrings("fact:1", cloned.graph_deletes[0].edge_id);
+}
+
+test "graph replay truncated relationship fields release all allocations" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeLogRecord(alloc, .{
+        .documents = &.{.{ .key = "fact:owner", .action = .upsert, .cleaned_value = "{}" }},
+        .graph_writes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "identity-write", .owner_document = "owner-write", .metadata_json = "metadata-write" }},
+        .graph_deletes = &.{.{ .index_name = "facts", .source = "a", .target = "b", .edge_type = "R", .edge_id = "identity-delete", .owner_document = "owner-delete" }},
+    });
+    defer alloc.free(payload);
+    const Case = struct {
+        fn decode(a: Allocator, bytes: []const u8) !void {
+            var record = try decodeLogRecord(a, bytes);
+            defer record.deinit();
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.decode, .{payload});
+    const start = std.mem.indexOf(u8, payload, "identity-write").?;
+    for (start..payload.len) |end| {
+        try std.testing.expectError(error.EndOfStream, decodeLogRecord(alloc, payload[0..end]));
+    }
+    var decoded = try decodeLogRecord(alloc, payload);
+    defer decoded.deinit();
+}
+
+test "graph relationship integration decodes legacy owner TTL and explicit identity journals" {
+    const alloc = std.testing.allocator;
+    const legacy = try encodeLogRecord(alloc, .{ .sequence = 1, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .owner = "producer", .ttl_created_ns = 123 }} });
+    defer alloc.free(legacy);
+    try std.testing.expectEqual(@as(u16, 7), std.mem.readInt(u16, legacy[4..6], .little));
+    var ttl = try decodeLogRecord(alloc, legacy);
+    defer ttl.deinit();
+    try std.testing.expectEqualStrings("producer", ttl.batch.graph_writes[0].owner);
+    try std.testing.expectEqual(@as(u64, 123), ttl.batch.graph_writes[0].ttl_created_ns);
+    // v6 ends each graph write with its owner; v7 appended an eight-byte TTL.
+    const v6 = try std.mem.concat(alloc, u8, &.{ legacy[0 .. legacy.len - 12], legacy[legacy.len - 4 ..] });
+    defer alloc.free(v6);
+    std.mem.writeInt(u16, v6[4..6], 6, .little);
+    var owner = try decodeLogRecord(alloc, v6);
+    defer owner.deinit();
+    try std.testing.expectEqualStrings("producer", owner.batch.graph_writes[0].owner);
+    try std.testing.expectEqual(@as(u64, 0), owner.batch.graph_writes[0].ttl_created_ns);
+    const modern = try encodeLogRecord(alloc, .{ .sequence = 2, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "one", .owner_document = "fact:one", .ttl_created_ns = 456 }} });
+    defer alloc.free(modern);
+    try std.testing.expectEqual(@as(u16, 8), std.mem.readInt(u16, modern[4..6], .little));
+    var fact = try decodeLogRecord(alloc, modern);
+    defer fact.deinit();
+    try std.testing.expectEqualStrings("one", fact.batch.graph_writes[0].edge_id);
+    try std.testing.expectEqualStrings("fact:one", fact.batch.graph_writes[0].owner_document);
+    try std.testing.expectEqual(@as(u64, 456), fact.batch.graph_writes[0].ttl_created_ns);
 }

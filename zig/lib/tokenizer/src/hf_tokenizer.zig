@@ -26,6 +26,7 @@ const SpecialTokens = @import("tokenizer.zig").SpecialTokens;
 const PriorityQueue = @import("priority_queue.zig").PriorityQueue;
 const unicode_classes = @import("unicode_classes.zig");
 const unicode_normalizer = @import("unicode_normalizer.zig");
+const unicode_punctuation_data = @import("unicode_punctuation_data.zig");
 
 /// Zig/WebAssembly supports atomics only up to the target's pointer width.
 /// The browser build is explicitly single-threaded, so keep 64-bit profiling
@@ -135,6 +136,10 @@ pub const HfTokenizer = struct {
     /// without explicit wrap tokens must not be wrapped with those defaults.
     wrap_specials_explicit: bool,
     do_lowercase: bool,
+    /// BertNormalizer.handle_chinese_chars: pad every Han-ideograph codepoint
+    /// with spaces before pre-tokenization, matching HF's `_is_chinese_char`.
+    /// Only ever set from a `BertNormalizer` block (not `Lowercase`).
+    handle_chinese_chars: bool,
     replace_space_with: ?[]const u8,
     unigram_normalizer: unicode_normalizer.Profile = .{},
     unigram_min_score: f64 = std.math.inf(f64),
@@ -929,6 +934,7 @@ pub const HfTokenizer = struct {
             .has_template_processing = false,
             .wrap_specials_explicit = false,
             .do_lowercase = false,
+            .handle_chinese_chars = false,
             .replace_space_with = null,
             .pre_tokenizer_type = .bert,
             .byte_level_pretokenizer = .gpt2,
@@ -1477,9 +1483,24 @@ pub const HfTokenizer = struct {
                             }
                         }
                     }
-                } else if (std.mem.eql(u8, t.string, "BertNormalizer") or
-                    std.mem.eql(u8, t.string, "Lowercase"))
-                {
+                } else if (std.mem.eql(u8, t.string, "BertNormalizer")) {
+                    if (obj.get("lowercase")) |lc| {
+                        self.do_lowercase = switch (lc) {
+                            .bool => lc.bool,
+                            else => true,
+                        };
+                    } else {
+                        self.do_lowercase = true;
+                    }
+                    if (obj.get("handle_chinese_chars")) |hcc| {
+                        self.handle_chinese_chars = switch (hcc) {
+                            .bool => hcc.bool,
+                            else => true,
+                        };
+                    } else {
+                        self.handle_chinese_chars = true;
+                    }
+                } else if (std.mem.eql(u8, t.string, "Lowercase")) {
                     if (obj.get("lowercase")) |lc| {
                         self.do_lowercase = switch (lc) {
                             .bool => lc.bool,
@@ -3918,7 +3939,7 @@ pub const HfTokenizer = struct {
         text: []const u8,
         ids: *std.ArrayListUnmanaged(i32),
     ) !void {
-        const words = try bertPreTokenize(allocator, text);
+        const words = try bertPreTokenize(allocator, text, self.handle_chinese_chars);
         defer allocator.free(words);
 
         // English averages ~0.25 tokens/byte; reserve to avoid the array
@@ -3930,7 +3951,7 @@ pub const HfTokenizer = struct {
     }
 
     fn encodeWordPieceWithOffsets(self: *HfTokenizer, allocator: std.mem.Allocator, text: []const u8) !RawWordPieceEncoding {
-        const words = try bertPreTokenizeWithOffsets(allocator, text);
+        const words = try bertPreTokenizeWithOffsets(allocator, text, self.handle_chinese_chars);
         defer allocator.free(words);
 
         var result = RawWordPieceEncoding{};
@@ -3970,7 +3991,10 @@ pub const HfTokenizer = struct {
 
     fn wordPieceEncodeWord(self: *HfTokenizer, allocator: std.mem.Allocator, word: []const u8, ids: *std.ArrayListUnmanaged(i32)) !void {
         if (word.len == 0) return;
-        if (word.len > self.max_input_chars_per_word) {
+        // max_input_chars_per_word counts codepoints in the reference
+        // implementation, not bytes; a 3-byte-per-char script must not hit
+        // this ceiling three times sooner than an ASCII word would.
+        if ((std.unicode.utf8CountCodepoints(word) catch word.len) > self.max_input_chars_per_word) {
             try ids.append(allocator, self.special.unk_id);
             return;
         }
@@ -4050,7 +4074,7 @@ pub const HfTokenizer = struct {
             lookup_word = owned_lookup_word.?;
         }
 
-        if (lookup_word.len > self.max_input_chars_per_word) {
+        if ((std.unicode.utf8CountCodepoints(lookup_word) catch lookup_word.len) > self.max_input_chars_per_word) {
             try result.ids.append(allocator, self.special.unk_id);
             try result.offsets.append(allocator, .{ @intCast(word_start), @intCast(word_start + word.len) });
             return;
@@ -4169,7 +4193,7 @@ pub const HfTokenizer = struct {
                 }
             },
             .bert => {
-                const words = try bertPreTokenize(allocator, text);
+                const words = try bertPreTokenize(allocator, text, self.handle_chinese_chars);
                 defer allocator.free(words);
                 for (words) |word| {
                     try self.bpeEncodeWord(allocator, word, ids, &scratch);
@@ -7142,7 +7166,7 @@ pub const HfTokenizer = struct {
                 }
             },
             .bert => {
-                const words = try bertPreTokenize(allocator, text);
+                const words = try bertPreTokenize(allocator, text, self.handle_chinese_chars);
                 defer allocator.free(words);
                 for (words) |word| {
                     try self.unigramEncodeWord(allocator, word, ids);
@@ -7755,84 +7779,151 @@ fn adjustedOffset(pos: usize, prefix_len: usize, word_len: usize) usize {
     return pos - clamped;
 }
 
-/// BERT pre-tokenizer: split on whitespace and punctuation.
-/// Returns slices borrowed from `text`. Caller owns the outer slice but must
-/// not free the inner string contents.
-fn bertPreTokenize(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
+/// HF tokenizers' `_is_chinese_char`: CJK Unified Ideographs and the
+/// Extension A-F / Compatibility blocks. Deliberately narrower than "any CJK
+/// script" — it does not cover hiragana/katakana/hangul, matching HF exactly.
+fn isChineseChar(cp: u21) bool {
+    return (cp >= 0x4E00 and cp <= 0x9FFF) or
+        (cp >= 0x3400 and cp <= 0x4DBF) or
+        (cp >= 0x20000 and cp <= 0x2A6DF) or
+        (cp >= 0x2A700 and cp <= 0x2B73F) or
+        (cp >= 0x2B740 and cp <= 0x2B81F) or
+        (cp >= 0x2B820 and cp <= 0x2CEAF) or
+        (cp >= 0xF900 and cp <= 0xFAFF) or
+        (cp >= 0x2F800 and cp <= 0x2FA1F);
+}
+
+/// Non-ASCII whitespace for the BERT pre-tokenizer. ASCII whitespace is
+/// handled by the existing `std.ascii.isWhitespace` fast path; this reuses
+/// the GPT-2 scanner's generated Unicode table (built from the `White_Space`
+/// property) read-only. That property is a superset of HF's `_is_whitespace`
+/// (Zs + 4 ASCII chars) by a handful of separator/control codepoints that
+/// essentially never appear standalone in real text.
+fn isUnicodeWhitespace(cp: u21) bool {
+    return unicode_classes.classify(cp) == .whitespace;
+}
+
+/// BERT pre-tokenizer: split on whitespace and punctuation (ASCII and
+/// Unicode), and — when `handle_chinese_chars` is set — on CJK ideographs,
+/// matching HF's normalizer padding + whitespace split without ever
+/// rewriting the buffer. Returns slices borrowed from `text`. Caller owns
+/// the outer slice but must not free the inner string contents.
+fn bertPreTokenize(allocator: std.mem.Allocator, text: []const u8, handle_chinese_chars: bool) ![][]const u8 {
     var words = std.ArrayListUnmanaged([]const u8).empty;
     var start: usize = 0;
     var i: usize = 0;
 
     while (i < text.len) {
-        const c = text[i];
-        if (std.ascii.isWhitespace(c)) {
-            if (i > start) {
-                try words.append(allocator, text[start..i]);
+        const first = text[i];
+        if (first < 0x80) {
+            if (std.ascii.isWhitespace(first)) {
+                if (i > start) try words.append(allocator, text[start..i]);
+                i += 1;
+                start = i;
+            } else if (isPunctuation(first)) {
+                if (i > start) try words.append(allocator, text[start..i]);
+                try words.append(allocator, text[i .. i + 1]);
+                i += 1;
+                start = i;
+            } else {
+                i += 1;
             }
+            continue;
+        }
+
+        const len = std.unicode.utf8ByteSequenceLength(first) catch {
             i += 1;
+            continue;
+        };
+        if (len > text.len - i) {
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        if (isUnicodeWhitespace(cp)) {
+            if (i > start) try words.append(allocator, text[start..i]);
+            i += len;
             start = i;
-        } else if (isPunctuation(c)) {
-            if (i > start) {
-                try words.append(allocator, text[start..i]);
-            }
-            try words.append(allocator, text[i .. i + 1]);
-            i += 1;
+        } else if (unicode_punctuation_data.isPunctuation(cp) or
+            (handle_chinese_chars and isChineseChar(cp)))
+        {
+            if (i > start) try words.append(allocator, text[start..i]);
+            try words.append(allocator, text[i .. i + len]);
+            i += len;
             start = i;
         } else {
-            i += 1;
+            i += len;
         }
     }
 
-    if (i > start) {
-        try words.append(allocator, text[start..i]);
-    }
-
+    if (i > start) try words.append(allocator, text[start..i]);
     return try words.toOwnedSlice(allocator);
 }
 
-fn bertPreTokenizeWithOffsets(allocator: std.mem.Allocator, text: []const u8) ![]PreTokenSpan {
+fn bertPreTokenizeWithOffsets(allocator: std.mem.Allocator, text: []const u8, handle_chinese_chars: bool) ![]PreTokenSpan {
     var words = std.ArrayListUnmanaged(PreTokenSpan).empty;
     var start: usize = 0;
     var i: usize = 0;
 
     while (i < text.len) {
-        const c = text[i];
-        if (std.ascii.isWhitespace(c)) {
-            if (i > start) {
-                try words.append(allocator, .{
-                    .text = text[start..i],
-                    .start = start,
-                    .end = i,
-                });
+        const first = text[i];
+        if (first < 0x80) {
+            if (std.ascii.isWhitespace(first)) {
+                if (i > start) {
+                    try words.append(allocator, .{ .text = text[start..i], .start = start, .end = i });
+                }
+                i += 1;
+                start = i;
+            } else if (isPunctuation(first)) {
+                if (i > start) {
+                    try words.append(allocator, .{ .text = text[start..i], .start = start, .end = i });
+                }
+                try words.append(allocator, .{ .text = text[i .. i + 1], .start = i, .end = i + 1 });
+                i += 1;
+                start = i;
+            } else {
+                i += 1;
             }
+            continue;
+        }
+
+        const len = std.unicode.utf8ByteSequenceLength(first) catch {
             i += 1;
+            continue;
+        };
+        if (len > text.len - i) {
+            i += 1;
+            continue;
+        }
+        const cp = std.unicode.utf8Decode(text[i .. i + len]) catch {
+            i += 1;
+            continue;
+        };
+        if (isUnicodeWhitespace(cp)) {
+            if (i > start) {
+                try words.append(allocator, .{ .text = text[start..i], .start = start, .end = i });
+            }
+            i += len;
             start = i;
-        } else if (isPunctuation(c)) {
+        } else if (unicode_punctuation_data.isPunctuation(cp) or
+            (handle_chinese_chars and isChineseChar(cp)))
+        {
             if (i > start) {
-                try words.append(allocator, .{
-                    .text = text[start..i],
-                    .start = start,
-                    .end = i,
-                });
+                try words.append(allocator, .{ .text = text[start..i], .start = start, .end = i });
             }
-            try words.append(allocator, .{
-                .text = text[i .. i + 1],
-                .start = i,
-                .end = i + 1,
-            });
-            i += 1;
+            try words.append(allocator, .{ .text = text[i .. i + len], .start = i, .end = i + len });
+            i += len;
             start = i;
         } else {
-            i += 1;
+            i += len;
         }
     }
 
     if (i > start) {
-        try words.append(allocator, .{
-            .text = text[start..i],
-            .start = start,
-            .end = i,
-        });
+        try words.append(allocator, .{ .text = text[start..i], .start = start, .end = i });
     }
 
     return try words.toOwnedSlice(allocator);
@@ -9218,7 +9309,7 @@ test "encode for model handles splade wordpiece tokenizer fixture" {
 test "bert pre-tokenizer" {
     const allocator = std.testing.allocator;
 
-    const words = try bertPreTokenize(allocator, "Hello, world! Test.");
+    const words = try bertPreTokenize(allocator, "Hello, world! Test.", true);
     defer allocator.free(words);
 
     try std.testing.expectEqual(@as(usize, 6), words.len);
@@ -9614,6 +9705,30 @@ test "real tokenizer.json golden values" {
         .{ .text = "testing", .expected = &.{5604} },
         .{ .text = "machine learning", .expected = &.{ 3698, 4083 } },
         .{ .text = "The quick brown fox jumps over the lazy dog.", .expected = &.{ 1996, 4248, 2829, 4419, 14523, 2058, 1996, 13971, 3899, 1012 } },
+        // #933: unspaced Japanese sentence — was 1 token (whole sentence as
+        // one [UNK]); reference (HF `tokenizers`, same tokenizer.json) is 16.
+        // (Picked a sentence with no voiced/handakuten kana: those normalize
+        // through BertNormalizer's accent-stripping step, which is a
+        // separate, not-yet-implemented gap — see the NFD/strip_accents note
+        // in the patch plan's Risks section.)
+        .{
+            .text = "私は毎日日本語を勉強しています。",
+            .expected = &.{ 100, 1672, 100, 1864, 1864, 1876, 1950, 1690, 100, 100, 1657, 30191, 30173, 30203, 30184, 1636 },
+        },
+        // #933: max_input_chars_per_word must count codepoints, not bytes —
+        // 100 hiragana codepoints (300 bytes) must NOT hit the 100-byte trap.
+        .{ .text = z17RepeatString("あ", 100), .expected = &([1]i32{1646} ++ @as([99]i32, @splat(30172))) },
+        // One codepoint over the limit is still correctly [UNK].
+        .{ .text = z17RepeatString("あ", 101), .expected = &.{100} },
+        // Unicode punctuation (not ASCII, not CJK) must still split a word:
+        // "§" is Po category, unspaced from neighbors.
+        .{ .text = "hello§world", .expected = &.{ 7592, 1073, 2088 } },
+        // Negative control: "€" is Sc (symbol), not punctuation — must NOT
+        // split ("cost€100" stays one word, wordpieced as cost/##€/##100).
+        .{ .text = "cost€100", .expected = &.{ 3465, 30102, 18613 } },
+        // Hiragana is not a "Chinese char" per handle_chinese_chars and is not
+        // padded, but a run with no ASCII separators still round-trips.
+        .{ .text = "ふくろう", .expected = &.{ 1674, 30179, 30215, 30174 } },
     };
 
     for (cases) |tc| {
@@ -12061,4 +12176,14 @@ test "applyModelWrapTemplate overrides gguf bos and eos wrap" {
     try std.testing.expectEqual(@as(i32, 9), result.ids[1]);
     try std.testing.expectEqual(@as(i32, 1), result.attention_mask[1]);
     try std.testing.expectEqual(@as(i32, 0), result.attention_mask[2]);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime count: usize) *const [bytes.len * count:0]u8 {
+    const result = comptime blk: {
+        var repeated: [bytes.len * count:0]u8 = undefined;
+        for (0..count) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * count] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

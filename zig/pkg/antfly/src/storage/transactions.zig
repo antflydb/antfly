@@ -2194,6 +2194,21 @@ pub const TxnManager = struct {
 
     const ReadAdmissionChange = struct { previous: IntentAdmission, next: IntentAdmission };
 
+    /// An implicit dependency may reuse a stronger caller-owned read guard.
+    /// Do not replace its persisted version/digest identity on a later prepare.
+    pub fn hasSharedReadDependency(self: *TxnManager, txn_id: TxnId, user_key: []const u8) !bool {
+        const prefix = makeSidecarKey(read_members_prefix, txn_id);
+        const key = try std.mem.concat(self.alloc, u8, &.{ &prefix, user_key });
+        defer self.alloc.free(key);
+        const member = self.getAlloc(self.alloc, key) catch |err| switch (err) {
+            error.NotFound => return false,
+            else => return err,
+        };
+        defer self.alloc.free(member);
+        if (!validReadMember(member)) return error.InvalidTxnRecord;
+        return true;
+    }
+
     fn stageReadGuards(
         self: *TxnManager,
         txn_id: TxnId,

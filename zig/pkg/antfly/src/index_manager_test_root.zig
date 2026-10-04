@@ -16,3 +16,9 @@ test {
     _ = @import("storage/db/catalog/index_manager.zig");
     _ = @import("storage/index_manager_vopr.zig");
 }
+
+/// Implementation choices for fixtures that cross the DB source boundary.
+pub const antfly_sources = struct {
+    pub const physical_db = @import("storage/db/db.zig");
+    pub const selected_db = @import("storage/db/mod.zig");
+};

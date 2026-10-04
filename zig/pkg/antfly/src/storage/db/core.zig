@@ -2121,13 +2121,12 @@ pub const DBCore = struct {
             try self.validateKeyOwnership(key);
         }
         for (req.graph_writes) |write| {
-            // The producer owns the artifact and graph projection. A graph
-            // source may be an entity in another range; its target is never
-            // an ownership claim on this shard.
-            try self.validateKeyOwnership(if (write.owner.len > 0) write.owner else write.source);
+            // A relationship is stored with its producing document. Logical
+            // endpoints may belong to any range in the graph index's table.
+            try self.validateKeyOwnership(if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source);
         }
         for (req.graph_deletes) |delete| {
-            try self.validateKeyOwnership(if (delete.owner.len > 0) delete.owner else delete.source);
+            try self.validateKeyOwnership(if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source);
         }
         for (req.predicates) |predicate| {
             try self.validateKeyOwnership(predicate.key);

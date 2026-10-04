@@ -439,7 +439,21 @@ pub fn authenticateGraphEdgeGenerationAlloc(alloc: Allocator, data: []const u8, 
     return try alloc.dupe(u8, data);
 }
 
+pub const BorrowedGraphEdge = struct {
+    generation: u64,
+    weight: f64,
+    created_at: u64,
+    updated_at: u64,
+    ttl_created_ns: u64,
+    metadata_json: []const u8,
+};
+
 pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
+    const edge = try decodeGraphEdgeBorrowed(data);
+    return .{ .generation = edge.generation, .weight = edge.weight, .created_at = edge.created_at, .updated_at = edge.updated_at, .ttl_created_ns = edge.ttl_created_ns, .metadata_json = try alloc.dupe(u8, edge.metadata_json) };
+}
+
+pub fn decodeGraphEdgeBorrowed(data: []const u8) !BorrowedGraphEdge {
     const header = try decodeHeader(data);
     if (header.kind != .graph_edge) return error.InvalidArtifactKind;
 
@@ -478,7 +492,7 @@ pub fn decodeGraphEdgeAlloc(alloc: Allocator, data: []const u8) !GraphEdge {
         .created_at = created_at,
         .updated_at = updated_at,
         .ttl_created_ns = ttl_created_ns,
-        .metadata_json = try alloc.dupe(u8, payload[pos..]),
+        .metadata_json = payload[pos..],
     };
 }
 

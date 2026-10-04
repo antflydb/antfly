@@ -14,7 +14,7 @@
 
 //! Decodes committed mutation envelopes for an engine owner. This ingress
 //! owns temporary payload allocations; DB methods only execute typed mutations.
-const DB = @import("db.zig").DB;
+const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
 const record_mod = @import("replication_record.zig");
 const effects = @import("replication_effects.zig");
 

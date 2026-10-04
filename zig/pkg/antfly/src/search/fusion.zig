@@ -120,7 +120,11 @@ fn rrfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
 
             const gop = try score_map.getOrPut(alloc, hit.doc_id);
             if (!gop.found_existing) {
-                gop.key_ptr.* = try alloc.dupe(u8, hit.doc_id);
+                const owned_id = alloc.dupe(u8, hit.doc_id) catch |err| {
+                    _ = score_map.remove(hit.doc_id);
+                    return err;
+                };
+                gop.key_ptr.* = owned_id;
                 gop.value_ptr.* = .{
                     .score = 0.0,
                     .index_scores = std.ArrayListUnmanaged(IndexScore).empty,
@@ -129,8 +133,10 @@ fn rrfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
             }
             gop.value_ptr.score += rrf_score;
             gop.value_ptr.index_count += 1;
+            const index_name = try alloc.dupe(u8, result.index_name);
+            errdefer alloc.free(index_name);
             try gop.value_ptr.index_scores.append(alloc, .{
-                .index_name = try alloc.dupe(u8, result.index_name),
+                .index_name = index_name,
                 .score = hit.score,
             });
         }
@@ -184,7 +190,11 @@ fn rsfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
 
             const gop = try score_map.getOrPut(alloc, hit.doc_id);
             if (!gop.found_existing) {
-                gop.key_ptr.* = try alloc.dupe(u8, hit.doc_id);
+                const owned_id = alloc.dupe(u8, hit.doc_id) catch |err| {
+                    _ = score_map.remove(hit.doc_id);
+                    return err;
+                };
+                gop.key_ptr.* = owned_id;
                 gop.value_ptr.* = .{
                     .score = 0.0,
                     .index_scores = std.ArrayListUnmanaged(IndexScore).empty,
@@ -193,8 +203,10 @@ fn rsfFuse(alloc: Allocator, results: []const RankedResult, config: FusionConfig
             }
             gop.value_ptr.score += rsf_score;
             gop.value_ptr.index_count += 1;
+            const index_name = try alloc.dupe(u8, result.index_name);
+            errdefer alloc.free(index_name);
             try gop.value_ptr.index_scores.append(alloc, .{
-                .index_name = try alloc.dupe(u8, result.index_name),
+                .index_name = index_name,
                 .score = hit.score,
             });
         }
@@ -232,9 +244,10 @@ fn buildSortedHits(alloc: Allocator, score_map: *std.StringHashMapUnmanaged(Accu
     var it = score_map.iterator();
     while (it.next()) |entry| {
         var copied_index_scores = try alloc.alloc(IndexScore, entry.value_ptr.index_scores.items.len);
+        var scores_initialized: usize = 0;
         errdefer {
-            for (copied_index_scores[0..entry.value_ptr.index_scores.items.len]) |is| {
-                if (is.index_name.len > 0) alloc.free(is.index_name);
+            for (copied_index_scores[0..scores_initialized]) |is| {
+                alloc.free(is.index_name);
             }
             alloc.free(copied_index_scores);
         }
@@ -243,6 +256,7 @@ fn buildSortedHits(alloc: Allocator, score_map: *std.StringHashMapUnmanaged(Accu
                 .index_name = try alloc.dupe(u8, is.index_name),
                 .score = is.score,
             };
+            scores_initialized += 1;
         }
         hits[i] = .{
             .doc_id = try alloc.dupe(u8, entry.key_ptr.*),

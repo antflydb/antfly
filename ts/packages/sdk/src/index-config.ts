@@ -372,7 +372,7 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     validateOptionalString(source.mention_edge_type, `sources[${index}].mention_edge_type`);
     if (source.nodes !== undefined) {
       if (!isRecord(source.nodes)) throw new TypeError(`sources[${index}].nodes must be an object`);
-      validateOnlyKeys(source.nodes, ["model", "target"], `sources[${index}].nodes`);
+      validateOnlyKeys(source.nodes, ["model", "source", "target"], `sources[${index}].nodes`);
     }
     if (
       source.nodes?.model !== undefined &&
@@ -383,9 +383,16 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
     }
     if (source.edge !== undefined) {
       if (!isRecord(source.edge)) throw new TypeError(`sources[${index}].edge must be an object`);
-      validateOnlyKeys(source.edge, ["type", "weight", "metadata"], `sources[${index}].edge`);
+      validateOnlyKeys(
+        source.edge,
+        ["type", "weight", "metadata", "edge_id"],
+        `sources[${index}].edge`
+      );
     }
-    for (const [fieldName, value] of [["target", source.nodes?.target]] as const) {
+    for (const [fieldName, value] of [
+      ["source", source.nodes?.source],
+      ["target", source.nodes?.target],
+    ] as const) {
       if (
         value !== undefined &&
         typeof value !== "string" &&
@@ -397,6 +404,7 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
       }
     }
     for (const [fieldName, value] of [
+      ["edge_id", source.edge?.edge_id],
       ["type", source.edge?.type],
       ["weight", source.edge?.weight],
     ] as const) {
@@ -409,6 +417,9 @@ export function graphIndexSources(...sources: GraphIndexSource[]): GraphIndexSou
           `sources[${index}].edge.${fieldName} must be a string or finite number`
         );
       }
+    }
+    if (source.nodes?.source !== undefined && source.edge?.edge_id === undefined) {
+      throw new TypeError(`sources[${index}].nodes.source requires edge.edge_id`);
     }
     if (source.edge?.metadata !== undefined && !isRecord(source.edge.metadata)) {
       throw new TypeError(`sources[${index}].edge.metadata must be an object`);

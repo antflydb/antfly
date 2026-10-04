@@ -16,9 +16,11 @@ T = TypeVar("T", bound="GraphArtifactEdgeMappingConfig")
 
 @_attrs_define
 class GraphArtifactEdgeMappingConfig:
-    """Maps each artifact item to an edge type, weight, and public metadata.
+    """Maps each artifact item to a relationship identity, type, weight, and public metadata.
 
     Attributes:
+        edge_id (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
+            each materialized graph item.
         type_ (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
             each materialized graph item.
         weight (float | str | Unset): A literal string or finite numeric value, or a Handlebars template evaluated for
@@ -27,11 +29,18 @@ class GraphArtifactEdgeMappingConfig:
             edge. Sensitive keys are omitted from create responses.
     """
 
+    edge_id: float | str | Unset = UNSET
     type_: float | str | Unset = UNSET
     weight: float | str | Unset = UNSET
     metadata: GraphArtifactEdgeMappingConfigMetadata | Unset = UNSET
 
     def to_dict(self) -> dict[str, Any]:
+        edge_id: float | str | Unset
+        if isinstance(self.edge_id, Unset):
+            edge_id = UNSET
+        else:
+            edge_id = self.edge_id
+
         type_: float | str | Unset
         if isinstance(self.type_, Unset):
             type_ = UNSET
@@ -51,6 +60,8 @@ class GraphArtifactEdgeMappingConfig:
         field_dict: dict[str, Any] = {}
 
         field_dict.update({})
+        if edge_id is not UNSET:
+            field_dict["edge_id"] = edge_id
         if type_ is not UNSET:
             field_dict["type"] = type_
         if weight is not UNSET:
@@ -65,6 +76,13 @@ class GraphArtifactEdgeMappingConfig:
         from ..models.graph_artifact_edge_mapping_config_metadata import GraphArtifactEdgeMappingConfigMetadata
 
         d = dict(src_dict)
+
+        def _parse_edge_id(data: object) -> float | str | Unset:
+            if isinstance(data, Unset):
+                return data
+            return cast(float | str | Unset, data)
+
+        edge_id = _parse_edge_id(d.pop("edge_id", UNSET))
 
         def _parse_type_(data: object) -> float | str | Unset:
             if isinstance(data, Unset):
@@ -88,6 +106,7 @@ class GraphArtifactEdgeMappingConfig:
             metadata = GraphArtifactEdgeMappingConfigMetadata.from_dict(_metadata)
 
         graph_artifact_edge_mapping_config = cls(
+            edge_id=edge_id,
             type_=type_,
             weight=weight,
             metadata=metadata,

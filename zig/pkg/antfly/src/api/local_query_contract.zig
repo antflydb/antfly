@@ -3291,7 +3291,9 @@ pub fn encodeQueryRequestWithGraphWireMode(
     }
     if (req.hierarchy_children != null or
         req.hierarchy_grouped_matches or
-        req.hierarchy_group_level == .unit)
+        req.hierarchy_group_level == .unit or
+        req.hierarchy_include_source or
+        req.hierarchy_include_unit)
     {
         try appendQueryHierarchyField(alloc, &out, &first, req);
     }
@@ -3830,19 +3832,34 @@ pub fn appendQueryHierarchyField(
         try appendJsonString(alloc, out, children.parent_id);
         try out.appendSlice(alloc, "},\"level\":\"unit\"}");
     } else {
-        try out.appendSlice(alloc, "\"group_by\":{\"level\":");
-        try appendJsonString(alloc, out, @tagName(req.hierarchy_group_level));
-        if (req.hierarchy_grouped_matches) {
-            try out.appendSlice(alloc, ",\"matches\":{");
-            try out.appendSlice(alloc, "\"limit\":");
-            try out.print(alloc, "{d}", .{req.max_chunks_per_parent});
-            try out.appendSlice(alloc, ",\"fields\":");
-            try appendJsonStringArray(alloc, out, req.hierarchy_match_fields);
+        // `group_by` is its own opt-in control (grouped matches, or explicit
+        // unit-level grouping); `ancestors` (hydrating a chunk hit's source/
+        // unit document, independent of any grouping) is a second, separate
+        // opt-in. Only emit each clause when the caller actually asked for
+        // it - unconditionally writing `group_by` here previously forced a
+        // stray `"group_by":{"level":"source"}` onto every ancestors-only
+        // request once this function started being called for that case
+        // too, which flips the reparsed request's return_mode from member to
+        // parent on the internal wire hop (issue #930).
+        const needs_group_by = req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
+        var wrote_group_by = false;
+        if (needs_group_by) {
+            try out.appendSlice(alloc, "\"group_by\":{\"level\":");
+            try appendJsonString(alloc, out, @tagName(req.hierarchy_group_level));
+            if (req.hierarchy_grouped_matches) {
+                try out.appendSlice(alloc, ",\"matches\":{");
+                try out.appendSlice(alloc, "\"limit\":");
+                try out.print(alloc, "{d}", .{req.max_chunks_per_parent});
+                try out.appendSlice(alloc, ",\"fields\":");
+                try appendJsonStringArray(alloc, out, req.hierarchy_match_fields);
+                try out.append(alloc, '}');
+            }
             try out.append(alloc, '}');
+            wrote_group_by = true;
         }
-        try out.append(alloc, '}');
         if (req.hierarchy_include_source or req.hierarchy_include_unit) {
-            try out.appendSlice(alloc, ",\"ancestors\":{");
+            if (wrote_group_by) try out.append(alloc, ',');
+            try out.appendSlice(alloc, "\"ancestors\":{");
             var first_ancestor = true;
             if (req.hierarchy_include_source) {
                 try out.appendSlice(alloc, "\"source\":{\"fields\":");
@@ -5504,6 +5521,10 @@ pub fn cloneRemoteCanonicalGraphNodePathEdges(
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, item.type);
         errdefer alloc.free(edge_type);
+        const edge_id = if (item.edge_id) |id| try alloc.dupe(u8, id) else "";
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = if (item.owner_document) |owner| try alloc.dupe(u8, owner) else "";
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
         const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
@@ -5511,6 +5532,8 @@ pub fn cloneRemoteCanonicalGraphNodePathEdges(
             .target = target,
             .edge_type = edge_type,
             .weight = item.weight,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .metadata = metadata,
             .traversal_direction = switch (item.direction) {
                 .out => .out,
@@ -5531,6 +5554,8 @@ pub fn freeRemoteGraphNodePathEdgeItems(
         alloc.free(edge.source);
         alloc.free(edge.target);
         alloc.free(edge.edge_type);
+        if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+        if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
         if (edge.metadata.len > 0) alloc.free(edge.metadata);
     }
     if (edges.len > 0) alloc.free(edges);
@@ -5599,6 +5624,8 @@ pub fn parseRemoteCanonicalGraphPath(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         alloc.free(edges);
@@ -5660,6 +5687,8 @@ pub fn parseRemoteCanonicalPathEdges(
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
+            if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+            if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
             if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (edges.len > 0) alloc.free(edges);
@@ -5673,6 +5702,10 @@ pub fn parseRemoteCanonicalPathEdges(
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, item.type);
         errdefer alloc.free(edge_type);
+        const edge_id = if (item.edge_id) |id| try alloc.dupe(u8, id) else "";
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = if (item.owner_document) |owner| try alloc.dupe(u8, owner) else "";
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
         const metadata = if (item.metadata) |metadata| try std.json.Stringify.valueAlloc(alloc, metadata, .{}) else "";
         errdefer if (metadata.len > 0) alloc.free(metadata);
         edges[i] = .{
@@ -5680,6 +5713,8 @@ pub fn parseRemoteCanonicalPathEdges(
             .target = target,
             .edge_type = edge_type,
             .weight = item.weight,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .metadata = metadata,
             .traversal_direction = switch (item.direction) {
                 .out => .out,
@@ -6420,4 +6455,48 @@ pub fn replaceOwnedCapabilityState(alloc: std.mem.Allocator, state: *[]const u8,
     const owned = try alloc.dupe(u8, replacement);
     alloc.free(state.*);
     state.* = owned;
+}
+
+test "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by (issue #930)" {
+    const alloc = std.testing.allocator;
+    // Every public query - even one served entirely by a single local
+    // shard - is parsed once from the caller's JSON and then re-encoded via
+    // encodeQueryRequestWithGraphWireMode into an internal wire request that
+    // gets parsed a second time for execution. A request that only uses
+    // hierarchy.ancestors (no group_by/children) must survive that hop.
+    const body =
+        \\{
+        \\  "full_text_search": {"match": "needle", "field": "content"},
+        \\  "hierarchy": {"ancestors": {"source": {"fields": ["title", "url"]}}}
+        \\}
+    ;
+    var first = try query_contract.parseQueryRequest(alloc, null, "docs", body);
+    defer first.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, first.req.return_mode);
+    try std.testing.expect(first.req.hierarchy_include_source);
+    try std.testing.expect(!first.req.hierarchy_include_unit);
+    try std.testing.expect(!first.req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqual(@as(usize, 2), first.req.hierarchy_source_fields.len);
+    try std.testing.expectEqualStrings("title", first.req.hierarchy_source_fields[0]);
+    try std.testing.expectEqualStrings("url", first.req.hierarchy_source_fields[1]);
+
+    const encoded = try encodeQueryRequest(alloc, first.req);
+    defer alloc.free(encoded);
+    // Two distinct mistakes both corrupt this hop: omitting "hierarchy"
+    // entirely (drops hierarchy_include_source, so ancestors.source never
+    // hydrates) and unconditionally writing "group_by" once this control is
+    // forwarded at all (flips the reparsed request's return_mode from member
+    // to parent).
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"ancestors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"group_by\"") == null);
+
+    var second = try query_contract.parseQueryRequest(alloc, null, "docs", encoded);
+    defer second.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.ReturnMode.member, second.req.return_mode);
+    try std.testing.expect(second.req.hierarchy_include_source);
+    try std.testing.expect(!second.req.hierarchy_include_unit);
+    try std.testing.expect(!second.req.hierarchy_source_include_all_fields);
+    try std.testing.expectEqual(@as(usize, 2), second.req.hierarchy_source_fields.len);
+    try std.testing.expectEqualStrings("title", second.req.hierarchy_source_fields[0]);
+    try std.testing.expectEqualStrings("url", second.req.hierarchy_source_fields[1]);
 }

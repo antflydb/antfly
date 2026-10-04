@@ -54,7 +54,7 @@ pub const ChunkerConfig = struct {
     store_chunks: ?bool = null,
     /// Configuration for full-text indexing of chunks. When present (even if empty), chunk artifacts are persisted and indexed in Antfly's native full-text index, queryable and projectable via the document's `_chunks` field. When absent, chunks are generated only to drive vector embeddings and are not indexed for full-text search (unless `store_chunks` is also set).
     full_text_index: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// Maximum number of chunks to generate per document. Zero uses the chunker default.
+    /// Maximum number of chunks to generate per document. Zero (or omitted, the default) means unlimited — the document is chunked in full with no cap. Set an explicit value up to 4096 to bound chunk count for very large inputs.
     max_chunks: ?i64 = null,
     threshold: ?f32 = null,
     text: ?antfly_chunking_api_openapi.TextChunkOptions = null,

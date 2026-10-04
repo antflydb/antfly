@@ -625,9 +625,16 @@ test "opaque owner relational handoff preserves binary proofs across the compile
     const topology = @import("db/relational_integrity_topology_contract.zig");
     const handoff = @import("db/relational_integrity_handoff_contract.zig");
     const contract = @import("db/relational_transition_contract.zig");
-    const path = "/tmp/antfly-kernel-relational-handoff";
-    cleanup(path);
-    defer cleanup(path);
+    // A fixed /tmp literal collides with any other process (including a
+    // concurrent test run) that opens the same path, surfacing spurious
+    // GenerationTransitionActive failures. Use a per-run unique directory
+    // like the rest of this file's tests.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/relational-handoff", .{root});
+    defer alloc.free(path);
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"uq","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false}}}}
     ;
@@ -1614,6 +1621,28 @@ fn ownerStatusEventually(owner: *client.Owner) !client.Response {
     }
 }
 
+// textMemoryJson is, by design, an observational read that tries the owner's
+// apply lock without waiting (storageOwnerTextMemoryJson ->
+// trySnapshotTextMemoryAttributionStats): a concurrent background checkpoint
+// or compaction worker from a preceding reconcile/full-index batch can hold
+// that lock just long enough to surface a transient StorageBusy here, the
+// same category of contention ownerStatusEventually already retries for
+// runtimeStatusJson.
+fn ownerTextMemoryEventually(owner: *client.Owner, table_name: []const u8) !client.Response {
+    const time = @import("antfly_platform").time;
+    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        return owner.textMemoryJson(table_name) catch |err| switch (err) {
+            error.StorageBusy => {
+                if (time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 test "opaque storage owner preserves dense profiles and captured identity" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-owner-dense-profile";
@@ -1666,12 +1695,19 @@ test "opaque storage owner preserves dense profiles and captured identity" {
 }
 
 test "opaque storage owner performs coarse batch and query on one live DB" {
-    const path = "/tmp/antfly-storage-kernel-owner-batch-query";
-    const backup_root = "/tmp/antfly-storage-kernel-owner-backups";
-    cleanup(path);
-    cleanup(backup_root);
-    defer cleanup(path);
-    defer cleanup(backup_root);
+    // A fixed /tmp literal collides with any other process (including a
+    // concurrent test run) that opens the same path, racing the storage
+    // owner's process-wide generation/lease lifecycle and surfacing spurious
+    // StorageBusy/LsmRootWriterAlreadyOpen failures. Use a per-run unique
+    // directory like the rest of this file's tests.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/batch-query", .{root});
+    defer std.testing.allocator.free(path);
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/backups", .{root});
+    defer std.testing.allocator.free(backup_root);
 
     var owner = try client.Owner.open(.{
         .path = .fromSlice(path),
@@ -2138,7 +2174,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
     );
     defer indexed_batch.deinit();
-    var text_memory = try owner.textMemoryJson("docs");
+    var text_memory = try ownerTextMemoryEventually(&owner, "docs");
     defer text_memory.deinit();
     try std.testing.expect(std.mem.indexOf(u8, text_memory.bytes(), "\"text_indexes\":1") != null);
     var dense_response = try owner.queryJson(
@@ -3871,6 +3907,40 @@ test "storage and shard query contracts preserve search effort" {
             try std.testing.expectEqual(@as(usize, 1), restored.req.dense_queries.len);
             if (effort == null) try std.testing.expect(std.mem.indexOf(u8, wire, "search_effort") == null);
         }
+    }
+}
+
+test "storage query contract embedding numbers preserve relationship precision" {
+    const alloc = std.testing.allocator;
+    const query = @import("../api/query_contract.zig");
+    const body =
+        \\{"embeddings":{"dense":[1,0.5,1e-3],"sparse":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8=","k":4}},"indexes":["dense","sparse"],"limit":9,"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+    ;
+    var public = try query.parsePublicQueryRequest(alloc, null, "docs", body);
+    defer public.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0.5, 0.001 }, public.req.dense_queries[0].query.vector);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 5 }, public.req.sparse_queries[0].query.indices);
+    try std.testing.expectEqual(@as(u32, 4), public.req.sparse_queries[0].query.k);
+    try std.testing.expectEqualStrings("1.0000000000000001", public.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+    const contract = @import("../api/local_query_contract.zig");
+    const wire = try contract.encodeStorageKernelQueryRequest(alloc, public.req);
+    defer alloc.free(wire);
+    var internal = try query.parseQueryRequest(alloc, null, "docs", wire);
+    defer internal.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, public.req.dense_queries[0].query.vector, internal.req.dense_queries[0].query.vector);
+    try std.testing.expectEqual(@as(u32, 4), internal.req.sparse_queries[0].query.k);
+    try std.testing.expectEqualStrings("1.0000000000000001", internal.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+    for ([_][]const u8{
+        \\{"embeddings":{"s":{"indices":[-1],"values":[1]}}}
+        ,
+        \\{"embeddings":{"s":{"indices":[1],"values":[1],"k":4294967296}}}
+        ,
+        \\{"embeddings":{"d":[1e100]}}
+        ,
+        \\{"embeddings":{"d":"AACAfw=="}}
+        ,
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidQueryRequest, query.parsePublicQueryRequest(alloc, null, "docs", invalid));
     }
 }
 

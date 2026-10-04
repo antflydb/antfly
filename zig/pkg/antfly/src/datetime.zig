@@ -81,6 +81,10 @@ pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
 }
 
 pub fn parseRfc3339ToNs(text: []const u8) ?u64 {
+    return std.math.cast(u64, parseRfc3339ToSignedNs(text) orelse return null);
+}
+
+pub fn parseRfc3339ToSignedNs(text: []const u8) ?i128 {
     if (text.len < 20) return null;
     if (text[4] != '-' or text[7] != '-' or
         (text[10] != 'T' and text[10] != 't') or
@@ -128,7 +132,7 @@ pub fn parseRfc3339ToNs(text: []const u8) ?u64 {
 
     const local_ns = civilDateTimeToSignedNs(year, month, day, hour, minute, second, nanos) orelse return null;
     const offset_ns = @as(i128, offset_seconds) * std.time.ns_per_s;
-    return std.math.cast(u64, local_ns - offset_ns);
+    return local_ns - offset_ns;
 }
 
 pub fn parseDateToNs(value: []const u8) ?u64 {

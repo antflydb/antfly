@@ -25,7 +25,7 @@ pub fn chunkText(alloc: Allocator, text: []const u8, cfg: chunking_types.Config)
     const shared_chunks = try inference_chunker.fixed_text.chunkText(alloc, text, .{
         .target_tokens = cfg.defaultedTargetTokens(),
         .overlap_tokens = cfg.defaultedOverlapTokens(),
-        .max_chunks = if (cfg.max_chunks > 0) cfg.max_chunks else 50,
+        .max_chunks = cfg.max_chunks, // 0 = unlimited
         .separator = cfg.defaultedSeparator(),
     });
     defer inference_chunker.types.freeChunks(alloc, shared_chunks);

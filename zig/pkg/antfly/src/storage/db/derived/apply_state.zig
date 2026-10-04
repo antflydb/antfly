@@ -597,7 +597,7 @@ fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, inde
 
 test "ordered artifact inventory projection snapshot owns a coherent checkpoint and publication fence" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = @import("../artifact_publication.zig");
     const epoch = @import("../artifact_projection_epoch.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -665,7 +665,7 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
 
 test "ordered artifact inventory projection sidecar transitions revoke completion before publication" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = @import("../artifact_publication.zig");
     const epoch = @import("../artifact_projection_epoch.zig");
     var tmp = std.testing.tmpDir(.{});

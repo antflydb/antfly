@@ -70,6 +70,8 @@ pub const BlockType = enum(u8) {
     /// Certified source-copy only. Inert producer proofs and a bitmap of
     /// source-cut output owners; receivers must issue their own adoption.
     source_proof_batch = 0x1D,
+    /// Exact versioned relationship artifact keys and portable edge values.
+    graph_relationship_batch = 0x1E,
     blob_header = 0x20,
     blob_chunk = 0x21,
     footer_index = 0x22,
@@ -530,6 +532,7 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
     if (data.len < 4) return error.BatchTooShort;
 
     const count = std.mem.readInt(u32, data[0..4], .little);
+    if (count > (data.len - 4) / 8) return error.Truncated;
     var off: usize = 4;
 
     var entries = try ArrayList(KeyValueEntry).initCapacity(alloc, count);
@@ -549,6 +552,7 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
 
         if (off + key_len > data.len) return error.Truncated;
         const key = try alloc.dupe(u8, data[off..][0..key_len]);
+        errdefer alloc.free(key);
         off += key_len;
 
         if (off + 4 > data.len) return error.Truncated;
@@ -557,6 +561,7 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
 
         if (off + value_len > data.len) return error.Truncated;
         const value = try alloc.dupe(u8, data[off..][0..value_len]);
+        errdefer alloc.free(value);
         off += value_len;
 
         try entries.append(alloc, .{
@@ -565,6 +570,7 @@ pub fn decodeKeyValueBatch(alloc: Allocator, data: []const u8) ![]KeyValueEntry 
         });
     }
 
+    if (off != data.len) return error.TrailingBytes;
     return entries.toOwnedSlice(alloc);
 }
 
@@ -1544,4 +1550,22 @@ fn decodeEdgeBatch(alloc: Allocator, data: []const u8) !struct {
         .index_name = index_name,
         .entries = try entries.toOwnedSlice(alloc),
     };
+}
+
+test "relationship key value decoding releases truncated and failed allocations" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeKeyValueBatch(alloc, &.{.{ .key = "owner-scoped-key", .value = "relationship-value" }});
+    defer alloc.free(payload);
+    for (4..payload.len) |end| try std.testing.expectError(error.Truncated, decodeKeyValueBatch(alloc, payload[0..end]));
+    const Case = struct {
+        fn decode(a: Allocator, bytes: []const u8) !void {
+            const entries = try decodeKeyValueBatch(a, bytes);
+            defer a.free(entries);
+            defer for (entries) |entry| {
+                a.free(entry.key);
+                a.free(entry.value);
+            };
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Case.decode, .{payload});
 }

@@ -647,3 +647,25 @@ func TestNewArtifactFullTextIndexConfig(t *testing.T) {
 		t.Fatalf("source-local full-text field was not normalized: %s", data)
 	}
 }
+
+func TestGraphFactProjectionSourceRequiresAndPreservesIdentity(t *testing.T) {
+	var source GraphArtifactSourceConfig
+	if err := json.Unmarshal([]byte(`{"artifact":"relations","path":"$","nodes":{"source":"{{ _item.source }}","target":"{{ _item.target }}"},"edge":{"edge_id":"{{ _doc.key }}","type":"RELATES_TO"}}`), &source); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := NewGraphIndexSources(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(sources[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"source":"{{ _item.source }}"`) || !strings.Contains(string(encoded), `"edge_id":"{{ _doc.key }}"`) {
+		t.Fatalf("lost projection identity: %s", encoded)
+	}
+	source.Edge.EdgeId = GraphTemplateValue{}
+	if _, err := NewGraphIndexSources(source); err == nil {
+		t.Fatal("expected source projection without edge_id to fail")
+	}
+}

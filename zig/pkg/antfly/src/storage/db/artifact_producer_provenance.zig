@@ -1541,7 +1541,7 @@ test "ordered artifact inventory document proof index tracks absence replacement
 
 test "ordered artifact inventory obsolete proof GC bounds pages and preserves current and pinned evidence" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/proof-gc", .{tmp.sub_path});
@@ -1615,7 +1615,7 @@ test "ordered artifact inventory obsolete proof GC bounds pages and preserves cu
 
 test "ordered artifact inventory document proof pages seek binary ranges and reject drift" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/proof-page", .{tmp.sub_path});

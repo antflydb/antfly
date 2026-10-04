@@ -14119,6 +14119,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return denseBuf(self.allocator, output, true, &shape);
     }
 
+    /// Model storage, whose address and contents stay fixed for the
+    /// session; identity-keyed device caches may retain a copy of it.
+    fn immutableTable(buf: *const Buf) bool {
+        return !buf.mutable_state and (buf.weight_handle_name != null or buf.lazy_entry != null or buf.boundary_immutable_f32);
+    }
+
     fn embeddingLookupOp(ctx: *anyopaque, weight: CT, ids: []const i64, total: usize, dim: usize) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const weight_buf = toBuf(weight);
@@ -14133,13 +14139,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (quantized_storage == null and weight_buf.native_dense_bytes == null and !disableRuntimeEmbeddingLookup()) {
             var weight_mt = try self.ownedMetalTensorFromCt(weight);
             defer weight_mt.deinit();
-            if (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
-                .weight = weight_mt,
-                .ids = ids,
-                .total = total,
-                .dim = dim,
-            })) |tensor| {
-                return self.ctFromOwnedMetalTensor(tensor);
+            // A host-visible table is cached on the device keyed by its host
+            // address, which only model storage keeps stable; an activation's
+            // address is reused by a later table of the same size.
+            if (weight_mt.isDevice() or immutableTable(weight_buf)) {
+                if (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
+                    .weight = weight_mt,
+                    .ids = ids,
+                    .total = total,
+                    .dim = dim,
+                })) |tensor| {
+                    return self.ctFromOwnedMetalTensor(tensor);
+                }
             }
         }
         if (quantized_storage) |storage| {
@@ -23375,6 +23386,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return lookupWeight(ctx, name, false);
     }
 
+    // Gemma 4 PLE lookups go through ComputeBackend.getEmbeddingWeight, not
+    // getWeight/acquireWeight. Metal's lookupWeight has no CPU-only "prepare
+    // the matrix" distinction (that's native_compute's acquireWeight vs.
+    // getEmbeddingWeight split), so an un-shared acquire is the right
+    // behavior here. Without this override the base native_compute vtable's
+    // getEmbeddingWeight stays wired in and reinterprets this MetalCompute
+    // ctx as a *NativeCompute, corrupting the weight-store pointer and
+    // segfaulting.
+    fn getEmbeddingWeightOp(ctx: *anyopaque, name: []const u8) anyerror!CT {
+        return lookupWeight(ctx, name, false);
+    }
+
     fn lookupWeight(ctx: *anyopaque, name: []const u8, shared: bool) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
 
@@ -30676,6 +30699,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.freeTensor = freeOp;
         vt.getWeight = getWeightOp;
         vt.acquireWeight = acquireWeightOp;
+        vt.getEmbeddingWeight = getEmbeddingWeightOp;
         vt.prefetchWeightHint = prefetchWeightHintOp;
         vt.drainPrefetchBudget = drainPrefetchBudgetOp;
         vt.fromFloat32 = fromFloat32Op;
@@ -39681,4 +39705,43 @@ test "metal_compute: integer CumSum matches native for batched strided scans" {
         try std.testing.expectEqual(.i32, actual_bytes.dtype);
         try std.testing.expectEqualSlices(u8, expected_bytes.payload.bytes, actual_bytes.payload.bytes);
     };
+}
+
+test "metal_compute: embedding lookup reads a recycled activation table's current contents" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&metal_ws);
+        metal_ws.lazy_weights.deinit(allocator);
+    }
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var cb = metal_compute.computeBackend();
+
+    // Activations come from pooled buffers, so a later table of the same
+    // shape can land in the buffer an earlier lookup read from. Every lookup
+    // must see the values written in this iteration.
+    const rows = 60;
+    const dim = 64;
+    const values = try allocator.alloc(f32, rows * dim);
+    defer allocator.free(values);
+    const ids = [_]i64{ 0, 7, 59 };
+    for (0..32) |iteration| {
+        for (values, 0..) |*value, i| value.* = @floatFromInt(iteration * 1000 + i / dim);
+        const uploaded = try cb.fromFloat32Shape(values, &.{ rows, dim });
+        defer cb.free(uploaded);
+        const table = try cb.add(uploaded, uploaded);
+        defer cb.free(table);
+        const gathered = try cb.embeddingLookup(table, &ids, ids.len, dim);
+        defer cb.free(gathered);
+        const host = try cb.toFloat32(gathered, allocator);
+        defer allocator.free(host);
+        for (ids, 0..) |id, row| {
+            const expected: f32 = @floatFromInt(2 * (iteration * 1000 + @as(usize, @intCast(id))));
+            for (host[row * dim ..][0..dim]) |got| try std.testing.expectEqual(expected, got);
+        }
+    }
 }

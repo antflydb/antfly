@@ -181,6 +181,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "local raft admission leaves global metadata refresh to control",
         "data raft stable placement refreshes changed peer transport endpoints",
         "raft batch round trips table batch payload",
+        "raft batch round trips guarded graph owner replay afterimages",
         "raft batch round trips deterministic transaction begin",
         "raft batch round trips deterministic storage owner descriptor",
         "raft batch round trips binary initial owner range",
