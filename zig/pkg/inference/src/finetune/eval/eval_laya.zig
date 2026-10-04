@@ -14,6 +14,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--backend")) {
             const value = args.next() orelse return usage();
             options.backend = std.meta.stringToEnum(@TypeOf(options.backend), value) orelse return usage();
+        } else if (std.mem.eql(u8, arg, "--truncate-state")) {
+            options.truncate_state = true;
+        } else if (std.mem.eql(u8, arg, "--predictions")) {
+            options.predictions_file = args.next() orelse return usage();
         } else if (std.mem.eql(u8, arg, "--top-k-recall")) {
             const value = args.next() orelse return usage();
             options.top_k_recall = std.fmt.parseInt(usize, value, 10) catch return usage();
@@ -40,7 +44,7 @@ fn usage() error{InvalidArguments} {
 }
 fn help() void {
     std.debug.print(
-        \\usage: antfly inference finetune eval laya <model_dir> <records.jsonl> [--backend metal|native] [--top-k-recall N]
+        \\usage: antfly inference finetune eval laya <model_dir> <records.jsonl> [--backend metal|native] [--top-k-recall N] [--predictions out.jsonl] [--truncate-state]
         \\Scores a prepared Laya checkpoint on native training records through the
         \\serving pipeline (packed or unpacked per the model config, with its
         \\calibration). Prints accuracy, soft CE, ECE, and ordinal MAE as JSON.
@@ -48,6 +52,12 @@ fn help() void {
         \\gold label is among the N highest probabilities (bounds two-stage
         \\choice's stage 2, LAYA.md roadmap 2b, run against a model with
         \\packing.two_stage unset to measure stage 1 alone).
+        \\--predictions writes each decision's id, labels, probabilities and target
+        \\as JSON lines to a new file (scripts/laya/typed_decisions_bench.py
+        \\compares models on them).
+        \\--truncate-state cuts the end of a state that does not fit the model's
+        \\max_len instead of failing, as upstream Laya and OpenDecider do; serving
+        \\never truncates.
         \\
     , .{});
 }

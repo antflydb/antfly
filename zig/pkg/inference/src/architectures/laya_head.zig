@@ -55,10 +55,12 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
         }
         if (valid < 2) return error.InvalidLayaInputs;
     }
-    const hidden = try transform(cb, a, cfg, encoder, mask, kinds, batch, seq, dim);
-    defer cb.free(hidden);
+    // OpenDecider scores the encoder's output directly.
+    const transformed = if (cfg.format == .laya) try transform(cb, a, cfg, encoder, mask, kinds, batch, seq, dim) else null;
+    defer if (transformed) |t| cb.free(t);
+    const hidden = transformed orelse encoder;
     // The CUDA tail is scorer-only; a pointer head scores on the host path.
-    if (cb.kind() == .cuda and cfg.decision_head == .scorer) return forwardCudaTail(cb, a, cfg, hidden, markers, batch, seq, count, dim);
+    if (cb.kind() == .cuda and cfg.decision_head == .scorer and cfg.format == .laya) return forwardCudaTail(cb, a, cfg, hidden, markers, batch, seq, count, dim);
     const host = try cb.toFloat32(hidden, a);
     defer a.free(host);
     if (host.len != batch * seq * dim) return error.UnexpectedOutputShape;
@@ -87,7 +89,17 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     defer cb.free(m);
     const logits = if (cfg.decision_head == .pointer)
         try pointerLogits(cb, a, cfg, host, m, anchors, count, dim)
-    else blk: {
+    else if (cfg.format == .opendecider) blk: {
+        const s0 = try linear(cb, m, "scorer.0", batch * count, dim, dim);
+        defer cb.free(s0);
+        const sg = try exactGelu(cb, s0);
+        defer cb.free(sg);
+        const n = try norm(cb, sg, "scorer.2", dim);
+        defer cb.free(n);
+        const s3 = try linear(cb, n, "scorer.3", batch * count, dim, 1);
+        defer cb.free(s3);
+        break :blk try cb.toFloat32(s3, a);
+    } else blk: {
         const n = try norm(cb, m, "scorer.0", dim);
         defer cb.free(n);
         const s1 = try linear(cb, n, "scorer.1", batch * count, dim, dim);
@@ -103,6 +115,12 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     for (markers, logits) |pos, *logit| if (pos < 0) {
         logit.* = -1e4;
     };
+    if (cfg.n_act == 0) {
+        const result = try a.alloc(Tensor, 1);
+        errdefer a.free(result);
+        result[0] = try Tensor.initFloat32(a, "logits", &.{ @intCast(batch), @intCast(count) }, logits);
+        return result;
+    }
     const features = try a.alloc(f32, batch * (dim + 4));
     defer a.free(features);
     for (0..batch) |row| {

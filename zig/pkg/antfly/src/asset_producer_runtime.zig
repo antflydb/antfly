@@ -4947,7 +4947,8 @@ fn validateExtractionResult(alloc: Allocator, item: std.json.Value, typed: extra
         try extractionStringChoice(raw, "type", &.{ "choice", "score", "boolean" });
         try extractionStringChoice(raw, "confidence_method", &.{ "normalized_inverse_entropy", "max_probability" });
         _ = try extractionNumber(raw.object.get("confidence") orelse return error.InvalidExtractorResponse, true);
-        _ = try extractionNumber(raw.object.get("act_probability") orelse return error.InvalidExtractorResponse, true);
+        // Only models with an action head (Laya) report one.
+        try extractionOptionalNumber(raw, "act_probability", true);
         try extractionOptionalNumber(raw, "true_probability", true);
         if (raw.object.get("expected_value")) |value| if (try extractionNumber(value, false) < 0) return error.InvalidExtractorResponse;
         if (decision.expected_value) |value| if (!std.math.isFinite(value)) return error.InvalidExtractorResponse;
@@ -7766,6 +7767,12 @@ test "laya enrichment preserves typed decisions and rejects invalid probabilitie
     const invalid = try std.mem.replaceOwned(u8, a, payload, "\"probability\":0.75", "\"probability\":1.5");
     defer a.free(invalid);
     try std.testing.expectError(error.InvalidExtractorResponse, extractionResultJsonAlloc(a, invalid, expected, null, false));
+    // OpenDecider-format models have no action head and omit act_probability.
+    const no_action = try std.mem.replaceOwned(u8, a, payload, ",\"act_probability\":0.8", "");
+    defer a.free(no_action);
+    const without = try extractionResultJsonAlloc(a, no_action, expected, null, false);
+    defer a.free(without);
+    try std.testing.expect(std.mem.indexOf(u8, without, "act_probability") == null);
 }
 
 test "decision functions materialized enrichment records version model and source provenance" {

@@ -224,6 +224,15 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
     if (obj.get("global_rope_theta")) |value| config.global_rope_theta = jsonF32(value) orelse config.global_rope_theta;
     if (obj.get("local_rope_theta")) |value| config.local_rope_theta = jsonF32(value) orelse config.local_rope_theta;
     if (obj.get("layer_norm_eps")) |value| config.layer_norm_eps = jsonF32(value) orelse config.layer_norm_eps;
+    if (obj.get("norm_eps")) |value| config.layer_norm_eps = jsonF32(value) orelse config.layer_norm_eps;
+    // Transformers 5 nests the rope settings per layer type (Ettin, for
+    // example, uses 160000 for sliding layers too) and lists each layer's
+    // type instead of `global_attn_every_n_layers`.
+    if (obj.get("rope_parameters")) |value| if (value == .object) {
+        if (ropeTheta(value.object, "full_attention")) |theta| config.global_rope_theta = theta;
+        if (ropeTheta(value.object, "sliding_attention")) |theta| config.local_rope_theta = theta;
+    };
+    if (obj.get("layer_types")) |value| try checkLayerTypes(value, config);
 
     // `modernbert` is Transformers' public checkpoint layout. Keep the
     // historical layout available to the fused-chunker training code.
@@ -239,6 +248,23 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Config
         if (config.hidden_size < 64 or config.hidden_size % 64 != 0 or config.num_attention_heads == 0 or config.hidden_size % config.num_attention_heads != 0 or config.num_hidden_layers == 0 or laya.max_len > config.max_position_embeddings) return error.InvalidLayaConfig;
     }
     return config;
+}
+
+fn ropeTheta(params: std.json.ObjectMap, layer_type: []const u8) ?f32 {
+    const entry = params.get(layer_type) orelse return null;
+    if (entry != .object) return null;
+    return jsonF32(entry.object.get("rope_theta") orelse return null);
+}
+
+/// The encoder places full attention on every `global_attn_every_n_layers`-th
+/// layer; refuse any other pattern rather than run it wrongly.
+fn checkLayerTypes(value: std.json.Value, config: Config) !void {
+    if (value != .array or value.array.items.len != config.num_hidden_layers or config.global_attn_every_n_layers == 0) return error.UnsupportedModernBertLayerTypes;
+    for (value.array.items, 0..) |item, i| {
+        if (item != .string) return error.UnsupportedModernBertLayerTypes;
+        const want: []const u8 = if (i % config.global_attn_every_n_layers == 0) "full_attention" else "sliding_attention";
+        if (!std.mem.eql(u8, item.string, want)) return error.UnsupportedModernBertLayerTypes;
+    }
 }
 
 fn jsonU32(value: std.json.Value) ?u32 {
@@ -1589,6 +1615,21 @@ test "HuggingFace ModernBERT config selects fused bias-free checkpoint layout" {
     try std.testing.expect(!cfg.rope_interleaved);
     try std.testing.expectEqual(@as(u32, 128), cfg.local_attention_window);
     try std.testing.expectEqual(@as(u32, 8192), cfg.max_position_embeddings);
+}
+
+test "Transformers 5 ModernBERT config reads per-layer-type rope and layer types" {
+    const cfg = try parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","num_hidden_layers":4,"norm_eps":1e-6,
+        \\"layer_types":["full_attention","sliding_attention","sliding_attention","full_attention"],
+        \\"rope_parameters":{"full_attention":{"rope_theta":160000.0},"sliding_attention":{"rope_theta":160000.0}}}
+    );
+    try std.testing.expectEqual(@as(f32, 160000), cfg.global_rope_theta);
+    try std.testing.expectEqual(@as(f32, 160000), cfg.local_rope_theta);
+    try std.testing.expectEqual(@as(f32, 1e-6), cfg.layer_norm_eps);
+    try std.testing.expectError(error.UnsupportedModernBertLayerTypes, parseConfig(std.testing.allocator,
+        \\{"model_type":"modernbert","num_hidden_layers":3,
+        \\"layer_types":["full_attention","full_attention","sliding_attention"]}
+    ));
 }
 
 test "HuggingFace ModernBERT fused checkpoint omits layer zero attention norm and all biases" {

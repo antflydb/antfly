@@ -614,7 +614,7 @@ test "laya packed pipeline batches many small states into fewer session calls" {
     var worst_act: f32 = 0;
     for (result.decisions, unbatched.decisions) |left, right| {
         worst_prob = @max(worst_prob, try maxError(left.probabilities, right.probabilities));
-        worst_act = @max(worst_act, @abs(left.act_probability - right.act_probability));
+        worst_act = @max(worst_act, @abs(left.act_probability.? - right.act_probability.?));
     }
     std.debug.print("Laya multi-row batching: {d} states, worst probability error={d}, worst act error={d}\n", .{ state_count, worst_prob, worst_act });
     try std.testing.expect(worst_prob < 1e-5);
@@ -704,7 +704,7 @@ test "laya packed pipeline groups shared states and preserves request order" {
         const alone = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{task}, null);
         unpacked_tokens += alone.prompt_tokens;
         try std.testing.expect(try maxError(alone.decisions[0].probabilities, decision.probabilities) < 1e-5);
-        try std.testing.expectApproxEqAbs(alone.decisions[0].act_probability, decision.act_probability, 1e-5);
+        try std.testing.expectApproxEqAbs(alone.decisions[0].act_probability.?, decision.act_probability.?, 1e-5);
     }
     // The shared state is encoded once instead of once per question.
     try std.testing.expect(result.prompt_tokens < unpacked_tokens);
