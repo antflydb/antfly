@@ -53033,16 +53033,27 @@ fn implementationTests() type {
             defer alloc.free(replica_root_dir);
             const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
             defer alloc.free(path);
+            const identity_namespace = doc_identity.Namespace{ .table_id = 7, .shard_id = 7001, .range_id = 7001 };
 
             {
-                var db = try openManagedDbWithIndexesJson(
+                var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
                     alloc,
                     path,
                     "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                    null,
+                    null,
+                    table_reads.backend_current_root_generation,
+                    null,
+                    .default,
+                    null,
+                    identity_namespace,
                 );
                 defer db.close();
+                try doc_identity.writeNamespaceToStore(db.core.store, identity_namespace);
+                // Vector candidates require a primary document. An embedding-only
+                // write has no row and is correctly excluded by presence checks.
                 try db.batch(.{
-                    .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
+                    .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"seed document\",\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
                     // The replay fields exercised below are supplied by the live
                     // status fixture. Make the separate read-cache/HBC precondition
                     // deterministic instead of racing asynchronous dense indexing.
@@ -53070,7 +53081,8 @@ fn implementationTests() type {
                 };
                 var profiled = try read_lease.db.searchDenseProfiled(alloc, req, req.dense.?);
                 defer profiled.result.deinit();
-                try std.testing.expect(profiled.result.hits.len >= 1);
+                try std.testing.expectEqual(@as(usize, 1), profiled.result.hits.len);
+                try std.testing.expectEqualStrings("doc:a", profiled.result.hits[0].id);
             }
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, NoCatalog.iface());
