@@ -239,7 +239,7 @@ def check_local_observation_contracts(relative: str, source: str) -> None:
     """Keep routing identity and destination policy out of local event/planning ports."""
     production = production_source(source)
     masked = mask_literals(production)
-    if relative == "storage/db/db.zig":
+    if relative in {"storage/db/db.zig", "storage/db/query_visibility.zig"}:
         hook = re.search(
             r"\bpub\s+const\s+QueryVisibilityHook\s*=\s*struct\s*\{(.*?)\n\};",
             masked,
@@ -278,6 +278,10 @@ def check_replication_contract(relative: str, source: str) -> None:
         "storage/db/runtime_restart_owner.zig",
         "storage/db/cleanup_job_owner.zig",
         "storage/db/query_visibility.zig",
+        "storage/db/coalesced_job_admission.zig",
+        "storage/db/dense_publication_admission.zig",
+        "storage/db/local_runtime_owner.zig",
+        "storage/db/embedding_activity_cache.zig",
         "storage/db/source_pin_cleanup_owner.zig",
         "storage/db/applied_sequence_coalescer.zig",
         "storage/db/bulk_ingest_session.zig",

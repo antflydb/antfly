@@ -895,19 +895,8 @@ const AsyncContext = struct {
     index_repair_scheduler: IndexRepairSchedulerDirectory = .{},
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
-    dense_finish_mutex: std.atomic.Mutex = .unlocked,
-    dense_sessions: @import("dense_catch_up_session_owner.zig").Owner = .{},
-    active_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    waiting_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    dense_projection_finalizing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    // Snapshot construction is optimistic and does not fence writers. Only
-    // the short lifecycle-checkpoint commit closes admission, preventing a
-    // clean marker from racing a newly admitted derived session.
-    dense_projection_committing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    dense_projection_finalization_requested: bool = false,
+    dense_admission: @import("dense_publication_admission.zig").Owner = .{},
     native_projection_owner: @import("native_projection_owner.zig").Owner = .{},
-    pending_dense_projection_finalizations: std.StringHashMapUnmanaged(u64) = .empty,
-    deferred_external_bulk_notify_sequence: AtomicU64 = AtomicU64.init(0),
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     index_repair_replay_pinned: std.atomic.Value(bool) = .init(false),
     index_repair_state_corrupt: std.atomic.Value(bool) = .init(false),
@@ -937,10 +926,7 @@ const AsyncContext = struct {
         stopNativeProjectionMaintenance(self);
         self.index_repair_scheduler.deinit(alloc);
         self.applied_sequence_coalescer.deinit(alloc);
-        self.dense_sessions.deinit(alloc, self.index_manager);
-        var pending_finalization_it = self.pending_dense_projection_finalizations.keyIterator();
-        while (pending_finalization_it.next()) |key| alloc.free(@constCast(key.*));
-        self.pending_dense_projection_finalizations.deinit(alloc);
+        self.dense_admission.deinit(alloc, self.index_manager);
         self.target_advance.deinit(alloc);
     }
 };
@@ -1611,8 +1597,7 @@ const LocalMutationExecution = struct {
     shadow: ?*ShadowState,
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
-    embedding_activity_cache_mutex: std.atomic.Mutex = .unlocked,
-    embedding_activity_cache: std.StringHashMapUnmanaged(EmbeddingActivityObservation) = .{},
+    embedding_activity: @import("embedding_activity_cache.zig").Owner = .{},
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     graph_restore_parse_cache: ?GraphRestoreParseCache = null,
@@ -1637,7 +1622,6 @@ const LocalMutationExecution = struct {
     const clearBulkIngestIdentityAllNewLocked = DB.clearBulkIngestIdentityAllNewLocked;
     const clearBulkIngestSeenDocKeysLocked = DB.clearBulkIngestSeenDocKeysLocked;
     const clearDurableReplicationOutbox = DB.clearDurableReplicationOutbox;
-    const clearEmbeddingActivityCache = DB.clearEmbeddingActivityCache;
     const clearLiveDocSetCache = DB.clearLiveDocSetCache;
     const clearNonVisibleDocSetCache = DB.clearNonVisibleDocSetCache;
     const deleteDocumentArtifactChildRangeOutboxEntry = DB.deleteDocumentArtifactChildRangeOutboxEntry;
@@ -1707,8 +1691,7 @@ const LocalMutationExecution = struct {
         self.rewrite_tail_cache.deinit(filesystem_io);
         if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
         if (self.last_run_until_idle_no_progress) |*diagnostic| diagnostic.deinit(self.alloc);
-        self.clearEmbeddingActivityCache();
-        self.embedding_activity_cache.deinit(self.alloc);
+        self.embedding_activity.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
         self.bulk_ingest_identity_state.deinit(self.alloc);
@@ -1819,6 +1802,14 @@ const TransactionRecoveryLocalContext = struct {
     /// wrapper is movable, so its `shadow` field is not a stable source for the
     /// recovery owner allocated during open.
     split_shadow: ?*ShadowState = null,
+};
+
+const TransactionRecoveryContexts = struct {
+    identity: db_core.TransactionRecoveryIdentityContext,
+    local: TransactionRecoveryLocalContext = .{},
+    fn release(self: *@This()) void {
+        self.identity.deinit();
+    }
 };
 
 const ManagedSyncTargets = struct {
@@ -4544,11 +4535,6 @@ const ShadowState = struct {
     repair_required: bool = false,
 };
 
-const EmbeddingActivityObservation = struct {
-    activity: types.EmbeddingActivityStats,
-    observed_at_ms: u64,
-};
-
 /// Restore owns one bounded parsed artifact at a time. Keeping it across
 /// durable page commits makes recovery linear in the artifact size during a
 /// normal run; after a crash the current artifact is parsed once again and
@@ -4707,6 +4693,13 @@ pub const DB = struct {
     enrichment_append_context: ?*EnrichmentAppendContext,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     resolution_append_context: ?*EnrichmentAppendContext = null,
+    resolution_owner: @import("local_runtime_owner.zig").Bundle(EnrichmentAppendContext, resolution_runtime_mod.ResolutionRuntime) = .{},
+    promotion_owner_bundle: @import("local_runtime_owner.zig").RuntimeOwner(promotion_runtime_mod.PromotionRuntime) = .{},
+    ttl_owner: @import("local_runtime_owner.zig").Bundle(TtlCleanupContext, ttl_runtime_mod.TtlRuntime) = .{},
+    text_merge_owner: @import("local_runtime_owner.zig").RuntimeOwner(text_merge_runtime_mod.TextMergeRuntime) = .{},
+    sparse_compaction_owner: @import("local_runtime_owner.zig").RuntimeOwner(sparse_compaction_runtime_mod.SparseCompactionRuntime) = .{},
+    graph_metric_owner: @import("local_runtime_owner.zig").RuntimeOwner(graph_metric_runtime_mod.GraphMetricRuntime) = .{},
+    // Runtime/context pointer fields below are borrowed views of these owners.
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     resolution_candidate_source: ?resolution_runtime_mod.CandidateSource = null,
     resolution_embedder: ?embedder_mod.DenseEmbedder = null,
@@ -4719,6 +4712,7 @@ pub const DB = struct {
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
     transaction_recovery_local_context: ?*TransactionRecoveryLocalContext,
+    transaction_owner: @import("local_runtime_owner.zig").OwningBundle(TransactionRecoveryContexts, transaction_runtime_mod.Runtime, TransactionRecoveryContexts.release) = .{},
     transaction_runtime: ?*transaction_runtime_mod.Runtime,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime,
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
@@ -4764,8 +4758,7 @@ pub const DB = struct {
     // it on the resident DB (rather than inside a returned DBStats value) lets
     // a contended lifecycle sample retain the last exact-incarnation activity
     // without turning that retained sample into a fresh cross-node heartbeat.
-    embedding_activity_cache_mutex: std.atomic.Mutex = .unlocked,
-    embedding_activity_cache: std.StringHashMapUnmanaged(EmbeddingActivityObservation) = .{},
+    embedding_activity: @import("embedding_activity_cache.zig").Owner = .{},
     bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
@@ -7296,14 +7289,26 @@ pub const DB = struct {
         try self.restartEnrichmentAfterStructuralMutation(operation, index_name);
     }
 
+    fn constructResolutionRuntime(alloc: Allocator, append_ctx: *EnrichmentAppendContext, self: *DB) !resolution_runtime_mod.ResolutionRuntime {
+        return try resolution_runtime_mod.ResolutionRuntime.init(
+            alloc,
+            self.core.batchExecutionResources().store,
+            self.core.replaySource(),
+            self.core.batchExecutionResources().index_manager,
+            append_ctx,
+            appendResolutionRecord,
+            self.backend_runtime,
+            self.resolution_candidate_source,
+            self.resolution_embedder,
+        );
+    }
+
     fn initResolutionRuntime(self: *DB) !void {
         // Always constructed so catalog/status/runUntilIdle APIs can observe
         // and drain replay. The background worker is started lazily only while
         // the resolver catalog is non-empty.
-        const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
-        errdefer self.runtime_alloc.destroy(append_ctx);
         const resources = self.core.batchExecutionResources();
-        append_ctx.* = .{
+        const context_value: EnrichmentAppendContext = .{
             .alloc = self.runtime_alloc,
             .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
@@ -7328,24 +7333,9 @@ pub const DB = struct {
             .replication_write_gate = self.local_execution.replication_write_gate,
         };
 
-        const runtime = try self.runtime_alloc.create(resolution_runtime_mod.ResolutionRuntime);
-        errdefer self.runtime_alloc.destroy(runtime);
-        runtime.* = try resolution_runtime_mod.ResolutionRuntime.init(
-            self.runtime_alloc,
-            self.core.batchExecutionResources().store,
-            self.core.replaySource(),
-            self.core.batchExecutionResources().index_manager,
-            append_ctx,
-            appendResolutionRecord,
-            self.backend_runtime,
-            // Cross-shard blocking source when the serving layer injected one
-            // (via OpenOptions); null means local-only blocking against this
-            // worker's own store.
-            self.resolution_candidate_source,
-            // Optional name embedder for mention-embedding backfill.
-            self.resolution_embedder,
-        );
-        errdefer runtime.deinit();
+        self.resolution_owner = try @TypeOf(self.resolution_owner).create(self.runtime_alloc, context_value, .{self}, constructResolutionRuntime);
+        const append_ctx = self.resolution_owner.context.?;
+        const runtime = self.resolution_owner.runtime.?;
         runtime.ordered_writer = .{ .ptr = append_ctx, .process = processOrderedResolutions };
         append_ctx.resolution_runtime = runtime;
         self.resolution_append_context = append_ctx;
@@ -7358,21 +7348,18 @@ pub const DB = struct {
         // Always constructed (like the resolution runtime) so synchronous
         // drains and status APIs remain available. The background worker is
         // started lazily only while resolver replay can produce promotion work.
-        const runtime = try self.runtime_alloc.create(promotion_runtime_mod.PromotionRuntime);
-        errdefer self.runtime_alloc.destroy(runtime);
-        runtime.* = try promotion_runtime_mod.PromotionRuntime.init(
+        self.promotion_owner_bundle = try @TypeOf(self.promotion_owner_bundle).create(self.runtime_alloc, .{
             self.runtime_alloc,
             self.core.batchExecutionResources().store,
             self.core.replaySource(),
             self.backend_runtime,
             self.promotion_owner,
             // Cross-shard entity sink when the serving layer injected one (via
-            // OpenOptions or setEntitySink); the missing-sink policy decides
-            // whether null means wait or explicit no-op.
+            // OpenOptions or setEntitySink); null follows the configured missing-sink policy.
             self.entity_sink,
             self.entity_sink_missing_policy,
-        );
-        errdefer runtime.deinit();
+        });
+        const runtime = self.promotion_owner_bundle.runtime.?;
         runtime.catalog = self.core.index_manager;
         self.promotion_runtime = runtime;
         self.async_context.promotion_runtime = runtime;
@@ -7381,11 +7368,21 @@ pub const DB = struct {
         if (self.resolution_append_context) |ctx| ctx.promotion_runtime = runtime;
     }
 
+    fn constructTtlRuntime(alloc: Allocator, ttl_ctx: *TtlCleanupContext, self: *DB, cfg: ttl_runtime_mod.Config) !ttl_runtime_mod.TtlRuntime {
+        return try ttl_runtime_mod.TtlRuntime.init(
+            alloc,
+            self.core.batchExecutionResources().store,
+            ttl_ctx,
+            deleteExpiredDocumentsFromCandidates,
+            &self.async_context.text_merge_deferred,
+            self.backend_runtime,
+            cfg,
+        );
+    }
+
     fn initOptionalTtlRuntime(self: *DB, cfg: ttl_runtime_mod.Config) !void {
-        const ttl_ctx = try self.runtime_alloc.create(TtlCleanupContext);
-        errdefer self.runtime_alloc.destroy(ttl_ctx);
         const batch_resources = self.core.batchExecutionResources();
-        ttl_ctx.* = .{
+        var context_value: TtlCleanupContext = .{
             .batch = .{
                 .alloc = self.runtime_alloc,
                 .io = self.backend_runtime.io(),
@@ -7416,19 +7413,10 @@ pub const DB = struct {
             .clock = cfg.clock,
             .schema_registry = self.core.schema_registry,
         };
-        ttl_ctx.batch.identity_visibility = &self.core.identity_visibility;
-        const runtime = try self.runtime_alloc.create(ttl_runtime_mod.TtlRuntime);
-        errdefer self.runtime_alloc.destroy(runtime);
-        runtime.* = try ttl_runtime_mod.TtlRuntime.init(
-            self.runtime_alloc,
-            self.core.batchExecutionResources().store,
-            ttl_ctx,
-            deleteExpiredDocumentsFromCandidates,
-            &self.async_context.text_merge_deferred,
-            self.backend_runtime,
-            cfg,
-        );
-        errdefer runtime.deinit();
+        context_value.batch.identity_visibility = &self.core.identity_visibility;
+        self.ttl_owner = try @TypeOf(self.ttl_owner).create(self.runtime_alloc, context_value, .{ self, cfg }, constructTtlRuntime);
+        const ttl_ctx = self.ttl_owner.context.?;
+        const runtime = self.ttl_owner.runtime.?;
         runtime.setGraphExpireFn(expireGraphTtlCandidates);
         self.ttl_cleanup_context = ttl_ctx;
         self.ttl_runtime = runtime;
@@ -7444,55 +7432,50 @@ pub const DB = struct {
         context.coordinated_port = port;
     }
 
-    fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
-        const identity_ctx = try self.runtime_alloc.create(db_core.TransactionRecoveryIdentityContext);
-        errdefer self.runtime_alloc.destroy(identity_ctx);
-        identity_ctx.* = try db_core.TransactionRecoveryIdentityContext.init(
-            self.runtime_alloc,
-            self.core.store,
-            self.core.identity_namespace,
-            relationalColumns(self),
-            if (self.core.schema) |schema| schema.version else 0,
-        );
-        errdefer identity_ctx.deinit();
-        identity_ctx.resource_manager = self.core.index_manager.resource_manager;
-        identity_ctx.io = self.backend_runtime.io() orelse std.Options.debug_io;
-        const local_ctx = try self.runtime_alloc.create(TransactionRecoveryLocalContext);
-        errdefer self.runtime_alloc.destroy(local_ctx);
-        local_ctx.* = .{};
+    fn constructTransactionRuntime(alloc: Allocator, contexts: *TransactionRecoveryContexts, self: *DB, cfg: transaction_runtime_mod.Config) !transaction_runtime_mod.Runtime {
         var effective_cfg = cfg;
-        effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(identity_ctx);
-        effective_cfg.local_resolution_ctx = local_ctx;
+        effective_cfg.resolution_extra_hooks = db_core.transactionRecoveryIdentityHooks(&contexts.identity);
+        effective_cfg.local_resolution_ctx = &contexts.local;
         effective_cfg.resolve_local_fn = resolveRecoveredLocalTransaction;
-
-        const runtime = try self.runtime_alloc.create(transaction_runtime_mod.Runtime);
-        errdefer self.runtime_alloc.destroy(runtime);
-        runtime.* = try transaction_runtime_mod.Runtime.init(
-            self.runtime_alloc,
+        return try transaction_runtime_mod.Runtime.init(
+            alloc,
             self.core.batchExecutionResources().store,
             self.backend_runtime,
             effective_cfg,
         );
-        errdefer runtime.deinit();
-        self.transaction_recovery_identity_context = identity_ctx;
-        self.transaction_recovery_local_context = local_ctx;
-        self.transaction_runtime = runtime;
+    }
+
+    fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
+        var contexts: TransactionRecoveryContexts = .{
+            .identity = try db_core.TransactionRecoveryIdentityContext.init(
+                self.runtime_alloc,
+                self.core.store,
+                self.core.identity_namespace,
+                relationalColumns(self),
+                if (self.core.schema) |schema| schema.version else 0,
+            ),
+        };
+        errdefer contexts.release();
+        contexts.identity.resource_manager = self.core.index_manager.resource_manager;
+        contexts.identity.io = self.backend_runtime.io() orelse std.Options.debug_io;
+        self.transaction_owner = try @TypeOf(self.transaction_owner).create(self.runtime_alloc, contexts, .{ self, cfg }, constructTransactionRuntime);
+        self.transaction_recovery_identity_context = &self.transaction_owner.context.?.identity;
+        self.transaction_recovery_local_context = &self.transaction_owner.context.?.local;
+        self.transaction_runtime = self.transaction_owner.runtime.?;
     }
 
     fn initOptionalTextMergeRuntime(self: *DB, cfg: text_merge_runtime_mod.Config) !void {
         if (!self.start_index_workers) return;
         if (!cfg.enabled) return;
         const resources = self.core.asyncResources();
-        const runtime = try self.runtime_alloc.create(text_merge_runtime_mod.TextMergeRuntime);
-        errdefer self.runtime_alloc.destroy(runtime);
-        runtime.* = try text_merge_runtime_mod.TextMergeRuntime.init(
+        self.text_merge_owner = try @TypeOf(self.text_merge_owner).create(self.runtime_alloc, .{
             self.runtime_alloc,
             resources.index_manager,
             resources.apply_mutex,
             self.backend_runtime,
             cfg,
-        );
-        errdefer runtime.deinit();
+        });
+        const runtime = self.text_merge_owner.runtime.?;
         self.text_merge_runtime = runtime;
         self.async_context.text_merge_runtime = runtime;
     }
@@ -7501,16 +7484,14 @@ pub const DB = struct {
         if (!self.start_index_workers) return;
         if (!cfg.enabled) return;
         const resources = self.core.asyncResources();
-        const runtime = try self.runtime_alloc.create(sparse_compaction_runtime_mod.SparseCompactionRuntime);
-        errdefer self.runtime_alloc.destroy(runtime);
-        runtime.* = try sparse_compaction_runtime_mod.SparseCompactionRuntime.init(
+        self.sparse_compaction_owner = try @TypeOf(self.sparse_compaction_owner).create(self.runtime_alloc, .{
             self.runtime_alloc,
             resources.index_manager,
             resources.apply_mutex,
             self.backend_runtime,
             cfg,
-        );
-        errdefer runtime.deinit();
+        });
+        const runtime = self.sparse_compaction_owner.runtime.?;
         self.sparse_compaction_runtime = runtime;
         self.async_context.sparse_compaction_runtime = runtime;
     }
@@ -7518,17 +7499,15 @@ pub const DB = struct {
     fn initOptionalGraphMetricRuntime(self: *DB, cfg: graph_metric_runtime_mod.Config) !void {
         if (!self.start_index_workers or !cfg.enabled) return;
         const resources = self.core.asyncResources();
-        const runtime = try self.runtime_alloc.create(graph_metric_runtime_mod.GraphMetricRuntime);
-        errdefer self.runtime_alloc.destroy(runtime);
-        runtime.* = try graph_metric_runtime_mod.GraphMetricRuntime.init(
+        self.graph_metric_owner = try @TypeOf(self.graph_metric_owner).create(self.runtime_alloc, .{
             self.runtime_alloc,
             resources.store,
             resources.index_manager,
             resources.apply_mutex,
             self.backend_runtime,
             cfg,
-        );
-        errdefer runtime.deinit();
+        });
+        const runtime = self.graph_metric_owner.runtime.?;
         self.graph_metric_runtime = runtime;
     }
 
@@ -7672,12 +7651,8 @@ pub const DB = struct {
         self.core.identity_visibility.clearNonvisible();
     }
 
-    fn clearEmbeddingActivityCache(self: anytype) void {
-        lockAtomic(&self.embedding_activity_cache_mutex);
-        defer self.embedding_activity_cache_mutex.unlock();
-        var keys = self.embedding_activity_cache.keyIterator();
-        while (keys.next()) |key| self.alloc.free(key.*);
-        self.embedding_activity_cache.clearRetainingCapacity();
+    fn clearEmbeddingActivityCache(self: *DB) void {
+        self.embedding_activity.clear(self.alloc);
     }
 
     fn deinitWrapperState(self: *DB, executor_ready: bool) void {
@@ -7692,23 +7667,14 @@ pub const DB = struct {
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
         self.stopGraphEndpointCleanupWorker();
-        if (self.transaction_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-            self.transaction_runtime = null;
-        }
+        self.transaction_owner.deinitRuntime(self.runtime_alloc);
+        self.transaction_runtime = null;
         self.local_execution.source_publication.stop(self.backend_runtime.io() orelse std.Options.debug_io);
         self.local_execution.merge_artifact_layout.clear();
         self.local_execution.online_merge_reader.retire(self.backend_runtime.io() orelse std.Options.debug_io, null);
-        if (self.transaction_recovery_local_context) |ctx| {
-            self.runtime_alloc.destroy(ctx);
-            self.transaction_recovery_local_context = null;
-        }
-        if (self.transaction_recovery_identity_context) |ctx| {
-            ctx.deinit();
-            self.runtime_alloc.destroy(ctx);
-            self.transaction_recovery_identity_context = null;
-        }
+        self.transaction_owner.deinitContext(self.runtime_alloc);
+        self.transaction_recovery_local_context = null;
+        self.transaction_recovery_identity_context = null;
         // Close may flush/coalesce derived watermarks while workers are
         // stopping. That must not call back into the write/status cache after
         // optional runtimes or index state have started tearing down.
@@ -7729,7 +7695,7 @@ pub const DB = struct {
         self.clearLiveDocSetCache();
         self.clearNonVisibleDocSetCache();
         self.clearEmbeddingActivityCache();
-        self.embedding_activity_cache.deinit(self.alloc);
+        self.embedding_activity.deinit(self.alloc);
         if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
         self.graph_restore_parse_cache = null;
         self.bulk_ingest_identity_state.deinit(self.alloc);
@@ -7739,27 +7705,22 @@ pub const DB = struct {
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
         self.closeShadowIndexManagerLocked() catch {};
-        if (self.ttl_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
-        if (self.ttl_cleanup_context) |ctx| self.runtime_alloc.destroy(ctx);
+        self.ttl_owner.deinit(self.runtime_alloc);
+        self.ttl_runtime = null;
+        self.ttl_cleanup_context = null;
         self.enrichment_owner.deinit(self.runtime_alloc);
         publishEnrichmentOwner(self);
-        if (self.resolution_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
+        self.resolution_owner.deinitRuntime(self.runtime_alloc);
+        self.resolution_runtime = null;
         self.async_context.resolution_runtime = null;
         // After the resolution runtime (its final catch-up may journal
         // resolution artifacts that notify the promoter) but before the
         // resolution append context the promoter is wired into is destroyed.
-        if (self.promotion_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
+        self.promotion_owner_bundle.deinit(self.runtime_alloc);
+        self.promotion_runtime = null;
         self.async_context.promotion_runtime = null;
-        if (self.resolution_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+        self.resolution_owner.deinitContext(self.runtime_alloc);
+        self.resolution_append_context = null;
         // Derived full-text publishers may be asleep in merge backpressure
         // admission. Close that admission before joining their executor: the
         // merge runtime is the owner of the wakeup predicate, so joining the
@@ -7770,20 +7731,14 @@ pub const DB = struct {
         if (self.text_merge_runtime) |runtime| _ = runtime.stop();
         if (executor_ready) self.executor.deinit(self.runtime_alloc);
         self.runtime_alloc.destroy(self.executor);
-        if (self.text_merge_runtime) |runtime| {
-            self.async_context.text_merge_runtime = null;
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
-        if (self.sparse_compaction_runtime) |runtime| {
-            self.async_context.sparse_compaction_runtime = null;
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
-        if (self.graph_metric_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
+        self.async_context.text_merge_runtime = null;
+        self.text_merge_owner.deinit(self.runtime_alloc);
+        self.text_merge_runtime = null;
+        self.async_context.sparse_compaction_runtime = null;
+        self.sparse_compaction_owner.deinit(self.runtime_alloc);
+        self.sparse_compaction_runtime = null;
+        self.graph_metric_owner.deinit(self.runtime_alloc);
+        self.graph_metric_runtime = null;
         if (executor_ready and self.open_mode.allowsIndexWorkers()) {
             // The executor has published its final HBC coverage. Mirror the
             // human-facing lifecycle/status view once at graceful shutdown;
@@ -8119,7 +8074,7 @@ pub const DB = struct {
         // exposes it through dense_vector_projection_pending and remains
         // closed until a complete generation is installed.
         async_stats.dense_projection_finalizing =
-            self.async_context.dense_projection_finalizing.load(.acquire) or
+            self.async_context.dense_admission.finalizing.load(.acquire) or
             self.core.index_manager.vectorBlockProjectionPending();
         async_stats.bulk_coalescing = self.bulk_ingest_session.snapshot();
         async_stats.derived_workers = self.executor.snapshotStats();
@@ -37065,7 +37020,7 @@ pub const DB = struct {
         var catalog_lease = self.tryAcquireIndexCatalogReadLease() orelse return .{ .busy = true };
         defer catalog_lease.release();
         var session_lock = lockAtomicWithBackoffProfiled(
-            &self.async_context.dense_finish_mutex,
+            &self.async_context.dense_admission.mutex,
             &self.async_context.stats.dense_finish_mutex,
         );
         const claimed = tryClaimDenseProjectionFinalizationLocked(self.async_context);
@@ -37115,7 +37070,7 @@ pub const DB = struct {
         const deadline = monotonicTimeNs() +| 30 * std.time.ns_per_s;
         var wait_ms: u64 = 1;
         while (true) {
-            var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+            var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
             const claimed = tryClaimDenseProjectionFinalizationLocked(ctx);
             const sessions_active = asyncContextHasDenseSessionsOrWaiters(ctx);
             session_lock.unlock();
@@ -40610,89 +40565,6 @@ pub const DB = struct {
         return enrichment_status;
     }
 
-    fn isEmbeddingActivityIndex(item: types.DBIndexStats) bool {
-        return item.kind == .dense_vector or item.kind == .sparse_vector;
-    }
-
-    fn statusContainsEmbeddingActivityIndex(indexes: []const types.DBIndexStats, name: []const u8) bool {
-        for (indexes) |item| {
-            if (isEmbeddingActivityIndex(item) and std.mem.eql(u8, item.name, name)) return true;
-        }
-        return false;
-    }
-
-    fn cacheObservedEmbeddingActivity(
-        self: *DB,
-        indexes: []types.DBIndexStats,
-        runtime: *enrichment_runtime_mod.EnrichmentRuntime,
-        now_ms: u64,
-    ) void {
-        lockAtomic(&self.embedding_activity_cache_mutex);
-        defer self.embedding_activity_cache_mutex.unlock();
-
-        for (indexes) |*item| {
-            if (!isEmbeddingActivityIndex(item.*)) continue;
-            const activity = runtime.indexEmbeddingActivity(item.name);
-            item.embedding_activity_observed = true;
-            item.embedding_activity_sample_fresh = true;
-            item.embedding_activity = activity;
-
-            if (self.embedding_activity_cache.getPtr(item.name)) |cached| {
-                cached.* = .{ .activity = activity, .observed_at_ms = now_ms };
-                continue;
-            }
-            const owned_name = self.alloc.dupe(u8, item.name) catch continue;
-            self.embedding_activity_cache.putNoClobber(
-                self.alloc,
-                owned_name,
-                .{ .activity = activity, .observed_at_ms = now_ms },
-            ) catch {
-                self.alloc.free(owned_name);
-                continue;
-            };
-        }
-
-        // Successful lifecycle access is authoritative for the current index
-        // set. Prune removed names so repeated DDL cannot grow telemetry state.
-        var entries = self.embedding_activity_cache.iterator();
-        while (entries.next()) |entry| {
-            if (statusContainsEmbeddingActivityIndex(indexes, entry.key_ptr.*)) continue;
-            const owned_name = entry.key_ptr.*;
-            self.embedding_activity_cache.removeByPtr(entry.key_ptr);
-            self.alloc.free(owned_name);
-        }
-    }
-
-    fn retainCachedEmbeddingActivity(self: *DB, indexes: []types.DBIndexStats, now_ms: u64) void {
-        lockAtomic(&self.embedding_activity_cache_mutex);
-        defer self.embedding_activity_cache_mutex.unlock();
-
-        for (indexes) |*item| {
-            if (!isEmbeddingActivityIndex(item.*)) continue;
-            item.embedding_activity_observed = false;
-            item.embedding_activity_sample_fresh = false;
-            item.embedding_activity = .{};
-
-            const cached = self.embedding_activity_cache.get(item.name) orelse continue;
-            const identity_matches = cached.activity.index_generation == item.coverage_generation;
-            const receipt_fresh = cached.observed_at_ms != 0 and
-                now_ms -| cached.observed_at_ms < types.embedding_activity_retention_ms;
-            if (cached.activity.epoch != 0 and
-                cached.activity.sample_sequence != 0 and
-                identity_matches and
-                receipt_fresh)
-            {
-                item.embedding_activity_observed = true;
-                item.embedding_activity = cached.activity;
-                continue;
-            }
-
-            if (self.embedding_activity_cache.fetchRemove(item.name)) |removed| {
-                self.alloc.free(removed.key);
-            }
-        }
-    }
-
     /// Refresh readiness-neutral worker diagnostics on a retained status
     /// snapshot. Publication lifecycle is deliberately excluded: a lock-free
     /// observation may add activity, but it cannot prove that the artifact
@@ -40722,14 +40594,14 @@ pub const DB = struct {
                         source.failed = source.failed or runtime.indexSourceHasIsolatedFailure(item.name, source.artifact_name);
                     }
                 }
-                self.cacheObservedEmbeddingActivity(runtime_stats.indexes, runtime, now_ms);
+                self.embedding_activity.observe(self.alloc, runtime_stats.indexes, runtime, now_ms);
                 return;
             }
             clearEmbeddingActivityObservations(runtime_stats.indexes);
             self.clearEmbeddingActivityCache();
             return;
         }
-        self.retainCachedEmbeddingActivity(runtime_stats.indexes, now_ms);
+        self.embedding_activity.retain(self.alloc, runtime_stats.indexes, now_ms);
     }
 
     fn clearEmbeddingActivityObservations(indexes: []types.DBIndexStats) void {
@@ -64106,7 +63978,7 @@ fn shouldDeferBacklogPressureForExternalDenseBulk(ctx: *const BatchExecutionCont
         .full_text, .full_index => return false,
     }
     const async_context = ctx.async_context orelse return false;
-    return async_context.active_external_dense_bulk_sessions.load(.acquire) != 0;
+    return async_context.dense_admission.external_sessions.load(.acquire) != 0;
 }
 
 fn runDerivedUntilContext(ctx: *const BatchExecutionContext, sequence: u64) !void {
@@ -64376,21 +64248,17 @@ fn densePostingIdleMaxBoundaryReassignmentsPerIndex() usize {
 
 fn beginDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) !void {
     _ = index_name;
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
-    if (ctx.active_external_dense_bulk_sessions.load(.acquire) != 0 or
-        ctx.waiting_external_dense_bulk_sessions.load(.acquire) != 0 or
-        ctx.dense_projection_committing.load(.acquire))
-        return error.ReplayDocumentNotVisible;
+    try ctx.dense_admission.beginReplayLocked();
     ctx.text_merge_deferred.store(true, .release);
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
     ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.replay), .monotonic);
-    ctx.dense_sessions.beginTracking();
     if (ctx.resource_manager) |manager| manager.beginLatencySensitiveDerivedReplay();
 }
 
 fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) bool {
-    const remaining = ctx.dense_sessions.finishTracking() orelse {
+    const remaining = ctx.dense_admission.finishReplayLocked() orelse {
         std.log.warn("dense catch-up session finish without active session index={s}", .{index_name});
         return false;
     };
@@ -64407,7 +64275,7 @@ fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) b
 }
 
 fn finishDenseCatchUpSessionTrackingOnly(ctx: *AsyncContext, index_name: []const u8) bool {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     const finished = finishDenseCatchUpSessionLocked(ctx, index_name);
     session_lock.unlock();
     return finished;
@@ -64419,28 +64287,25 @@ fn finishDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) 
 }
 
 fn beginExternalDenseBulkSessionTracked(ctx: *AsyncContext) !void {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
-    if (ctx.dense_sessions.active.load(.acquire) != 0 or
-        ctx.dense_projection_committing.load(.acquire))
-        return error.ReplayDocumentNotVisible;
+    try ctx.dense_admission.beginExternalLocked();
     ctx.text_merge_deferred.store(true, .release);
-    _ = ctx.active_external_dense_bulk_sessions.fetchAdd(1, .release);
 }
 
 fn beginExternalDenseBulkSessionTrackedWait(ctx: *AsyncContext, io: ?std.Io) !void {
     const wait_start_ns = monotonicTimeNs();
     const wait_timeout_ns = 30 * std.time.ns_per_s;
     {
-        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
         defer session_lock.unlock();
-        _ = ctx.waiting_external_dense_bulk_sessions.fetchAdd(1, .release);
+        ctx.dense_admission.beginWaitLocked();
     }
     var admitted = false;
     defer {
         if (!admitted) {
-            var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-            _ = ctx.waiting_external_dense_bulk_sessions.fetchSub(1, .release);
+            var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
+            ctx.dense_admission.cancelWaitLocked();
             session_lock.unlock();
 
             const completed = finalizeCoveredDenseProjectionCheckpointsIfIdle(ctx) catch |err| blk: {
@@ -64455,13 +64320,9 @@ fn beginExternalDenseBulkSessionTrackedWait(ctx: *AsyncContext, io: ?std.Io) !vo
 
     var wait_ms: u64 = 1;
     while (true) {
-        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-        if (ctx.dense_sessions.active.load(.acquire) == 0 and
-            !ctx.dense_projection_committing.load(.acquire))
-        {
-            _ = ctx.waiting_external_dense_bulk_sessions.fetchSub(1, .release);
+        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
+        if (ctx.dense_admission.admitWaiterLocked()) {
             ctx.text_merge_deferred.store(true, .release);
-            _ = ctx.active_external_dense_bulk_sessions.fetchAdd(1, .release);
             admitted = true;
             session_lock.unlock();
             return;
@@ -64480,17 +64341,13 @@ fn beginExternalDenseBulkSessionTrackedWait(ctx: *AsyncContext, io: ?std.Io) !vo
 }
 
 fn finishExternalDenseBulkSessionLocked(ctx: *AsyncContext) bool {
-    const active = ctx.active_external_dense_bulk_sessions.load(.acquire);
-    if (active == 0) {
-        std.log.warn("dense external bulk session finish without active session", .{});
-        return false;
-    }
-    ctx.active_external_dense_bulk_sessions.store(active - 1, .release);
-    return true;
+    if (ctx.dense_admission.finishExternalLocked()) return true;
+    std.log.warn("dense external bulk session finish without active session", .{});
+    return false;
 }
 
 fn finishExternalDenseBulkSessionTrackingOnly(ctx: *AsyncContext) bool {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     const finished = finishExternalDenseBulkSessionLocked(ctx);
     session_lock.unlock();
     return finished;
@@ -64513,7 +64370,7 @@ fn finishDenseCatchUpSessionTrackedAndFinalize(ctx: *AsyncContext, index_name: [
             return err;
         };
         defer ctx.apply_mutex.unlockShared();
-        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
         finished = finishDenseCatchUpSessionLocked(ctx, index_name);
         const claimed = finished and tryClaimOrRequestDenseProjectionFinalizationLocked(ctx);
         session_lock.unlock();
@@ -64534,7 +64391,7 @@ fn finishExternalDenseBulkSessionTrackedAndFinalize(ctx: *AsyncContext) !bool {
             return err;
         };
         defer ctx.apply_mutex.unlockShared();
-        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
         finished = finishExternalDenseBulkSessionLocked(ctx);
         const claimed = finished and tryClaimOrRequestDenseProjectionFinalizationLocked(ctx);
         session_lock.unlock();
@@ -64570,9 +64427,7 @@ fn finishExternalDenseBulkSessionTrackedBestEffort(ctx: *AsyncContext) void {
 }
 
 fn asyncContextHasDenseSessionsOrWaiters(ctx: *const AsyncContext) bool {
-    return ctx.dense_sessions.active.load(.acquire) != 0 or
-        ctx.active_external_dense_bulk_sessions.load(.acquire) != 0 or
-        ctx.waiting_external_dense_bulk_sessions.load(.acquire) != 0;
+    return ctx.dense_admission.hasSessionsOrWaiters();
 }
 
 fn asyncContextHasActiveDenseBulkWork(ctx: *const AsyncContext) bool {
@@ -64589,11 +64444,7 @@ fn asyncContextHasActiveDenseBulkWork(ctx: *const AsyncContext) bool {
 // expensive native generation construction remains optimistic and does not
 // close session admission.
 fn tryClaimDenseProjectionFinalizationLocked(ctx: *AsyncContext) bool {
-    if (asyncContextHasDenseSessionsOrWaiters(ctx) or
-        ctx.dense_projection_finalizing.load(.acquire)) return false;
-    ctx.dense_projection_finalization_requested = false;
-    ctx.dense_projection_finalizing.store(true, .release);
-    return true;
+    return ctx.dense_admission.claimLocked();
 }
 
 // dense_finish_mutex must be held. A session that completes while another
@@ -64602,42 +64453,33 @@ fn tryClaimDenseProjectionFinalizationLocked(ctx: *AsyncContext) bool {
 // the same critical section in which the session count reaches zero so the
 // owner cannot miss the request while deciding whether it is finished.
 fn tryClaimOrRequestDenseProjectionFinalizationLocked(ctx: *AsyncContext) bool {
-    if (tryClaimDenseProjectionFinalizationLocked(ctx)) return true;
-    if (ctx.dense_projection_finalizing.load(.acquire)) {
-        ctx.dense_projection_finalization_requested = true;
-    }
-    return false;
+    return ctx.dense_admission.claimOrRequestLocked();
 }
 
 fn finishDenseProjectionFinalization(ctx: *AsyncContext) void {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     // Source completion can hand off a newer sequence while this owner is
     // staging. Consume the handoff and release ownership atomically: a later
     // callback either requested this wake or can claim finalization itself.
-    const requested = ctx.dense_projection_finalization_requested;
-    ctx.dense_projection_finalization_requested = false;
-    ctx.dense_projection_finalizing.store(false, .release);
+    const requested = ctx.dense_admission.finishFinalizationLocked();
     session_lock.unlock();
     if (requested) scheduleNativeProjectionMaintenance(ctx);
 }
 
 fn tryBeginDenseProjectionCommit(ctx: *AsyncContext) bool {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
-    if (asyncContextHasDenseSessionsOrWaiters(ctx) or
-        ctx.dense_projection_committing.load(.acquire)) return false;
-    ctx.dense_projection_committing.store(true, .release);
-    return true;
+    return ctx.dense_admission.beginCommitLocked();
 }
 
 fn finishDenseProjectionCommit(ctx: *AsyncContext) void {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-    ctx.dense_projection_committing.store(false, .release);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
+    ctx.dense_admission.finishCommitLocked();
     session_lock.unlock();
 }
 
 fn asyncContextHasActiveExternalDenseBulkWork(ctx: *const AsyncContext) bool {
-    return ctx.active_external_dense_bulk_sessions.load(.acquire) != 0;
+    return ctx.dense_admission.external_sessions.load(.acquire) != 0;
 }
 
 fn resumeDeferredBackgroundMaintenanceIfIdle(ctx: *AsyncContext) void {
@@ -64659,8 +64501,8 @@ fn deferExternalBulkExecutorNotification(ctx: *AsyncContext, sync_level: types.S
         .propose, .write, .enrichments => {},
         .full_text, .full_index => return false,
     }
-    if (ctx.active_external_dense_bulk_sessions.load(.acquire) == 0) return false;
-    storeMaxAtomicU64(&ctx.deferred_external_bulk_notify_sequence, sequence);
+    if (ctx.dense_admission.external_sessions.load(.acquire) == 0) return false;
+    ctx.dense_admission.deferSequence(sequence);
     return true;
 }
 
@@ -64693,7 +64535,7 @@ fn notifyExecutorForSyncLevel(
 }
 
 fn flushDeferredExternalBulkExecutorNotification(ctx: *AsyncContext, executor: *derived_executor_mod.Executor) void {
-    const sequence = ctx.deferred_external_bulk_notify_sequence.swap(0, .acq_rel);
+    const sequence = ctx.dense_admission.takeDeferredSequence();
     if (sequence == 0) return;
     if (!executor.hasWorkers()) return;
     executor.notifySequence(sequence);
@@ -64704,7 +64546,7 @@ fn flushDeferredExternalBulkExecutorNotificationOrTarget(
     executor: *derived_executor_mod.Executor,
     target_sequence: u64,
 ) void {
-    const deferred_sequence = ctx.deferred_external_bulk_notify_sequence.swap(0, .acq_rel);
+    const deferred_sequence = ctx.dense_admission.takeDeferredSequence();
     const sequence = @max(deferred_sequence, target_sequence);
     if (sequence == 0) return;
     if (!executor.hasWorkers()) return;
@@ -64714,14 +64556,14 @@ fn flushDeferredExternalBulkExecutorNotificationOrTarget(
 fn denseApplyUsesLocalStreamingSession(ctx: *const AsyncContext, index_name: []const u8) bool {
     _ = index_name;
     if (ctx.dense_bulk_session_scope == .external) return false;
-    if (ctx.active_external_dense_bulk_sessions.load(.acquire) != 0) return false;
-    if (ctx.dense_sessions.active.load(.acquire) != 0) return false;
+    if (ctx.dense_admission.external_sessions.load(.acquire) != 0) return false;
+    if (ctx.dense_admission.sessions.active.load(.acquire) != 0) return false;
     return true;
 }
 
 fn shouldDeferAppliedSequenceFlush(ctx: *const AsyncContext, force: bool) bool {
     if (force) return false;
-    return ctx.dense_sessions.active.load(.monotonic) != 0;
+    return ctx.dense_admission.sessions.active.load(.monotonic) != 0;
 }
 
 fn shouldLogTargetAdvanceDebt(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) bool {
@@ -64853,11 +64695,11 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     };
     defer ctx.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.sessions.active.load(.monotonic));
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
     try beginDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 1), ctx.dense_sessions.active.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), ctx.dense_admission.sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) != 0);
     try std.testing.expect(asyncContextHasActiveDenseBulkWork(&ctx));
     try std.testing.expect(resource_manager.shouldDeferSoftCompactionForDerivedReplay());
@@ -64867,7 +64709,7 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expect(!denseApplyUsesLocalStreamingSession(&ctx, "vec"));
     try std.testing.expectError(error.ReplayDocumentNotVisible, beginExternalDenseBulkSessionTracked(&ctx));
     finishDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
     // Session-owned deferral has ended, but the short quiet period still
@@ -64877,23 +64719,23 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 
     try beginExternalDenseBulkSessionTracked(&ctx);
-    try std.testing.expectEqual(@as(u32, 1), ctx.active_external_dense_bulk_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), ctx.dense_admission.external_sessions.load(.monotonic));
     try std.testing.expect(asyncContextHasActiveDenseBulkWork(&ctx));
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
     try std.testing.expect(!denseApplyUsesLocalStreamingSession(&ctx, "vec"));
     try std.testing.expectError(error.ReplayDocumentNotVisible, beginDenseCatchUpSessionTracked(&ctx, "vec"));
     try std.testing.expect(deferExternalBulkExecutorNotification(&ctx, .write, 7));
-    try std.testing.expectEqual(@as(u64, 7), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 7), ctx.dense_admission.deferred_sequence.load(.monotonic));
     try std.testing.expect(deferExternalBulkExecutorNotification(&ctx, .propose, 11));
-    try std.testing.expectEqual(@as(u64, 11), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 11), ctx.dense_admission.deferred_sequence.load(.monotonic));
     try std.testing.expect(deferExternalBulkExecutorNotification(&ctx, .enrichments, 13));
-    try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 13), ctx.dense_admission.deferred_sequence.load(.monotonic));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .full_text, 17));
-    try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 13), ctx.dense_admission.deferred_sequence.load(.monotonic));
     try std.testing.expect(!deferExternalBulkExecutorNotification(&ctx, .full_index, 23));
-    try std.testing.expectEqual(@as(u64, 13), ctx.deferred_external_bulk_notify_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 13), ctx.dense_admission.deferred_sequence.load(.monotonic));
     finishExternalDenseBulkSessionTracked(&ctx);
-    try std.testing.expectEqual(@as(u32, 0), ctx.active_external_dense_bulk_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.external_sessions.load(.monotonic));
     try std.testing.expect(!asyncContextHasActiveDenseBulkWork(&ctx));
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
@@ -64902,26 +64744,26 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     ctx.dense_bulk_session_scope = .external;
     try std.testing.expect(!denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 
-    var finalization_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var finalization_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     try std.testing.expect(tryClaimDenseProjectionFinalizationLocked(&ctx));
     finalization_lock.unlock();
-    try std.testing.expect(ctx.dense_finish_mutex.tryLock());
-    ctx.dense_finish_mutex.unlock();
+    try std.testing.expect(ctx.dense_admission.mutex.tryLock());
+    ctx.dense_admission.mutex.unlock();
     // Optimistic generation construction owns the finalization worker but no
     // longer fences writers for the duration of a corpus scan.
     try beginDenseCatchUpSessionTracked(&ctx, "vec");
     try std.testing.expect(!try finishDenseCatchUpSessionTrackedAndFinalize(&ctx, "vec"));
-    try std.testing.expect(ctx.dense_projection_finalization_requested);
-    ctx.dense_projection_finalization_requested = false;
+    try std.testing.expect(ctx.dense_admission.finalization_requested);
+    ctx.dense_admission.finalization_requested = false;
     try beginExternalDenseBulkSessionTracked(&ctx);
     try std.testing.expect(!try finishExternalDenseBulkSessionTrackedAndFinalize(&ctx));
-    try std.testing.expect(ctx.dense_projection_finalization_requested);
+    try std.testing.expect(ctx.dense_admission.finalization_requested);
     try std.testing.expect(tryBeginDenseProjectionCommit(&ctx));
     try std.testing.expectError(error.ReplayDocumentNotVisible, beginDenseCatchUpSessionTracked(&ctx, "vec"));
     finishDenseProjectionCommit(&ctx);
     finishDenseProjectionFinalization(&ctx);
-    try std.testing.expect(!ctx.dense_projection_finalization_requested);
-    try std.testing.expect(!ctx.dense_projection_finalizing.load(.acquire));
+    try std.testing.expect(!ctx.dense_admission.finalization_requested);
+    try std.testing.expect(!ctx.dense_admission.finalizing.load(.acquire));
 }
 
 test "native publication reports contention separately from an empty pass" {
@@ -64932,11 +64774,11 @@ test "native publication reports contention separately from an empty pass" {
     defer alloc.free(path);
     var db = try DB.open(alloc, path, .{ .start_index_workers = false, .start_optional_runtimes = false });
     defer db.close();
-    db.async_context.dense_projection_finalizing.store(true, .release);
+    db.async_context.dense_admission.finalizing.store(true, .release);
     const busy = try db.publishVectorBlockBasesOnlineReported(.{});
     try std.testing.expect(busy.busy);
     try std.testing.expectEqual(@as(usize, 0), busy.published);
-    db.async_context.dense_projection_finalizing.store(false, .release);
+    db.async_context.dense_admission.finalizing.store(false, .release);
     const idle = try db.publishVectorBlockBasesOnlineReported(.{});
     try std.testing.expect(!idle.busy);
     try std.testing.expectEqual(@as(usize, 0), idle.published);
@@ -64962,16 +64804,16 @@ test "native publication finalization forwards raced source completion" {
     ctx.native_projection_owner.future = try io.concurrent(struct {
         fn run() void {}
     }.run, .{});
-    var guard = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var guard = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     try std.testing.expect(tryClaimDenseProjectionFinalizationLocked(&ctx));
     try std.testing.expect(!tryClaimOrRequestDenseProjectionFinalizationLocked(&ctx));
     guard.unlock();
     finishDenseProjectionFinalization(&ctx);
     try std.testing.expect(ctx.native_projection_owner.wake.isSet());
-    try std.testing.expect(!ctx.dense_projection_finalization_requested);
-    try std.testing.expect(!ctx.dense_projection_finalizing.load(.acquire));
+    try std.testing.expect(!ctx.dense_admission.finalization_requested);
+    try std.testing.expect(!ctx.dense_admission.finalizing.load(.acquire));
     ctx.native_projection_owner.wake.reset();
-    guard = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    guard = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     try std.testing.expect(tryClaimOrRequestDenseProjectionFinalizationLocked(&ctx));
     guard.unlock();
     finishDenseProjectionFinalization(&ctx);
@@ -65005,7 +64847,7 @@ test "external dense bulk waiter owns admission across catch-up handoff" {
     defer waiter_thread.await(std.testing.io);
 
     const wait_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
-    while (ctx.waiting_external_dense_bulk_sessions.load(.acquire) == 0) {
+    while (ctx.dense_admission.waiters.load(.acquire) == 0) {
         if (monotonicTimeNs() >= wait_deadline) return error.TestUnexpectedResult;
         sleepNs(std.time.ns_per_ms);
     }
@@ -65015,12 +64857,12 @@ test "external dense bulk waiter owns admission across catch-up handoff" {
     finishDenseCatchUpSessionTracked(&ctx, "vec");
 
     const admission_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
-    while (ctx.active_external_dense_bulk_sessions.load(.acquire) == 0) {
+    while (ctx.dense_admission.external_sessions.load(.acquire) == 0) {
         if (monotonicTimeNs() >= admission_deadline) return error.TestUnexpectedResult;
         sleepNs(std.time.ns_per_ms);
     }
     try std.testing.expect(waiter.result == null);
-    try std.testing.expectEqual(@as(u32, 0), ctx.waiting_external_dense_bulk_sessions.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.waiters.load(.acquire));
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
 
     finishExternalDenseBulkSessionTracked(&ctx);
@@ -65039,17 +64881,17 @@ test "async context dense catch-up session finish is idempotent when already clo
     defer ctx.deinit(std.testing.allocator);
 
     finishDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
 
     try beginDenseCatchUpSessionTracked(&ctx, "vec");
     try beginDenseCatchUpSessionTracked(&ctx, "vec");
     finishDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 1), ctx.dense_sessions.active.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), ctx.dense_admission.sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) != 0);
     finishDenseCatchUpSessionTracked(&ctx, "vec");
     finishDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 }
@@ -65070,7 +64912,7 @@ test "portable activation failure still releases dense session bookkeeping" {
         error.PortableRuntimeActivationPending,
         finishDenseCatchUpSessionTrackedAndFinalize(&ctx, "vec"),
     );
-    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.sessions.active.load(.acquire));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
 
@@ -65084,7 +64926,7 @@ test "portable activation failure still releases dense session bookkeeping" {
         error.PortableRuntimeActivationPending,
         finishExternalDenseBulkSessionTrackedAndFinalize(&ctx),
     );
-    try std.testing.expectEqual(@as(u32, 0), ctx.active_external_dense_bulk_sessions.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_admission.external_sessions.load(.acquire));
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
 
     ctx.portable_runtime_activation_pending.store(false, .release);
@@ -77037,7 +76879,7 @@ fn resetPath(path: []const u8) !void {
 fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: derived_executor_mod.CatchUpSessionToken) !bool {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
-    if (index_ref.kind == .dense_vector and ctx.active_external_dense_bulk_sessions.load(.acquire) != 0) {
+    if (index_ref.kind == .dense_vector and ctx.dense_admission.external_sessions.load(.acquire) != 0) {
         return error.ReplayDocumentNotVisible;
     }
 
@@ -77081,13 +76923,13 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
 }
 
 fn installAsyncDenseCatchUpSession(ctx: *AsyncContext, index_name: []const u8, index_incarnation: u64, lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease, snapshot_replay: *?snapshot_admission_mod.SnapshotAdmission.MutationLease) !derived_executor_mod.CatchUpSessionToken {
-    return ctx.dense_sessions.install(ctx.alloc, index_name, index_incarnation, lease, snapshot_replay);
+    return ctx.dense_admission.sessions.install(ctx.alloc, index_name, index_incarnation, lease, snapshot_replay);
 }
 fn retainAsyncDenseCatchUpAdmission(ctx: *AsyncContext, index_name: []const u8, token: derived_executor_mod.CatchUpSessionToken) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
-    return ctx.dense_sessions.retainAdmission(index_name, token);
+    return ctx.dense_admission.sessions.retainAdmission(index_name, token);
 }
 fn takeAsyncDenseCatchUpSession(ctx: *AsyncContext, index_name: []const u8, token: derived_executor_mod.CatchUpSessionToken) !AsyncDenseCatchUpSession {
-    return ctx.dense_sessions.take(index_name, token);
+    return ctx.dense_admission.sessions.take(index_name, token);
 }
 
 fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
@@ -78425,7 +78267,7 @@ fn finalizeCoveredDenseProjectionCheckpoint(
     index_name: []const u8,
     applied_sequence: u64,
 ) !bool {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name) orelse {
         session_lock.unlock();
         return false;
@@ -78464,27 +78306,20 @@ fn queueDenseProjectionFinalizationLocked(
     index_name: []const u8,
     applied_sequence: u64,
 ) !void {
-    ctx.dense_projection_finalization_requested = true;
-    if (ctx.pending_dense_projection_finalizations.getPtr(index_name)) |pending_sequence| {
-        pending_sequence.* = @max(pending_sequence.*, applied_sequence);
-        return;
-    }
-    const owned_name = try ctx.alloc.dupe(u8, index_name);
-    errdefer ctx.alloc.free(owned_name);
-    try ctx.pending_dense_projection_finalizations.putNoClobber(ctx.alloc, owned_name, applied_sequence);
+    ctx.dense_admission.finalization_requested = true;
+    try ctx.dense_admission.deferCheckpointLocked(ctx.alloc, index_name, applied_sequence);
 }
 
 fn pendingDenseProjectionFinalizationSequence(ctx: *AsyncContext, index_name: []const u8) u64 {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
-    return ctx.pending_dense_projection_finalizations.get(index_name) orelse 0;
+    return ctx.dense_admission.pending.get(index_name) orelse 0;
 }
 
 fn clearPendingDenseProjectionFinalization(ctx: *AsyncContext, index_name: []const u8) void {
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
-    if (ctx.pending_dense_projection_finalizations.fetchRemove(index_name)) |removed|
-        ctx.alloc.free(@constCast(removed.key));
+    ctx.dense_admission.clearCheckpointLocked(ctx.alloc, index_name);
 }
 
 fn finalizeCoveredDenseProjectionCheckpointClaimed(
@@ -78606,7 +78441,7 @@ fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
     const manager = ctx.index_manager;
     if (!manager.tryAcquireCatalogRead()) return true;
     defer manager.releaseCatalogRead();
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     const claimed = tryClaimDenseProjectionFinalizationLocked(ctx);
     session_lock.unlock();
     if (!claimed) return true;
@@ -78657,7 +78492,7 @@ fn finalizeCoveredDenseProjectionCheckpointsIfIdle(ctx: *AsyncContext) !bool {
     try lockApplySharedForPortableRuntimeAsync(ctx);
     defer ctx.apply_mutex.unlockShared();
 
-    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+    var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     const claimed = tryClaimDenseProjectionFinalizationLocked(ctx);
     session_lock.unlock();
     if (!claimed) return false;
@@ -78675,13 +78510,13 @@ fn drainClaimedDenseProjectionFinalizations(ctx: *AsyncContext) !bool {
     while (true) {
         completed = try finalizeCoveredDenseProjectionCheckpointsClaimed(ctx) or completed;
 
-        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-        if (!ctx.dense_projection_finalization_requested) {
-            ctx.dense_projection_finalizing.store(false, .release);
+        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
+        if (!ctx.dense_admission.finalization_requested) {
+            ctx.dense_admission.finalizing.store(false, .release);
             session_lock.unlock();
             return completed;
         }
-        ctx.dense_projection_finalization_requested = false;
+        ctx.dense_admission.finalization_requested = false;
         session_lock.unlock();
     }
 }
@@ -78694,18 +78529,18 @@ fn finalizeCoveredDenseProjectionCheckpointsClaimed(ctx: *AsyncContext) !bool {
     // catalog generation disappeared or completed through another path so a
     // long-running process cannot retain obsolete index names indefinitely.
     {
-        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
+        var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
         defer session_lock.unlock();
-        if (ctx.pending_dense_projection_finalizations.count() != 0) {
-            const names = try ctx.alloc.alloc([]const u8, ctx.pending_dense_projection_finalizations.count());
+        if (ctx.dense_admission.pending.count() != 0) {
+            const names = try ctx.alloc.alloc([]const u8, ctx.dense_admission.pending.count());
             defer ctx.alloc.free(names);
             var count: usize = 0;
-            var it = ctx.pending_dense_projection_finalizations.keyIterator();
+            var it = ctx.dense_admission.pending.keyIterator();
             while (it.next()) |name| : (count += 1) names[count] = name.*;
             for (names[0..count]) |index_name| {
                 const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name);
                 if (checkpoint != null and checkpoint.?.status == .rebuilding) continue;
-                const removed = ctx.pending_dense_projection_finalizations.fetchRemove(index_name) orelse continue;
+                const removed = ctx.dense_admission.pending.fetchRemove(index_name) orelse continue;
                 ctx.alloc.free(@constCast(removed.key));
             }
         }
@@ -82466,10 +82301,10 @@ test "db runtime-only status overlay preserves a resident enrichment worker" {
 
     // A stale receipt cannot survive indefinitely if the owner is wedged or
     // gone while lifecycle access remains contended.
-    lockAtomic(&db.embedding_activity_cache_mutex);
-    const cached = db.embedding_activity_cache.getPtr("semantic") orelse return error.TestUnexpectedResult;
+    lockAtomic(&db.embedding_activity.mutex);
+    const cached = db.embedding_activity.cache.getPtr("semantic") orelse return error.TestUnexpectedResult;
     cached.observed_at_ms -|= types.embedding_activity_retention_ms;
-    db.embedding_activity_cache_mutex.unlock();
+    db.embedding_activity.mutex.unlock();
     indexes[0] = .{
         .name = "semantic",
         .kind = .dense_vector,
@@ -87464,7 +87299,7 @@ test "db portable import target rejects active in-memory bulk leases" {
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
     try std.testing.expectError(error.PortableRuntimeActivationPending, db.beginBulkIngestSession());
-    try std.testing.expectEqual(@as(u32, 0), db.async_context.active_external_dense_bulk_sessions.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), db.async_context.dense_admission.external_sessions.load(.acquire));
     try std.testing.expect(!db.bulk_ingest_session.active);
     db.async_context.portable_runtime_activation_pending.store(false, .release);
 
@@ -116622,14 +116457,14 @@ test "managed dense physical migration is online and uses durable repair intent"
 
     // Candidate vector-block publication is table-wide runtime work. It must
     // not project onto the readiness of the still-authoritative v1 index.
-    db.async_context.dense_projection_finalizing.store(true, .release);
-    defer db.async_context.dense_projection_finalizing.store(false, .release);
+    db.async_context.dense_admission.finalizing.store(true, .release);
+    defer db.async_context.dense_admission.finalizing.store(false, .release);
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     const dense_stats = for (stats.indexes) |item| {
         if (std.mem.eql(u8, item.name, "dense_idx")) break item;
     } else return error.TestUnexpectedResult;
-    try std.testing.expect(stats.async_indexing.dense_projection_finalizing);
+    try std.testing.expect(stats.async_indexing.dense_admission.finalizing);
     try std.testing.expect(!dense_stats.dense_vector_projection_pending);
 }
 
@@ -128814,17 +128649,17 @@ test "db dense finalization owner drains requests queued during publication" {
 
     db.async_context.apply_mutex.lockShared();
     defer db.async_context.apply_mutex.unlockShared();
-    var claim_lock = lockAtomicWithBackoffProfiled(&db.async_context.dense_finish_mutex, &db.async_context.stats.dense_finish_mutex);
+    var claim_lock = lockAtomicWithBackoffProfiled(&db.async_context.dense_admission.mutex, &db.async_context.stats.dense_finish_mutex);
     const claimed = tryClaimDenseProjectionFinalizationLocked(db.async_context);
     claim_lock.unlock();
     try std.testing.expect(claimed);
     defer finishDenseProjectionFinalization(db.async_context);
-    try std.testing.expect(db.snapshotAsyncIndexingStats().dense_projection_finalizing);
+    try std.testing.expect(db.snapshotAsyncIndexingStats().dense_admission.finalizing);
     try std.testing.expect(!try finalizeCoveredDenseProjectionCheckpoint(db.async_context, config.name, applied));
-    try std.testing.expect(db.async_context.dense_projection_finalization_requested);
+    try std.testing.expect(db.async_context.dense_admission.finalization_requested);
     try std.testing.expect(try drainClaimedDenseProjectionFinalizations(db.async_context));
-    try std.testing.expect(!db.async_context.dense_projection_finalizing.load(.acquire));
-    try std.testing.expect(!db.snapshotAsyncIndexingStats().dense_projection_finalizing);
+    try std.testing.expect(!db.async_context.dense_admission.finalizing.load(.acquire));
+    try std.testing.expect(!db.snapshotAsyncIndexingStats().dense_admission.finalizing);
 
     const checkpoint = try db.core.loadProjectionCheckpoint(alloc, config.name);
     try std.testing.expectEqual(apply_state.ProjectionStatus.clean, checkpoint.status);
@@ -128889,14 +128724,14 @@ test "db last external dense bulk lease finalizes covered rebuilding generations
     // readiness fence. Another dense index may begin projection work after
     // this generation becomes complete; the immutable generation token above
     // must remain independently serviceable.
-    db.async_context.dense_projection_finalizing.store(true, .release);
-    defer db.async_context.dense_projection_finalizing.store(false, .release);
+    db.async_context.dense_admission.finalizing.store(true, .release);
+    defer db.async_context.dense_admission.finalizing.store(false, .release);
     const stats = try db.stats(alloc);
     defer types.freeDBStats(alloc, stats);
     const dense_stats = for (stats.indexes) |item| {
         if (std.mem.eql(u8, item.name, config.name)) break item;
     } else return error.TestUnexpectedResult;
-    try std.testing.expect(stats.async_indexing.dense_projection_finalizing);
+    try std.testing.expect(stats.async_indexing.dense_admission.finalizing);
     try std.testing.expect(!dense_stats.dense_vector_projection_pending);
 }
 
@@ -141215,7 +141050,7 @@ test "db primary auto bulk leaves dense replay active while session is open" {
 
     try db.beginPrimaryStoreAutoBulkIngestSession();
     errdefer db.abortPrimaryStoreAutoBulkIngestSession();
-    try std.testing.expectEqual(@as(u32, 0), db.async_context.active_external_dense_bulk_sessions.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), db.async_context.dense_admission.external_sessions.load(.acquire));
 
     try db.batch(.{
         .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1.0,0.0,0.0]}}" }},
@@ -141404,7 +141239,7 @@ test "db dense auto bulk finish wakes current replay target if deferred wake is 
 
     const target_sequence = db.core.nextDerivedSequence();
     try std.testing.expect(target_sequence > 0);
-    db.async_context.deferred_external_bulk_notify_sequence.store(0, .release);
+    db.async_context.dense_admission.deferred_sequence.store(0, .release);
 
     try db.finishDenseAutoBulkIngestSessionWithOptions(.{ .compact = false });
     try db.executor.waitForAll(target_sequence);

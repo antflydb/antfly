@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const admission = @import("coalesced_job_admission.zig");
 const builtin = @import("builtin");
 const runtime = @import("../background_runtime.zig");
 /// Local restart admission and retry supervision. The runtime owner drains the
@@ -44,10 +45,7 @@ pub const Owner = struct {
     };
     pub fn schedule(self: *Owner, port: Port) void {
         if (port.closing.load(.acquire) or !port.wanted(port.ptr)) return;
-        if (self.state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = self.state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
-            return;
-        }
+        if (!admission.request(&self.state)) return;
         const work = std.heap.page_allocator.create(Work) catch {
             self.state.store(0, .release);
             return;
@@ -60,8 +58,7 @@ pub const Owner = struct {
         };
     }
     fn settled(self: *Owner) bool {
-        if (self.state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return true;
-        return self.state.cmpxchgStrong(2, 1, .acq_rel, .acquire) != null;
+        return admission.settled(&self.state);
     }
     pub fn run(self: *Owner, port: Port) !void {
         var retries: usize = 0;

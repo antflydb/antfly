@@ -336,3 +336,37 @@ identity before returning an error. Providers remain with the caller until
 construction succeeds, and cleanup does not release a pre-existing durable
 lease. Allocation-failure and corrupt persisted-status regressions exercise
 these ownership boundaries.
+
+## Admission and remaining local owners
+
+`storage/db/coalesced_job_admission.zig` defines the shared idle/active/dirty
+notification handshake used by restart and cleanup jobs. Failed compare-exchanges
+retry from the observed state, so an old worker retiring during notification
+cannot strand the new request. Operation-specific retry limits and shutdown
+remain in the job owners; durable work is still rediscovered from storage.
+
+`storage/db/dense_publication_admission.zig` owns replay and external-session
+admission, waiters, finalization requests, commit admission, deferred notification
+sequences and pending checkpoint names. Its profiled mutex remains available to
+DB's coordinator so local admission and durable publication use the existing
+critical sections. Optimistic projection construction leaves source admission
+open; only checkpoint commit closes it. DB retains catalog-incarnation checks,
+WAL commits, immutable-generation publication and apply/snapshot ordering.
+
+`storage/db/local_runtime_owner.zig` owns stable allocation and destruction of
+resolution/promotion, TTL, transaction-recovery, text-merge, sparse-compaction and
+graph-metric runtimes.
+Callback contexts are adopted only after successful construction. Resolution's
+context has a separate retirement step: resolution drains first, promotion drains
+while that context remains alive, then the context is released. DB assembles the
+borrowed execution capabilities and coordinates this shutdown dependency graph.
+Transaction recovery bundles its stable identity/local contexts and releases
+identity-owned resources only after recovery and source publication have drained.
+
+`storage/db/embedding_activity_cache.zig` owns sample names, synchronization,
+pruning and generation/age retention. Cached telemetry remains readiness-neutral;
+DB supplies the authoritative current index set and optional live runtime sample.
+
+The visibility-hook routing guard covers the extracted `query_visibility.zig`
+definition as well as the legacy inline location, preventing server table/group
+identity or a DB pointer from becoming fields of the shared local hook.

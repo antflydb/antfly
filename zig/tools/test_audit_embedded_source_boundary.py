@@ -125,6 +125,43 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             "pub const QueryVisibilityHook = struct {\n    ptr: *anyopaque,\n};",
         )
 
+    def test_extracted_visibility_hook_rejects_server_identity(self):
+        for field in ("table_name: []const u8", "group_id: u64", "db: *DB"):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    ValueError, "server routing in local visibility hook"
+                ),
+            ):
+                check_replication_contract(
+                    "storage/db/query_visibility.zig",
+                    f"pub const QueryVisibilityHook = struct {{\n    {field},\n}};",
+                )
+        check_replication_contract(
+            "storage/db/db.zig",
+            'pub const QueryVisibilityHook = @import("query_visibility.zig").QueryVisibilityHook;',
+        )
+
+    def test_real_visibility_hook_cannot_regain_server_fields(self):
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "pkg/antfly/src/storage/db/query_visibility.zig"
+        )
+        source = source_path.read_text()
+        declaration = "pub const QueryVisibilityHook = struct {"
+        self.assertIn(declaration, source)
+        for field in (
+            "group_id: u64 = 0,",
+            'table_name: []const u8 = "",',
+            "owner: ?*DB = null,",
+        ):
+            changed = source.replace(declaration, declaration + "\n    " + field, 1)
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "server routing"),
+            ):
+                check_replication_contract("storage/db/query_visibility.zig", changed)
+
     def test_local_child_range_planning_rejects_server_destination_policy(self):
         path = "storage/db/document_child_range_effects.zig"
         for source in (

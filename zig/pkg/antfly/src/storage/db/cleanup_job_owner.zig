@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const admission = @import("coalesced_job_admission.zig");
 const builtin = @import("builtin");
 const runtime = @import("../background_runtime.zig");
 
@@ -44,10 +45,7 @@ const Work = struct {
 };
 pub fn schedule(port: Port) void {
     if (port.closing) |closing| if (closing.load(.acquire)) return;
-    if (port.state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-        _ = port.state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
-        return;
-    }
+    if (!admission.request(port.state)) return;
     const work = std.heap.page_allocator.create(Work) catch {
         port.state.store(0, .release);
         return;
@@ -109,12 +107,9 @@ pub fn drain(port: Port) !void {
         }
         contention_retries = 0;
         if (advance == .idle) {
-            if (port.state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-            if (port.state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                pages = 0;
-                continue;
-            }
-            return;
+            if (admission.settled(port.state)) return;
+            pages = 0;
+            continue;
         }
         pages += 1;
         if (pages < 8) continue;
