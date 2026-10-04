@@ -25,6 +25,8 @@ comptime {
     _ = @import("db/durable_outbox.zig");
     _ = @import("db/durable_outbox_store.zig");
     _ = @import("db/primary_effect.zig");
+    _ = @import("db/graph_edge_types.zig");
+    _ = @import("document_mutation_revision.zig");
     _ = @import("db/replication_contract.zig");
     _ = @import("db/replication_ingress.zig");
     _ = @import("db/replication_effects.zig");
@@ -127,6 +129,8 @@ comptime {
     _ = @import("db/artifact_ids.zig");
     _ = @import("db/backfill_state.zig");
     _ = @import("db/batcher.zig");
+    _ = @import("db/lookup_key_scratch.zig");
+    _ = @import("db/document_read_scratch.zig");
     _ = @import("db/catalog/enrichment_catalog.zig");
     _ = @import("db/catalog/index_manager.zig");
     _ = @import("db/catalog/resolver_catalog.zig");
@@ -275,7 +279,6 @@ comptime {
     _ = @import("hot_standby/replication_api.zig");
     _ = @import("hot_standby/replication_log.zig");
     _ = @import("db/replication_record.zig");
-    _ = @import("db/primary_effect.zig");
     _ = @import("hot_standby/seed_activation.zig");
     _ = @import("hot_standby/seed_artifact.zig");
     _ = @import("hot_standby/seed_capture.zig");

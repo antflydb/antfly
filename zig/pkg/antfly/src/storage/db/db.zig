@@ -279,6 +279,8 @@ const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document_mapper.zig");
 const relational_store = @import("relational_store.zig");
+const lookup_key_scratch = @import("lookup_key_scratch.zig");
+const document_read_scratch = @import("document_read_scratch.zig");
 const relational_columns = @import("relational_columns.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
@@ -72687,13 +72689,14 @@ fn collectSparseFieldWritesProfiled(
 ) !OwnedSparseFieldWrites {
     const PendingDocumentWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
@@ -72749,7 +72752,7 @@ fn collectSparseFieldWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -72775,14 +72778,13 @@ fn collectSparseFieldWritesProfiled(
     }.lessThan);
     if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
-    const read_keys = try alloc.alloc([]const u8, pending.items.len);
-    defer alloc.free(read_keys);
-    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-    defer alloc.free(read_values);
+    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    defer read_scratch.deinit();
+    const read_keys = read_scratch.keys;
+    const read_values = read_scratch.values;
 
     for (pending.items, 0..) |item, i| {
         read_keys[i] = item.store_key;
-        read_values[i] = null;
     }
     const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
     try txn.getManySorted(read_keys, read_values);
@@ -72847,6 +72849,19 @@ fn collectDocumentWrites(
     return try collectDocumentWritesProfiled(alloc, store, null, documents, byte_range, .{}, null);
 }
 
+// Count contiguous store hits first. Inline fallbacks require inspecting
+// pending metadata only when that metadata actually contains inline values.
+fn availableDocumentValueCount(pending: anytype, values: []const ?[]const u8, has_inline: bool) usize {
+    var count: usize = 0;
+    for (values) |value| count += @intFromBool(value != null);
+    if (has_inline) {
+        for (pending, values) |item, value| {
+            count += @intFromBool(value == null and item.inline_value != null);
+        }
+    }
+    return count;
+}
+
 fn collectDocumentWritesProfiled(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -72858,16 +72873,18 @@ fn collectDocumentWritesProfiled(
 ) !OwnedBatchWrites {
     const PendingDocumentWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
+    var has_pending_inline = false;
     var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
     errdefer {
         for (writes.items) |item| alloc.free(@constCast(item.value));
@@ -72893,18 +72910,22 @@ fn collectDocumentWritesProfiled(
         }
         if (trust_inline and doc.cleaned_value != null) {
             const owned_value = try alloc.dupe(u8, doc.cleaned_value.?);
-            try writes.append(alloc, .{
+            writes.append(alloc, .{
                 .key = doc.key,
                 .value = owned_value,
-            });
+            }) catch |err| {
+                alloc.free(owned_value);
+                return err;
+            };
             if (profile) |p| p.inline_hits += 1;
             continue;
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
+        has_pending_inline = has_pending_inline or doc.cleaned_value != null;
     }
     if (profile) |p| {
         p.scan_ns = monotonicTimeNs() - scan_start_ns;
@@ -72928,18 +72949,20 @@ fn collectDocumentWritesProfiled(
     }.lessThan);
     if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
-    const read_keys = try alloc.alloc([]const u8, pending.items.len);
-    defer alloc.free(read_keys);
-    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-    defer alloc.free(read_values);
+    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    defer read_scratch.deinit();
+    const read_keys = read_scratch.keys;
+    const read_values = read_scratch.values;
 
     for (pending.items, 0..) |item, i| {
         read_keys[i] = item.store_key;
-        read_values[i] = null;
     }
     const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
     try txn.getManySorted(read_keys, read_values);
     if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
+
+    const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
+    try writes.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, writes.items.len, available_values));
 
     const materialize_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (pending.items, 0..) |item, i| {
@@ -72961,10 +72984,13 @@ fn collectDocumentWritesProfiled(
                 try relational_store.materializeStoredValueAlloc(alloc, item.store_key, value)
         else
             try alloc.dupe(u8, value);
-        try writes.append(alloc, .{
+        writes.append(alloc, .{
             .key = item.doc_key,
             .value = owned_value,
-        });
+        }) catch |err| {
+            alloc.free(owned_value);
+            return err;
+        };
     }
     if (profile) |p| {
         p.materialize_ns = monotonicTimeNs() - materialize_start_ns;
@@ -73116,16 +73142,18 @@ fn collectTextDocumentWritesForIndex(
 ) !CollectedTextDocumentWrites {
     const PendingTextWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingTextWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
+    var has_pending_inline = false;
     var result = CollectedTextDocumentWrites{ .alloc = alloc };
     errdefer result.deinit();
     var schema_views = index_manager_mod.IndexManager.SchemaViewSet.init(index_manager);
@@ -73149,7 +73177,10 @@ fn collectTextDocumentWritesForIndex(
                 doc.key,
                 doc.cleaned_value.?,
             );
-            if (projected) |value| try result.owned_values.append(alloc, value);
+            if (projected) |value| result.owned_values.append(alloc, value) catch |err| {
+                alloc.free(value);
+                return err;
+            };
             try result.docs.append(alloc, .{
                 .key = doc.key,
                 .value = projected orelse doc.cleaned_value.?,
@@ -73171,9 +73202,10 @@ fn collectTextDocumentWritesForIndex(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
+        has_pending_inline = has_pending_inline or doc.cleaned_value != null;
     }
 
     if (pending.items.len == 0) return result;
@@ -73187,16 +73219,18 @@ fn collectTextDocumentWritesForIndex(
         }
     }.lessThan);
 
-    const read_keys = try alloc.alloc([]const u8, pending.items.len);
-    defer alloc.free(read_keys);
-    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-    defer alloc.free(read_values);
+    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    defer read_scratch.deinit();
+    const read_keys = read_scratch.keys;
+    const read_values = read_scratch.values;
 
     for (pending.items, 0..) |item, i| {
         read_keys[i] = item.store_key;
-        read_values[i] = null;
     }
     try txn.getManySorted(read_keys, read_values);
+
+    const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
+    try result.docs.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, result.docs.items.len, available_values));
 
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
@@ -157775,4 +157809,167 @@ test "db generated write read fences detect artifact mutations and ABA independe
     try db.batch(.{ .deletes = &.{"doc:a"}, .timestamp_ns = 42 });
     try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
     try std.testing.expectError(error.PreparedReadSetChanged, db.validateGeneratedWriteReadSnapshot(snapshot));
+}
+
+test "db document lookup allocation benchmark" {
+    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const Case = enum { short, long, missing, sparse, text, relational };
+    const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
+    const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
+    const alloc = std.testing.allocator;
+    const count: usize = 50_000;
+    const batch_size = 256;
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var directory = try TestDirectory.init("collector-benchmark");
+    defer directory.cleanup();
+    var db: ?DB = if (fixture == .text or fixture == .relational) try DB.open(alloc, directory.path(), .{ .start_index_workers = false }) else null;
+    defer if (db) |*database| database.close();
+    const value = if (fixture == .sparse) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}" else "{\"title\":\"document value\"}";
+    const relational_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":false}}}}";
+    var packed_value: ?[]u8 = null;
+    defer if (packed_value) |packed_bytes| alloc.free(packed_bytes);
+    if (fixture == .relational) {
+        try db.?.setSchemaJson(alloc, relational_schema);
+        var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, relational_schema);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, value, .{});
+        defer parsed_value.deinit();
+        packed_value = try mapper.buildRelationalRowValueForSchemaFromParsedAlloc(alloc, parsed_value.value, runtime_schema);
+    }
+    if (fixture == .text) try db.?.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
+    const names = try alloc.alloc([544]u8, count);
+    defer alloc.free(names);
+    const docs = try alloc.alloc(derived_types.DerivedDocument, count);
+    defer alloc.free(docs);
+    const stored = try alloc.alloc(docstore_mod.KVPair, count);
+    defer alloc.free(stored);
+    var initialized: usize = 0;
+    defer for (stored[0..initialized]) |write| alloc.free(write.key);
+    for (names, docs, stored, 0..) |*name, *doc, *write, i| {
+        const prefix = try std.fmt.bufPrint(name, "document-{d:0>10}", .{i});
+        const key = if (fixture == .long) blk: {
+            @memset(name[prefix.len..512], 'x');
+            // Exercise escaped component encoding and multiple key blocks.
+            name[100] = 0;
+            break :blk name[0..512];
+        } else prefix;
+        doc.* = .{ .key = key, .action = .upsert, .targets = &targets };
+        write.* = .{ .key = try replayDocumentStoreKeyAlloc(alloc, key, fixture == .relational), .value = packed_value orelse value };
+        initialized += 1;
+    }
+    const expected_count = if (fixture == .missing) count / 5 else count;
+    try store.putBatch(stored[0..expected_count], &.{});
+    for (0..2) |measurement| {
+        for (0..2) |sample| {
+            var counter: Counter = .{};
+            const run_alloc = if (measurement == 0) counter.allocator() else std.heap.smp_allocator;
+            var checksum: usize = 0;
+            var output_count: usize = 0;
+            const started = monotonicTimeNs();
+            var offset: usize = 0;
+            while (offset < count) {
+                const end = @min(count, offset + batch_size);
+                if (fixture == .sparse) {
+                    var writes = try collectSparseFieldWritesProfiled(run_alloc, &store, null, docs[offset..end], .{ .start = "", .end = "" }, "vec", .{}, null);
+                    defer writes.deinit();
+                    try std.testing.expectEqual(end - offset, writes.items.len);
+                    for (writes.items, docs[offset..end]) |write, doc| {
+                        try std.testing.expectEqualStrings(doc.key, write.doc_id);
+                        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, write.vec.indices);
+                        try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25 }, write.vec.values);
+                        for (write.doc_id) |byte| checksum +%= byte;
+                    }
+                    output_count += writes.items.len;
+                } else if (fixture == .text) {
+                    var writes = try collectTextDocumentWritesForIndex(run_alloc, &store, db.?.core.index_manager, docs[offset..end], "text", false, .{ .start = "", .end = "" }, .{});
+                    defer writes.deinit();
+                    try std.testing.expectEqual(end - offset, writes.docs.items.len);
+                    for (writes.docs.items, docs[offset..end]) |write, doc| {
+                        try std.testing.expectEqualStrings(doc.key, write.key);
+                        try std.testing.expectEqualStrings(value, write.value);
+                        for (write.key) |byte| checksum +%= byte;
+                    }
+                    output_count += writes.docs.items.len;
+                } else {
+                    var writes = try collectDocumentWritesProfiled(run_alloc, &store, if (db) |database| database.core.index_manager else null, docs[offset..end], .{ .start = "", .end = "" }, .{ .relational_base_rows = fixture == .relational }, null);
+                    defer writes.deinit();
+                    const available = @min(end, expected_count) -| offset;
+                    try std.testing.expectEqual(available, writes.items.len);
+                    for (writes.items, docs[offset .. offset + available]) |write, doc| {
+                        try std.testing.expectEqualStrings(doc.key, write.key);
+                        try std.testing.expectEqualStrings(value, write.value);
+                        for (write.key) |byte| checksum +%= byte;
+                    }
+                    output_count += writes.items.len;
+                }
+                offset = end;
+            }
+            const elapsed = monotonicTimeNs() - started;
+            try std.testing.expectEqual(expected_count, output_count);
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+            if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ @tagName(fixture), count, batch_size, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+        }
+    }
+}
+
+fn documentCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
+    var writes = try collectDocumentWritesProfiled(alloc, store, null, documents, .{ .start = "", .end = "" }, .{ .prefer_available_inline_values = inline_values }, null);
+    defer writes.deinit();
+    try std.testing.expectEqual(documents.len, writes.items.len);
+    for (writes.items) |write| try std.testing.expectEqualStrings("{\"title\":\"value\"}", write.value);
+}
+
+test "document collectors release owned values and pooled read scratch on allocation failures" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var names: [80][96]u8 = undefined;
+    var docs: [80]derived_types.DerivedDocument = undefined;
+    for (&names, &docs, 0..) |*name, *doc, i| {
+        @memset(name, 'x');
+        _ = try std.fmt.bufPrint(name[0..8], "{d:0>8}", .{i});
+        doc.* = .{ .key = name, .action = .upsert, .cleaned_value = "{\"title\":\"value\"}" };
+    }
+    const stored_key = try replayDocumentStoreKeyAlloc(alloc, docs[0].key, false);
+    defer alloc.free(stored_key);
+    try store.putBatch(&.{.{ .key = stored_key, .value = docs[0].cleaned_value.? }}, &.{});
+    for ([_]bool{ false, true }) |inline_values|
+        try std.testing.checkAllAllocationFailures(alloc, documentCollectorFailureSweep, .{ &store, @as([]const derived_types.DerivedDocument, &docs), inline_values });
+}
+
+fn textCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, manager: *index_manager_mod.IndexManager, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
+    var result = try collectTextDocumentWritesForIndex(alloc, store, manager, documents, "text", false, .{ .start = "", .end = "" }, .{ .prefer_inline_when_store_tip_matches_sequence = if (inline_values) 0 else null });
+    defer result.deinit();
+    try std.testing.expectEqual(documents.len, result.docs.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.docs.items[0].value, "projected") != null);
+}
+
+test "document collectors release text projections and materialized values on allocation failures" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("text-collector-failures");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "caption", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "caption");
+    defer alloc.free(asset_key);
+    const key = try replayDocumentStoreKeyAlloc(alloc, "normal", false);
+    defer alloc.free(key);
+    try db.core.store.putBatch(&.{ .{ .key = asset_key, .value = "projected value" }, .{ .key = key, .value = "{\"title\":\"normal\"}" } }, &.{});
+    const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = asset_key, .action = .upsert, .targets = &targets, .cleaned_value = "projected value" },
+        .{ .key = "normal", .action = .upsert, .targets = &targets, .cleaned_value = "{\"title\":\"normal\"}" },
+    };
+    for ([_]bool{ false, true }) |inline_values|
+        try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
 }

@@ -9,7 +9,9 @@ const lsm = @import("storage/lsm_backend/mod.zig");
 const time = @import("antfly_platform").time;
 
 pub fn main(init: std.process.Init) !void {
-    const alloc = std.heap.smp_allocator;
+    var allocation_counter: @import("allocation_bench_support.zig").Counter = .{};
+    const count_allocations = @import("antfly_platform").env.getenvBool("ANTFLY_COUNT_BENCH_ALLOCATIONS");
+    const alloc = if (count_allocations) allocation_counter.allocator() else std.heap.smp_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len < 2) return error.ExpectedHashOrIngestOrRead;
     if (std.mem.eql(u8, args[1], "hash")) return hashBench();
@@ -17,21 +19,23 @@ pub fn main(init: std.process.Init) !void {
     const root = args[2];
     const count = try std.fmt.parseInt(usize, args[3], 10);
     const dims = try std.fmt.parseInt(usize, args[4], 10);
+    const retrying = std.mem.eql(u8, args[1], "retry");
+    const mixed = std.mem.eql(u8, args[1], "retry-mixed") or std.mem.eql(u8, args[1], "read-mixed");
     const updating = std.mem.eql(u8, args[1], "update") or std.mem.eql(u8, args[1], "read-updated");
     var disk = try lsm.NativeStorage.init(alloc, .threaded);
     defer disk.deinit();
     const storage = disk.storage();
-    const refs_path = try std.fmt.allocPrint(alloc, "{s}{s}.refs", .{ root, if (updating) ".updated" else "" });
+    const refs_path = try std.fmt.allocPrint(alloc, "{s}{s}.refs", .{ root, if (updating) ".updated" else if (mixed) ".mixed" else "" });
     defer alloc.free(refs_path);
-    const writing = std.mem.eql(u8, args[1], "ingest") or std.mem.eql(u8, args[1], "update");
-    if (!writing and !std.mem.eql(u8, args[1], "read") and !std.mem.eql(u8, args[1], "read-updated")) return error.InvalidMode;
+    const writing = std.mem.eql(u8, args[1], "ingest") or std.mem.eql(u8, args[1], "update") or retrying or std.mem.eql(u8, args[1], "retry-mixed");
+    if (!writing and !std.mem.eql(u8, args[1], "read") and !std.mem.eql(u8, args[1], "read-updated") and !std.mem.eql(u8, args[1], "read-mixed")) return error.InvalidMode;
     if (writing) {
         const current = try std.fmt.allocPrint(alloc, "{s}/CURRENT", .{root});
         defer alloc.free(current);
         if (storage.fileSize(current)) |_| {
-            if (!updating) return error.BenchmarkRequiresFreshRoot;
+            if (!updating and !retrying and !mixed) return error.BenchmarkRequiresFreshRoot;
         } else |err| {
-            if (err != error.FileNotFound or updating) return err;
+            if (err != error.FileNotFound or updating or retrying or mixed) return err;
         }
     }
     const started = time.monotonicNs();
@@ -51,11 +55,18 @@ pub fn main(init: std.process.Init) !void {
     var max_batch_ns: u64 = 0;
     var maintenance = Maintenance{ .store = &store, .io = init.io };
     const background = writing and std.c.getenv("ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT") != null;
+    // The diagnostic counter is deliberately single-threaded so it does not
+    // insert locks into every allocation. Keep its use out of concurrent runs.
+    if (count_allocations and background) return error.AllocationCountingRequiresForegroundCheckpoint;
     var task = if (background) try init.io.concurrent(Maintenance.run, .{&maintenance}) else null;
     defer if (task) |*future| {
         maintenance.stop.store(true, .release);
         future.await(init.io) catch {};
     };
+    const initial_live = allocation_counter.live;
+    allocation_counter.calls = 0;
+    allocation_counter.bytes = 0;
+    allocation_counter.peak = initial_live;
     const run_start = time.monotonicNs();
     var offset: usize = 0;
     while (offset < count) {
@@ -68,16 +79,17 @@ pub fn main(init: std.process.Init) !void {
             const key = try keys.embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&id, "doc-{d:0>10}", .{i}), "model-a");
             defer alloc.free(key);
             const ref = refs[i * payload.reference_len ..][0..payload.reference_len];
+            const changed = updating or (mixed and i % 128 == 0);
             if (writing) {
-                vector[0] = @floatFromInt(i % 10007 + @intFromBool(updating));
-                const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, if (updating) 18 else 17, vector);
+                vector[0] = @floatFromInt(i % 10007 + @intFromBool(changed));
+                const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, if (changed) 18 else 17, vector);
                 defer alloc.free(artifact);
                 @memcpy(ref, try session.put(key, artifact));
             } else {
                 const artifact = try session.getAlloc(alloc, key, ref);
                 defer alloc.free(artifact);
                 const values = (try codec.denseEmbeddingVectorView(artifact)) orelse return error.ExpectedFloat32;
-                if (values.len != dims or values[0] != @as(f32, @floatFromInt(i % 10007 + @intFromBool(updating)))) return error.PayloadMismatch;
+                if (values.len != dims or values[0] != @as(f32, @floatFromInt(i % 10007 + @intFromBool(changed)))) return error.PayloadMismatch;
                 std.mem.doNotOptimizeAway(artifact.ptr);
             }
         }
@@ -101,6 +113,9 @@ pub fn main(init: std.process.Init) !void {
     const stats = try std.json.Stringify.valueAlloc(alloc, store.statsSnapshot(), .{});
     defer alloc.free(stats);
     std.debug.print("payload_bench {{\"mode\":\"{s}\",\"count\":{d},\"dims\":{d},\"open_ns\":{d},\"run_ns\":{d},\"final_checkpoint_ns\":{d},\"max_batch_ns\":{d},\"stats\":{s}}}\n", .{ args[1], count, dims, opened_ns, run_ns, finish_ns, max_batch_ns, stats });
+    if (count_allocations) std.debug.print("allocation_bench {{\"allocations\":{d},\"allocated_bytes\":{d},\"peak_additional_live_bytes\":{d}}}\n", .{
+        allocation_counter.calls, allocation_counter.bytes, allocation_counter.peak - initial_live,
+    });
 }
 
 fn hashBench() !void {
