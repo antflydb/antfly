@@ -6521,13 +6521,14 @@ pub const DataServer = struct {
     /// Safety fuse for allocator-retained memory. The ResourceManager only
     /// governs what owners charge; freed heap the allocator keeps dirty still
     /// counts against the process envelope. When the pressure working set
-    /// passes the threshold, ask the allocator to return unused pages. The
-    /// check is rate-limited and never fires while the process is well inside
-    /// its envelope, so a large host does not pay for it.
+    /// passes the threshold, ask the allocator to return unused pages. It is
+    /// armed only in small envelopes: on a large node half the envelope is an
+    /// ordinary working set, and a purge walks every arena and re-faults the
+    /// pages it returns, which shows up as tail latency.
     fn maintainProcessMemoryReclaim(self: *DataServer, now_ns: u64) void {
         if (comptime !platform.allocator.processMemoryReclaimSupported()) return;
         const limit = self.provisioned_storage.effective_memory_limit_bytes;
-        if (limit == 0) return;
+        if (limit == 0 or limit > platform.allocator.small_process_envelope_bytes) return;
         if (now_ns < self.process_memory_reclaim_next_check_ns.load(.monotonic)) return;
         self.process_memory_reclaim_next_check_ns.store(now_ns +| process_memory_reclaim_check_interval_ns, .monotonic);
         const working_set = platform.process_memory.pressureWorkingSetBytes(platform.process_memory.pressureSnapshot());
