@@ -176,7 +176,7 @@ pub const Page = struct {
         return .{ .arena = arena, .pinned = pinned, .namespace = namespace, .owner = owner, .id = id, .expected = expected, .next = continuation, .deletes = deletes.items, .records_scanned = scanned };
     }
 
-    /// Caller owns apply-exclusive and the snapshot/HA mutation leases.
+    /// Caller owns apply-exclusive and the snapshot/hot-standby mutation leases.
     pub fn commit(self: *Page, core: anytype) !void {
         if (self.consumed) return error.RelationalIndexPageConsumed;
         self.consumed = true;

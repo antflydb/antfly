@@ -761,34 +761,7 @@ pub const OpenMode = OpenOptions.OpenMode;
 
 pub const MutationBarrier = replication_mutation_barrier_mod.MutationBarrier;
 
-fn deinitOwnedEnrichmentConfig(alloc: Allocator, cfg: *enrichment_runtime_mod.Config) void {
-    if (cfg.dense_embedder) |dense_embedder| {
-        dense_embedder.deinit(alloc);
-        cfg.dense_embedder = null;
-    }
-    if (cfg.sparse_embedder) |sparse_embedder| {
-        sparse_embedder.deinit(alloc);
-        cfg.sparse_embedder = null;
-    }
-    if (cfg.asset_producer) |producer| {
-        producer.deinit(alloc);
-        cfg.asset_producer = null;
-    }
-    if (cfg.chunk_provider) |*provider| {
-        provider.deinit();
-        cfg.chunk_provider = null;
-    }
-}
-
-test "uninstalled enrichment config releases owned chunk provider routing" {
-    var cfg = enrichment_runtime_mod.Config{
-        .chunk_provider = try (enrichment_runtime_mod.ChunkProvider{
-            .execution = .{ .routing = .{ .source_table = "docs" } },
-        }).ownExecutionStrings(std.testing.allocator),
-    };
-    deinitOwnedEnrichmentConfig(std.testing.allocator, &cfg);
-    try std.testing.expect(cfg.chunk_provider == null);
-}
+const deinitOwnedEnrichmentConfig = @import("enrichment_runtime_owner.zig").deinitConfig;
 
 pub const ReplicationAsyncEffectMirror = replication_contract.AsyncEffectMirror;
 
@@ -879,17 +852,7 @@ fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
 const IndexRepairSchedulerDirectory = @import("index_repair_scheduler.zig").Directory;
 const retryableIndexRepairTerminalPhase = @import("index_repair_scheduler.zig").retryableTerminalPhase;
 
-const AsyncDenseCatchUpSession = struct {
-    index_name: []u8,
-    index_incarnation: u64,
-    lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
-    /// Covers the complete derived transaction, including native WAL commit,
-    /// immutable-generation publication, and lifecycle checkpointing. A
-    /// snapshot capture must never observe the replay apply as drained while
-    /// its durable query generation is still being published.
-    snapshot_replay: ?snapshot_admission_mod.SnapshotAdmission.MutationLease,
-};
-
+const AsyncDenseCatchUpSession = @import("dense_catch_up_session_owner.zig").Session;
 const AsyncContext = struct {
     alloc: Allocator,
     io: ?std.Io = null,
@@ -906,7 +869,7 @@ const AsyncContext = struct {
     // holding apply exclusive; every catalog-sensitive lease revalidates it
     // after admission.
     portable_runtime_activation_pending: std.atomic.Value(bool) = .init(false),
-    /// Stable notification shared by TTL callbacks and the resident HA owner.
+    /// Stable notification shared by TTL callbacks and the resident hot-standby owner.
     primary_replication_outbox_pending: std.atomic.Value(bool) = .init(false),
     primary_replication_append_pending: std.atomic.Value(bool) = .init(false),
     snapshot_replay_admission: ?*snapshot_admission_mod.SnapshotAdmission = null,
@@ -933,10 +896,7 @@ const AsyncContext = struct {
     text_merge_deferred: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     applied_sequence_mutex: std.atomic.Mutex = .unlocked,
     dense_finish_mutex: std.atomic.Mutex = .unlocked,
-    dense_catch_up_session_mutex: std.atomic.Mutex = .unlocked,
-    dense_catch_up_session_nonce: AtomicU64 = .init(0),
-    dense_catch_up_sessions: std.AutoHashMapUnmanaged(u64, AsyncDenseCatchUpSession) = .empty,
-    active_dense_catch_up_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    dense_sessions: @import("dense_catch_up_session_owner.zig").Owner = .{},
     active_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     waiting_external_dense_bulk_sessions: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     dense_projection_finalizing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -977,18 +937,7 @@ const AsyncContext = struct {
         stopNativeProjectionMaintenance(self);
         self.index_repair_scheduler.deinit(alloc);
         self.applied_sequence_coalescer.deinit(alloc);
-        var capture_it = self.dense_catch_up_sessions.iterator();
-        while (capture_it.next()) |entry| {
-            if (entry.value_ptr.lease) |lease| if (lease.ownsLifecycle()) {
-                self.index_manager.cancelDensePostingSidecarCaptureLeaseByName(
-                    entry.value_ptr.index_name,
-                    lease,
-                ) catch {};
-            };
-            if (entry.value_ptr.snapshot_replay) |*lease| lease.release();
-            alloc.free(entry.value_ptr.index_name);
-        }
-        self.dense_catch_up_sessions.deinit(alloc);
+        self.dense_sessions.deinit(alloc, self.index_manager);
         var pending_finalization_it = self.pending_dense_projection_finalizations.keyIterator();
         while (pending_finalization_it.next()) |key| alloc.free(@constCast(key.*));
         self.pending_dense_projection_finalizations.deinit(alloc);
@@ -1769,7 +1718,7 @@ const LocalMutationExecution = struct {
     comptime {
         // Borrowed execution must never gain DB destruction or resident
         // callbacks: its address is valid only for this synchronous invocation.
-        for (.{ "close", "closeOwned", "deinitWrapperState", "startResidentBackgroundWorkersIfNeeded", "armDurableReplicationRecoveryProbe", "runSchemaIndexReconcileWorker" }) |operation| {
+        for (.{ "close", "closeOwned", "deinitWrapperState", "startResidentBackgroundWorkersIfNeeded", "armDurableReplicationRecoveryProbe", "reconcilePublishedSchemaIndexes", "reconcileSchemaPass" }) |operation| {
             if (@hasDecl(@This(), operation)) @compileError("borrowed mutation receiver exposes an owning operation: " ++ operation);
         }
         for (.{ "generation_read_lease", "owned_backend_runtime", "owned_resource_manager", "source_vector_storage", "stable_address" }) |field| {
@@ -4658,12 +4607,12 @@ const LocalExecutionState = struct {
     /// may return it to false.
     durable_replication_outbox_maybe: std.atomic.Value(bool) = .init(true),
     /// A committed policy publication cannot be followed by row mutations in
-    /// the HA tail until its metadata record has been appended. The ordinary
+    /// the hot-standby tail until its metadata record has been appended. The ordinary
     /// startup barrier also serves as this transient publication barrier.
     row_policy_replication_outbox_pending: std.atomic.Value(bool) = .init(false),
     durable_replication_flush_mutex: std.Io.Mutex = .init,
     /// Crash-left records must be replayed before this process publishes its
-    /// first HA mutation. Once crossed, foreground commits append under the
+    /// first hot-standby mutation. Once crossed, foreground commits append under the
     /// apply/log ordering fences and may await independent LSNs concurrently.
     durable_replication_startup_barrier_pending: std.atomic.Value(bool) = .init(true),
     /// Owner-scoped recovery keeps remote acknowledgement off the open/read
@@ -4752,6 +4701,9 @@ pub const DB = struct {
     resolver_workers_enabled: bool,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
+    enrichment_owner: EnrichmentOwner = .{},
+    /// Borrowed views for existing local consumers. The bundle owns destruction;
+    /// replacement publishes these views while holding the lifecycle fence.
     enrichment_append_context: ?*EnrichmentAppendContext,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime,
     resolution_append_context: ?*EnrichmentAppendContext = null,
@@ -5094,7 +5046,7 @@ pub const DB = struct {
 
     /// A single bounded maintenance increment. Derived entries and local
     /// coverage are reconstructed independently on every replica; progress is
-    /// never an HA command and cannot make a different owner query-ready.
+    /// never a hot-standby command and cannot make a different owner query-ready.
     pub fn buildRelationalIndexStep(self: *DB, name: []const u8, budget: RelationalIndexBuildBudget) !void {
         return self.buildRelationalIndexStepLocal(name, budget, false);
     }
@@ -5374,7 +5326,7 @@ pub const DB = struct {
 
     fn ensureDurableReplicationStartupBarrier(self: anytype) !void {
         // A failed primary append must complete before a later mutation can
-        // overtake its afterimage in the HA tail.
+        // overtake its afterimage in the hot-standby tail.
         while (self.async_context.primary_replication_append_pending.load(.acquire)) try self.flushDurableReplicationOutboxes();
         if (!self.local_execution.durable_replication_startup_barrier_pending.load(.acquire) and
             !self.local_execution.row_policy_replication_outbox_pending.load(.acquire)) return;
@@ -7179,36 +7131,8 @@ pub const DB = struct {
         ctx.visibility_observer.notify(event);
     }
 
-    const DetachedEnrichmentRuntime = struct {
-        append_ctx: ?*EnrichmentAppendContext = null,
-        runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
-
-        fn deinit(self: *@This(), alloc: Allocator) void {
-            if (self.runtime) |runtime| {
-                runtime.deinit();
-                alloc.destroy(runtime);
-                self.runtime = null;
-            }
-            if (self.append_ctx) |ctx| {
-                alloc.destroy(ctx);
-                self.append_ctx = null;
-            }
-        }
-
-        fn take(self: *@This()) struct {
-            append_ctx: *EnrichmentAppendContext,
-            runtime: *enrichment_runtime_mod.EnrichmentRuntime,
-        } {
-            const append_ctx = self.append_ctx.?;
-            const runtime = self.runtime.?;
-            self.append_ctx = null;
-            self.runtime = null;
-            return .{
-                .append_ctx = append_ctx,
-                .runtime = runtime,
-            };
-        }
-    };
+    const EnrichmentOwner = @import("enrichment_runtime_owner.zig").Owner(EnrichmentAppendContext);
+    const DetachedEnrichmentRuntime = EnrichmentOwner.Bundle;
 
     fn createDetachedEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
         if (enrichment_cfg.dense_embedder == null and enrichment_cfg.sparse_embedder == null and enrichment_cfg.asset_producer == null and !enrichment_cfg.enable_without_producers) return null;
@@ -7225,10 +7149,8 @@ pub const DB = struct {
         if (runtime_cfg.io == null) runtime_cfg.io = self.backend_runtime.inferenceIo();
         runtime_cfg.relational_base_rows = relationalColumns(self) != null;
 
-        const append_ctx = try self.runtime_alloc.create(EnrichmentAppendContext);
-        errdefer self.runtime_alloc.destroy(append_ctx);
         const resources = self.core.batchExecutionResources();
-        append_ctx.* = .{
+        const context: EnrichmentAppendContext = .{
             .alloc = self.runtime_alloc,
             .root_incarnation = self.root_incarnation,
             .read_only = openModeRequiresReadOnlyBackends(self.open_mode),
@@ -7256,56 +7178,22 @@ pub const DB = struct {
             .promotion_runtime = self.promotion_runtime,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
         };
-
-        runtime_cfg.neighbor_context_graph_source = .{
-            .ptr = append_ctx,
-            .acquire_fn = acquireNeighborContextGraphSource,
-        };
-
-        const runtime = try self.runtime_alloc.create(enrichment_runtime_mod.EnrichmentRuntime);
-        errdefer self.runtime_alloc.destroy(runtime);
-        runtime.* = try enrichment_runtime_mod.EnrichmentRuntime.init(
-            self.runtime_alloc,
-            self.core.batchExecutionResources().store,
-            self.core.batchExecutionResources().change_journal,
-            self.core.replaySource(),
-            self.core.batchExecutionResources().index_manager,
-            self.core.batchExecutionResources().apply_mutex,
-            append_ctx,
-            appendGeneratedBatchFromEnrichment,
-            append_ctx,
-            recordEnrichmentRequestFailure,
-            enrichmentRequestFailurePending,
-            enrichmentRequestFailureRangePending,
-            .{
-                .ptr = append_ctx,
-                .lock_fn = lockEnrichmentFailurePendingFence,
-                .unlock_fn = unlockEnrichmentFailurePendingFence,
-            },
-            self.executor,
-            notifyDerivedExecutorSequence,
-            self.backend_runtime,
-            runtime_cfg,
-        );
-        // Runtime.init has now adopted every move-only provider. Clear the
-        // source owner before any later fallible initialization so exactly one
-        // side destroys the providers on both success and error paths.
-        runtime.artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher;
-        runtime.artifact_unit_turn_commit = .{ .ptr = append_ctx, .commit = commitArtifactUnitTurnFromEnrichment };
-        enrichment_cfg.dense_embedder = null;
-        enrichment_cfg.sparse_embedder = null;
-        enrichment_cfg.asset_producer = null;
-        enrichment_cfg.chunk_provider = null;
-        errdefer runtime.deinit();
-        // The repair ledger and its sequence marker are committed before the
-        // enrichment runtime status. A crash in that narrow interval must not
-        // make replay invoke a permanently failing provider again. Rebuild the
-        // conservative in-memory gate from the authoritative marker index.
-        try mergeEnrichmentTerminalFailureEnvelope(resources.store, runtime);
-        return .{
-            .append_ctx = append_ctx,
-            .runtime = runtime,
-        };
+        var bundle = try DetachedEnrichmentRuntime.create(self.runtime_alloc, enrichment_cfg, runtime_cfg, context, .{
+            .backend_runtime = self.backend_runtime,
+            .neighbor_acquire = acquireNeighborContextGraphSource,
+            .write = appendGeneratedBatchFromEnrichment,
+            .failure = recordEnrichmentRequestFailure,
+            .failure_pending = enrichmentRequestFailurePending,
+            .failure_range_pending = enrichmentRequestFailureRangePending,
+            .failure_lock = lockEnrichmentFailurePendingFence,
+            .failure_unlock = unlockEnrichmentFailurePendingFence,
+            .notify_ctx = self.executor,
+            .notify = notifyDerivedExecutorSequence,
+            .commit = commitArtifactUnitTurnFromEnrichment,
+        });
+        errdefer bundle.deinit(self.runtime_alloc);
+        try mergeEnrichmentTerminalFailureEnvelope(resources.store, bundle.runtime.?);
+        return bundle;
     }
 
     fn mergeEnrichmentTerminalFailureEnvelope(
@@ -7322,16 +7210,15 @@ pub const DB = struct {
         }
     }
 
-    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !void {
-        var detached = (try self.createDetachedEnrichmentRuntime(enrichment_cfg)) orelse return;
-        const owned = detached.take();
-        self.enrichment_append_context = owned.append_ctx;
-        self.enrichment_runtime = owned.runtime;
-        self.async_context.enrichment_runtime = owned.runtime;
+    fn publishEnrichmentOwner(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.enrichment_append_context = self.enrichment_owner.bundle.append_ctx;
+        self.enrichment_runtime = self.enrichment_owner.bundle.runtime;
+        self.async_context.enrichment_runtime = self.enrichment_owner.bundle.runtime;
     }
-
-    fn deinitEnrichmentConfig(self: *DB, cfg: *enrichment_runtime_mod.Config) void {
-        deinitOwnedEnrichmentConfig(self.runtime_alloc, cfg);
+    fn initOptionalEnrichmentRuntime(self: *DB, enrichment_cfg: *enrichment_runtime_mod.Config) !void {
+        self.enrichment_owner.bundle = (try self.createDetachedEnrichmentRuntime(enrichment_cfg)) orelse return;
+        publishEnrichmentOwner(self);
     }
 
     const EnrichmentReconfigureOptions = struct {
@@ -7363,81 +7250,45 @@ pub const DB = struct {
         if (recovery) |ctx| ctx.provider_mutex.lockUncancelable(recovery_io.?);
         defer if (recovery) |ctx| ctx.provider_mutex.unlock(recovery_io.?);
 
-        var owned_cfg = cfg;
-        defer self.deinitEnrichmentConfig(&owned_cfg);
-
-        const query_visibility_hook_present = hasQueryVisibilityHook(self.async_context);
-        var detached = try self.createDetachedEnrichmentRuntime(&owned_cfg);
-        errdefer if (detached) |*runtime| runtime.deinit(self.runtime_alloc);
-        if (builtin.is_test) {
-            if (test_enrichment_reconfigure_after_detached_hook) |hook| try hook(self);
+        const hook_present = hasQueryVisibilityHook(self.async_context);
+        try self.enrichment_owner.replace(.{
+            .ptr = self,
+            .alloc = self.runtime_alloc,
+            .mutex = &self.async_context.enrichment_lifecycle_mutex,
+            .desired_running = &self.async_context.enrichment_desired_running,
+            .allows_running = self.open_mode.allowsOptionalRuntimes(),
+            .status_hook = if (hook_present) .{ .ptr = self.async_context, .on_change = notifyAsyncContextVisibilityHook, .on_activity = notifyAsyncContextActivityHook } else null,
+            .create = createEnrichmentReplacement,
+            .after_create = enrichmentReplacementCreated,
+            .prepare = prepareEnrichmentReplacement,
+            .restore = restoreEnrichmentPrevious,
+            .publish = publishEnrichmentOwner,
+        }, cfg, options.start_replacement);
+        if (!hook_present) self.setQueryVisibilityHook(null);
+    }
+    fn createEnrichmentReplacement(ptr: *anyopaque, cfg: *enrichment_runtime_mod.Config) !?DetachedEnrichmentRuntime {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.createDetachedEnrichmentRuntime(cfg);
+    }
+    fn enrichmentReplacementCreated(ptr: *anyopaque) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        if (builtin.is_test) if (test_enrichment_reconfigure_after_detached_hook) |hook| try hook(self);
+    }
+    fn prepareEnrichmentReplacement(ptr: *anyopaque, runtime: *enrichment_runtime_mod.EnrichmentRuntime, telemetry: ?types.EnrichmentStats) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        // The previous worker has joined. Rehydrate its final durable debt;
+        // volatile telemetry never substitutes for those persisted markers.
+        try runtime.reloadDurableState();
+        if (telemetry) |previous| runtime.inheritProcessTelemetry(previous);
+        try mergeEnrichmentTerminalFailureEnvelope(self.core.batchExecutionResources().store, runtime);
+        if (self.core.hasGeneratedEnrichmentTargets()) {
+            const target = self.core.nextEnrichmentSequence();
+            if (target != 0) runtime.resumeTargetPreservingRetryDebt(target);
         }
-        if (detached) |*runtime| {
-            if (query_visibility_hook_present) {
-                runtime.runtime.?.setStatusHook(.{
-                    .ptr = self.async_context,
-                    .on_change = notifyAsyncContextVisibilityHook,
-                    .on_activity = notifyAsyncContextActivityHook,
-                });
-            }
-        }
-
-        const replacement_can_run = detached != null and self.open_mode.allowsOptionalRuntimes();
-        const should_start_replacement = replacement_can_run and options.start_replacement;
-        const previous_desired = self.async_context.enrichment_desired_running.swap(false, .acq_rel);
-        var stopped_existing_runtime = false;
-        var previous_telemetry: ?types.EnrichmentStats = null;
-        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
-        if (self.async_context.enrichment_runtime) |runtime| {
-            stopped_existing_runtime = runtime.isStarted();
-            runtime.stop();
-            previous_telemetry = runtime.stats();
-        }
-        self.async_context.enrichment_lifecycle_mutex.unlock();
-        errdefer if (stopped_existing_runtime) {
-            self.async_context.enrichment_desired_running.store(previous_desired or stopped_existing_runtime, .release);
-            self.restartEnrichmentAfterStructuralMutation("failed enrichment reconfiguration", "") catch |err| {
-                std.log.err("failed to restart previous enrichment runtime after reconfigure failure: {}", .{err});
-            };
-        };
-
-        if (replacement_can_run) {
-            // stop() joins the previous worker. Only now is its durable
-            // checkpoint/status/repair-marker state final enough to seed the
-            // replacement. Taking this snapshot before the join can resurrect
-            // a terminal request that the old worker parks concurrently.
-            const replacement = detached.?.runtime.?;
-            try replacement.reloadDurableState();
-            if (previous_telemetry) |telemetry| replacement.inheritProcessTelemetry(telemetry);
-            try mergeEnrichmentTerminalFailureEnvelope(self.core.batchExecutionResources().store, replacement);
-            if (self.core.hasGeneratedEnrichmentTargets()) {
-                const target_sequence = self.core.nextEnrichmentSequence();
-                if (target_sequence != 0) replacement.resumeTargetPreservingRetryDebt(target_sequence);
-            }
-            if (should_start_replacement) try replacement.start();
-        }
-
-        lockAtomicWithBackoff(&self.async_context.enrichment_lifecycle_mutex);
-        if (self.enrichment_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-            self.enrichment_runtime = null;
-            self.async_context.enrichment_runtime = null;
-        }
-        if (self.enrichment_append_context) |ctx| {
-            self.runtime_alloc.destroy(ctx);
-            self.enrichment_append_context = null;
-        }
-
-        if (detached) |*runtime| {
-            const owned = runtime.take();
-            self.enrichment_append_context = owned.append_ctx;
-            self.enrichment_runtime = owned.runtime;
-            self.async_context.enrichment_runtime = owned.runtime;
-        }
-        self.async_context.enrichment_desired_running.store(should_start_replacement, .release);
-        self.async_context.enrichment_lifecycle_mutex.unlock();
-        if (!query_visibility_hook_present) self.setQueryVisibilityHook(null);
+    }
+    fn restoreEnrichmentPrevious(ptr: *anyopaque) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        try self.restartEnrichmentAfterStructuralMutation("failed enrichment reconfiguration", "");
     }
 
     pub fn resumeEnrichmentRuntimeAfterReconfigure(self: *DB, operation: []const u8, index_name: []const u8) !void {
@@ -7893,11 +7744,8 @@ pub const DB = struct {
             self.runtime_alloc.destroy(runtime);
         }
         if (self.ttl_cleanup_context) |ctx| self.runtime_alloc.destroy(ctx);
-        if (self.enrichment_runtime) |runtime| {
-            runtime.deinit();
-            self.runtime_alloc.destroy(runtime);
-        }
-        if (self.enrichment_append_context) |ctx| self.runtime_alloc.destroy(ctx);
+        self.enrichment_owner.deinit(self.runtime_alloc);
+        publishEnrichmentOwner(self);
         if (self.resolution_runtime) |runtime| {
             runtime.deinit();
             self.runtime_alloc.destroy(runtime);
@@ -9712,7 +9560,7 @@ pub const DB = struct {
             (self.local_execution.replication_async_batch_mirror != null or self.local_execution.replication_write_gate != null)) return error.ReplicationPublisherUnavailable;
         // The policy cut must be serialized with all in-flight primary writes,
         // including writers that passed their fast outbox preflight already.
-        // Production HA mirrors share this capture barrier with every mutation.
+        // Production hot-standby mirrors share this capture barrier with every mutation.
         if (replication_lsn == null) if (self.local_execution.replication_async_metadata_mirror) |mirror|
             if (mirror.mutation_barrier == null) return error.ReplicationPublisherUnavailable;
         var replication_mutation: ?MutationBarrier.ExclusiveLease = null;
@@ -10086,9 +9934,9 @@ pub const DB = struct {
         if (applied_lsn_marker) |lsn| try self.recordReplicationApplied(lsn);
     }
 
-    /// The HA journal carries the primary's authenticated child-source cut.
+    /// The hot-standby journal carries the primary's authenticated child-source cut.
     /// Apply the schema, accepted integrity catalog, source-fence release,
-    /// owner receipt and HA LSN in one standby transaction. Generic metadata
+    /// owner receipt and hot-standby LSN in one standby transaction. Generic metadata
     /// replay deliberately cannot publish a changed FK generation.
     fn setPublishedChildSchemaReplicatedApplyWithMarker(self: *DB, table_schema: schema_mod.TableSchema, schema_json: []const u8, published: replication_effects_mod.PublishedChildSchema, lsn: u64) !void {
         if (lsn == 0 or (published.fence.role != .child_generation_source and published.fence.role != .child_generation_dual) or
@@ -10864,7 +10712,7 @@ pub const DB = struct {
             const view = request_schema_view orelse return error.PreparedGenerationChanged;
             if (view.version() != version) return error.PreparedGenerationChanged;
         }
-        // Only authenticated HA replay may supply final scoped metadata effects
+        // Only authenticated hot-standby replay may supply final scoped metadata effects
         // without local participant intents. Scope, key kinds, owner range and
         // generation are revalidated below under the apply fence.
         const scoped_restore_replication_apply = opts.replication_applied_lsn_marker != null and effective_req.restore_staging_scope != null and opts.restore_staging == null;
@@ -11184,10 +11032,10 @@ pub const DB = struct {
             }
         }
 
-        // HA encoding is a pure function of the admitted request and can be
+        // hot-standby encoding is a pure function of the admitted request and can be
         // proportional to the entire batch. Prepare it before the serialized
         // apply section, then reuse the exact bytes for durable outboxes and
-        // the stream append. This also avoids holding the HA log mutex while
+        // the stream append. This also avoids holding the hot-standby log mutex while
         // walking and encoding every document in a large request.
         var preencoded_replication_batch_payload: ?[]u8 = null;
         defer if (preencoded_replication_batch_payload) |payload| preparation_alloc.free(payload);
@@ -11254,7 +11102,7 @@ pub const DB = struct {
             }
         }
 
-        // HA replay may bypass the primary-role gate, but it must never bypass
+        // hot-standby replay may bypass the primary-role gate, but it must never bypass
         // portable runtime activation. Rechecking under apply also closes the
         // interval between the fast preflight above and lock acquisition.
         var prepared_artifacts = try self.prepareMergeArtifactEffects(preparation_alloc, req);
@@ -11537,7 +11385,7 @@ pub const DB = struct {
             if (!coordinated_handoff) coordinated_handoff = try @import("relational_integrity_handoff.zig").admitMergeRequest(self.alloc, &topology_read, req);
             if (hasCoordinatedConstraints(request_schema_view) and !coordinated_handoff) return error.CoordinatedConstraintTopologyUnsupported;
         }
-        // HA carries already committed effects, including prepared decisions
+        // hot-standby carries already committed effects, including prepared decisions
         // drained after a topology fence. It must not rerun fresh-write
         // admission on the replica and strand an authoritative commit.
         if (!coordinated_handoff and opts.transaction_resolution == null and !live_replication_apply and !scoped_restore_replication_apply and (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or
@@ -11812,7 +11660,7 @@ pub const DB = struct {
                 effective_req.merge_artifacts = cleanup_replay_writes.?;
             }
             // The selected identities and job removals share the primary apply
-            // fence. Both the durable HA outbox and stream reuse these bytes.
+            // fence. Both the durable hot-standby outbox and stream reuse these bytes.
             // Encoding failures abort before commit even for async mirroring:
             // falling back to a planner command could fork authoritative state.
             if (!opts.bypass_replication_write_gate and self.local_execution.replication_async_batch_mirror != null) {
@@ -13156,7 +13004,7 @@ pub const DB = struct {
         }
         try delete_keys.appendSlice(self.alloc, identity_visibility_deletes.items);
 
-        // A synchronous HA append can fail after the local transaction commit.
+        // A synchronous hot-standby append can fail after the local transaction commit.
         // Persist the exact committed payloads in the same backend batch so an
         // idempotent resolve retry can finish mirroring without reconstructing
         // data from already-deleted intents.
@@ -13166,7 +13014,7 @@ pub const DB = struct {
             if (self.local_execution.replication_async_batch_mirror) |mirror| if (replicationMirrorSyncEnabled(mirror)) {
                 const payload = preencoded_replication_batch_payload orelse return error.ReplicationPublisherUnavailable;
                 // The outbox borrows the request-owned buffer through commit
-                // and the HA wait; keep its original budgeted owner intact.
+                // and the hot-standby wait; keep its original budgeted owner intact.
                 const key_array = transactions_mod.makeTransactionReplicationBatchOutboxKey(resolution.txn_id);
                 const key = try self.alloc.dupe(u8, &key_array);
                 try owned_store_keys.append(self.alloc, key);
@@ -13340,9 +13188,9 @@ pub const DB = struct {
             return error.InjectedRestoreProjectionApplyFailure;
         }
         // Replay intent is locally durable at this point. Wake derived workers
-        // before any remote HA acknowledgment so HBC/full-text progress is
+        // before any remote hot-standby acknowledgment so HBC/full-text progress is
         // independent of response durability latency; explicit visibility
-        // waits still occur only after the HA gate below.
+        // waits still occur only after the hot-standby gate below.
         if (append_derived_replay and self.executor.hasWorkers()) {
             const notify_executor_start_ns = monotonicTimeNs();
             notifyExecutorForSyncLevelWithDenseBulkDeferral(self.async_context, self.executor, effective_req.sync_level, sequence, sync_targets);
@@ -29853,7 +29701,7 @@ pub const DB = struct {
     }
 
     /// Returns whether split or merge handoff would strand a pending decision,
-    /// unresolved participant, intent, or HA recovery outbox.
+    /// unresolved participant, intent, or hot-standby recovery outbox.
     pub fn hasTopologySensitiveTransactions(self: *DB) !bool {
         return try self.core.hasTopologySensitiveTransactions();
     }
@@ -32783,7 +32631,7 @@ pub const DB = struct {
     fn managedAdmissionVisibilitySummary(self: *DB) !doc_identity.VisibilitySummary {
         // Admission is a rare structural mutation and must be based on the
         // primary store that commits the catalog marker. The runtime cache is
-        // published only after HA mirrors complete, so a mirror failure can
+        // published only after hot-standby mirrors complete, so a mirror failure can
         // legitimately leave it behind the durable primary state.
         if (try doc_identity.visibilitySummaryFromStore(self.core.store)) |summary| return summary;
         const empty = (try doc_identity.loadAllNewTrustedStateForNamespace(
@@ -35560,7 +35408,7 @@ pub const DB = struct {
 
     /// Appends internal derived work without exposing the DB's batch execution
     /// context. Runtime partitions use this boundary while retaining the normal
-    /// write gate, locking, backlog accounting, and HA mirroring semantics.
+    /// write gate, locking, backlog accounting, and hot-standby mirroring semantics.
     pub fn derivedAsyncAppendDerivedBatchRecord(self: *DB, derived_batch: derived_types.DerivedBatch) !u64 {
         return try appendDerivedBatchRecord(self, derived_batch);
     }
@@ -41679,7 +41527,7 @@ pub const DB = struct {
 
     /// Private provisioners call this before cache adoption, after installing
     /// the durable reservation. Initial empty schema/index admission must not
-    /// emit an HA mutation before its owner authorization exists.
+    /// emit a hot-standby mutation before its owner authorization exists.
     pub fn attachRestoreStagingReplicationMirror(self: *DB, mirror: ?ReplicationAsyncEffectMirror) !void {
         if (!self.local_execution.restore_staging_required.load(.acquire)) return error.RestoreStagingScopeChanged;
         if (mirror != null and self.core.table_catalog.row_policy_phase != .disabled)
@@ -41835,7 +41683,7 @@ pub const DB = struct {
 
     /// Install the immutable historical read mapping before constructing any
     /// versioned projection. This does not switch the active row schema or
-    /// import source-local migration progress. HA begin carries the same mapping
+    /// import source-local migration progress. hot-standby begin carries the same mapping
     /// so followers reconstruct it before accepting row effects.
     pub fn installRestoreStagingReadSchema(self: *DB, alloc: Allocator, scope: @import("restore_staging.zig").Scope, read_json: []const u8) !void {
         if (read_json.len == 0) return;
@@ -42061,7 +41909,7 @@ pub const DB = struct {
         return receipt;
     }
 
-    /// Control payload and owner marker are committed together. Every HA mode
+    /// Control payload and owner marker are committed together. Every hot-standby mode
     /// retains a local append obligation; remote acknowledgement still follows
     /// the configured policy. Retrying an applied Raft entry drains this record.
     fn applyRestoreStagingControl(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
@@ -42097,7 +41945,7 @@ pub const DB = struct {
         if (payload != null) try self.flushDurableReplicationOutboxes();
     }
 
-    /// Authenticated HA resolution records carry final native effects, not
+    /// Authenticated hot-standby resolution records carry final native effects, not
     /// participant commands. They may touch only this hidden owner's current
     /// claims/coverage; primary rows enter exclusively through import controls.
     fn validateRestoreStagingReplicationEffects(self: anytype, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
@@ -42134,7 +41982,7 @@ pub const DB = struct {
     }
 
     /// A committed live transaction is mirrored as final rows + metadata, not
-    /// as participant intents. Only the authenticated HA entrypoint supplies
+    /// as participant intents. Only the authenticated hot-standby entrypoint supplies
     /// the applied-LSN capability. Recheck protected effects against this
     /// owner's immutable catalog; this is not an ordinary batch escape hatch.
     fn validateLiveReplicationIntegrityEffects(self: anytype, alloc: Allocator, txn: anytype, req: types.BatchRequest) !void {
@@ -62713,9 +62561,9 @@ fn storeHasUserDataBounded(store: *docstore_mod.DocStore) !bool {
     return if (first) |entry| internal_keys.isInternalUserKey(entry.key) else false;
 }
 
-/// A physical maintenance mutation and its HA delivery obligation are one
+/// A physical maintenance mutation and its hot-standby delivery obligation are one
 /// primary transaction. Projection replay alone cannot certify these effects.
-/// Every configured mirror uses a durable outbox, including asynchronous HA.
+/// Every configured mirror uses a durable outbox, including asynchronous hot-standby.
 const PrimaryReplicationEffect = struct {
     payload: ?[]u8 = null,
     key: ?[]u8 = null,
@@ -64089,7 +63937,7 @@ const DurableReplicationOutboxKind = @import("durable_outbox.zig").Kind;
 
 /// Finish a crash-left local outbox without appending its non-idempotent
 /// mutation twice. The transition mutex serializes this lookup-and-append with
-/// every normal HA publisher, while `from_lsn` bounds the scan to records that
+/// every normal hot-standby publisher, while `from_lsn` bounds the scan to records that
 /// could belong to this local commit. If retention has removed that boundary,
 /// Primary fails closed instead of guessing and duplicating the mutation.
 fn recoverDurableReplicationOutboxContext(
@@ -64499,19 +64347,17 @@ fn beginDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) !
     ctx.text_merge_deferred.store(true, .release);
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
     ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.replay), .monotonic);
-    _ = ctx.active_dense_catch_up_sessions.fetchAdd(1, .release);
+    ctx.dense_sessions.beginTracking();
     if (ctx.resource_manager) |manager| manager.beginLatencySensitiveDerivedReplay();
 }
 
 fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) bool {
-    const active = ctx.active_dense_catch_up_sessions.load(.acquire);
-    if (active == 0) {
+    const remaining = ctx.dense_sessions.finishTracking() orelse {
         std.log.warn("dense catch-up session finish without active session index={s}", .{index_name});
         return false;
-    }
-    ctx.active_dense_catch_up_sessions.store(active - 1, .release);
+    };
     if (ctx.resource_manager) |manager| manager.finishLatencySensitiveDerivedReplay();
-    if (active == 1) {
+    if (remaining == 0) {
         ctx.stats.dense_catch_up.active.store(0, .monotonic);
         ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.idle), .monotonic);
         ctx.stats.dense_catch_up.bulk_finish_current_window.store(0, .monotonic);
@@ -64537,7 +64383,7 @@ fn finishDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) 
 fn beginExternalDenseBulkSessionTracked(ctx: *AsyncContext) !void {
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
-    if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0 or
+    if (ctx.dense_sessions.active.load(.acquire) != 0 or
         ctx.dense_projection_committing.load(.acquire))
         return error.ReplayDocumentNotVisible;
     ctx.text_merge_deferred.store(true, .release);
@@ -64572,7 +64418,7 @@ fn beginExternalDenseBulkSessionTrackedWait(ctx: *AsyncContext, io: ?std.Io) !vo
     var wait_ms: u64 = 1;
     while (true) {
         var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
-        if (ctx.active_dense_catch_up_sessions.load(.acquire) == 0 and
+        if (ctx.dense_sessions.active.load(.acquire) == 0 and
             !ctx.dense_projection_committing.load(.acquire))
         {
             _ = ctx.waiting_external_dense_bulk_sessions.fetchSub(1, .release);
@@ -64686,7 +64532,7 @@ fn finishExternalDenseBulkSessionTrackedBestEffort(ctx: *AsyncContext) void {
 }
 
 fn asyncContextHasDenseSessionsOrWaiters(ctx: *const AsyncContext) bool {
-    return ctx.active_dense_catch_up_sessions.load(.acquire) != 0 or
+    return ctx.dense_sessions.active.load(.acquire) != 0 or
         ctx.active_external_dense_bulk_sessions.load(.acquire) != 0 or
         ctx.waiting_external_dense_bulk_sessions.load(.acquire) != 0;
 }
@@ -64831,13 +64677,13 @@ fn denseApplyUsesLocalStreamingSession(ctx: *const AsyncContext, index_name: []c
     _ = index_name;
     if (ctx.dense_bulk_session_scope == .external) return false;
     if (ctx.active_external_dense_bulk_sessions.load(.acquire) != 0) return false;
-    if (ctx.active_dense_catch_up_sessions.load(.acquire) != 0) return false;
+    if (ctx.dense_sessions.active.load(.acquire) != 0) return false;
     return true;
 }
 
 fn shouldDeferAppliedSequenceFlush(ctx: *const AsyncContext, force: bool) bool {
     if (force) return false;
-    return ctx.active_dense_catch_up_sessions.load(.monotonic) != 0;
+    return ctx.dense_sessions.active.load(.monotonic) != 0;
 }
 
 fn shouldLogTargetAdvanceDebt(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) bool {
@@ -64947,7 +64793,7 @@ fn clearTargetAdvanceStuck(ctx: *AsyncContext, index_name: []const u8) void {
     return ctx.target_advance.clearStuck(ctx.alloc, index_name);
 }
 
-/// Snapshot of `target_advance_stuck` older than `timeout_ns`, or null if
+/// Snapshot of the target tracker’s stuck observations older than `timeout_ns`, or null if
 /// none. Copies out under the shared mutex so the caller can log/stash the
 /// diagnostic and return without holding it.
 const TargetAdvanceStuckSnapshot = @import("target_advance_tracker.zig").Snapshot;
@@ -64969,11 +64815,11 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     };
     defer ctx.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.monotonic));
     try std.testing.expect(!shouldDeferAppliedSequenceFlush(&ctx, false));
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
     try beginDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 1), ctx.active_dense_catch_up_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), ctx.dense_sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) != 0);
     try std.testing.expect(asyncContextHasActiveDenseBulkWork(&ctx));
     try std.testing.expect(resource_manager.shouldDeferSoftCompactionForDerivedReplay());
@@ -64983,7 +64829,7 @@ test "async context dense catch-up session tracking suppresses local bulk sessio
     try std.testing.expect(!denseApplyUsesLocalStreamingSession(&ctx, "vec"));
     try std.testing.expectError(error.ReplayDocumentNotVisible, beginExternalDenseBulkSessionTracked(&ctx));
     finishDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(!ctx.text_merge_deferred.load(.acquire));
     // Session-owned deferral has ended, but the short quiet period still
@@ -65155,17 +65001,17 @@ test "async context dense catch-up session finish is idempotent when already clo
     defer ctx.deinit(std.testing.allocator);
 
     finishDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
 
     try beginDenseCatchUpSessionTracked(&ctx, "vec");
     try beginDenseCatchUpSessionTracked(&ctx, "vec");
     finishDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 1), ctx.active_dense_catch_up_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 1), ctx.dense_sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) != 0);
     finishDenseCatchUpSessionTracked(&ctx, "vec");
     finishDenseCatchUpSessionTracked(&ctx, "vec");
-    try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.monotonic));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(denseApplyUsesLocalStreamingSession(&ctx, "vec"));
 }
@@ -65186,7 +65032,7 @@ test "portable activation failure still releases dense session bookkeeping" {
         error.PortableRuntimeActivationPending,
         finishDenseCatchUpSessionTrackedAndFinalize(&ctx, "vec"),
     );
-    try std.testing.expectEqual(@as(u32, 0), ctx.active_dense_catch_up_sessions.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), ctx.dense_sessions.active.load(.acquire));
     try std.testing.expect(ctx.stats.dense_catch_up.active.load(.monotonic) == 0);
     try std.testing.expect(ctx.text_merge_deferred.load(.acquire));
 
@@ -65472,7 +65318,7 @@ fn publishResolutionHandoffContextWithSink(
     }
 
     // Match the established apply -> transition lock order. The encompassing
-    // resolution writer still owns the HA mutation lease; the final gate check
+    // resolution writer still owns the hot-standby mutation lease; the final gate check
     // makes marker publication linearizable with a primary-role fence, while a
     // single metadata batch preserves backfill throughput.
     try lockApplyForPortableRuntimeContext(ctx);
@@ -77196,68 +77042,14 @@ fn applyDerivedBatchToIndexAsync(ctx_ptr: *anyopaque, batch: derived_types.Deriv
     return true;
 }
 
-fn installAsyncDenseCatchUpSession(
-    ctx: *AsyncContext,
-    index_name: []const u8,
-    index_incarnation: u64,
-    lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease,
-    snapshot_replay: *?snapshot_admission_mod.SnapshotAdmission.MutationLease,
-) !derived_executor_mod.CatchUpSessionToken {
-    if (lease) |value| if (!value.ownsLifecycle()) return error.PostingWalCaptureOwnershipConflict;
-    const owned_name = try ctx.alloc.dupe(u8, index_name);
-    errdefer ctx.alloc.free(owned_name);
-    var observed = ctx.dense_catch_up_session_nonce.load(.monotonic);
-    const session_id = while (true) {
-        if (observed == std.math.maxInt(u64)) return error.DenseCatchUpSessionTokenExhausted;
-        const candidate = observed + 1;
-        if (ctx.dense_catch_up_session_nonce.cmpxchgWeak(observed, candidate, .monotonic, .monotonic)) |raced| {
-            observed = raced;
-            continue;
-        }
-        break candidate;
-    };
-    lockAtomicWithBackoff(&ctx.dense_catch_up_session_mutex);
-    defer ctx.dense_catch_up_session_mutex.unlock();
-    const entry = try ctx.dense_catch_up_sessions.getOrPut(ctx.alloc, session_id);
-    if (entry.found_existing) return error.DenseCatchUpSessionTokenExhausted;
-    entry.value_ptr.* = .{
-        .index_name = owned_name,
-        .index_incarnation = index_incarnation,
-        .lease = lease,
-        .snapshot_replay = snapshot_replay.*,
-    };
-    snapshot_replay.* = null;
-    return .{ .value = session_id };
+fn installAsyncDenseCatchUpSession(ctx: *AsyncContext, index_name: []const u8, index_incarnation: u64, lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease, snapshot_replay: *?snapshot_admission_mod.SnapshotAdmission.MutationLease) !derived_executor_mod.CatchUpSessionToken {
+    return ctx.dense_sessions.install(ctx.alloc, index_name, index_incarnation, lease, snapshot_replay);
 }
-
-// The map mutex protects the transfer from the session's lease to an
-// independently retained batch lease. Session close cannot retire admission
-// underneath an in-flight callback, and stale tokens cannot borrow a new one.
-fn retainAsyncDenseCatchUpAdmission(
-    ctx: *AsyncContext,
-    index_name: []const u8,
-    token: derived_executor_mod.CatchUpSessionToken,
-) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
-    if (token.isNone()) return error.DenseCatchUpSessionSuperseded;
-    lockAtomicWithBackoff(&ctx.dense_catch_up_session_mutex);
-    defer ctx.dense_catch_up_session_mutex.unlock();
-    const session = ctx.dense_catch_up_sessions.getPtr(token.value) orelse return error.DenseCatchUpSessionSuperseded;
-    if (!std.mem.eql(u8, session.index_name, index_name)) return error.DenseCatchUpSessionSuperseded;
-    return if (session.snapshot_replay) |*lease| lease.retain() else null;
+fn retainAsyncDenseCatchUpAdmission(ctx: *AsyncContext, index_name: []const u8, token: derived_executor_mod.CatchUpSessionToken) !?snapshot_admission_mod.SnapshotAdmission.MutationLease {
+    return ctx.dense_sessions.retainAdmission(index_name, token);
 }
-
-fn takeAsyncDenseCatchUpSession(
-    ctx: *AsyncContext,
-    index_name: []const u8,
-    token: derived_executor_mod.CatchUpSessionToken,
-) !AsyncDenseCatchUpSession {
-    if (token.isNone()) return error.DenseCatchUpSessionSuperseded;
-    lockAtomicWithBackoff(&ctx.dense_catch_up_session_mutex);
-    defer ctx.dense_catch_up_session_mutex.unlock();
-    const current = ctx.dense_catch_up_sessions.get(token.value) orelse return error.DenseCatchUpSessionSuperseded;
-    if (!std.mem.eql(u8, current.index_name, index_name)) return error.DenseCatchUpSessionSuperseded;
-    const removed = ctx.dense_catch_up_sessions.fetchRemove(token.value) orelse unreachable;
-    return removed.value;
+fn takeAsyncDenseCatchUpSession(ctx: *AsyncContext, index_name: []const u8, token: derived_executor_mod.CatchUpSessionToken) !AsyncDenseCatchUpSession {
+    return ctx.dense_sessions.take(index_name, token);
 }
 
 fn beginDensePostingCaptureAndStreamingReplaySessionForAsyncCatchUp(
@@ -87921,7 +87713,7 @@ test "db portable activation gate revalidates queued and replicated writes" {
     try std.testing.expectEqual(@as(?anyerror, error.PortableRuntimeActivationPending), writer.err);
     try std.testing.expect((try db.lookup(alloc, "doc:queued-before-portable-publication", .{})) == null);
 
-    // Replicated apply bypasses HA role admission only; portable activation is
+    // Replicated apply bypasses hot-standby role admission only; portable activation is
     // a generation-safety fence and therefore remains mandatory.
     try std.testing.expectError(error.PortableRuntimeActivationPending, db.batchReplicatedApply(.{
         .writes = &.{.{
@@ -125965,7 +125757,7 @@ test "db managed admission ignores stale zero identity cache" {
         .sync_level = .write,
     });
 
-    // Model a primary commit followed by an HA mirror failure before runtime
+    // Model a primary commit followed by a hot-standby mirror failure before runtime
     // cache publication. Admission authority must remain the primary store.
     db.core.identity_visibility.summary = .{};
     try std.testing.expect((try db.admitManagedFullTextIndex(.{
@@ -152881,7 +152673,7 @@ test "db transaction integrity contention precedes stale claim semantics" {
     }
 }
 
-/// Project the borrowed replication controls without giving the HA owner
+/// Project the borrowed replication controls without giving the hot-standby owner
 /// access to database state, stores, caches, or the mutation executor.
 fn replicationCommitContext(ctx: *const BatchExecutionContext) replication_commit.CommitContext {
     return .{

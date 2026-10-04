@@ -283,6 +283,8 @@ def check_replication_contract(relative: str, source: str) -> None:
         "storage/db/bulk_ingest_session.zig",
         "storage/db/target_advance_tracker.zig",
         "storage/db/schema_reconcile_owner.zig",
+        "storage/db/dense_catch_up_session_owner.zig",
+        "storage/db/enrichment_runtime_owner.zig",
     }:
         return
     source = mask_literals(production_source(source))

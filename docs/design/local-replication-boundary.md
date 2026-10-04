@@ -293,5 +293,46 @@ borrowed DB and reconciliation owner until queued work completes.
 Server group-created timestamp persistence and schema-upgrade assertions belong
 to the server integration suite. Local relational tests preserve opaque internal
 metadata through ordinary storage operations and have no server metadata import.
-Enrichment runtime replacement and dense replay session ownership remain separate
-follow-ons; their provider leases and durable publication fences are unchanged.
+Enrichment runtime replacement and dense replay session ownership now have local
+owners, described below. Their provider leases and durable publication fences
+remain part of the embedded engine closure.
+
+
+## Enrichment bundle and dense replay session ownership
+
+`storage/db/enrichment_runtime_owner.zig` owns the runtime and its append context
+as one bundle. Construction adopts moved providers only after runtime init
+succeeds; every later failure destroys the bundle exactly once. DB hydrates the
+resident security/execution capabilities and supplies callbacks for durable
+failure-envelope recovery and replay target selection. Replacement is serialized
+by an owner mutex even when transaction recovery is absent. The recovery provider
+borrow fence still encloses replacement when that runtime is present.
+
+A replacement is constructed before stopping the old worker. Its durable state
+is reloaded after that worker joins, before starting or publishing the replacement.
+Failure retains the original bundle and restores both active and pending restart
+demand. Paused replacement transfers ownership without starting the new worker.
+The existing DB and AsyncContext runtime/context fields are borrowed views;
+publication updates them under the lifecycle fence, and only the bundle destroys
+those allocations. Close drains background callbacks before bundle teardown.
+
+`storage/db/dense_catch_up_session_owner.zig` owns the token nonce, session map,
+owned index names, capture leases, snapshot replay leases, and active tracking.
+A failed registration leaves replay admission with the caller. Token/name checks
+fence stale finish and retain callbacks, and retaining admission under the map
+mutex allows an in-flight transaction to outlive token removal. DB retains the
+catalog and incarnation checks, dense-finish admission fence, resource accounting,
+native WAL commit, generation publication, and durable lifecycle checkpoints.
+Tracking transitions remain serialized by that dense-finish fence; callback drain
+precedes session-owner destruction.
+
+The merge-page regression uses direct bulk writes and checks committed copy
+cursors and receiver base rows across reopen, without fabricating retired staging
+state. Focused maintenance tests include provider replacement, token admission,
+allocation rollback, and both owner modules; normal test ownership is preserved.
+
+Constructor failure paths also unwind the runtime's lease adapter and owned
+identity before returning an error. Providers remain with the caller until
+construction succeeds, and cleanup does not release a pre-existing durable
+lease. Allocation-failure and corrupt persisted-status regressions exercise
+these ownership boundaries.

@@ -32,6 +32,8 @@ comptime {
     _ = @import("db/bulk_ingest_session.zig");
     _ = @import("db/target_advance_tracker.zig");
     _ = @import("db/schema_reconcile_owner.zig");
+    _ = @import("db/dense_catch_up_session_owner.zig");
+    _ = @import("db/enrichment_runtime_owner.zig");
 
     _ = @import("document_mutation_revision.zig");
     _ = @import("db/graph_edge_types.zig");
