@@ -287,9 +287,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     // remains below the full database compilation and integration test roots.
     sql_tests.step.max_rss = 1536 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
-    // runs (about 137 MiB process RSS in ReleaseSafe). This scheduling estimate
+    // runs (about 203 MiB process RSS in Debug). This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
-    run_sql_tests.step.max_rss = 192 * 1024 * 1024;
+    run_sql_tests.step.max_rss = 256 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
     const pgwire_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),

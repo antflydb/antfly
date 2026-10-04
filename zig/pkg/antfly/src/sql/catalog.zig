@@ -164,6 +164,9 @@ pub const ColumnPage = struct {
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
 pub const Cursor = struct {
+    /// Snapshot-local optimizer estimates; absent means unknown, never zero.
+    estimated_rows: ?u64 = null,
+    estimated_bytes: ?u64 = null,
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!Page,
     close: *const fn (*anyopaque) void,

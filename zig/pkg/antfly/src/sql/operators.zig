@@ -555,7 +555,7 @@ pub const HashJoin = struct {
             var arena = std.heap.ArenaAllocator.init(self.backing);
             defer arena.deinit();
             const values = try (Match{ .index = ordinal, .row = entry.row }).materializeValues(arena.allocator());
-            const hashed = try hash(entry.row.keys);
+            const hashed = try keyHash(entry.row.keys);
             const bucket = if (hashed) |value| value & (heads.len - 1) else 0;
             const offset = try file.append(.{ .values = values, .keys = entry.row.keys, .ordinal = ordinal }, if (hashed != null) heads[bucket] else @import("spill.zig").none);
             if (hashed != null) heads[bucket] = offset;
@@ -568,7 +568,7 @@ pub const HashJoin = struct {
         self.disk = file;
     }
     fn appendDisk(self: *HashJoin, values: []const Datum, keys: []const Datum) !void {
-        const hashed = try hash(keys);
+        const hashed = try keyHash(keys);
         const bucket = if (hashed) |value| value & (self.disk_heads.len - 1) else 0;
         const offset = try self.disk.?.append(.{ .values = values, .keys = keys, .ordinal = self.row_count }, if (hashed != null) self.disk_heads[bucket] else @import("spill.zig").none);
         if (hashed != null) self.disk_heads[bucket] = offset;
@@ -592,7 +592,7 @@ pub const HashJoin = struct {
         std.debug.assert(self.budget.live == 0);
         self.backing.destroy(self);
     }
-    fn hash(keys: []const Datum) !?u64 {
+    pub fn keyHash(keys: []const Datum) !?u64 {
         var hasher = std.hash.Wyhash.init(0);
         for (keys) |key| {
             if (key.sql_null) return null;
@@ -624,7 +624,7 @@ pub const HashJoin = struct {
         if (self.sealed or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         if (self.entries.items.len >= self.limits.rows) return error.SqlProgramLimitExceeded;
         self.key_count = keys.len;
-        const key_hash = try hash(keys);
+        const key_hash = try keyHash(keys);
         const alloc = self.budget.allocator();
         try self.entries.ensureUnusedCapacity(alloc, 1);
         if (key_hash != null) try self.heads.ensureUnusedCapacity(alloc, 1);
@@ -651,10 +651,10 @@ pub const HashJoin = struct {
         self.sealed = true;
         if (self.key_count != null and self.key_count.? != keys.len) return error.InvalidSqlBackendResponse;
         if (self.disk != null) {
-            const bucket = if (try hash(keys)) |hashed| self.disk_heads[hashed & (self.disk_heads.len - 1)] else @import("spill.zig").none;
+            const bucket = if (try keyHash(keys)) |hashed| self.disk_heads[hashed & (self.disk_heads.len - 1)] else @import("spill.zig").none;
             return .{ .owner = self, .keys = keys, .cursor = if (bucket == @import("spill.zig").none) null else @intCast(bucket) };
         }
-        return .{ .owner = self, .keys = keys, .cursor = if (try hash(keys)) |hashed| self.heads.get(hashed) else null };
+        return .{ .owner = self, .keys = keys, .cursor = if (try keyHash(keys)) |hashed| self.heads.get(hashed) else null };
     }
     /// Mark only after the complete ON residual accepts this candidate.
     pub fn markMatched(self: *HashJoin, index: usize) !void {

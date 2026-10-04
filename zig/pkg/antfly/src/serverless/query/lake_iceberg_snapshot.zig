@@ -596,6 +596,49 @@ pub fn readDeleteRowRefsAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+/// Equality identity belongs to the Iceberg field ID, independent of the
+/// physical name in each data/delete file. Normalize only the owned metadata;
+/// offsets still point to the original physical chunks.
+fn discoverEqualityColumnsAlloc(a: Allocator, request: DeleteRowRefsReadRequest, inventory: external_source.Inventory, ids: []const i32, names: []const []const u8) !lake_parquet_rowgroup.DiscoveredObjectRangeRowGroupPlan {
+    const metadata = @import("lake_parquet_metadata.zig");
+    const footers = try a.alloc(metadata.FileFooter, inventory.files.len);
+    defer a.free(footers);
+    var initialized: usize = 0;
+    defer for (footers[0..initialized]) |*entry| entry.footer.deinit(a);
+    for (inventory.files, footers) |file, *entry| {
+        entry.* = .{ .file_id = file.file_id, .footer = try @import("lake_schema.zig").readFooter(a, request.reader, file) };
+        initialized += 1;
+        const physical_names = try a.alloc([]const u8, ids.len);
+        defer a.free(physical_names);
+        for (ids, names, physical_names) |id, name, *selected| {
+            var physical: ?[]const u8 = null;
+            var has_ids = false;
+            for (entry.footer.schema_columns) |leaf| {
+                has_ids = has_ids or leaf.field_id != null;
+                if (leaf.field_id == id) {
+                    if (physical != null) return error.InvalidParquetMetadata;
+                    physical = leaf.column_id;
+                }
+            }
+            selected.* = physical orelse if (has_ids) return error.UnsupportedIcebergSchemaEvolution else name;
+        }
+        for (entry.footer.row_groups) |*group| for (group.column_chunks) |*chunk| {
+            // Resolve against the original name once, including crossed renames.
+            for (physical_names, names) |physical, logical| {
+                if (!std.mem.eql(u8, chunk.column_id, physical)) continue;
+                const replacement = try a.dupe(u8, logical);
+                a.free(chunk.column_id);
+                chunk.column_id = replacement;
+                break;
+            }
+        };
+    }
+    var enriched = try metadata.enrichInventoryFilesWithFootersAlloc(a, inventory, footers);
+    errdefer enriched.deinit(a);
+    const plan = try lake_parquet_rowgroup.planSupportedI64ObjectRangeRowGroupsAlloc(a, enriched, names);
+    return .{ .inventory = enriched, .row_group_plan = plan };
+}
+
 fn appendEqualityDeleteRowRefsAlloc(
     alloc: Allocator,
     request: DeleteRowRefsReadRequest,
@@ -632,23 +675,7 @@ fn appendEqualityDeleteRowRefsAlloc(
 
             var delete_inventory = try equalityDeleteFileInventoryAlloc(alloc, request.data_inventory, delete_file, request.client);
             defer delete_inventory.deinit(alloc);
-            var discovered_delete = if (request.cache) |cache|
-                try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc(
-                    alloc,
-                    request.reader,
-                    cache,
-                    delete_inventory,
-                    equality_columns,
-                    request.footer_probe_bytes,
-                )
-            else
-                try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
-                    alloc,
-                    request.reader,
-                    delete_inventory,
-                    equality_columns,
-                    request.footer_probe_bytes,
-                );
+            var discovered_delete = try discoverEqualityColumnsAlloc(alloc, request, delete_inventory, group_file.equality_ids, equality_columns);
             defer discovered_delete.deinit(alloc);
             var delete_source = if (request.cache) |cache|
                 try lake_parquet_rowgroup.ObjectRangeRowGroupSource.initWithCacheAndCoalesceOptions(
@@ -705,28 +732,9 @@ fn appendEqualityDeleteRowRefsAlloc(
         }
         if (delete_keys.count() == 0) continue;
 
-        var discovered_data: ?lake_parquet_rowgroup.DiscoveredObjectRangeRowGroupPlan = null;
-        defer if (discovered_data) |*discovered| discovered.deinit(alloc);
-        if (!inventoryHasRowGroupMetadata(request.data_inventory)) {
-            discovered_data = if (request.cache) |cache|
-                try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc(
-                    alloc,
-                    request.reader,
-                    cache,
-                    request.data_inventory,
-                    equality_columns,
-                    request.footer_probe_bytes,
-                )
-            else
-                try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
-                    alloc,
-                    request.reader,
-                    request.data_inventory,
-                    equality_columns,
-                    request.footer_probe_bytes,
-                );
-        }
-        const data_inventory = if (discovered_data) |discovered| discovered.inventory else request.data_inventory;
+        var discovered_data = try discoverEqualityColumnsAlloc(alloc, request, request.data_inventory, group_file.equality_ids, equality_columns);
+        defer discovered_data.deinit(alloc);
+        const data_inventory = discovered_data.inventory;
 
         var data_row_group_plan = try lake_parquet_rowgroup.planSupportedI64ObjectRangeRowGroupsAlloc(
             alloc,
@@ -2679,4 +2687,158 @@ fn encodeZigzag(value: i64) u64 {
     if (value >= 0) return @as(u64, @intCast(value)) << 1;
     const magnitude: u64 = @intCast(-(value + 1));
     return (magnitude << 1) | 1;
+}
+
+test "iceberg equality deletes resolve renamed data and delete fields by ID" {
+    const alloc = std.testing.allocator;
+
+    const data_file_path = "s3://bucket/t/data/a.parquet";
+    const data_columns = [_]lake_parquet_rowgroup.TestPlainI64Column{.{
+        .column_id = "old_amount",
+        .values = &[_]i64{ 10, 20, 10 },
+        .field_id = 1,
+    }};
+    const data_object = try lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(alloc, &data_columns);
+    defer alloc.free(data_object);
+
+    const delete_file_path = "s3://bucket/t/deletes/eq-a.parquet";
+    const delete_columns = [_]lake_parquet_rowgroup.TestPlainI64Column{.{
+        .column_id = "delete_amount",
+        .values = &[_]i64{20},
+        .field_id = 1,
+    }};
+    const delete_object = try lake_parquet_rowgroup.buildTestPlainI64ParquetObjectAlloc(alloc, &delete_columns);
+    defer alloc.free(delete_object);
+
+    const position_file_path = "s3://bucket/t/deletes/pos-a.parquet";
+    const position_columns = [_]lake_parquet_rowgroup.TestPlainI64Column{.{
+        .column_id = "pos",
+        .values = &[_]i64{0},
+    }};
+    const position_path_columns = [_]lake_parquet_rowgroup.TestPlainByteArrayColumn{.{
+        .column_id = "file_path",
+        .values = &[_][]const u8{data_file_path},
+    }};
+    const position_object = try lake_parquet_rowgroup.buildTestPlainI64AndByteArrayParquetObjectAlloc(
+        alloc,
+        &position_columns,
+        &position_path_columns,
+    );
+    defer alloc.free(position_object);
+
+    const MemoryRangeReader = struct {
+        data_body: []const u8,
+        delete_body: []const u8,
+        position_body: []const u8,
+
+        fn reader(self: *@This()) lake_parquet_rowgroup.ObjectRangeReader {
+            return .{
+                .ctx = self,
+                .read_range_alloc = readRangeAlloc,
+            };
+        }
+
+        fn readRangeAlloc(
+            ctx: *anyopaque,
+            a: Allocator,
+            bucket: []const u8,
+            key: []const u8,
+            offset: u64,
+            len: usize,
+        ) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (!std.mem.eql(u8, bucket, "bucket")) return error.ObjectNotFound;
+            const body = if (std.mem.eql(u8, key, "t/data/a.parquet"))
+                self.data_body
+            else if (std.mem.eql(u8, key, "t/deletes/eq-a.parquet"))
+                self.delete_body
+            else if (std.mem.eql(u8, key, "t/deletes/pos-a.parquet"))
+                self.position_body
+            else
+                return error.ObjectNotFound;
+            const start: usize = std.math.cast(usize, offset) orelse return error.InvalidLakeRangeRead;
+            if (start > body.len or len > body.len - start) return error.InvalidLakeRangeRead;
+            return try a.dupe(u8, body[start..][0..len]);
+        }
+    };
+    var range_reader = MemoryRangeReader{
+        .data_body = data_object,
+        .delete_body = delete_object,
+        .position_body = position_object,
+    };
+
+    var inventory = external_source.Inventory{
+        .format = .iceberg,
+        .source_id = try alloc.dupe(u8, "events"),
+        .source_uri = try alloc.dupe(u8, "s3://bucket/t"),
+        .snapshot_id = try alloc.dupe(u8, "12"),
+        .schema_fingerprint = try alloc.dupe(u8, "iceberg-schema:7"),
+        .files = try alloc.alloc(external_source.FileEntry, 1),
+    };
+    defer inventory.deinit(alloc);
+    inventory.files[0] = .{
+        .file_id = try alloc.dupe(u8, data_file_path),
+        .object_uri = try alloc.dupe(u8, data_file_path),
+        .version_id = try alloc.dupe(u8, "iceberg:v1:data_seq=5:file_seq=6"),
+        .byte_len = data_object.len,
+        .row_count = 3,
+        .data_sequence_number = 5,
+        .partition_spec_id = 0,
+        .row_groups = &.{},
+    };
+
+    var plan = IcebergDeletePlan{ .files = try alloc.alloc(IcebergDeleteFile, 2) };
+    defer plan.deinit(alloc);
+    plan.files[0] = .{
+        .content = .equality_deletes,
+        .file_path = try alloc.dupe(u8, delete_file_path),
+        .file_format = try alloc.dupe(u8, "PARQUET"),
+        .snapshot_id = 12,
+        .data_sequence_number = 7,
+        .file_sequence_number = 8,
+        .equality_ids = try alloc.dupe(i32, &[_]i32{1}),
+        .equality_columns = try alloc.alloc([]u8, 1),
+        .record_count = 1,
+        .file_size_in_bytes = delete_object.len,
+    };
+    plan.files[0].equality_columns[0] = try alloc.dupe(u8, "amount");
+    plan.files[1] = .{
+        .content = .position_deletes,
+        .file_path = try alloc.dupe(u8, position_file_path),
+        .file_format = try alloc.dupe(u8, "PARQUET"),
+        .snapshot_id = 12,
+        .data_sequence_number = 7,
+        .file_sequence_number = 9,
+        .record_count = 1,
+        .file_size_in_bytes = position_object.len,
+    };
+
+    var discovered_data = try lake_parquet_rowgroup.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(
+        alloc,
+        range_reader.reader(),
+        inventory,
+        &[_][]const u8{"old_amount"},
+        64 * 1024,
+    );
+    defer discovered_data.deinit(alloc);
+
+    try std.testing.expectError(error.IcebergDeleteApplicationTooLarge, readDeleteRowRefsAlloc(alloc, .{
+        .reader = range_reader.reader(),
+        .data_inventory = discovered_data.inventory,
+        .delete_plan = plan,
+        .application_limits = .{ .max_deleted_rows = 1 },
+    }));
+
+    const refs = try readDeleteRowRefsAlloc(alloc, .{
+        .reader = range_reader.reader(),
+        .data_inventory = discovered_data.inventory,
+        .delete_plan = plan,
+    });
+    defer alloc.free(refs);
+
+    try std.testing.expectEqual(@as(usize, 2), refs.len);
+    try std.testing.expectEqualStrings(data_file_path, refs[0].external.file_id);
+    try std.testing.expectEqual(@as(u64, 0), refs[0].external.row_ordinal);
+    try std.testing.expectEqualStrings(data_file_path, refs[1].external.file_id);
+    try std.testing.expectEqual(@as(u64, 1), refs[1].external.row_ordinal);
 }

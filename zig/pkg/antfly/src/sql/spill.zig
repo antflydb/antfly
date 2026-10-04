@@ -22,6 +22,7 @@ const Row = operators.Row;
 const Allocator = std.mem.Allocator;
 pub const none = std.math.maxInt(u64);
 const frame_bytes = 25;
+const snappy = @import("../encoding/snappy.zig");
 
 pub const Manager = struct {
     patterns: std.ArrayList(*scalar.PatternSet) = .empty,
@@ -37,6 +38,13 @@ pub const Manager = struct {
     peak_bytes: u64 = 0,
     written_bytes: u64 = 0,
     merges: usize = 0,
+    read_calls: u64 = 0,
+    write_calls: u64 = 0,
+    read_bytes: u64 = 0,
+    buffer_bytes: usize = 4096,
+    async_writes: bool = true,
+    compression: enum { none, snappy } = .snappy,
+    compressed_records: u64 = 0,
     dir: ?std.Io.Dir = null,
     parent: ?std.Io.Dir = null,
     directory_name: [43]u8 = undefined,
@@ -99,9 +107,116 @@ pub const File = struct {
     id: u64,
     size: u64 = 0,
     closed: bool = false,
+    write_buffer: []u8 = &.{},
+    write_start: u64 = 0,
+    write_len: usize = 0,
+    read_buffer: []u8 = &.{},
+    read_start: u64 = none,
+    read_len: usize = 0,
+    buffer_bytes: ?usize = null,
+    spare: []u8 = &.{},
+    pending: ?*WriteJob = null,
+    write_job: ?*WriteJob = null,
+    const WriteJob = struct {
+        io: std.Io,
+        file: std.Io.File,
+        buffer: []u8,
+        len: usize,
+        offset: u64,
+        future: ?std.Io.Future(anyerror!void) = null,
+        fn write(job: *WriteJob) anyerror!void {
+            try job.file.writePositionalAll(job.io, job.buffer[0..job.len], job.offset);
+        }
+    };
+    fn awaitWrite(self: *File) !void {
+        const job = self.pending orelse return;
+        const result = job.future.?.await(self.manager.io);
+        self.pending = null;
+        self.spare = job.buffer;
+        try result;
+    }
+    // One in-flight buffer per file. Worker code owns stable bytes and never
+    // touches the statement allocator, quota counters, or mutable operators.
+    fn submit(self: *File) !void {
+        if (self.write_len == 0) return;
+        try self.awaitWrite();
+        try self.manager.check();
+        if (self.manager.async_writes and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
+            if (self.spare.len == 0) self.spare = try self.manager.alloc.alloc(u8, self.write_buffer.len);
+            const job = self.write_job orelse blk: {
+                const created = try self.manager.alloc.create(WriteJob);
+                self.write_job = created;
+                break :blk created;
+            };
+            job.* = .{ .io = self.manager.io, .file = self.file, .buffer = self.write_buffer, .len = self.write_len, .offset = self.write_start };
+            const future = self.manager.io.concurrent(WriteJob.write, .{job}) catch {
+                try WriteJob.write(job);
+                self.manager.write_calls += 1;
+                self.write_len = 0;
+                return;
+            };
+            job.future = future;
+            self.pending = job;
+            self.write_buffer = self.spare;
+            self.spare = &.{};
+        } else {
+            try self.file.writePositionalAll(self.manager.io, self.write_buffer[0..self.write_len], self.write_start);
+        }
+        self.manager.write_calls += 1;
+        self.write_len = 0;
+    }
+    pub fn flush(self: *File) !void {
+        try self.submit();
+        try self.awaitWrite();
+    }
+    fn bufferedWrite(self: *File, bytes: []const u8, offset: u64) !void {
+        self.read_start = none;
+        if (self.write_buffer.len == 0) self.write_buffer = try self.manager.alloc.alloc(u8, @max(1, self.buffer_bytes orelse self.manager.buffer_bytes));
+        if (self.write_len != 0 and offset != self.write_start + self.write_len) try self.submit();
+        if (bytes.len > self.write_buffer.len) {
+            try self.flush();
+            try self.file.writePositionalAll(self.manager.io, bytes, offset);
+            self.manager.write_calls += 1;
+            return;
+        }
+        if (bytes.len > self.write_buffer.len - self.write_len) try self.submit();
+        if (self.write_len == 0) self.write_start = offset;
+        @memcpy(self.write_buffer[self.write_len..][0..bytes.len], bytes);
+        self.write_len += bytes.len;
+    }
+    fn bufferedRead(self: *File, offset: u64, bytes: []u8) !void {
+        try self.flush();
+        if (self.read_buffer.len == 0) self.read_buffer = try self.manager.alloc.alloc(u8, @max(1, self.buffer_bytes orelse self.manager.buffer_bytes));
+        if (bytes.len > self.read_buffer.len) {
+            const count = try self.file.readPositionalAll(self.manager.io, bytes, offset);
+            self.manager.read_calls += 1;
+            self.manager.read_bytes += count;
+            if (count != bytes.len) return error.InvalidSqlSpill;
+            return;
+        }
+        if (self.read_start == none or offset < self.read_start or offset - self.read_start > self.read_len or bytes.len > self.read_len -| (offset - self.read_start)) {
+            self.read_start = offset;
+            self.read_len = @intCast(@min(self.read_buffer.len, self.size - offset));
+            const count = try self.file.readPositionalAll(self.manager.io, self.read_buffer[0..self.read_len], offset);
+            self.manager.read_calls += 1;
+            self.manager.read_bytes += count;
+            if (count != self.read_len) return error.InvalidSqlSpill;
+        }
+        @memcpy(bytes, self.read_buffer[@intCast(offset - self.read_start)..][0..bytes.len]);
+    }
     pub fn close(self: *File) void {
         if (self.closed) return;
+        if (self.pending) |job| {
+            job.future.?.cancel(self.manager.io) catch {};
+            self.manager.alloc.free(job.buffer);
+            self.pending = null;
+        }
+        if (self.write_job) |job| self.manager.alloc.destroy(job);
+        self.write_job = null;
         self.file.close(self.manager.io);
+        self.manager.alloc.free(self.spare);
+        self.manager.alloc.free(self.write_buffer);
+        self.manager.alloc.free(self.read_buffer);
         self.manager.live_bytes -= self.size;
         self.manager.files -= 1;
         self.closed = true;
@@ -114,15 +229,29 @@ pub const File = struct {
         try encoder.word(row.ordinal);
         try encoder.cells(row.values);
         try encoder.cells(row.keys);
-        const growth = bytes.items.len + frame_bytes;
+        var compressed: ?[]u8 = null;
+        defer if (compressed) |value| self.manager.alloc.free(value);
+        // Avoid codec work on short or apparently incompressible records.
+        // Compression is an existing Snappy block format, never a new codec.
+        if (self.manager.compression == .snappy and bytes.items.len >= 4096) {
+            const sample = bytes.items[0..@min(bytes.items.len, 1024)];
+            var repeated: usize = 0;
+            for (sample[1..], sample[0 .. sample.len - 1]) |x, y| repeated += @intFromBool(x == y);
+            if (repeated > sample.len / 4) compressed = try snappy.encode(self.manager.alloc, bytes.items);
+        }
+        const compressed_record = compressed != null and compressed.?.len + 32 < bytes.items.len;
+        const stored = if (compressed_record) compressed.? else bytes.items;
+        const growth = stored.len + frame_bytes;
         if (growth > self.manager.max_bytes -| self.manager.live_bytes) return error.SqlProgramLimitExceeded;
         var frame: [frame_bytes]u8 = @splat(0);
-        std.mem.writeInt(u64, frame[0..8], bytes.items.len, .little);
+        std.mem.writeInt(u64, frame[0..8], stored.len, .little);
+        frame[24] = if (compressed_record) 2 else 0;
         std.mem.writeInt(u64, frame[8..16], std.hash.Wyhash.hash(0, bytes.items), .little);
         std.mem.writeInt(u64, frame[16..24], link, .little);
         const offset = self.size;
-        try self.file.writePositionalAll(self.manager.io, &frame, offset);
-        try self.file.writePositionalAll(self.manager.io, bytes.items, offset + frame_bytes);
+        try self.bufferedWrite(&frame, offset);
+        try self.bufferedWrite(stored, offset + frame_bytes);
+        self.manager.compressed_records += @intFromBool(compressed_record);
         self.size += growth;
         self.manager.live_bytes += growth;
         self.manager.peak_bytes = @max(self.manager.peak_bytes, self.manager.live_bytes);
@@ -133,21 +262,32 @@ pub const File = struct {
         try self.manager.check();
         if (offset > self.size or self.size - offset < frame_bytes) return error.InvalidSqlSpill;
         var frame: [frame_bytes]u8 = undefined;
-        if (try self.file.readPositionalAll(self.manager.io, &frame, offset) != frame.len) return error.InvalidSqlSpill;
+        try self.bufferedRead(offset, &frame);
         const len = std.mem.readInt(u64, frame[0..8], .little);
         if (len > self.manager.max_record_bytes or len > self.size - offset - frame_bytes) return error.InvalidSqlSpill;
         const bytes = try a.alloc(u8, @intCast(len));
         defer a.free(bytes);
-        if (try self.file.readPositionalAll(self.manager.io, bytes, offset + frame_bytes) != bytes.len) return error.InvalidSqlSpill;
-        if (std.hash.Wyhash.hash(0, bytes) != std.mem.readInt(u64, frame[8..16], .little)) return error.InvalidSqlSpill;
+        try self.bufferedRead(offset + frame_bytes, bytes);
+        if (frame[24] > 3) return error.InvalidSqlSpill;
+        const decoded: ?[]u8 = if (frame[24] & 2 != 0) blk: {
+            const length = snappy.decodedLen(bytes) catch return error.InvalidSqlSpill;
+            if (length > self.manager.max_record_bytes) return error.InvalidSqlSpill;
+            break :blk snappy.decode(a, bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => return error.InvalidSqlSpill,
+            };
+        } else null;
+        defer if (decoded) |value| a.free(value);
+        const payload = decoded orelse bytes;
+        if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, frame[8..16], .little)) return error.InvalidSqlSpill;
         const link = std.mem.readInt(u64, frame[16..24], .little);
         if (link != none and link >= offset) return error.InvalidSqlSpill;
-        var decoder: Decoder = .{ .manager = self.manager, .a = a, .bytes = bytes };
+        var decoder: Decoder = .{ .manager = self.manager, .a = a, .bytes = payload };
         const ordinal = try decoder.word();
         const values = try decoder.cells();
         const keys = try decoder.cells();
-        if (decoder.position != bytes.len or frame[24] > 1) return error.InvalidSqlSpill;
-        return .{ .row = .{ .values = values, .keys = keys, .ordinal = ordinal }, .next = link, .matched = frame[24] == 1, .following = offset + frame_bytes + len };
+        if (decoder.position != payload.len) return error.InvalidSqlSpill;
+        return .{ .row = .{ .values = values, .keys = keys, .ordinal = ordinal }, .next = link, .matched = frame[24] & 1 != 0, .following = offset + frame_bytes + len };
     }
     /// Fixed-size operator state/index pages share the statement disk quota.
     pub fn writeRaw(self: *File, offset: u64, bytes: []const u8) !void {
@@ -156,7 +296,7 @@ pub const File = struct {
         const end = std.math.add(u64, offset, bytes.len) catch return error.SqlProgramLimitExceeded;
         const growth = end -| self.size;
         if (growth > self.manager.max_bytes -| self.manager.live_bytes) return error.SqlProgramLimitExceeded;
-        try self.file.writePositionalAll(self.manager.io, bytes, offset);
+        try self.bufferedWrite(bytes, offset);
         self.size = @max(self.size, end);
         self.manager.live_bytes += growth;
         self.manager.peak_bytes = @max(self.manager.peak_bytes, self.manager.live_bytes);
@@ -165,12 +305,16 @@ pub const File = struct {
     pub fn readRaw(self: *File, offset: u64, bytes: []u8) !void {
         try self.manager.check();
         if (offset > self.size or bytes.len > self.size - offset) return error.InvalidSqlSpill;
-        if (try self.file.readPositionalAll(self.manager.io, bytes, offset) != bytes.len) return error.InvalidSqlSpill;
+        try self.bufferedRead(offset, bytes);
     }
     pub fn match(self: *File, offset: u64) !void {
         try self.manager.check();
         if (offset > self.size or self.size - offset < frame_bytes) return error.InvalidSqlSpill;
-        try self.file.writePositionalAll(self.manager.io, &.{1}, offset + 24);
+        var flag: [1]u8 = undefined;
+        try self.bufferedRead(offset + 24, &flag);
+        if (flag[0] > 3) return error.InvalidSqlSpill;
+        flag[0] |= 1;
+        try self.bufferedWrite(&flag, offset + 24);
     }
 };
 const Encoder = struct {
@@ -322,7 +466,11 @@ pub const Sort = struct {
     rows: std.ArrayList(Row) = .empty,
     estimated: usize = 0,
     runs: [32]?File = @splat(null),
-    output: ?File = null,
+    outputs: [8]?File = @splat(null),
+    heads: [8]?Decoded = @splat(null),
+    head_arenas: [8]std.heap.ArenaAllocator = undefined,
+    output_count: usize = 0,
+    max_row_bytes: usize = 0,
     offset: u64 = 0,
     finished: bool = false,
     total: usize = 0,
@@ -333,7 +481,10 @@ pub const Sort = struct {
         self.arena.deinit();
         self.rows.deinit(self.a);
         for (&self.runs) |*run| if (run.*) |*file| file.close();
-        if (self.output) |*file| file.close();
+        for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count]) |*file, *arena| {
+            if (file.*) |*open_file| open_file.close();
+            arena.deinit();
+        }
     }
     pub fn add(self: *Sort, row: Row) !void {
         if (self.finished or row.keys.len != self.orders.len) return error.InvalidSqlBackendResponse;
@@ -345,6 +496,7 @@ pub const Sort = struct {
         for (row.values) |v| bytes +|= try operators.datumBytes(v);
         for (row.keys) |v| bytes +|= try operators.datumBytes(v);
         if (bytes > self.memory_bytes / 3) return error.SqlProgramLimitExceeded;
+        self.max_row_bytes = @max(self.max_row_bytes, bytes);
         if (self.rows.items.len != 0 and (bytes > self.memory_bytes / 4 -| self.estimated)) try self.flush();
         const a = self.arena.allocator();
         const values = try a.alloc(Datum, row.values.len);
@@ -409,12 +561,12 @@ pub const Sort = struct {
             if (r == null or (l != null and (try operators.compareRows(l.?.row, r.?.row, self.orders)) != .gt)) {
                 _ = try output.append(l.?.row, none);
                 lp = l.?.following;
-                _ = la.reset(.free_all);
+                _ = la.reset(.retain_capacity);
                 l = if (lp < left.size) try left.read(la.allocator(), lp) else null;
             } else {
                 _ = try output.append(r.?.row, none);
                 rp = r.?.following;
-                _ = ra.reset(.free_all);
+                _ = ra.reset(.retain_capacity);
                 r = if (rp < right.size) try right.read(ra.allocator(), rp) else null;
             }
         }
@@ -432,24 +584,51 @@ pub const Sort = struct {
             return;
         }
         try self.flush();
+        // Bound decoded heads and I/O buffers; stream the final merge instead
+        // of writing and rereading another complete sorted run.
+        const head_bytes = self.max_row_bytes *| 4 +| self.manager.buffer_bytes *| 2 +| 512;
+        const fan_in = @min(self.outputs.len, @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes)));
+        errdefer {
+            for (self.outputs[0..self.output_count]) |*file| if (file.*) |*active| active.close();
+            self.output_count = 0;
+        }
         for (&self.runs) |*slot| if (slot.*) |*run| {
-            if (self.output) |*old| {
-                const combined = try self.merge(old, run);
-                old.close();
-                run.close();
-                self.output = combined;
-            } else self.output = run.*;
+            if (self.output_count == fan_in) {
+                const combined = try self.merge(&self.outputs[0].?, &self.outputs[1].?);
+                self.outputs[0].?.close();
+                self.outputs[1].?.close();
+                self.outputs[0] = combined;
+                self.output_count -= 1;
+                self.outputs[1] = self.outputs[self.output_count];
+                self.outputs[self.output_count] = null;
+            }
+            self.outputs[self.output_count] = run.*;
+            self.output_count += 1;
             slot.* = null;
         };
+        for (self.head_arenas[0..self.output_count]) |*arena| arena.* = std.heap.ArenaAllocator.init(self.a);
+        errdefer for (self.head_arenas[0..self.output_count]) |*arena| arena.deinit();
+        for (self.outputs[0..self.output_count], self.head_arenas[0..self.output_count], self.heads[0..self.output_count]) |*file, *arena, *head| {
+            head.* = if (file.*.?.size != 0) try file.*.?.read(arena.allocator(), 0) else null;
+        }
         self.finished = true;
     }
     pub fn next(self: *Sort, a: Allocator) !?Row {
         try self.finish();
-        if (self.output) |*file| {
-            if (self.offset == file.size) return null;
-            const row = try file.read(a, self.offset);
-            self.offset = row.following;
-            return row.row;
+        if (self.output_count != 0) {
+            var selected: ?usize = null;
+            for (self.heads[0..self.output_count], 0..) |head, index| if (head) |value| {
+                if (selected == null or (try operators.compareRows(value.row, self.heads[selected.?].?.row, self.orders)) == .lt) selected = index;
+            };
+            const index = selected orelse return null;
+            const head = self.heads[index].?;
+            const values = try a.alloc(Datum, head.row.values.len);
+            const keys = try a.alloc(Datum, head.row.keys.len);
+            for (head.row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
+            for (head.row.keys, keys) |value, *out| out.* = try operators.cloneDatum(a, value);
+            _ = self.head_arenas[index].reset(.retain_capacity);
+            self.heads[index] = if (head.following < self.outputs[index].?.size) try self.outputs[index].?.read(self.head_arenas[index].allocator(), head.following) else null;
+            return .{ .values = values, .keys = keys, .ordinal = head.row.ordinal };
         }
         if (self.offset < self.rows.items.len) {
             const row = self.rows.items[@intCast(self.offset)];
@@ -517,6 +696,7 @@ test "SQL spill quotas cancellation and corrupt records fail without leaked file
     canceled = true;
     try std.testing.expectError(error.Cancelled, file.read(a, 0));
     canceled = false;
+    try file.flush();
     try file.file.writePositionalAll(manager.io, &.{255}, frame_bytes);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -529,4 +709,51 @@ test "SQL spill quotas cancellation and corrupt records fail without leaked file
     const parent = try std.Io.Dir.openDirAbsolute(std.testing.io, "/tmp", .{});
     defer parent.close(std.testing.io);
     try std.testing.expectError(error.FileNotFound, parent.openDir(std.testing.io, &name, .{}));
+}
+
+test "SQL compressed spill validates decoded quotas and preserves matched flags" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var file = try manager.create();
+    defer file.close();
+    const text = [_]u8{'x'} ** 8192;
+    const offset = try file.append(.{ .values = &.{Datum.json(.{ .string = &text })}, .keys = &.{Datum.json(.{ .integer = 7 })}, .ordinal = 11 }, none);
+    try std.testing.expectEqual(@as(u64, 1), manager.compressed_records);
+    try std.testing.expect(file.size < 1024);
+    try file.match(offset);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const row = try file.read(arena.allocator(), offset);
+    try std.testing.expect(row.matched);
+    try std.testing.expectEqualStrings(&text, row.row.values[0].value.string);
+    try std.testing.expectEqual(@as(u64, 11), row.row.ordinal);
+    manager.max_record_bytes = 1024;
+    try std.testing.expectError(error.InvalidSqlSpill, file.read(arena.allocator(), offset));
+}
+
+test "SQL buffered spill joins outstanding writes on cancelled close" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(raw: *anyopaque) !void {
+            if (@as(*bool, @ptrCast(@alignCast(raw))).*) return error.QueryCanceled;
+        }
+    };
+    var canceled = false;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &canceled, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var file = try manager.create();
+    defer file.close();
+    const bytes = [_]u8{'x'} ** 4096;
+    try file.writeRaw(0, &bytes);
+    try file.writeRaw(4096, &bytes);
+    canceled = true;
+    try std.testing.expectError(error.QueryCanceled, file.flush());
+    file.close();
+    try std.testing.expectEqual(@as(usize, 0), manager.files);
+    try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
 }

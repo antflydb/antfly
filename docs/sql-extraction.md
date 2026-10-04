@@ -98,7 +98,9 @@ before releasing source metadata. Prefetch failures stay speculative: required
 reads still enforce pinned versions, deadlines and cancellation.
 
 Each stream admits at most 100,000,000 examined rows. Parquet decoding aligns
-independent column pages and decodes each column dictionary once. The 32 MiB
+independent column pages and decodes each column dictionary once. Up to four
+column decoders overlap provider reads and page decoding; allocation admission
+is serialized, and every worker joins before releasing cursor state. The 32 MiB
 input/decoded budgets apply to the active page set, rather than the entire row group. Large
 individual pages and dictionaries can still fail admission. SQL defaults admit
 10,000,000 scanned rows, 65,536 scan pages and 64 MiB retained bytes per statement.
@@ -106,11 +108,21 @@ Nested pipelines reduce internal page sizes under smaller budgets.
 
 Blocking sorts, grouped aggregates (including DISTINCT inputs), hash-join build
 rows and window partitions spill through a shared statement owner. Sorts merge
-bounded runs and stream past OFFSET; groups merge partial states one key at a
-time; joins persist outer-join match markers. Window passes retain partition
+bounded runs and stream past OFFSET; the final merge reads up to eight run heads
+directly without writing another complete run. Groups merge partial states one
+key at a time. Spilled joins sequentially hash-partition both sides, retaining
+one build partition at a time and preserving outer-join match markers. A
+bounded runtime filter skips certainly absent probe keys when outer semantics
+permit it. Oversized partitions recursively split on unused hash bits with bounded depth
+and open files; inseparable duplicate keys retain the disk-chain fallback.
+Snapshot-local row estimates, bounded derived-query LIMITs, and source byte
+estimates choose the smaller build side when comparable estimates exist. Window passes retain partition
 rows, peer/group directories and aggregate frame trees on disk, with small
 tracked caches. Separate cell records store window outputs without rewriting
-the original row payload for each function. Ranking, navigation,
+the original row payload for each function. Window sorts carry row indices instead
+of wide row payloads. Sliding COUNT, integer SUM, BOOL_AND and BOOL_OR use exact
+removable state with constant memory; other aggregates and exclusions retain
+the frame tree. Ranking, navigation,
 ROWS/RANGE/GROUPS and frame exclusions keep their existing semantics. Quantified pattern sets use external DISTINCT and a
 reusable statement-owned file; matching retains one pattern at a time.
 
@@ -121,18 +133,26 @@ and files are private; files are immediately unlinked while open, and handles
 and directories are cleaned up on completion, cancellation and error. Spill
 records preserve exact numeric tags, SQL/JSON null distinction and row order,
 with length and checksum validation. Disk exhaustion and oversized records
-still return errors.
+still return errors. Spill I/O uses bounded read-ahead and double-buffered
+asynchronous writes where concurrency is available. Repetitive large records
+use the existing Snappy codec when it saves space; decoded lengths and checksums
+remain validated before rows are accepted. Small join budgets reduce per-file
+buffer sizes to leave room for the active partition.
 
-Pgwire can deliver sorted, grouped and window results from a disk spool in bounded
-pages, beyond the materialized response row cap. Execution pins one statement
-cut and writes final rows once; later portal pulls read the spool without
-rescanning source data. Explicit SQL LIMIT/OFFSET, ordering and NULL flags are
+Pgwire can deliver sorted, grouped and window results in bounded pages, beyond
+the materialized response row cap. Execution pins one statement cut and
+transfers ownership of the completed sort into the result cursor, avoiding a
+second full result spool. Delivered in-memory rows are released immediately;
+external sorts merge directly into continuation pages. Other blocking shapes
+retain the spool fallback without rescanning source data. Explicit SQL LIMIT/OFFSET, ordering and NULL flags are
 preserved. HTTP JSON response limits remain; blocking projections involving
 external decision providers retain the existing bounded materialization path.
 
 Numeric and boolean expression batches use bounded instruction-major kernels,
 including four-lane exact integer and floating-point arithmetic/comparisons.
-String comparisons and boolean unary operations also run by batch. Live
+String comparisons and boolean unary operations also run by batch. Eligible
+streaming filters/projections and aggregate input expressions consume selected
+column pages directly, applying predicates before computing projections. Live
 intermediate vectors reuse workspace slots; global COUNT, integer SUM and
 boolean reductions avoid per-row grouping probes. Mixed numeric values retain
 scalar conversion semantics. Lazy expressions (CASE, AND/OR) and
@@ -144,6 +164,13 @@ from `zig/`. The measured baseline and refined paths validate equivalent outputs
 and alternate execution order across three samples at each size. Raw samples,
 fixture details and median timings are in
 [`native-sql-refinements.json`](../zig/bench/baselines/native-sql-refinements.json).
+The sort and partitioned-join cases also report first-row latency, allocator
+peaks, backing allocation counts, spill bytes, and physical I/O calls; their
+single-sample results are in
+[`native-lake-execution-refinements.json`](../zig/bench/baselines/native-lake-execution-refinements.json).
+Partitioning can increase writes and first-row latency while reducing random
+reads, so those samples are not a general throughput guarantee. Merge-head
+arenas retain bounded capacity between records to reduce allocation churn.
 These measure CPU kernels and local temporary-file writes; remote lake latency
 and end-to-end query throughput need separate measurement. Vector batching
 uses more bounded workspace than row-at-a-time scalar evaluation, while reuse
@@ -151,7 +178,7 @@ lets long expressions run without retaining one vector per instruction.
 
 The regression fixture scans 131,072 and 1,048,576 integer rows in 65,536-row
 Parquet groups under a 32 MiB tracking allocator. Peak tracked allocations are
-7,081,607 and 7,081,721 bytes respectively: input growth adds file metadata rather
+7,081,695 and 7,081,809 bytes respectively: input growth adds file metadata rather
 than retaining all rows. This measures cursor memory for that fixture, not
 process memory or query latency. Tests also verify lazy first-page I/O, warm
 range reuse, pruning without decoded pages, changed-object rejection, exact
@@ -162,6 +189,29 @@ keys and unmatched rows; spill tests cover quota failures, cancellation, checksu
 corruption and cleanup. Prefetch tests prove overlapping reads, warm reuse and
 provider-token cancellation independent of the worker I/O runtime. Kernel tests
 compare results and numeric errors with the scalar evaluator.
+
+The independent-file integration fixtures are written by PyArrow, with Snappy,
+SQL nulls, multiple row groups, and dictionary and plain encodings. Native tests
+infer and decode every row. The production end-to-end test additionally creates
+an attachment without an explicit schema, checks HTTP projections, aggregates,
+joins and windows, streams all rows with psycopg, checks read-only rejection,
+and repeats reads after a cold process restart. Run it from `zig/` with:
+
+```sh
+ANTFLY_BIN="$PWD/zig-out/bin/antfly" uv run --project e2e/antfly --extra lake pytest e2e/antfly/test_lake_sql.py -n 0
+```
+
+The filesystem fixture wraps the independently generated Parquet payload in
+Antfly's existing object-store envelope; `file://` is that provider's namespace.
+Iceberg rename tests separately verify equality deletes resolve field IDs in
+both data and delete files rather than trusting physical column names.
+
+The native batch interface is internal, not Apache Arrow. Joins and general
+keyed aggregate state still use tagged Datum cells. Further optimizations include
+compact normalized sort keys, fully typed join/group state and batch probing,
+scan-level dynamic filters, broader ordering reuse across windows, a shared parallel operator
+scheduler, and richer statistics-driven planning. These require their own
+semantic and memory-budget validation; the current bounded fallbacks remain.
 
 `EXPLAIN` identifies `Lake Scan`; verbose plans include the source format and
 configured snapshot selector without opening the source. Unsupported Parquet

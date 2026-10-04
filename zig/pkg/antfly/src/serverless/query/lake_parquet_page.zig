@@ -55,14 +55,14 @@ pub const PageType = enum(i32) {
 
 pub const Encoding = enum(i32) {
     plain = 0,
-    plain_dictionary = 1,
-    rle = 2,
-    bit_packed = 3,
-    delta_binary_packed = 4,
-    delta_length_byte_array = 5,
-    delta_byte_array = 6,
-    rle_dictionary = 7,
-    byte_stream_split = 8,
+    plain_dictionary = 2,
+    rle = 3,
+    bit_packed = 4,
+    delta_binary_packed = 5,
+    delta_length_byte_array = 6,
+    delta_byte_array = 7,
+    rle_dictionary = 8,
+    byte_stream_split = 9,
 };
 
 pub const CompressionCodec = enum {
@@ -2783,18 +2783,7 @@ fn pageTypeFromInt(raw: i32) !PageType {
 }
 
 fn encodingFromInt(raw: i32) !Encoding {
-    return switch (raw) {
-        0 => .plain,
-        1 => .plain_dictionary,
-        2 => .rle,
-        3 => .bit_packed,
-        4 => .delta_binary_packed,
-        5 => .delta_length_byte_array,
-        6 => .delta_byte_array,
-        7 => .rle_dictionary,
-        8 => .byte_stream_split,
-        else => error.InvalidParquetPage,
-    };
+    return std.enums.fromInt(Encoding, raw) orelse error.InvalidParquetPage;
 }
 
 const Field = struct {
@@ -3089,9 +3078,9 @@ fn buildDataPageHeaderFixtureWithSizesAndEncoding(
     try appendField(&out, alloc, &data_prev, 2, .i32);
     try appendI32(&out, alloc, encoding);
     try appendField(&out, alloc, &data_prev, 3, .i32);
-    try appendI32(&out, alloc, 2);
+    try appendI32(&out, alloc, 3);
     try appendField(&out, alloc, &data_prev, 4, .i32);
-    try appendI32(&out, alloc, 2);
+    try appendI32(&out, alloc, 3);
     try appendStop(&out, alloc);
 
     try appendStop(&out, alloc);
@@ -3139,11 +3128,11 @@ fn buildDictionaryDataPageHeaderFixture(alloc: Allocator, value_count: i32, comp
     try appendField(&out, alloc, &data_prev, 1, .i32);
     try appendI32(&out, alloc, value_count);
     try appendField(&out, alloc, &data_prev, 2, .i32);
-    try appendI32(&out, alloc, 7);
+    try appendI32(&out, alloc, 8);
     try appendField(&out, alloc, &data_prev, 3, .i32);
-    try appendI32(&out, alloc, 2);
+    try appendI32(&out, alloc, 3);
     try appendField(&out, alloc, &data_prev, 4, .i32);
-    try appendI32(&out, alloc, 2);
+    try appendI32(&out, alloc, 3);
     try appendStop(&out, alloc);
 
     try appendStop(&out, alloc);
@@ -3776,7 +3765,7 @@ test "parquet page scanner decodes optional dictionary i64 v2 pages" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 3, 24);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 4, 6, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 4, 6, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -3830,7 +3819,7 @@ test "parquet page scanner decodes optional dictionary f64 v2 pages" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 16);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -3883,7 +3872,7 @@ test "parquet page scanner decodes optional dictionary f32 v2 pages as f64" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 8);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -3932,7 +3921,7 @@ test "parquet page scanner decodes optional dictionary i32 v2 pages" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 3, 12);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 4, 6, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 4, 6, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;
@@ -4021,7 +4010,7 @@ test "parquet page scanner decodes optional dictionary byte array v2 pages" {
     const alloc = std.testing.allocator;
     var dictionary_header = try buildDictionaryPageHeaderFixture(alloc, 2, 12);
     defer dictionary_header.deinit(alloc);
-    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 7);
+    var data_header = try buildDataPageV2HeaderFixtureWithLevelsAndEncoding(alloc, 3, 5, 2, 0, 8);
     defer data_header.deinit(alloc);
 
     var chunk = std.ArrayListUnmanaged(u8).empty;

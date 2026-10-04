@@ -239,6 +239,35 @@ fn Engine(comptime Context: type) type {
             return result;
         }
 
+        fn estimate(self: *Self, node: *const binding.Node) ?u64 {
+            return switch (node.operation) {
+                .scan => |scan| self.cursors[scan.index].estimated_rows,
+                .singleton => 1,
+                .literal_rows => |rows| rows.len,
+                .query => |query| blk: {
+                    const source = self.estimate(query.source);
+                    if (query.statement.limit) |limit| {
+                        const count = self.context.count(limit, 0) catch break :blk source;
+                        break :blk if (source) |rows| @min(rows, count) else count;
+                    }
+                    break :blk source;
+                },
+                .materialized_ref => |source| self.estimate(source),
+                else => null,
+            };
+        }
+        fn preferLeftBuild(self: *Self, left: *const binding.Node, right: *const binding.Node) bool {
+            if (self.estimate(left)) |l| if (self.estimate(right)) |r| return l < r;
+            // Compressed source bytes are a secondary estimate, used only when
+            // neither side provides snapshot-local cardinality information.
+            if (left.operation == .scan and right.operation == .scan) {
+                const l = self.cursors[left.operation.scan.index].estimated_bytes orelse return false;
+                const r = self.cursors[right.operation.scan.index].estimated_bytes orelse return false;
+                return l < r;
+            }
+            return false;
+        }
+
         const Iterator = struct {
             engine: *Self,
             node: *const binding.Node,
@@ -252,6 +281,7 @@ fn Engine(comptime Context: type) type {
             eof: bool = false,
             emitted: bool = false,
             hash_join: ?*operators.HashJoin = null,
+            partition_join: ?*@import("partition_join.zig").Join = null,
             probe: ?operators.HashJoin.Probe = null,
             left_values: ?[]const Datum = null,
             left_matched: bool = false,
@@ -294,7 +324,7 @@ fn Engine(comptime Context: type) type {
                     .join => |join| {
                         // Always probe the delta and build the invariant side.
                         // Keep output ordinals in the original SQL FROM order.
-                        self.flipped_join = if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else false;
+                        self.flipped_join = if (recursive_id) |id| !dependsOn(join.left, id) and dependsOn(join.right, id) else engine.preferLeftBuild(join.left, join.right);
                         self.left = try createRecursive(engine, if (self.flipped_join) join.right else join.left, recursive_id);
                         self.right = try createRecursive(engine, if (self.flipped_join) join.left else join.right, recursive_id);
                     },
@@ -313,6 +343,7 @@ fn Engine(comptime Context: type) type {
                 if (self.left) |left| left.deinit();
                 if (self.right) |right| right.deinit();
                 if (self.values_leaf) |leaf| leaf.deinit();
+                if (self.partition_join) |join| join.close();
                 if (!self.borrowed_hash) if (self.hash_join) |join| join.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
@@ -608,13 +639,39 @@ fn Engine(comptime Context: type) type {
                 if (if (self.flipped_join) left else right) |cells| @memcpy(values[width..], cells);
                 return values;
             }
+            fn nextPartitionJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
+                const owner = self.partition_join.?;
+                while (try owner.next()) |pair| {
+                    try self.engine.checkpoint();
+                    _ = self.scratch.reset(.free_all);
+                    const values = try self.combine(self.scratch.allocator(), pair.left, pair.right);
+                    if (pair.match) |index| {
+                        if (join.condition) |program| {
+                            const accepted = try self.engine.context.evaluate(self.scratch.allocator(), program, values);
+                            if (accepted.sql_null) continue;
+                            if (accepted.value != .bool) return error.SqlTypeMismatch;
+                            if (!accepted.value.bool) continue;
+                        }
+                        try owner.accept(index);
+                    }
+                    const result = try alloc.alloc(Datum, values.len);
+                    for (values, result) |value, *out| out.* = try operators.cloneDatum(alloc, value);
+                    return result;
+                }
+                return null;
+            }
             fn nextJoin(self: *Iterator, alloc: Allocator, join: @FieldType(@FieldType(binding.Node, "operation"), "join")) anyerror!?[]const Datum {
-                const kind = if (self.flipped_join and join.kind == .right) .left else join.kind;
+                const kind = if (self.flipped_join) switch (join.kind) {
+                    .right => .left,
+                    .left => .right,
+                    else => join.kind,
+                } else join.kind;
                 const shared = self.recursive_id != null;
                 if (self.hash_join == null and shared) if (self.engine.static_hashes.get(self.node)) |cached| {
                     self.hash_join = cached;
                     self.borrowed_hash = true;
                 };
+                if (self.partition_join != null) return self.nextPartitionJoin(alloc, join);
                 if (self.hash_join == null) {
                     self.hash_join = try operators.HashJoin.create(self.engine.context.alloc, .{ .rows = self.engine.context.limits.scan_rows, .bytes = self.engine.context.limits.retained_bytes, .spill = self.engine.context.spill });
                     var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
@@ -623,6 +680,28 @@ fn Engine(comptime Context: type) type {
                         const key_values = try self.keys(scratch.allocator(), if (self.flipped_join) join.left_keys else join.right_keys, values);
                         try self.hash_join.?.add(values, key_values);
                         _ = scratch.reset(.free_all);
+                    }
+                    if (!shared and self.hash_join.?.disk != null and self.engine.context.spill != null) {
+                        const owner = try @import("partition_join.zig").Join.create(self.engine.context.alloc, self.engine.context.spill.?, self.engine.context.limits.retained_bytes, self.engine.context.limits.scan_rows, self.hash_join.?.disk.?.size, kind == .left or kind == .full, kind == .right or kind == .full);
+                        var transferred = false;
+                        errdefer if (!transferred) owner.close();
+                        var index: usize = 0;
+                        while (try self.hash_join.?.unmatched(&index)) |match| {
+                            _ = scratch.reset(.free_all);
+                            try owner.add(true, try match.materializeValues(scratch.allocator()), match.row.keys, @intCast(match.index));
+                        }
+                        var ordinal: usize = 0;
+                        while (try self.left.?.next(scratch.allocator())) |values| {
+                            const keys_ = try self.keys(scratch.allocator(), if (self.flipped_join) join.right_keys else join.left_keys, values);
+                            try owner.add(false, values, keys_, ordinal);
+                            ordinal += 1;
+                            _ = scratch.reset(.free_all);
+                        }
+                        self.hash_join.?.deinit();
+                        self.hash_join = null;
+                        self.partition_join = owner;
+                        transferred = true;
+                        return self.nextPartitionJoin(alloc, join);
                     }
                     if (shared) {
                         try self.engine.static_hashes.put(self.engine.cache_arena.allocator(), self.node, self.hash_join.?);

@@ -782,7 +782,7 @@ fn parseRowGroup(
                 if (field.type != .list) return error.InvalidParquetMetadata;
                 column_chunks = try parseColumnChunkList(alloc, reader, file_len);
             },
-            2 => total_byte_len = try reader.readRequiredU64(field.type),
+            2 => _ = try reader.readRequiredU64(field.type),
             3 => row_count = try reader.readRequiredU64(field.type),
             5 => file_offset = try reader.readRequiredU64(field.type),
             7 => ordinal = @intCast(try reader.readRequiredU64(field.type)),
@@ -791,7 +791,18 @@ fn parseRowGroup(
     }
 
     const got_chunks = column_chunks orelse return error.InvalidParquetMetadata;
-    column_chunks = null;
+    // Parquet total_byte_size is UNCOMPRESSED bytes. Internal row-group
+    // ranges must instead describe the physical compressed column span.
+    if (got_chunks.len != 0) {
+        var first = file_len;
+        var end: u64 = 0;
+        for (got_chunks) |chunk| {
+            first = @min(first, chunk.file_offset);
+            end = @max(end, try std.math.add(u64, chunk.file_offset, chunk.compressed_len));
+        }
+        file_offset = first;
+        total_byte_len = end - first;
+    }
     const group = external_source.RowGroup{
         .ordinal = ordinal,
         .row_count = row_count orelse return error.InvalidParquetMetadata,
@@ -800,6 +811,7 @@ fn parseRowGroup(
         .column_chunks = got_chunks,
     };
     group.validate(file_len) catch return error.InvalidParquetMetadata;
+    column_chunks = null;
     return group;
 }
 
@@ -1107,12 +1119,13 @@ fn parseFirstEncodingAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
     if (field_type != .list) return error.InvalidParquetMetadata;
     const list = try reader.readListHeader();
     if (list.elem_type != .i32) return error.InvalidParquetMetadata;
-    var first: ?i32 = null;
-    for (0..list.len) |idx| {
+    var data_encoding: ?i32 = null;
+    for (0..list.len) |_| {
         const value = try reader.readI32();
-        if (idx == 0) first = value;
+        // This is a set, not a page order. RLE may describe definition levels.
+        if (value == 2 or value == 8) data_encoding = value else if (value == 0 and data_encoding == null) data_encoding = value;
     }
-    return try alloc.dupe(u8, encodingName(first orelse -1));
+    return try alloc.dupe(u8, encodingName(data_encoding orelse -1));
 }
 
 fn compressionCodecNameAlloc(alloc: Allocator, codec: i32) ![]u8 {
@@ -1181,12 +1194,12 @@ fn parseLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type
     errdefer annotation.deinit(alloc);
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
-            1, 6, 11 => {
+            1, 6, 12 => {
                 annotation.deinit(alloc);
                 annotation = .{ .name = try alloc.dupe(u8, switch (field.id) {
                     1 => "string",
                     6 => "date",
-                    11 => "json",
+                    12 => "json",
                     else => unreachable,
                 }) };
                 try reader.skip(field.type);
@@ -1304,14 +1317,14 @@ fn parseTimestampUnitNameAlloc(alloc: Allocator, reader: *Reader, field_type: Co
 fn encodingName(encoding: i32) []const u8 {
     return switch (encoding) {
         0 => "plain",
-        1 => "plain_dictionary",
-        2 => "rle",
-        3 => "bit_packed",
-        4 => "delta_binary_packed",
-        5 => "delta_length_byte_array",
-        6 => "delta_byte_array",
-        7 => "rle_dictionary",
-        8 => "byte_stream_split",
+        2 => "plain_dictionary",
+        3 => "rle",
+        4 => "bit_packed",
+        5 => "delta_binary_packed",
+        6 => "delta_length_byte_array",
+        7 => "delta_byte_array",
+        8 => "rle_dictionary",
+        9 => "byte_stream_split",
         else => "unknown",
     };
 }
@@ -1559,7 +1572,7 @@ test "parquet metadata parser extracts row groups and column chunks" {
     try std.testing.expectEqual(@as(u32, 0), footer.row_groups[0].ordinal);
     try std.testing.expectEqual(@as(u64, 2), footer.row_groups[0].row_count);
     try std.testing.expectEqual(@as(u64, 100), footer.row_groups[0].file_offset);
-    try std.testing.expectEqual(@as(u64, 80), footer.row_groups[0].total_byte_len);
+    try std.testing.expectEqual(@as(u64, 40), footer.row_groups[0].total_byte_len);
     try std.testing.expectEqual(@as(usize, 1), footer.row_groups[0].column_chunks.len);
     try std.testing.expectEqualStrings("amount", footer.row_groups[0].column_chunks[0].column_id);
     try std.testing.expectEqualStrings("zstd", footer.row_groups[0].column_chunks[0].compression_codec);

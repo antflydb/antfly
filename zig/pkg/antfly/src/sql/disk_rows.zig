@@ -249,7 +249,7 @@ test "SQL window cell updates preserve wide rows without rewriting input payload
         fn check(_: *anyopaque) !void {}
     };
     var dummy: u8 = 0;
-    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
     defer manager.deinit();
     var rows = try Rows.init(a, &manager, 3);
     defer rows.deinit();

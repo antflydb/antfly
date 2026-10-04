@@ -81,6 +81,62 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
     if (bound.group_count == 0) try grouped.addGlobalBatch(inputs) else for (keys, inputs) |key, input| try grouped.add(key, input);
 }
 
+// Evaluate expressions against selected physical columns. Only unsupported
+// scalar instructions construct a temporary input row; retained aggregate
+// inputs contain the computed values, never the complete input row matrix.
+fn columnValues(context: anytype, bound: *const binding.Bound, a: std.mem.Allocator, page: catalog.ColumnPage, program: *const scalar.Program) ![]const Datum {
+    if (try @import("vector_eval.zig").evaluateColumns(a, program, page, bound.input.columns, context.parameters)) |values| return values;
+    const values = try a.alloc(Datum, page.selection.len);
+    for (values, 0..) |*value, index| value.* = try context.evaluate(a, program.*, try bound.input.columnCells(a, page, index));
+    return values;
+}
+fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, a: std.mem.Allocator, page: catalog.ColumnPage) !void {
+    const predicates = if (bound.input.predicate) |*program| try columnValues(context, bound, a, page, program) else null;
+    var selection: std.ArrayList(usize) = .empty;
+    for (page.selection, 0..) |physical, index| {
+        if (predicates) |values| {
+            if (values[index].sql_null) continue;
+            if (values[index].value != .bool) return error.SqlTypeMismatch;
+            if (!values[index].value.bool) continue;
+        }
+        try selection.append(a, physical);
+    }
+    var accepted = page;
+    accepted.selection = selection.items;
+    const keys = try a.alloc([]Datum, selection.items.len);
+    const inputs = try a.alloc([]Datum, selection.items.len);
+    for (keys, inputs) |*key, *input| {
+        key.* = try a.alloc(Datum, bound.group_count);
+        input.* = try a.alloc(Datum, bound.inputs.len);
+        @memset(input.*, .{});
+    }
+    for (bound.input.projections[0..bound.group_count], 0..) |optional, k| {
+        const values = try columnValues(context, bound, a, accepted, &optional.?);
+        for (keys, values) |key, value| key[k] = value;
+    }
+    for (bound.inputs, bound.filters, 0..) |input, filter, k| {
+        const filters = if (filter) |slot| try columnValues(context, bound, a, accepted, &bound.input.projections[slot].?) else null;
+        var filtered: std.ArrayList(usize) = .empty;
+        var positions: std.ArrayList(usize) = .empty;
+        for (accepted.selection, 0..) |physical, index| {
+            if (filters) |values| {
+                if (values[index].sql_null) continue;
+                if (values[index].value != .bool) return error.SqlTypeMismatch;
+                if (!values[index].value.bool) continue;
+            }
+            try filtered.append(a, physical);
+            try positions.append(a, index);
+        }
+        var selected = accepted;
+        selected.selection = filtered.items;
+        if (input) |slot| {
+            const values = try columnValues(context, bound, a, selected, &bound.input.projections[slot].?);
+            for (positions.items, values) |index, value| inputs[index][k] = value;
+        } else for (positions.items) |index| inputs[index][k] = Datum.json(.{ .integer = 1 });
+    }
+    if (bound.group_count == 0) try grouped.addGlobalBatch(inputs) else for (keys, inputs) |key, input| try grouped.add(key, input);
+}
+
 fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {
     const decision = @import("decision_eval.zig");
     var exhausted = false;
@@ -171,9 +227,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
                 if (column_page.selection.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
                 if (column_page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
                 visited += column_page.selection.len;
-                const cells = try arena.allocator().alloc([]const Datum, column_page.selection.len);
-                for (cells, 0..) |*row, index| row.* = try bound.input.columnCells(arena.allocator(), column_page, index);
-                try addRows(context, bound, grouped, arena.allocator(), cells);
+                try addColumns(context, bound, grouped, arena.allocator(), column_page);
                 const next = column_page.after orelse break;
                 if (!scan.retained(context)) return error.SqlStatementSnapshotRequired;
                 if (after) |previous| if (std.mem.eql(u8, previous, next)) return error.InvalidSqlBackendResponse;

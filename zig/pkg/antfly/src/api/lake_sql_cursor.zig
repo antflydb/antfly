@@ -103,7 +103,13 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     const before = if (request.before) |v| try owned.dupe(u8, v) else null;
     const primary_key = if (request.primary_key) |v| try owned.dupe(u8, v) else null;
     owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key };
-    return .{ .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .close = Owner.close };
+    var estimated_rows: u64 = 0;
+    var estimated_bytes: u64 = 0;
+    for (source.inventory.files) |file| {
+        estimated_rows +|= file.row_count;
+        estimated_bytes +|= file.byte_len;
+    }
+    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .close = Owner.close };
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {

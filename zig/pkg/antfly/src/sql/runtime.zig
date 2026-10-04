@@ -47,6 +47,12 @@ pub const Output = struct {
     command_tag: []const u8,
     mutation_outcome: ?catalog.MutationOutcome = null,
     ddl_receipt: ?catalog.DdlReceipt = null,
+
+    /// Internal pattern sources contain executable callbacks and have no wire
+    /// representation. Keep the public result envelope explicit at every ABI.
+    pub fn jsonStringify(self: Output, writer: anytype) !void {
+        try writer.write(.{ .columns = self.columns, .rows = self.rows, .sql_nulls = self.sql_nulls, .rows_affected = self.rows_affected, .command_tag = self.command_tag, .mutation_outcome = self.mutation_outcome, .ddl_receipt = self.ddl_receipt });
+    }
 };
 pub const Result = struct {
     state: *State,
@@ -155,6 +161,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
 pub const RowSink = struct {
     ptr: *anyopaque,
     append: *const fn (*anyopaque, []const Datum) anyerror!void,
+    take_sorted: ?*const fn (*anyopaque, *@import("operators.zig").TopK, usize, usize, bool) anyerror!void = null,
 };
 pub const Context = struct {
     sink: ?RowSink = null,
@@ -170,7 +177,7 @@ pub const Context = struct {
     typed_output: bool = false,
 
     pub fn emitTop(self: Context, top: *@import("operators.zig").TopK, offset: usize, limit: usize, implicit: bool) !Output {
-        try top.drain(self.alloc, offset, limit, implicit, self.sink.?);
+        if (self.sink.?.take_sorted) |take| try take(self.sink.?.ptr, top, offset, limit, implicit) else try top.drain(self.alloc, offset, limit, implicit, self.sink.?);
         return .{ .columns = self.binding.columns, .command_tag = "SELECT" };
     }
 
@@ -1293,6 +1300,7 @@ fn jsonSize(value: Json) usize {
 }
 
 const TestBackend = struct {
+    estimate_scans: bool = false,
     pages: usize = 0,
     writes: usize = 0,
     row_count: usize = 2,
@@ -1352,7 +1360,7 @@ const TestBackend = struct {
         owner.* = .{ .backend = backend, .alloc = alloc, .cursors = cursors, .states = states };
         for (scans, states, cursors) |request, *state, *cursor| {
             state.* = .{ .owner = owner, .table = request.table, .request = request.request };
-            cursor.* = .{ .ptr = state, .next = Statement.next, .close = Statement.closeCursor };
+            cursor.* = .{ .ptr = state, .next = Statement.next, .close = Statement.closeCursor, .estimated_rows = if (backend.estimate_scans) backend.row_count else null };
         }
         backend.statement_opens += 1;
         backend.statement_scan_count = scans.len;
@@ -3080,5 +3088,23 @@ test "SQL quantified subqueries retain spilled pattern sources through relationa
             try std.testing.expect(!output.output.sql_nulls.?[0][0]);
             try std.testing.expectEqual(value, output.output.rows[0][0].bool);
         } else try std.testing.expect(output.output.sql_nulls.?[0][0]);
+    }
+}
+
+test "SQL snapshot estimates change build side without changing residual outer joins" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "LEFT", "RIGHT", "FULL" }) |kind| {
+        const text = try std.fmt.allocPrint(a, "SELECT a.k AS l, CAST(b._id AS BIGINT) AS r FROM (SELECT CAST(_id AS BIGINT) AS k FROM things ORDER BY k LIMIT 3) a {s} JOIN things b ON a.k = CAST(b._id AS BIGINT) AND CAST(b._id AS BIGINT) < 2 ORDER BY r, l", .{kind});
+        defer a.free(text);
+        var compiled = try compiler.compile(a, text, .{});
+        defer compiled.deinit();
+        var baseline: TestBackend = .{ .row_count = 10 };
+        var planned: TestBackend = .{ .row_count = 10, .estimate_scans = true };
+        var before = try execute(a, baseline.coordinated(), &compiled, &.{}, .{});
+        defer before.deinit();
+        var after = try execute(a, planned.coordinated(), &compiled, &.{}, .{});
+        defer after.deinit();
+        try std.testing.expectEqualDeep(before.output.rows, after.output.rows);
+        try std.testing.expectEqualDeep(before.output.sql_nulls, after.output.sql_nulls);
     }
 }

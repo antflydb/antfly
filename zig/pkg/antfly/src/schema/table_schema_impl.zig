@@ -620,6 +620,15 @@ const RootRefGuard = struct {
 };
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return parseSchemaRequest(alloc, body, false);
+}
+
+/// Creation can carry an unpublished external schema-inference draft. Updates
+/// and stored schemas always require fully bound relational columns.
+pub fn parseCreateSchemaRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return parseSchemaRequest(alloc, body, true);
+}
+fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inference: bool) ![]u8 {
     if (body.len == 0) return error.InvalidSchemaUpdateRequest;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
@@ -628,8 +637,13 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     defer schema.deinit(alloc);
     try validateParsedStorageModeSchema(schema);
     try validateParsedTtlSchema(schema);
-    try validateParsedRelationalSchema(schema);
-    try validateRelationalExpressions(alloc, schema);
+    const pending = allow_inference and schema.external_base_source != null and schema.document_schemas.len == 0;
+    if (pending) {
+        if (schema.dynamic_templates.len != 0 or schema.index_sort.len != 0) return error.InvalidSchemaUpdateRequest;
+    } else {
+        try validateParsedRelationalSchema(schema);
+        try validateRelationalExpressions(alloc, schema);
+    }
     return try stringifyJsonValue(alloc, parsed.value);
 }
 

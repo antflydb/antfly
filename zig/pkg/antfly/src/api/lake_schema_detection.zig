@@ -74,7 +74,9 @@ pub fn prepare(a: A, input: []const u8, options: @import("../serverless/configur
         try parsed.value.object.put(owned, "default_type", .{ .string = "row" });
         try parsed.value.object.put(owned, "enforce_types", .{ .bool = true });
     }
-    return try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    const resolved = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
+    defer a.free(resolved);
+    return try @import("../schema/mod.zig").parseSchemaUpdateRequest(a, resolved);
 }
 
 test "lake SQL schema detection persists Parquet and Iceberg columns without data decoding" {
@@ -97,7 +99,10 @@ test "lake SQL schema detection persists Parquet and Iceberg columns without dat
     for ([_][]const u8{ "parquet", "iceberg" }) |format| {
         const input = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"{s}\",\"uri\":\"file://{s}\"}}}}", .{ format, directory.path() });
         defer a.free(input);
-        const result = (try prepare(a, input, .{}, .{})).?;
+        const draft = try @import("../schema/table_schema_impl.zig").parseCreateSchemaRequest(a, input);
+        defer a.free(draft);
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, @import("../schema/mod.zig").parseSchemaUpdateRequest(a, draft));
+        const result = (try prepare(a, draft, .{}, .{})).?;
         defer a.free(result);
         var document = try std.json.parseFromSlice(std.json.Value, a, result, .{});
         defer document.deinit();
@@ -341,4 +346,45 @@ test "external lake rejects uncommitted metadata and unsigned schema inference" 
     const cursor = try @import("lake_sql_cursor.zig").open(a, table, .{ .fields = &.{"amount"}, .limit = 4 }, .{}, .{});
     defer cursor.close(cursor.ptr);
     try std.testing.expectError(error.UnsupportedParquetPage, cursor.next(cursor.ptr, a, 4));
+}
+
+test "lake SQL independent PyArrow compressed nullable fixtures infer and decode complete files" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        @embedFile("../serverless/query/testdata/pyarrow_plain_nullable_snappy.parquet"),
+        @embedFile("../serverless/query/testdata/pyarrow_dictionary_nullable_snappy.parquet"),
+    }) |bytes| {
+        var directory = try @import("../common/test_directory.zig").TestDirectory.init("lake-pyarrow");
+        defer directory.cleanup();
+        var fs = try @import("../storage/object_storage.zig").FilesystemObjectStorage.init(a, directory.path());
+        defer fs.deinit();
+        var client = fs.client();
+        var put = try client.putObject("antfly", "part.parquet", bytes, .{});
+        put.deinit(a);
+        const input = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"parquet\",\"uri\":\"file://{s}\"}}}}", .{directory.path()});
+        defer a.free(input);
+        const resolved = (try prepare(a, input, .{}, .{})).?;
+        defer a.free(resolved);
+        var binding = (try binding_api.externalBindingFromSchemaJsonAlloc(a, resolved)).?;
+        defer binding.deinit(a);
+        const table: @import("../sql/catalog.zig").Table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .columns = &.{ .{ .name = "amount", .path = "amount", .type = .integer }, .{ .name = "label", .path = "label", .type = .string } }, .external_base_source = binding };
+        const cursor = try @import("lake_sql_cursor.zig").open(a, table, .{ .fields = &.{ "amount", "label" }, .limit = 37 }, .{}, .{});
+        defer cursor.close(cursor.ptr);
+        var count: usize = 0;
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const page = try cursor.next_columns.?(cursor.ptr, arena.allocator(), 37);
+            for (0..page.selection.len) |index| {
+                const number = try page.cell(arena.allocator(), index, "amount");
+                try std.testing.expectEqual(@as(i64, @intCast(count)), number.value.integer);
+                const label = try page.cell(arena.allocator(), index, "label");
+                try std.testing.expectEqual(count % 7 == 0, label.sql_null);
+                if (!label.sql_null) try std.testing.expectEqualStrings(try std.fmt.allocPrint(arena.allocator(), "row-{d}", .{count}), label.value.string);
+                count += 1;
+            }
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqual(@as(usize, 1200), count);
+    }
 }

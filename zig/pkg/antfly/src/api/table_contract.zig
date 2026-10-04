@@ -155,7 +155,7 @@ pub fn parseCreateTableRequest(alloc: std.mem.Allocator, body: []const u8) !tabl
         if (schema_value != .null) {
             const raw_schema = try stringifyJsonAlloc(alloc, schema_value);
             defer alloc.free(raw_schema);
-            const validated_schema = tables_api.parseSchemaUpdateRequest(alloc, raw_schema) catch |err| switch (err) {
+            const validated_schema = @import("../schema/table_schema_impl.zig").parseCreateSchemaRequest(alloc, raw_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableSchemaRequest,
                 else => return err,
             };
@@ -2216,4 +2216,13 @@ test "create table default index incarnation survives the system catalog hop" {
         const incarnation = coverage_policy.incarnation(before.value.object.get("full_text_index_v0").?) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(incarnation, coverage_policy.incarnation(after.value.object.get("full_text_index_v0").?).?);
     }
+}
+
+test "lake SQL public create accepts an unpublished inference draft only for creation" {
+    const a = std.testing.allocator;
+    var draft = try parseCreateTableRequest(a, "{\"schema\":{\"storage_mode\":\"relational\",\"base_source\":{\"kind\":\"external\",\"format\":\"parquet\",\"table_id\":\"events\",\"uri\":\"file:///tmp/lake\"}}}");
+    defer draft.deinit(a);
+    try std.testing.expect(draft.schema_json != null);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, tables_api.parseSchemaUpdateRequest(a, draft.schema_json.?));
+    try std.testing.expectError(error.InvalidCreateTableSchemaRequest, parseCreateTableRequest(a, "{\"schema\":{\"storage_mode\":\"relational\"}}"));
 }

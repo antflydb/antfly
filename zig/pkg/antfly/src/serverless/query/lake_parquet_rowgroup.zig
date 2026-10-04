@@ -36,6 +36,7 @@ const snappy = @import("../../encoding/snappy.zig");
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 pub const MaterializationLimits = struct {
+    page_encoding: ?parquet_page.Encoding = null,
     /// Legacy row scanners retain their approximate numeric contract. Native
     /// SQL and public typed lake rows explicitly select lossless decimal text.
     decimal_representation: enum { approximate_number, exact_string } = .approximate_number,
@@ -1943,7 +1944,13 @@ fn buildPlainI64RowGroupBatchAlloc(
 
     for (projected_chunks, 0..) |input, idx| {
         try input.validate();
-        const chunk = findColumnChunk(row_group, input.column_id) orelse return error.ParquetColumnNotFound;
+        var chunk = findColumnChunk(row_group, input.column_id) orelse return error.ParquetColumnNotFound;
+        if (limits.page_encoding) |encoding| chunk.encoding = switch (encoding) {
+            .plain => @constCast("plain"),
+            .plain_dictionary => @constCast("plain_dictionary"),
+            .rle_dictionary => @constCast("rle_dictionary"),
+            else => return error.UnsupportedParquetPage,
+        };
         const mode = switch (mode_request) {
             .fixed => |fixed| SupportedColumnMode{ .i64 = fixed },
             .from_inventory => try supportedColumnModeForColumnChunk(chunk),
@@ -3553,9 +3560,9 @@ fn appendPlainI64DataPageHeader(
     try appendField(out, alloc, &data_prev, 2, .i32);
     try appendI32(out, alloc, 0);
     try appendField(out, alloc, &data_prev, 3, .i32);
-    try appendI32(out, alloc, 2);
+    try appendI32(out, alloc, 3);
     try appendField(out, alloc, &data_prev, 4, .i32);
-    try appendI32(out, alloc, 2);
+    try appendI32(out, alloc, 3);
     try appendStop(out, alloc);
     try appendStop(out, alloc);
 }
@@ -3745,11 +3752,11 @@ fn appendDictionaryI64DataPage(
     try appendField(out, alloc, &data_prev, 1, .i32);
     try appendI32(out, alloc, @intCast(value_count));
     try appendField(out, alloc, &data_prev, 2, .i32);
-    try appendI32(out, alloc, 7);
+    try appendI32(out, alloc, 8);
     try appendField(out, alloc, &data_prev, 3, .i32);
-    try appendI32(out, alloc, 2);
+    try appendI32(out, alloc, 3);
     try appendField(out, alloc, &data_prev, 4, .i32);
-    try appendI32(out, alloc, 2);
+    try appendI32(out, alloc, 3);
     try appendStop(out, alloc);
     try appendStop(out, alloc);
 
@@ -3790,7 +3797,7 @@ fn appendOptionalDictionaryI64DataPageV2(
     try appendField(out, alloc, &data_prev, 3, .i32);
     try appendI32(out, alloc, @intCast(values.len));
     try appendField(out, alloc, &data_prev, 4, .i32);
-    try appendI32(out, alloc, 7);
+    try appendI32(out, alloc, 8);
     try appendField(out, alloc, &data_prev, 5, .i32);
     try appendI32(out, alloc, definition_level_bytes);
     try appendField(out, alloc, &data_prev, 6, .i32);
@@ -8884,7 +8891,7 @@ test "parquet object range discovery scans dictionary byte array predicates" {
             .compressed_len = tenant_chunk.items.len,
             .uncompressed_len = tenant_chunk.items.len,
             .physical_type = 6,
-            .encoding = 7,
+            .encoding = 8,
         },
     };
     const metadata_start = object.items.len;
@@ -9011,7 +9018,7 @@ test "parquet object range discovery scans int32 predicates" {
             .compressed_len = rank_chunk.items.len,
             .uncompressed_len = rank_chunk.items.len,
             .physical_type = 1,
-            .encoding = 7,
+            .encoding = 8,
         },
     };
     const metadata_start = object.items.len;

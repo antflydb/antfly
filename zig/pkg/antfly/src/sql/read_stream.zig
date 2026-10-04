@@ -200,12 +200,57 @@ const Spool = struct {
     shared: ?*@import("spill.zig").Manager = null,
     rows: @import("disk_rows.zig").Rows,
     index: usize = 0,
+    sorted: ?*@import("operators.zig").TopK = null,
+    sorted_rows: []const @import("operators.zig").Row = &.{},
+    sorted_offset: usize = 0,
+    sorted_count: usize = 0,
+    fn count(self: *const Spool) usize {
+        return if (self.sorted != null) self.sorted_count else self.rows.len;
+    }
+    fn takeSorted(raw: *anyopaque, top: *@import("operators.zig").TopK, offset: usize, limit: usize, implicit: bool) !void {
+        const self: *Spool = @ptrCast(@alignCast(raw));
+        if (self.sorted != null or self.rows.len != 0) return error.InvalidSqlBackendResponse;
+        const total = if (top.external) |sort| @min(sort.total, top.capacity) else top.count;
+        const available = total -| offset;
+        if (implicit and available > limit) return error.SqlResultTooLarge;
+        const owned = try self.rows.a.create(@import("operators.zig").TopK);
+        errdefer self.rows.a.destroy(owned);
+        // Finish before moving: memory rows borrow the heap's stable arenas.
+        const memory_rows = if (top.external == null) try top.finish(self.rows.a) else &.{};
+        owned.* = top.*;
+        top.* = .{ .alloc = top.alloc, .entries = &.{}, .orders = &.{}, .max_bytes = 0, .retained_bytes = 0 };
+        self.sorted = owned;
+        self.sorted_rows = memory_rows;
+        self.sorted_offset = @min(offset, total);
+        self.sorted_count = @min(available, limit);
+        if (owned.external == null) for (0..self.sorted_offset) |index| owned.releaseFinishedRow(index);
+    }
+    fn read(self: *Spool, a: std.mem.Allocator) !@import("operators.zig").Row {
+        if (self.sorted) |top| {
+            if (top.external) |sort| {
+                var scratch = std.heap.ArenaAllocator.init(self.rows.a);
+                defer scratch.deinit();
+                while (self.sorted_offset != 0) : (self.sorted_offset -= 1) {
+                    _ = scratch.reset(.free_all);
+                    _ = (try sort.next(scratch.allocator())) orelse return error.InvalidSqlSpill;
+                }
+                return (try sort.next(a)) orelse error.InvalidSqlSpill;
+            }
+            return self.sorted_rows[self.sorted_offset + self.index];
+        }
+        return self.rows.row(self.index);
+    }
     fn append(raw: *anyopaque, values: []const @import("scalar.zig").Datum) !void {
         const self: *Spool = @ptrCast(@alignCast(raw));
         try self.rows.append(.{ .values = values, .keys = &.{}, .ordinal = self.rows.len });
     }
     fn close(self: *Spool) void {
         const a = self.rows.a;
+        if (self.sorted) |top| {
+            a.free(self.sorted_rows);
+            top.deinit();
+            a.destroy(top);
+        }
         self.rows.deinit();
         if (self.shared == null) self.manager.deinit();
         a.destroy(self);
@@ -289,8 +334,12 @@ pub const Stream = struct {
             owner.rows = try @import("disk_rows.zig").Rows.init(self.budget.allocator(), manager, binding.columns.len);
             errdefer owner.rows.deinit();
             owner.index = 0;
+            owner.sorted = null;
+            owner.sorted_rows = &.{};
+            owner.sorted_offset = 0;
+            owner.sorted_count = 0;
             self.context.spill = manager;
-            self.context.sink = .{ .ptr = owner, .append = Spool.append };
+            self.context.sink = .{ .ptr = owner, .append = Spool.append, .take_sorted = Spool.takeSorted };
             self.context.limits.result_rows = limits.scan_rows;
             const output = try self.context.select(compiled.statement.select);
             // Constant/count and bounded fallback paths return ordinary rows.
@@ -305,8 +354,8 @@ pub const Stream = struct {
             self.fields = &.{};
             self.request = .{ .fields = &.{}, .limit = limits.page_rows };
             self.skip = 0;
-            self.remaining = owner.rows.len;
-            self.exhausted = owner.rows.len == 0;
+            self.remaining = owner.count();
+            self.exhausted = owner.count() == 0;
             self.context.sink = null;
             return self;
         }
@@ -386,13 +435,13 @@ pub const Stream = struct {
         var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer arena.deinit();
         const a = arena.allocator();
-        const count = @min(max_rows, spool.rows.len - spool.index);
+        const count = @min(max_rows, spool.count() - spool.index);
         const rows = try a.alloc([]const Json, count);
         const flags = try a.alloc([]const bool, count);
         var bytes: usize = 0;
         var read: usize = 0;
         for (rows, flags) |*out, *bits| {
-            const row = try spool.rows.row(spool.index);
+            const row = try spool.read(a);
             out.* = try a.alloc(Json, row.values.len);
             bits.* = try a.alloc(bool, row.values.len);
             for (row.values, @constCast(out.*), @constCast(bits.*)) |value, *cell, *flag| {
@@ -400,17 +449,103 @@ pub const Stream = struct {
                 flag.* = value.sql_null;
                 bytes +|= try @import("operators.zig").datumBytes(value);
             }
+            if (spool.sorted) |top| if (top.external == null) top.releaseFinishedRow(spool.sorted_offset + spool.index);
             spool.index += 1;
             read += 1;
             if (bytes >= self.context.limits.page_bytes) break;
         }
         self.emitted += read;
-        self.exhausted = spool.index == spool.rows.len;
+        self.exhausted = spool.index == spool.count();
         return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
+    }
+    fn columnProgram(self: *Stream, a: std.mem.Allocator, program: *const @import("scalar.zig").Program, page: catalog.ColumnPage) ![]const @import("scalar.zig").Datum {
+        if (try @import("vector_eval.zig").evaluateColumns(a, program, page, self.context.binding.scalars.columns, self.context.parameters)) |values| return values;
+        const values = try a.alloc(@import("scalar.zig").Datum, page.selection.len);
+        var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
+        defer scratch.deinit();
+        for (values, 0..) |*value, index| {
+            _ = scratch.reset(.free_all);
+            const cells = try self.context.binding.scalars.columnCells(scratch.allocator(), page, index);
+            value.* = try @import("operators.zig").cloneDatum(a, try self.context.evaluate(scratch.allocator(), program.*, cells));
+        }
+        return values;
+    }
+    fn pullColumns(self: *Stream, max_rows: u32) !Page {
+        var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
+        errdefer arena.deinit();
+        const out = arena.allocator();
+        var rows: std.ArrayList([]const Json) = .empty;
+        var flags: std.ArrayList([]const bool) = .empty;
+        var output_bytes: usize = 0;
+        while (!self.exhausted and rows.items.len < max_rows) {
+            try self.context.checkpoint();
+            self.pages += 1;
+            if (self.pages > self.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+            var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const wanted: u32 = @intCast(@min(self.context.limits.page_rows, @min(self.remaining, max_rows - rows.items.len) +| self.skip));
+            const cursor = self.cursor.?;
+            const page = try cursor.next_columns.?(cursor.ptr, a, wanted);
+            if (page.selection.len > wanted or page.selection.len > self.context.limits.scan_rows -| self.visited) return error.SqlProgramLimitExceeded;
+            self.visited += page.selection.len;
+            const predicates = if (self.context.binding.scalars.predicate) |*program| try self.columnProgram(a, program, page) else null;
+            var selection: std.ArrayList(usize) = .empty;
+            for (page.selection, 0..) |physical, index| {
+                if (predicates) |values| {
+                    if (values[index].sql_null) continue;
+                    if (values[index].value != .bool) return error.SqlTypeMismatch;
+                    if (!values[index].value.bool) continue;
+                }
+                if (self.skip != 0) {
+                    self.skip -= 1;
+                    continue;
+                }
+                try selection.append(a, physical);
+            }
+            const selected: catalog.ColumnPage = .{ .batch = page.batch, .selection = selection.items };
+            const projections = try a.alloc(?[]const @import("scalar.zig").Datum, self.fields.len);
+            for (projections, 0..) |*values, index| values.* = if (index < self.context.binding.scalars.projections.len) if (self.context.binding.scalars.projections[index]) |*program| try self.columnProgram(a, program, selected) else null else null;
+            for (0..selection.items.len) |index| {
+                const row = try out.alloc(Json, self.fields.len);
+                const nulls = try out.alloc(bool, self.fields.len);
+                for (self.fields, self.context.binding.columns, row, nulls, 0..) |field, column, *value, *is_null, ordinal| {
+                    const cell = if (projections[ordinal]) |values| values[index] else blk: {
+                        const raw = try selected.cell(a, index, field);
+                        break :blk @import("scalar.zig").Datum{ .value = raw.value, .sql_null = raw.sql_null };
+                    };
+                    value.* = try describe.coerceAlloc(out, cell.value, column.type);
+                    value.* = (try @import("operators.zig").cloneDatum(out, .{ .value = value.*, .sql_null = cell.sql_null })).value;
+                    is_null.* = cell.sql_null;
+                    output_bytes +|= try @import("operators.zig").datumBytes(cell);
+                }
+                try rows.append(out, row);
+                try flags.append(out, nulls);
+                self.remaining -= 1;
+                self.emitted += 1;
+            }
+            self.exhausted = self.remaining == 0 or page.after == null;
+
+            if (output_bytes >= self.context.limits.page_bytes) break;
+        }
+        if (self.exhausted) {
+            if (self.cursor) |cursor| cursor.close(cursor.ptr);
+            self.cursor = null;
+        }
+        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows.items, .sql_nulls = flags.items, .command_tag = "SELECT" } };
+    }
+    fn columnsEligible(self: *Stream) bool {
+        const cursor = self.cursor orelse return false;
+        if (cursor.next_columns == null) return false;
+        const decisions = @import("decision_eval.zig");
+        if (self.context.binding.scalars.predicate) |*program| if (decisions.hasExternal(program)) return false;
+        for (self.context.binding.scalars.projections) |optional| if (optional) |*program| if (decisions.hasExternal(program)) return false;
+        return true;
     }
     fn pull(self: *Stream, max_rows: u32) !Page {
         try self.context.checkpoint();
         if (self.spool) |spool| return self.pullSpool(spool, max_rows);
+        if (self.columnsEligible()) return self.pullColumns(max_rows);
         var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer arena.deinit();
         const out = arena.allocator();
@@ -622,7 +757,7 @@ test "SQL decision pull streams carry trusted source routing" {
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
 }
 
-test "SQL blocking results spool once and deliver bounded continuation pages" {
+test "SQL blocking results transfer sorted operators and deliver bounded continuation pages" {
     for ([_][]const u8{
         "SELECT n FROM docs ORDER BY n DESC",
         "SELECT n % 37 AS k, count(*) AS c FROM docs GROUP BY n % 37 ORDER BY k",
@@ -636,6 +771,8 @@ test "SQL blocking results spool once and deliver bounded continuation pages" {
         const stream = (try Stream.open(std.heap.page_allocator, backend, &compiled, &.{}, .{ .result_rows = 2, .page_rows = 16, .retained_bytes = 256 * 1024 })).?;
         defer stream.close();
         try std.testing.expect(stream.spool != null);
+        try std.testing.expect(stream.spool.?.sorted != null);
+        try std.testing.expectEqual(@as(usize, 0), stream.spool.?.rows.len);
         const reads = fixture.calls;
         var seen: usize = 0;
         while (true) {

@@ -85,10 +85,10 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
             const keys = try scratch.allocator().alloc(Datum, orders.len);
             for (specification.partition, keys[0..specification.partition.len]) |column, *key| key.* = row.values[column];
             for (specification.order, keys[specification.partition.len..]) |column, *key| key.* = row.values[column];
-            try sort.add(.{ .values = row.values, .keys = keys, .ordinal = row.ordinal });
+            // Sort compact row references; wide payloads stay in their
+            // existing row store instead of being copied into every run.
+            try sort.add(.{ .values = &.{Datum.json(.{ .integer = @intCast(index) })}, .keys = keys, .ordinal = row.ordinal });
         }
-        rows.deinit();
-        rows_owned = false;
         var next = try disk.Rows.init(context.alloc, manager, width);
         errdefer next.deinit();
         var carry: ?operators.Row = null;
@@ -101,7 +101,7 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
             for (first_row.keys[0..keys.len], keys) |value, *key| key.* = try operators.cloneDatum(keys_arena.allocator(), value);
             var partition = try disk.Rows.init(context.alloc, manager, width);
             defer partition.deinit();
-            try partition.append(first_row);
+            try partition.append(try rows.row(std.math.cast(usize, first_row.values[0].value.integer) orelse return error.InvalidSqlSpill));
             while (true) {
                 _ = scratch.reset(.free_all);
                 const candidate = (try sort.next(scratch.allocator())) orelse break;
@@ -109,7 +109,7 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
                     carry = candidate;
                     break;
                 }
-                try partition.append(candidate);
+                try partition.append(try rows.row(std.math.cast(usize, candidate.values[0].value.integer) orelse return error.InvalidSqlSpill));
             }
             var starts = try disk.Integers.init(manager);
             defer starts.deinit();
@@ -134,6 +134,7 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
             for (bound.specs, 0..) |spec, column| if (spec.sort == sort_index) try window.evaluate(context, &partition, indices, specification, spec, bound.input.columns.len + column, &starts, &ends, &groups);
             for (0..partition.len) |index| try next.append(try partition.row(index));
         }
+        rows.deinit();
         rows = next;
         rows_owned = true;
     }

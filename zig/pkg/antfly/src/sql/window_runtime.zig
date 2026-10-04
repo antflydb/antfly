@@ -492,6 +492,68 @@ test "SQL window wide moving frames retain bounded indexed aggregate state" {
     std.debug.print("SQL window frames: rows={d} frame_width=8193 peak_bytes={d} elapsed_ns={d}\n", .{ count, budget.peak, std.Io.Clock.awake.now(std.testing.io).nanoseconds - started });
 }
 
+// Removable exact state gives running and sliding count/integer/boolean
+// frames linear work and constant memory. Floating-point, min/max and frame
+// exclusions retain the tree, preserving their existing numeric semantics.
+const Sliding = struct {
+    bounds: Frame = .{ .start = 0, .end = 0 },
+    count: u64 = 0,
+    sum: i128 = 0,
+    trues: u64 = 0,
+    fn eligible(spec: binding.Spec) bool {
+        if (spec.frame) |definition| if (definition.exclusion != .no_others) return false;
+        return spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and spec.type == .integer);
+    }
+    fn change(self: *Sliding, context: anytype, cells: anytype, indices: anytype, spec: binding.Spec, first: usize, end: usize, add: bool) !void {
+        for (first..end) |position| {
+            if (position % 256 == 0) try context.checkpoint();
+            const row = try at(indices, position);
+            if (spec.filter) |slot| {
+                const accepted = try getCell(cells, row, slot);
+                if (accepted.sql_null) continue;
+                if (accepted.value != .bool) return error.SqlTypeMismatch;
+                if (!accepted.value.bool) continue;
+            }
+            const value = if (spec.star) Datum.json(.{ .integer = 1 }) else try getCell(cells, row, spec.arguments[0]);
+            if (value.sql_null) continue;
+            if (add) self.count += 1 else self.count -= 1;
+            switch (spec.kind) {
+                .sum => {
+                    if (value.value != .integer) return error.SqlTypeMismatch;
+                    if (add) self.sum += value.value.integer else self.sum -= value.value.integer;
+                },
+                .bool_and, .bool_or => {
+                    if (value.value != .bool) return error.SqlTypeMismatch;
+                    if (value.value.bool) {
+                        if (add) self.trues += 1 else self.trues -= 1;
+                    }
+                },
+                else => {},
+            }
+        }
+    }
+    fn query(self: *Sliding, context: anytype, cells: anytype, indices: anytype, spec: binding.Spec, bounds: Frame) !Datum {
+        // Variable frame offsets can move backwards; restart without relying
+        // on monotonicity when intervals stop overlapping or reverse.
+        if (bounds.start < self.bounds.start or bounds.end < self.bounds.end or bounds.start > self.bounds.end) {
+            self.* = .{};
+            try self.change(context, cells, indices, spec, bounds.start, bounds.end, true);
+        } else {
+            try self.change(context, cells, indices, spec, self.bounds.start, bounds.start, false);
+            try self.change(context, cells, indices, spec, self.bounds.end, bounds.end, true);
+        }
+        self.bounds = bounds;
+        if (spec.kind == .count) return Datum.json(.{ .integer = std.math.cast(i64, self.count) orelse return error.SqlNumericOutOfRange });
+        if (self.count == 0) return .{};
+        return switch (spec.kind) {
+            .sum => Datum.json(.{ .integer = std.math.cast(i64, self.sum) orelse return error.SqlNumericOutOfRange }),
+            .bool_and => Datum.json(.{ .bool = self.trues == self.count }),
+            .bool_or => Datum.json(.{ .bool = self.trues != 0 }),
+            else => unreachable,
+        };
+    }
+};
+
 pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: binding.Sort, spec: binding.Spec, column: usize, peers_start: anytype, peers_end: anytype, groups: anytype) !void {
     const aggregate = switch (spec.kind) {
         .count, .sum, .avg, .min, .max, .bool_and, .bool_or => true,
@@ -499,7 +561,9 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
     };
     // A single contiguous tree needs no arena growth slack. It is released
     // between specifications/partitions instead of accumulating with input.
-    var tree: ?Tree = if (aggregate) try Tree.create(context, context.alloc, cells, indices, spec) else null;
+    const sliding = aggregate and Sliding.eligible(spec);
+    var running: Sliding = .{};
+    var tree: ?Tree = if (aggregate and !sliding) try Tree.create(context, context.alloc, cells, indices, spec) else null;
     defer if (tree) |*value| value.deinit(context.alloc);
     var dense: i64 = 0;
     for (0..indices.len) |position| {
@@ -543,7 +607,7 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
                 };
                 break :blk try getCell(cells, try at(indices, index), spec.arguments[0]);
             },
-            else => try tree.?.querySet(selected),
+            else => if (sliding) try running.query(context, cells, indices, spec, bounds) else try tree.?.querySet(selected),
         };
         try setCell(cells, row, column, if (result.sql_null) result else .{
             .value = try describe.coerceAlloc(if (@TypeOf(cells) == *disk.Rows) result_arena.allocator() else context.arena, result.value, spec.type),
@@ -700,4 +764,33 @@ pub fn finishCells(context: anytype, statement: ast.Select, cells: anytype) !@im
         nulls.* = bits;
     }
     return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = flags, .command_tag = "SELECT" };
+}
+
+test "SQL sliding kernels match independent tree across nullable filtered reversing frames" {
+    const Context = struct {
+        pub fn checkpoint(_: @This()) !void {}
+    };
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var values: [33][2]Datum = undefined;
+    var cells: [33][]Datum = undefined;
+    var indices: [33]usize = undefined;
+    for ([_]binding.Kind{ .count, .sum, .bool_and, .bool_or }) |kind| {
+        for (&values, &cells, &indices, 0..) |*row, *cell, *index, i| {
+            row.* = .{ if (i % 5 == 0) Datum{} else if (kind == .bool_and or kind == .bool_or) Datum.json(.{ .bool = i % 4 != 0 }) else Datum.json(.{ .integer = @as(i64, @intCast(i)) - 16 }), Datum.json(.{ .bool = i % 3 != 0 }) };
+            cell.* = row;
+            index.* = i;
+        }
+        const spec: binding.Spec = .{ .kind = kind, .arguments = &.{0}, .filter = 1, .sort = 0, .frame = null, .type = if (kind == .bool_and or kind == .bool_or) .boolean else .integer, .star = false };
+        var tree = try Tree.create(Context{}, arena.allocator(), &cells, &indices, spec);
+        defer tree.deinit(arena.allocator());
+        var sliding: Sliding = .{};
+        for (0..34) |first| for (first..34) |end| {
+            const bounds: Frame = .{ .start = first, .end = end };
+            try std.testing.expectEqualDeep(try tree.query(bounds), try sliding.query(Context{}, &cells, &indices, spec, bounds));
+        };
+        // Restart and narrow frames must not report overflow from unused rows.
+        try std.testing.expectEqualDeep(try tree.query(.{ .start = 0, .end = 3 }), try sliding.query(Context{}, &cells, &indices, spec, .{ .start = 0, .end = 3 }));
+    }
 }
