@@ -8,7 +8,8 @@ const ast = @import("ast.zig");
 const catalog = @import("catalog.zig");
 const binding = @import("aggregate_binding.zig");
 const operators = @import("operators.zig");
-const Datum = @import("scalar.zig").Datum;
+const scalar = @import("scalar.zig");
+const Datum = scalar.Datum;
 const Json = std.json.Value;
 
 fn addRow(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, alloc: std.mem.Allocator, row: catalog.Row) !void {
@@ -133,7 +134,7 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
     const offset = try context.count(statement.offset, 0);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
-    const grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes, .spill = context.spill });
+    const grouped = try operators.Grouped.create(context.alloc, bound.specs, .{ .groups = context.limits.scan_rows, .bytes = context.limits.retained_bytes / 2, .spill = context.spill });
     defer grouped.deinit();
     if (bound.group_count == 0) try grouped.ensureGlobalGroup();
     if (context.binding.table) |table| {
@@ -251,15 +252,20 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         for (bound.orders, keys) |program, *value| value.* = try context.evaluate(alloc, program, cells);
         try top.add(.{ .values = values, .keys = keys, .ordinal = group.ordinal });
     }
+    if (context.sink != null) return context.emitTop(&top, offset, limit, statement.limit == null);
     const ordered = try top.finishPage(context.arena, offset, limit + @intFromBool(statement.limit == null));
     const remaining = ordered.len;
     if (statement.limit == null and remaining > limit) return error.SqlResultTooLarge;
     const selected = ordered[0..@min(remaining, limit)];
     const rows = try context.arena.alloc([]const Json, selected.len);
     const nulls = try context.arena.alloc([]const bool, selected.len);
-    for (selected, rows, nulls) |row, *output, *null_row| {
+    const sources = try context.arena.alloc([]const ?*scalar.PatternSet, selected.len);
+    for (selected, rows, nulls, sources) |row, *output, *null_row, *pattern_row| {
         const values = try context.arena.alloc(Json, row.values.len);
         const sql_nulls = try context.arena.alloc(bool, row.values.len);
+        const patterns = try context.arena.alloc(?*scalar.PatternSet, row.values.len);
+        for (row.values, patterns) |value, *pattern| pattern.* = value.patterns;
+        pattern_row.* = patterns;
         for (row.values, values, sql_nulls) |value, *out, *sql_null| {
             out.* = try context.outputValue(value.value);
             sql_null.* = value.sql_null;
@@ -267,5 +273,5 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
         output.* = values;
         null_row.* = sql_nulls;
     }
-    return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = nulls, .command_tag = "SELECT" };
+    return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = nulls, .pattern_sources = sources, .command_tag = "SELECT" };
 }

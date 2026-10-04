@@ -24,6 +24,8 @@ pub const none = std.math.maxInt(u64);
 const frame_bytes = 25;
 
 pub const Manager = struct {
+    patterns: std.ArrayList(*scalar.PatternSet) = .empty,
+    pattern_file: ?*File = null,
     alloc: Allocator,
     io: std.Io,
     context: *anyopaque,
@@ -73,6 +75,14 @@ pub const Manager = struct {
     pub fn deinit(self: *Manager) void {
         const protection = self.io.swapCancelProtection(.blocked);
         defer _ = self.io.swapCancelProtection(protection);
+        for (self.patterns.items) |pattern| pattern.close(pattern.ptr);
+        self.patterns.deinit(self.alloc);
+        self.patterns = .empty;
+        if (self.pattern_file) |file| {
+            file.close();
+            self.alloc.destroy(file);
+        }
+        self.pattern_file = null;
         if (self.dir) |dir| dir.close(self.io);
         if (self.parent) |parent| {
             parent.deleteTree(self.io, &self.directory_name) catch {};
@@ -100,7 +110,7 @@ pub const File = struct {
         try self.manager.check();
         var bytes: std.ArrayList(u8) = .empty;
         defer bytes.deinit(self.manager.alloc);
-        var encoder: Encoder = .{ .a = self.manager.alloc, .bytes = &bytes, .limit = self.manager.max_record_bytes };
+        var encoder: Encoder = .{ .manager = self.manager, .a = self.manager.alloc, .bytes = &bytes, .limit = self.manager.max_record_bytes };
         try encoder.word(row.ordinal);
         try encoder.cells(row.values);
         try encoder.cells(row.keys);
@@ -132,12 +142,30 @@ pub const File = struct {
         if (std.hash.Wyhash.hash(0, bytes) != std.mem.readInt(u64, frame[8..16], .little)) return error.InvalidSqlSpill;
         const link = std.mem.readInt(u64, frame[16..24], .little);
         if (link != none and link >= offset) return error.InvalidSqlSpill;
-        var decoder: Decoder = .{ .a = a, .bytes = bytes };
+        var decoder: Decoder = .{ .manager = self.manager, .a = a, .bytes = bytes };
         const ordinal = try decoder.word();
         const values = try decoder.cells();
         const keys = try decoder.cells();
         if (decoder.position != bytes.len or frame[24] > 1) return error.InvalidSqlSpill;
         return .{ .row = .{ .values = values, .keys = keys, .ordinal = ordinal }, .next = link, .matched = frame[24] == 1, .following = offset + frame_bytes + len };
+    }
+    /// Fixed-size operator state/index pages share the statement disk quota.
+    pub fn writeRaw(self: *File, offset: u64, bytes: []const u8) !void {
+        try self.manager.check();
+        if (offset > self.size) return error.InvalidSqlSpill;
+        const end = std.math.add(u64, offset, bytes.len) catch return error.SqlProgramLimitExceeded;
+        const growth = end -| self.size;
+        if (growth > self.manager.max_bytes -| self.manager.live_bytes) return error.SqlProgramLimitExceeded;
+        try self.file.writePositionalAll(self.manager.io, bytes, offset);
+        self.size = @max(self.size, end);
+        self.manager.live_bytes += growth;
+        self.manager.peak_bytes = @max(self.manager.peak_bytes, self.manager.live_bytes);
+        self.manager.written_bytes += bytes.len;
+    }
+    pub fn readRaw(self: *File, offset: u64, bytes: []u8) !void {
+        try self.manager.check();
+        if (offset > self.size or bytes.len > self.size - offset) return error.InvalidSqlSpill;
+        if (try self.file.readPositionalAll(self.manager.io, bytes, offset) != bytes.len) return error.InvalidSqlSpill;
     }
     pub fn match(self: *File, offset: u64) !void {
         try self.manager.check();
@@ -146,6 +174,7 @@ pub const File = struct {
     }
 };
 const Encoder = struct {
+    manager: *Manager,
     a: Allocator,
     bytes: *std.ArrayList(u8),
     limit: usize,
@@ -166,7 +195,13 @@ const Encoder = struct {
         try self.word(values.len);
         for (values) |value| {
             try self.append(&.{@intFromBool(value.sql_null)});
-            try self.json(value.value, 0);
+            if (value.patterns) |pattern| {
+                const id = for (self.manager.patterns.items, 0..) |item, id| {
+                    if (item == pattern) break id;
+                } else return error.InvalidSqlSpill;
+                try self.append(&.{8});
+                try self.word(id);
+            } else try self.json(value.value, 0);
         }
     }
     fn json(self: *Encoder, value: std.json.Value, depth: usize) anyerror!void {
@@ -207,6 +242,7 @@ const Encoder = struct {
     }
 };
 const Decoder = struct {
+    manager: *Manager,
     a: Allocator,
     bytes: []const u8,
     position: usize = 0,
@@ -235,7 +271,12 @@ const Decoder = struct {
         for (values) |*value| {
             const flag = try self.byte();
             if (flag > 1) return error.InvalidSqlSpill;
-            value.* = .{ .sql_null = flag == 1, .value = try self.json(0) };
+            if (self.position < self.bytes.len and self.bytes[self.position] == 8) {
+                self.position += 1;
+                const id = try self.word();
+                if (id >= self.manager.patterns.items.len or flag != 0) return error.InvalidSqlSpill;
+                value.* = .{ .sql_null = false, .patterns = self.manager.patterns.items[@intCast(id)] };
+            } else value.* = .{ .sql_null = flag == 1, .value = try self.json(0) };
         }
         return values;
     }
@@ -303,7 +344,7 @@ pub const Sort = struct {
         var bytes: usize = @sizeOf(Row);
         for (row.values) |v| bytes +|= try operators.datumBytes(v);
         for (row.keys) |v| bytes +|= try operators.datumBytes(v);
-        if (bytes > self.memory_bytes / 4) return error.SqlProgramLimitExceeded;
+        if (bytes > self.memory_bytes / 3) return error.SqlProgramLimitExceeded;
         if (self.rows.items.len != 0 and (bytes > self.memory_bytes / 4 -| self.estimated)) try self.flush();
         const a = self.arena.allocator();
         const values = try a.alloc(Datum, row.values.len);

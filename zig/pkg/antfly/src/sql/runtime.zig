@@ -42,6 +42,7 @@ pub const Output = struct {
     /// Mirrors rows when present. JSON null is encoded as a value when false;
     /// true denotes SQL NULL independently of the column's logical type.
     sql_nulls: ?[]const []const bool = null,
+    pattern_sources: ?[]const []const ?*@import("scalar.zig").PatternSet = null,
     rows_affected: u64 = 0,
     command_tag: []const u8,
     mutation_outcome: ?catalog.MutationOutcome = null,
@@ -117,14 +118,14 @@ pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *co
     var result = Result{ .state = state, .output = undefined };
     errdefer result.deinit();
     const arena = state.arena.allocator();
-    result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits) catch |err| {
+    result.output = runBound(state.budget.allocator(), arena, statement_backend, compiled, parameters, limits, null) catch |err| {
         if (err == error.OutOfMemory and state.budget.exhausted) return error.SqlProgramLimitExceeded;
         return err;
     };
     return result;
 }
 
-fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits) !Output {
+fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits, sink: ?RowSink) !Output {
     if (compiled.statement == .explain) {
         const explanation = compiled.statement.explain;
         const inner: compiler.Compiled = .{ .arena = undefined, .statement = explanation.statement.*, .parameter_count = compiled.parameter_count };
@@ -147,11 +148,16 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
         manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
     };
-    const context = Context{ .alloc = alloc, .arena = arena, .backend = backend, .binding = binding, .parameters = parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null };
+    const context = Context{ .alloc = alloc, .arena = arena, .backend = backend, .binding = binding, .parameters = parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     return context.run(compiled.statement);
 }
 
+pub const RowSink = struct {
+    ptr: *anyopaque,
+    append: *const fn (*anyopaque, []const Datum) anyerror!void,
+};
 pub const Context = struct {
+    sink: ?RowSink = null,
     spill: ?*@import("spill.zig").Manager = null,
     alloc: std.mem.Allocator,
     arena: std.mem.Allocator,
@@ -162,6 +168,11 @@ pub const Context = struct {
     /// Internal relational consumers retain typed values. Decimal strings are
     /// a transport encoding, never the representation of an INSERT source.
     typed_output: bool = false,
+
+    pub fn emitTop(self: Context, top: *@import("operators.zig").TopK, offset: usize, limit: usize, implicit: bool) !Output {
+        try top.drain(self.alloc, offset, limit, implicit, self.sink.?);
+        return .{ .columns = self.binding.columns, .command_tag = "SELECT" };
+    }
 
     pub fn evaluate(self: Context, alloc: std.mem.Allocator, program: @import("scalar.zig").Program, cells: []const Datum) !Datum {
         return @import("decision_eval.zig").evaluate(alloc, self.backend.decision_provider, &program, cells, self.parameters);
@@ -229,6 +240,7 @@ pub const Context = struct {
     /// the public bigint string representation must not enter row arithmetic.
     pub fn deferredScalar(self: Context, query: *const ast.Select, bound: *const describe.BoundStatement) !@import("scalar.zig").Datum {
         var nested = self;
+        nested.sink = null;
         nested.binding = bound.*;
         nested.typed_output = true;
         nested.limits.result_rows = @min(nested.limits.result_rows, 2);
@@ -499,7 +511,7 @@ pub const Context = struct {
                             projection_values[index].?[selected_positions[row_index].?]
                         else blk: {
                             const cell = try row.cell(field);
-                            break :blk .{ .value = try coerce(scratch, cell.value, columns[index].type), .sql_null = cell.sql_null };
+                            break :blk .{ .value = try coerce(scratch, cell.value, columns[index].type), .sql_null = cell.sql_null, .patterns = cell.patterns };
                         };
                         const keys = try scratch.alloc(Datum, self.binding.order_keys.len);
                         for (self.binding.order_keys, keys) |key, *out| out.* = switch (key.source) {
@@ -507,7 +519,7 @@ pub const Context = struct {
                             .expression => |index| order_values[index].?[selected_positions[row_index].?],
                             .column => |column| blk: {
                                 const cell = try row.cell(column.path);
-                                break :blk .{ .value = try coerce(scratch, cell.value, column.type), .sql_null = cell.sql_null };
+                                break :blk .{ .value = try coerce(scratch, cell.value, column.type), .sql_null = cell.sql_null, .patterns = cell.patterns };
                             },
                         };
                         try operator.add(.{ .values = values, .keys = keys, .ordinal = visited });
@@ -548,6 +560,7 @@ pub const Context = struct {
             after = owned_next;
         }
         if (top_k) |*operator| {
+            if (self.sink != null and !defer_projection) return self.emitTop(operator, offset, limit, statement.limit == null);
             const ordered = try operator.finishPage(self.arena, offset, limit + @intFromBool(statement.limit == null));
             const remaining = ordered.len;
             const start = operator.released;
@@ -618,9 +631,9 @@ pub const Context = struct {
             const program = if (index < self.binding.scalars.projections.len) self.binding.scalars.projections[index] else null;
             const input = if (program) |expression| try self.evaluate(alloc, expression, expression_cells) else blk: {
                 const cell = try row.cell(field);
-                break :blk Datum{ .value = cell.value, .sql_null = cell.sql_null };
+                break :blk Datum{ .value = cell.value, .sql_null = cell.sql_null, .patterns = cell.patterns };
             };
-            out.* = .{ .value = try coerce(alloc, input.value, column.type), .sql_null = input.sql_null };
+            out.* = .{ .value = try coerce(alloc, input.value, column.type), .sql_null = input.sql_null, .patterns = input.patterns };
         }
         return values;
     }
@@ -641,9 +654,9 @@ pub const Context = struct {
             for (fields, self.binding.columns, projected, 0..) |field, column, *out, index| {
                 const input = if (index < columns.len and columns[index] != null) columns[index].?[row_index] else blk: {
                     const cell = try row.cell(field);
-                    break :blk Datum{ .value = cell.value, .sql_null = cell.sql_null };
+                    break :blk Datum{ .value = cell.value, .sql_null = cell.sql_null, .patterns = cell.patterns };
                 };
-                out.* = .{ .value = try coerce(alloc, input.value, column.type), .sql_null = input.sql_null };
+                out.* = .{ .value = try coerce(alloc, input.value, column.type), .sql_null = input.sql_null, .patterns = input.patterns };
             }
             values.* = projected;
         }
@@ -3023,5 +3036,49 @@ test "SQL runtime executes spilled order group distinct and join under a small s
             try std.testing.expectEqualStrings(case.first, result.output.rows[0][1].string);
             try std.testing.expectEqualStrings("1", result.output.rows[0][2].string);
         }
+    }
+}
+
+test "SQL external window partitions match memory frames ranks and navigation under small budget" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT CAST(_id AS BIGINT) AS k, row_number() OVER (PARTITION BY CAST(_id AS BIGINT) % 7 ORDER BY CAST(_id AS BIGINT)) AS rn, sum(CAST(_id AS BIGINT)) OVER (PARTITION BY CAST(_id AS BIGINT) % 7 ORDER BY CAST(_id AS BIGINT) ROWS BETWEEN 3 PRECEDING AND 2 FOLLOWING) AS s, lag(_id,2,'none') OVER (PARTITION BY CAST(_id AS BIGINT) % 7 ORDER BY CAST(_id AS BIGINT)) AS previous FROM things ORDER BY k LIMIT 3 OFFSET 990",
+        "SELECT CAST(_id AS BIGINT) AS k, rank() OVER (ORDER BY CAST(_id AS BIGINT) % 3) AS r, sum(CAST(_id AS BIGINT)) OVER (ORDER BY CAST(_id AS BIGINT) % 3 GROUPS BETWEEN 1 PRECEDING AND 1 FOLLOWING EXCLUDE CURRENT ROW) AS s, last_value(_id) OVER (ORDER BY CAST(_id AS BIGINT) RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS last FROM things ORDER BY k LIMIT 3 OFFSET 990",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var fixture: TestBackend = .{ .row_count = 1000 };
+        var native = try execute(std.heap.page_allocator, fixture.iface(), &compiled, &.{}, .{ .retained_bytes = 8 * 1024 * 1024, .page_rows = 16 });
+        defer native.deinit();
+        var backend = fixture.iface();
+        backend.execution_io = std.testing.io;
+        var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
+        defer std.debug.assert(quota.live == 0);
+        var spilled = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
+        defer spilled.deinit();
+        try std.testing.expectEqualDeep(native.output.rows, spilled.output.rows);
+        try std.testing.expectEqualDeep(native.output.sql_nulls, spilled.output.sql_nulls);
+        try std.testing.expect(spilled.state.budget.peak <= 256 * 1024);
+    }
+}
+
+test "SQL quantified subqueries retain spilled pattern sources through relational adapters" {
+    for ([_]struct { sql: []const u8, expected: ?bool }{
+        .{ .sql = "SELECT 'absent' LIKE ANY (SELECT _id FROM things)", .expected = false },
+        .{ .sql = "SELECT 'absent' LIKE ANY (SELECT _id FROM things UNION ALL SELECT NULL)", .expected = null },
+        .{ .sql = "SELECT 'absent' NOT LIKE ALL (SELECT _id FROM things)", .expected = true },
+    }) |case| {
+        var compiled = try compiler.compile(std.testing.allocator, case.sql, .{});
+        defer compiled.deinit();
+        var fixture: TestBackend = .{ .row_count = 2000 };
+        var backend = fixture.coordinated();
+        backend.execution_io = std.testing.io;
+        var output = try execute(std.heap.page_allocator, backend, &compiled, &.{}, .{ .retained_bytes = 1024 * 1024, .page_rows = 32 });
+        defer output.deinit();
+        try std.testing.expectEqual(@as(usize, 1), output.output.rows.len);
+        if (case.expected) |value| {
+            try std.testing.expect(!output.output.sql_nulls.?[0][0]);
+            try std.testing.expectEqual(value, output.output.rows[0][0].bool);
+        } else try std.testing.expect(output.output.sql_nulls.?[0][0]);
     }
 }

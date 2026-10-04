@@ -101,8 +101,9 @@ pub const Row = struct {
     /// Authoritative native null flags aligned with value.object insertion
     /// order. Null means a legacy JSON-only backend without that distinction.
     sql_nulls: ?[]const bool = null,
+    pattern_sources: ?[]const ?*@import("scalar.zig").PatternSet = null,
 
-    pub const Cell = struct { value: std.json.Value, sql_null: bool };
+    pub const Cell = struct { value: std.json.Value, sql_null: bool, patterns: ?*@import("scalar.zig").PatternSet = null };
 
     /// Decoding is explicit about the SQL/JSON null boundary. The native
     /// projection's field names are literal names, never dotted JSON paths.
@@ -114,7 +115,7 @@ pub const Row = struct {
         const value = self.value.object.values()[index];
         const sql_null = if (self.sql_nulls) |flags| flags[index] else value == .null;
         if (sql_null and value != .null) return error.InvalidSqlBackendResponse;
-        return .{ .value = value, .sql_null = sql_null };
+        return .{ .value = value, .sql_null = sql_null, .patterns = if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null };
     }
 };
 pub const Page = struct {

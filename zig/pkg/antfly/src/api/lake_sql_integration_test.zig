@@ -89,7 +89,7 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
     defer alloc.free(manifest);
     const manifest_list = try iceberg.buildTestManifestListAlloc(alloc, "object://antfly/metadata/data.avro", manifest.len, 1, 5);
     defer alloc.free(manifest_list);
-    const metadata = "{\"format-version\":2,\"table-uuid\":\"events\",\"location\":\"object://antfly\",\"current-schema-id\":7,\"current-snapshot-id\":12,\"snapshots\":[{\"snapshot-id\":12,\"sequence-number\":42,\"timestamp-ms\":1700000000000,\"manifest-list\":\"object://antfly/metadata/snap.avro\"}]}";
+    const metadata = "{\"format-version\":2,\"table-uuid\":\"events\",\"location\":\"object://antfly\",\"schemas\":[{\"schema-id\":7,\"fields\":[{\"id\":1,\"name\":\"amount\",\"required\":true,\"type\":\"long\"}]}],\"current-schema-id\":7,\"current-snapshot-id\":12,\"snapshots\":[{\"snapshot-id\":12,\"sequence-number\":42,\"timestamp-ms\":1700000000000,\"manifest-list\":\"object://antfly/metadata/snap.avro\"}]}";
     const objects = [_]struct { key: []const u8, data: []const u8 }{
         .{ .key = "metadata/version-hint.text", .data = "1\n" },
         .{ .key = "metadata/v1.metadata.json", .data = metadata },
@@ -115,6 +115,15 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         defer backend_runtime.deinit();
         var server = server_mod.ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog, .supports_query_definitions = true } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fixture.openNative } }, null);
         defer server.deinit();
+        // Exercise the shared creation hook before SQL sees the durable schema.
+        _ = schema_json.value.object.swapRemove("document_schemas");
+        _ = source.value.object.swapRemove("schema_fingerprint");
+        try schema_json.value.object.put(alloc, "base_source", source.value);
+        const provisional = try std.json.Stringify.valueAlloc(alloc, schema_json.value, .{});
+        defer alloc.free(provisional);
+        const inferred = try server.bindForeignKeySchema(alloc, try domain.Target.parse("default.public.events"), "events", provisional, "", null, .{});
+        defer alloc.free(inferred);
+        fixture.lake_schema = inferred;
         var identity: ?server_mod.AuthenticatedIdentity = null;
         const cases = [_]struct { sql: []const u8, expected: []const u8 }{
             .{ .sql = "SELECT COUNT(*) FROM events", .expected = "5" },

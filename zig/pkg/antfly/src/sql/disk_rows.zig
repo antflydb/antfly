@@ -1,0 +1,202 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+//! Indexed statement-local rows and integer arrays. Window partitions use
+//! bounded row caches; payloads and offset/state directories live on disk.
+const std = @import("std");
+const spill = @import("spill.zig");
+const operators = @import("operators.zig");
+const Datum = @import("scalar.zig").Datum;
+const A = std.mem.Allocator;
+pub const Integers = struct {
+    file: spill.File,
+    len: usize = 0,
+    buffer: []u8,
+    block: ?usize = null,
+    valid: usize = 0,
+    dirty: bool = false,
+    pub fn init(manager: *spill.Manager) !Integers {
+        var file = try manager.create();
+        errdefer file.close();
+        return .{ .file = file, .buffer = try manager.alloc.alloc(u8, 4096) };
+    }
+    pub fn deinit(self: *Integers) void {
+        self.file.manager.alloc.free(self.buffer);
+        self.file.close();
+    }
+    fn load(self: *Integers, offset: usize) !usize {
+        try self.file.manager.check();
+        const block = offset / self.buffer.len * self.buffer.len;
+        if (self.block != block) {
+            if (self.dirty) try self.file.writeRaw(self.block.?, self.buffer[0..self.valid]);
+            self.dirty = false;
+            self.block = block;
+            self.valid = @intCast(@min(self.buffer.len, self.file.size -| block));
+            if (self.valid != 0) try self.file.readRaw(block, self.buffer[0..self.valid]);
+        }
+        return offset - block;
+    }
+    pub fn append(self: *Integers, value: usize) !void {
+        const position = try self.load(self.len * 8);
+        std.mem.writeInt(u64, self.buffer[position..][0..8], value, .little);
+        self.valid = @max(self.valid, position + 8);
+        self.dirty = true;
+        self.len += 1;
+    }
+    pub fn at(self: *Integers, index: usize) !usize {
+        if (index >= self.len) return error.InvalidSqlSpill;
+        const position = try self.load(index * 8);
+        if (position + 8 > self.valid) return error.InvalidSqlSpill;
+        return std.math.cast(usize, std.mem.readInt(u64, self.buffer[position..][0..8], .little)) orelse error.InvalidSqlSpill;
+    }
+    pub fn set(self: *Integers, index: usize, value: usize) !void {
+        if (index >= self.len) return error.InvalidSqlSpill;
+        const position = try self.load(index * 8);
+        std.mem.writeInt(u64, self.buffer[position..][0..8], value, .little);
+        self.dirty = true;
+    }
+};
+pub const Identity = struct {
+    len: usize,
+    pub fn at(self: Identity, index: usize) !usize {
+        if (index >= self.len) return error.InvalidSqlSpill;
+        return index;
+    }
+};
+pub const Rows = struct {
+    a: A,
+    file: spill.File,
+    offsets: Integers,
+    len: usize = 0,
+    width: usize,
+    cache: [4]Entry,
+    tick: u64 = 0,
+    const Entry = struct { arena: std.heap.ArenaAllocator, index: ?usize = null, row: operators.Row = undefined, touched: u64 = 0 };
+    pub fn init(a: A, manager: *spill.Manager, width: usize) !Rows {
+        var file = try manager.create();
+        errdefer file.close();
+        const offsets = try Integers.init(manager);
+        var result = Rows{ .a = a, .file = file, .offsets = offsets, .width = width, .cache = undefined };
+        for (&result.cache) |*entry| entry.* = .{ .arena = std.heap.ArenaAllocator.init(a) };
+        return result;
+    }
+    pub fn deinit(self: *Rows) void {
+        for (&self.cache) |*entry| entry.arena.deinit();
+        self.offsets.deinit();
+        self.file.close();
+    }
+    pub fn append(self: *Rows, input: operators.Row) !void {
+        if (input.values.len != self.width) return error.InvalidSqlSpill;
+        const offset = try self.file.append(.{ .values = input.values, .keys = &.{}, .ordinal = input.ordinal }, spill.none);
+        try self.offsets.append(@intCast(offset));
+        self.len += 1;
+    }
+    pub fn row(self: *Rows, index: usize) !operators.Row {
+        if (index >= self.len) return error.InvalidSqlSpill;
+        self.tick +%= 1;
+        var oldest: *Entry = &self.cache[0];
+        for (&self.cache) |*entry| {
+            if (entry.index == index) {
+                entry.touched = self.tick;
+                return entry.row;
+            }
+            if (entry.index == null or entry.touched < oldest.touched) oldest = entry;
+        }
+        _ = oldest.arena.reset(.free_all);
+        oldest.index = null;
+        const decoded = try self.file.read(oldest.arena.allocator(), try self.offsets.at(index));
+        if (decoded.row.values.len != self.width) return error.InvalidSqlSpill;
+        oldest.row = decoded.row;
+        oldest.index = index;
+        oldest.touched = self.tick;
+        return oldest.row;
+    }
+    pub fn cell(self: *Rows, index: usize, column: usize) !Datum {
+        if (column >= self.width) return error.InvalidSqlSpill;
+        return (try self.row(index)).values[column];
+    }
+    pub fn setCell(self: *Rows, index: usize, column: usize, value: Datum) !void {
+        if (column >= self.width) return error.InvalidSqlSpill;
+        const before = try self.row(index);
+        const values = try self.a.dupe(Datum, before.values);
+        defer self.a.free(values);
+        values[column] = value;
+        const offset = try self.file.append(.{ .values = values, .keys = &.{}, .ordinal = before.ordinal }, spill.none);
+        try self.offsets.set(index, @intCast(offset));
+        for (&self.cache) |*entry| if (entry.index == index) {
+            entry.index = null;
+            _ = entry.arena.reset(.free_all);
+        };
+    }
+};
+
+/// Small write-back cache for fixed window state. The underlying file is
+/// already sized and charged to the statement quota before cache admission.
+pub const RawCache = struct {
+    file: spill.File,
+    a: A,
+    pages: []Page,
+    tick: u64 = 0,
+    const Page = struct { bytes: [4096]u8 = undefined, block: ?u64 = null, valid: usize = 0, dirty: bool = false, touched: u64 = 0 };
+    pub fn init(a: A, file: spill.File) !*RawCache {
+        const self = try a.create(RawCache);
+        errdefer a.destroy(self);
+        const pages = try a.alloc(Page, 4);
+        for (pages) |*page| page.* = .{};
+        self.* = .{ .a = a, .file = file, .pages = pages };
+        return self;
+    }
+    pub fn close(self: *RawCache) void {
+        const a = self.a;
+        self.file.close();
+        a.free(self.pages);
+        a.destroy(self);
+    }
+    fn load(self: *RawCache, block: u64) !*Page {
+        try self.file.manager.check();
+        self.tick +%= 1;
+        var oldest = &self.pages[0];
+        for (self.pages) |*page| {
+            if (page.block == block) {
+                page.touched = self.tick;
+                return page;
+            }
+            if (page.block == null or page.touched < oldest.touched) oldest = page;
+        }
+        if (oldest.dirty) try self.file.writeRaw(oldest.block.?, oldest.bytes[0..oldest.valid]);
+        oldest.block = null;
+        oldest.dirty = false;
+        const size: usize = @intCast(@min(4096, self.file.size -| block));
+        try self.file.readRaw(block, oldest.bytes[0..size]);
+        oldest.block = block;
+        oldest.valid = size;
+        oldest.touched = self.tick;
+        return oldest;
+    }
+    pub fn readRaw(self: *RawCache, offset: u64, bytes: []u8) !void {
+        if (offset > self.file.size or bytes.len > self.file.size - offset) return error.InvalidSqlSpill;
+        var copied: usize = 0;
+        while (copied < bytes.len) {
+            const position = offset + copied;
+            const block = position / 4096 * 4096;
+            const page = try self.load(block);
+            const start: usize = @intCast(position - block);
+            const count = @min(bytes.len - copied, page.valid - start);
+            @memcpy(bytes[copied..][0..count], page.bytes[start..][0..count]);
+            copied += count;
+        }
+    }
+    pub fn writeRaw(self: *RawCache, offset: u64, bytes: []const u8) !void {
+        if (offset > self.file.size or bytes.len > self.file.size - offset) return error.InvalidSqlSpill;
+        var copied: usize = 0;
+        while (copied < bytes.len) {
+            const position = offset + copied;
+            const block = position / 4096 * 4096;
+            const page = try self.load(block);
+            const start: usize = @intCast(position - block);
+            const count = @min(bytes.len - copied, page.valid - start);
+            @memcpy(page.bytes[start..][0..count], bytes[copied..][0..count]);
+            page.dirty = true;
+            copied += count;
+        }
+    }
+};

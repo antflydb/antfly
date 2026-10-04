@@ -132,6 +132,32 @@ pub const TopK = struct {
     }
     /// Return only the requested output window; spilled OFFSET rows are read
     /// and discarded through one scratch arena rather than retained in memory.
+    /// Consume external results one row at a time; offsets never allocate rows.
+    pub fn drain(self: *TopK, alloc: Allocator, offset: usize, limit: usize, implicit: bool, sink: anytype) !void {
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        if (self.external) |sort| {
+            self.finished = true;
+            var index: usize = 0;
+            var emitted: usize = 0;
+            while (index < self.capacity) : (index += 1) {
+                _ = arena.reset(.free_all);
+                const row = (try sort.next(arena.allocator())) orelse break;
+                if (index < offset) continue;
+                if (emitted == limit) {
+                    if (implicit) return error.SqlResultTooLarge;
+                    break;
+                }
+                try sink.append(sink.ptr, row.values);
+                emitted += 1;
+            }
+        } else {
+            const rows = try self.finish(arena.allocator());
+            const begin = @min(offset, rows.len);
+            if (implicit and rows.len - begin > limit) return error.SqlResultTooLarge;
+            for (rows[begin..][0..@min(limit, rows.len - begin)]) |row| try sink.append(sink.ptr, row.values);
+        }
+    }
     pub fn finishPage(self: *TopK, alloc: Allocator, offset: usize, limit: usize) ![]const Row {
         if (self.external) |sort| {
             self.finished = true;
@@ -736,10 +762,13 @@ pub const Grouped = struct {
         if (self.failed or self.finished) return error.InvalidSqlBackendResponse;
         if (inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         self.key_count = keys.len;
-        const mergeable = for (self.specs) |spec| {
-            if (spec.kind == .pattern_set) break false;
-        } else true;
-        if (self.external == null and self.limits.spill != null and mergeable) {
+        const disk_patterns = for (self.specs) |spec| {
+            if (spec.kind == .pattern_set) break true;
+        } else false;
+        if (self.external == null and self.limits.spill != null) {
+            if (disk_patterns) try self.startSpill();
+        }
+        if (self.external == null and self.limits.spill != null) {
             var needed: usize = 4096 + self.specs.len * @sizeOf(Aggregate) * 2;
             for (keys) |key| needed +|= (try datumBytes(key)) *| 4;
             for (inputs) |input| needed +|= (try datumBytes(input)) *| 4;
@@ -859,7 +888,7 @@ pub const Grouped = struct {
 };
 
 pub fn cloneDatum(alloc: Allocator, value: Datum) !Datum {
-    return .{ .value = try cloneJson(alloc, value.value, 0), .sql_null = value.sql_null };
+    return .{ .value = try cloneJson(alloc, value.value, 0), .sql_null = value.sql_null, .patterns = value.patterns };
 }
 
 fn cloneJson(alloc: Allocator, value: Json, depth: usize) error{ OutOfMemory, SqlProgramLimitExceeded }!Json {
@@ -1262,4 +1291,39 @@ test "SQL spilled aggregate partials merge averages extrema booleans and high ca
     try std.testing.expectEqual(@as(i64, 500), result.aggregates[7].value.integer);
     try std.testing.expectEqual(@as(i64, 124750), result.aggregates[8].value.integer);
     try std.testing.expect((try group.nextResult(arena.allocator())) == null);
+}
+
+test "SQL pattern sets spill distinct state and preserve reusable quantified null semantics" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = std.heap.page_allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const group = try Grouped.create(std.heap.page_allocator, &.{ .{ .kind = .pattern_set, .input_type = .string, .distinct = true }, .{ .kind = .pattern_set, .input_type = .string, .distinct = true } }, .{ .bytes = 128 * 1024, .spill = &manager });
+    defer group.deinit();
+    for (0..4000) |index| {
+        var bytes: [32]u8 = undefined;
+        const value = Datum.json(.{ .string = try std.fmt.bufPrint(&bytes, "pattern-{d}", .{index % 2000}) });
+        try group.add(&.{}, &.{ value, value });
+    }
+    try group.add(&.{}, &.{ .{}, Datum.json(.{ .string = "pattern-0" }) });
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = (try group.nextResult(arena.allocator())).?;
+    try std.testing.expectEqual(@as(usize, 2001), result.aggregates[0].patterns.?.count);
+    try std.testing.expectEqual(@as(usize, 2000), result.aggregates[1].patterns.?.count);
+    const operand: ast.Scalar = .{ .literal = .{ .string = "absent" } };
+    const patterns: ast.Scalar = .{ .column = "p" };
+    const no: ast.Scalar = .{ .literal = .{ .boolean = false } };
+    const expression: ast.Scalar = .{ .call = .{ .name = "$pattern_quantified", .args = &.{ &operand, &patterns, &no, &no, &no } } };
+    var program = try scalar.bind(std.testing.allocator, &expression, &.{.{ .name = "p", .type = .json }}, &.{}, .{});
+    defer program.deinit();
+    for (0..2) |_| {
+        const nullable = try program.evaluate(arena.allocator(), &.{result.aggregates[0]}, &.{}, .{});
+        try std.testing.expect(nullable.sql_null);
+        const nonnullable = try program.evaluate(arena.allocator(), &.{result.aggregates[1]}, &.{}, .{});
+        try std.testing.expect(!nonnullable.sql_null and !nonnullable.value.bool);
+    }
+    try std.testing.expect(manager.written_bytes > 128 * 1024);
 }

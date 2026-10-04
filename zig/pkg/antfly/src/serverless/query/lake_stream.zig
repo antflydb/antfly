@@ -59,7 +59,10 @@ pub const Stream = struct {
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
     group_index: usize = 0,
     current: ?parquet.OwnedBatch = null,
+    page_cursor: ?@import("lake_parquet_cursor.zig").Cursor = null,
     deleted: []types.RowRef = &.{},
+    schema_contract: []const @import("lake_schema.zig").Column = &.{},
+    file_columns: []const []const u8 = &.{},
 
     pub fn init(alloc: Allocator, source: *serving.ServingSource, columns: []const []const u8, predicates: []const Predicate, context: Context, limits: Limits) !Stream {
         try context.ensureActive();
@@ -87,10 +90,15 @@ pub const Stream = struct {
     fn clearFile(self: *Stream) void {
         if (self.source.scanner.shared_reader) |reader| reader.drain(true);
         self.clearBatch();
+        if (self.page_cursor) |*cursor| cursor.deinit();
+        self.page_cursor = null;
         if (self.deleted.len != 0) self.alloc.free(self.deleted);
         self.deleted = &.{};
         if (self.discovered) |*plan| plan.deinit(self.alloc);
         self.discovered = null;
+        for (self.file_columns) |name| self.alloc.free(name);
+        self.alloc.free(self.file_columns);
+        self.file_columns = &.{};
         self.group_index = 0;
     }
     /// The returned vectors remain valid until the next pull or close.
@@ -99,6 +107,11 @@ pub const Stream = struct {
         self.clearBatch();
         if (self.source.scanner.shared_reader) |reader| reader.drain(false);
         while (true) {
+            if (self.page_cursor) |*cursor| {
+                if (try cursor.next()) |batch| return batch;
+                cursor.deinit();
+                self.page_cursor = null;
+            }
             if (self.discovered) |*plan| {
                 while (self.group_index < plan.row_group_plan.row_groups.len) {
                     const input = plan.row_group_plan.row_groups[self.group_index];
@@ -111,17 +124,17 @@ pub const Stream = struct {
                         continue;
                     }
                     if (group.row_count > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
-                    self.current = parquet.buildSupportedI64RowGroupBatchFromMaybeCachedCoalescedObjectRangeReaderAlloc(self.alloc, self.source.scanner.reader(), self.source.scanner.cache, plan.inventory, input.file_id, input.row_group_ordinal, self.columns, self.source.scanner.coalesce_options, .{
+                    self.page_cursor = try @import("lake_parquet_cursor.zig").Cursor.init(self.alloc, self.source.scanner.reader(), plan.inventory, input.file_id, input.row_group_ordinal, if (self.schema_contract.len != 0) self.file_columns else self.columns, .{
                         .max_rows = self.limits.max_row_group_rows,
                         .max_struct_allocation_bytes = self.limits.max_decoded_bytes,
                         .max_input_bytes = self.limits.max_input_bytes,
                         .max_decoded_bytes = self.limits.max_decoded_bytes,
-                    }) catch |err| return serving.normalizeLakeFooterDiscoveryError(err);
+                    });
                     self.stats.groups_decoded += 1;
                     self.stats.rows_examined += group.row_count;
                     try self.context.ensureActive();
                     try self.prefetchNext();
-                    return self.current.?.batch;
+                    return try self.page_cursor.?.next();
                 }
                 self.clearFile();
             }
@@ -129,7 +142,7 @@ pub const Stream = struct {
             const index = self.files[self.file_index];
             self.file_index += 1;
             const file = self.source.inventory.files[index];
-            if (!fileMayMatch(file, self.predicates)) {
+            if (!fileMayMatch(file, self.predicates) or (if (self.source.partition_rules) |rules| !@import("lake_partition_pruning.zig").mayMatch(rules.items, file, self.predicates) else false)) {
                 self.stats.files_pruned += 1;
                 continue;
             }
@@ -175,10 +188,50 @@ pub const Stream = struct {
         var inventory = self.source.inventory;
         inventory.files = self.source.inventory.files[index..][0..1];
         inventory.deleted_row_groups = &.{};
-        self.discovered = if (self.source.scanner.cache) |cache|
-            try parquet.discoverSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc(self.alloc, self.source.scanner.reader(), cache, inventory, self.columns, 64 * 1024)
-        else
-            try parquet.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(self.alloc, self.source.scanner.reader(), inventory, self.columns, 64 * 1024);
+        if (self.schema_contract.len != 0) {
+            var footer = try @import("lake_schema.zig").readFooter(self.alloc, self.source.scanner.reader(), inventory.files[0]);
+            defer footer.deinit(self.alloc);
+            if (footer.schema_columns.len == 0) return error.ExternalLakeSchemaUnavailable;
+            for (self.schema_contract) |expected| {
+                const leaf = for (footer.schema_columns) |candidate| {
+                    if (std.mem.eql(u8, candidate.column_id, expected.name)) break candidate;
+                } else null;
+                if (leaf) |found| {
+                    if (!std.mem.eql(u8, try @import("lake_schema.zig").parquetKind(found), expected.kind) or (expected.required and found.nullable)) return error.ExternalLakeSchemaMismatch;
+                } else if (expected.required) return error.ExternalLakeSchemaMismatch;
+            }
+            if (footer.row_count == 0) return;
+            var columns: std.ArrayList([]const u8) = .empty;
+            errdefer {
+                for (columns.items) |name| self.alloc.free(name);
+                columns.deinit(self.alloc);
+            }
+            for (self.columns) |wanted| for (footer.schema_columns) |leaf| {
+                if (std.mem.eql(u8, leaf.column_id, wanted)) {
+                    const name = try self.alloc.dupe(u8, wanted);
+                    errdefer self.alloc.free(name);
+                    try columns.append(self.alloc, name);
+                    break;
+                }
+            };
+            // A physical driver supplies row refs when every selected column
+            // is absent. SQL's existing missing-cell contract returns NULL.
+            if (columns.items.len == 0) {
+                const name = try self.alloc.dupe(u8, footer.schema_columns[0].column_id);
+                errdefer self.alloc.free(name);
+                try columns.append(self.alloc, name);
+            }
+            self.file_columns = try columns.toOwnedSlice(self.alloc);
+            var enriched = try @import("lake_parquet_metadata.zig").enrichInventoryFileWithFooterAlloc(self.alloc, inventory, inventory.files[0].file_id, footer);
+            errdefer enriched.deinit(self.alloc);
+            const plan = try parquet.planSupportedI64ObjectRangeRowGroupsAlloc(self.alloc, enriched, self.file_columns);
+            self.discovered = .{ .inventory = enriched, .row_group_plan = plan };
+        } else {
+            self.discovered = if (self.source.scanner.cache) |cache|
+                try parquet.discoverSupportedI64ObjectRangeRowGroupsFromCachedFootersAlloc(self.alloc, self.source.scanner.reader(), cache, inventory, self.columns, 64 * 1024)
+            else
+                try parquet.discoverSupportedI64ObjectRangeRowGroupsFromFootersAlloc(self.alloc, self.source.scanner.reader(), inventory, self.columns, 64 * 1024);
+        }
         self.stats.files_opened += 1;
         std.mem.sort(parquet.ObjectRangeRowGroupInput, self.discovered.?.row_group_plan.row_groups, {}, struct {
             fn less(_: void, a: parquet.ObjectRangeRowGroupInput, b: parquet.ObjectRangeRowGroupInput) bool {
@@ -203,7 +256,7 @@ pub const Stream = struct {
         for (self.files) |index| {
             try self.context.ensureActive();
             try self.loadFile(index);
-            total = std.math.add(u64, total, self.discovered.?.inventory.files[0].row_count) catch return error.LakeRowsScanBudgetExceeded;
+            if (self.discovered) |plan| total = std.math.add(u64, total, plan.inventory.files[0].row_count) catch return error.LakeRowsScanBudgetExceeded;
             self.clearFile();
         }
         self.file_index = self.files.len;
@@ -249,7 +302,7 @@ pub fn groupMayMatch(group: external.RowGroup, predicates: []const Predicate) bo
         if (!std.mem.eql(u8, chunk.column_id, predicate.column)) continue;
         // Decimal/timestamp annotations change comparison semantics relative
         // to their physical statistics. Keep those predicates residual.
-        if (chunk.logical_type.len != 0) continue;
+        if (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string")) continue;
         const matches = switch (predicate.value) {
             .integer => |value| if (chunk.stats_min_i64) |min| if (chunk.stats_max_i64) |max| rangeMayMatch(i64, min, max, value, predicate.op) else true else true,
             .bytes => |value| if (chunk.stats_min_bytes) |min| if (chunk.stats_max_bytes) |max| rangeMayMatch([]const u8, min, max, value, predicate.op) else true else true,

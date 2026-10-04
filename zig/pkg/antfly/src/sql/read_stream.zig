@@ -1,10 +1,9 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Elastic-2.0
 
-//! Pull execution for order-preserving scan/filter/projection plans. Binding
-//! and parameters live once per cursor; native/evaluation/result pages share
-//! one memory budget and are reclaimed before the next pull. Blocking plans
-//! explicitly decline this path, never pretend that LIMIT is a continuation.
+//! Pull execution for scan/filter/projection plans and disk-spooled blocking
+//! results. Binding and parameters live once per cursor; evaluation/result
+//! pages share one memory budget and are reclaimed before the next pull.
 const std = @import("std");
 const catalog = @import("catalog.zig");
 const compiler = @import("compiler.zig");
@@ -196,13 +195,31 @@ test "SQL pull stream unwinds every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationScenario, .{});
 }
 
+const Spool = struct {
+    manager: @import("spill.zig").Manager,
+    shared: ?*@import("spill.zig").Manager = null,
+    rows: @import("disk_rows.zig").Rows,
+    index: usize = 0,
+    fn append(raw: *anyopaque, values: []const @import("scalar.zig").Datum) !void {
+        const self: *Spool = @ptrCast(@alignCast(raw));
+        try self.rows.append(.{ .values = values, .keys = &.{}, .ordinal = self.rows.len });
+    }
+    fn close(self: *Spool) void {
+        const a = self.rows.a;
+        self.rows.deinit();
+        if (self.shared == null) self.manager.deinit();
+        a.destroy(self);
+    }
+};
 pub const Stream = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     settings: ?*@import("setting_catalog.zig").View = null,
     context: runtime.Context,
     cursor: ?catalog.Cursor = null,
+    spool: ?*Spool = null,
     fields: []const []const u8,
+    request: catalog.Scan,
     after: ?[]u8 = null,
     skip: usize,
     remaining: usize,
@@ -213,8 +230,8 @@ pub const Stream = struct {
     failed: bool = false,
 
     /// Caller retains the compiled plan and backend until close. A null result
-    /// means a blocking plan, which may use the bounded materializing executor.
-    /// No row reads or mutations occur on that decline path.
+    /// selects the bounded materializing executor for unsupported shapes or
+    /// when spilling is unavailable. No row reads occur on that decline path.
     pub fn open(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits) !?*Stream {
         if (compiled.statement != .select) return null;
         if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
@@ -225,6 +242,13 @@ pub const Stream = struct {
         self.budget = .{ .backing = alloc, .limit = limits.retained_bytes };
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer self.arena.deinit();
+        self.spool = null;
+        self.cursor = null;
+        self.after = null;
+        self.visited = 0;
+        self.pages = 0;
+        self.emitted = 0;
+        self.failed = false;
         self.settings = null;
         errdefer if (self.settings) |view| view.deinit();
         const arena = self.arena.allocator();
@@ -237,19 +261,55 @@ pub const Stream = struct {
         }
         const binding = try describe.bind(arena, statement_backend, compiled, &.{});
         const statement = if (binding.relation) |relation| relation.statement else compiled.statement.select;
-        if (binding.aggregate != null or binding.window != null or binding.table == null or
-            statement.count_all or (binding.order_keys.len != 0 and !binding.primary_order))
-        {
-            if (self.settings) |view| view.deinit();
-            self.arena.deinit();
-            alloc.destroy(self);
-            return null;
-        }
         self.context = .{ .alloc = self.budget.allocator(), .arena = arena, .backend = @import("decision_eval.zig").scopedBackend(statement_backend, binding), .binding = binding, .parameters = &.{}, .limits = limits, .typed_output = true };
         const params = try arena.alloc(Json, parameters.len);
         for (parameters, params) |value, *out| out.* = try self.context.outputValue(value);
         self.context.parameters = params;
         try @import("decision_eval.zig").validateStatement(arena, statement_backend.decision_provider, binding, params);
+        if (binding.aggregate != null or binding.window != null or binding.table == null or statement.count_all or (binding.order_keys.len != 0 and !binding.primary_order)) {
+            const decisions = @import("decision_eval.zig");
+            var external = false;
+            for (binding.scalars.projections) |optional| if (optional) |*program| {
+                external = external or decisions.hasExternal(program);
+            };
+            if (binding.aggregate) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
+            if (binding.window) |bound| external = external or decisions.hasExternalPrograms(bound.outputs) or decisions.hasExternalPrograms(bound.orders);
+            if (external or (backend.execution_io == null and backend.spill_manager == null) or limits.spill_bytes == 0 or binding.table == null) {
+                if (self.settings) |view| view.deinit();
+                self.arena.deinit();
+                alloc.destroy(self);
+                return null;
+            }
+            const owner = try self.budget.allocator().create(Spool);
+            errdefer self.budget.allocator().destroy(owner);
+            owner.manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+            owner.shared = backend.spill_manager;
+            const manager = owner.shared orelse &owner.manager;
+            errdefer if (owner.shared == null) owner.manager.deinit();
+            owner.rows = try @import("disk_rows.zig").Rows.init(self.budget.allocator(), manager, binding.columns.len);
+            errdefer owner.rows.deinit();
+            owner.index = 0;
+            self.context.spill = manager;
+            self.context.sink = .{ .ptr = owner, .append = Spool.append };
+            self.context.limits.result_rows = limits.scan_rows;
+            const output = try self.context.select(compiled.statement.select);
+            // Constant/count and bounded fallback paths return ordinary rows.
+            for (output.rows, 0..) |row, index| {
+                var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
+                defer scratch.deinit();
+                const values = try scratch.allocator().alloc(@import("scalar.zig").Datum, row.len);
+                for (row, values, 0..) |value, *cell, column| cell.* = .{ .value = value, .sql_null = if (output.sql_nulls) |flags| flags[index][column] else value == .null };
+                try Spool.append(owner, values);
+            }
+            self.spool = owner;
+            self.fields = &.{};
+            self.request = .{ .fields = &.{}, .limit = limits.page_rows };
+            self.skip = 0;
+            self.remaining = owner.rows.len;
+            self.exhausted = owner.rows.len == 0;
+            self.context.sink = null;
+            return self;
+        }
         const table = binding.table.?;
         const predicates = try self.context.conditions(table, statement.predicate);
         var fields: std.ArrayList([]const u8) = .empty;
@@ -282,24 +342,22 @@ pub const Stream = struct {
         self.failed = false;
         self.exhausted = predicates.empty or self.remaining == 0;
         self.cursor = null;
+        self.request = .{ .fields = needed.items, .primary_order = binding.primary_order, .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = limits.page_rows };
         if (!self.exhausted) {
             if (binding.relation != null) {
                 self.cursor = try @import("relation_runtime.zig").openCursor(self.context);
             } else {
-                const open_scan = backend.vtable.open_scan orelse return error.SqlStatementSnapshotRequired;
-                self.cursor = (try open_scan(backend.ptr, self.budget.allocator(), table, .{
-                    .fields = needed.items,
-                    .primary_order = binding.primary_order,
-                    .primary_key = predicates.primary_key,
-                    .conditions = predicates.terms.items,
-                    .limit = limits.page_rows,
-                })) orelse return error.SqlStatementSnapshotRequired;
+                if (backend.vtable.open_scan) |open_scan| {
+                    self.cursor = try open_scan(backend.ptr, self.budget.allocator(), table, self.request);
+                }
+                if (self.cursor == null and !backend.pinned_statement_snapshot) return error.SqlStatementSnapshotRequired;
             }
         }
         return self;
     }
 
     pub fn close(self: *Stream) void {
+        if (self.spool) |spool| spool.close();
         if (self.cursor) |cursor| cursor.close(cursor.ptr);
         if (self.after) |after| self.budget.allocator().free(after);
         if (self.settings) |view| view.deinit();
@@ -313,6 +371,8 @@ pub const Stream = struct {
         if (max_rows == 0 or max_rows > 4096) return error.InvalidSqlLimit;
         return self.pull(max_rows) catch |err| {
             self.failed = true;
+            if (self.spool) |spool| spool.close();
+            self.spool = null;
             // A failed pull is terminal. Release native snapshots immediately;
             // a portal that remains named must not retain storage admission.
             if (self.cursor) |cursor| cursor.close(cursor.ptr);
@@ -322,8 +382,35 @@ pub const Stream = struct {
         };
     }
 
+    fn pullSpool(self: *Stream, spool: *Spool, max_rows: u32) !Page {
+        var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        const count = @min(max_rows, spool.rows.len - spool.index);
+        const rows = try a.alloc([]const Json, count);
+        const flags = try a.alloc([]const bool, count);
+        var bytes: usize = 0;
+        var read: usize = 0;
+        for (rows, flags) |*out, *bits| {
+            const row = try spool.rows.row(spool.index);
+            out.* = try a.alloc(Json, row.values.len);
+            bits.* = try a.alloc(bool, row.values.len);
+            for (row.values, @constCast(out.*), @constCast(bits.*)) |value, *cell, *flag| {
+                cell.* = (try @import("operators.zig").cloneDatum(a, value)).value;
+                flag.* = value.sql_null;
+                bytes +|= try @import("operators.zig").datumBytes(value);
+            }
+            spool.index += 1;
+            read += 1;
+            if (bytes >= self.context.limits.page_bytes) break;
+        }
+        self.emitted += read;
+        self.exhausted = spool.index == spool.rows.len;
+        return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
+    }
     fn pull(self: *Stream, max_rows: u32) !Page {
         try self.context.checkpoint();
+        if (self.spool) |spool| return self.pullSpool(spool, max_rows);
         var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer arena.deinit();
         const out = arena.allocator();
@@ -339,8 +426,10 @@ pub const Stream = struct {
             defer page_arena.deinit();
             const native_scratch = page_arena.allocator();
             const wanted: u32 = @intCast(@min(self.context.limits.page_rows, @min(self.remaining, max_rows - rows.items.len) +| self.skip));
-            const cursor = self.cursor orelse return error.InvalidSqlBackendResponse;
-            const page = try cursor.next(cursor.ptr, native_scratch, wanted);
+            var request = self.request;
+            request.limit = wanted;
+            request.after = self.after;
+            const page = if (self.cursor) |cursor| try cursor.next(cursor.ptr, native_scratch, wanted) else try self.context.backend.vtable.scan(self.context.backend.ptr, native_scratch, self.context.binding.table.?, request);
             defer page.deinit();
             if (page.rows.len > wanted) return error.InvalidSqlBackendResponse;
             if (self.visited + page.rows.len > self.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
@@ -531,4 +620,43 @@ test "SQL decision pull streams carry trusted source routing" {
     var page = try stream.next(1);
     defer page.deinit();
     try std.testing.expectEqual(@as(usize, 1), provider.calls);
+}
+
+test "SQL blocking results spool once and deliver bounded continuation pages" {
+    for ([_][]const u8{
+        "SELECT n FROM docs ORDER BY n DESC",
+        "SELECT n % 37 AS k, count(*) AS c FROM docs GROUP BY n % 37 ORDER BY k",
+        "SELECT n, row_number() OVER (ORDER BY n DESC) AS r FROM docs ORDER BY n DESC",
+    }, [_]usize{ 1000, 37, 1000 }) |sql, expected| {
+        var compiled = try compiler.compile(std.testing.allocator, sql, .{});
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .count = 1000 };
+        var backend = fixture.backend();
+        backend.execution_io = std.testing.io;
+        const stream = (try Stream.open(std.heap.page_allocator, backend, &compiled, &.{}, .{ .result_rows = 2, .page_rows = 16, .retained_bytes = 256 * 1024 })).?;
+        defer stream.close();
+        try std.testing.expect(stream.spool != null);
+        const reads = fixture.calls;
+        var seen: usize = 0;
+        while (true) {
+            var result = try stream.next(7);
+            defer result.deinit();
+            try std.testing.expect(result.output.rows.len <= 7);
+            if (expected == 1000) {
+                for (result.output.rows) |row| {
+                    try std.testing.expectEqual(@as(i64, @intCast(999 - seen)), row[0].integer);
+                    seen += 1;
+                }
+            } else {
+                seen += result.output.rows.len;
+            }
+            if (result.exhausted) break;
+        }
+        try std.testing.expectEqual(expected, seen);
+        try std.testing.expectEqual(reads, fixture.calls);
+        try std.testing.expect(stream.budget.peak <= 256 * 1024);
+        fixture.cancel = true;
+        try std.testing.expectError(error.QueryCanceled, stream.next(1));
+        try std.testing.expect(stream.spool == null);
+    }
 }

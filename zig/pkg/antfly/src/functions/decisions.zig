@@ -239,7 +239,7 @@ pub fn normalizeResponse(a: std.mem.Allocator, questions: Json, source: Json) !J
         try put(a, &normalized, q.key_ptr.*, answer);
     }
     var result = response;
-    try put(a, &result, "answers", normalized);
+    result.object.getPtr("answers").?.* = normalized;
     return result;
 }
 pub const Request = struct { decider: []const u8, questions: Json, input: []const u8, source_table: []const u8 = "" };

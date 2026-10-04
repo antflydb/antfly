@@ -28,7 +28,7 @@ class ExternalLakeTableSource:
             table_id (str):
             format_ (ExternalLakeTableSourceFormat):
             uri (str):
-            schema_fingerprint (str):
+            schema_fingerprint (str | Unset):  Default: 'auto'.
             write_policy (ExternalLakeTableSourceWritePolicy | Unset):  Default:
                 ExternalLakeTableSourceWritePolicy.READ_ONLY.
             credentials (ExternalLakeCredentialRef | Unset):
@@ -39,7 +39,7 @@ class ExternalLakeTableSource:
     table_id: str
     format_: ExternalLakeTableSourceFormat
     uri: str
-    schema_fingerprint: str
+    schema_fingerprint: str | Unset = "auto"
     write_policy: ExternalLakeTableSourceWritePolicy | Unset = ExternalLakeTableSourceWritePolicy.READ_ONLY
     credentials: ExternalLakeCredentialRef | Unset = UNSET
     snapshot: ExternalLakeSnapshotSelector | Unset = UNSET
@@ -75,9 +75,10 @@ class ExternalLakeTableSource:
                 "table_id": table_id,
                 "format": format_,
                 "uri": uri,
-                "schema_fingerprint": schema_fingerprint,
             }
         )
+        if schema_fingerprint is not UNSET:
+            field_dict["schema_fingerprint"] = schema_fingerprint
         if write_policy is not UNSET:
             field_dict["write_policy"] = write_policy
         if credentials is not UNSET:
@@ -101,7 +102,7 @@ class ExternalLakeTableSource:
 
         uri = d.pop("uri")
 
-        schema_fingerprint = d.pop("schema_fingerprint")
+        schema_fingerprint = d.pop("schema_fingerprint", UNSET)
 
         _write_policy = d.pop("write_policy", UNSET)
         write_policy: ExternalLakeTableSourceWritePolicy | Unset

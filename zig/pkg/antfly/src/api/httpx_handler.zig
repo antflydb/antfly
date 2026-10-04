@@ -382,6 +382,10 @@ fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []cons
 fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const jsonErrorResponse = AntflyApiHandler.jsonErrorResponse;
     return switch (err) {
+        error.UnsupportedExternalLakeSchemaType => jsonErrorResponse(ctx, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
+        error.ExternalLakeSchemaMismatch => jsonErrorResponse(ctx, 409, "lake files have incompatible column types or the supplied schema fingerprint does not match the detected schema"),
+        error.ExternalLakeSchemaUnavailable => jsonErrorResponse(ctx, 400, "lake schema metadata is unavailable; Parquet inference requires at least one file with a schema"),
+        error.ExternalLakeSchemaTooLarge => jsonErrorResponse(ctx, 400, "detected lake schema exceeds the 1024-column limit"),
         error.ReservedForeignKeySupportIndex => jsonErrorResponse(ctx, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => jsonErrorResponse(ctx, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => jsonErrorResponse(ctx, 409, "foreign-key support changed or is still building; refresh the schema and retry"),

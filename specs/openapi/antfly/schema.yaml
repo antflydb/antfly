@@ -445,7 +445,7 @@ components:
       type: object
       additionalProperties: false
       description: Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows.
-      required: [kind, table_id, format, uri, schema_fingerprint]
+      required: [kind, table_id, format, uri]
       properties:
         kind:
           type: string
@@ -461,6 +461,7 @@ components:
           minLength: 1
         schema_fingerprint:
           type: string
+          default: auto
           minLength: 1
         write_policy:
           type: string

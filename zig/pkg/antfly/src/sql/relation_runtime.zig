@@ -361,7 +361,7 @@ fn Engine(comptime Context: type) type {
                             self.pages += 1;
                             if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
                             const cursor = self.engine.cursors[scan.index];
-                            self.page = try cursor.next(cursor.ptr, self.arena.allocator(), self.engine.context.limits.page_rows);
+                            self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(@min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
                             if (self.page.?.rows.len > self.engine.context.limits.page_rows) return error.InvalidSqlBackendResponse;
                             self.page_index = 0;
                             self.eof = self.page.?.after == null;
@@ -373,7 +373,7 @@ fn Engine(comptime Context: type) type {
                         const values = try alloc.alloc(Datum, self.node.columns.len);
                         for (scan.source_columns, self.node.columns, values) |name, column, *out| {
                             const cell = try @import("joined_mutation.zig").cell(alloc, row, name);
-                            out.* = .{ .value = try describe.coerceAlloc(alloc, cell.value, column.type), .sql_null = cell.sql_null };
+                            out.* = .{ .value = try describe.coerceAlloc(alloc, cell.value, column.type), .sql_null = cell.sql_null, .patterns = cell.patterns };
                         }
                         break :blk values;
                     },
@@ -390,6 +390,7 @@ fn Engine(comptime Context: type) type {
                             var adapter: Adapter = .{ .engine = self.engine, .iterator = self.left.?, .table = query.binding.table.? };
                             var context = self.engine.context;
                             context.backend = adapter.iface();
+                            context.sink = null;
                             context.binding = query.binding;
                             context.binding.relation = null;
                             context.arena = self.arena.allocator();
@@ -402,7 +403,7 @@ fn Engine(comptime Context: type) type {
                         const sql_nulls = if (output.sql_nulls) |nulls| nulls[self.output_index] else null;
                         self.output_index += 1;
                         const values = try alloc.alloc(Datum, row.len);
-                        for (row, self.node.columns, values, 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerceAlloc(alloc, value, column.type), .sql_null = if (sql_nulls) |flags| flags[i] else value == .null };
+                        for (row, self.node.columns, values, 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerceAlloc(alloc, value, column.type), .sql_null = if (sql_nulls) |flags| flags[i] else value == .null, .patterns = if (output.pattern_sources) |sources| sources[self.output_index - 1][i] else null };
                         break :blk values;
                     },
                 };
@@ -431,17 +432,20 @@ fn Engine(comptime Context: type) type {
                     var page_bytes: usize = 0;
                     var rows: std.ArrayList(catalog.Row) = .empty;
                     var cells: std.ArrayList([]const Datum) = .empty;
-                    const wanted = @min(context.limits.page_rows, self.query_remaining +| self.query_skip);
+                    // Each nested stage leaves room for upstream pages, bindings and spill operators.
+                    const wanted = @min(@min(context.limits.page_rows, @max(@as(usize, 1), context.limits.retained_bytes / (16 * 1024 + query.source.columns.len * @sizeOf(Datum) * 16))), self.query_remaining +| self.query_skip);
                     while (rows.items.len < wanted) {
                         const input = try self.left.?.next(scratch) orelse break;
                         try self.engine.checkpoint();
                         var object: std.json.ObjectMap = .empty;
                         const nulls = try scratch.alloc(bool, input.len);
+                        const sources = try scratch.alloc(?*scalar.PatternSet, input.len);
+                        for (input, sources) |cell, *source| source.* = cell.patterns;
                         for (input, query.source.columns, nulls) |cell, column, *is_null| {
                             try object.put(scratch, column.internal, cell.value);
                             is_null.* = cell.sql_null;
                         }
-                        const row: catalog.Row = .{ .id = "", .version = 0, .value = .{ .object = object }, .sql_nulls = nulls };
+                        const row: catalog.Row = .{ .id = "", .version = 0, .value = .{ .object = object }, .sql_nulls = nulls, .pattern_sources = sources };
                         try rows.append(scratch, row);
                         try cells.append(scratch, try context.binding.scalars.cells(scratch, row));
                         for (input) |cell| page_bytes +|= try operators.datumBytes(cell);
@@ -710,13 +714,15 @@ fn Engine(comptime Context: type) type {
                     for (values) |value| bytes +|= try operators.datumBytes(value);
                     var object: std.json.ObjectMap = .empty;
                     const nulls = try alloc.alloc(bool, values.len);
+                    const sources = try alloc.alloc(?*scalar.PatternSet, values.len);
+                    for (values, sources) |value, *source| source.* = value.patterns;
                     for (values, self.iterator.node.columns, nulls) |value, column, *sql_null| {
                         const owned = try operators.cloneDatum(alloc, value);
                         try object.put(alloc, column.internal, owned.value);
                         sql_null.* = owned.sql_null;
                     }
                     self.ordinal += 1;
-                    try rows.append(alloc, .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal}), .version = 0, .value = .{ .object = object }, .sql_nulls = nulls });
+                    try rows.append(alloc, .{ .id = try std.fmt.allocPrint(alloc, "{d}", .{self.ordinal}), .version = 0, .value = .{ .object = object }, .sql_nulls = nulls, .pattern_sources = sources });
                     if (bytes >= self.engine.context.limits.page_bytes) {
                         stopped_for_bytes = true;
                         break;

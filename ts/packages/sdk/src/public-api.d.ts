@@ -13731,7 +13731,8 @@ export interface components {
             /** @enum {string} */
             format: "parquet" | "iceberg";
             uri: string;
-            schema_fingerprint: string;
+            /** @default auto */
+            schema_fingerprint?: string;
             /**
              * @default read_only
              * @enum {string}

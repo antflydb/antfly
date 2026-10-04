@@ -11420,7 +11420,7 @@ pub const ExternalLakeTableSource = struct {
     table_id: []const u8,
     format: []const u8,
     uri: []const u8,
-    schema_fingerprint: []const u8,
+    schema_fingerprint: ?[]const u8 = null,
     write_policy: ?[]const u8 = null,
     credentials: ?ExternalLakeCredentialRef = null,
     snapshot: ?ExternalLakeSnapshotSelector = null,
@@ -11431,7 +11431,7 @@ pub const ExternalLakeTableSource = struct {
         .{ "table_id", "table_id", false },
         .{ "format", "format", false },
         .{ "uri", "uri", false },
-        .{ "schema_fingerprint", "schema_fingerprint", false },
+        .{ "schema_fingerprint", "schema_fingerprint", true },
         .{ "write_policy", "write_policy", true },
         .{ "credentials", "credentials", true },
         .{ "snapshot", "snapshot", true },
@@ -11455,8 +11455,10 @@ pub const ExternalLakeTableSource = struct {
         try jw.write(self.format);
         try jw.objectField("uri");
         try jw.write(self.uri);
-        try jw.objectField("schema_fingerprint");
-        try jw.write(self.schema_fingerprint);
+        if (self.schema_fingerprint) |value| {
+            try jw.objectField("schema_fingerprint");
+            try jw.write(value);
+        }
         if (self.write_policy) |value| {
             try jw.objectField("write_policy");
             try jw.write(value);

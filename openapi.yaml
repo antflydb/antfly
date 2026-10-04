@@ -27258,7 +27258,6 @@ components:
         - table_id
         - format
         - uri
-        - schema_fingerprint
       properties:
         kind:
           type: string
@@ -27277,6 +27276,7 @@ components:
           minLength: 1
         schema_fingerprint:
           type: string
+          default: auto
           minLength: 1
         write_policy:
           type: string

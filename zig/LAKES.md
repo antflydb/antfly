@@ -22,8 +22,8 @@ immutable lake files:
 ## Native SQL Serving Implementation
 
 Read-only lake attachments now use the native SQL catalog and execution runtime.
-The serving cursor pulls existing typed `ColumnBatch` vectors one row group at a
-time. SQL aggregates can consume selected vector cells without constructing row
+The serving cursor aligns independently decoded Parquet column pages into typed
+`ColumnBatch` vectors. SQL aggregates can consume selected vector cells without constructing row
 JSON; row pages remain available to public queries and existing operators. The
 provider contract exposes optional column pulls and exact metadata counts, so
 other native sources can adopt the same execution interface incrementally.
@@ -51,12 +51,26 @@ spill quota defaults to 1 GiB and 64 open files. Private files are immediately
 unlinked and close on success/error/cancellation. Small inputs keep the existing
 in-memory paths. The exact datum codec preserves integers and SQL/JSON nulls.
 
-Large individual row groups retain the existing 32 MiB materialization bound.
-Window input partitions, pattern-set aggregate state, and result buffers still
-obey SQL's retained-memory budget. Page-sized decoding remains future work.
-Iceberg partition pruning needs a transform-aware proof; raw partition values
-alone are insufficient. These layers stay behind the same snapshot-bound
-provider contract.
+Table creation can infer and persist columns/fingerprints from every Parquet
+footer or the selected Iceberg schema. Inference preserves requiredness and
+rejects incompatible or unsupported flat types; nested/binary schemas need a
+compatible source. SQL never changes catalog types while reading files. Empty
+Iceberg tables can serve zero rows. Optional missing Parquet columns are SQL NULL.
+
+Parquet cursors retain one decoded page per projected column and dictionary,
+aligning different page boundaries while preserving physical row ordinals.
+The active page set retains the 32 MiB input/decoded budgets; oversized individual
+pages/dictionaries still fail. Iceberg file pruning uses spec/source field IDs
+and inclusive identity, bucket, truncate and temporal projections. Unknown
+transforms or values remain residual.
+
+Window partition rows, peer/group directories and frame trees now share the
+statement spill quota, with small tracked caches. Quantified pattern sets use
+external DISTINCT and a reusable file, reading one pattern per match step.
+Sorted/grouped/window pgwire results can spool final rows and serve bounded portal
+pages without retaining the entire response or rescanning sources. HTTP JSON
+response limits and bounded materialization for blocking external decision
+projections remain. These layers use the same native snapshot-bound providers.
 
 ## Relationship To Arrow, Parquet, Iceberg, And Lance
 

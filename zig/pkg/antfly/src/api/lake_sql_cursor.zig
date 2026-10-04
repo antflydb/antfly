@@ -67,8 +67,8 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         const column = try table.column(condition.column);
         const Predicate = @import("../serverless/query/lake_stream.zig").Predicate;
         const value: @FieldType(Predicate, "value") = switch (out.value) {
-            .integer => |v| if (column.type == .integer) .{ .integer = v } else continue,
-            .string => |v| if (column.type == .string) .{ .bytes = v } else continue,
+            .integer => |v| if (column.type == .integer or column.type == .datetime) .{ .integer = v } else continue,
+            .string => |v| if (column.type == .string) .{ .bytes = v } else if (column.type == .datetime) .{ .integer = std.math.cast(i64, @import("../datetime.zig").parseRfc3339ToSignedNs(v) orelse continue) orelse continue } else continue,
             .bool => |v| if (column.type == .boolean) .{ .boolean = v } else continue,
             else => continue,
         };
@@ -77,6 +77,14 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     const normalized = try context.platformDeadline();
     var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
+    if (std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
+        var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;
+        for (table.columns) |column| {
+            if (std.mem.eql(u8, column.name, "_id")) continue;
+            try contract.append(owned, .{ .name = column.path, .kind = @tagName(column.type), .required = !column.nullable });
+        }
+        stream.schema_contract = contract.items;
+    }
     const owner = try alloc.create(Owner);
     errdefer alloc.destroy(owner);
     owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = if (request.after) |v| try owned.dupe(u8, v) else null, .primary_key = if (request.primary_key) |v| try owned.dupe(u8, v) else null };
@@ -220,7 +228,7 @@ const Owner = struct {
                 continue;
             }
             last_id = try @import("../storage/rowsource/identity.zig").allocId(alloc, batch.row_refs[selected[count - 1]]);
-            const end = self.position == batch.rowCount() and self.stream.file_index == self.stream.files.len and self.stream.group_index == self.stream.discovered.?.row_group_plan.row_groups.len;
+            const end = self.position == batch.rowCount() and (self.stream.page_cursor == null or self.stream.page_cursor.?.position == self.stream.page_cursor.?.group.row_count) and self.stream.file_index == self.stream.files.len and self.stream.group_index == self.stream.discovered.?.row_group_plan.row_groups.len;
             return .{ .batch = view, .selection = selected[0..count], .after = if (end or self.primary_key != null) null else last_id };
         }
         return .{ .batch = .{ .snapshot = .{ .table_id = self.stream.source.inventory.source_id, .snapshot_id = self.stream.source.inventory.snapshot_id }, .row_refs = &.{}, .columns = &.{} }, .selection = &.{} };
@@ -339,6 +347,7 @@ test "lake SQL cursor scans real Parquet with residual filtering before page lim
 }
 
 const TestLake = struct {
+    page_rows: usize = std.math.maxInt(usize),
     memory: @import("../storage/object_storage.zig").MemoryObjectStorage,
     inventory: @import("../serverless/external_source/types.zig").Inventory = undefined,
     meter: Meter = undefined,
@@ -375,7 +384,7 @@ const TestLake = struct {
     fn populate(self: *TestLake, alloc: Allocator, count: usize, values: []const i64) !void {
         var client = self.memory.client();
         try client.makeBucket("bucket");
-        const data = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .values = values, .field_id = 1, .write_statistics = true }});
+        const data = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .values = values, .field_id = 1, .write_statistics = true, .page_rows = self.page_rows }});
         defer alloc.free(data);
         for (0..count) |i| {
             const key = try std.fmt.allocPrint(alloc, "events/{d}.parquet", .{i});
@@ -554,4 +563,36 @@ test "lake SQL typed stream applies Iceberg equality and position deletes before
     var mismatched = lake.table;
     mismatched.external_base_source.?.binding.schema_fingerprint = "another-schema";
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, openPinned(alloc, mismatched, .{ .fields = &.{}, .limit = 1 }, .{}, &lake.source));
+}
+
+test "lake SQL Parquet page cursor preserves row ordinals and bounds decoded row group memory" {
+    const a = std.testing.allocator;
+    const values = try a.alloc(i64, 8192);
+    defer a.free(values);
+    for (values, 0..) |*value, index| value.* = @intCast(index);
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a), .page_rows = 64 };
+    try lake.populate(a, 1, values);
+    defer lake.deinit(a);
+    var budget: @import("../sql/memory_budget.zig") = .{ .backing = a, .limit = 1024 * 1024 };
+    {
+        const cursor = try openPinned(budget.allocator(), lake.table, .{ .fields = &.{"amount"}, .limit = 17 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        var count: usize = 0;
+        while (true) {
+            var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+            defer scratch.deinit();
+            const page = try cursor.next_columns.?(cursor.ptr, scratch.allocator(), 17);
+            for (0..page.selection.len) |index| {
+                try std.testing.expectEqual(@as(i64, @intCast(count)), (try page.cell(scratch.allocator(), index, "amount")).value.integer);
+                try std.testing.expectEqual(@as(u64, @intCast(count)), page.batch.row_refs[page.selection[index]].external.row_ordinal);
+                count += 1;
+            }
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqual(values.len, count);
+        const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+        try std.testing.expectEqual(@as(usize, 1), owner.stream.stats.groups_decoded);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.peak < 256 * 1024);
 }

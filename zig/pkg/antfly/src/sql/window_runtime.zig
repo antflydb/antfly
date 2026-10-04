@@ -13,6 +13,30 @@ const Datum = scalar.Datum;
 const Json = std.json.Value;
 const Allocator = std.mem.Allocator;
 
+const disk = @import("disk_rows.zig");
+const Cells = union(enum) {
+    memory: []const []Datum,
+    disk: *disk.Rows,
+    fn from(value: anytype) Cells {
+        return if (@TypeOf(value) == *disk.Rows) .{ .disk = value } else .{ .memory = value };
+    }
+    fn get(self: Cells, row: usize, column: usize) !Datum {
+        return switch (self) {
+            .memory => |rows| rows[row][column],
+            .disk => |rows| rows.cell(row, column),
+        };
+    }
+};
+fn getCell(rows: anytype, row: usize, column: usize) !Datum {
+    return Cells.from(rows).get(row, column);
+}
+fn at(values: anytype, index: usize) !usize {
+    return if (@TypeOf(values) == disk.Identity or @TypeOf(values) == *disk.Integers) values.at(index) else (@as([]const usize, values))[index];
+}
+fn setCell(rows: anytype, row: usize, column: usize, value: Datum) !void {
+    if (@TypeOf(rows) == *disk.Rows) try rows.setCell(row, column, value) else rows[row][column] = value;
+}
+
 fn compare(a: Datum, b: Datum, direction: operators.Order) !std.math.Order {
     if (a.sql_null or b.sql_null) {
         if (a.sql_null == b.sql_null) return .eq;
@@ -21,8 +45,8 @@ fn compare(a: Datum, b: Datum, direction: operators.Order) !std.math.Order {
     const result = try scalar.compare(a.value, b.value);
     return if (direction.descending) result.invert() else result;
 }
-fn equal(cells: []const []Datum, a: usize, b: usize, columns: []const usize) !bool {
-    for (columns) |column| if (try compare(cells[a][column], cells[b][column], .{}) != .eq) return false;
+pub fn equal(cells: anytype, a: usize, b: usize, columns: []const usize) !bool {
+    for (columns) |column| if (try compare(try getCell(cells, a, column), try getCell(cells, b, column), .{}) != .eq) return false;
     return true;
 }
 fn Sorter(comptime Context: type) type {
@@ -83,7 +107,7 @@ fn rowBoundary(context: anytype, bound: ast.Window.Bound, position: usize, count
     return @intCast(@max(0, @min(@as(i128, @intCast(count)), index)));
 }
 
-fn rangeBoundary(context: anytype, bound: ast.Window.Bound, cells: []const []Datum, indices: []const usize, spec: binding.Sort, position: usize, peer_start: usize, peer_end: usize, end: bool) !usize {
+fn rangeBoundary(context: anytype, bound: ast.Window.Bound, cells: anytype, indices: anytype, spec: binding.Sort, position: usize, peer_start: usize, peer_end: usize, end: bool) !usize {
     switch (bound) {
         .unbounded_preceding => return 0,
         .unbounded_following => return indices.len,
@@ -97,7 +121,7 @@ fn rangeBoundary(context: anytype, bound: ast.Window.Bound, cells: []const []Dat
     });
     const column = spec.order[0];
     const direction = spec.directions[0];
-    const current = cells[indices[position]][column];
+    const current = try getCell(cells, try at(indices, position), column);
     if (current.sql_null) return if (end) peer_end else peer_start;
     if (current.value != .integer and current.value != .float) return error.SqlTypeMismatch;
     const subtract = (bound == .preceding) != direction.descending;
@@ -107,7 +131,7 @@ fn rangeBoundary(context: anytype, bound: ast.Window.Bound, cells: []const []Dat
     var high = indices.len;
     while (low < high) {
         const middle = low + (high - low) / 2;
-        const value = cells[indices[middle]][column];
+        const value = try getCell(cells, try at(indices, middle), column);
         const order: std.math.Order = if (value.sql_null)
             (if (direction.nulls_first orelse direction.descending) .lt else .gt)
         else blk: {
@@ -123,18 +147,18 @@ fn rangeBoundary(context: anytype, bound: ast.Window.Bound, cells: []const []Dat
 }
 
 const Frame = struct { start: usize, end: usize };
-fn frame(context: anytype, spec: binding.Spec, sort: binding.Sort, cells: []const []Datum, indices: []const usize, position: usize, peer_start: usize, peer_end: usize, groups: []const usize, group_index: usize) !Frame {
+fn frame(context: anytype, spec: binding.Spec, sort: binding.Sort, cells: anytype, indices: anytype, position: usize, peer_start: usize, peer_end: usize, groups: anytype, group_index: usize) !Frame {
     const definition = spec.frame orelse ast.Window.Frame{ .mode = .range, .start = .unbounded_preceding, .end = .current };
     const start = if (definition.mode == .rows)
         try rowBoundary(context, definition.start, position, indices.len, false)
     else if (definition.mode == .groups)
-        groups[try rowBoundary(context, definition.start, group_index, groups.len - 1, false)]
+        try at(groups, try rowBoundary(context, definition.start, group_index, groups.len - 1, false))
     else
         try rangeBoundary(context, definition.start, cells, indices, sort, position, peer_start, peer_end, false);
     const end = if (definition.mode == .rows)
         try rowBoundary(context, definition.end, position, indices.len, true)
     else if (definition.mode == .groups)
-        groups[try rowBoundary(context, definition.end, group_index, groups.len - 1, true)]
+        try at(groups, try rowBoundary(context, definition.end, group_index, groups.len - 1, true))
     else
         try rangeBoundary(context, definition.end, cells, indices, sort, position, peer_start, peer_end, true);
     return .{ .start = start, .end = @max(start, end) };
@@ -215,24 +239,40 @@ const Node = struct {
 const Tree = struct {
     nodes: []Node,
     base: usize,
-    cells: []const []Datum,
+    cells: Cells,
+    file: ?*disk.RawCache = null,
     spec: binding.Spec,
 
-    fn create(context: anytype, alloc: Allocator, cells: []const []Datum, indices: []const usize, spec: binding.Spec) !Tree {
+    fn create(context: anytype, alloc: Allocator, cells: anytype, indices: anytype, spec: binding.Spec) !Tree {
         const base = try std.math.ceilPowerOfTwo(usize, @max(1, indices.len));
-        const nodes = try alloc.alloc(Node, try std.math.mul(usize, base, 2));
+        const count = try std.math.mul(usize, base, 2);
+        const nodes: []Node = if (@TypeOf(cells) == *disk.Rows) &.{} else try alloc.alloc(Node, count);
         errdefer alloc.free(nodes);
         @memset(nodes, .{});
-        var result = Tree{ .nodes = nodes, .base = base, .cells = cells, .spec = spec };
-        for (indices, 0..) |row, index| {
+        var result = Tree{ .nodes = nodes, .base = base, .cells = Cells.from(cells), .spec = spec };
+        if (@TypeOf(cells) == *disk.Rows) {
+            var file = try context.spill.?.create();
+            errdefer file.close();
+            const zeros: [4096]u8 = @splat(0);
+            var remaining = try std.math.mul(usize, count, 72);
+            while (remaining != 0) {
+                const size = @min(remaining, zeros.len);
+                try file.writeRaw(file.size, zeros[0..size]);
+                remaining -= size;
+            }
+            result.file = try disk.RawCache.init(alloc, file);
+        }
+        errdefer if (result.file) |file| file.close();
+        for (0..indices.len) |index| {
+            const row = try at(indices, index);
             if (index % 256 == 0) try context.checkpoint();
             if (spec.filter) |slot| {
-                const accepted = cells[row][slot];
+                const accepted = try getCell(cells, row, slot);
                 if (accepted.sql_null) continue;
                 if (accepted.value != .bool) return error.SqlTypeMismatch;
                 if (!accepted.value.bool) continue;
             }
-            const value = if (spec.star) Datum.json(.{ .integer = 1 }) else cells[row][spec.arguments[0]];
+            const value = if (spec.star) Datum.json(.{ .integer = 1 }) else try getCell(cells, row, spec.arguments[0]);
             if (value.sql_null) continue;
             var node = Node{ .count = 1, .selected = row };
             switch (spec.kind) {
@@ -247,15 +287,39 @@ const Tree = struct {
                 },
                 else => {},
             }
-            nodes[base + index] = node;
+            try result.setNode(base + index, node);
         }
         var index = base;
         while (index > 1) {
             index -= 1;
             if (index % 256 == 0) try context.checkpoint();
-            nodes[index] = try result.combine(nodes[2 * index], nodes[2 * index + 1]);
+            try result.setNode(index, try result.combine(try result.getNode(2 * index), try result.getNode(2 * index + 1)));
         }
         return result;
+    }
+    fn deinit(self: *Tree, alloc: Allocator) void {
+        if (self.file) |file| file.close();
+        alloc.free(self.nodes);
+    }
+    fn getNode(self: Tree, index: usize) !Node {
+        if (self.file) |file| {
+            var bytes: [72]u8 = undefined;
+            try file.readRaw(index * 72, &bytes);
+            return .{ .count = std.mem.readInt(u64, bytes[0..8], .little), .integer_sum = @bitCast(std.mem.readInt(u128, bytes[8..24], .little)), .number = @bitCast(std.mem.readInt(u128, bytes[24..40], .little)), .compensation = @bitCast(std.mem.readInt(u128, bytes[40..56], .little)), .selected = @intCast(std.mem.readInt(u64, bytes[56..64], .little)), .true_count = std.mem.readInt(u64, bytes[64..72], .little) };
+        }
+        return self.nodes[index];
+    }
+    fn setNode(self: *Tree, index: usize, node: Node) !void {
+        if (self.file) |file| {
+            var bytes: [72]u8 = undefined;
+            std.mem.writeInt(u64, bytes[0..8], node.count, .little);
+            std.mem.writeInt(u128, bytes[8..24], @bitCast(node.integer_sum), .little);
+            std.mem.writeInt(u128, bytes[24..40], @bitCast(node.number), .little);
+            std.mem.writeInt(u128, bytes[40..56], @bitCast(node.compensation), .little);
+            std.mem.writeInt(u64, bytes[56..64], node.selected, .little);
+            std.mem.writeInt(u64, bytes[64..72], node.true_count, .little);
+            try file.writeRaw(index * 72, &bytes);
+        } else self.nodes[index] = node;
     }
     fn combine(self: Tree, left: Node, right: Node) !Node {
         if (left.count == 0) return right;
@@ -266,13 +330,13 @@ const Tree = struct {
         result.true_count += right.true_count;
         switch (self.spec.kind) {
             .min, .max => {
-                const order = try scalar.compare(self.cells[left.selected][self.spec.arguments[0]].value, self.cells[right.selected][self.spec.arguments[0]].value);
+                const order = try scalar.compare((try self.cells.get(left.selected, self.spec.arguments[0])).value, (try self.cells.get(right.selected, self.spec.arguments[0])).value);
                 if (order == (if (self.spec.kind == .min) std.math.Order.gt else .lt)) result.selected = right.selected;
             },
             .avg => {
                 // Integer inputs retain an exact wide sum; do not invoke
                 // software quad-precision arithmetic for their unused mean.
-                if (self.cells[result.selected][self.spec.arguments[0]].value != .integer) {
+                if ((try self.cells.get(result.selected, self.spec.arguments[0])).value != .integer) {
                     const left_weight = @as(f128, @floatFromInt(left.count)) / @as(f128, @floatFromInt(result.count));
                     const right_weight = @as(f128, @floatFromInt(right.count)) / @as(f128, @floatFromInt(result.count));
                     result.number = left.number * left_weight + right.number * right_weight;
@@ -306,12 +370,12 @@ const Tree = struct {
         var result: Node = .{};
         while (left < right) {
             if (left % 2 != 0) {
-                result = try self.combine(result, self.nodes[left]);
+                result = try self.combine(result, try self.getNode(left));
                 left += 1;
             }
             if (right % 2 != 0) {
                 right -= 1;
-                result = try self.combine(result, self.nodes[right]);
+                result = try self.combine(result, try self.getNode(right));
             }
             left /= 2;
             right /= 2;
@@ -323,10 +387,10 @@ const Tree = struct {
         if (result.count == 0) return .{};
         return switch (self.spec.kind) {
             .sum => Datum.json(if (self.spec.type == .integer) .{ .integer = std.math.cast(i64, result.integer_sum) orelse return error.SqlNumericOutOfRange } else .{ .float = try finite(result.number + result.compensation) }),
-            .avg => Datum.json(.{ .float = if (self.cells[result.selected][self.spec.arguments[0]].value == .integer) @as(f64, @floatFromInt(result.integer_sum)) / @as(f64, @floatFromInt(result.count)) else try finite(result.number) }),
+            .avg => Datum.json(.{ .float = if ((try self.cells.get(result.selected, self.spec.arguments[0])).value == .integer) @as(f64, @floatFromInt(result.integer_sum)) / @as(f64, @floatFromInt(result.count)) else try finite(result.number) }),
             .bool_and => Datum.json(.{ .bool = result.true_count == result.count }),
             .bool_or => Datum.json(.{ .bool = result.true_count != 0 }),
-            .min, .max => self.cells[result.selected][self.spec.arguments[0]],
+            .min, .max => try self.cells.get(result.selected, self.spec.arguments[0]),
             else => unreachable,
         };
     }
@@ -428,29 +492,32 @@ test "SQL window wide moving frames retain bounded indexed aggregate state" {
     std.debug.print("SQL window frames: rows={d} frame_width=8193 peak_bytes={d} elapsed_ns={d}\n", .{ count, budget.peak, std.Io.Clock.awake.now(std.testing.io).nanoseconds - started });
 }
 
-fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: binding.Sort, spec: binding.Spec, column: usize, peers_start: []const usize, peers_end: []const usize, groups: []const usize) !void {
+pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: binding.Sort, spec: binding.Spec, column: usize, peers_start: anytype, peers_end: anytype, groups: anytype) !void {
     const aggregate = switch (spec.kind) {
         .count, .sum, .avg, .min, .max, .bool_and, .bool_or => true,
         else => false,
     };
     // A single contiguous tree needs no arena growth slack. It is released
     // between specifications/partitions instead of accumulating with input.
-    const tree: ?Tree = if (aggregate) try Tree.create(context, context.alloc, cells, indices, spec) else null;
-    defer if (tree) |value| context.alloc.free(value.nodes);
+    var tree: ?Tree = if (aggregate) try Tree.create(context, context.alloc, cells, indices, spec) else null;
+    defer if (tree) |*value| value.deinit(context.alloc);
     var dense: i64 = 0;
-    for (indices, 0..) |row, position| {
+    for (0..indices.len) |position| {
+        const row = try at(indices, position);
+        var result_arena = std.heap.ArenaAllocator.init(context.alloc);
+        defer result_arena.deinit();
         try context.checkpoint();
-        if (peers_start[position] == position) dense += 1;
-        const bounds = try frame(context, spec, sort, cells, indices, position, peers_start[position], peers_end[position], groups, @intCast(dense - 1));
-        const selected = FrameSet.init(bounds, if (spec.frame) |definition| definition.exclusion else .no_others, position, peers_start[position], peers_end[position]);
+        if ((try at(peers_start, position)) == position) dense += 1;
+        const bounds = try frame(context, spec, sort, cells, indices, position, (try at(peers_start, position)), (try at(peers_end, position)), groups, @intCast(dense - 1));
+        const selected = FrameSet.init(bounds, if (spec.frame) |definition| definition.exclusion else .no_others, position, (try at(peers_start, position)), (try at(peers_end, position)));
         const result: Datum = switch (spec.kind) {
             .row_number => Datum.json(.{ .integer = @intCast(position + 1) }),
-            .rank => Datum.json(.{ .integer = @intCast(peers_start[position] + 1) }),
+            .rank => Datum.json(.{ .integer = @intCast((try at(peers_start, position)) + 1) }),
             .dense_rank => Datum.json(.{ .integer = dense }),
-            .percent_rank => Datum.json(.{ .float = if (indices.len <= 1) 0 else @as(f64, @floatFromInt(peers_start[position])) / @as(f64, @floatFromInt(indices.len - 1)) }),
-            .cume_dist => Datum.json(.{ .float = @as(f64, @floatFromInt(peers_end[position])) / @as(f64, @floatFromInt(indices.len)) }),
+            .percent_rank => Datum.json(.{ .float = if (indices.len <= 1) 0 else @as(f64, @floatFromInt((try at(peers_start, position)))) / @as(f64, @floatFromInt(indices.len - 1)) }),
+            .cume_dist => Datum.json(.{ .float = @as(f64, @floatFromInt((try at(peers_end, position)))) / @as(f64, @floatFromInt(indices.len)) }),
             .ntile => blk: {
-                const buckets = (try integer(cells[indices[0]][spec.arguments[0]])) orelse break :blk Datum{};
+                const buckets = (try integer(try getCell(cells, try at(indices, 0), spec.arguments[0]))) orelse break :blk Datum{};
                 if (buckets <= 0) return error.InvalidSqlParameters;
                 const count: usize = @intCast(buckets);
                 const base = indices.len / count;
@@ -460,28 +527,28 @@ fn evaluate(context: anytype, cells: [][]Datum, indices: []const usize, sort: bi
                 break :blk Datum.json(.{ .integer = @intCast(bucket + 1) });
             },
             .lag, .lead => blk: {
-                const distance = if (spec.arguments.len > 1) (try integer(cells[row][spec.arguments[1]])) orelse break :blk Datum{} else 1;
+                const distance = if (spec.arguments.len > 1) (try integer(try getCell(cells, row, spec.arguments[1]))) orelse break :blk Datum{} else 1;
                 const target: i128 = @as(i128, @intCast(position)) + (if (spec.kind == .lag) -@as(i128, distance) else @as(i128, distance));
-                if (target < 0 or target >= indices.len) break :blk if (spec.arguments.len > 2) cells[row][spec.arguments[2]] else Datum{};
-                break :blk cells[indices[@intCast(target)]][spec.arguments[0]];
+                if (target < 0 or target >= indices.len) break :blk if (spec.arguments.len > 2) try getCell(cells, row, spec.arguments[2]) else Datum{};
+                break :blk try getCell(cells, try at(indices, @intCast(target)), spec.arguments[0]);
             },
             .first_value, .last_value, .nth_value => blk: {
                 const index: usize = if (spec.kind == .last_value) last: {
                     if (selected.len == 0) break :blk Datum{};
                     break :last selected.parts[selected.len - 1].end - 1;
                 } else if (spec.kind == .first_value) selected.nth(0) orelse break :blk Datum{} else nth: {
-                    const n = (try integer(cells[row][spec.arguments[1]])) orelse break :blk Datum{};
+                    const n = (try integer(try getCell(cells, row, spec.arguments[1]))) orelse break :blk Datum{};
                     if (n <= 0) return error.InvalidSqlParameters;
                     break :nth selected.nth(@intCast(n - 1)) orelse break :blk Datum{};
                 };
-                break :blk cells[indices[index]][spec.arguments[0]];
+                break :blk try getCell(cells, try at(indices, index), spec.arguments[0]);
             },
             else => try tree.?.querySet(selected),
         };
-        cells[row][column] = if (result.sql_null) result else .{
-            .value = try describe.coerceAlloc(context.arena, result.value, spec.type),
+        try setCell(cells, row, column, if (result.sql_null) result else .{
+            .value = try describe.coerceAlloc(if (@TypeOf(cells) == *disk.Rows) result_arena.allocator() else context.arena, result.value, spec.type),
             .sql_null = false,
-        };
+        });
     }
 }
 
@@ -495,10 +562,12 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
     const offset = try context.count(statement.offset, 0);
     if (limit > context.limits.result_rows or offset > context.limits.scan_rows) return error.SqlProgramLimitExceeded;
     if (limit == 0) return .{ .columns = context.binding.columns, .command_tag = "SELECT" };
+    if (context.spill != null) if (try @import("window_spill.zig").execute(context, statement)) |output| return output;
     var state = std.heap.ArenaAllocator.init(context.alloc);
     defer state.deinit();
     const alloc = state.allocator();
     var input_context = context;
+    input_context.sink = null;
     input_context.binding = bound.input.*;
     input_context.arena = alloc;
     input_context.typed_output = true;
@@ -510,6 +579,10 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
         @memset(values.*, .{});
         for (row, bound.input.columns, values.*[0..row.len], 0..) |value, column, *out, i| out.* = .{ .value = try describe.coerceAlloc(alloc, value, column.type), .sql_null = if (input.sql_nulls) |flags| flags[index][i] else value == .null };
     }
+    return evaluateCells(context, statement, cells);
+}
+pub fn evaluateCells(context: anytype, statement: ast.Select, cells: [][]Datum) !@import("runtime.zig").Output {
+    const bound = context.binding.window.?;
     for (bound.sorts, 0..) |sort, sort_index| {
         try context.checkpoint();
         var sorted = std.heap.ArenaAllocator.init(context.alloc);
@@ -550,6 +623,27 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
             start = end;
         }
     }
+    return finishCells(context, statement, cells);
+}
+fn rowCells(cells: anytype, alloc: Allocator, index: usize) ![]const Datum {
+    if (@TypeOf(cells) == *disk.Rows) {
+        const row = try cells.row(index);
+        const values = try alloc.alloc(Datum, row.values.len);
+        for (row.values, values) |value, *out| out.* = try operators.cloneDatum(alloc, value);
+        return values;
+    }
+    return cells[index];
+}
+fn rowOrdinal(cells: anytype, index: usize) !u64 {
+    return if (@TypeOf(cells) == *disk.Rows) (try cells.row(index)).ordinal else index;
+}
+pub fn finishCells(context: anytype, statement: ast.Select, cells: anytype) !@import("runtime.zig").Output {
+    const bound = context.binding.window.?;
+    const limit = try context.count(statement.limit, context.limits.result_rows);
+    const offset = try context.count(statement.offset, 0);
+    var output_state = std.heap.ArenaAllocator.init(context.alloc);
+    defer output_state.deinit();
+    const alloc = output_state.allocator();
     const orders = try alloc.alloc(operators.Order, statement.order_by.len);
     for (statement.order_by, orders) |order, *out| out.* = .{ .descending = order.descending, .nulls_first = order.nulls_first };
     var top = try operators.TopK.initWithSpill(context.alloc, offset + limit + @intFromBool(statement.limit == null), orders, context.limits.retained_bytes, context.spill);
@@ -567,26 +661,28 @@ pub fn execute(context: anytype, statement: ast.Select) anyerror!@import("runtim
             var page: std.ArrayList([]const Datum) = .empty;
             var bytes: usize = 0;
             while (begin + page.items.len < cells.len and page.items.len < context.limits.page_rows) {
-                const row = cells[begin + page.items.len];
+                const row = try rowCells(cells, a, begin + page.items.len);
                 try page.append(a, row);
                 for (row) |cell| bytes +|= try operators.datumBytes(cell);
                 if (bytes >= context.limits.page_bytes) break;
             }
             const ordinals = try a.alloc(u64, page.items.len);
-            for (ordinals, begin..) |*ordinal, index| ordinal.* = index;
+            for (ordinals, begin..) |*out_ordinal, index| out_ordinal.* = try rowOrdinal(cells, index);
             try projection.add(context, a, &top, page.items, ordinals);
             begin += page.items.len;
         }
         return projection.finish(context, &top, offset, limit, statement.limit == null);
-    } else for (cells, 0..) |row, index| {
+    } else for (0..cells.len) |index| {
         try context.checkpoint();
         _ = eval.reset(.retain_capacity);
+        const row = try rowCells(cells, eval.allocator(), index);
         const values = try eval.allocator().alloc(Datum, bound.outputs.len);
         for (bound.outputs, values) |program, *out| out.* = try context.evaluate(eval.allocator(), program, row);
         const keys = try eval.allocator().alloc(Datum, bound.orders.len);
         for (bound.orders, keys) |program, *out| out.* = try context.evaluate(eval.allocator(), program, row);
-        try top.add(.{ .values = values, .keys = keys, .ordinal = index });
+        try top.add(.{ .values = values, .keys = keys, .ordinal = try rowOrdinal(cells, index) });
     }
+    if (context.sink != null) return context.emitTop(&top, offset, limit, statement.limit == null);
     const ordered = try top.finishPage(alloc, offset, limit + @intFromBool(statement.limit == null));
     const remaining = ordered.len;
     if (statement.limit == null and remaining > limit) return error.SqlResultTooLarge;

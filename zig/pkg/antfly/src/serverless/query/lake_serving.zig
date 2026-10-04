@@ -343,6 +343,7 @@ pub const ServingSource = struct {
     store: object_store_support.OpenedObjectStore,
     inventory: external_source_api.Inventory,
     scanner: PinnedExternalObjectStorageLakeRowsScanner,
+    partition_rules: ?@import("lake_partition_pruning.zig").Rules = null,
     context_store: ?*@import("lake_read_context.zig").Store = null,
 
     pub fn open(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: configured_store.BindingObjectStoreOpenOptions) !ServingSource {
@@ -357,9 +358,11 @@ pub const ServingSource = struct {
         const context_store = try alloc.create(@import("lake_read_context.zig").Store);
         errdefer alloc.destroy(context_store);
         context_store.* = .{ .base = store.client, .context = context };
-        const client = context_store.client(alloc);
+        var client = context_store.client(alloc);
         const base = if (store.fs_client != null) try std.fmt.allocPrint(alloc, "object://{s}/{s}", .{ store.bucket, store.prefix }) else null;
         defer if (base) |value| alloc.free(value);
+        var partition_rules: ?@import("lake_partition_pruning.zig").Rules = null;
+        errdefer if (partition_rules) |*rules| rules.deinit();
         var deletes: ?serverless_query.LakeIcebergDeletePlan = null;
         errdefer if (deletes) |*value| value.deinit(alloc);
         var inventory = switch (binding.format) {
@@ -389,6 +392,11 @@ pub const ServingSource = struct {
                     alloc.free(@constCast(snapshot.inventory.source_uri));
                     snapshot.inventory.source_uri = uri_copy;
                 }
+                if (snapshot.inventory.files.len != 0) {
+                    const metadata_bytes = try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, uri, .iceberg_metadata, null, 16 * 1024 * 1024);
+                    defer alloc.free(metadata_bytes);
+                    partition_rules = try @import("lake_partition_pruning.zig").parseAlloc(alloc, uri, metadata_bytes, snapshot.inventory.snapshot_id, binding.snapshot_mode.pinnedSnapshotId(), snapshot.inventory.schema_fingerprint);
+                }
                 try serverless_query.pinLakeIcebergInventoryDataFileObjectVersionsAlloc(alloc, client, &snapshot.inventory);
                 break :blk snapshot.inventory;
             },
@@ -398,7 +406,7 @@ pub const ServingSource = struct {
         try serverless_query.validateLakeBindingInventory(binding, inventory);
         var scanner = PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client);
         scanner.iceberg_delete_plan = deletes;
-        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store };
+        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules };
     }
 
     pub fn attachCache(self: *ServingSource, cache: *@import("lake_serving_cache.zig").Cache, binding: @import("../external_source/catalog_binding.zig").Binding, context: @import("lake_read_context.zig").Context) !void {
@@ -426,12 +434,13 @@ pub const ServingSource = struct {
             self.alloc.destroy(reader);
         }
         if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
+        if (self.partition_rules) |*rules| rules.deinit();
         self.inventory.deinit(self.alloc);
         self.store.deinit();
         if (self.context_store) |store| self.alloc.destroy(store);
         self.* = undefined;
     }
-    fn icebergMetadataUriForOpenedStoreAlloc(
+    pub fn icebergMetadataUriForOpenedStoreAlloc(
         alloc: std.mem.Allocator,
         client: object_storage_api.ObjectStorage,
         bucket: []const u8,

@@ -69,10 +69,12 @@ pub const ParsedFooter = struct {
     version: i32,
     row_count: u64,
     row_groups: []external_source.RowGroup,
+    schema_columns: []SchemaColumn = &.{},
 
     pub fn deinit(self: *ParsedFooter, alloc: Allocator) void {
         for (self.row_groups) |*row_group| row_group.deinit(alloc);
         alloc.free(self.row_groups);
+        freeSchemaColumns(alloc, self.schema_columns);
         self.* = undefined;
     }
 };
@@ -477,8 +479,6 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
     const got_row_groups = row_groups orelse return error.InvalidParquetMetadata;
     if (schema_columns) |columns| {
         try applySchemaNullability(alloc, got_row_groups, columns);
-        freeSchemaColumns(alloc, columns);
-        schema_columns = null;
     }
 
     var total_rows: u64 = 0;
@@ -487,16 +487,20 @@ fn parseFileMetadata(alloc: Allocator, reader: *Reader, file_len: u64) !ParsedFo
     }
     if (got_row_groups.len != 0 and total_rows != got_row_count) return error.InvalidParquetMetadata;
     row_groups = null;
+    const retained_columns: []SchemaColumn = schema_columns orelse &.{};
+    schema_columns = null;
 
     return .{
         .version = got_version,
         .row_count = got_row_count,
         .row_groups = got_row_groups,
+        .schema_columns = retained_columns,
     };
 }
 
 const SchemaElement = struct {
     name: []u8,
+    physical_type: ?i32 = null,
     repetition_type: ?i32 = null,
     type_length: i32 = 0,
     child_count: u32 = 0,
@@ -512,8 +516,10 @@ const SchemaElement = struct {
     }
 };
 
-const SchemaColumn = struct {
+pub const SchemaColumn = struct {
     column_id: []u8,
+    physical_type: ?i32 = null,
+    nested: bool = false,
     nullable: bool,
     type_length: i32 = 0,
     logical_type: []u8 = &.{},
@@ -569,6 +575,7 @@ fn parseSchemaColumnsAlloc(alloc: Allocator, reader: *Reader, field_type: Compac
 fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
     var previous_field_id: i16 = 0;
     var name: ?[]u8 = null;
+    var physical_type: ?i32 = null;
     var repetition_type: ?i32 = null;
     var type_length: i32 = 0;
     var child_count: u32 = 0;
@@ -581,6 +588,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
 
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
+            1 => physical_type = try reader.readRequiredI32(field.type),
             2 => type_length = try reader.readRequiredI32(field.type),
             3 => repetition_type = try reader.readRequiredI32(field.type),
             4 => {
@@ -617,6 +625,7 @@ fn parseSchemaElement(alloc: Allocator, reader: *Reader) !SchemaElement {
     name = null;
     return .{
         .name = got_name,
+        .physical_type = physical_type,
         .repetition_type = repetition_type,
         .type_length = type_length,
         .child_count = child_count,
@@ -658,6 +667,8 @@ fn collectSchemaColumnsAlloc(
             errdefer if (logical_type.len > 0) alloc.free(logical_type);
             try columns.append(alloc, .{
                 .column_id = column_id,
+                .physical_type = element.physical_type,
+                .nested = path.items.len != 1 or element.repetition_type == 2,
                 .nullable = element_nullable,
                 .type_length = element.type_length,
                 .logical_type = logical_type,
@@ -1134,10 +1145,14 @@ fn physicalTypeNameAlloc(alloc: Allocator, physical_type: i32) ![]u8 {
 
 fn logicalTypeNameForConvertedTypeAlloc(alloc: Allocator, converted_type: i32) ![]u8 {
     return switch (converted_type) {
+        0 => try alloc.dupe(u8, "string"),
+        6 => try alloc.dupe(u8, "date"),
+        19 => try alloc.dupe(u8, "json"),
         5 => try alloc.dupe(u8, "decimal"),
         9 => try alloc.dupe(u8, "timestamp_millis"),
         10 => try alloc.dupe(u8, "timestamp_micros"),
-        else => &.{},
+        11...14 => &.{},
+        else => try alloc.dupe(u8, "unsupported"),
     };
 }
 
@@ -1159,6 +1174,16 @@ fn parseLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type
     errdefer annotation.deinit(alloc);
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
         switch (field.id) {
+            1, 6, 11 => {
+                annotation.deinit(alloc);
+                annotation = .{ .name = try alloc.dupe(u8, switch (field.id) {
+                    1 => "string",
+                    6 => "date",
+                    11 => "json",
+                    else => unreachable,
+                }) };
+                try reader.skip(field.type);
+            },
             5 => {
                 annotation.deinit(alloc);
                 annotation = try parseDecimalLogicalTypeAnnotationAlloc(alloc, reader, field.type);
@@ -1167,7 +1192,11 @@ fn parseLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type
                 annotation.deinit(alloc);
                 annotation = .{ .name = try parseTimestampLogicalTypeNameAlloc(alloc, reader, field.type) };
             },
-            else => try reader.skip(field.type),
+            else => {
+                annotation.deinit(alloc);
+                annotation = .{ .name = try alloc.dupe(u8, "unsupported") };
+                try reader.skip(field.type);
+            },
         }
     }
     return annotation;

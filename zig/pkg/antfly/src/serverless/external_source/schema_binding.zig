@@ -112,7 +112,7 @@ pub fn externalBindingFromSchemaJsonAlloc(
     };
     const snapshot_value = if (snapshot_borrowed) |value| try alloc.dupe(u8, value) else null;
     errdefer if (snapshot_value) |value| alloc.free(value);
-    const schema_fingerprint = try alloc.dupe(u8, try requiredJsonString(source, "schema_fingerprint"));
+    const schema_fingerprint = try alloc.dupe(u8, if (source.get("schema_fingerprint") != null) try requiredJsonString(source, "schema_fingerprint") else "auto");
     errdefer alloc.free(schema_fingerprint);
     const write_policy: external_binding.WritePolicy = if (source.get("write_policy")) |value| blk: {
         const string = switch (value) {

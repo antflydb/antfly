@@ -16157,7 +16157,11 @@ pub const ApiHttpServer = struct {
     /// Resolve public, namespace-relative REFERENCES names once at DDL ingress.
     /// Stored constraints use immutable identities, so rename never retargets
     /// an FK and drop/recreate cannot silently attach it to a different table.
-    pub fn bindForeignKeySchema(self: *ApiHttpServer, alloc: std.mem.Allocator, scope: system_catalog.Target, child: []const u8, proposed: []const u8, before: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) ![]u8 {
+    pub fn bindForeignKeySchema(self: *ApiHttpServer, alloc: std.mem.Allocator, scope: system_catalog.Target, child: []const u8, proposed_json: []const u8, before: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) ![]u8 {
+        const normalized = try context.platformDeadline();
+        const inferred = if (before.len == 0) try @import("lake_schema_detection.zig").prepare(alloc, proposed_json, .{ .node_config = self.cfg.node_config, .secret_store = self.cfg.secret_store }, .{ .io = self.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }) else null;
+        defer if (inferred) |bytes| alloc.free(bytes);
+        const proposed = inferred orelse proposed_json;
         if (self.source.vtable.system_catalog == null) {
             if (!try foreignKeyParentsAllowed(alloc, identity, proposed)) return error.Forbidden;
             return alloc.dupe(u8, proposed);
@@ -24502,6 +24506,10 @@ fn contextualJsonResponseOmitNullOptionals(alloc: std.mem.Allocator, status: u16
 
 fn contextualWitnessDDLError(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
     return switch (err) {
+        error.UnsupportedExternalLakeSchemaType => contextualJsonErrorResponse(alloc, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
+        error.ExternalLakeSchemaMismatch => contextualJsonErrorResponse(alloc, 409, "lake files have incompatible column types or the supplied schema fingerprint does not match the detected schema"),
+        error.ExternalLakeSchemaUnavailable => contextualJsonErrorResponse(alloc, 400, "lake schema metadata is unavailable; Parquet inference requires at least one file with a schema"),
+        error.ExternalLakeSchemaTooLarge => contextualJsonErrorResponse(alloc, 400, "detected lake schema exceeds the 1024-column limit"),
         error.ReservedForeignKeySupportIndex => contextualJsonErrorResponse(alloc, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => contextualJsonErrorResponse(alloc, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => contextualJsonErrorResponse(alloc, 409, "foreign-key support changed or is still building; refresh the schema and retry"),

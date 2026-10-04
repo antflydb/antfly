@@ -57,12 +57,10 @@ pub const Grouped = struct {
         }
         try self.sort.add(.{ .keys = keys, .values = values, .ordinal = ordinal });
         for (states, 0..) |state, slot| if (state.distinct) {
-            const inputs = try a.alloc(Datum, states.len);
-            @memset(inputs, .{});
             for (state.distinct_values.items) |entry| {
-                inputs[slot] = entry.row.row.values[0];
-                try self.add(keys, inputs, ordinal);
+                try self.sort.add(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), entry.row.row.values[0] }, .ordinal = ordinal });
             }
+            if (state.kind == .pattern_set and state.patterns.?.has_null) try self.sort.add(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
         };
     }
     pub fn add(self: *Grouped, keys: []const Datum, inputs: []const Datum, ordinal: u64) !void {
@@ -92,20 +90,28 @@ pub const Grouped = struct {
             state.* = try operators.Aggregate.init(self.a, spec.kind, spec.input_type);
             initialized += 1;
         }
+        const pattern_sets = try a.alloc(?*@import("pattern_spill.zig").Set, states.len);
+        for (self.specs, pattern_sets) |spec, *set| set.* = if (spec.kind == .pattern_set) try @import("pattern_spill.zig").Set.create(self.sort.manager) else null;
         var distinct = spill.Sort.init(self.a, self.sort.manager, &.{ .{}, .{} }, self.sort.memory_bytes);
         defer distinct.deinit();
         var distinct_ordinal: u64 = 0;
         while (true) {
             ordinal = @min(ordinal, row.ordinal);
-            if (row.values.len == 0 or row.values[0].value != .bool) return error.InvalidSqlSpill;
-            if (row.values[0].value.bool) {
+            if (row.values.len == 0) return error.InvalidSqlSpill;
+            if (row.values[0].value == .integer) {
+                if (row.values.len != 2) return error.InvalidSqlSpill;
+                const slot = std.math.cast(usize, row.values[0].value.integer) orelse return error.InvalidSqlSpill;
+                if (slot >= states.len) return error.InvalidSqlSpill;
+                try distinct.add(.{ .keys = &.{ row.values[0], row.values[1] }, .values = &.{row.values[1]}, .ordinal = distinct_ordinal });
+                distinct_ordinal += 1;
+            } else if (row.values[0].value != .bool) return error.InvalidSqlSpill else if (row.values[0].value.bool) {
                 if (row.values.len != 1 + states.len * 7) return error.InvalidSqlSpill;
                 for (states, 0..) |*state, i| try merge(state, row.values[1 + i * 7 ..][0..7]);
             } else {
                 if (row.values.len != states.len + 1) return error.InvalidSqlSpill;
                 for (states, row.values[1..], self.specs, 0..) |*state, input, spec, slot| {
                     if (spec.distinct) {
-                        if (!input.sql_null) {
+                        if (!input.sql_null or spec.kind == .pattern_set) {
                             try distinct.add(.{ .keys = &.{ Datum.json(.{ .integer = @intCast(slot) }), input }, .values = &.{input}, .ordinal = distinct_ordinal });
                             distinct_ordinal += 1;
                         }
@@ -131,7 +137,7 @@ pub const Grouped = struct {
                 if (last) |prior| if (try same(prior, record.keys)) continue;
                 const slot = std.math.cast(usize, record.keys[0].value.integer) orelse return error.InvalidSqlSpill;
                 if (slot >= states.len) return error.InvalidSqlSpill;
-                try states[slot].update(record.values[0]);
+                if (pattern_sets[slot]) |set| try set.append(record.values[0]) else try states[slot].update(record.values[0]);
                 _ = previous.reset(.free_all);
                 const copy = try previous.allocator().alloc(Datum, 2);
                 for (record.keys, copy) |v, *cell| cell.* = try operators.cloneDatum(previous.allocator(), v);
@@ -141,7 +147,7 @@ pub const Grouped = struct {
         const output_keys = try out.alloc(Datum, keys.len);
         for (keys, output_keys) |key, *copy| copy.* = try operators.cloneDatum(out, key);
         const aggregates = try out.alloc(Datum, states.len);
-        for (states, aggregates) |*state, *copy| copy.* = try operators.cloneDatum(out, try state.finish());
+        for (states, aggregates, pattern_sets) |*state, *copy, set| copy.* = if (set) |patterns| .{ .patterns = &patterns.interface, .sql_null = false } else try operators.cloneDatum(out, try state.finish());
         self.output_count += 1;
         return .{ .keys = output_keys, .aggregates = aggregates, .ordinal = ordinal };
     }

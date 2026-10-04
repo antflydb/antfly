@@ -36,6 +36,8 @@ const snappy = @import("../../encoding/snappy.zig");
 pub const ObjectRangeCacheDigest = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 
 pub const MaterializationLimits = struct {
+    /// Internal page cursor: physical rows represented by the supplied page.
+    page_row_count: ?usize = null,
     max_rows: usize = 1_000_000,
     max_projected_cells: usize = 8_000_000,
     max_struct_allocation_bytes: usize = 256 * 1024 * 1024,
@@ -1900,7 +1902,7 @@ fn buildPlainI64RowGroupBatchAlloc(
     const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
     if (row_group_ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
     const row_group = file.row_groups[row_group_ordinal];
-    const row_count = try admitMaterialization(row_group.row_count, projected_chunks.len, limits);
+    const row_count = try admitMaterialization(limits.page_row_count orelse row_group.row_count, projected_chunks.len, limits);
     try preflightColumnChunks(projected_chunks, row_count, limits);
     const binding = rowsource_bridge.bindingFromValidatedInventory(inventory);
 
@@ -3763,6 +3765,7 @@ pub const TestPlainI64Column = struct {
     values: []const i64,
     field_id: ?i32 = null,
     write_statistics: bool = false,
+    page_rows: usize = std.math.maxInt(usize),
 };
 
 pub const TestPlainByteArrayColumn = struct {
@@ -3972,8 +3975,14 @@ pub fn buildTestPlainI64ParquetObjectAlloc(alloc: Allocator, columns: []const Te
         for (chunks[0..initialized_chunks]) |*chunk| chunk.deinit(alloc);
     }
     for (columns, 0..) |column, idx| {
-        try appendPlainI64DataPage(&chunks[idx], alloc, column.values);
         initialized_chunks += 1;
+        if (column.page_rows == 0) return error.InvalidParquetRowGroupBatch;
+        var first: usize = 0;
+        while (first < column.values.len) {
+            const count = @min(column.page_rows, column.values.len - first);
+            try appendPlainI64DataPage(&chunks[idx], alloc, column.values[first..][0..count]);
+            first += count;
+        }
     }
 
     const footers = try alloc.alloc(TestColumnFooter, columns.len);
