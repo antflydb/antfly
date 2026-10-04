@@ -5760,7 +5760,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const local_maintenance_tests = b.addTest(.{
         .name = "local-maintenance-contract-tests",
         .root_module = antfly_test_mod,
-        .filters = &.{ "storage.source_authority.", "storage.db.promotion_runtime.", "storage.db.artifact_publication_transport.", "storage.db.artifact_producer_scheduler.", "storage.db.publication_outbox_recovery.", "storage.db.document_child_range_manifest.", "storage.db.document_child_range_effects.", "storage.db.document_child_range_outbox.", "storage.db.quarantine_recovery.", "storage.db.independent_maintenance.", "storage.db.index_repair_scheduler.", "storage.db.graph_cleanup_owner.", "storage.db.native_projection_owner.", "storage.db.runtime_restart_owner." },
+        .filters = &.{ "storage.source_authority.", "storage.db.promotion_runtime.", "storage.db.artifact_publication_transport.", "storage.db.artifact_producer_scheduler.", "storage.db.publication_outbox_recovery.", "storage.db.document_child_range_manifest.", "storage.db.document_child_range_effects.", "storage.db.document_child_range_outbox.", "storage.db.quarantine_recovery.", "storage.db.independent_maintenance.", "storage.db.index_repair_scheduler.", "storage.db.graph_cleanup_owner.", "storage.db.native_projection_owner.", "storage.db.runtime_restart_owner.", "storage.db.cleanup_job_owner.", "storage.db.query_visibility.", "storage.db.source_pin_cleanup_owner.", "storage.db.applied_sequence_coalescer." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_local_maintenance_tests = addCuratedTestRunArtifact(b, local_maintenance_tests, local_maintenance_tests.filters);
@@ -6064,6 +6064,10 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.graph_cleanup_owner.",
             "storage.db.native_projection_owner.",
             "storage.db.runtime_restart_owner.",
+            "storage.db.cleanup_job_owner.",
+            "storage.db.query_visibility.",
+            "storage.db.source_pin_cleanup_owner.",
+            "storage.db.applied_sequence_coalescer.",
             "storage.db.artifact_publication_transport_codec.",
             "storage.db.artifact_publication_wire.",
             "storage.db.artifact_reconcile.",

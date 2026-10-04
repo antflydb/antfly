@@ -228,3 +228,38 @@ heap, fairness cursor, progress waits, and independent summary types. Durable
 repair checkpoints remain the authority. DB reconciles committed events under
 its scheduler mutex and executes selected fenced work. A revision gap still
 invalidates the projection; volatile progress hints cannot authorize publication.
+
+## Cleanup supervision, visibility lifetime, and local batching
+
+`storage/db/cleanup_job_owner.zig` owns repair-shadow and generated-artifact job
+admission, notification coalescing, bounded pages, retry delays, and queue yielding.
+IndexManager owns the shared admission atomics; the durable owner lane drains
+before either IndexManager or the borrowed operation context is destroyed. DB
+retains the actual cleanup page, catalog/snapshot/apply fences, durable cursors,
+and terminal filesystem finalization. Inline lanes yield after a bounded slice
+on errors, contention, and progress; an explicit maintenance request or reopen
+rediscovers the durable marker. Restart supervision uses the same inline-yield
+rule, keeping desired runtime state available for the next explicit request.
+
+`storage/db/query_visibility.zig` owns the local visibility event contracts and
+observer attachment, replay leases, in-flight callbacks, and detachment barrier.
+Callbacks run outside the attachment mutex. A replay lease protects the borrowed
+observer while DB reconstructs exact repair identity from durable checkpoints;
+no borrowed intent strings survive a notification. Existing DB type aliases and
+C notification layouts remain compatible. Detachment must be invoked outside
+that observer's own callback and joins outstanding callback and replay leases.
+
+`storage/db/source_pin_cleanup_owner.zig` owns fairness turns, retry deadlines,
+progress-sensitive backoff, and diagnostics. Source-pin intents, bounded deletion,
+and epoch fencing remain in the local storage reconciliation code. Work-unit
+counters allow an error after partial progress to retain a short retry delay.
+
+`storage/db/applied_sequence_coalescer.zig` owns watermark batching and owned
+index-name memory. DB retains checkpoint serialization and durable publication.
+The existing maximum-per-index rule and 100 ms cadence are unchanged; removing
+a pending item transfers its key ownership to the caller.
+
+The independent-maintenance shutdown regression waits for the stop critical
+section to release its mutex, with a bounded deadline. This distinguishes the
+normal flag-before-unlock handoff from a join-under-lock regression without
+leaving a callback borrowed past owner destruction.

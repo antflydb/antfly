@@ -837,79 +837,13 @@ pub const CommittedBatchEffectsObserver = struct {
 
 pub const ReplayProgressHook = *const fn (ctx: *anyopaque, index_name: []const u8, progress: ReplayProgress) anyerror!void;
 
-pub const QueryVisibilityChange = enum {
-    invalidate,
-    status,
-    /// High-frequency, readiness-neutral owner telemetry. Serving layers may
-    /// coalesce this independently from durable status and visibility edges.
-    activity,
-    publish,
-    publish_consistent,
-    publish_blocking,
-    /// The primary source replay target advanced at a durable commit
-    /// boundary. This is convergence-only: it must not revoke an already
-    /// published serving generation.
-    target_advanced,
-    index_repair_pending,
-    index_repair_cleared,
-    /// An exact derived watermark advanced far enough to wake a resident
-    /// progress wait. This is scheduling-only: it neither invalidates readers
-    /// nor changes durable repair admission.
-    index_repair_progress,
-};
-
-pub const IndexRepairAdmission = enum {
-    unknown,
-    serviceable,
-    blocked,
-};
-
-/// Durable lifecycle class carried with visibility edges. Consumers must use
-/// this fact instead of interpreting trigger strings: initial materialization
-/// shares the generation scheduler with repair but is not corruption debt.
-pub const IndexLifecycleWorkClass = enum {
-    repair,
-    initial_build,
-};
-
-/// Incarnation-scoped identity for a durable repair visibility edge. The
-/// slices are borrowed for the synchronous notification only; consumers that
-/// retain an event must clone them.
-pub const IndexRepairVisibility = struct {
-    index_name: []const u8,
-    work_class: IndexLifecycleWorkClass = .repair,
-    repair_id: u128 = 0,
-    revision: u64 = 0,
-    config_hash: u64 = 0,
-    root_generation: u64 = 0,
-    previous_admission: IndexRepairAdmission = .unknown,
-    admission: IndexRepairAdmission = .unknown,
-    previous_action_required: bool = false,
-    action_required: bool = false,
-};
-
-pub const IndexTargetVisibility = types.IndexTargetVisibility;
-
-pub const QueryVisibilityEvent = struct {
-    change: QueryVisibilityChange,
-    repair: ?IndexRepairVisibility = null,
-    target_sequence: ?u64 = null,
-    target_indexes: []const IndexTargetVisibility = &.{},
-    target_scope_known: bool = false,
-    /// An exact clear may leave other durable lifecycle work in the group.
-    /// This is a scheduling/replay fact, not an unknown-scope visibility
-    /// edge: consumers must audit the group without fencing unrelated index
-    /// incarnations.
-    group_repair_debt_remains: bool = false,
-};
-
-pub const QueryVisibilityHook = struct {
-    ptr: *anyopaque,
-    on_change: *const fn (ptr: *anyopaque, event: QueryVisibilityEvent) void,
-    pub fn notify(self: @This(), event: QueryVisibilityEvent) void {
-        self.on_change(self.ptr, event);
-    }
-};
+pub const QueryVisibilityChange = @import("query_visibility.zig").QueryVisibilityChange;
+pub const IndexRepairAdmission = @import("query_visibility.zig").IndexRepairAdmission;
+pub const IndexLifecycleWorkClass = @import("query_visibility.zig").IndexLifecycleWorkClass;
+pub const IndexRepairVisibility = @import("query_visibility.zig").IndexRepairVisibility;
+pub const IndexTargetVisibility = @import("query_visibility.zig").IndexTargetVisibility;
+pub const QueryVisibilityEvent = @import("query_visibility.zig").QueryVisibilityEvent;
+pub const QueryVisibilityHook = @import("query_visibility.zig").QueryVisibilityHook;
 
 pub const PrimaryBackend = db_config.PrimaryBackend;
 
@@ -985,10 +919,7 @@ const AsyncContext = struct {
     /// committed source rows/artifacts from the primary store but must never
     /// rewrite its coverage, repair, or graph-binding metadata.
     projection_only: bool = false,
-    query_visibility_hook_mutex: std.atomic.Mutex = .unlocked,
-    query_visibility_hook: ?QueryVisibilityHook = null,
-    query_visibility_hook_in_flight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    index_repair_notification_pending: bool = false,
+    visibility_observer: @import("query_visibility.zig").Observer = .{},
     /// Serializes durable repair-control transitions with their process-local
     /// quarantine binding effects. The scheduler directory remains a fallible
     /// projection and is never allowed to race claim ownership decisions.
@@ -1319,7 +1250,6 @@ var test_published_dense_catalog_lookup_hook: ?*PublishedDenseCatalogLookupTestH
 const dense_posting_idle_default_max_postings_per_index: usize = 64;
 const dense_posting_idle_default_max_layout_changes_per_index: usize = 8;
 const dense_posting_idle_default_max_boundary_reassignments_per_index: usize = 64;
-const applied_sequence_flush_interval_ns: u64 = 100 * std.time.ns_per_ms;
 
 fn backgroundRuntimeAllocator(fallback: Allocator) Allocator {
     if (comptime builtin.os.tag == .freestanding) return fallback;
@@ -1328,51 +1258,7 @@ fn backgroundRuntimeAllocator(fallback: Allocator) Allocator {
     return std.heap.smp_allocator;
 }
 
-const AppliedSequenceCoalescer = struct {
-    pending: std.StringHashMapUnmanaged(u64) = .empty,
-    last_flush_ns: u64 = 0,
-
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        self.clearPending(alloc);
-        self.pending.deinit(alloc);
-        self.* = .{};
-    }
-
-    fn note(self: *@This(), alloc: Allocator, index_name: []const u8, sequence: u64) !void {
-        const gop = try self.pending.getOrPut(alloc, index_name);
-        if (gop.found_existing) {
-            gop.value_ptr.* = @max(gop.value_ptr.*, sequence);
-            return;
-        }
-        errdefer _ = self.pending.remove(index_name);
-        gop.key_ptr.* = try alloc.dupe(u8, index_name);
-        gop.value_ptr.* = sequence;
-    }
-
-    fn shouldFlush(self: *const @This(), now_ns: u64) bool {
-        if (self.pending.count() == 0) return false;
-        return self.last_flush_ns == 0 or now_ns -| self.last_flush_ns >= applied_sequence_flush_interval_ns;
-    }
-
-    fn clearPending(self: *@This(), alloc: Allocator) void {
-        var it = self.pending.iterator();
-        while (it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
-        self.pending.clearRetainingCapacity();
-    }
-
-    fn removePending(self: *@This(), alloc: Allocator, index_name: []const u8) void {
-        const removed = self.pending.fetchRemove(index_name) orelse return;
-        alloc.free(@constCast(removed.key));
-    }
-
-    fn takePending(self: *@This(), index_name: []const u8) ?struct { owned_name: []const u8, sequence: u64 } {
-        const removed = self.pending.fetchRemove(index_name) orelse return null;
-        return .{
-            .owned_name = @constCast(removed.key),
-            .sequence = removed.value,
-        };
-    }
-};
+const AppliedSequenceCoalescer = @import("applied_sequence_coalescer.zig").Coalescer;
 
 const MutexContentionStats = struct {
     lock_calls: AtomicU64 = .init(0),
@@ -4923,14 +4809,7 @@ pub const DB = struct {
     entity_sink: ?promotion_runtime_mod.EntitySink = null,
     promotion_owner: ?promotion_runtime_mod.PromotionOwner = null,
     entity_sink_missing_policy: promotion_runtime_mod.MissingSinkPolicy = .wait,
-    source_pin_gc_epoch: @import("antfly_platform").atomic.Value(u64) = .init(1),
-    source_pin_gc_turn: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    source_pin_gc_next_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    source_pin_gc_failures: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    source_pin_gc_failure_streak: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    source_pin_gc_work_units: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    source_pin_gc_error: std.atomic.Value(u32) = .init(0),
-    source_pin_gc_log_next_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    source_pin_cleanup: @import("source_pin_cleanup_owner.zig").Owner = .{},
     ttl_cleanup_context: ?*TtlCleanupContext,
     ttl_runtime: ?*ttl_runtime_mod.TtlRuntime,
     transaction_recovery_identity_context: ?*db_core.TransactionRecoveryIdentityContext,
@@ -6122,7 +6001,7 @@ pub const DB = struct {
                     try @import("source_pin.zig").reconcileReleased(&db);
                 }
             } else {
-                db.source_pin_gc_epoch.store(0, .release);
+                db.source_pin_cleanup.epoch.store(0, .release);
             }
             const table_storage_started_ns = monotonicTimeNs();
             try db.initializeTableStorage(opts.table_storage);
@@ -6279,7 +6158,7 @@ pub const DB = struct {
                 if (repair_state) |*state| {
                     for (state.entries.items) |entry| {
                         if (entry.intent.phase != .terminal and entry.intent.automation == .enabled) {
-                            db.async_context.index_repair_notification_pending = true;
+                            db.async_context.visibility_observer.replay_pending = true;
                             break;
                         }
                     }
@@ -7127,7 +7006,7 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .native_projection_owner = .{ .enabled = self.start_index_workers },
             .require_graph_resolution_contract = true,
-            .query_visibility_hook = null,
+            .visibility_observer = .{},
             .text_merge_runtime = null,
         };
         self.core.index_manager.setRelationalBaseRows(self.async_context.relational_base_rows);
@@ -7149,31 +7028,9 @@ pub const DB = struct {
     }
 
     pub fn setQueryVisibilityHook(self: *DB, hook: ?QueryVisibilityHook) void {
-        var pending_hook: ?QueryVisibilityHook = null;
-        lockAtomic(&self.async_context.query_visibility_hook_mutex);
-        self.async_context.query_visibility_hook = hook;
-        if (hook) |attached| {
-            if (self.async_context.index_repair_notification_pending) {
-                self.async_context.index_repair_notification_pending = false;
-                _ = self.async_context.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
-                pending_hook = attached;
-            }
-        }
-        self.async_context.query_visibility_hook_mutex.unlock();
-        if (pending_hook) |attached| {
-            if (comptime builtin.os.tag != .freestanding) {
-                self.replayPendingIndexRepairVisibility(attached);
-            }
-            _ = self.async_context.query_visibility_hook_in_flight.fetchSub(1, .release);
-        }
-        if (hook == null) {
-            // A notifier copies the hook before invoking it so the callback may
-            // inspect the DB without holding this mutex. Detachment is also a
-            // teardown barrier: once it returns, no callback can still inspect
-            // optional runtimes or index state that close is about to destroy.
-            while (self.async_context.query_visibility_hook_in_flight.load(.acquire) != 0) {
-                spinOrYield();
-            }
+        if (self.async_context.visibility_observer.attach(hook)) |lease| {
+            defer lease.release();
+            if (comptime builtin.os.tag != .freestanding) self.replayPendingIndexRepairVisibility(lease.hook);
         }
         if (self.enrichment_runtime) |runtime| {
             runtime.setStatusHook(if (hook == null) null else .{
@@ -7287,9 +7144,7 @@ pub const DB = struct {
     }
 
     fn hasQueryVisibilityHook(ctx: *AsyncContext) bool {
-        lockAtomic(&ctx.query_visibility_hook_mutex);
-        defer ctx.query_visibility_hook_mutex.unlock();
-        return ctx.query_visibility_hook != null;
+        return ctx.visibility_observer.attached();
     }
 
     fn notifyQueryVisibilityHook(ctx: *AsyncContext, change: QueryVisibilityChange) void {
@@ -7369,34 +7224,7 @@ pub const DB = struct {
     }
 
     fn notifyQueryVisibilityEvent(ctx: *AsyncContext, event: QueryVisibilityEvent) void {
-        lockAtomic(&ctx.query_visibility_hook_mutex);
-        const hook = ctx.query_visibility_hook orelse {
-            switch (event.change) {
-                .index_repair_pending => ctx.index_repair_notification_pending = true,
-                .index_repair_cleared => if (event.repair != null) {
-                    // An exact clear carries enough aggregate information to
-                    // settle or retain the hook-attachment replay bit. A
-                    // legacy/unknown clear cannot prove that queued debt is
-                    // gone and therefore leaves the bit conservative.
-                    ctx.index_repair_notification_pending = event.group_repair_debt_remains;
-                },
-                .index_repair_progress => {},
-                else => {},
-            }
-            ctx.query_visibility_hook_mutex.unlock();
-            return;
-        };
-        if (event.change == .index_repair_pending or event.change == .index_repair_cleared) {
-            // A delivered exact clear settles its own edge, but it may also be
-            // the only bounded notification that another durable intent
-            // remains. Retain the replay bit for a later hook attachment
-            // without manufacturing an anonymous visibility invalidation.
-            ctx.index_repair_notification_pending = event.group_repair_debt_remains;
-        }
-        _ = ctx.query_visibility_hook_in_flight.fetchAdd(1, .acquire);
-        ctx.query_visibility_hook_mutex.unlock();
-        defer _ = ctx.query_visibility_hook_in_flight.fetchSub(1, .release);
-        hook.notify(event);
+        ctx.visibility_observer.notify(event);
     }
 
     const DetachedEnrichmentRuntime = struct {
@@ -8448,14 +8276,14 @@ pub const DB = struct {
     pub fn lsmMaintenanceScore(self: *DB) u64 {
         lockApplyShared(self);
         defer self.core.unlockApplyShared();
-        return @max(@intFromBool(self.source_pin_gc_epoch.load(.acquire) != 0), @max(
+        return @max(@intFromBool(self.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
             self.core.primary_store_owner.lsmMaintenanceScore(),
             self.core.index_manager.lsmMaintenanceScore(),
         ));
     }
 
     pub fn lsmMaintenanceDebtHint(self: *DB) u64 {
-        return @max(@intFromBool(self.source_pin_gc_epoch.load(.acquire) != 0), @max(
+        return @max(@intFromBool(self.source_pin_cleanup.epoch.load(.acquire) != 0), @max(
             self.core.primary_store_owner.lsmMaintenanceDebtHint(),
             self.core.index_manager.lsmMaintenanceDebtHint(),
         ));
@@ -8470,8 +8298,8 @@ pub const DB = struct {
         if (self.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |candidate| {
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
-        if (self.source_pin_gc_epoch.load(.acquire) != 0) {
-            const candidate = self.source_pin_gc_next_ns.load(.acquire) -| monotonicTimeNs();
+        if (self.source_pin_cleanup.epoch.load(.acquire) != 0) {
+            const candidate = self.source_pin_cleanup.next_ns.load(.acquire) -| monotonicTimeNs();
             delay_ns = if (delay_ns) |current| @min(current, candidate) else candidate;
         }
         return delay_ns;
@@ -8775,7 +8603,7 @@ pub const DB = struct {
 
     fn runLsmMaintenanceStepAdmitted(self: *DB, snapshot_replay: *const snapshot_admission_mod.SnapshotAdmission.MutationLease) !bool {
         std.debug.assert(snapshot_replay.active and snapshot_replay.admission == self.core.snapshot_replay_admission);
-        if (self.source_pin_gc_turn.fetchAdd(1, .monotonic) % 4 == 0 and try self.runSourcePinCleanupStep()) return true;
+        if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDue()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -8800,7 +8628,7 @@ pub const DB = struct {
         defer if (replication_mutation) |*lease| lease.release();
         var snapshot_replay = try self.acquireSnapshotReplayMutation();
         defer snapshot_replay.release();
-        if (self.source_pin_gc_turn.fetchAdd(1, .monotonic) % 4 == 0 and try self.runSourcePinCleanupStep()) return true;
+        if (self.source_pin_cleanup.takeTurn() and try self.runSourcePinCleanupStep()) return true;
         if (try self.core.index_manager.runLsmObsoleteReclaimDueBestEffort()) return true;
         const primary_reclaim_due = if (self.core.primary_store_owner.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay_ns| delay_ns == 0 else false;
         if (primary_reclaim_due) {
@@ -8821,18 +8649,15 @@ pub const DB = struct {
     /// Source-pin deletion shares the LSM maintenance lane; it never creates a
     /// dedicated thread or monopolizes compaction while the corpus is large.
     pub fn runSourcePinCleanupStep(self: *DB) !bool {
-        if (openModeRequiresReadOnlyBackends(self.open_mode) or self.source_pin_gc_epoch.load(.acquire) == 0) return false;
-        if (monotonicTimeNs() < self.source_pin_gc_next_ns.load(.acquire)) return false;
-        const units_before = self.source_pin_gc_work_units.load(.acquire);
+        if (openModeRequiresReadOnlyBackends(self.open_mode) or !self.source_pin_cleanup.due(monotonicTimeNs())) return false;
+        const units_before = self.source_pin_cleanup.work_units.load(.acquire);
         const work = @import("source_pin.zig").reconcileReleasedWithBudget(self, .{}) catch |err| {
-            const progressed = self.source_pin_gc_work_units.load(.acquire) != units_before;
+            const progressed = self.source_pin_cleanup.work_units.load(.acquire) != units_before;
             self.recordSourcePinCleanupFailureWithProgress(err, progressed);
             return progressed;
         };
-        self.source_pin_gc_error.store(0, .release);
-        self.source_pin_gc_failure_streak.store(0, .release);
         const progressed = work.completed_units != 0;
-        self.source_pin_gc_next_ns.store(monotonicTimeNs() +| (if (progressed) @as(u64, std.time.ns_per_ms) else 20 * std.time.ns_per_ms), .release);
+        self.source_pin_cleanup.succeeded(progressed, monotonicTimeNs());
         return progressed;
     }
 
@@ -8841,28 +8666,11 @@ pub const DB = struct {
     }
 
     fn recordSourcePinCleanupFailureWithProgress(self: *DB, err: anyerror, progressed: bool) void {
-        const failures = self.source_pin_gc_failures.fetchAdd(1, .acq_rel) +| 1;
-        const streak = self.source_pin_gc_failure_streak.fetchAdd(1, .acq_rel) +| 1;
-        const previous = self.source_pin_gc_error.swap(@intFromError(err), .acq_rel);
-        const delay = if (progressed) std.time.ns_per_ms else (20 * std.time.ns_per_ms) * (@as(u64, 1) << @as(u6, @intCast(@min(streak - 1, 8))));
-        const now = monotonicTimeNs();
-        self.source_pin_gc_next_ns.store(now +| delay, .release);
-        const log_after = self.source_pin_gc_log_next_ns.load(.acquire);
-        if ((previous != @intFromError(err) or std.math.isPowerOfTwo(streak)) and now >= log_after and
-            self.source_pin_gc_log_next_ns.cmpxchgStrong(log_after, now +| 30 * std.time.ns_per_s, .acq_rel, .acquire) == null)
-        {
-            std.log.warn("source pin cleanup pending path={s} err={s} failures={} retry_ms={}", .{ self.core.path, @errorName(err), failures, delay / std.time.ns_per_ms });
-        }
+        self.source_pin_cleanup.failed(err, progressed, monotonicTimeNs(), self.core.path);
     }
 
-    pub fn sourcePinCleanupStatus(self: *DB) struct { pending: bool, failures: u64, last_error: ?[]const u8, next_attempt_ns: u64 } {
-        const code = self.source_pin_gc_error.load(.acquire);
-        return .{
-            .pending = self.source_pin_gc_epoch.load(.acquire) != 0,
-            .failures = self.source_pin_gc_failures.load(.acquire),
-            .last_error = if (code == 0) null else @errorName(@errorFromInt(@as(u16, @intCast(code)))),
-            .next_attempt_ns = self.source_pin_gc_next_ns.load(.acquire),
-        };
+    pub fn sourcePinCleanupStatus(self: *DB) @import("source_pin_cleanup_owner.zig").Status {
+        return self.source_pin_cleanup.status();
     }
 
     pub fn runPrimaryLsmMaintenanceStep(self: *DB) !bool {
@@ -13809,70 +13617,6 @@ pub const DB = struct {
         self.active_index_repairs.clearRetainingCapacity();
     }
 
-    const RepairShadowCleanupWork = struct {
-        manager: *index_manager_mod.IndexManager,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-
-        const pages_per_job: usize = 8;
-        const retries_per_job: usize = 8;
-        const retry_initial_ms: i64 = 25;
-        const retry_max_ms: i64 = 1000;
-
-        fn run(ptr: *anyopaque) anyerror!void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            var pages: usize = 0;
-            var retries: usize = 0;
-            while (true) {
-                const progressed = work.manager.cleanupInactiveRepairShadowRootsPage() catch |err| {
-                    retries += 1;
-                    if (retries == 1 or std.math.isPowerOfTwo(retries))
-                        std.log.warn("repair-generation cleanup retry attempt={} err={s}", .{ retries, @errorName(err) });
-                    const shift: u6 = @intCast(@min(retries - 1, 5));
-                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
-                    work.manager.checkpointIo().sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
-                    if (retries >= retries_per_job) {
-                        work.manager.repair_cleanup_state.store(0, .release);
-                        // Manual lanes run `submit` synchronously. Propagate the
-                        // failure to that caller and leave the filesystem/key
-                        // namespace as the durable retry marker; resubmitting
-                        // here would recurse forever on a persistent error.
-                        if (work.lane.executesInline()) return err;
-                        scheduleInactiveRepairShadowCleanupContext(work.manager, work.lane, work.owner_id);
-                        return;
-                    }
-                    continue;
-                };
-                retries = 0;
-                if (progressed) {
-                    pages += 1;
-                    if (pages < pages_per_job) continue;
-                    // Orphaned key deletion is itself durable. Yield the shared
-                    // cleanup lane between bounded slices and rediscover the
-                    // first remaining namespace on the next job.
-                    work.manager.repair_cleanup_state.store(0, .release);
-                    // A manual runtime has no autonomous queue. Bound the
-                    // foreground call and let the next maintenance request or
-                    // reopen rediscover the durable orphan marker.
-                    if (work.lane.executesInline()) return;
-                    scheduleInactiveRepairShadowCleanupContext(work.manager, work.lane, work.owner_id);
-                    return;
-                }
-                if (work.manager.repair_cleanup_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                if (work.manager.repair_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                    pages = 0;
-                    continue;
-                }
-                return;
-            }
-        }
-
-        fn deinit(ptr: *anyopaque) void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            std.heap.page_allocator.destroy(work);
-        }
-    };
-
     fn scheduleInactiveRepairShadowCleanup(self: *DB) void {
         scheduleInactiveRepairShadowCleanupContext(
             self.core.index_manager,
@@ -13886,127 +13630,21 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
-        if (manager.repair_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = manager.repair_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
-            return;
-        }
-        const work = std.heap.page_allocator.create(RepairShadowCleanupWork) catch {
-            manager.repair_cleanup_state.store(0, .release);
-            return;
-        };
-        work.* = .{ .manager = manager, .lane = lane, .owner_id = owner_id };
-        lane.submit(.{
+        @import("cleanup_job_owner.zig").schedule(.{
+            .ptr = manager,
+            .state = &manager.repair_cleanup_state,
+            .lane = lane,
             .owner_id = owner_id,
-            .class = .cleanup,
-            .ptr = work,
-            .run = RepairShadowCleanupWork.run,
-            .deinit = RepairShadowCleanupWork.deinit,
-        }) catch |err| {
-            std.heap.page_allocator.destroy(work);
-            manager.repair_cleanup_state.store(0, .release);
-            std.log.warn("deferred index-generation cleanup was not scheduled err={s}", .{@errorName(err)});
-        };
+            .io = manager.checkpointIo(),
+            .advance = advanceRepairShadowCleanup,
+            .name = "repair-generation",
+        });
     }
 
-    const GeneratedArtifactCleanupWork = struct {
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-
-        const pages_per_job: usize = 8;
-        const retries_per_job: usize = 8;
-        const retry_initial_ms: i64 = 25;
-        const retry_max_ms: i64 = 1000;
-
-        fn drainOnePage(work: *@This()) !GeneratedArtifactCleanupAdvanceResult {
-            return try advanceGeneratedArtifactCleanupContext(work.ctx, null);
-        }
-
-        fn run(ptr: *anyopaque) anyerror!void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            var pages: usize = 0;
-            var retries: usize = 0;
-            var contention_retries: usize = 0;
-            while (true) {
-                if (work.ctx.background_closing.load(.acquire)) {
-                    work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
-                    return;
-                }
-                const advance = work.drainOnePage() catch |err| {
-                    retries += 1;
-                    if (retries == 1 or std.math.isPowerOfTwo(retries))
-                        std.log.warn("generated-artifact cleanup retry attempt={} err={s}", .{ retries, @errorName(err) });
-                    if (work.ctx.io) |io| {
-                        const shift: u6 = @intCast(@min(retries - 1, 5));
-                        const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
-                        io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
-                    } else {
-                        // Manual/freestanding lanes have no autonomous timer.
-                        // Leave the durable marker pending for the next explicit
-                        // maintenance poll or reopen instead of monopolizing the
-                        // caller that is executing the lane synchronously.
-                        work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
-                        return err;
-                    }
-                    if (retries >= retries_per_job) {
-                        // A persistent failure must not monopolize a shared
-                        // durable-job worker. Requeue at the tail while the
-                        // durable tombstone remains the source of truth.
-                        work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
-                        scheduleGeneratedArtifactCleanupContext(work.ctx, work.lane, work.owner_id);
-                        return;
-                    }
-                    continue;
-                };
-                retries = 0;
-
-                if (advance == .busy) {
-                    // Another caller owns a bounded page or terminal filesystem
-                    // finalization. Yield without turning expected contention
-                    // into an error or spinning on the shared durable-job lane.
-                    const io = work.ctx.io orelse {
-                        work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
-                        return;
-                    };
-                    contention_retries += 1;
-                    if (contention_retries < retries_per_job) {
-                        const shift: u6 = @intCast(@min(contention_retries - 1, 5));
-                        const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
-                        io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
-                        continue;
-                    }
-                    work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
-                    scheduleGeneratedArtifactCleanupContext(work.ctx, work.lane, work.owner_id);
-                    return;
-                }
-                contention_retries = 0;
-
-                if (advance == .idle) {
-                    if (work.ctx.index_manager.artifact_cleanup_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                    if (work.ctx.index_manager.artifact_cleanup_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                        pages = 0;
-                        continue;
-                    }
-                    return;
-                }
-
-                pages += 1;
-                if (pages < pages_per_job) continue;
-
-                // Yield the durable-job lane between bounded slices. The
-                // outbox cursor makes resubmission idempotent across failures.
-                work.ctx.index_manager.artifact_cleanup_state.store(0, .release);
-                if (work.lane.executesInline()) return;
-                scheduleGeneratedArtifactCleanupContext(work.ctx, work.lane, work.owner_id);
-                return;
-            }
-        }
-
-        fn deinit(ptr: *anyopaque) void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            std.heap.page_allocator.destroy(work);
-        }
-    };
+    fn advanceRepairShadowCleanup(ptr: *anyopaque) !@import("cleanup_job_owner.zig").Advance {
+        const manager: *index_manager_mod.IndexManager = @ptrCast(@alignCast(ptr));
+        return if (try manager.cleanupInactiveRepairShadowRootsPage()) .progressed else .idle;
+    }
 
     var test_enrichment_restart_failures_remaining: std.atomic.Value(u32) = .init(0);
     var test_enrichment_reconfigure_after_detached_hook: ?*const fn (*DB) anyerror!void = null;
@@ -14284,11 +13922,7 @@ pub const DB = struct {
     /// Try to advance one bounded page of retired-index artifact records.
     /// Terminal filesystem finalization owns a separate lease, so callers never
     /// wait behind checkpoint or directory deletion performed by another job.
-    pub const GeneratedArtifactCleanupAdvanceResult = enum {
-        idle,
-        progressed,
-        busy,
-    };
+    pub const GeneratedArtifactCleanupAdvanceResult = @import("cleanup_job_owner.zig").Advance;
 
     pub fn advanceGeneratedArtifactCleanupPage(self: *DB, index_name: ?[]const u8) !GeneratedArtifactCleanupAdvanceResult {
         return try advanceGeneratedArtifactCleanupContext(self.async_context, index_name);
@@ -14357,27 +13991,21 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
-        if (ctx.background_closing.load(.acquire)) return;
-        if (ctx.index_manager.artifact_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = ctx.index_manager.artifact_cleanup_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
-            return;
-        }
-        const work = std.heap.page_allocator.create(GeneratedArtifactCleanupWork) catch {
-            ctx.index_manager.artifact_cleanup_state.store(0, .release);
-            return;
-        };
-        work.* = .{ .ctx = ctx, .lane = lane, .owner_id = owner_id };
-        lane.submit(.{
+        @import("cleanup_job_owner.zig").schedule(.{
+            .ptr = ctx,
+            .state = &ctx.index_manager.artifact_cleanup_state,
+            .lane = lane,
             .owner_id = owner_id,
-            .class = .cleanup,
-            .ptr = work,
-            .run = GeneratedArtifactCleanupWork.run,
-            .deinit = GeneratedArtifactCleanupWork.deinit,
-        }) catch |err| {
-            std.heap.page_allocator.destroy(work);
-            ctx.index_manager.artifact_cleanup_state.store(0, .release);
-            std.log.warn("generated-artifact cleanup was not scheduled err={s}", .{@errorName(err)});
-        };
+            .io = ctx.io,
+            .closing = &ctx.background_closing,
+            .advance = advanceArtifactCleanup,
+            .name = "generated-artifact",
+        });
+    }
+
+    fn advanceArtifactCleanup(ptr: *anyopaque) !@import("cleanup_job_owner.zig").Advance {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        return try advanceGeneratedArtifactCleanupContext(ctx, null);
     }
 
     const retired_index_artifact_repair_cleanup_page_size: usize = 64;
@@ -80179,44 +79807,6 @@ fn waitForAppliedSequenceAdvance(
     }
     if (applied <= previous) return error.Timeout;
     return applied;
-}
-
-test "applied sequence coalescer keeps max sequence per index" {
-    const alloc = std.testing.allocator;
-
-    var coalescer = AppliedSequenceCoalescer{};
-    defer coalescer.deinit(alloc);
-
-    try coalescer.note(alloc, "dv_v1", 10);
-    try coalescer.note(alloc, "dv_v1", 7);
-    try coalescer.note(alloc, "ft_v1", 4);
-    try coalescer.note(alloc, "dv_v1", 12);
-
-    try std.testing.expectEqual(@as(u32, 2), coalescer.pending.count());
-    try std.testing.expectEqual(@as(u64, 12), coalescer.pending.get("dv_v1").?);
-    try std.testing.expectEqual(@as(u64, 4), coalescer.pending.get("ft_v1").?);
-    try std.testing.expect(coalescer.shouldFlush(applied_sequence_flush_interval_ns));
-
-    coalescer.clearPending(alloc);
-    try std.testing.expectEqual(@as(u32, 0), coalescer.pending.count());
-}
-
-test "applied sequence coalescer takePending removes only requested index" {
-    const alloc = std.testing.allocator;
-
-    var coalescer = AppliedSequenceCoalescer{};
-    defer coalescer.deinit(alloc);
-
-    try coalescer.note(alloc, "dv_v1", 10);
-    try coalescer.note(alloc, "ft_v1", 4);
-
-    const removed = coalescer.takePending("dv_v1").?;
-    defer alloc.free(removed.owned_name);
-    try std.testing.expectEqualStrings("dv_v1", removed.owned_name);
-    try std.testing.expectEqual(@as(u64, 10), removed.sequence);
-    try std.testing.expectEqual(@as(u32, 1), coalescer.pending.count());
-    try std.testing.expectEqual(@as(u64, 4), coalescer.pending.get("ft_v1").?);
-    try std.testing.expect(coalescer.pending.get("dv_v1") == null);
 }
 
 fn waitForRawDelete(alloc: Allocator, db: *DB, key: []const u8, max_attempts: usize) !void {

@@ -25,6 +25,10 @@ comptime {
     _ = @import("db/graph_cleanup_owner.zig");
     _ = @import("db/native_projection_owner.zig");
     _ = @import("db/runtime_restart_owner.zig");
+    _ = @import("db/cleanup_job_owner.zig");
+    _ = @import("db/query_visibility.zig");
+    _ = @import("db/source_pin_cleanup_owner.zig");
+    _ = @import("db/applied_sequence_coalescer.zig");
 
     _ = @import("document_mutation_revision.zig");
     _ = @import("db/graph_edge_types.zig");

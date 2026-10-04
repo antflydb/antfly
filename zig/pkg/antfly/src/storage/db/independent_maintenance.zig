@@ -203,10 +203,19 @@ test "independent maintenance joins callbacks outside its lifecycle lock" {
             if (work == .upload) {
                 self.entered.store(true, .release);
                 while (!self.owner.stopping.load(.acquire)) @import("antfly_platform").time.yieldNow();
-                // Use a nonblocking probe so a regression fails without hanging
-                // the test's join or borrowing the owner past destruction.
-                const unlocked = self.owner.lifecycle_mutex.tryLock();
-                if (unlocked) self.owner.lifecycle_mutex.unlock();
+                // The stop flag is published while the mutex is held. Allow
+                // that critical section to finish, but bound the wait so a
+                // join-under-lock regression fails instead of hanging.
+                const probe_deadline = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s;
+                var unlocked = false;
+                while (@import("antfly_platform").time.monotonicNs() < probe_deadline) {
+                    if (self.owner.lifecycle_mutex.tryLock()) {
+                        self.owner.lifecycle_mutex.unlock();
+                        unlocked = true;
+                        break;
+                    }
+                    @import("antfly_platform").time.yieldNow();
+                }
                 self.unlocked.store(unlocked, .release);
             }
             return false;

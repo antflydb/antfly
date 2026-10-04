@@ -99,6 +99,7 @@ pub const Owner = struct {
             }
             if (retries >= 8) {
                 self.state.store(0, .release);
+                if (port.lane.executesInline()) return start_error orelse port.unavailable;
                 self.schedule(port);
                 return;
             }
@@ -158,4 +159,47 @@ test "runtime restart owner releases admission when its operation fails without 
         .name = "test",
     }));
     try std.testing.expectEqual(@as(u8, 0), owner.state.load(.acquire));
+}
+
+test "runtime restart owner bounds inline retries with borrowed io" {
+    const F = struct {
+        owner: Owner = .{},
+        closing: std.atomic.Value(bool) = .init(false),
+        calls: usize = 0,
+        depth: usize = 0,
+        max_depth: usize = 0,
+        fn submit(ptr: *anyopaque, job: runtime.Job) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.depth += 1;
+            defer self.depth -= 1;
+            self.max_depth = @max(self.max_depth, self.depth);
+            try job.run(job.ptr);
+            job.deinit(job.ptr);
+        }
+        fn noop(_: *anyopaque, _: u64) void {}
+        fn poll(_: *anyopaque, _: usize) !usize {
+            return 0;
+        }
+        fn wanted(_: *anyopaque) bool {
+            return true;
+        }
+        fn attempt(ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls <= 16) return error.InjectedStartFailure;
+            return true;
+        }
+        fn port(self: *@This()) Owner.Port {
+            return .{ .ptr = self, .lane = .{ .ptr = self, .vtable = &.{ .submit = submit, .drain_owner = noop, .close_owner = noop, .poll = poll, .executes_inline = true } }, .owner_id = 1, .io = std.testing.io, .closing = &self.closing, .wanted = wanted, .attempt = attempt, .name = "inline-test" };
+        }
+    };
+    var f: F = .{};
+    f.owner.schedule(f.port());
+    try std.testing.expectEqual(@as(usize, 8), f.calls);
+    try std.testing.expectEqual(@as(u8, 0), f.owner.state.load(.acquire));
+    f.owner.schedule(f.port());
+    try std.testing.expectEqual(@as(usize, 16), f.calls);
+    f.owner.schedule(f.port());
+    try std.testing.expectEqual(@as(usize, 17), f.calls);
+    try std.testing.expectEqual(@as(usize, 1), f.max_depth);
 }
