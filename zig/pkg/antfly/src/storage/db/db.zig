@@ -12,6 +12,12 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const independent_maintenance = @import("independent_maintenance.zig");
+const portable_activation_recovery = @import("portable_activation_recovery.zig");
+const quarantine_recovery = @import("quarantine_recovery.zig");
+const document_child_range_manifest = @import("document_child_range_manifest.zig");
+const document_child_range_effects = @import("document_child_range_effects.zig");
+const document_child_range_outbox = @import("document_child_range_outbox.zig");
 const replicated_mutation = @import("replicated_mutation.zig");
 const std = @import("std");
 const GraphTtlSha256 = @import("antfly_hash").Sha256;
@@ -646,7 +652,6 @@ pub const OpenOptions = struct {
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     coordinated_ttl: ?coordinated_ttl.Port = null,
-    coordinated_ttl_group_id: u64 = 0,
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
     sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
@@ -812,35 +817,10 @@ pub const ReplayProgress = struct {
 
 pub const DocumentArtifactChildRangeApplyBatch = document_artifact_child_range.ApplyBatch;
 
-pub const DocumentArtifactChildRangeDispatch = struct {
-    owner_group_id: u64,
-    doc_key: []const u8,
-    artifact_name: []const u8,
-    child_batch: DocumentArtifactChildRangeApplyBatch,
-};
-
-pub const DocumentArtifactChildRangeOutboxDrainResult = struct {
-    scanned: usize = 0,
-    dispatched: usize = 0,
-    deleted: usize = 0,
-};
-
-const DocumentArtifactChildRangeOutboxRecord = struct {
-    version: u16 = 1,
-    owner_group_id: u64,
-    doc_key: []const u8,
-    artifact_name: []const u8,
-    child_batch: DocumentArtifactChildRangeApplyBatch,
-};
-
-pub const DocumentArtifactChildRangeDispatcher = struct {
-    ptr: *anyopaque,
-    apply: *const fn (ptr: *anyopaque, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) anyerror!void,
-
-    fn applyDispatch(self: DocumentArtifactChildRangeDispatcher, alloc: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
-        return try self.apply(self.ptr, alloc, dispatch);
-    }
-};
+pub const DocumentArtifactChildRangeDispatch = document_child_range_outbox.DocumentArtifactChildRangeDispatch;
+pub const DocumentArtifactChildRangeOutboxDrainResult = document_child_range_outbox.DocumentArtifactChildRangeOutboxDrainResult;
+const DocumentArtifactChildRangeOutboxRecord = document_child_range_outbox.DocumentArtifactChildRangeOutboxRecord;
+pub const DocumentArtifactChildRangeDispatcher = document_child_range_outbox.DocumentArtifactChildRangeDispatcher;
 
 /// Synchronous handoff of the exact durable derived replay payload produced by
 /// one committed batch. An empty payload means the batch intentionally elided
@@ -925,13 +905,9 @@ pub const QueryVisibilityEvent = struct {
 
 pub const QueryVisibilityHook = struct {
     ptr: *anyopaque,
-    table_name: []const u8,
-    group_id: u64 = 0,
-    db: ?*DB = null,
-    on_change: *const fn (ptr: *anyopaque, table_name: []const u8, group_id: u64, db: ?*DB, event: QueryVisibilityEvent) void,
-
+    on_change: *const fn (ptr: *anyopaque, event: QueryVisibilityEvent) void,
     pub fn notify(self: @This(), event: QueryVisibilityEvent) void {
-        self.on_change(self.ptr, self.table_name, self.group_id, self.db, event);
+        self.on_change(self.ptr, event);
     }
 };
 
@@ -966,434 +942,8 @@ fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
     };
 }
 
-fn retryableIndexRepairTerminalPhase(
-    last_error: ?[]const u8,
-    trigger: index_repair_state.Trigger,
-) ?index_repair_state.Phase {
-    const reason = last_error orelse return null;
-    if (!std.mem.eql(u8, reason, @errorName(error.RepairSourceCoverageIncomplete))) return null;
-    // A shadow can lag changing source artifacts during replacement or
-    // initial catalog admission. Resume its durable owner and discard only
-    // the inactive candidate; coverage lag is not structural corruption.
-    // Externally supplied and structurally invalid generations stay closed.
-    if (trigger != .operator_generation_rebuild and
-        trigger != .artifact_baseline_adoption and
-        trigger != .storage_format_migration and
-        trigger != .artifact_coverage_mismatch and
-        trigger != .replay_artifact_unavailable and
-        trigger != .catalog_admission)
-    {
-        return null;
-    }
-    return .detected;
-}
-
-const IndexRepairScheduleClass = enum {
-    runnable,
-    paused,
-    terminal,
-};
-
-const IndexRepairScheduleRecord = struct {
-    repair_id: u128,
-    revision: u64,
-    index_name: []u8,
-    work_class: index_repair_state.WorkClass,
-    config_hash: u64,
-    root_generation: u64,
-    class: IndexRepairScheduleClass,
-    phase_terminal: bool,
-    /// Durable retry deadline from the checkpoint. Progress waits are a
-    /// process-local acceleration layer and may temporarily replace the
-    /// effective deadline without changing durable repair authority.
-    durable_next_retry_at_ms: u64,
-    next_retry_at_ms: u64,
-    progress_wait_until_sequence: ?u64 = null,
-    // Process-local grace period for an already-queryable initial build.
-    // Once its deadline is selected, the repair owner receives one explicit
-    // audit authority instead of blindly rearming the same grace period.
-    audit_wait_armed: bool = false,
-    heap_position: ?usize = null,
-};
-
-/// Process-resident projection of the durable repair checkpoint. Durable
-/// intents remain the authority; this directory is rebuilt once per open and
-/// then revision-reconciled after every committed mutation. It makes the
-/// maintenance owner's steady-state inspection cost depend on its quantum,
-/// not on the total number of paused or future-dated intents.
-const IndexRepairSchedulerDirectory = struct {
-    const ControlMutationDisposition = enum { stale, next, gap };
-
-    initialized: bool = false,
-    identity: ?index_repair_state.ReplicaIdentity = null,
-    /// Exact durable checkpoint revision materialized by this projection.
-    /// Events must arrive consecutively; a gap invalidates the acceleration
-    /// layer and the next owner reconstructs it from the durable authority.
-    control_revision: u64 = 0,
-    records: std.ArrayListUnmanaged(IndexRepairScheduleRecord) = .empty,
-    by_id: std.AutoHashMapUnmanaged(u128, usize) = .empty,
-    by_name: std.StringHashMapUnmanaged(usize) = .empty,
-    /// Exact min-heap of runnable repair IDs. Record-owned positions make
-    /// update/removal O(log N) without tombstones, lazy pruning, or an
-    /// occasionally unbounded compaction pass under the owner mutex.
-    runnable_heap: std.ArrayListUnmanaged(u128) = .empty,
-    cursor: usize = 0,
-    runnable: usize = 0,
-    paused: usize = 0,
-    terminal: usize = 0,
-    progress_waiters: usize = 0,
-
-    fn classifyControlMutation(
-        self: *const @This(),
-        identity: index_repair_state.ReplicaIdentity,
-        control_revision: u64,
-    ) ControlMutationDisposition {
-        const current_identity = self.identity orelse return .gap;
-        if (!current_identity.eql(identity)) return .gap;
-        if (control_revision <= self.control_revision) return .stale;
-        if (control_revision != self.control_revision +| 1) return .gap;
-        return .next;
-    }
-
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        for (self.records.items) |record| alloc.free(record.index_name);
-        self.records.deinit(alloc);
-        self.by_id.deinit(alloc);
-        self.by_name.deinit(alloc);
-        self.runnable_heap.deinit(alloc);
-        self.* = .{};
-    }
-
-    fn heapLess(self: *const @This(), a: u128, b: u128) bool {
-        const a_record = self.records.items[self.by_id.get(a).?];
-        const b_record = self.records.items[self.by_id.get(b).?];
-        if (a_record.next_retry_at_ms != b_record.next_retry_at_ms) {
-            return a_record.next_retry_at_ms < b_record.next_retry_at_ms;
-        }
-        return a < b;
-    }
-
-    fn swapHeap(self: *@This(), a: usize, b: usize) void {
-        if (a == b) return;
-        std.mem.swap(u128, &self.runnable_heap.items[a], &self.runnable_heap.items[b]);
-        self.records.items[self.by_id.get(self.runnable_heap.items[a]).?].heap_position = a;
-        self.records.items[self.by_id.get(self.runnable_heap.items[b]).?].heap_position = b;
-    }
-
-    fn siftHeapUp(self: *@This(), start: usize) usize {
-        var child = start;
-        while (child != 0) {
-            const parent = (child - 1) / 2;
-            if (!self.heapLess(self.runnable_heap.items[child], self.runnable_heap.items[parent])) break;
-            self.swapHeap(child, parent);
-            child = parent;
-        }
-        return child;
-    }
-
-    fn siftHeapDown(self: *@This(), start: usize) void {
-        var parent = start;
-        while (true) {
-            const left = parent * 2 + 1;
-            if (left >= self.runnable_heap.items.len) break;
-            const right = left + 1;
-            const child = if (right < self.runnable_heap.items.len and
-                self.heapLess(self.runnable_heap.items[right], self.runnable_heap.items[left]))
-                right
-            else
-                left;
-            if (!self.heapLess(self.runnable_heap.items[child], self.runnable_heap.items[parent])) break;
-            self.swapHeap(parent, child);
-            parent = child;
-        }
-    }
-
-    fn addRunnableAssumeCapacity(self: *@This(), repair_id: u128) void {
-        const position = self.runnable_heap.items.len;
-        self.runnable_heap.appendAssumeCapacity(repair_id);
-        self.records.items[self.by_id.get(repair_id).?].heap_position = position;
-        _ = self.siftHeapUp(position);
-    }
-
-    fn removeRunnable(self: *@This(), repair_id: u128) void {
-        const record_index = self.by_id.get(repair_id) orelse return;
-        const position = self.records.items[record_index].heap_position orelse return;
-        const last = self.runnable_heap.pop().?;
-        self.records.items[record_index].heap_position = null;
-        if (position == self.runnable_heap.items.len) return;
-        self.runnable_heap.items[position] = last;
-        self.records.items[self.by_id.get(last).?].heap_position = position;
-        const new_position = self.siftHeapUp(position);
-        self.siftHeapDown(new_position);
-    }
-
-    fn rescheduleRunnable(self: *@This(), repair_id: u128) void {
-        const record = self.records.items[self.by_id.get(repair_id).?];
-        const position = record.heap_position orelse unreachable;
-        const new_position = self.siftHeapUp(position);
-        self.siftHeapDown(new_position);
-    }
-
-    /// Arm an event-driven wait for an exact durable repair revision. The
-    /// fallback deadline recovers missed callbacks and non-replay maintenance
-    /// completion without turning a queryable partial generation into a hot
-    /// owner loop.
-    fn deferForProgress(
-        self: *@This(),
-        repair_id: u128,
-        expected_revision: u64,
-        wake_at_sequence: u64,
-        fallback_at_ms: u64,
-    ) bool {
-        const record_index = self.by_id.get(repair_id) orelse return false;
-        const record = &self.records.items[record_index];
-        if (record.revision != expected_revision or record.class != .runnable) return false;
-        if (record.progress_wait_until_sequence == null) self.progress_waiters += 1;
-        record.progress_wait_until_sequence = wake_at_sequence;
-        record.audit_wait_armed = false;
-        record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
-        self.rescheduleRunnable(repair_id);
-        return true;
-    }
-
-    /// Defer a runnable lifecycle intent to its bounded audit deadline without
-    /// arming an applied-watermark waiter. Once replay has already reached its
-    /// durable target, later watermark increments are ordinary producer
-    /// progress and cannot prove corpus-wide coverage complete; waking the
-    /// lifecycle owner for every increment would turn a long initial build
-    /// into a maintenance hot loop.
-    fn deferForAudit(
-        self: *@This(),
-        repair_id: u128,
-        expected_revision: u64,
-        fallback_at_ms: u64,
-    ) bool {
-        const record_index = self.by_id.get(repair_id) orelse return false;
-        const record = &self.records.items[record_index];
-        if (record.revision != expected_revision or record.class != .runnable) return false;
-        if (record.progress_wait_until_sequence != null) {
-            record.progress_wait_until_sequence = null;
-            self.progress_waiters -= 1;
-        }
-        record.audit_wait_armed = true;
-        record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
-        self.rescheduleRunnable(repair_id);
-        return true;
-    }
-
-    const ProgressWake = struct {
-        repair_id: u128,
-        revision: u64,
-        work_class: index_repair_state.WorkClass,
-        config_hash: u64,
-        root_generation: u64,
-    };
-
-    /// Wake only the waiting repair for the exact index whose durable applied
-    /// watermark advanced. Return the exact lifecycle identity so the outer
-    /// owner cannot mistake normal initial-build progress for corruption debt;
-    /// repeated notifications at the same sequence are coalesced.
-    fn wakeForIndexProgress(self: *@This(), index_name: []const u8, applied_sequence: u64) ?ProgressWake {
-        const record_index = self.by_name.get(index_name) orelse return null;
-        const record = &self.records.items[record_index];
-        const wake_at = record.progress_wait_until_sequence orelse return null;
-        if (applied_sequence < wake_at) return null;
-        record.progress_wait_until_sequence = null;
-        record.audit_wait_armed = false;
-        self.progress_waiters -= 1;
-        record.next_retry_at_ms = record.durable_next_retry_at_ms;
-        self.rescheduleRunnable(record.repair_id);
-        return .{
-            .repair_id = record.repair_id,
-            .revision = record.revision,
-            .work_class = record.work_class,
-            .config_hash = record.config_hash,
-            .root_generation = record.root_generation,
-        };
-    }
-
-    fn earliestRetryDeadline(self: *const @This()) u64 {
-        const repair_id = if (self.runnable_heap.items.len == 0)
-            return 0
-        else
-            self.runnable_heap.items[0];
-        return self.records.items[self.by_id.get(repair_id).?].next_retry_at_ms;
-    }
-
-    fn wake(self: *const @This()) DB.IndexRepairWake {
-        if (self.runnable != 0) {
-            const deadline = self.earliestRetryDeadline();
-            return if (deadline == 0) .immediate else .{ .at_realtime_ms = deadline };
-        }
-        if (self.paused != 0 or self.terminal != 0) return .parked;
-        return .empty;
-    }
-
-    fn incrementClass(self: *@This(), class: IndexRepairScheduleClass) void {
-        switch (class) {
-            .runnable => self.runnable += 1,
-            .paused => self.paused += 1,
-            .terminal => self.terminal += 1,
-        }
-    }
-
-    fn decrementClass(self: *@This(), class: IndexRepairScheduleClass) void {
-        switch (class) {
-            .runnable => self.runnable -= 1,
-            .paused => self.paused -= 1,
-            .terminal => self.terminal -= 1,
-        }
-    }
-
-    fn classForIntent(intent: index_repair_state.IndexRepairIntent) IndexRepairScheduleClass {
-        if (intent.phase == .terminal and retryableIndexRepairTerminalPhase(
-            intent.last_error,
-            intent.trigger,
-        ) == null) return .terminal;
-        if (intent.automation == .paused) return .paused;
-        return .runnable;
-    }
-
-    fn upsert(
-        self: *@This(),
-        alloc: Allocator,
-        intent: index_repair_state.IndexRepairIntent,
-        persisted_revision: u64,
-    ) !void {
-        const class = classForIntent(intent);
-        if (self.by_id.get(intent.repair_id)) |record_index| {
-            const record = &self.records.items[record_index];
-            if (!std.mem.eql(u8, record.index_name, intent.index_name)) return error.InvalidIndexRepairState;
-            if (persisted_revision < record.revision) return;
-            if (persisted_revision == record.revision) {
-                if (record.class != class or
-                    record.work_class != intent.work_class or
-                    record.config_hash != intent.config_hash or
-                    record.root_generation != intent.root_generation or
-                    record.phase_terminal != (intent.phase == .terminal) or
-                    record.durable_next_retry_at_ms != intent.next_retry_at_ms)
-                {
-                    return error.InvalidIndexRepairState;
-                }
-                return;
-            }
-            const schedule_changed = record.class != class or
-                record.next_retry_at_ms != intent.next_retry_at_ms or
-                record.progress_wait_until_sequence != null;
-            if (schedule_changed and record.class != .runnable and class == .runnable)
-                try self.runnable_heap.ensureUnusedCapacity(alloc, 1);
-            if (schedule_changed and record.class == .runnable and class != .runnable)
-                self.removeRunnable(intent.repair_id);
-            if (record.class != class) {
-                self.decrementClass(record.class);
-                self.incrementClass(class);
-                record.class = class;
-            }
-            record.next_retry_at_ms = intent.next_retry_at_ms;
-            record.durable_next_retry_at_ms = intent.next_retry_at_ms;
-            record.work_class = intent.work_class;
-            record.config_hash = intent.config_hash;
-            record.root_generation = intent.root_generation;
-            if (record.progress_wait_until_sequence != null) self.progress_waiters -= 1;
-            record.progress_wait_until_sequence = null;
-            record.audit_wait_armed = false;
-            record.phase_terminal = intent.phase == .terminal;
-            record.revision = persisted_revision;
-            if (schedule_changed and class == .runnable) {
-                if (record.heap_position == null)
-                    self.addRunnableAssumeCapacity(intent.repair_id)
-                else
-                    self.rescheduleRunnable(intent.repair_id);
-            }
-            return;
-        }
-        if (self.by_name.contains(intent.index_name)) return error.InvalidIndexRepairState;
-        const owned_name = try alloc.dupe(u8, intent.index_name);
-        errdefer alloc.free(owned_name);
-        try self.records.ensureUnusedCapacity(alloc, 1);
-        try self.by_id.ensureUnusedCapacity(alloc, 1);
-        try self.by_name.ensureUnusedCapacity(alloc, 1);
-        if (class == .runnable) try self.runnable_heap.ensureUnusedCapacity(alloc, 1);
-        const record_index = self.records.items.len;
-        self.records.appendAssumeCapacity(.{
-            .repair_id = intent.repair_id,
-            .revision = persisted_revision,
-            .index_name = owned_name,
-            .work_class = intent.work_class,
-            .config_hash = intent.config_hash,
-            .root_generation = intent.root_generation,
-            .class = class,
-            .phase_terminal = intent.phase == .terminal,
-            .durable_next_retry_at_ms = intent.next_retry_at_ms,
-            .next_retry_at_ms = intent.next_retry_at_ms,
-        });
-        self.by_id.putAssumeCapacity(intent.repair_id, record_index);
-        self.by_name.putAssumeCapacity(owned_name, record_index);
-        self.incrementClass(class);
-        if (class == .runnable) self.addRunnableAssumeCapacity(intent.repair_id);
-    }
-
-    fn remove(self: *@This(), alloc: Allocator, repair_id: u128) void {
-        const record_index = self.by_id.get(repair_id) orelse return;
-        const removed = self.records.items[record_index];
-        if (removed.progress_wait_until_sequence != null) self.progress_waiters -= 1;
-        if (removed.class == .runnable) self.removeRunnable(removed.repair_id);
-        self.decrementClass(removed.class);
-        _ = self.by_id.remove(removed.repair_id);
-        _ = self.by_name.remove(removed.index_name);
-        alloc.free(removed.index_name);
-        _ = self.records.swapRemove(record_index);
-        if (record_index < self.records.items.len) {
-            const moved = self.records.items[record_index];
-            self.by_id.getPtr(moved.repair_id).?.* = record_index;
-            self.by_name.getPtr(moved.index_name).?.* = record_index;
-        }
-        if (self.records.items.len == 0) {
-            self.cursor = 0;
-        } else if (self.cursor >= self.records.items.len) {
-            self.cursor %= self.records.items.len;
-        }
-    }
-
-    fn buildFromState(alloc: Allocator, state: index_repair_state.State) !@This() {
-        var directory: @This() = .{
-            .initialized = true,
-            .identity = state.identity,
-            .control_revision = state.control_revision,
-        };
-        errdefer directory.deinit(alloc);
-        try directory.records.ensureTotalCapacity(alloc, state.entries.items.len);
-        const map_capacity: u32 = @intCast(state.entries.items.len);
-        try directory.by_id.ensureTotalCapacity(alloc, map_capacity);
-        try directory.by_name.ensureTotalCapacity(alloc, map_capacity);
-        try directory.runnable_heap.ensureTotalCapacity(alloc, state.entries.items.len);
-        for (state.entries.items) |entry| try directory.upsert(alloc, entry.intent, entry.intent.revision);
-        return directory;
-    }
-
-    fn summary(self: *@This()) DB.IndexRepairIntentSummary {
-        return .{
-            .runnable = self.runnable,
-            .paused = self.paused,
-            .terminal = self.terminal,
-            .earliest_retry_at_ms = self.earliestRetryDeadline(),
-            .wake = self.wake(),
-        };
-    }
-
-    fn summaryForIndex(self: *@This(), target_index_name: ?[]const u8) DB.IndexRepairIntentSummary {
-        const name = target_index_name orelse return self.summary();
-        const index = self.by_name.get(name) orelse return .{};
-        const record = self.records.items[index];
-        return .{
-            .runnable = @intFromBool(record.class == .runnable),
-            .paused = @intFromBool(record.class == .paused),
-            .terminal = @intFromBool(record.class == .terminal),
-            .earliest_retry_at_ms = if (record.class == .runnable) record.next_retry_at_ms else 0,
-            .wake = if (record.class != .runnable) .empty else if (record.next_retry_at_ms == 0) .immediate else .{ .at_realtime_ms = record.next_retry_at_ms },
-        };
-    }
-};
+const IndexRepairSchedulerDirectory = @import("index_repair_scheduler.zig").Directory;
+const retryableIndexRepairTerminalPhase = @import("index_repair_scheduler.zig").retryableTerminalPhase;
 
 const AsyncDenseCatchUpSession = struct {
     index_name: []u8,
@@ -1464,10 +1014,7 @@ const AsyncContext = struct {
     // clean marker from racing a newly admitted derived session.
     dense_projection_committing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     dense_projection_finalization_requested: bool = false,
-    native_publication_enabled: bool = false,
-    native_publication_mutex: std.atomic.Mutex = .unlocked,
-    native_publication_wake: std.Io.Event = .unset,
-    native_publication_future: ?std.Io.Future(void) = null,
+    native_projection_owner: @import("native_projection_owner.zig").Owner = .{},
     pending_dense_projection_finalizations: std.StringHashMapUnmanaged(u64) = .empty,
     deferred_external_bulk_notify_sequence: AtomicU64 = AtomicU64.init(0),
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
@@ -1483,7 +1030,7 @@ const AsyncContext = struct {
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
-    enrichment_restart_state: std.atomic.Value(u8) = .init(0),
+    enrichment_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     target_advance_warning_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     /// Exact indexes whose replay watermark could not advance because the
@@ -1508,9 +1055,9 @@ const AsyncContext = struct {
     /// looping on the same deferred check indefinitely.
     target_advance_stuck: std.StringHashMapUnmanaged(TargetAdvanceStuckRecord) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
-    text_merge_restart_state: std.atomic.Value(u8) = .init(0),
+    text_merge_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
-    sparse_compaction_restart_state: std.atomic.Value(u8) = .init(0),
+    sparse_compaction_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     repair_options: types.ArtifactRepairRunOptions = .{},
@@ -1716,7 +1263,6 @@ const artifact_repair_summary_invalidation_page_size: usize = 256;
 const dense_catch_up_startup_max_records_default: usize = 32;
 const dense_catch_up_startup_max_chunk_bytes_default: u64 = 512 * 1024;
 const graph_repair_rebuild_batch_size: usize = 2048;
-var portable_activation_retry_jitter_nonce: AtomicU64 = AtomicU64.init(0);
 var test_fail_portable_activation_retry_fallback_submit: std.atomic.Value(bool) = .init(false);
 var test_pause_portable_activation_retry_probe_before_lifecycle_lock: std.atomic.Value(bool) = .init(false);
 var test_portable_activation_retry_probe_paused: std.atomic.Value(bool) = .init(false);
@@ -2236,7 +1782,6 @@ const TtlCleanupContext = struct {
     schema_registry: ?*schema_registry_mod.Registry = null,
     hook_mutex: Io.Mutex = .init,
     coordinated_port: ?coordinated_ttl.Port = null,
-    coordinated_group_id: u64 = 0,
 };
 
 /// Synchronous local mutation receiver. It borrows resources and owns only
@@ -2286,7 +1831,7 @@ const LocalMutationExecution = struct {
     const acquireReplicationMutationShared = DB.acquireReplicationMutationShared;
     const acquireTransactionSchemaView = DB.acquireTransactionSchemaView;
     const artifactMaterializationsReady = DB.artifactMaterializationsReady;
-    const graphCleanupRequiresOrderedApply = DB.graphCleanupRequiresOrderedApply;
+    const maintenanceRequiresOrderedApply = DB.maintenanceRequiresOrderedApply;
     fn finishBatchGraphEndpointCleanup(_: *@This(), _: types.BatchRequest, _: BatchExecutionOptions) !void {
         // Recovery owns only the committed mutation. The resident DB services
         // its durable jobs independently after recovery releases admission.
@@ -5056,10 +4601,6 @@ fn sleepNs(duration_ns: u64) void {
     };
 }
 
-fn groupCreatedAtMetadataKeyAlloc(alloc: Allocator, group_id: u64) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_created_at:{d}", .{group_id});
-}
-
 fn sleepPollInterval() void {
     platform_clock.Clock.real().sleepMs(10);
 }
@@ -5289,9 +4830,7 @@ const LocalExecutionState = struct {
     /// Owner-scoped recovery keeps remote acknowledgement off the open/read
     /// path. The startup barrier orders crash-left obligations before new WAL
     /// records; steady-state mutations then wait on independent LSN watermarks.
-    durable_replication_recovery_state: std.atomic.Value(u8) = .init(0),
-    durable_replication_recovery_failure_streak: u32 = 0,
-    durable_replication_recovery_next_attempt_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    publication_outbox_recovery: @import("publication_outbox_recovery.zig").Driver = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested. The owner-scoped
     /// durable lane is drained before DB teardown, so jobs may safely borrow
     /// this DB while keeping schema publication latency independent of index
@@ -5340,8 +4879,7 @@ pub const DB = struct {
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     stable_address: bool = false,
-    graph_cleanup_worker: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
-    graph_cleanup_stop: std.atomic.Value(bool) = .init(false),
+    graph_cleanup_owner: @import("graph_cleanup_owner.zig").Owner = .{},
     alloc: Allocator,
     runtime_alloc: Allocator,
     generation_read_lease: ?generation_lifecycle.ReadLease,
@@ -5408,41 +4946,20 @@ pub const DB = struct {
     // The retry worker is owner-scoped and short-lived: it exits after recovery
     // instead of retaining an OS thread per DB. The runtime owner provides the
     // close-safe lifetime fence and bounded process-wide concurrency.
-    portable_activation_retry_lifecycle_mutex: std.atomic.Mutex = .unlocked,
-    portable_activation_retry_worker_running: std.atomic.Value(bool) = .init(false),
-    portable_activation_retry_stop: std.atomic.Value(bool) = .init(false),
-    portable_activation_retry_jitter_salt: u64 = 0,
-    portable_activation_retry_launch_failure_streak: u32 = 0,
-    portable_activation_retry_next_launch_ns: u64 = 0,
+    portable_activation_recovery: portable_activation_recovery.Owner = .{},
     // Background retry of quarantined index loads (see retryQuarantinedIndexLoads).
     // Started after the DB reaches its final address; exits once all
     // quarantined indexes recover or the DB closes.
-    quarantine_retry_thread: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
-    quarantine_retry_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    // DB pointers are borrowed by independently compiled runtime units. Keep
-    // the physical layout identical in test and production artifacts even
-    // though only tests observe this diagnostic value.
-    quarantine_retry_start_address_for_test: usize = 0,
-    artifact_repair_metadata_future: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
-    artifact_repair_metadata_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    quarantine_recovery: quarantine_recovery.Owner = .{},
+    independent_maintenance: independent_maintenance.Owner = .{},
     relational_columns_building: std.atomic.Value(bool) = .init(false),
     relational_columns_rebuild_requested: std.atomic.Value(bool) = .init(false),
     relational_column_maintenance: relational_columns.Maintenance = .{},
-    artifact_metadata_retry_after_ns: u64 = 0,
     artifact_repair_metadata_due_ns: u64 = 0,
     artifact_repair_metadata_pending: bool = true,
     artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
-    artifact_producer_work_running: std.atomic.Value(bool) = .init(false),
-    artifact_producer_work_pending: std.atomic.Value(bool) = .init(false),
-    artifact_producer_work_retry_after_ns: std.atomic.Value(u64) = .init(0),
-    artifact_producer_work_cursor: ?@import("artifact_producer_obligations.zig").WorkCursor = null,
-    artifact_producer_retry_after_ns: ?u64 = null,
-    artifact_producer_retry_round: ?struct { authority: @import("artifact_publication.zig").Authority, number: u64, more: bool = false } = null,
-    artifact_upload_recovery_cursor: std.atomic.Value(u64) = .init(0),
-    artifact_upload_recovery_mutex: std.Io.Mutex = .init,
-    artifact_upload_recovery_tracker: @import("artifact_publication_transport.zig").RecoveryTracker = .{},
-    artifact_upload_recovery_retry_after_ns: std.atomic.Value(u64) = .init(0),
+    artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
     /// no_progress_timeout_ns`); 0 disables it. Copied into `ReplayDrainOptions`
@@ -6142,73 +5659,61 @@ pub const DB = struct {
     /// Queue remote acknowledgement without coupling it to DB open or reads.
     /// The dedicated owner gives this retry state an independent maintenance
     /// probe and makes close a lifetime barrier for every borrowed callback.
-    fn scheduleDurableReplicationOutboxRecovery(self: *DB) void {
-        if (!self.stable_address or self.replication_recovery_owner_id == 0) return;
-        if (self.async_context.background_closing.load(.acquire)) return;
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
-        if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
-        if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) {
-            if (self.local_execution.replication_async_effect_mirror == null) self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
-            return;
-        }
-        if (self.backend_runtime.durable_jobs.executesInline()) return;
-        if (monotonicTimeNs() < self.local_execution.durable_replication_recovery_next_attempt_ns.load(.acquire)) {
-            self.armDurableReplicationRecoveryProbe();
-            return;
-        }
-        if (self.local_execution.durable_replication_recovery_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
-        self.backend_runtime.durable_jobs.submit(.{
-            .owner_id = self.replication_recovery_owner_id,
-            .class = .maintenance,
-            .ptr = self,
-            .run = DurableReplicationRecoveryWork.run,
-            .deinit = DurableReplicationRecoveryWork.deinit,
-        }) catch |err| {
-            self.local_execution.durable_replication_recovery_state.store(0, .release);
-            self.local_execution.durable_replication_recovery_next_attempt_ns.store(
-                monotonicTimeNs() +| portable_activation_retry_base_ns,
-                .release,
-            );
-            self.armDurableReplicationRecoveryProbe();
-            std.log.warn("durable HA recovery queue unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
-        };
+    fn publicationOutboxRecoveryPort(self: *DB) @import("publication_outbox_recovery.zig").Driver.Port {
+        return .{ .ptr = self, .eligible = outboxRecoveryEligible, .closing = outboxRecoveryClosing, .pending = outboxRecoveryPending, .may_disarm = outboxRecoveryMayDisarm, .now = outboxRecoveryNow, .drain = outboxRecoveryDrain, .submit = outboxRecoverySubmit, .arm = outboxRecoveryArm, .disarm = outboxRecoveryDisarm, .retry_delay = outboxRecoveryDelay, .report = outboxRecoveryReport };
     }
 
+    fn scheduleDurableReplicationOutboxRecovery(self: *DB) void {
+        self.local_execution.publication_outbox_recovery.schedule(self.publicationOutboxRecoveryPort());
+    }
     fn runDurableReplicationOutboxRecovery(self: *DB) void {
-        // A successful delivery leaves the conservative maybe-bit set until a
-        // fenced empty scan. A second pass supplies that proof without making
-        // every individual clear perform another prefix scan.
-        for (0..2) |_| {
-            self.flushDurableReplicationOutboxes() catch |err| {
-                if (self.async_context.background_closing.load(.acquire)) {
-                    self.local_execution.durable_replication_recovery_state.store(0, .release);
-                    return;
-                }
-                self.local_execution.durable_replication_recovery_failure_streak +|= 1;
-                const delay_ns = portableActivationRetryDelayNs(
-                    self.core.path,
-                    @as(u64, @truncate(self.root_incarnation)) ^ self.replication_recovery_owner_id,
-                    self.local_execution.durable_replication_recovery_failure_streak - 1,
-                );
-                self.local_execution.durable_replication_recovery_next_attempt_ns.store(monotonicTimeNs() +| delay_ns, .release);
-                self.local_execution.durable_replication_recovery_state.store(0, .release);
-                self.armDurableReplicationRecoveryProbe();
-                std.log.warn(
-                    "durable HA acknowledgement pending path={s} err={s} failures={d} next_retry_ms={d}",
-                    .{ self.core.path, @errorName(err), self.local_execution.durable_replication_recovery_failure_streak, delay_ns / std.time.ns_per_ms },
-                );
-                return;
-            };
-            if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) break;
-        }
-        self.local_execution.durable_replication_recovery_failure_streak = 0;
-        self.local_execution.durable_replication_recovery_next_attempt_ns.store(0, .release);
-        self.local_execution.durable_replication_recovery_state.store(0, .release);
-        if (self.local_execution.durable_replication_outbox_maybe.load(.acquire)) {
-            self.scheduleDurableReplicationOutboxRecovery();
-        } else {
-            if (self.local_execution.replication_async_effect_mirror == null) self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
-        }
+        self.local_execution.publication_outbox_recovery.run(self.publicationOutboxRecoveryPort());
+    }
+    fn outboxRecoveryEligible(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.stable_address and self.replication_recovery_owner_id != 0 and
+            !self.async_context.background_closing.load(.acquire) and
+            !openModeRequiresReadOnlyBackends(self.open_mode) and !self.backend_runtime.durable_jobs.executesInline();
+    }
+    fn outboxRecoveryClosing(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.async_context.background_closing.load(.acquire);
+    }
+    fn outboxRecoveryPending(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+        return self.local_execution.durable_replication_outbox_maybe.load(.acquire);
+    }
+    fn outboxRecoveryMayDisarm(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.local_execution.replication_async_effect_mirror == null;
+    }
+    fn outboxRecoveryNow(_: *anyopaque) u64 {
+        return monotonicTimeNs();
+    }
+    fn outboxRecoveryDrain(ptr: *anyopaque) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        try self.flushDurableReplicationOutboxes();
+    }
+    fn outboxRecoverySubmit(ptr: *anyopaque) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        try self.backend_runtime.durable_jobs.submit(.{ .owner_id = self.replication_recovery_owner_id, .class = .maintenance, .ptr = self, .run = DurableReplicationRecoveryWork.run, .deinit = DurableReplicationRecoveryWork.deinit });
+    }
+    fn outboxRecoveryArm(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.armDurableReplicationRecoveryProbe();
+    }
+    fn outboxRecoveryDisarm(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
+    }
+    fn outboxRecoveryDelay(ptr: *anyopaque, failure_streak: u32) u64 {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return portableActivationRetryDelayNs(self.core.path, @as(u64, @truncate(self.root_incarnation)) ^ self.replication_recovery_owner_id, failure_streak);
+    }
+    fn outboxRecoveryReport(ptr: *anyopaque, failure: @import("publication_outbox_recovery.zig").Driver.Failure, err: anyerror, failures: u32, delay_ns: u64) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        std.log.warn("hot_standby publication recovery {s} failed path={s} err={s} failures={d} next_retry_ms={d}", .{ @tagName(failure), self.core.path, @errorName(err), failures, delay_ns / std.time.ns_per_ms });
     }
 
     fn armDurableReplicationRecoveryProbe(self: *DB) void {
@@ -6216,7 +5721,7 @@ pub const DB = struct {
             .ptr = self,
             .run = durableReplicationRecoveryMaintenanceProbeMain,
         }) catch |err| {
-            std.log.warn("durable HA recovery supervisor unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
+            std.log.warn("hot_standby recovery supervisor unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
         };
     }
 
@@ -7620,7 +7125,7 @@ pub const DB = struct {
             .snapshot_replay_admission = async_resources.snapshot_replay_admission,
             .repair_replay_mutex = async_resources.repair_replay_mutex,
             .io = self.backend_runtime.io(),
-            .native_publication_enabled = self.start_index_workers,
+            .native_projection_owner = .{ .enabled = self.start_index_workers },
             .require_graph_resolution_contract = true,
             .query_visibility_hook = null,
             .text_merge_runtime = null,
@@ -8300,13 +7805,12 @@ pub const DB = struct {
 
     /// The context must outlive the managed DB. This only swaps the callback;
     /// teardown drains TTL workers before releasing the owning service.
-    pub fn setCoordinatedTtl(self: *DB, port: ?coordinated_ttl.Port, group_id: u64) void {
+    pub fn setCoordinatedTtl(self: *DB, port: ?coordinated_ttl.Port) void {
         const context = self.ttl_cleanup_context orelse return;
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
         context.hook_mutex.lockUncancelable(io);
         defer context.hook_mutex.unlock(io);
         context.coordinated_port = port;
-        context.coordinated_group_id = group_id;
     }
 
     fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
@@ -8417,7 +7921,7 @@ pub const DB = struct {
         }
         if (opts.ttl_cleanup.enabled) {
             try self.initOptionalTtlRuntime(opts.ttl_cleanup);
-            self.setCoordinatedTtl(opts.coordinated_ttl, opts.coordinated_ttl_group_id);
+            self.setCoordinatedTtl(opts.coordinated_ttl);
         }
         if (opts.transaction_recovery.enabled) {
             try self.initOptionalTransactionRuntime(opts.transaction_recovery);
@@ -8447,7 +7951,7 @@ pub const DB = struct {
     /// deterministic scheduler drains them. Destruction still happens through
     /// the ordinary close path after the drain completes.
     pub fn beginTeardown(self: *DB) void {
-        self.graph_cleanup_stop.store(true, .release);
+        self.graph_cleanup_owner.stopping.store(true, .release);
         if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
         if (self.transaction_runtime) |runtime| runtime.beginTeardown();
     }
@@ -8552,8 +8056,7 @@ pub const DB = struct {
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
         self.stopArtifactRepairMetadataWorker();
-        if (self.artifact_producer_work_cursor) |cursor| self.alloc.free(cursor.document);
-        self.artifact_producer_work_cursor = null;
+        self.artifact_producer_scheduler.deinit(self.alloc);
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
         self.stopGraphEndpointCleanupWorker();
@@ -9644,7 +9147,7 @@ pub const DB = struct {
             try self.waitForCurrentSyncLevelWithCancellation(.full_index, opts.visibility_cancellation);
     }
 
-    /// Local maintenance follows the same live HA authority as user writes.
+    /// Local maintenance follows the same captured write admission as user writes.
     /// A retained standby/fenced generation may open and replay exact commands,
     /// but cannot choose cleanup effects or mutate its local directory on its own.
     fn graphEndpointCleanupWriteAuthority(self: *DB) !bool {
@@ -9654,48 +9157,33 @@ pub const DB = struct {
 
     fn canRunLocalGraphEndpointCleanup(self: *DB) !bool {
         if (!try self.graphEndpointCleanupWriteAuthority()) return false;
-        return !try self.graphCleanupRequiresOrderedApply();
+        return !try self.maintenanceRequiresOrderedApply();
     }
 
-    fn graphCleanupRequiresOrderedApply(self: anytype) !bool {
-        return blk: {
-            var read = try self.core.store.beginReadTxn();
-            defer read.abort();
-            if (try @import("../source_authority.zig").load(&read)) |authority| if (authority.kind == .raft) break :blk true;
-            break :blk if (read.get(&internal_keys.ordered_document_applied_entry_key)) |_| true else |err| if (err == error.NotFound) false else return err;
-        };
+    fn maintenanceRequiresOrderedApply(self: anytype) !bool {
+        var read = try self.core.store.beginReadTxn();
+        defer read.abort();
+        return try @import("../source_authority.zig").maintenanceMode(&read) == .ordered;
     }
 
     fn startGraphEndpointCleanupWorker(self: *DB) void {
         if (comptime builtin.os.tag == .freestanding) return;
-        if (!self.stable_address or !self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer or self.graph_cleanup_worker != null) return;
+        if (!self.stable_address or !self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer) return;
         if (!(self.canRunLocalGraphEndpointCleanup() catch false)) return;
-        const scheduler = self.backend_runtime.maintenanceScheduler() catch |err| {
-            std.log.warn("graph cleanup scheduler unavailable: {}", .{err});
-            return;
-        };
-        self.graph_cleanup_stop.store(false, .release);
-        self.graph_cleanup_worker = scheduler.register(self, graphEndpointCleanupWorkerStep) catch |err| {
-            std.log.warn("graph cleanup worker unavailable: {}", .{err});
-            return;
-        };
+        self.graph_cleanup_owner.start(self.graphCleanupPort());
     }
-
+    fn graphCleanupPort(self: *DB) @import("graph_cleanup_owner.zig").Owner.Port {
+        return .{ .ptr = self, .runtime = self.backend_runtime, .run = graphCleanupPage };
+    }
+    fn graphCleanupPage(ptr: *anyopaque) !bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.runStandaloneGraphEndpointCleanupStep();
+    }
     fn stopGraphEndpointCleanupWorker(self: *DB) void {
-        self.graph_cleanup_stop.store(true, .release);
-        if (self.graph_cleanup_worker) |*worker| {
-            worker.await(self.backend_runtime.io().?);
-            self.graph_cleanup_worker = null;
-        }
+        self.graph_cleanup_owner.stop(self.backend_runtime.io());
     }
-
     fn graphEndpointCleanupWorkerStep(self: *DB) ?u64 {
-        if (self.graph_cleanup_stop.load(.acquire)) return null;
-        const progressed = self.runStandaloneGraphEndpointCleanupStep() catch |err| {
-            std.log.warn("graph endpoint cleanup deferred: {}", .{err});
-            return 250;
-        };
-        return if (progressed) 1 else 100;
+        return self.graph_cleanup_owner.step(self.graphCleanupPort());
     }
 
     /// Every enqueue path is serviced independently of subsequent foreground
@@ -9926,26 +9414,23 @@ pub const DB = struct {
         apply_mutex_held = false;
         defer docstore_mod.DocStore.freeResults(self.alloc, scanned);
 
-        var result = DocumentArtifactChildRangeOutboxDrainResult{};
-        const max_entries = if (limit == 0 or limit > scanned.len) scanned.len else limit;
-        for (scanned[0..max_entries]) |entry| {
-            result.scanned += 1;
-            var parsed = try std.json.parseFromSlice(DocumentArtifactChildRangeOutboxRecord, self.alloc, entry.value, .{
-                .allocate = .alloc_always,
-            });
-            defer parsed.deinit();
-            if (parsed.value.version != 1) return error.InvalidDocumentChildRangeOutboxRecord;
-            try dispatcher.applyDispatch(self.alloc, .{
-                .owner_group_id = parsed.value.owner_group_id,
-                .doc_key = parsed.value.doc_key,
-                .artifact_name = parsed.value.artifact_name,
-                .child_batch = parsed.value.child_batch,
-            });
-            result.dispatched += 1;
-            try self.deleteDocumentArtifactChildRangeOutboxEntry(entry.key);
-            result.deleted += 1;
-        }
-        return result;
+        const Removal = struct {
+            fn remove(ptr: *anyopaque, key: []const u8) !void {
+                const owner: @TypeOf(self) = @ptrCast(@alignCast(ptr));
+                return owner.deleteDocumentArtifactChildRangeOutboxEntry(key);
+            }
+        };
+        return document_child_range_outbox.drain(self.alloc, scanned, dispatcher, limit, self, Removal.remove);
+    }
+
+    fn childRangeManifestReader(self: anytype) document_child_range_effects.Reader {
+        const Read = struct {
+            fn get(ptr: *anyopaque, alloc: Allocator, key: []const u8) !?[]u8 {
+                const owner: @TypeOf(self) = @ptrCast(@alignCast(ptr));
+                return owner.core.getStoreValue(alloc, key);
+            }
+        };
+        return .{ .ptr = self, .get = Read.get };
     }
 
     fn deleteDocumentArtifactChildRangeOutboxEntry(self: anytype, key: []const u8) !void {
@@ -12570,7 +12055,7 @@ pub const DB = struct {
         if (req.graph_endpoint_cleanup and !req.graph_endpoint_cleanup_planned) {
             // Recheck under the apply fence: ownership may have changed since
             // the scheduler or foreground drain probed it.
-            if (try self.graphCleanupRequiresOrderedApply()) return error.InvalidBatchRequest;
+            if (try self.maintenanceRequiresOrderedApply()) return error.InvalidBatchRequest;
             effective_req.graph_endpoint_cleanup_planned = true;
             graph_cleanup_page = try self.core.store.prepareGraphEndpointCleanupPage(self.alloc);
             if (graph_cleanup_page) |page| {
@@ -13335,8 +12820,8 @@ pub const DB = struct {
                 );
             }
 
-            if (opts.document_child_range_dispatcher != null) {
-                try partitionRemoteDocumentChildRangeGeneratedBatch(self, preparation_alloc, &precomputed_generated, &remote_child_range_dispatches);
+            if (opts.document_child_range_dispatcher) |dispatcher| {
+                try document_child_range_effects.partitionRemoteDocumentChildRangeGeneratedBatch(childRangeManifestReader(self), preparation_alloc, &precomputed_generated, &remote_child_range_dispatches, .{ .ptr = dispatcher.ptr, .select = dispatcher.select_destination });
             }
 
             for (precomputed_generated.artifact_writes) |write| {
@@ -14523,86 +14008,6 @@ pub const DB = struct {
         }
     };
 
-    const EnrichmentRestartWork = struct {
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-
-        const retry_initial_ms: i64 = 25;
-        const retry_max_ms: i64 = 1000;
-        const retries_per_job: usize = 8;
-
-        fn run(ptr: *anyopaque) anyerror!void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            var retries: usize = 0;
-            while (true) {
-                if (work.ctx.background_closing.load(.acquire)) {
-                    work.ctx.enrichment_restart_state.store(0, .release);
-                    return;
-                }
-                if (!work.ctx.enrichment_desired_running.load(.acquire)) {
-                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                        retries = 0;
-                        continue;
-                    }
-                    return;
-                }
-
-                lockAtomicWithBackoff(&work.ctx.enrichment_lifecycle_mutex);
-                const runtime = work.ctx.enrichment_runtime;
-                const should_start = runtime != null and
-                    work.ctx.enrichment_desired_running.load(.acquire) and
-                    !work.ctx.background_closing.load(.acquire) and
-                    !runtime.?.isStarted();
-                const start_result: ?anyerror = if (should_start) blk: {
-                    startEnrichmentRuntimeForLifecycle(runtime.?) catch |err| break :blk err;
-                    break :blk null;
-                } else null;
-                const started = runtime == null or runtime.?.isStarted();
-                work.ctx.enrichment_lifecycle_mutex.unlock();
-
-                if (started) {
-                    notifyQueryVisibilityHook(work.ctx, .status);
-                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                        retries = 0;
-                        continue;
-                    }
-                    return;
-                }
-
-                retries += 1;
-                if (retries == 1 or std.math.isPowerOfTwo(retries)) {
-                    std.log.warn("enrichment runtime restart retry attempt={} err={s}", .{
-                        retries,
-                        if (start_result) |err| @errorName(err) else "RuntimeNotStarted",
-                    });
-                }
-                if (work.ctx.io) |io| {
-                    const shift: u6 = @intCast(@min(retries - 1, 5));
-                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
-                    io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
-                } else {
-                    work.ctx.enrichment_restart_state.store(0, .release);
-                    return start_result orelse error.EnrichmentRuntimeUnavailable;
-                }
-                if (retries >= retries_per_job) {
-                    // Preserve autonomous recovery while allowing unrelated
-                    // durable work to run on a persistently failing runtime.
-                    work.ctx.enrichment_restart_state.store(0, .release);
-                    scheduleEnrichmentRestartContext(work.ctx, work.lane, work.owner_id);
-                    return;
-                }
-            }
-        }
-
-        fn deinit(ptr: *anyopaque) void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            std.heap.page_allocator.destroy(work);
-        }
-    };
-
     var test_enrichment_restart_failures_remaining: std.atomic.Value(u32) = .init(0);
     var test_enrichment_reconfigure_after_detached_hook: ?*const fn (*DB) anyerror!void = null;
 
@@ -14625,152 +14030,52 @@ pub const DB = struct {
         try runtime.start();
     }
 
-    fn scheduleEnrichmentRestartContext(
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-    ) void {
-        if (ctx.background_closing.load(.acquire) or
-            !ctx.enrichment_desired_running.load(.acquire)) return;
-        if (ctx.enrichment_restart_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = ctx.enrichment_restart_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
-            return;
-        }
-        const work = std.heap.page_allocator.create(EnrichmentRestartWork) catch {
-            ctx.enrichment_restart_state.store(0, .release);
-            return;
-        };
-        work.* = .{ .ctx = ctx, .lane = lane, .owner_id = owner_id };
-        lane.submit(.{
-            .owner_id = owner_id,
-            .class = .maintenance,
-            .ptr = work,
-            .run = EnrichmentRestartWork.run,
-            .deinit = EnrichmentRestartWork.deinit,
-        }) catch |err| {
-            std.heap.page_allocator.destroy(work);
-            ctx.enrichment_restart_state.store(0, .release);
-            std.log.warn("enrichment runtime restart was not scheduled err={s}", .{@errorName(err)});
-        };
+    fn scheduleEnrichmentRestartContext(ctx: *AsyncContext, lane: background_runtime_mod.DurableJobLane, owner_id: u64) void {
+        ctx.enrichment_restart_owner.schedule(.{ .ptr = ctx, .lane = lane, .owner_id = owner_id, .io = ctx.io, .closing = &ctx.background_closing, .wanted = enrichmentRestartWanted, .attempt = attemptEnrichmentRestart, .name = "enrichment", .unavailable = error.EnrichmentRuntimeUnavailable });
     }
-
-    const MaintenanceRuntimeKind = enum {
-        text_merge,
-        sparse_compaction,
-    };
-
-    fn maintenanceRestartState(ctx: *AsyncContext, kind: MaintenanceRuntimeKind) *std.atomic.Value(u8) {
-        return switch (kind) {
-            .text_merge => &ctx.text_merge_restart_state,
-            .sparse_compaction => &ctx.sparse_compaction_restart_state,
-        };
+    fn enrichmentRestartWanted(ptr: *anyopaque) bool {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        return ctx.enrichment_desired_running.load(.acquire);
     }
-
-    fn ensureMaintenanceRuntimeRunning(ctx: *AsyncContext, kind: MaintenanceRuntimeKind) !bool {
-        return switch (kind) {
-            .text_merge => if (ctx.text_merge_runtime) |runtime| try runtime.ensureRunning() else true,
-            .sparse_compaction => if (ctx.sparse_compaction_runtime) |runtime| try runtime.ensureRunning() else true,
-        };
+    fn attemptEnrichmentRestart(ptr: *anyopaque) !bool {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        lockAtomicWithBackoff(&ctx.enrichment_lifecycle_mutex);
+        const runtime = ctx.enrichment_runtime;
+        const should_start = runtime != null and ctx.enrichment_desired_running.load(.acquire) and !ctx.background_closing.load(.acquire) and !runtime.?.isStarted();
+        const start_error: ?anyerror = if (should_start) blk: {
+            startEnrichmentRuntimeForLifecycle(runtime.?) catch |err| break :blk err;
+            break :blk null;
+        } else null;
+        const started = runtime == null or runtime.?.isStarted();
+        ctx.enrichment_lifecycle_mutex.unlock();
+        if (started) {
+            notifyQueryVisibilityHook(ctx, .status);
+            return true;
+        }
+        if (start_error) |err| return err;
+        return false;
     }
-
-    const MaintenanceRestartWork = struct {
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-        kind: MaintenanceRuntimeKind,
-
-        const retry_initial_ms: i64 = 25;
-        const retry_max_ms: i64 = 1000;
-        const retries_per_job: usize = 8;
-
-        fn run(ptr: *anyopaque) anyerror!void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            const restart_state = maintenanceRestartState(work.ctx, work.kind);
-            var retries: usize = 0;
-            while (true) {
-                if (work.ctx.background_closing.load(.acquire)) {
-                    restart_state.store(0, .release);
-                    return;
-                }
-
-                var start_error: ?anyerror = null;
-                const running = ensureMaintenanceRuntimeRunning(work.ctx, work.kind) catch |err| blk: {
-                    start_error = err;
-                    break :blk false;
-                };
-                if (running) {
-                    if (restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                    if (restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                        retries = 0;
-                        continue;
-                    }
-                    return;
-                }
-
-                retries += 1;
-                if (start_error) |err| {
-                    if (retries == 1 or std.math.isPowerOfTwo(retries)) {
-                        std.log.warn("{s} runtime restart retry attempt={} err={s}", .{
-                            @tagName(work.kind),
-                            retries,
-                            @errorName(err),
-                        });
-                    }
-                }
-                // A paused runtime is owned by a subsequent structural
-                // mutation. Wait without starting it behind that mutation.
-                if (work.ctx.io) |io| {
-                    const shift: u6 = @intCast(@min(retries - 1, 5));
-                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
-                    io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
-                } else {
-                    restart_state.store(0, .release);
-                    return error.MaintenanceRuntimeUnavailable;
-                }
-                if (retries >= retries_per_job) {
-                    // Yield the shared durable lane during persistent failure;
-                    // the desired-running bit makes resubmission idempotent.
-                    restart_state.store(0, .release);
-                    scheduleMaintenanceRestartContext(work.ctx, work.lane, work.owner_id, work.kind);
-                    return;
-                }
-            }
-        }
-
-        fn deinit(ptr: *anyopaque) void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            std.heap.page_allocator.destroy(work);
-        }
-    };
-
-    fn scheduleMaintenanceRestartContext(
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-        kind: MaintenanceRuntimeKind,
-    ) void {
-        if (ctx.background_closing.load(.acquire)) return;
-        const restart_state = maintenanceRestartState(ctx, kind);
-        if (restart_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = restart_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
-            return;
-        }
-        const work = std.heap.page_allocator.create(MaintenanceRestartWork) catch {
-            restart_state.store(0, .release);
-            return;
+    const MaintenanceRuntimeKind = enum { text_merge, sparse_compaction };
+    fn restartWanted(_: *anyopaque) bool {
+        return true;
+    }
+    fn attemptTextMergeRestart(ptr: *anyopaque) !bool {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        return if (ctx.text_merge_runtime) |runtime| try runtime.ensureRunning() else true;
+    }
+    fn attemptSparseCompactionRestart(ptr: *anyopaque) !bool {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        return if (ctx.sparse_compaction_runtime) |runtime| try runtime.ensureRunning() else true;
+    }
+    fn scheduleMaintenanceRestartContext(ctx: *AsyncContext, lane: background_runtime_mod.DurableJobLane, owner_id: u64, kind: MaintenanceRuntimeKind) void {
+        const owner = switch (kind) {
+            .text_merge => &ctx.text_merge_restart_owner,
+            .sparse_compaction => &ctx.sparse_compaction_restart_owner,
         };
-        work.* = .{ .ctx = ctx, .lane = lane, .owner_id = owner_id, .kind = kind };
-        lane.submit(.{
-            .owner_id = owner_id,
-            .class = .maintenance,
-            .ptr = work,
-            .run = MaintenanceRestartWork.run,
-            .deinit = MaintenanceRestartWork.deinit,
-        }) catch |err| {
-            std.heap.page_allocator.destroy(work);
-            restart_state.store(0, .release);
-            std.log.warn("{s} runtime restart was not scheduled err={s}", .{ @tagName(kind), @errorName(err) });
-        };
+        owner.schedule(.{ .ptr = ctx, .lane = lane, .owner_id = owner_id, .io = ctx.io, .closing = &ctx.background_closing, .wanted = restartWanted, .attempt = switch (kind) {
+            .text_merge => attemptTextMergeRestart,
+            .sparse_compaction => attemptSparseCompactionRestart,
+        }, .name = @tagName(kind) });
     }
 
     fn quiesceEnrichmentForStructuralMutation(self: *DB) bool {
@@ -16330,33 +15635,6 @@ pub const DB = struct {
         errdefer alloc.free(result);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
-    }
-
-    pub fn getGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64) !?u64 {
-        const key = try groupCreatedAtMetadataKeyAlloc(alloc, group_id);
-        defer alloc.free(key);
-        const raw = try self.get(alloc, key) orelse return null;
-        defer alloc.free(raw);
-        return try std.fmt.parseInt(u64, raw, 10);
-    }
-
-    pub fn ensureGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64, now_ms: u64) !u64 {
-        if (try self.getGroupCreatedAtMillis(alloc, group_id)) |created_at_millis| return created_at_millis;
-
-        const key = try groupCreatedAtMetadataKeyAlloc(alloc, group_id);
-        defer alloc.free(key);
-        const encoded = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
-        defer alloc.free(encoded);
-
-        try self.batch(.{
-            .writes = &.{
-                .{
-                    .key = key,
-                    .value = encoded,
-                },
-            },
-        });
-        return now_ms;
     }
 
     pub fn getArtifact(self: *DB, alloc: Allocator, artifact_id: []const u8) !?types.ArtifactRecord {
@@ -18355,13 +17633,7 @@ pub const DB = struct {
     /// boundaries.
     pub const IndexRepairWake = types.IndexRepairWake;
 
-    pub const IndexRepairIntentSummary = struct {
-        runnable: usize = 0,
-        paused: usize = 0,
-        terminal: usize = 0,
-        earliest_retry_at_ms: u64 = 0,
-        wake: IndexRepairWake = .empty,
-    };
+    pub const IndexRepairIntentSummary = @import("index_repair_scheduler.zig").Summary;
 
     /// Requires index_repair_scheduler_mutex.
     fn publishIndexRepairProgressWaitHint(ctx: *AsyncContext) void {
@@ -34904,13 +34176,13 @@ pub const DB = struct {
             defer activity.deinit();
             // No resolver can be removed while an old decision or promotion is
             // in flight. Wake the existing owner and retry on a later refresh.
-            const promotion = self.promotionStageStats();
-            // Followers cannot promote. Their queued hints reference the live
-            // artifacts deleted below and cannot publish after this callback
-            // fence; they must not prevent local catalog retirement forever.
-            const follower = std.mem.eql(u8, promotion.blocked_reason, "not_source_group_leader");
-            if (self.resolutionStageStats().catch_up_required or
-                (!follower and (promotion.catch_up_required or promotion.blocked)))
+            const promotion_ready = if (self.promotion_runtime) |runtime|
+                runtime.retirementReadinessLocked() != .pending
+            else blk: {
+                const persisted = self.promotionStageStats();
+                break :blk !persisted.catch_up_required and !persisted.blocked;
+            };
+            if (self.resolutionStageStats().catch_up_required or !promotion_ready)
                 return error.WriterLocked;
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
@@ -35321,10 +34593,10 @@ pub const DB = struct {
                 try @import("relational_integrity_retirement.zig").requireMutable(&read);
                 try @import("restore_staging.zig").requireScope(alloc, &read, null, false);
                 if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-                // This local administrative entry point cannot invent a Raft
-                // position. Hosted owners must order curation through their owner.
-                if (try @import("../source_authority.zig").load(&read)) |authority| {
-                    if (authority.kind == .raft) return error.OnlineSourceScopeChanged;
+                // Local administration cannot invent an ordered publication
+                // position. External owners must order curation through their owner.
+                if (try @import("../source_authority.zig").publicationOwner(&read)) |owner| {
+                    if (owner.mode == .ordered) return error.OnlineSourceScopeChanged;
                 }
             }
             if (self.core.index_manager.graphIndex(index_name) == null) return error.IndexNotFound;
@@ -37194,10 +36466,8 @@ pub const DB = struct {
         while (try self.runArtifactRepairMetadataMaintenancePass()) {}
     }
 
-    const quarantine_retry_poll_ns: u64 = 10 * std.time.ns_per_s;
-    const quarantine_retry_sleep_slice_ns: u64 = 25 * std.time.ns_per_ms;
-    const portable_activation_retry_base_ns: u64 = 250 * std.time.ns_per_ms;
-    const portable_activation_retry_max_ns: u64 = 30 * std.time.ns_per_s;
+    const portable_activation_retry_base_ns = portable_activation_recovery.Owner.portable_activation_retry_base_ns;
+    const portable_activation_retry_max_ns = portable_activation_recovery.Owner.portable_activation_retry_max_ns;
     const artifact_repair_metadata_poll_ns: u64 = 5 * std.time.ns_per_s;
     const artifact_repair_metadata_active_poll_ns: u64 = 100 * std.time.ns_per_ms;
 
@@ -37223,93 +36493,64 @@ pub const DB = struct {
         }
         if (!self.start_index_workers) return;
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
-        if (self.artifact_repair_metadata_future != null) return;
-        const scheduler = self.backend_runtime.maintenanceScheduler() catch |err| {
-            std.log.warn("artifact repair scheduler unavailable: {}", .{err});
-            return;
-        };
-        self.artifact_repair_metadata_stop.store(false, .release);
-        self.artifact_repair_metadata_future = scheduler.register(self, artifactRepairMetadataWorkerStep) catch |err| {
-            std.log.warn("artifact repair metadata worker spawn failed: {}", .{err});
-            return;
-        };
+        self.independent_maintenance.start(self.independentMaintenancePort());
     }
 
     fn stopArtifactRepairMetadataWorker(self: *DB) void {
-        self.artifact_repair_metadata_stop.store(true, .release);
-        if (self.artifact_repair_metadata_future) |*future| {
-            if (self.backend_runtime.io()) |io| {
-                _ = future.await(io);
-            }
-            self.artifact_repair_metadata_future = null;
-        }
+        self.independent_maintenance.stop(self.backend_runtime);
     }
 
     fn artifactRepairMetadataWorkerStep(self: *DB) ?u64 {
-        if (self.artifact_repair_metadata_stop.load(.acquire)) return null;
-        self.runIndependentMaintenancePass();
-        const artifact_active = self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or
-            (if (self.local_execution.source_vectors.load(.acquire)) |source| source.collectionPending() else false);
-        const active = (self.independentMaintenanceNowNs() >= self.artifact_metadata_retry_after_ns and artifact_active) or
-            (self.artifact_producer_work_pending.load(.acquire) and self.independentMaintenanceNowNs() >= self.artifact_producer_work_retry_after_ns.load(.acquire)) or
-            (self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire)) or
-            (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
-        const scan_pause = if (self.local_execution.source_vectors.load(.acquire)) |source| source.activeScanPauseNs() else null;
-        if (self.local_execution.source_vectors.load(.acquire)) |source| if (source.background_checkpoint and scan_pause == null and !active) return 50;
-        return std.math.divCeil(u64, scan_pause orelse if (active) artifact_repair_metadata_active_poll_ns else artifact_repair_metadata_poll_ns, std.time.ns_per_ms) catch unreachable;
+        return self.independent_maintenance.step(self.independentMaintenancePort());
     }
 
-    fn runIndependentMaintenancePass(self: *DB) void {
-        self.enforcePortableRuntimeGate() catch return;
-        const recovery_now = self.independentMaintenanceNowNs();
-        if (recovery_now >= self.artifact_upload_recovery_retry_after_ns.load(.acquire)) {
-            // Recovery must not inherit the tight active scan cadence: a
-            // coverage-blocked finalize may remain pending for many passes.
-            self.artifact_upload_recovery_retry_after_ns.store(recovery_now +| artifact_repair_metadata_poll_ns, .release);
-            _ = self.advanceArtifactUploadRecovery() catch |err| switch (err) {
-                error.NotLeader, error.Canceled, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ArtifactCatalogDrift => {},
-                else => std.log.warn("artifact upload recovery failed: {s}", .{@errorName(err)}),
-            };
+    fn independentMaintenancePort(self: *DB) independent_maintenance.Owner.Port {
+        return .{ .ptr = self, .runtime = self.backend_runtime, .now = producerMaintenanceNow, .ready = independentMaintenanceReady, .run = independentMaintenanceRun, .failed = independentMaintenanceFailed, .activity = independentMaintenanceActivity };
+    }
+    fn independentMaintenanceReady(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.enforcePortableRuntimeGate() catch return false;
+        return true;
+    }
+    fn independentMaintenanceRun(ptr: *anyopaque, work: independent_maintenance.Owner.Work) !bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        switch (work) {
+            .upload => return self.advanceArtifactUploadRecoveryWithTrigger(.maintenance),
+            .baseline => return self.advanceArtifactProducerBaselinePage(),
+            .producer => return self.advanceArtifactProducerWorkPage(),
+            .footprint => return self.advanceArtifactFootprintPage(),
+            .repair => {
+                try self.runArtifactRepairMaintenanceTurn();
+                return false;
+            },
+            .column => {
+                _ = try self.runRelationalColumnMaintenancePass();
+                return false;
+            },
+            .index => {
+                _ = try self.runRelationalIndexMaintenancePass();
+                return false;
+            },
         }
-        _ = self.advanceArtifactProducerBaselinePage() catch |err| blk: {
-            self.artifact_producer_baseline_pending.store(false, .release);
-            switch (err) {
-                error.OnlineSourcePinPending, error.WriterLocked, error.Canceled, error.ResourceBudgetExceeded, error.ArtifactCatalogDrift => {},
-                else => std.log.warn("artifact producer baseline failed: {s}", .{@errorName(err)}),
-            }
-            break :blk false;
-        };
-        _ = self.advanceArtifactProducerWorkPage() catch |err| switch (err) {
-            error.NotLeader, error.Canceled, error.ResourceLimitExceeded, error.ResourceBudgetExceeded, error.ArtifactCatalogDrift, error.EnrichmentSourceChanged, error.OnlineSourcePinPending, error.WriterLocked => {},
-            else => std.log.warn("artifact producer scheduling failed: {s}", .{@errorName(err)}),
-        };
-        _ = self.advanceArtifactFootprintPage() catch |err| blk: {
-            // A prepared source pin and writer contention are temporary. Keep
-            // the normal idle retry cadence instead of spinning on a fence.
-            self.artifact_footprint_pending.store(false, .release);
-            switch (err) {
-                error.OnlineSourcePinPending, error.WriterLocked, error.Canceled, error.ResourceBudgetExceeded => {},
-                else => std.log.warn("artifact footprint reconciliation failed: {s}", .{@errorName(err)}),
-            }
-            break :blk false;
-        };
-        if (self.independentMaintenanceNowNs() >= self.artifact_metadata_retry_after_ns) {
-            _ = self.runArtifactRepairMaintenanceTurn() catch |err| failed: {
-                if (err == error.PortableRuntimeActivationPending) return;
-                self.artifact_metadata_retry_after_ns = self.independentMaintenanceNowNs() +| artifact_repair_metadata_poll_ns;
-                std.log.warn("artifact repair metadata maintenance pass failed: {}", .{err});
-                break :failed false;
-            };
+    }
+    fn independentMaintenanceFailed(ptr: *anyopaque, work: independent_maintenance.Owner.Work) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        switch (work) {
+            .baseline => self.artifact_producer_baseline_pending.store(false, .release),
+            .footprint => self.artifact_footprint_pending.store(false, .release),
+            else => unreachable,
         }
-        // Drain a time/range budget, then yield to other owner work. A
-        // backlog uses the active cadence rather than the idle poll.
-        _ = self.runRelationalColumnMaintenancePass() catch |err| switch (err) {
-            error.Canceled, error.PreparedGenerationChanged, error.ResourceBudgetExceeded => {},
-            else => std.log.warn("relational column maintenance failed: {s}", .{@errorName(err)}),
-        };
-        _ = self.runRelationalIndexMaintenancePass() catch |err| switch (err) {
-            error.Canceled, error.PreparedGenerationChanged, error.IntentConflict, error.ResourceBudgetExceeded, error.PortableRuntimeActivationPending, error.IndexNotFound => {},
-            else => std.log.warn("relational index maintenance failed: {s}", .{@errorName(err)}),
+    }
+    fn independentMaintenanceActivity(ptr: *anyopaque) independent_maintenance.Owner.Activity {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        const source = self.local_execution.source_vectors.load(.acquire);
+        return .{
+            .artifacts = self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or (if (source) |value| value.collectionPending() else false),
+            .producers = self.artifact_producer_scheduler.active(self.independentMaintenanceNowNs()),
+            .indexes = self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire),
+            .columns = self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire),
+            .scan_pause_ns = if (source) |value| value.activeScanPauseNs() else null,
+            .background_checkpoint = if (source) |value| value.background_checkpoint else false,
         };
     }
 
@@ -37332,30 +36573,31 @@ pub const DB = struct {
         return complete;
     }
 
-    /// Discover bounded upload state without reading payloads, then select a
-    /// ready finalization or idle retirement. Release the snapshot and tracker
-    /// mutex before dispatch; refusal retains the cursor and durable work.
-    /// Admission is only a hint, never an acknowledgement or seal.
+    /// Discover bounded durable upload facts without payload reads. Release
+    /// the storage snapshot before invoking the external scheduling owner.
+    /// Admission remains a hint, never an acknowledgement or seal.
     pub fn advanceArtifactUploadRecovery(self: *DB) !bool {
+        return self.advanceArtifactUploadRecoveryWithTrigger(.explicit);
+    }
+
+    fn advanceArtifactUploadRecoveryWithTrigger(self: *DB, trigger: @FieldType(@import("artifact_publication.zig").UploadRecoveryInvocation, "trigger")) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         const dispatcher = self.local_execution.artifact_publication_dispatcher orelse return false;
+        const recovery = dispatcher.upload_recovery orelse return false;
+        const now_ns = self.independentMaintenanceNowNs();
+        if (!recovery.should_poll(dispatcher.ptr, .{ .now_ns = now_ns, .trigger = trigger })) return false;
         const inventory = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            const owner = (try @import("../source_authority.zig").load(&read)) orelse return false;
-            if (owner.kind != .raft) return false;
-            break :blk try @import("artifact_publication_transport.zig").recoveryInventory(&read, owner.namespace);
+            const namespace = (try @import("../source_authority.zig").externalPublicationNamespace(&read)) orelse return false;
+            break :blk try @import("artifact_publication_transport.zig").recoveryInventory(&read, namespace);
         };
-        const hint = blk: {
-            const io = self.core.index_manager.checkpointIo();
-            self.artifact_upload_recovery_mutex.lockUncancelable(io);
-            defer self.artifact_upload_recovery_mutex.unlock(io);
-            break :blk self.artifact_upload_recovery_tracker.observe(inventory, self.independentMaintenanceNowNs(), self.artifact_upload_recovery_cursor.load(.acquire)) orelse return false;
-        };
-        const encoded = hint.encode();
-        try dispatcher.enqueue(dispatcher.ptr, hint.namespace, &encoded);
-        self.artifact_upload_recovery_cursor.store(hint.created_index, .release);
-        return true;
+        return recovery.recover(dispatcher.ptr, .{
+            .io = self.core.index_manager.checkpointIo(),
+            .now_ns = now_ns,
+            .inventory = inventory,
+            .trigger = trigger,
+        });
     }
 
     /// Append root-producer requests using the existing durable replay journal.
@@ -37363,17 +36605,16 @@ pub const DB = struct {
     /// operations, and restart can safely rediscover every unscheduled row.
     pub fn advanceArtifactProducerWorkPage(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        if (self.independentMaintenanceNowNs() < self.artifact_producer_work_retry_after_ns.load(.acquire)) return false;
-        if (self.artifact_producer_work_running.swap(true, .acq_rel)) return false;
-        defer self.artifact_producer_work_running.store(false, .release);
-        errdefer {
-            self.artifact_producer_work_pending.store(false, .release);
-            self.artifact_producer_work_retry_after_ns.store(self.independentMaintenanceNowNs() +| artifact_repair_metadata_poll_ns, .release);
-        }
-        self.artifact_producer_work_pending.store(false, .release);
-        // Other maintenance jobs may stay on the active cadence. A completed
-        // sweep must still back off instead of rescanning scheduled rows then.
-        self.artifact_producer_work_retry_after_ns.store(self.independentMaintenanceNowNs() +| artifact_repair_metadata_poll_ns, .release);
+        return self.artifact_producer_scheduler.advance(.{ .ptr = self, .now = producerMaintenanceNow, .page = advanceArtifactProducerBudgetedPage });
+    }
+
+    fn producerMaintenanceNow(ptr: *anyopaque) u64 {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.independentMaintenanceNowNs();
+    }
+
+    fn advanceArtifactProducerBudgetedPage(ptr: *anyopaque) !bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
         var budget = if (self.core.index_manager.resource_manager) |manager|
             resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
         else
@@ -37435,8 +36676,8 @@ pub const DB = struct {
         {
             var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
             defer read.abort();
-            const owner = (try @import("../source_authority.zig").load(&read)) orelse return error.ArtifactCatalogDrift;
-            if (owner.kind != .raft) return;
+            const owner = (try @import("../source_authority.zig").publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
+            if (owner.mode != .ordered) return;
             action = (try @import("artifact_completion_progress.zig").discoverNextAction(scratch, &read, self.root_incarnation, document, plan, .{})) orelse return;
             switch (action.?) {
                 .control => |*prepared| {
@@ -37530,40 +36771,34 @@ pub const DB = struct {
             if (state.sealed_attempt != null) return false;
             const catalogs = try @import("artifact_inventory.zig").catalogs(&read);
             if (!plan.plan().matchesArtifactInventory(catalogs) or !std.mem.eql(u8, &catalogs.digest(), &authority.catalog_digest)) return error.ArtifactCatalogDrift;
-            if (self.artifact_producer_work_cursor) |cursor| if (!std.meta.eql(cursor.authority, authority)) {
-                self.alloc.free(cursor.document);
-                self.artifact_producer_work_cursor = null;
-            };
-            break :blk try obligations.scanWork(scratch, &read, authority, self.artifact_producer_work_cursor);
+            const cursor = self.artifact_producer_scheduler.cursorForAuthority(self.alloc, authority);
+            break :blk try obligations.scanWork(scratch, &read, authority, cursor);
         };
         defer page.deinit();
         const dispatch = @import("artifact_producer_dispatch.zig");
         const retry = @import("artifact_producer_retry.zig");
         const retry_now = self.independentMaintenanceNowNs();
-        if (self.artifact_producer_retry_round) |round| if (!std.meta.eql(round.authority, page.authority)) {
-            self.artifact_producer_retry_round = null;
-            self.artifact_producer_retry_after_ns = null;
-        };
+        self.artifact_producer_scheduler.observeAuthority(page.authority);
         const retry_real_now: u64 = @intCast(@max(0, std.Io.Timestamp.now(self.core.index_manager.checkpointIo(), .real).toNanoseconds()));
         // Persisted wall time selects retries only. It prevents cold-owner
         // churn from restarting the grace period forever; runtime deadlines
         // still use the owner's awake clock and cannot discharge any work.
-        if (self.artifact_producer_retry_after_ns == null) {
+        if (self.artifact_producer_scheduler.needsRetryDelay()) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            self.artifact_producer_retry_after_ns = retry_now +| try obligations.retryDelay(&read, page.authority, retry_real_now, retry.interval_ns);
+            self.artifact_producer_scheduler.setRetryDelay(retry_now, try obligations.retryDelay(&read, page.authority, retry_real_now, retry.interval_ns));
         }
-        if (self.artifact_producer_retry_round == null and page.items.len != 0 and plan.plan().generated_templates.len != 0 and retry_now >= self.artifact_producer_retry_after_ns.?) {
+        if (self.artifact_producer_scheduler.needsRetryRound(retry_now, page.items.len != 0, plan.plan().generated_templates.len != 0)) {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             var txn = try self.core.store.beginWriteTxn();
             errdefer txn.abort();
             const round = try obligations.beginRetryRoundAt(&txn, page.authority, retry_real_now);
             try txn.commit();
-            self.artifact_producer_retry_round = .{ .authority = page.authority, .number = round };
+            self.artifact_producer_scheduler.startRound(page.authority, round);
         }
         var refs: dispatch.Buffer = undefined;
-        const deadline = platform_time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        const deadline = platform_time.monotonicNs() +| @import("artifact_producer_scheduler.zig").Scheduler.quantum_ns;
         var processed: usize = 0;
         var more_dispatch = false;
         for (page.items) |item| {
@@ -37591,53 +36826,33 @@ pub const DB = struct {
                 });
                 more_dispatch = more_dispatch or !requests.progress.complete;
             }
-            if (self.artifact_producer_retry_round) |*round| {
-                if (item.dispatch_complete and plan.plan().generated_templates.len != 0 and
-                    (item.retry_round != round.number or item.retry_next_template != 0))
-                {
-                    const first = if (item.retry_round == round.number) item.retry_next_template else 0;
-                    const requests = blk: {
-                        var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
-                        defer read.abort();
-                        break :blk try retry.prepare(scratch, &read, self.root_incarnation, plan.plan(), first, item.document, &refs);
-                    };
-                    const required: RequiredProducerDispatch = .{ .authority = page.authority, .item = item, .plan_generation = plan.generation(), .page = requests.progress, .retry_round = round.number };
-                    if (requests.items.len != 0) {
-                        var ctx = self.batchContext();
-                        _ = try appendDerivedBatchRecordContextWithWork(&ctx, .{ .generated_enrichment_refs = requests.items }, false, required);
-                    } else {
-                        // No empty replay record for an already accepted page.
-                        // This advances scheduling only, not completion credit.
-                        try self.lockApplyForPortableRuntime();
-                        defer self.core.unlockApply();
-                        if (self.core.index_manager.writePlanGeneration() != required.plan_generation) return error.EnrichmentSourceChanged;
-                        var txn = try self.core.store.beginWriteTxn();
-                        errdefer txn.abort();
-                        if (!try obligations.stageRetry(scratch, &txn, page.authority, item, round.number, null, requests.progress)) return error.EnrichmentSourceChanged;
-                        try txn.commit();
-                    }
-                    round.more = round.more or !requests.progress.complete;
+            if (self.artifact_producer_scheduler.retryPage(item, plan.plan().generated_templates.len != 0)) |round| {
+                const requests = blk: {
+                    var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+                    defer read.abort();
+                    break :blk try retry.prepare(scratch, &read, self.root_incarnation, plan.plan(), round.first_template, item.document, &refs);
+                };
+                const required: RequiredProducerDispatch = .{ .authority = page.authority, .item = item, .plan_generation = plan.generation(), .page = requests.progress, .retry_round = round.number };
+                if (requests.items.len != 0) {
+                    var ctx = self.batchContext();
+                    _ = try appendDerivedBatchRecordContextWithWork(&ctx, .{ .generated_enrichment_refs = requests.items }, false, required);
+                } else {
+                    // No empty replay record for an already accepted page.
+                    // This advances scheduling only, not completion credit.
+                    try self.lockApplyForPortableRuntime();
+                    defer self.core.unlockApply();
+                    if (self.core.index_manager.writePlanGeneration() != required.plan_generation) return error.EnrichmentSourceChanged;
+                    var txn = try self.core.store.beginWriteTxn();
+                    errdefer txn.abort();
+                    if (!try obligations.stageRetry(scratch, &txn, page.authority, item, round.number, null, requests.progress)) return error.EnrichmentSourceChanged;
+                    try txn.commit();
                 }
+                self.artifact_producer_scheduler.noteRetryProgress(requests.progress.complete);
             }
-            if (self.artifact_producer_work_cursor) |cursor| self.alloc.free(cursor.document);
-            self.artifact_producer_work_cursor = .{ .authority = page.authority, .document = next };
+            self.artifact_producer_scheduler.commitCursor(self.alloc, page.authority, next);
             processed += 1;
         }
-        if (processed == page.items.len and page.at_end) {
-            if (self.artifact_producer_work_cursor) |cursor| self.alloc.free(cursor.document);
-            self.artifact_producer_work_cursor = null;
-            if (self.artifact_producer_retry_round) |*round| {
-                if (round.more) {
-                    round.more = false;
-                } else {
-                    self.artifact_producer_retry_round = null;
-                    self.artifact_producer_retry_after_ns = self.independentMaintenanceNowNs() +| retry.interval_ns;
-                }
-            }
-        }
-        more_dispatch = more_dispatch or self.artifact_producer_retry_round != null;
-        self.artifact_producer_work_pending.store(self.artifact_producer_work_cursor != null or more_dispatch, .release);
-        if (self.artifact_producer_work_cursor != null or more_dispatch) self.artifact_producer_work_retry_after_ns.store(0, .release);
+        self.artifact_producer_scheduler.completePage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, self.independentMaintenanceNowNs());
         return processed != 0;
     }
 
@@ -37762,15 +36977,15 @@ pub const DB = struct {
     }
 
     fn advanceArtifactProducerBaselinePageWithAllocator(self: *DB, scratch: Allocator) !bool {
-        const owner_kind = blk: {
+        const publication_mode = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             if (try @import("artifact_publication.zig").authority(&read) == null) {
                 self.artifact_producer_baseline_pending.store(false, .release);
                 return true;
             }
-            const owner = (try @import("../source_authority.zig").load(&read)) orelse return error.ArtifactCatalogDrift;
-            break :blk owner.kind;
+            const owner = (try @import("../source_authority.zig").publicationOwner(&read)) orelse return error.ArtifactCatalogDrift;
+            break :blk owner.mode;
         };
         const retired_work = try @import("artifact_producer_obligations.zig").collectObsoleteWorkPage(scratch, self.core.store);
         const retired_proofs = try @import("artifact_producer_provenance.zig").collectObsoletePage(scratch, self.core.store);
@@ -37784,7 +36999,7 @@ pub const DB = struct {
         const retired_authored = try @import("artifact_authored_acceptance.zig").collectObsoletePage(scratch, self.core.store, self.root_incarnation);
         const swept_authored = try @import("artifact_authored_acceptance.zig").collectCurrentPage(scratch, self.core.store, self.root_incarnation);
         const retired = retired_work and retired_proofs and retired_checkpoints and retired_streams and retired_completions and retired_native and retired_inventories and retired_units and retired_unit_jobs and retired_authored and swept_authored;
-        if (owner_kind == .raft) {
+        if (publication_mode == .ordered) {
             var prepared = (try @import("artifact_producer_baseline.zig").prepareRaft(scratch, self.core.store)) orelse {
                 var validation = (try @import("artifact_producer_validation.zig").prepareRaft(scratch, self.core.store)) orelse {
                     self.artifact_producer_baseline_pending.store(!retired, .release);
@@ -37823,7 +37038,7 @@ pub const DB = struct {
     /// Never scan every catalog entry or finish an entire index in one turn.
     pub fn runRelationalIndexMaintenancePass(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        if (self.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+        if (self.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
         const started = platform_time.monotonicNs();
         if (started < self.local_execution.relational_index_retry_after_ns.load(.acquire)) return false;
         const sweep = &self.local_execution.relational_index_maintenance_sweep;
@@ -37892,7 +37107,7 @@ pub const DB = struct {
 
     fn rebuildRelationalColumnsWithPolicy(self: *DB, adaptive: bool) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        if (self.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+        if (self.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
         var view = self.core.acquireSchemaView() orelse return false;
         defer view.release();
         if (view.storageMode() != .relational) return false;
@@ -37920,6 +37135,38 @@ pub const DB = struct {
         return changed;
     }
 
+    fn portableActivationRecoveryPort(self: *DB) portable_activation_recovery.Owner.Port {
+        return .{
+            .ptr = self,
+            .path = self.core.path,
+            .runtime = self.backend_runtime,
+            .owner_id = self.backend_owner_id,
+            .pending = &self.async_context.portable_runtime_activation_pending,
+            .retry = retryPortableActivationFromOwner,
+            .before_start = if (builtin.is_test) portableActivationBeforeStartForTest else null,
+            .refuse_launch = if (builtin.is_test) portableActivationRefuseLaunchForTest else null,
+        };
+    }
+
+    fn retryPortableActivationFromOwner(ptr: *anyopaque) !bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.retryPortableRuntimeActivationIfNeeded();
+    }
+
+    fn portableActivationBeforeStartForTest(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        if (test_pause_portable_activation_retry_probe_before_lifecycle_lock.load(.acquire)) {
+            test_portable_activation_retry_probe_paused.store(true, .release);
+            const io = self.backend_runtime.io() orelse std.Options.debug_io;
+            while (!test_release_portable_activation_retry_probe.load(.acquire))
+                io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
+    }
+
+    fn portableActivationRefuseLaunchForTest(_: *anyopaque) bool {
+        return test_fail_portable_activation_retry_fallback_submit.swap(false, .acq_rel);
+    }
+
     fn startPortableActivationRetryWorkerIfNeeded(self: *DB) void {
         self.startPortableActivationRetryWorkerIfNeededInner(false);
     }
@@ -37929,216 +37176,20 @@ pub const DB = struct {
         if (comptime builtin.is_test) {
             if (!allow_test_background) return;
         }
-        if (!self.async_context.portable_runtime_activation_pending.load(.acquire)) {
-            self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
-            return;
-        }
-        if (comptime builtin.is_test) {
-            if (allow_test_background and test_pause_portable_activation_retry_probe_before_lifecycle_lock.load(.acquire)) {
-                test_portable_activation_retry_probe_paused.store(true, .release);
-                const io = self.backend_runtime.io() orelse std.Options.debug_io;
-                while (!test_release_portable_activation_retry_probe.load(.acquire))
-                    io.sleep(.fromMilliseconds(1), .awake) catch {};
-            }
-        }
-        _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
-        defer self.portable_activation_retry_lifecycle_mutex.unlock();
-        // This lifecycle-owned stop flag is permanent once close begins. A
-        // probe may already have been claimed by the reaper when close disarms
-        // it, so recheck under the same mutex used by stop before launching.
-        if (self.portable_activation_retry_stop.load(.acquire)) {
-            self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
-            return;
-        }
-        if (self.portable_activation_retry_worker_running.load(.acquire)) {
-            self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
-            return;
-        }
-        const now_ns = monotonicTimeNs();
-        if (now_ns < self.portable_activation_retry_next_launch_ns) return;
-        if (self.portable_activation_retry_jitter_salt == 0) {
-            const nonce = portable_activation_retry_jitter_nonce.fetchAdd(1, .monotonic);
-            var entropy: [16]u8 = undefined;
-            std.mem.writeInt(u64, entropy[0..8], now_ns, .little);
-            std.mem.writeInt(u64, entropy[8..16], nonce, .little);
-            const path_hash = std.hash.Wyhash.hash(0x5052544143545048, self.core.path);
-            self.portable_activation_retry_jitter_salt = std.hash.Wyhash.hash(path_hash, &entropy) | 1;
-        }
-        self.portable_activation_retry_worker_running.store(true, .release);
-        _ = self.launchPortableActivationRetryWorkerLocked() catch |err| {
-            self.portable_activation_retry_worker_running.store(false, .release);
-            self.portable_activation_retry_launch_failure_streak +|= 1;
-            const retry_delay_ns = portableActivationRetryDelayNs(
-                self.core.path,
-                self.portable_activation_retry_jitter_salt,
-                self.portable_activation_retry_launch_failure_streak - 1,
-            );
-            self.portable_activation_retry_next_launch_ns = now_ns +| retry_delay_ns;
-            self.backend_runtime.armOwnerMaintenanceProbe(self.backend_owner_id, .{
-                .ptr = self,
-                .run = portableActivationRetryMaintenanceProbeMain,
-            }) catch |arm_err| {
-                std.log.warn(
-                    "portable activation retry supervisor arm failed path={s} launch_err={s} arm_err={s}",
-                    .{ self.core.path, @errorName(err), @errorName(arm_err) },
-                );
-                return;
-            };
-            std.log.warn(
-                "portable activation retry launch deferred path={s} err={s} failures={d} next_retry_ms={d}",
-                .{
-                    self.core.path,
-                    @errorName(err),
-                    self.portable_activation_retry_launch_failure_streak,
-                    retry_delay_ns / std.time.ns_per_ms,
-                },
-            );
-            return;
-        };
-        self.portable_activation_retry_launch_failure_streak = 0;
-        self.portable_activation_retry_next_launch_ns = 0;
-        self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
+        self.portable_activation_recovery.start(self.portableActivationRecoveryPort());
     }
 
-    const PortableActivationRetryLaunch = enum {
-        backend_runtime,
-    };
-
-    /// Portable activation belongs to the runtime's bounded maintenance lane,
-    /// not an untracked OS thread. Owner shutdown is the join barrier and the
-    /// runtime controls concurrency across all resident databases.
-    fn launchPortableActivationRetryWorkerLocked(self: *DB) !PortableActivationRetryLaunch {
-        std.debug.assert(self.portable_activation_retry_worker_running.load(.acquire));
-        if (self.backend_runtime.durable_jobs.executesInline()) return error.BackgroundRuntimeUnavailable;
-        if (comptime builtin.is_test) {
-            if (test_fail_portable_activation_retry_fallback_submit.swap(false, .acq_rel))
-                return error.InjectedPortableActivationRetrySubmitFailure;
-        }
-        try self.backend_runtime.durable_jobs.submit(.{
-            .owner_id = self.backend_owner_id,
-            .class = .maintenance,
-            .ptr = self,
-            .run = portableActivationRetryDurableJobMain,
-            .deinit = portableActivationRetryDurableJobDeinit,
-        });
-        return .backend_runtime;
-    }
-
-    fn portableActivationRetryDurableJobMain(ptr: *anyopaque) !void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        self.portableActivationRetryWorkerMain();
-    }
-
-    fn portableActivationRetryDurableJobDeinit(_: *anyopaque) void {}
-
-    fn portableActivationRetryMaintenanceProbeMain(ptr: *anyopaque) void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        self.startPortableActivationRetryWorkerIfNeededInner(true);
-    }
-
-    fn finishPortableActivationRetryWorker(self: *DB) void {
-        _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
-        self.portable_activation_retry_worker_running.store(false, .release);
-        self.portable_activation_retry_lifecycle_mutex.unlock();
+    fn launchPortableActivationRetryWorkerLocked(self: *DB) !portable_activation_recovery.Owner.PortableActivationRetryLaunch {
+        self.portable_activation_recovery.port = self.portableActivationRecoveryPort();
+        self.portable_activation_recovery.bound = true;
+        return self.portable_activation_recovery.launchPortableActivationRetryWorkerLocked();
     }
 
     fn stopPortableActivationRetryWorker(self: *DB) void {
-        self.backend_runtime.disarmOwnerMaintenanceProbe(self.backend_owner_id);
-        _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
-        self.portable_activation_retry_stop.store(true, .release);
-        self.portable_activation_retry_lifecycle_mutex.unlock();
-
-        // The owner-scoped worker publishes completion. Wait outside the
-        // lifecycle mutex so its final handshake cannot deadlock shutdown.
-        while (self.portable_activation_retry_worker_running.load(.acquire)) {
-            const io = self.backend_runtime.io() orelse std.Options.debug_io;
-            io.sleep(.fromMilliseconds(1), .awake) catch {};
-        }
-
-        // Completion is published immediately before the worker releases this
-        // mutex. Reacquiring it is the final memory-lifetime barrier.
-        _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
-        std.debug.assert(!self.portable_activation_retry_worker_running.load(.acquire));
-        self.portable_activation_retry_lifecycle_mutex.unlock();
+        self.portable_activation_recovery.stop(self.portableActivationRecoveryPort());
     }
 
-    fn portableActivationRetryDelayNs(path: []const u8, jitter_salt: u64, failure_streak: u32) u64 {
-        const exponent: u6 = @intCast(@min(failure_streak, 7));
-        const nominal = @min(portable_activation_retry_base_ns << exponent, portable_activation_retry_max_ns);
-        // Stable 80-100% jitter desynchronizes restored replicas without ever
-        // exceeding the operator-facing retry cap. Including the DB path keeps
-        // independent databases from marching in lockstep after process start.
-        var streak_bytes: [4]u8 = undefined;
-        std.mem.writeInt(u32, &streak_bytes, failure_streak, .little);
-        const path_hash = std.hash.Wyhash.hash(0x5052544143545259, path);
-        const entropy = std.hash.Wyhash.hash(path_hash ^ jitter_salt, &streak_bytes);
-        const spread = @max(@as(u64, 1), nominal / 5);
-        return nominal - spread + entropy % (spread + 1);
-    }
-
-    fn sleepPortableActivationRetryWorker(self: *DB, target_ns: u64) bool {
-        const io = self.backend_runtime.io() orelse std.Options.debug_io;
-        var slept: u64 = 0;
-        while (slept < target_ns) {
-            if (self.portable_activation_retry_stop.load(.acquire)) return false;
-            const slice = @min(quarantine_retry_sleep_slice_ns, target_ns - slept);
-            io.sleep(.fromNanoseconds(slice), .awake) catch {};
-            slept += slice;
-        }
-        return !self.portable_activation_retry_stop.load(.acquire);
-    }
-
-    fn portableActivationRetryWorkerMain(self: *DB) void {
-        var failure_streak: u32 = 0;
-        while (true) {
-            while (self.async_context.portable_runtime_activation_pending.load(.acquire)) {
-                const delay_ns = portableActivationRetryDelayNs(self.core.path, self.portable_activation_retry_jitter_salt, failure_streak);
-                if (!self.sleepPortableActivationRetryWorker(delay_ns)) {
-                    self.finishPortableActivationRetryWorker();
-                    return;
-                }
-                _ = self.retryPortableRuntimeActivationIfNeeded() catch |err| {
-                    // Contention means an explicit recovery caller owns the single
-                    // flight; it is not another activation failure and must not
-                    // advance backoff or emit a misleading repair warning.
-                    if (err == error.PortableRuntimeActivationPending) continue;
-                    failure_streak +|= 1;
-                    std.log.warn(
-                        "portable runtime activation retry failed path={s} class={s} failures={d} next_retry_ms={d}",
-                        .{
-                            self.core.path,
-                            @errorName(err),
-                            failure_streak,
-                            portableActivationRetryDelayNs(self.core.path, self.portable_activation_retry_jitter_salt, failure_streak) / std.time.ns_per_ms,
-                        },
-                    );
-                    continue;
-                };
-            }
-
-            if (self.portable_activation_retry_stop.load(.acquire)) {
-                self.finishPortableActivationRetryWorker();
-                return;
-            }
-            _ = lockAtomic(&self.portable_activation_retry_lifecycle_mutex);
-            if (self.portable_activation_retry_stop.load(.acquire)) {
-                self.portable_activation_retry_worker_running.store(false, .release);
-                self.portable_activation_retry_lifecycle_mutex.unlock();
-                return;
-            }
-            if (self.async_context.portable_runtime_activation_pending.load(.acquire)) {
-                // A new generation became degraded while start() observed this
-                // handle as live. Keep servicing it instead of stranding the
-                // generation between the old worker's condition check and exit.
-                failure_streak = 0;
-                self.portable_activation_retry_lifecycle_mutex.unlock();
-                continue;
-            }
-            self.portable_activation_retry_worker_running.store(false, .release);
-            self.portable_activation_retry_lifecycle_mutex.unlock();
-            return;
-        }
-    }
+    const portableActivationRetryDelayNs = portable_activation_recovery.Owner.portableActivationRetryDelayNs;
 
     fn runArtifactRepairMaintenanceTurn(self: *DB) !void {
         if (self.local_execution.source_vectors.load(.acquire)) |source| try source.checkpointMaintenance();
@@ -38163,55 +37214,32 @@ pub const DB = struct {
     /// Start only after the DB has reached its final address. The scheduler
     /// registration retains `self` until its stop/join boundary.
     pub fn startQuarantineRetryWorkerIfNeeded(self: *DB) void {
-        // Tests drive retries deterministically via retryQuarantinedIndexLoads;
-        // a background worker racing them turns every quarantine-shaped test
-        // into a timing assumption.
-        if (comptime builtin.is_test) {
-            if (self.quarantine_retry_start_address_for_test == 0) {
-                self.quarantine_retry_start_address_for_test = @intFromPtr(self);
-            }
-            return;
-        }
-        if (comptime builtin.single_threaded or builtin.os.tag == .freestanding) return;
-        if (!self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer) return;
-        if (self.quarantine_retry_thread != null) return;
-        if (!self.core.index_manager.hasLoadFailures()) return;
-        const scheduler = self.backend_runtime.maintenanceScheduler() catch |err| {
-            std.log.warn("quarantine retry scheduler unavailable: {}", .{err});
-            return;
-        };
-        self.quarantine_retry_stop.store(false, .release);
-        self.quarantine_retry_thread = scheduler.register(self, quarantineRetryWorkerStep) catch |err| {
-            // Self-healing is best-effort: the quarantine still recovers on
-            // the next open or via drop+recreate.
-            std.log.warn("quarantine retry worker spawn failed: {}", .{err});
-            return;
-        };
+        if (comptime !builtin.is_test and (builtin.single_threaded or builtin.os.tag == .freestanding)) return;
+        if (!builtin.is_test and (!self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer)) return;
+        self.quarantine_recovery.start(.{
+            .ptr = self,
+            .runtime = self.backend_runtime,
+            .has_failures = quarantineHasFailures,
+            .retry = retryQuarantineFromOwner,
+        });
+    }
+
+    fn quarantineHasFailures(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.core.index_manager.hasLoadFailures();
+    }
+
+    fn retryQuarantineFromOwner(ptr: *anyopaque) !usize {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return (try self.retryQuarantinedIndexLoads(false)).remaining;
     }
 
     pub fn quarantineRetryWorkerStartedAtCurrentAddressForTest(self: *const DB) bool {
-        if (comptime builtin.is_test) {
-            return self.quarantine_retry_start_address_for_test == @intFromPtr(self);
-        } else {
-            return false;
-        }
+        return builtin.is_test and self.quarantine_recovery.start_address_for_test == @intFromPtr(self);
     }
 
     fn stopQuarantineRetryWorker(self: *DB) void {
-        self.quarantine_retry_stop.store(true, .release);
-        if (self.quarantine_retry_thread) |*task| {
-            task.await(self.backend_runtime.io().?);
-            self.quarantine_retry_thread = null;
-        }
-    }
-
-    fn quarantineRetryWorkerStep(self: *DB) ?u64 {
-        if (self.quarantine_retry_stop.load(.acquire)) return null;
-        const result = self.retryQuarantinedIndexLoads(false) catch |err| {
-            std.log.warn("quarantine retry pass failed: {}", .{err});
-            return quarantine_retry_poll_ns / std.time.ns_per_ms;
-        };
-        return if (result.remaining == 0) null else quarantine_retry_poll_ns / std.time.ns_per_ms;
+        self.quarantine_recovery.stop(self.backend_runtime);
     }
 
     fn runRestoreRepairDrainAsync(self: *DB) !void {
@@ -42447,7 +41475,7 @@ pub const DB = struct {
         if (desired and !started) {
             // While lifecycle owns the runtime pointer, expose the persisted
             // snapshot as a supervised transition rather than a fatal worker.
-            const supervised = !lifecycle_locked or self.async_context.enrichment_restart_state.load(.acquire) != 0;
+            const supervised = !lifecycle_locked or self.async_context.enrichment_restart_owner.state.load(.acquire) != 0;
             enrichment_status.retrying = supervised;
             enrichment_status.worker_failed = !supervised;
             enrichment_status.projection_checkpoint_status = if (supervised) "retrying" else "failed";
@@ -57247,98 +56275,17 @@ fn documentExtractionManifestGeneration(alloc: Allocator, manifest: []const u8) 
     return std.math.cast(u64, generation.integer) orelse return error.InvalidDocumentExtractionManifest;
 }
 
-fn jsonObjectStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) ![]u8 {
-    const value = object.get(field_name) orelse return "";
-    if (value != .string) return "";
-    return try alloc.dupe(u8, value.string);
-}
-
-fn jsonObjectOptionalStringDup(alloc: Allocator, object: std.json.ObjectMap, field_name: []const u8) !?[]u8 {
-    const value = object.get(field_name) orelse return null;
-    if (value != .string) return null;
-    return try alloc.dupe(u8, value.string);
-}
-
-fn jsonObjectOptionalNestedStringDup(alloc: Allocator, object: std.json.ObjectMap, object_field: []const u8, string_field: []const u8) !?[]u8 {
-    const value = object.get(object_field) orelse return null;
-    if (value != .object) return null;
-    return try jsonObjectOptionalStringDup(alloc, value.object, string_field);
-}
-
-fn jsonObjectU64(object: std.json.ObjectMap, field_name: []const u8) !u64 {
-    const value = object.get(field_name) orelse return 0;
-    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
-    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
-}
-
-fn jsonObjectUsize(object: std.json.ObjectMap, field_name: []const u8) !usize {
-    return std.math.cast(usize, try jsonObjectU64(object, field_name)) orelse return error.InvalidDocumentExtractionManifest;
-}
-
-fn jsonObjectOptionalUsize(object: std.json.ObjectMap, field_name: []const u8) !?usize {
-    const value = object.get(field_name) orelse return null;
-    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
-    return std.math.cast(usize, value.integer) orelse return error.InvalidDocumentExtractionManifest;
-}
-
-fn jsonObjectOptionalU64(object: std.json.ObjectMap, field_name: []const u8) !?u64 {
-    const value = object.get(field_name) orelse return null;
-    if (value != .integer or value.integer < 0) return error.InvalidDocumentExtractionManifest;
-    return std.math.cast(u64, value.integer) orelse return error.InvalidDocumentExtractionManifest;
-}
-
-fn jsonObjectOptionalBool(object: std.json.ObjectMap, field_name: []const u8) !?bool {
-    const value = object.get(field_name) orelse return null;
-    if (value != .bool) return error.InvalidDocumentExtractionManifest;
-    return value.bool;
-}
-
-fn documentArtifactChildRangesFromJsonAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]types.DocumentArtifactChildRange {
-    const value = object.get("child_ranges") orelse return try alloc.alloc(types.DocumentArtifactChildRange, 0);
-    if (value != .array) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
-
-    const out = try alloc.alloc(types.DocumentArtifactChildRange, value.array.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*range| range.deinit(alloc);
-        if (out.len > 0) alloc.free(out);
-    }
-
-    for (value.array.items, 0..) |item, i| {
-        if (item != .object) return error.InvalidDocumentExtractionManifest;
-        out[i] = .{
-            .range_id = try jsonObjectStringDup(alloc, item.object, "range_id"),
-            .range_kind = try jsonObjectStringDup(alloc, item.object, "range_kind"),
-            .artifact_name = try jsonObjectStringDup(alloc, item.object, "artifact_name"),
-            .split_boundary = try jsonObjectStringDup(alloc, item.object, "split_boundary"),
-            .placement = try jsonObjectStringDup(alloc, item.object, "placement"),
-            .owner_group_id = try jsonObjectOptionalU64(item.object, "owner_group_id"),
-            .placement_generation = try jsonObjectOptionalU64(item.object, "placement_generation"),
-            .route_status = try jsonObjectOptionalStringDup(alloc, item.object, "route_status"),
-            .split_eligible = try jsonObjectOptionalBool(item.object, "split_eligible"),
-            .start_key = try jsonObjectStringDup(alloc, item.object, "start_key"),
-            .end_key_exclusive = try jsonObjectStringDup(alloc, item.object, "end_key_exclusive"),
-            .last_key = try jsonObjectStringDup(alloc, item.object, "last_key"),
-            .child_count = try jsonObjectUsize(item.object, "child_count"),
-            .text_bytes = try jsonObjectOptionalUsize(item.object, "text_bytes"),
-        };
-        initialized += 1;
-    }
-
-    return out;
-}
-
-fn documentArtifactChildRangesFromManifestJsonAlloc(alloc: Allocator, manifest_json: []const u8) ![]types.DocumentArtifactChildRange {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, manifest_json, .{});
-    defer parsed.deinit();
-    if (parsed.value != .object) return try alloc.alloc(types.DocumentArtifactChildRange, 0);
-    return try documentArtifactChildRangesFromJsonAlloc(alloc, parsed.value.object);
-}
-
-fn freeDocumentArtifactChildRanges(alloc: Allocator, child_ranges: []types.DocumentArtifactChildRange) void {
-    for (child_ranges) |*child_range| child_range.deinit(alloc);
-    if (child_ranges.len > 0) alloc.free(child_ranges);
-}
+const jsonObjectStringDup = document_child_range_manifest.jsonObjectStringDup;
+const jsonObjectOptionalStringDup = document_child_range_manifest.jsonObjectOptionalStringDup;
+const jsonObjectOptionalNestedStringDup = document_child_range_manifest.jsonObjectOptionalNestedStringDup;
+const jsonObjectU64 = document_child_range_manifest.jsonObjectU64;
+const jsonObjectUsize = document_child_range_manifest.jsonObjectUsize;
+const jsonObjectOptionalUsize = document_child_range_manifest.jsonObjectOptionalUsize;
+const jsonObjectOptionalU64 = document_child_range_manifest.jsonObjectOptionalU64;
+const jsonObjectOptionalBool = document_child_range_manifest.jsonObjectOptionalBool;
+const documentArtifactChildRangesFromJsonAlloc = document_child_range_manifest.documentArtifactChildRangesFromJsonAlloc;
+const documentArtifactChildRangesFromManifestJsonAlloc = document_child_range_manifest.documentArtifactChildRangesFromManifestJsonAlloc;
+const freeDocumentArtifactChildRanges = document_child_range_manifest.freeDocumentArtifactChildRanges;
 
 fn documentArtifactManifestFromJsonAlloc(
     alloc: Allocator,
@@ -62512,467 +61459,11 @@ const PrecomputedGeneratedBatch = struct {
     }
 };
 
-const DocumentChildRangeRoutingSnapshot = struct {
-    doc_key: []u8,
-    manifest_artifact_name: []u8,
-    child_ranges: []types.DocumentArtifactChildRange,
-
-    fn deinit(self: *DocumentChildRangeRoutingSnapshot, alloc: Allocator) void {
-        alloc.free(self.doc_key);
-        alloc.free(self.manifest_artifact_name);
-        freeDocumentArtifactChildRanges(alloc, self.child_ranges);
-        self.* = undefined;
-    }
-};
-
-const DocumentChildRangeDispatchGroup = struct {
-    owner_group_id: u64,
-    doc_key: []u8,
-    artifact_name: []u8,
-    artifact_writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
-    artifact_delete_keys: std.ArrayListUnmanaged([]const u8) = .empty,
-    documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
-    dense_embeddings: std.ArrayListUnmanaged(derived_types.DerivedDenseEmbeddingWrite) = .empty,
-    sparse_embeddings: std.ArrayListUnmanaged(derived_types.DerivedSparseEmbeddingWrite) = .empty,
-    generated_enrichment_refs: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRef) = .empty,
-
-    fn deinit(self: *DocumentChildRangeDispatchGroup, alloc: Allocator) void {
-        alloc.free(self.doc_key);
-        alloc.free(self.artifact_name);
-        for (self.artifact_writes.items) |write| {
-            alloc.free(@constCast(write.key));
-            alloc.free(@constCast(write.value));
-        }
-        self.artifact_writes.deinit(alloc);
-        for (self.artifact_delete_keys.items) |key| alloc.free(@constCast(key));
-        self.artifact_delete_keys.deinit(alloc);
-        for (self.documents.items) |doc| derived_types.deinitDerivedDocument(alloc, doc);
-        self.documents.deinit(alloc);
-        for (self.dense_embeddings.items) |embedding|
-            derived_types.deinitDerivedDenseEmbedding(alloc, embedding);
-        self.dense_embeddings.deinit(alloc);
-        for (self.sparse_embeddings.items) |embedding|
-            derived_types.deinitDerivedSparseEmbedding(alloc, embedding);
-        self.sparse_embeddings.deinit(alloc);
-        for (self.generated_enrichment_refs.items) |request|
-            enrichment_types.freeGeneratedRef(alloc, request);
-        self.generated_enrichment_refs.deinit(alloc);
-        self.* = undefined;
-    }
-
-    fn dispatch(self: DocumentChildRangeDispatchGroup, sync_level: types.SyncLevel) DocumentArtifactChildRangeDispatch {
-        return .{
-            .owner_group_id = self.owner_group_id,
-            .doc_key = self.doc_key,
-            .artifact_name = self.artifact_name,
-            .child_batch = .{
-                .artifact_writes = self.artifact_writes.items,
-                .artifact_delete_keys = self.artifact_delete_keys.items,
-                .documents = self.documents.items,
-                .dense_embeddings = self.dense_embeddings.items,
-                .sparse_embeddings = self.sparse_embeddings.items,
-                .generated_enrichment_refs = self.generated_enrichment_refs.items,
-                .sync_level = sync_level,
-            },
-        };
-    }
-};
-
-fn appendDocumentChildRangeOutboxWrites(
-    alloc: Allocator,
-    sequence: u64,
-    groups: []const DocumentChildRangeDispatchGroup,
-    sync_level: types.SyncLevel,
-    writes: *std.ArrayListUnmanaged(docstore_mod.KVPair),
-    owned_keys: *std.ArrayListUnmanaged([]u8),
-    owned_values: *std.ArrayListUnmanaged([]u8),
-) !void {
-    for (groups, 0..) |group, i| {
-        const key = try internal_keys.documentChildRangeOutboxKeyAlloc(alloc, sequence, @intCast(i));
-        errdefer alloc.free(key);
-        const value = try encodeDocumentChildRangeOutboxRecordAlloc(alloc, group.dispatch(sync_level));
-        errdefer alloc.free(value);
-        try owned_keys.append(alloc, key);
-        try owned_values.append(alloc, value);
-        try writes.append(alloc, .{
-            .key = key,
-            .value = value,
-        });
-    }
-}
-
-fn encodeDocumentChildRangeOutboxRecordAlloc(
-    alloc: Allocator,
-    dispatch: DocumentArtifactChildRangeDispatch,
-) ![]u8 {
-    return try std.json.Stringify.valueAlloc(alloc, DocumentArtifactChildRangeOutboxRecord{
-        .owner_group_id = dispatch.owner_group_id,
-        .doc_key = dispatch.doc_key,
-        .artifact_name = dispatch.artifact_name,
-        .child_batch = dispatch.child_batch,
-    }, .{});
-}
-
-const DocumentChildRangeRoute = struct {
-    owner_group_id: u64,
-    doc_key: []const u8,
-    artifact_name: []const u8,
-};
-
-fn partitionRemoteDocumentChildRangeGeneratedBatch(
-    self: anytype,
-    alloc: Allocator,
-    generated: *PrecomputedGeneratedBatch,
-    out: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
-) !void {
-    var snapshots = std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot).empty;
-    defer {
-        for (snapshots.items) |*snapshot| snapshot.deinit(alloc);
-        snapshots.deinit(alloc);
-    }
-    try collectDocumentChildRangeRoutingSnapshots(self, alloc, generated.*, &snapshots);
-    if (snapshots.items.len == 0) return;
-
-    try partitionRemoteArtifactWrites(alloc, snapshots.items, &generated.artifact_writes, out);
-    try partitionRemoteArtifactDeletes(alloc, snapshots.items, &generated.artifact_delete_keys, out);
-    try partitionRemoteDerivedDocuments(alloc, snapshots.items, &generated.documents, out);
-    try partitionRemoteDenseEmbeddings(alloc, snapshots.items, &generated.dense_embeddings, out);
-    try partitionRemoteSparseEmbeddings(alloc, snapshots.items, &generated.sparse_embeddings, out);
-}
-
-fn collectDocumentChildRangeRoutingSnapshots(
-    self: anytype,
-    alloc: Allocator,
-    generated: PrecomputedGeneratedBatch,
-    out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
-) !void {
-    for (generated.artifact_writes) |write| {
-        try appendDocumentChildRangeRoutingSnapshotFromValue(alloc, write.key, write.value, out);
-    }
-    for (generated.artifact_delete_keys) |key| {
-        var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse continue;
-        defer artifact_ref.deinit(alloc);
-        if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) continue;
-        const existing = self.core.getStoreValue(alloc, key) catch |err| switch (err) {
-            error.NotFound => continue,
-            else => return err,
-        };
-        defer if (existing) |value| alloc.free(value);
-        if (existing) |value| try appendDocumentChildRangeRoutingSnapshotFromValue(alloc, key, value, out);
-    }
-}
-
-fn appendDocumentChildRangeRoutingSnapshotFromValue(
-    alloc: Allocator,
-    key: []const u8,
-    value: []const u8,
-    out: *std.ArrayListUnmanaged(DocumentChildRangeRoutingSnapshot),
-) !void {
-    if (std.mem.indexOf(u8, value, "\"child_ranges\"") == null) return;
-    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse return;
-    defer artifact_ref.deinit(alloc);
-    if (artifact_ref.kind != .asset or artifact_ref.unit_id != null) return;
-
-    const ranges = documentArtifactChildRangesFromManifestJsonAlloc(alloc, value) catch |err| switch (err) {
-        error.InvalidDocumentExtractionManifest => return,
-        else => return err,
-    };
-    errdefer freeDocumentArtifactChildRanges(alloc, ranges);
-    if (ranges.len == 0) {
-        freeDocumentArtifactChildRanges(alloc, ranges);
-        return;
-    }
-    const doc_key = try alloc.dupe(u8, artifact_ref.document_id);
-    errdefer alloc.free(doc_key);
-    const manifest_artifact_name = try alloc.dupe(u8, artifact_ref.name);
-    errdefer alloc.free(manifest_artifact_name);
-    try out.append(alloc, .{
-        .doc_key = doc_key,
-        .manifest_artifact_name = manifest_artifact_name,
-        .child_ranges = ranges,
-    });
-}
-
-fn documentChildRangeRouteForKey(
-    alloc: Allocator,
-    snapshots: []const DocumentChildRangeRoutingSnapshot,
-    key: []const u8,
-) !?DocumentChildRangeRoute {
-    var artifact_ref = (try decodeArtifactRefIfKnownAlloc(alloc, key)) orelse return null;
-    defer artifact_ref.deinit(alloc);
-
-    const route_kind, const route_artifact_name = switch (artifact_ref.kind) {
-        .asset => blk: {
-            if (artifact_ref.unit_id == null) return null;
-            break :blk .{ "unit", artifact_ref.name };
-        },
-        .chunk => .{ "chunk", artifact_ref.name },
-        .embedding => blk: {
-            const source = artifact_ref.source orelse return null;
-            break :blk .{
-                if (source.kind == .chunk) "chunk" else "unit",
-                source.name,
-            };
-        },
-    };
-
-    for (snapshots) |snapshot| {
-        if (!std.mem.eql(u8, snapshot.doc_key, artifact_ref.document_id)) continue;
-        for (snapshot.child_ranges) |range| {
-            if (!std.mem.eql(u8, range.range_kind, route_kind)) continue;
-            if (!std.mem.eql(u8, range.artifact_name, route_artifact_name)) continue;
-            const owner_group_id = range.owner_group_id orelse 0;
-            if (owner_group_id == 0) continue;
-            const route_status = range.route_status orelse "local_committed";
-            if (!std.mem.eql(u8, route_status, "remote_committed")) continue;
-            if (!keyWithinDocumentChildRange(key, range)) continue;
-            return .{
-                .owner_group_id = owner_group_id,
-                .doc_key = snapshot.doc_key,
-                .artifact_name = range.artifact_name,
-            };
-        }
-    }
-    return null;
-}
-
-fn keyWithinDocumentChildRange(key: []const u8, range: types.DocumentArtifactChildRange) bool {
-    if (std.mem.order(u8, key, range.start_key) == .lt) return false;
-    if (range.end_key_exclusive.len == 0) return true;
-    return std.mem.order(u8, key, range.end_key_exclusive) == .lt;
-}
-
-const local_document_child_range_destination = std.math.maxInt(usize);
-
-fn ensureDocumentChildRangeDispatchGroupIndex(
-    alloc: Allocator,
-    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
-    route: DocumentChildRangeRoute,
-) !usize {
-    for (groups.items, 0..) |group, i| {
-        if (group.owner_group_id == route.owner_group_id and
-            std.mem.eql(u8, group.doc_key, route.doc_key) and
-            std.mem.eql(u8, group.artifact_name, route.artifact_name))
-        {
-            return i;
-        }
-    }
-    const doc_key = try alloc.dupe(u8, route.doc_key);
-    errdefer alloc.free(doc_key);
-    const artifact_name = try alloc.dupe(u8, route.artifact_name);
-    errdefer alloc.free(artifact_name);
-    try groups.append(alloc, .{
-        .owner_group_id = route.owner_group_id,
-        .doc_key = doc_key,
-        .artifact_name = artifact_name,
-    });
-    return groups.items.len - 1;
-}
-
-fn countDocumentChildRangeDestinations(
-    alloc: Allocator,
-    destinations: []const usize,
-    group_count: usize,
-) !struct { local: usize, groups: []usize } {
-    const group_counts = try alloc.alloc(usize, group_count);
-    @memset(group_counts, 0);
-    var local_count: usize = 0;
-    for (destinations) |destination| {
-        if (destination == local_document_child_range_destination) {
-            local_count += 1;
-        } else {
-            group_counts[destination] += 1;
-        }
-    }
-    return .{ .local = local_count, .groups = group_counts };
-}
-
-fn partitionRemoteArtifactWrites(
-    alloc: Allocator,
-    snapshots: []const DocumentChildRangeRoutingSnapshot,
-    writes: *[]types.BatchWrite,
-    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
-) !void {
-    if (writes.*.len == 0) return;
-    const destinations = try alloc.alloc(usize, writes.*.len);
-    defer if (destinations.len > 0) alloc.free(destinations);
-    for (writes.*, 0..) |write, i| {
-        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, write.key)) |route|
-            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
-        else
-            local_document_child_range_destination;
-    }
-
-    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
-    defer if (counts.groups.len > 0) alloc.free(counts.groups);
-    const local = try alloc.alloc(types.BatchWrite, counts.local);
-    errdefer if (local.len > 0) alloc.free(local);
-    for (groups.items, counts.groups) |*group, count| {
-        try group.artifact_writes.ensureUnusedCapacity(alloc, count);
-    }
-
-    var local_i: usize = 0;
-    for (writes.*, destinations) |write, destination| {
-        if (destination == local_document_child_range_destination) {
-            local[local_i] = write;
-            local_i += 1;
-        } else {
-            groups.items[destination].artifact_writes.appendAssumeCapacity(write);
-        }
-    }
-    if (writes.*.len > 0) alloc.free(writes.*);
-    writes.* = local;
-}
-
-fn partitionRemoteArtifactDeletes(
-    alloc: Allocator,
-    snapshots: []const DocumentChildRangeRoutingSnapshot,
-    keys: *[]const []const u8,
-    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
-) !void {
-    if (keys.*.len == 0) return;
-    const destinations = try alloc.alloc(usize, keys.*.len);
-    defer if (destinations.len > 0) alloc.free(destinations);
-    for (keys.*, 0..) |key, i| {
-        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, key)) |route|
-            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
-        else
-            local_document_child_range_destination;
-    }
-
-    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
-    defer if (counts.groups.len > 0) alloc.free(counts.groups);
-    const local = try alloc.alloc([]const u8, counts.local);
-    errdefer if (local.len > 0) alloc.free(local);
-    for (groups.items, counts.groups) |*group, count| {
-        try group.artifact_delete_keys.ensureUnusedCapacity(alloc, count);
-    }
-
-    var local_i: usize = 0;
-    for (keys.*, destinations) |key, destination| {
-        if (destination == local_document_child_range_destination) {
-            local[local_i] = key;
-            local_i += 1;
-        } else {
-            groups.items[destination].artifact_delete_keys.appendAssumeCapacity(key);
-        }
-    }
-    if (keys.*.len > 0) alloc.free(keys.*);
-    keys.* = local;
-}
-
-fn partitionRemoteDerivedDocuments(
-    alloc: Allocator,
-    snapshots: []const DocumentChildRangeRoutingSnapshot,
-    documents: *[]const derived_types.DerivedDocument,
-    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
-) !void {
-    if (documents.*.len == 0) return;
-    const destinations = try alloc.alloc(usize, documents.*.len);
-    defer if (destinations.len > 0) alloc.free(destinations);
-    for (documents.*, 0..) |doc, i| {
-        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, doc.key)) |route|
-            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
-        else
-            local_document_child_range_destination;
-    }
-
-    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
-    defer if (counts.groups.len > 0) alloc.free(counts.groups);
-    const local = try alloc.alloc(derived_types.DerivedDocument, counts.local);
-    errdefer if (local.len > 0) alloc.free(local);
-    for (groups.items, counts.groups) |*group, count| {
-        try group.documents.ensureUnusedCapacity(alloc, count);
-    }
-
-    var local_i: usize = 0;
-    for (documents.*, destinations) |doc, destination| {
-        if (destination == local_document_child_range_destination) {
-            local[local_i] = doc;
-            local_i += 1;
-        } else {
-            groups.items[destination].documents.appendAssumeCapacity(doc);
-        }
-    }
-    if (documents.*.len > 0) alloc.free(documents.*);
-    documents.* = local;
-}
-
-fn partitionRemoteDenseEmbeddings(
-    alloc: Allocator,
-    snapshots: []const DocumentChildRangeRoutingSnapshot,
-    embeddings: *[]const derived_types.DerivedDenseEmbeddingWrite,
-    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
-) !void {
-    if (embeddings.*.len == 0) return;
-    const destinations = try alloc.alloc(usize, embeddings.*.len);
-    defer if (destinations.len > 0) alloc.free(destinations);
-    for (embeddings.*, 0..) |embedding, i| {
-        const route_key = embedding.artifact_key orelse embedding.doc_key;
-        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route|
-            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
-        else
-            local_document_child_range_destination;
-    }
-
-    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
-    defer if (counts.groups.len > 0) alloc.free(counts.groups);
-    const local = try alloc.alloc(derived_types.DerivedDenseEmbeddingWrite, counts.local);
-    errdefer if (local.len > 0) alloc.free(local);
-    for (groups.items, counts.groups) |*group, count| {
-        try group.dense_embeddings.ensureUnusedCapacity(alloc, count);
-    }
-
-    var local_i: usize = 0;
-    for (embeddings.*, destinations) |embedding, destination| {
-        if (destination == local_document_child_range_destination) {
-            local[local_i] = embedding;
-            local_i += 1;
-        } else {
-            groups.items[destination].dense_embeddings.appendAssumeCapacity(embedding);
-        }
-    }
-    if (embeddings.*.len > 0) alloc.free(embeddings.*);
-    embeddings.* = local;
-}
-
-fn partitionRemoteSparseEmbeddings(
-    alloc: Allocator,
-    snapshots: []const DocumentChildRangeRoutingSnapshot,
-    embeddings: *[]const derived_types.DerivedSparseEmbeddingWrite,
-    groups: *std.ArrayListUnmanaged(DocumentChildRangeDispatchGroup),
-) !void {
-    if (embeddings.*.len == 0) return;
-    const destinations = try alloc.alloc(usize, embeddings.*.len);
-    defer if (destinations.len > 0) alloc.free(destinations);
-    for (embeddings.*, 0..) |embedding, i| {
-        const route_key = embedding.artifact_key orelse embedding.doc_key;
-        destinations[i] = if (try documentChildRangeRouteForKey(alloc, snapshots, route_key)) |route|
-            try ensureDocumentChildRangeDispatchGroupIndex(alloc, groups, route)
-        else
-            local_document_child_range_destination;
-    }
-
-    const counts = try countDocumentChildRangeDestinations(alloc, destinations, groups.items.len);
-    defer if (counts.groups.len > 0) alloc.free(counts.groups);
-    const local = try alloc.alloc(derived_types.DerivedSparseEmbeddingWrite, counts.local);
-    errdefer if (local.len > 0) alloc.free(local);
-    for (groups.items, counts.groups) |*group, count| {
-        try group.sparse_embeddings.ensureUnusedCapacity(alloc, count);
-    }
-
-    var local_i: usize = 0;
-    for (embeddings.*, destinations) |embedding, destination| {
-        if (destination == local_document_child_range_destination) {
-            local[local_i] = embedding;
-            local_i += 1;
-        } else {
-            groups.items[destination].sparse_embeddings.appendAssumeCapacity(embedding);
-        }
-    }
-    if (embeddings.*.len > 0) alloc.free(embeddings.*);
-    embeddings.* = local;
-}
+const DocumentChildRangeRoutingSnapshot = document_child_range_effects.DocumentChildRangeRoutingSnapshot;
+const DocumentChildRangeDispatchGroup = document_child_range_effects.DocumentChildRangeDispatchGroup;
+const partitionRemoteDerivedDocuments = document_child_range_effects.partitionRemoteDerivedDocuments;
+const appendDocumentChildRangeOutboxWrites = document_child_range_outbox.appendDocumentChildRangeOutboxWrites;
+const encodeDocumentChildRangeOutboxRecordAlloc = document_child_range_outbox.encodeDocumentChildRangeOutboxRecordAlloc;
 
 fn appendPrecomputedGraphSourceArtifacts(
     self: *DB,
@@ -65340,10 +63831,9 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
         const io = ctx.batch.io orelse std.Options.debug_io;
         ctx.hook_mutex.lockUncancelable(io);
         const port = ctx.coordinated_port;
-        const group_id = ctx.coordinated_group_id;
         ctx.hook_mutex.unlock(io);
         const callback = port orelse return error.ForeignKeyCoordinationRequired;
-        if (group_id == 0 or ctx.batch.identity_namespace.table_id == 0)
+        if (ctx.batch.identity_namespace.table_id == 0)
             return error.ForeignKeyCoordinationRequired;
         const schema = pinned.tableSchema();
         if (schema.ttl_duration_ns == 0) return 0;
@@ -65388,7 +63878,6 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
         // No native transaction, apply lock, or hook lock spans distributed IO.
         return callback.expire(.{
             .table_id = ctx.batch.identity_namespace.table_id,
-            .group_id = group_id,
             .schema_version = pinned.version(),
             .ttl_duration_ns = schema.ttl_duration_ns,
             .ttl_field = schema.ttl_field,
@@ -67375,12 +65864,12 @@ test "native publication finalization forwards raced source completion" {
         .index_manager = undefined,
         .apply_mutex = &apply_mutex,
         .io = io,
-        .native_publication_enabled = true,
+        .native_projection_owner = .{ .enabled = true },
     };
     defer ctx.deinit(alloc);
     // Keep an owned task installed without a consumer racing the observation.
     // Its only purpose is to exercise the real scheduler's wakeup path.
-    ctx.native_publication_future = try io.concurrent(struct {
+    ctx.native_projection_owner.future = try io.concurrent(struct {
         fn run() void {}
     }.run, .{});
     var guard = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
@@ -67388,15 +65877,15 @@ test "native publication finalization forwards raced source completion" {
     try std.testing.expect(!tryClaimOrRequestDenseProjectionFinalizationLocked(&ctx));
     guard.unlock();
     finishDenseProjectionFinalization(&ctx);
-    try std.testing.expect(ctx.native_publication_wake.isSet());
+    try std.testing.expect(ctx.native_projection_owner.wake.isSet());
     try std.testing.expect(!ctx.dense_projection_finalization_requested);
     try std.testing.expect(!ctx.dense_projection_finalizing.load(.acquire));
-    ctx.native_publication_wake.reset();
+    ctx.native_projection_owner.wake.reset();
     guard = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
     try std.testing.expect(tryClaimOrRequestDenseProjectionFinalizationLocked(&ctx));
     guard.unlock();
     finishDenseProjectionFinalization(&ctx);
-    try std.testing.expect(!ctx.native_publication_wake.isSet());
+    try std.testing.expect(!ctx.native_projection_owner.wake.isSet());
 }
 
 test "external dense bulk waiter owns admission across catch-up handoff" {
@@ -81084,61 +79573,15 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
 /// by-value wrapper moves. The catalog read pin protects lifetime, not primary
 /// write admission; no apply or mutation lock is held across file staging.
 fn scheduleNativeProjectionMaintenance(ctx: *AsyncContext) void {
-    if (!ctx.native_publication_enabled or ctx.background_closing.load(.acquire)) return;
     const io = ctx.io orelse return;
-    if (!ctx.native_publication_mutex.tryLock()) return;
-    defer ctx.native_publication_mutex.unlock();
-    if (ctx.background_closing.load(.acquire)) return;
-    if (ctx.native_publication_future == null) {
-        ctx.native_publication_future = io.concurrent(nativeProjectionMaintenanceMain, .{ctx}) catch |err| {
-            std.log.warn("native projection maintenance admission deferred err={s}", .{@errorName(err)});
-            return;
-        };
-    }
-    ctx.native_publication_wake.set(io);
+    ctx.native_projection_owner.schedule(.{ .ptr = ctx, .io = io, .closing = &ctx.background_closing, .round = nativeProjectionRound });
 }
-
+fn nativeProjectionRound(ptr: *anyopaque) !bool {
+    return nativeProjectionMaintenanceRound(@ptrCast(@alignCast(ptr)));
+}
 fn stopNativeProjectionMaintenance(ctx: *AsyncContext) void {
-    const io = ctx.io orelse return;
     ctx.background_closing.store(true, .release);
-    lockAtomic(&ctx.native_publication_mutex);
-    const future = ctx.native_publication_future;
-    ctx.native_publication_future = null;
-    ctx.native_publication_mutex.unlock();
-    ctx.native_publication_wake.set(io);
-    if (future) |owned| {
-        var join = owned;
-        join.await(io);
-    }
-}
-
-fn nativeProjectionMaintenanceMain(ctx: *AsyncContext) void {
-    const io = ctx.io.?;
-    while (!ctx.background_closing.load(.acquire)) {
-        ctx.native_publication_wake.waitUncancelable(io);
-        ctx.native_publication_wake.reset();
-        while (!ctx.background_closing.load(.acquire)) {
-            const pending = nativeProjectionMaintenanceRound(ctx) catch |err| blk: {
-                std.log.warn("native projection maintenance deferred err={s}", .{@errorName(err)});
-                // Durable WAL/source coverage remains the recovery authority.
-                // Capacity can return without another source write, so retain
-                // the retry wakeup on this bounded background timer.
-                break :blk switch (err) {
-                    error.ResourceBudgetExceeded,
-                    error.OutOfMemory,
-                    error.WriterLocked,
-                    error.PostingCheckpointCaptureActive,
-                    error.PostingCheckpointSequenceMismatch,
-                    error.VectorBlockSnapshotAdvancedWithoutWal,
-                    error.VectorBlockGenerationReservationLost,
-                    => true,
-                    else => false,
-                };
-            };
-            if (!pending) break;
-            io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch return;
-        }
-    }
+    ctx.native_projection_owner.stop(ctx.io orelse return);
 }
 
 fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
@@ -89104,14 +87547,14 @@ test "relational columnar maintenance survives unrelated artifact corruption and
     try db.core.store.putBatch(&.{}, &.{ready});
     const started = db.independentMaintenanceNowNs();
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expect(db.artifact_metadata_retry_after_ns > started);
+    try std.testing.expect(db.independent_maintenance.repair_retry_after_ns > started);
     try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > 0);
-    const retry = db.artifact_metadata_retry_after_ns;
+    const retry = db.independent_maintenance.repair_retry_after_ns;
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }} });
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expectEqual(retry, db.artifact_metadata_retry_after_ns);
+    try std.testing.expectEqual(retry, db.independent_maintenance.repair_retry_after_ns);
     try std.testing.expect(db.relational_column_maintenance.ranges_compacted.load(.monotonic) > 0);
-    db.artifact_repair_metadata_stop.store(true, .release);
+    db.independent_maintenance.stopping.store(true, .release);
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() == null);
 }
 
@@ -89148,21 +87591,21 @@ test "relational columnar artifact backoff uses the owner clock through suppress
     defer alloc.free(ready);
     try db.core.store.putBatch(&.{}, &.{ready});
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expect(db.artifact_metadata_retry_after_ns > db.independentMaintenanceNowNs());
+    try std.testing.expect(db.independent_maintenance.repair_retry_after_ns > db.independentMaintenanceNowNs());
     try std.testing.expect(db.relational_column_maintenance.blocks_written.load(.monotonic) > 0);
-    const retry = db.artifact_metadata_retry_after_ns;
+    const retry = db.independent_maintenance.repair_retry_after_ns;
     try std.testing.expectEqual(clock.monotonic_ns + DB.artifact_repair_metadata_poll_ns, retry);
     clock.monotonic_ns = retry - 1;
     try db.batch(.{ .writes = &.{.{ .key = "a", .value = "{\"n\":2}" }} });
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expectEqual(retry, db.artifact_metadata_retry_after_ns);
+    try std.testing.expectEqual(retry, db.independent_maintenance.repair_retry_after_ns);
     try std.testing.expect(db.relational_column_maintenance.ranges_compacted.load(.monotonic) > 0);
     // At the exact deadline the malformed issue is retried and gets a new
     // deadline. No wall-clock sleeping or comparison across clock domains.
     clock.monotonic_ns = retry;
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() != null);
-    try std.testing.expectEqual(retry + DB.artifact_repair_metadata_poll_ns, db.artifact_metadata_retry_after_ns);
-    db.artifact_repair_metadata_stop.store(true, .release);
+    try std.testing.expectEqual(retry + DB.artifact_repair_metadata_poll_ns, db.independent_maintenance.repair_retry_after_ns);
+    db.independent_maintenance.stopping.store(true, .release);
     try std.testing.expect(db.artifactRepairMetadataWorkerStep() == null);
 }
 
@@ -89387,9 +87830,9 @@ test "relational columnar generations preserve scans and compact dirty ranges" {
     defer raced.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 1), raced.documents.len);
     try std.testing.expectEqualStrings("{\"n\":901}", raced.documents[0].json);
-    db.artifact_repair_metadata_stop.store(true, .release);
+    db.independent_maintenance.stopping.store(true, .release);
     try std.testing.expectError(error.Canceled, db.rebuildRelationalColumns());
-    db.artifact_repair_metadata_stop.store(false, .release);
+    db.independent_maintenance.stopping.store(false, .release);
     try std.testing.expect(try db.rebuildRelationalColumns());
 }
 
@@ -89579,7 +88022,7 @@ test "relational columnar bounded compaction splits empty ranges and resumes can
     const Cancel = struct {
         fn run(ptr: *anyopaque) anyerror!void {
             const owner: *DB = @ptrCast(@alignCast(ptr));
-            owner.artifact_repair_metadata_stop.store(true, .release);
+            owner.independent_maintenance.stopping.store(true, .release);
         }
     };
     // Reach the next publication boundary before injecting cancellation;
@@ -89662,8 +88105,8 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         const stored_public_v1 = try db.core.store.get(alloc, public_v1_key);
         defer alloc.free(stored_public_v1);
         try std.testing.expectEqualStrings(schema_json, stored_public_v1);
-        try std.testing.expectEqual(@as(u64, 1234), try db.ensureGroupCreatedAtMillis(alloc, 7, 1234));
-        try std.testing.expectEqual(@as(?u64, 1234), try db.getGroupCreatedAtMillis(alloc, 7));
+        try std.testing.expectEqual(@as(u64, 1234), try @import("../server_group_metadata.zig").ensureGroupCreatedAtMillis(&db, alloc, 7, 1234));
+        try std.testing.expectEqual(@as(?u64, 1234), try @import("../server_group_metadata.zig").getGroupCreatedAtMillis(&db, alloc, 7));
         try db.addIndex(.{ .name = "ft_rows", .kind = .full_text, .config_json = "{}" });
 
         try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{
@@ -89727,7 +88170,7 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
         const raw = (try db.get(alloc, "row:a")) orelse return error.TestExpectedEqual;
         defer alloc.free(raw);
-        try std.testing.expectEqual(@as(?u64, 1234), try db.getGroupCreatedAtMillis(alloc, 7));
+        try std.testing.expectEqual(@as(?u64, 1234), try @import("../server_group_metadata.zig").getGroupCreatedAtMillis(&db, alloc, 7));
         try std.testing.expectEqualStrings(
             "{\"id\":\"a\",\"count\":9007199254740993,\"status\":\"active\",\"title\":\"replayed relational row\",\"payload\":{\"n\":0.10000000000000001}}",
             raw,
@@ -90505,22 +88948,22 @@ test "portable activation retry runtime job can be restarted" {
     // A worker with no pending activation exits immediately. Exercise two full
     // runtime-owned generations to prove completion releases launch admission.
     for (0..2) |_| {
-        _ = lockAtomic(&db.portable_activation_retry_lifecycle_mutex);
-        db.portable_activation_retry_stop.store(false, .release);
-        db.portable_activation_retry_worker_running.store(true, .release);
+        _ = lockAtomic(&db.portable_activation_recovery.lifecycle_mutex);
+        db.portable_activation_recovery.stopping.store(false, .release);
+        db.portable_activation_recovery.worker_running.store(true, .release);
         const launch = db.launchPortableActivationRetryWorkerLocked() catch |err| {
-            db.portable_activation_retry_worker_running.store(false, .release);
-            db.portable_activation_retry_lifecycle_mutex.unlock();
+            db.portable_activation_recovery.worker_running.store(false, .release);
+            db.portable_activation_recovery.lifecycle_mutex.unlock();
             return err;
         };
-        db.portable_activation_retry_lifecycle_mutex.unlock();
-        try std.testing.expectEqual(DB.PortableActivationRetryLaunch.backend_runtime, launch);
+        db.portable_activation_recovery.lifecycle_mutex.unlock();
+        try std.testing.expectEqual(portable_activation_recovery.Owner.PortableActivationRetryLaunch.backend_runtime, launch);
 
         const exit_deadline = monotonicTimeNs() + std.time.ns_per_s;
-        while (db.portable_activation_retry_worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
+        while (db.portable_activation_recovery.worker_running.load(.acquire) and monotonicTimeNs() < exit_deadline) {
             @import("antfly_platform").time.yieldNow();
         }
-        try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
+        try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
     }
 }
 
@@ -90547,12 +88990,12 @@ test "portable activation retry stop joins the runtime worker final handshake" {
         release_final_lock: *std.atomic.Value(bool),
 
         fn run(ctx: @This()) void {
-            while (!ctx.db.portable_activation_retry_stop.load(.acquire)) @import("antfly_platform").time.yieldNow();
-            _ = lockAtomic(&ctx.db.portable_activation_retry_lifecycle_mutex);
-            ctx.db.portable_activation_retry_worker_running.store(false, .release);
+            while (!ctx.db.portable_activation_recovery.stopping.load(.acquire)) @import("antfly_platform").time.yieldNow();
+            _ = lockAtomic(&ctx.db.portable_activation_recovery.lifecycle_mutex);
+            ctx.db.portable_activation_recovery.worker_running.store(false, .release);
             ctx.holding_final_lock.store(true, .release);
             while (!ctx.release_final_lock.load(.acquire)) @import("antfly_platform").time.yieldNow();
-            ctx.db.portable_activation_retry_lifecycle_mutex.unlock();
+            ctx.db.portable_activation_recovery.lifecycle_mutex.unlock();
         }
     };
     const StopCtx = struct {
@@ -90568,8 +89011,8 @@ test "portable activation retry stop joins the runtime worker final handshake" {
     var holding_final_lock = std.atomic.Value(bool).init(false);
     var release_final_lock = std.atomic.Value(bool).init(false);
     var stop_returned = std.atomic.Value(bool).init(false);
-    db.portable_activation_retry_stop.store(false, .release);
-    db.portable_activation_retry_worker_running.store(true, .release);
+    db.portable_activation_recovery.stopping.store(false, .release);
+    db.portable_activation_recovery.worker_running.store(true, .release);
 
     var worker = try std.Thread.spawn(.{}, ExitCtx.run, .{ExitCtx{
         .db = &db,
@@ -90630,12 +89073,12 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
     db.startPortableActivationRetryWorkerIfNeededInner(true);
-    try std.testing.expect(db.portable_activation_retry_next_launch_ns > 0);
+    try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
 
     // Rearm the injected launch failures. The claimed probe must leave these
     // untouched after close publishes the permanent stop state.
     test_fail_portable_activation_retry_fallback_submit.store(true, .release);
-    db.portable_activation_retry_next_launch_ns = 0;
+    db.portable_activation_recovery.next_launch_ns = 0;
     test_release_portable_activation_retry_probe.store(false, .release);
     test_portable_activation_retry_probe_paused.store(false, .release);
     test_pause_portable_activation_retry_probe_before_lifecycle_lock.store(true, .release);
@@ -90691,10 +89134,10 @@ test "portable activation retry shutdown rejects an already claimed maintenance 
     };
 
     const stop_deadline = monotonicTimeNs() + std.time.ns_per_s;
-    while (!db.portable_activation_retry_stop.load(.acquire) and monotonicTimeNs() < stop_deadline) {
+    while (!db.portable_activation_recovery.stopping.load(.acquire) and monotonicTimeNs() < stop_deadline) {
         @import("antfly_platform").time.yieldNow();
     }
-    try std.testing.expect(db.portable_activation_retry_stop.load(.acquire));
+    try std.testing.expect(db.portable_activation_recovery.stopping.load(.acquire));
     try std.testing.expect(!close_returned.load(.acquire));
 
     test_release_portable_activation_retry_probe.store(true, .release);
@@ -90726,26 +89169,26 @@ test "portable activation retry uses owner scoped runtime" {
     defer db.close();
 
     db.async_context.portable_runtime_activation_pending.store(true, .release);
-    _ = lockAtomic(&db.portable_activation_retry_lifecycle_mutex);
-    db.portable_activation_retry_stop.store(false, .release);
-    db.portable_activation_retry_worker_running.store(true, .release);
+    _ = lockAtomic(&db.portable_activation_recovery.lifecycle_mutex);
+    db.portable_activation_recovery.stopping.store(false, .release);
+    db.portable_activation_recovery.worker_running.store(true, .release);
     const launch = db.launchPortableActivationRetryWorkerLocked() catch |err| {
-        db.portable_activation_retry_worker_running.store(false, .release);
-        db.portable_activation_retry_lifecycle_mutex.unlock();
+        db.portable_activation_recovery.worker_running.store(false, .release);
+        db.portable_activation_recovery.lifecycle_mutex.unlock();
         return err;
     };
-    db.portable_activation_retry_lifecycle_mutex.unlock();
-    try std.testing.expectEqual(DB.PortableActivationRetryLaunch.backend_runtime, launch);
+    db.portable_activation_recovery.lifecycle_mutex.unlock();
+    try std.testing.expectEqual(portable_activation_recovery.Owner.PortableActivationRetryLaunch.backend_runtime, launch);
 
     const recovery_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
-        db.portable_activation_retry_worker_running.load(.acquire)) and
+        db.portable_activation_recovery.worker_running.load(.acquire)) and
         monotonicTimeNs() < recovery_deadline)
     {
         @import("antfly_platform").time.yieldNow();
     }
     try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
-    try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
+    try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
     try std.testing.expectEqual(@as(u64, 1), db.portable_runtime_activation_attempts.load(.monotonic));
 }
 
@@ -90771,21 +89214,21 @@ test "portable activation retry automatically rearms after runtime submission fa
     defer test_fail_portable_activation_retry_fallback_submit.store(false, .release);
 
     db.startPortableActivationRetryWorkerIfNeededInner(true);
-    try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 1), db.portable_activation_retry_launch_failure_streak);
-    try std.testing.expect(db.portable_activation_retry_next_launch_ns > 0);
+    try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), db.portable_activation_recovery.launch_failure_streak);
+    try std.testing.expect(db.portable_activation_recovery.next_launch_ns > 0);
 
     const recovery_deadline = monotonicTimeNs() + 5 * std.time.ns_per_s;
     while ((db.async_context.portable_runtime_activation_pending.load(.acquire) or
-        db.portable_activation_retry_worker_running.load(.acquire)) and
+        db.portable_activation_recovery.worker_running.load(.acquire)) and
         monotonicTimeNs() < recovery_deadline)
     {
         sleepNs(std.time.ns_per_ms);
     }
     try std.testing.expect(!db.async_context.portable_runtime_activation_pending.load(.acquire));
-    try std.testing.expect(!db.portable_activation_retry_worker_running.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 0), db.portable_activation_retry_launch_failure_streak);
-    try std.testing.expectEqual(@as(u64, 0), db.portable_activation_retry_next_launch_ns);
+    try std.testing.expect(!db.portable_activation_recovery.worker_running.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), db.portable_activation_recovery.launch_failure_streak);
+    try std.testing.expectEqual(@as(u64, 0), db.portable_activation_recovery.next_launch_ns);
     try std.testing.expectEqual(@as(u64, 1), db.portable_runtime_activation_attempts.load(.monotonic));
 }
 
@@ -95216,29 +93659,21 @@ test "db enrichment status changes notify query visibility hook" {
 
     const HookCtx = struct {
         status_calls: u64 = 0,
-        table_name: ?[]const u8 = null,
-        group_id: u64 = 0,
         saw_db: bool = false,
         change: ?QueryVisibilityChange = null,
 
-        fn onChange(ptr: *anyopaque, table_name: []const u8, group_id: u64, changed_db: ?*DB, event: QueryVisibilityEvent) void {
+        fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             // Attachment also replays existing repair debt. That is a valid
             // visibility edge, independent of the enrichment status contract.
             if (event.change != .status) return;
             self.status_calls += 1;
-            self.table_name = table_name;
-            self.group_id = group_id;
-            self.saw_db = changed_db != null;
             self.change = event.change;
         }
     };
     var hook_ctx = HookCtx{};
     db.setQueryVisibilityHook(.{
         .ptr = &hook_ctx,
-        .table_name = "docs",
-        .group_id = 7001,
-        .db = &db,
         .on_change = HookCtx.onChange,
     });
 
@@ -95248,9 +93683,6 @@ test "db enrichment status changes notify query visibility hook" {
     try db.enrichment_runtime.?.markAppliedThrough(1);
 
     try std.testing.expectEqual(@as(u64, 1), hook_ctx.status_calls);
-    try std.testing.expectEqualStrings("docs", hook_ctx.table_name.?);
-    try std.testing.expectEqual(@as(u64, 7001), hook_ctx.group_id);
-    try std.testing.expect(hook_ctx.saw_db);
     try std.testing.expectEqual(QueryVisibilityChange.status, hook_ctx.change.?);
 
     try db.enrichment_runtime.?.markAppliedThrough(2);
@@ -95288,7 +93720,7 @@ test "db source commit publishes exact target observation sequence" {
         target_name_matches: bool = false,
         target_effect: ?IndexTargetVisibility.ServingSetEffect = null,
 
-        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+        fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (event.change != .target_advanced) return;
             self.target_calls += 1;
@@ -95308,9 +93740,6 @@ test "db source commit publishes exact target observation sequence" {
     var hook_ctx = HookCtx{};
     db.setQueryVisibilityHook(.{
         .ptr = &hook_ctx,
-        .table_name = "docs",
-        .group_id = 7001,
-        .db = &db,
         .on_change = HookCtx.onChange,
     });
 
@@ -95449,7 +93878,7 @@ test "db generated downstream indexes are exact convergence targets at source co
         saw_dense: bool = false,
         saw_graph: bool = false,
 
-        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+        fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (event.change != .target_advanced) return;
             self.calls += 1;
@@ -95470,9 +93899,6 @@ test "db generated downstream indexes are exact convergence targets at source co
     var hook_ctx = HookCtx{};
     db.setQueryVisibilityHook(.{
         .ptr = &hook_ctx,
-        .table_name = "docs",
-        .group_id = 7001,
-        .db = &db,
         .on_change = HookCtx.onChange,
     });
 
@@ -104247,7 +102673,7 @@ test "db dispatches generated document child range artifacts to remote owner" {
         }
 
         fn dispatcher(self: *@This()) DocumentArtifactChildRangeDispatcher {
-            return .{ .ptr = self, .apply = apply };
+            return .{ .ptr = self, .select_destination = testChildRangeDestination, .apply = apply };
         }
 
         fn apply(ptr: *anyopaque, allocator: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
@@ -104349,6 +102775,7 @@ test "document child range partition preserves single ownership on allocation fa
                 try partitionRemoteDerivedDocuments(
                     failing_alloc,
                     &.{snapshot},
+                    .{ .ptr = &source, .select = testChildRangeDestination },
                     &documents,
                     &groups,
                 );
@@ -104495,7 +102922,7 @@ test "db retries remote document child range dispatch from durable outbox" {
         }
 
         fn dispatcher(self: *@This()) DocumentArtifactChildRangeDispatcher {
-            return .{ .ptr = self, .apply = apply };
+            return .{ .ptr = self, .select_destination = testChildRangeDestination, .apply = apply };
         }
 
         fn apply(ptr: *anyopaque, allocator: Allocator, dispatch: DocumentArtifactChildRangeDispatch) !void {
@@ -126185,172 +124612,6 @@ test "resident index repair scheduler skips deferred prefixes with bounded fair 
     try std.testing.expect(!third.repairs.items[0].audit_due);
 }
 
-test "resident index repair scheduler maintains exact aggregate wake precedence" {
-    const alloc = std.testing.allocator;
-    var directory = IndexRepairSchedulerDirectory{
-        .initialized = true,
-        .identity = .{ .db_identity = 1, .replica_id = 1, .root_generation = 1 },
-    };
-    defer directory.deinit(alloc);
-
-    const Intent = struct {
-        fn make(
-            allocator: Allocator,
-            id: u128,
-            deadline: u64,
-            automation: index_repair_state.Automation,
-        ) !index_repair_state.IndexRepairIntent {
-            return .{
-                .repair_id = id,
-                .revision = 1,
-                .db_identity = 1,
-                .group_id = 1,
-                .replica_id = 1,
-                .root_generation = 1,
-                .index_name = try std.fmt.allocPrint(allocator, "repair-{d}", .{id}),
-                .kind = .full_text,
-                .config_hash = 1,
-                .detected_sequence = 1,
-                .target_sequence = 1,
-                .started_at_ms = 1,
-                .updated_at_ms = 1,
-                .owner_epoch = 0,
-                .next_retry_at_ms = deadline,
-                .automation = automation,
-            };
-        }
-    };
-
-    var future = try Intent.make(alloc, 1, 900, .enabled);
-    defer future.deinit(alloc);
-    try directory.upsert(alloc, future, future.revision);
-    var immediate = try Intent.make(alloc, 2, 0, .enabled);
-    defer immediate.deinit(alloc);
-    try directory.upsert(alloc, immediate, immediate.revision);
-    var earlier = try Intent.make(alloc, 3, 400, .enabled);
-    defer earlier.deinit(alloc);
-    try directory.upsert(alloc, earlier, earlier.revision);
-    try std.testing.expectEqual(@as(usize, 3), directory.runnable_heap.items.len);
-    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
-
-    // Deadline churn updates one indexed heap position; it never accumulates
-    // lazy tombstones that later require an unbounded owner-side compaction.
-    for (0..4096) |i| {
-        immediate.revision += 1;
-        immediate.next_retry_at_ms = if (i % 2 == 0) 0 else 800;
-        try directory.upsert(alloc, immediate, immediate.revision);
-        try std.testing.expectEqual(@as(usize, 3), directory.runnable_heap.items.len);
-    }
-    immediate.next_retry_at_ms = 0;
-    immediate.revision += 1;
-    try directory.upsert(alloc, immediate, immediate.revision);
-
-    // Model the first selected intent deferring itself. A different immediate
-    // intent must continue to dominate the aggregate wake until it too moves.
-    future.next_retry_at_ms = 1_200;
-    future.revision += 1;
-    try directory.upsert(alloc, future, future.revision);
-    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
-    immediate.next_retry_at_ms = 700;
-    immediate.revision += 1;
-    try directory.upsert(alloc, immediate, immediate.revision);
-    try std.testing.expectEqual(@as(u64, 400), directory.wake().at_realtime_ms);
-
-    earlier.automation = .paused;
-    earlier.revision += 1;
-    try directory.upsert(alloc, earlier, earlier.revision);
-    try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
-    try std.testing.expectEqual(directory.runnable, directory.runnable_heap.items.len);
-    directory.remove(alloc, 2);
-    directory.remove(alloc, 1);
-    try std.testing.expectEqual(DB.IndexRepairWake.parked, directory.wake());
-    try std.testing.expectEqual(@as(usize, 0), directory.runnable_heap.items.len);
-
-    // A durable clear advances the materialized-view revision even though it
-    // removes the record. A delayed pre-clear upsert is then stale and cannot
-    // resurrect debt which is absent from the checkpoint. A missed event is a
-    // gap, forcing reconstruction rather than accepting a partial view.
-    directory.control_revision = 41;
-    const identity = directory.identity.?;
-    try std.testing.expectEqual(
-        IndexRepairSchedulerDirectory.ControlMutationDisposition.next,
-        directory.classifyControlMutation(identity, 42),
-    );
-    directory.control_revision = 42;
-    try std.testing.expectEqual(
-        IndexRepairSchedulerDirectory.ControlMutationDisposition.stale,
-        directory.classifyControlMutation(identity, 41),
-    );
-    try std.testing.expectEqual(
-        IndexRepairSchedulerDirectory.ControlMutationDisposition.gap,
-        directory.classifyControlMutation(identity, 44),
-    );
-}
-
-test "resident index repair progress waits are revision scoped and event driven" {
-    const alloc = std.testing.allocator;
-    var directory = IndexRepairSchedulerDirectory{
-        .initialized = true,
-        .identity = .{ .db_identity = 1, .replica_id = 1, .root_generation = 1 },
-    };
-    defer directory.deinit(alloc);
-
-    var intent = index_repair_state.IndexRepairIntent{
-        .repair_id = 17,
-        .revision = 1,
-        .db_identity = 1,
-        .group_id = 1,
-        .replica_id = 1,
-        .root_generation = 1,
-        .index_name = try alloc.dupe(u8, "semantic_idx"),
-        .kind = .dense_vector,
-        .config_hash = 9,
-        .detected_sequence = 1,
-        .target_sequence = 20,
-        .started_at_ms = 1,
-        .updated_at_ms = 1,
-        .owner_epoch = 0,
-    };
-    defer intent.deinit(alloc);
-    try directory.upsert(alloc, intent, intent.revision);
-
-    try std.testing.expect(directory.deferForProgress(17, 1, 20, 500));
-    try std.testing.expectEqual(@as(usize, 1), directory.progress_waiters);
-    try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
-    // An idempotent durable projection must not erase a resident wait.
-    try directory.upsert(alloc, intent, intent.revision);
-    try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 10) == null);
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 19) == null);
-    const progress_wake = directory.wakeForIndexProgress("semantic_idx", 20) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u128, 17), progress_wake.repair_id);
-    try std.testing.expectEqual(@as(u64, 1), progress_wake.revision);
-    try std.testing.expectEqual(index_repair_state.WorkClass.repair, progress_wake.work_class);
-    try std.testing.expectEqual(@as(u64, 9), progress_wake.config_hash);
-    try std.testing.expectEqual(@as(u64, 1), progress_wake.root_generation);
-    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
-    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
-    try std.testing.expect(directory.wakeForIndexProgress("unrelated", 99) == null);
-
-    try std.testing.expect(directory.deferForProgress(17, 1, 30, 600));
-    intent.revision += 1;
-    intent.next_retry_at_ms = 700;
-    try directory.upsert(alloc, intent, intent.revision);
-    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
-    try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
-    // A delayed event from the prior revision cannot wake the new schedule.
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 12) == null);
-
-    // Once replay is at its durable target, corpus coverage—not another
-    // watermark increment—is the remaining completion proof. The bounded
-    // audit must therefore ignore arbitrarily high progress notifications.
-    try std.testing.expect(directory.deferForAudit(17, 2, 800));
-    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
-    try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", std.math.maxInt(u64)) == null);
-    try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
-}
-
 test "index repair intent string replacement is allocation failure safe" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -128999,13 +127260,7 @@ test "db managed visibility hook rehydrates exact durable initial build debt onc
         index_name_matches: bool = false,
         work_class: ?IndexLifecycleWorkClass = null,
 
-        fn onChange(
-            ptr: *anyopaque,
-            _: []const u8,
-            _: u64,
-            _: ?*DB,
-            event: QueryVisibilityEvent,
-        ) void {
+        fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (event.change != .index_repair_pending) return;
             self.pending += 1;
@@ -129024,9 +127279,6 @@ test "db managed visibility hook rehydrates exact durable initial build debt onc
     DB.notifyQueryVisibilityHook(db.async_context, .index_repair_cleared);
     db.setQueryVisibilityHook(.{
         .ptr = &hook,
-        .table_name = "docs",
-        .group_id = 7001,
-        .db = &db,
         .on_change = Hook.onChange,
     });
     try std.testing.expectEqual(@as(usize, 1), hook.pending);
@@ -129066,13 +127318,7 @@ test "db completed managed admission emits an initial build clear edge" {
         previous_admission: ?IndexRepairAdmission = null,
         admission: ?IndexRepairAdmission = null,
 
-        fn onChange(
-            ptr: *anyopaque,
-            _: []const u8,
-            _: u64,
-            _: ?*DB,
-            event: QueryVisibilityEvent,
-        ) void {
+        fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             if (event.change != .index_repair_cleared) return;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const lifecycle = event.repair orelse return;
@@ -129086,9 +127332,6 @@ test "db completed managed admission emits an initial build clear edge" {
     var hook = Hook{};
     db.setQueryVisibilityHook(.{
         .ptr = &hook,
-        .table_name = "docs",
-        .group_id = 7001,
-        .db = &db,
         .on_change = Hook.onChange,
     });
     defer db.setQueryVisibilityHook(null);
@@ -129448,13 +127691,7 @@ test "db durable repair classification emits exact admission and action edges" {
         previous_action_required: bool = false,
         action_required: bool = false,
 
-        fn onChange(
-            ptr: *anyopaque,
-            _: []const u8,
-            _: u64,
-            _: ?*DB,
-            event: QueryVisibilityEvent,
-        ) void {
+        fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             if (event.change != .index_repair_pending) return;
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const repair = event.repair orelse return;
@@ -129469,9 +127706,6 @@ test "db durable repair classification emits exact admission and action edges" {
     var capture = Capture{};
     db.setQueryVisibilityHook(.{
         .ptr = &capture,
-        .table_name = "docs",
-        .group_id = 1,
-        .db = &db,
         .on_change = Capture.onChange,
     });
     // Hook attachment replays the current durable level so a newly resident
@@ -129925,7 +128159,7 @@ test "db removing one repair pin preserves pressure gate for another index" {
         pending_unknown: usize = 0,
         pending_exact: usize = 0,
 
-        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+        fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             switch (event.change) {
                 .index_repair_cleared => if (event.repair) |repair| {
@@ -129944,9 +128178,6 @@ test "db removing one repair pin preserves pressure gate for another index" {
     var hook = Hook{};
     db.setQueryVisibilityHook(.{
         .ptr = &hook,
-        .table_name = "docs",
-        .group_id = 7001,
-        .db = &db,
         .on_change = Hook.onChange,
     });
     defer db.setQueryVisibilityHook(null);
@@ -129977,9 +128208,6 @@ test "db removing one repair pin preserves pressure gate for another index" {
     hook = .{};
     db.setQueryVisibilityHook(.{
         .ptr = &hook,
-        .table_name = "docs",
-        .group_id = 7001,
-        .db = &db,
         .on_change = Hook.onChange,
     });
     try std.testing.expectEqual(@as(usize, 0), hook.pending_unknown);
@@ -136929,8 +135157,8 @@ test "db structural mutation autonomously retries transient maintenance restart 
     for (0..500) |_| {
         if (text_runtime.isStarted() and
             sparse_runtime.isStarted() and
-            db.async_context.text_merge_restart_state.load(.acquire) == 0 and
-            db.async_context.sparse_compaction_restart_state.load(.acquire) == 0)
+            db.async_context.text_merge_restart_owner.state.load(.acquire) == 0 and
+            db.async_context.sparse_compaction_restart_owner.state.load(.acquire) == 0)
         {
             recovered = true;
             break;
@@ -142225,8 +140453,7 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
         fn expire(ptr: *anyopaque, request: coordinated_ttl.Request) !u32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 100), request.table_id);
-            // Group routing is explicit, never guessed from inherited namespace.
-            try std.testing.expectEqual(@as(u64, 999), request.group_id);
+            // The local observation carries table identity; routing is bound by its owner.
             try std.testing.expectEqual(@as(usize, 1), request.candidates.len);
             try std.testing.expectEqual(@as(u64, 1), request.candidates[0].row_version);
             try std.testing.expectEqual(@as(u64, 1), request.candidates[0].ttl_timestamp_ns);
@@ -142249,7 +140476,6 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
         .schema_registry = db.core.schema_registry,
         .grace_period_ns = 0,
         .coordinated_port = .{ .ptr = &capture, .expire_fn = Capture.expire },
-        .coordinated_group_id = 999,
     };
     const candidates = [_]ttl_runtime_mod.DeleteCandidate{.{ .key = @constCast("parent"), .timestamp_ns = 1 }};
     try std.testing.expectEqual(@as(u32, 0), try deleteExpiredDocumentsFromCandidates(&context, &candidates));
@@ -142395,16 +140621,11 @@ test "db ttl cleanup reclaims expired documents through normal delete semantics"
     const NoopVisibilityHook = struct {
         fn onChange(
             _: *anyopaque,
-            _: []const u8,
-            _: u64,
-            _: ?*DB,
             _: QueryVisibilityEvent,
         ) void {}
     };
     db.setQueryVisibilityHook(.{
         .ptr = &db,
-        .table_name = "docs",
-        .db = &db,
         .on_change = NoopVisibilityHook.onChange,
     });
     defer db.setQueryVisibilityHook(null);
@@ -144018,6 +142239,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
 
     const HookCtx = struct {
         mutex: *std.Io.Mutex,
+        changed_db: ?*DB,
         publish_calls: u64 = 0,
         status_calls: u64 = 0,
         status_calls_after_wal_checkpoint: u64 = 0,
@@ -144028,7 +142250,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         publish_blocking_checkpoint_clean: bool = false,
         invalidate_calls: u64 = 0,
 
-        fn onChange(ptr: *anyopaque, _: []const u8, _: u64, changed_db: ?*DB, event: QueryVisibilityEvent) void {
+        fn onChange(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.mutex.lockUncancelable(std.testing.io);
             defer self.mutex.unlock(std.testing.io);
@@ -144036,7 +142258,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
                 .status => {
                     self.publish_calls += 1;
                     self.status_calls += 1;
-                    if (changed_db) |hook_db| {
+                    if (self.changed_db) |hook_db| {
                         if (hook_db.core.denseIndex("dense_idx")) |entry| if (entry.index.snapshotLsmMaintenanceStats()) |stats| {
                             const checkpoint = hook_db.core.index_manager.denseProjectionCheckpointMetadata("dense_idx") orelse return;
                             if (checkpoint.applied_sequence >= 4 and
@@ -144054,7 +142276,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
                 .publish_blocking => {
                     self.publish_calls += 1;
                     self.publish_blocking_calls += 1;
-                    if (changed_db) |hook_db| {
+                    if (self.changed_db) |hook_db| {
                         if (hook_db.async_context.applied_sequence_mutex.tryLock()) {
                             hook_db.async_context.applied_sequence_mutex.unlock();
                         } else {
@@ -144075,12 +142297,9 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
         }
     };
     var hook_mutex: std.Io.Mutex = .init;
-    var hook_ctx = HookCtx{ .mutex = &hook_mutex };
+    var hook_ctx = HookCtx{ .mutex = &hook_mutex, .changed_db = &db };
     db.setQueryVisibilityHook(.{
         .ptr = &hook_ctx,
-        .table_name = "docs",
-        .group_id = 7001,
-        .db = &db,
         .on_change = HookCtx.onChange,
     });
 
@@ -144106,7 +142325,7 @@ test "db dense auto bulk finish wakes weak-sync replay and publishes visibility 
     // the test can prove the replay catch-up itself publishes fresh visibility.
     try db.finishDenseAutoBulkIngestSessionWithOptionsInternal(.{ .compact = false }, false);
     hook_mutex.lockUncancelable(std.testing.io);
-    hook_ctx = .{ .mutex = &hook_mutex };
+    hook_ctx = .{ .mutex = &hook_mutex, .changed_db = &db };
     hook_mutex.unlock(std.testing.io);
 
     flushDeferredExternalBulkExecutorNotification(db.async_context, db.executor);
@@ -155170,8 +153389,8 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             // Lose the producer's queue/upload entirely: the durable original
             // dispatch is complete, but no accepted output exists. A bounded
             // retry sweep must append work without reopening that dispatch.
-            db.artifact_producer_retry_after_ns = 0;
-            db.artifact_producer_work_retry_after_ns.store(0, .release);
+            db.artifact_producer_scheduler.producer_retry_after_ns = 0;
+            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
             try std.testing.expect(try db.advanceArtifactProducerWorkPage());
             const retried_sequence = db.core.store.lastReplaySequence(0);
             try std.testing.expect(retried_sequence > expected_sequence);
@@ -155199,8 +153418,8 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
                 try std.testing.expectEqual(@as(u64, 3), round);
                 try std.testing.expect(try obligations.stageRetry(alloc, &txn, authority, current, round, expected_sequence + 1, .{ .next_template = 1, .complete = true }));
             }
-            db.artifact_producer_retry_after_ns = 0;
-            db.artifact_producer_work_retry_after_ns.store(0, .release);
+            db.artifact_producer_scheduler.producer_retry_after_ns = 0;
+            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
             try std.testing.expect(try db.advanceArtifactProducerWorkPage());
             expected_sequence = db.core.store.lastReplaySequence(0);
             {
@@ -155214,7 +153433,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             }
             // A completed local retry round cannot spin while other work
             // keeps the maintenance scheduler on its active cadence.
-            db.artifact_producer_work_retry_after_ns.store(0, .release);
+            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
             _ = try db.advanceArtifactProducerWorkPage();
             try std.testing.expectEqual(expected_sequence, db.core.store.lastReplaySequence(0));
             // A dependency repair can retain the primary position. It must
@@ -155224,7 +153443,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             const authority = (try publication.authority(&txn)).?;
             _ = try obligations.mark(alloc, &txn, authority, "doc", null);
             try txn.commit();
-            db.artifact_producer_work_retry_after_ns.store(0, .release);
+            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
             try std.testing.expect(try db.advanceArtifactProducerWorkPage());
             try std.testing.expect(db.core.store.lastReplaySequence(0) > expected_sequence);
         }
@@ -155672,7 +153891,7 @@ test "db graph endpoint cleanup pages progress after standalone ttl without anot
     defer directory.cleanup();
     const db = try DB.openOwned(alloc, directory.path(), .{ .start_index_workers = false });
     defer db.closeOwned();
-    try std.testing.expect(db.graph_cleanup_worker != null);
+    try std.testing.expect(db.graph_cleanup_owner.registration != null);
     try db.setSchema(.{ .version = 1, .default_type = "_default", .ttl_duration_ns = std.time.ns_per_s });
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
     try db.batch(.{ .writes = &.{.{ .key = "hub", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .timestamp_ns = currentTimeNs() - 2 * std.time.ns_per_s, .sync_level = .full_index });
@@ -155755,7 +153974,7 @@ test "db graph endpoint cleanup pages full index completion covers every local w
         try db.batch(.{ .writes = &.{.{ .key = "hub", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .timestamp_ns = 1, .sync_level = .full_index });
         const req: types.BatchRequest = .{ .deletes = &.{"hub"}, .sync_level = .full_index };
         var capture = Capture{};
-        const dispatcher = DocumentArtifactChildRangeDispatcher{ .ptr = &capture, .apply = Capture.dispatch };
+        const dispatcher = DocumentArtifactChildRangeDispatcher{ .ptr = &capture, .select_destination = testChildRangeDestination, .apply = Capture.dispatch };
         switch (mode) {
             0 => try db.batchTransactionCompatible(req),
             1 => {
@@ -155915,7 +154134,7 @@ test "db graph endpoint cleanup pages weak sync has one page budget and full ind
         }
         try db.core.store.putBatch(jobs, &.{});
         var capture = Capture{};
-        try db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = level }, .{ .ptr = &capture, .apply = Capture.dispatch }, .{ .ptr = &capture, .apply = Capture.observe });
+        try db.batchWithDocumentArtifactChildRangeDispatcherAndCommittedEffectsObserver(.{ .writes = &.{.{ .key = "unrelated", .value = "{}" }}, .sync_level = level }, .{ .ptr = &capture, .select_destination = testChildRangeDestination, .apply = Capture.dispatch }, .{ .ptr = &capture, .apply = Capture.observe });
         const pending = try db.core.store.scanPrefix(alloc, internal_keys.graph_endpoint_cleanup_prefix);
         defer docstore_mod.DocStore.freeResults(alloc, pending);
         if (level == .full_index) {
@@ -155975,6 +154194,10 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
 // White-box hooks for server integration fixtures; absent from production builds.
 const fixture_owner = @This();
 pub const test_support = if (builtin.is_test) struct {
+    pub fn advanceArtifactUploadRecoveryMaintenance(db: *fixture_owner.DB) !bool {
+        return db.advanceArtifactUploadRecoveryWithTrigger(.maintenance);
+    }
+
     pub const drainStandaloneGraphEndpointCleanup = fixture_owner.DB.drainStandaloneGraphEndpointCleanup;
     pub const runStandaloneGraphEndpointCleanupStep = fixture_owner.DB.runStandaloneGraphEndpointCleanupStep;
     pub const enrichmentReconfigureHook = &fixture_owner.DB.test_enrichment_reconfigure_after_detached_hook;
@@ -157055,7 +155278,7 @@ test "db graph fact materialized scopes match journal" {
     const Observer = struct {
         saw_generated_consumer: bool = false,
         scope_known: bool = false,
-        fn changed(ptr: *anyopaque, _: []const u8, _: u64, _: ?*DB, event: QueryVisibilityEvent) void {
+        fn changed(ptr: *anyopaque, event: QueryVisibilityEvent) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             if (event.target_sequence == null) return;
             self.scope_known = event.target_scope_known;
@@ -157066,7 +155289,7 @@ test "db graph fact materialized scopes match journal" {
         }
     };
     var observer = Observer{};
-    db.setQueryVisibilityHook(.{ .ptr = &observer, .table_name = "docs", .on_change = Observer.changed });
+    db.setQueryVisibilityHook(.{ .ptr = &observer, .on_change = Observer.changed });
     defer db.setQueryVisibilityHook(null);
     try db.batch(.{ .graph_writes = req.graph_writes, .sync_level = .write });
     try std.testing.expect(observer.scope_known);
@@ -157809,6 +156032,13 @@ test "db generated write read fences detect artifact mutations and ABA independe
     try db.batch(.{ .deletes = &.{"doc:a"}, .timestamp_ns = 42 });
     try db.batch(.{ .writes = writes, .timestamp_ns = 42 });
     try std.testing.expectError(error.PreparedReadSetChanged, db.validateGeneratedWriteReadSnapshot(snapshot));
+}
+
+fn testChildRangeDestination(_: *anyopaque, range: types.DocumentArtifactChildRange) ?u64 {
+    if (!builtin.is_test) @compileError("test-only routing policy");
+    if (!std.mem.eql(u8, range.route_status orelse "local_committed", "remote_committed")) return null;
+    const owner = range.owner_group_id orelse return null;
+    return if (owner == 0) null else owner;
 }
 
 test "db document lookup allocation benchmark" {

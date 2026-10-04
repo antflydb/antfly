@@ -880,8 +880,28 @@ pub fn validateSources(alloc: std.mem.Allocator, txn: anytype, namespace: Namesp
     }
 }
 
+pub const UploadRecoveryTick = struct {
+    now_ns: u64,
+    trigger: enum { maintenance, explicit },
+};
+
+pub const UploadRecoveryInvocation = struct {
+    io: std.Io,
+    now_ns: u64,
+    inventory: @import("artifact_publication_transport.zig").RecoveryInventory,
+    trigger: @FieldType(UploadRecoveryTick, "trigger"),
+};
+
+pub const UploadRecovery = struct {
+    should_poll: *const fn (*anyopaque, UploadRecoveryTick) bool,
+    recover: *const fn (*anyopaque, UploadRecoveryInvocation) anyerror!bool,
+};
+
 pub const Dispatcher = struct {
     ptr: *anyopaque,
+    /// Borrowed synchronous owner capability. Storage releases its snapshot
+    /// before recovery; absence leaves external publication recovery inert.
+    upload_recovery: ?UploadRecovery = null,
     /// No storage/apply lock may be held here. Success means bounded queue
     /// admission only; output remains pending until the local durable receipt.
     enqueue: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,

@@ -98,3 +98,133 @@ The focused storage gate validates caller filters against the combined local
 and server test inventories before dispatching to either owner. A filter may
 select just one owner; unknown filters still fail. The server's aggregate
 slice remains independent of filters intended for the local root.
+
+## Local maintenance requirements and external upload recovery
+
+Resolver retirement asks the promotion runtime for typed readiness while holding
+its catalog activity fence. Diagnostic status strings remain available to users
+but do not grant retirement authority. A pending publisher blocks retirement;
+a runtime without local publication ownership leaves server reconciliation free
+to remove its local resolver.
+
+Storage interprets historical source-authority records as local or ordered
+maintenance requirements. The persisted format, legacy ordered receipt fence,
+publication namespace, and corruption checks remain unchanged. DB maintenance
+uses these requirements without selecting a Raft role.
+
+`storage/artifact_upload_recovery.zig` owns upload polling cadence, idle detection,
+fairness, and queue admission cursors. A cheap borrowed dispatcher hook checks
+cadence before DB reads its bounded upload inventory. Storage releases the read
+snapshot before handing those facts to the owner; the owner releases its own
+mutex before queue admission. A refused proposal never advances its cursor.
+Explicit retries bypass periodic cadence. Durable exact-incarnation and progress
+checks remain in storage and are the only authority to retire upload bytes.
+
+## Producer scheduling, publication recovery, and TTL routing
+
+`storage/db/artifact_producer_scheduler.zig` owns volatile producer polling,
+single-flight admission, fairness cursors, and retry rounds. It is shared local
+maintenance, including native inference. DB supplies budgeted transactional work;
+it retains durable obligations, exact-generation checks, replay-journal append,
+and completion receipts. A scheduler cursor advances only after accepted work,
+and a restart rediscovers obligations from storage.
+
+`storage/db/publication_outbox_recovery.zig` owns the publication retry driver.
+Its borrowed port provides queue submission, probes, clocks, and fenced draining.
+The DB owner still drains queued work before destruction. Durable outboxes,
+startup publication barriers, and local append/acknowledgement ordering remain in
+storage. Retry deadlines never prove delivery or discharge an obligation.
+
+`storage/coordinated_ttl.zig` contains only local expiration observations and their
+borrowed callback. `storage/server_coordinated_ttl.zig` binds group routing and owns
+the bounded server queue. Stable cache-entry bindings synchronize route refreshes
+with callbacks without holding a routing lock across distributed work. C ABI
+adapters attach their existing group identity; the wire layout is unchanged.
+Storage retains timestamps, content digests, schema guards, and local deletion.
+
+Upload recovery is one optional dispatcher capability containing both cadence and
+recovery callbacks. Its integration regression uses the actual server runtime-hook
+factory and verifies refused periodic admission, cadence suppression, explicit
+retry, and the following maintenance opportunity against reopened upload state.
+
+## Visibility observations and child-range effects
+
+The DB emits `QueryVisibilityEvent` through a borrowed context and callback.
+`storage/server_query_visibility.zig` binds table, group, cache, and owner identity
+outside storage. The private C owner attaches its handle's existing routing
+identity when encoding the unchanged notification ABI. Detachment still waits
+for in-flight observations, and installing a hook still rehydrates durable repair
+state. An observer that needs local DB access borrows it through its own context.
+
+`storage/db/document_child_range_effects.zig` partitions prepared generated effects
+against local manifest snapshots and physical key bounds. A pure, bounded
+selection callback supplies a destination; planning does not inspect server role
+or placement status. `storage/server_document_child_range.zig` interprets committed
+server placement. Delivery adapters retain live routing and transport admission
+checks after the local apply fence is released.
+
+`document_child_range_manifest.zig` owns child-range decoding and allocation
+cleanup. `document_child_range_outbox.zig` owns intent encoding, staging, and
+delivery iteration. DB supplies fenced manifest reads, snapshot scans, and intent
+deletion. Local effects and staged intents still commit in the same batch; an
+intent is deleted only after successful delivery. The version-one record and
+persisted destination remain compatible. Allocation failure cannot transfer only
+part of a record's key/value ownership.
+
+## Local recovery and maintenance owners
+
+`storage/db/portable_activation_recovery.zig` owns activation queue admission,
+retry jitter, supervisor probes, the running flag, and permanent close state.
+Its stable borrowed port invokes DB's fenced catalog activation. The completion
+handshake and runtime owner drain protect the DB and callback context through
+shutdown, including a supervisor probe claimed before close.
+
+`storage/db/quarantine_recovery.zig` owns index-load retry registration and joining.
+DB supplies load-failure observation and its fenced retry operation. A completed
+cohort is joined before another cohort can be scheduled; close permanently
+rejects new registration. These are embedded self-healing mechanisms and have
+no server coordination dependency.
+
+`storage/db/independent_maintenance.zig` owns bounded operation order, retry
+suppression, active/idle and source-scan cadence, scheduler registration, and
+shutdown. DB supplies local activity and the budgeted, fenced operations. Runtime
+awake time controls repair retry deadlines; relational-index activity retains its
+existing clock. Activation contention yields the turn without increasing repair
+backoff. Other repair errors leave relational maintenance able to progress.
+
+Publication recovery snapshots its diagnostic counter and publishes the next
+retry deadline before releasing its single-flight state. A successor admitted by
+a rearm callback cannot change the previous failure's report. Producer
+single-flight tests advance the clock while a page is active so cadence cannot
+hide missing admission protection.
+
+## Remaining local worker owners and server metadata
+
+`storage/server_group_metadata.zig` owns the server's group creation timestamp
+key and accessors. DB provides ordinary reads and writes without interpreting
+this server metadata. The existing key and decimal encoding remain unchanged;
+server status consumers attach their group identity in the adapter.
+
+`storage/db/graph_cleanup_owner.zig` owns scheduler registration, bounded polling
+cadence, and a permanent shutdown barrier. DB supplies write eligibility and one
+fenced graph cleanup page. A registration borrows the stable DB address until
+stop joins its callback outside the admission mutex.
+
+`storage/db/runtime_restart_owner.zig` owns restart admission, coalesced rerun
+requests, capped retry delay, and bounded durable-lane resubmission. Enrichment,
+text merge, and sparse compaction each have a separate owner. DB supplies desired
+state and a start attempt; enrichment runtime replacement remains protected by
+its lifecycle mutex, and structural mutations still govern paused runtimes.
+The durable owner lane drains before the borrowed context is destroyed.
+
+`storage/db/native_projection_owner.zig` owns wakeups, worker admission, retryable
+failure classification, and shutdown/join. Its stable AsyncContext supplies one
+publication round. Catalog pins, stable-tip/cardinality checks, snapshot admission,
+and durable checkpoint publication remain local storage operations. Shutdown
+joins outside the worker admission mutex; a stopped owner cannot be restarted.
+
+`storage/db/index_repair_scheduler.zig` owns the revision projection, exact runnable
+heap, fairness cursor, progress waits, and independent summary types. Durable
+repair checkpoints remain the authority. DB reconciles committed events under
+its scheduler mutex and executes selected fenced work. A revision gap still
+invalidates the projection; volatile progress hints cannot authorize publication.

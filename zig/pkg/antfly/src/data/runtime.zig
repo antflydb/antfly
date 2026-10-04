@@ -12,6 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
+const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const replication_ingress = @import("../storage/db/replication_ingress.zig");
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const std = @import("std");
@@ -5546,7 +5548,7 @@ pub const DataServer = struct {
     background_jobs_shutdown: std.atomic.Value(bool) = .init(false),
     // Preparation may own up to 16 MiB per transaction. Bound concurrency as
     // well as queued observation bytes, independent of local shard count.
-    relational_ttl_queue: antfly.db.coordinated_ttl.Queue = .{ .max_jobs = 4 },
+    relational_ttl_queue: server_coordinated_ttl.Queue = .{ .max_jobs = 4 },
     artifact_publication_queue: artifact_publication_dispatch.Queue = .{},
     relational_ttl_completed: std.atomic.Value(u64) = .init(0),
     relational_ttl_expired: std.atomic.Value(u64) = .init(0),
@@ -6817,7 +6819,7 @@ pub const DataServer = struct {
         // from diverging and gives both paths the configured durable L2.
         self.http_server.?.bindIncomingGraphRoutes(self.read_source.source());
         antfly.public_api.kernel_bridge.setAntflyProvider(&self.http_server.?, self.read_source.antfly_provider);
-        const ttl_port: antfly.db.coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
+        const ttl_port: server_coordinated_ttl.Port = .{ .ptr = self, .expire_fn = expireRelationalRows };
         _ = self.write_source.withCoordinatedTtl(ttl_port);
         if (self.data_raft_apply) |apply_sm| _ = apply_sm.write_source.withCoordinatedTtl(ttl_port);
     }
@@ -6976,7 +6978,7 @@ pub const DataServer = struct {
         self.alloc.destroy(job);
     }
 
-    fn expireRelationalRows(ptr: *anyopaque, request: antfly.db.coordinated_ttl.Request) !u32 {
+    fn expireRelationalRows(ptr: *anyopaque, request: server_coordinated_ttl.Request) !u32 {
         const self: *DataServer = @ptrCast(@alignCast(ptr));
         if (self.background_jobs_shutdown.load(.acquire)) return error.Canceled;
         const runtime = self.backend_runtime orelse return error.CoordinatedTtlBackpressure;
@@ -7011,7 +7013,7 @@ pub const DataServer = struct {
 
     const RelationalTtlJob = struct {
         server: *DataServer,
-        observation: ?*antfly.db.coordinated_ttl.Queue.Job,
+        observation: ?*server_coordinated_ttl.Queue.Job,
         io: std.Io,
         next_candidate: usize = 0,
     };
@@ -20498,7 +20500,7 @@ pub const DataServer = struct {
         if (status.created_at_millis == 0) {
             if (comptime control_only_storage_sources) return;
             if (db) |ptr| {
-                status.created_at_millis = (ptr.getGroupCreatedAtMillis(self.alloc, group_id) catch null) orelse 0;
+                status.created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(ptr, self.alloc, group_id) catch null) orelse 0;
             }
         }
     }
@@ -29304,7 +29306,7 @@ fn collectLocalGroupStatusFromDb(
     const source_doc_count = controlPlaneDocumentCount(stats);
 
     const now_realtime_ms = platform_clock.Clock.real().nowRealtimeMs();
-    const created_at_millis = (try db.getGroupCreatedAtMillis(alloc, group_id)) orelse now_realtime_ms;
+    const created_at_millis = (try server_group_metadata.getGroupCreatedAtMillis(db, alloc, group_id)) orelse now_realtime_ms;
     const readiness = derivePublishedGroupReadiness(
         group_id,
         snapshot_stores,
@@ -47341,7 +47343,7 @@ fn implementationTests() type {
             defer server.deinit();
             server.write_source.write_cache = &cache;
             var key = [_]u8{ 'r', 0, 'x' };
-            const request: antfly.db.coordinated_ttl.Request = .{
+            const request: server_coordinated_ttl.Request = .{
                 .table_id = 17,
                 .group_id = 171,
                 .schema_version = 1,

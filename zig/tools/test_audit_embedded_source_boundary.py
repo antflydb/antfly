@@ -75,11 +75,17 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             "raft_applied_entry_marker",
             "HAMirrorUnavailable",
             "primary_ha",
+            "getGroupCreatedAtMillis",
+            "ensureGroupCreatedAtMillis",
         ):
             for path in (
                 "storage/db/replication_contract.zig",
                 "storage/db/commit_integration.zig",
                 "storage/db/db.zig",
+                "storage/db/index_repair_scheduler.zig",
+                "storage/db/graph_cleanup_owner.zig",
+                "storage/db/native_projection_owner.zig",
+                "storage/db/runtime_restart_owner.zig",
             ):
                 with (
                     self.subTest(token=token, path=path),
@@ -96,6 +102,47 @@ class EmbeddedBoundaryTest(unittest.TestCase):
         check_replication_contract(
             "storage/db/replication_contract.zig",
             '// standby_names\nconst note = "sync_policy";',
+        )
+
+    def test_visibility_hook_keeps_server_identity_outside_local_storage(self):
+        for field in ("table_name: []const u8", "group_id: u64", "db: *DB"):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    ValueError, "server routing in local visibility hook"
+                ),
+            ):
+                check_replication_contract(
+                    "storage/db/db.zig",
+                    f"pub const QueryVisibilityHook = struct {{\n    {field},\n}};",
+                )
+        check_replication_contract(
+            "storage/db/db.zig",
+            "pub const QueryVisibilityHook = struct {\n    ptr: *anyopaque,\n};",
+        )
+
+    def test_local_child_range_planning_rejects_server_destination_policy(self):
+        path = "storage/db/document_child_range_effects.zig"
+        for source in (
+            "const status = range.route_status;",
+            'const status = "remote_committed";',
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(
+                    ValueError, "server child-range destination policy"
+                ),
+            ):
+                check_replication_contract(path, source)
+        check_replication_contract(
+            path, 'test "fixture" { const status = "remote_committed"; }'
+        )
+        check_replication_contract(
+            path, "const destination = selector.select(ptr, range);"
+        )
+        check_replication_contract(
+            "storage/server_document_child_range.zig",
+            'const status = "remote_committed";',
         )
 
     def test_dynamic_imports_fail_closed(self):
