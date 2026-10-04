@@ -30,13 +30,16 @@ BATCH_SIZE = 100
 def _query_total(stateful_api, table_name: str, state: str | None = None) -> int:
     query: dict[str, object] = {
         "full_text_search": {"match": "catalog", "field": "title"},
-        "limit": 1,
+        # A bounded result page can only certify a lower-bound total after
+        # primary-row visibility checks. Request the exact count contract.
+        "count": True,
     }
     if state is not None:
         query["filter_query"] = {"term": state, "field": "state"}
     response = stateful_api.query_table(table_name, query)
     responses = response.get("responses", [])
     assert len(responses) == 1, response
+    assert responses[0]["hits"]["total"]["relation"] == "exact", response
     return query_hits_total_value(responses[0]["hits"])
 
 

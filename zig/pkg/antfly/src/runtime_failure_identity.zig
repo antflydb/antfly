@@ -104,6 +104,7 @@ const mappings = [_]Mapping{
     .{ .status = .metadata_incarnation_mismatch, .err = error.MetadataIncarnationMismatch },
     .{ .status = .metadata_incarnation_unavailable, .err = error.MetadataIncarnationUnavailable },
     .{ .status = .metadata_mutation_outcome_unknown, .err = error.MetadataMutationOutcomeUnknown },
+    .{ .status = .metadata_replication_pending, .err = error.MetadataReplicationPending },
     .{ .status = .metadata_snapshot_head_mismatch, .err = error.MetadataSnapshotHeadMismatch },
     .{ .status = .namespace_not_empty, .err = error.NamespaceNotEmpty },
     .{ .status = .namespace_not_found, .err = error.NamespaceNotFound },
