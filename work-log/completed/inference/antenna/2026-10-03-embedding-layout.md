@@ -26,8 +26,38 @@ Within noise, and if anything slightly worse. Earlier native runs with Decide
 targets were void (the resident Metal Q·Kᵀ bug), so this is the first valid
 comparison.
 
-A second distillation epoch from run21's student is the remaining lever
-(run25, in progress). Its stage 3 uses hard labels.
+## Classification: a second distillation epoch helps
+
+run25 continues distillation from run21's student for a second epoch on the
+same clean pool, keeping its fitted neck (63,000 microbatches, about five
+hours on the Studio). run26 is stage 3 from run25 on the same rows as run23,
+with hard labels.
+
+The distilled students, read through gliner2.5-base's heads before stage 3:
+
+| Mean | run21 (one epoch) | run25 (two epochs) |
+| --- | --- | --- |
+| In-domain classification | 0.655 | 0.683 |
+| Held-out classification | 0.372 | 0.391 |
+| In-domain NER | 0.503 | 0.536 |
+| Held-out NER | 0.520 | 0.532 |
+
+Ten of the twelve datasets improve; SST-5 (0.410 → 0.390) and MIT movie
+(0.473 → 0.465) slip within noise.
+
+After stage 3:
+
+| Mean | run23 (from run21) | run26 (from run25) |
+| --- | --- | --- |
+| In-domain classification | 0.654 | 0.663 |
+| Held-out classification | 0.385 | 0.415 |
+| In-domain NER | 0.644 | 0.645 |
+| Held-out NER | 0.625 | 0.626 |
+
+Most of the held-out gain is typed decisions (0.262 → 0.329) and CLINC150
+(0.476 → 0.498). NER is unchanged after stage 3. antenna-0 now carries run25
+as `student/` and run26 as `gliner/`. The decision head (dec7) stays on
+run21's trunk.
 
 ## Embedding: a head on the frozen trunk
 
