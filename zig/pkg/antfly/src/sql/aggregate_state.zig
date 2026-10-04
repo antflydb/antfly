@@ -200,6 +200,73 @@ pub const Column = struct {
         try state.update(value);
         self.set(index, state);
     }
+    /// Dispatch once per aggregate vector. Each group's lane order remains
+    /// stable, including compensated floating reductions in the fallback.
+    pub fn updateBatch(self: *Column, a: A, ids: []const usize, values: []const Datum) !void {
+        if (ids.len != values.len) return error.InvalidSqlBackendResponse;
+        switch (self.values) {
+            .counts => |*counts| for (ids, values) |id, value| {
+                if (value.sql_null) continue;
+                counts.items[id] = std.math.add(u64, counts.items[id], 1) catch return error.SqlNumericOutOfRange;
+                if (counts.items[id] > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+            },
+            .integers => |*integers| {
+                if (self.spec.kind != .sum) {
+                    for (ids, values) |id, value| try self.update(a, id, value);
+                    return;
+                }
+                for (values) |value| if (!value.sql_null and value.value != .integer) {
+                    for (ids, values) |id, cell| try self.update(a, id, cell);
+                    return;
+                };
+                for (ids, values) |id, value| {
+                    if (value.sql_null) continue;
+                    const state = &integers.items[id];
+                    state.sum = std.math.add(i128, state.sum, value.value.integer) catch return error.SqlNumericOutOfRange;
+                    state.count = std.math.add(u64, state.count, 1) catch return error.SqlNumericOutOfRange;
+                    if (state.count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+                }
+            },
+            .booleans => |*booleans| {
+                if (self.spec.kind != .bool_and and self.spec.kind != .bool_or) {
+                    for (ids, values) |id, value| try self.update(a, id, value);
+                    return;
+                }
+                for (values) |value| if (!value.sql_null and value.value != .bool) return error.SqlTypeMismatch;
+                for (ids, values) |id, value| {
+                    if (value.sql_null) continue;
+                    const state = &booleans.items[id];
+                    state.value = if (self.spec.kind == .bool_and) state.value and value.value.bool else state.value or value.value.bool;
+                    state.count = std.math.add(u64, state.count, 1) catch return error.SqlNumericOutOfRange;
+                    if (state.count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+                }
+            },
+            else => for (ids, values) |id, value| try self.update(a, id, value),
+        }
+    }
+    pub fn mergeExact(self: *Column, index: usize, state: operators.Aggregate) !void {
+        switch (self.values) {
+            .counts => |*values| {
+                values.items[index] = std.math.add(u64, values.items[index], state.count) catch return error.SqlNumericOutOfRange;
+                if (values.items[index] > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+            },
+            .integers => |*values| {
+                if (self.spec.kind != .sum) return error.InvalidSqlBackendResponse;
+                const target = &values.items[index];
+                target.sum = std.math.add(i128, target.sum, state.integer_sum) catch return error.SqlNumericOutOfRange;
+                target.count = std.math.add(u64, target.count, state.count) catch return error.SqlNumericOutOfRange;
+                if (target.count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+            },
+            .booleans => |*values| {
+                if (self.spec.kind != .bool_and and self.spec.kind != .bool_or) return error.InvalidSqlBackendResponse;
+                const target = &values.items[index];
+                target.value = if (self.spec.kind == .bool_and) target.value and state.boolean else target.value or state.boolean;
+                target.count = std.math.add(u64, target.count, state.count) catch return error.SqlNumericOutOfRange;
+                if (target.count > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+            },
+            else => return error.InvalidSqlBackendResponse,
+        }
+    }
     pub fn finish(self: *const Column, index: usize) !Datum {
         if (self.values == .dynamic) return self.values.dynamic.items[index].finish();
         if (self.spec.kind == .min or self.spec.kind == .max) return switch (self.values) {

@@ -126,7 +126,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
     }
-    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .close = Owner.close };
+    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .close = Owner.close };
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {
@@ -198,6 +198,7 @@ const Owner = struct {
     conditions: []const catalog.Condition,
     context: operation.RequestContext,
     source: ?*serving.ServingSource = null,
+    partition_source: ?*serving.ServingSource = null,
     after: ?[]const u8 = null,
     before: ?[]const u8 = null,
     primary_key: ?[]const u8 = null,
@@ -369,9 +370,41 @@ const Owner = struct {
         _ = self;
         return .{ .rows = output, .owned_arena = arena, .after = page.after };
     }
+    fn splitScan(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        if (self.started or self.dynamic != null or self.stream.partition_count != 1) return null;
+        const count = try self.stream.partitionCount(maximum);
+        if (count < 2) return null;
+        const cursors = try a.alloc(catalog.Cursor, count);
+        errdefer a.free(cursors);
+        var opened: usize = 0;
+        errdefer for (cursors[0..opened]) |cursor| cursor.close(cursor.ptr);
+        for (cursors, 0..) |*cursor, index| {
+            const source = try a.create(serving.ServingSource);
+            errdefer a.destroy(source);
+            source.* = self.stream.source.*;
+            const parent_reader = source.scanner.shared_reader.?;
+            const reader = try a.create(@import("../serverless/query/lake_serving_cache.zig").Reader);
+            errdefer a.destroy(reader);
+            reader.* = .{ .cache = parent_reader.cache, .base = parent_reader.base, .scope = parent_reader.scope, .context = parent_reader.context };
+            source.scanner.shared_reader = reader;
+            cursor.* = try openPinned(a, self.table, .{ .fields = self.stream.columns, .conditions = self.conditions, .after = self.after, .before = self.before, .primary_key = self.primary_key, .limit = 1024 }, self.context, source);
+            const child: *Owner = @ptrCast(@alignCast(cursor.ptr));
+            child.partition_source = source;
+            child.stream.partition_index = index;
+            child.stream.partition_count = count;
+            opened += 1;
+        }
+        self.started = true;
+        return cursors;
+    }
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
         self.stream.deinit();
+        if (self.partition_source) |source| {
+            self.alloc.destroy(source.scanner.shared_reader.?);
+            self.alloc.destroy(source);
+        }
         if (self.source) |source| {
             source.deinit();
             self.alloc.destroy(source);
@@ -905,4 +938,119 @@ test "lake SQL dynamic scan filters prune groups before decoding and filter sele
     try std.testing.expectEqual(@as(usize, 0), empty.rows.len);
     try std.testing.expectEqual(@as(usize, 3), owner.stream.stats.groups_pruned);
     try std.testing.expectEqual(@as(usize, 0), owner.stream.stats.groups_decoded);
+}
+
+test "lake SQL review evolved nullable equality column absent from older data" {
+    const a = std.testing.allocator;
+    const parquet = @import("../serverless/query/lake_parquet_rowgroup.zig");
+    const iceberg = @import("../serverless/query/lake_iceberg_snapshot.zig");
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 1, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    lake.inventory.format = .iceberg;
+    lake.inventory.files[0].row_count = 3;
+    lake.inventory.files[0].data_sequence_number = 1;
+    lake.inventory.files[0].partition_spec_id = 0;
+    lake.source.inventory = lake.inventory;
+    lake.table.external_base_source.?.binding.format = .iceberg;
+    var selected = try @import("../serverless/query/lake_schema.zig").icebergSchema(a, "{\"current-schema-id\":8,\"schemas\":[{\"schema-id\":8,\"fields\":[{\"id\":1,\"name\":\"amount\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"added\",\"required\":false,\"type\":\"long\"}]}]}", null);
+    defer selected.deinit();
+    lake.source.iceberg_schema = selected;
+    lake.table.columns = &.{ .{ .name = "amount", .path = "amount", .type = .integer, .nullable = false }, .{ .name = "added", .path = "added", .type = .integer } };
+    const bytes = try parquet.buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "added", .field_id = 2, .values = &.{2} }});
+    defer a.free(bytes);
+    var client = lake.memory.client();
+    var put = try client.putObject("bucket", "deletes/equal.parquet", bytes, .{});
+    defer put.deinit(a);
+    var plan: iceberg.IcebergDeletePlan = .{ .files = try a.alloc(iceberg.IcebergDeleteFile, 1) };
+    defer plan.deinit(a);
+    plan.files[0] = .{ .content = .equality_deletes, .file_path = try a.dupe(u8, "s3://bucket/deletes/equal.parquet"), .file_format = try a.dupe(u8, "PARQUET"), .snapshot_id = 12, .data_sequence_number = 2, .file_sequence_number = 3, .record_count = 1, .file_size_in_bytes = bytes.len, .equality_ids = try a.dupe(i32, &.{2}), .equality_columns = try a.alloc([]u8, 1) };
+    plan.files[0].equality_columns[0] = try a.dupe(u8, "added");
+    lake.source.scanner.iceberg_delete_plan = plan;
+    const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 8 }, .{}, &lake.source);
+    defer cursor.close(cursor.ptr);
+    const page = try cursor.next(cursor.ptr, a, 8);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 3), page.rows.len);
+}
+
+test "lake SQL ordered partitions and exact parallel reducers match serial groups" {
+    const a = std.testing.allocator;
+    const Cache = @import("../serverless/query/lake_serving_cache.zig").Cache;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    var values: [2048]i64 = undefined;
+    for (&values, 0..) |*value, index| value.* = @intCast(index);
+    try lake.populate(a, 4, &values);
+    defer lake.deinit(a);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1024 }, .{}, &lake.source);
+    defer parent.close(parent.ptr);
+    const parts = (try parent.split_scan.?(parent.ptr, a, 4)).?;
+    defer a.free(parts);
+    defer for (parts) |part| part.close(part.ptr);
+    try std.testing.expectEqual(@as(usize, 4), parts.len);
+    for (parts) |part| {
+        var count: usize = 0;
+        while (true) {
+            var arena = std.heap.ArenaAllocator.init(a);
+            defer arena.deinit();
+            const page = try part.next_columns.?(part.ptr, arena.allocator(), 1024);
+            count += page.selection.len;
+            if (page.after == null) break;
+        }
+        try std.testing.expectEqual(values.len, count);
+    }
+    const Backend = struct {
+        lake: *TestLake,
+        fn resolve(raw: *anyopaque, _: Allocator, _: @import("../sql/ast.zig").Name, _: catalog.Action) !catalog.Table {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.lake.table;
+        }
+        fn scan(_: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !catalog.Page {
+            return error.UnexpectedStatelessScan;
+        }
+        fn openScan(raw: *anyopaque, alloc: Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return try openPinned(alloc, table, request, .{}, &self.lake.source);
+        }
+        fn mutate(_: *anyopaque, _: Allocator, _: catalog.Table, _: []const catalog.Mutation) !catalog.MutationOutcome {
+            return error.UnexpectedMutation;
+        }
+        fn checkpoint(_: *anyopaque) !void {}
+        fn backend(self: *@This()) catalog.Backend {
+            return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .open_scan = openScan, .mutate = mutate, .checkpoint = checkpoint } };
+        }
+    };
+    var fixture: Backend = .{ .lake = &lake };
+    const compiler = @import("../sql/compiler.zig");
+    const runtime = @import("../sql/runtime.zig");
+    for ([_][]const u8{
+        "SELECT amount % 7 AS bucket, SUM(amount) AS total, COUNT(*) AS n FROM events GROUP BY amount % 7 ORDER BY bucket",
+        "SELECT SUM(amount), COUNT(*) FROM events",
+        "SELECT amount % 7 AS bucket, COUNT(*) AS n FROM events GROUP BY amount % 7 LIMIT 3",
+    }) |sql| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var serial = try runtime.execute(a, fixture.backend(), &compiled, &.{}, .{});
+        defer serial.deinit();
+        var backend = fixture.backend();
+        backend.execution_io = std.testing.io;
+        var parallel = try runtime.execute(a, backend, &compiled, &.{}, .{});
+        defer parallel.deinit();
+        try std.testing.expectEqualDeep(serial.output.rows, parallel.output.rows);
+        try std.testing.expectEqualDeep(serial.output.sql_nulls, parallel.output.sql_nulls);
+    }
+    // A high-cardinality local reducer can exceed its shard. The pinned
+    // parent must remain readable for the serial spilling fallback.
+    var high = try compiler.compile(a, "SELECT amount, SUM(amount) FROM events GROUP BY amount ORDER BY amount LIMIT 3", .{});
+    defer high.deinit();
+    var backend = fixture.backend();
+    backend.execution_io = std.testing.io;
+    var small = try runtime.execute(a, backend, &high, &.{}, .{ .retained_bytes = 1024 * 1024 });
+    defer small.deinit();
+    try std.testing.expectEqual(@as(usize, 3), small.output.rows.len);
+    try std.testing.expectEqualStrings("0", small.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("8", small.output.rows[2][1].string);
 }

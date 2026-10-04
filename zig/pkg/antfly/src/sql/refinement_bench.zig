@@ -239,6 +239,36 @@ fn typedState(count: usize) !void {
     try std.testing.expectEqual(@as(usize, 0), budget.live);
 }
 
+fn groupedColumns(batched: bool, count: usize) !struct { ns: i96, checksum: i64, peak: usize } {
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .bool_or } };
+    const groups = try operators.Grouped.create(std.testing.allocator, &specs, .{});
+    defer groups.deinit();
+    var keys: [1024]Datum = undefined;
+    var counts: [1024]Datum = undefined;
+    var sums: [1024]Datum = undefined;
+    var booleans: [1024]Datum = undefined;
+    for (&keys, &counts, &sums, &booleans, 0..) |*key, *count_, *sum, *boolean, index| {
+        key.* = Datum.json(.{ .integer = @intCast(index % 64) });
+        count_.* = Datum.json(.{ .integer = 1 });
+        sum.* = if (index % 17 == 0) .{} else Datum.json(.{ .integer = @intCast(index % 7) });
+        boolean.* = Datum.json(.{ .bool = index % 3 == 0 });
+    }
+    const started = now();
+    for (0..count / keys.len) |_| {
+        if (batched) try groups.addColumns(&.{&keys}, &.{ &counts, &sums, &booleans }, keys.len) else for (keys, counts, sums, booleans) |key, count_, sum, boolean| try groups.add(&.{key}, &.{ count_, sum, boolean });
+    }
+    const elapsed = now() - started;
+    var checksum: i64 = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for (0..groups.groupCount()) |index| {
+        _ = arena.reset(.free_all);
+        const result = try groups.resultAt(arena.allocator(), index);
+        checksum += result.aggregates[0].value.integer + result.aggregates[1].value.integer + @as(i64, @intFromBool(result.aggregates[2].value.bool));
+    }
+    return .{ .ns = elapsed, .checksum = checksum, .peak = groups.budget.peak };
+}
+
 test "native refinements benchmark" {
     for ([_]usize{ 8192, 32768 }) |count| try typedState(count);
     const a = std.testing.allocator;
@@ -271,6 +301,14 @@ test "native refinements benchmark" {
         const batch_group = if (sample % 2 == 0) second_group else first_group;
         try std.testing.expectEqual(scalar_group.sum, batch_group.sum);
         std.debug.print("native_refinement {{\"case\":\"global_aggregate\",\"rows\":{d},\"sample\":{d},\"scalar_ns\":{d},\"batch_ns\":{d},\"scalar_probes\":{d},\"batch_probes\":{d},\"scalar_peak_bytes\":{d},\"batch_peak_bytes\":{d}}}\n", .{ count, sample, scalar_group.ns, batch_group.ns, scalar_group.probes, batch_group.probes, scalar_group.peak, batch_group.peak });
+    };
+    for ([_]usize{ 262144, 1048576 }) |count| for (0..3) |sample| {
+        const first = try groupedColumns(sample % 2 != 0, count);
+        const second = try groupedColumns(sample % 2 == 0, count);
+        const baseline = if (sample % 2 == 0) first else second;
+        const refined = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(baseline.checksum, refined.checksum);
+        std.debug.print("native_refinement {{\"case\":\"grouped_columns\",\"rows\":{d},\"sample\":{d},\"scalar_ns\":{d},\"batch_ns\":{d},\"scalar_peak_bytes\":{d},\"batch_peak_bytes\":{d}}}\n", .{ count, sample, baseline.ns, refined.ns, baseline.peak, refined.peak });
     };
     for ([_]usize{ 512, 4096 }) |count| for (0..3) |sample| {
         const first_window = try windows(sample % 2 != 0, count);

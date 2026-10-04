@@ -219,6 +219,12 @@ pub const Context = struct {
             return null;
         }
 
+        pub fn partitions(self: *ScanState, context: Context, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan, maximum: usize) !?[]catalog.Cursor {
+            try self.open(context, table, request);
+            if (self.cursor) |cursor| if (cursor.split_scan) |split| return try split(cursor.ptr, alloc, maximum);
+            return null;
+        }
+
         pub fn retained(self: ScanState, context: Context) bool {
             return self.cursor != null or context.backend.pinned_statement_snapshot;
         }
@@ -3238,4 +3244,18 @@ test "SQL joins consume native column batches without invoking the JSON cursor" 
     try std.testing.expectEqualStrings("1180416", result.output.rows[0][1].string);
     try std.testing.expectEqual(@as(usize, 0), fixture.pages);
     try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
+}
+
+test "SQL batched join defers probe expression errors beyond a satisfied limit" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{ .row_count = 3 };
+    var compiled = try compiler.compile(a, "SELECT a._id FROM things a JOIN things b ON (1 / (1 - CAST(a._id AS BIGINT))) = CAST(b._id AS BIGINT) LIMIT 1", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("0", result.output.rows[0][0].string);
+    var all = try compiler.compile(a, "SELECT a._id FROM things a JOIN things b ON (1 / (1 - CAST(a._id AS BIGINT))) = CAST(b._id AS BIGINT)", .{});
+    defer all.deinit();
+    try std.testing.expectError(error.SqlDivisionByZero, execute(a, fixture.coordinated(), &all, &.{}, .{ .page_rows = 1 }));
 }

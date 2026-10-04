@@ -73,10 +73,52 @@ const ColumnInput = struct {
     page: @import("catalog.zig").ColumnPage,
     columns: []const scalar.Column,
     count: usize,
+    fn fillColumn(self: ColumnInput, a: std.mem.Allocator, ordinal: u32, output: []Datum) !void {
+        if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
+        const definition = self.columns[ordinal];
+        const column = self.page.batch.findColumn(definition.name) orelse {
+            for (output, 0..) |*value, index| value.* = try self.cell(a, index, ordinal);
+            return;
+        };
+        if (column.values == .dictionary_bytes) {
+            const dictionary = column.values.dictionary_bytes;
+            const normalized = try a.alloc(?Datum, dictionary.values.len);
+            defer a.free(normalized);
+            @memset(normalized, null);
+            for (self.page.selection, output) |index, *value| {
+                if (index >= self.page.batch.rowCount()) return error.InvalidSqlBackendResponse;
+                if (column.nulls.isNull(index)) {
+                    value.* = .{};
+                    continue;
+                }
+                const id = dictionary.indices[index];
+                if (id >= normalized.len) return error.InvalidSqlBackendResponse;
+                if (normalized[id] == null) normalized[id] = Datum.json(try @import("describe.zig").coerceAlloc(a, .{ .string = dictionary.values[id] }, definition.type));
+                value.* = normalized[id].?;
+            }
+            return;
+        }
+        for (self.page.selection, output) |index, *value| {
+            if (index >= self.page.batch.rowCount()) return error.InvalidSqlBackendResponse;
+            if (column.nulls.isNull(index)) {
+                value.* = .{};
+                continue;
+            }
+            const raw: std.json.Value = switch (column.values) {
+                .i64 => |values| .{ .integer = values[index] },
+                .f64 => |values| .{ .float = values[index] },
+                .bool => |values| .{ .bool = values[index] },
+                .bytes => |values| .{ .string = values[index] },
+                .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, a, values[index], .{ .parse_numbers = false }),
+                else => return error.UnsupportedSqlExecution,
+            };
+            value.* = Datum.json(try @import("describe.zig").coerceAlloc(a, raw, definition.type));
+        }
+    }
     fn cell(self: ColumnInput, a: std.mem.Allocator, index: usize, ordinal: u32) !Datum {
         if (ordinal >= self.columns.len) return error.InvalidSqlBackendResponse;
         const value = try self.page.cell(a, index, self.columns[ordinal].name);
-        return .{ .value = value.value, .sql_null = value.sql_null };
+        return .{ .value = try @import("describe.zig").coerceAlloc(a, value.value, self.columns[ordinal].type), .sql_null = value.sql_null };
     }
 };
 fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: anytype, parameters: []const std.json.Value) !?[]const Datum {
@@ -90,12 +132,12 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
         },
         .column => |ordinal| {
             if (instruction.type.kind != .integer and instruction.type.kind != .number and instruction.type.kind != .boolean and instruction.type.kind != .string) return null;
-            for (0..inputs.count) |index| {
+            if (comptime !@hasDecl(@TypeOf(inputs), "fillColumn")) for (0..inputs.count) |index| {
                 switch ((try inputs.cell(a, index, ordinal)).value) {
                     .null, .bool, .integer, .float, .string => {},
                     else => return null,
                 }
-            }
+            };
         },
         .parameter => if (instruction.type.kind != .integer and instruction.type.kind != .number and instruction.type.kind != .boolean and instruction.type.kind != .string) return null,
         .unary => {},
@@ -144,8 +186,12 @@ fn evaluateInput(a: std.mem.Allocator, program: *const scalar.Program, inputs: a
         switch (instruction.operation) {
             .literal => |v| @memset(target, Datum.fromJson(v)),
             .parameter => @memset(target, try program.evaluateInstruction(a, @intCast(index), parameters)),
-            .column => |ordinal| for (target, 0..) |*out, row_index| {
-                out.* = try inputs.cell(a, row_index, ordinal);
+            .column => |ordinal| {
+                if (comptime @hasDecl(@TypeOf(inputs), "fillColumn")) try inputs.fillColumn(a, ordinal, target) else {
+                    for (target, 0..) |*out, row_index| {
+                        out.* = try inputs.cell(a, row_index, ordinal);
+                    }
+                }
             },
             .unary => |u| {
                 if (u.operand >= index) return error.InvalidSqlBackendResponse;
@@ -366,6 +412,24 @@ test "SQL vector kernels match scalar exact integers nulls arithmetic and lazy f
     try std.testing.expectEqual(@as(i64, 7), (try program.evaluate(alloc, &.{}, &.{}, .{})).value.integer);
 }
 
+test "SQL review column kernels honor declared integer coercion" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + 1", .{});
+    defer compiled.deinit();
+    const columns = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    var program = try scalar.bind(a, compiled.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "r" }}, .columns = &.{.{ .name = "n", .values = .{ .bytes = &.{"41"} } }} }, .selection = &.{0} };
+    const raw = try page.cell(arena.allocator(), 0, "n");
+    const coerced = try @import("describe.zig").coerceAlloc(arena.allocator(), raw.value, .integer);
+    const expected = try program.evaluate(arena.allocator(), &.{Datum.json(coerced)}, &.{}, .{});
+    try std.testing.expectEqual(@as(i64, 42), expected.value.integer);
+    const actual = (try evaluateColumns(arena.allocator(), &program, page, &columns, &.{})).?;
+    try std.testing.expectEqualDeep(expected, actual[0]);
+}
+
 test "SQL vector arithmetic preserves scalar overflow and mixed numeric semantics" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -485,4 +549,19 @@ test "SQL shared scheduled column kernels match scalar values over permuted null
         const expected = try program.evaluate(a, &.{source}, &.{}, .{});
         try std.testing.expectEqualDeep(expected, actual);
     }
+}
+
+test "SQL dictionary kernels normalize selected values once and preserve missing nulls" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "n + 1", .{});
+    defer compiled.deinit();
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+    defer program.deinit();
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{ .{ .relational_key = "a" }, .{ .relational_key = "b" }, .{ .relational_key = "c" } }, .columns = &.{.{ .name = "n", .nulls = .{ .bytes = &.{ 0, 0, 1 } }, .values = .{ .dictionary_bytes = .{ .values = &.{ "41", "invalid-unselected" }, .indices = &.{ 0, 0, 0 } } } }} }, .selection = &.{ 2, 1, 0 } };
+    const values = (try evaluateColumns(a, &program, page, &definitions, &.{})).?;
+    defer a.free(values);
+    try std.testing.expect(values[0].sql_null);
+    try std.testing.expectEqual(@as(i64, 42), values[1].value.integer);
+    try std.testing.expectEqual(@as(i64, 42), values[2].value.integer);
 }

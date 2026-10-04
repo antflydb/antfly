@@ -79,6 +79,22 @@ pub const ColumnKind = enum(u8) {
     f64 = 4,
     bool = 5,
     vector_f32 = 6,
+    dictionary_bytes = 7,
+};
+
+/// Compact native scan values. IDs are page-local; semantic consumers compare
+/// values, never IDs from different dictionaries. Ownership follows the batch.
+pub const DictionaryBytes = struct {
+    values: []const []const u8,
+    indices: []const u32,
+    pub fn at(self: DictionaryBytes, row: usize) []const u8 {
+        return self.values[self.indices[row]];
+    }
+    pub fn deinit(self: DictionaryBytes, a: Allocator) void {
+        for (self.values) |value| a.free(value);
+        a.free(self.values);
+        a.free(self.indices);
+    }
 };
 
 pub const ColumnValues = union(ColumnKind) {
@@ -88,6 +104,7 @@ pub const ColumnValues = union(ColumnKind) {
     f64: []const f64,
     bool: []const bool,
     vector_f32: []const []const f32,
+    dictionary_bytes: DictionaryBytes,
 };
 
 pub const NullBitmap = struct {
@@ -111,6 +128,7 @@ pub const ColumnVector = struct {
     pub fn rowCount(self: ColumnVector) usize {
         return switch (self.values) {
             .bytes => |values| values.len,
+            .dictionary_bytes => |values| values.indices.len,
             .json => |values| values.len,
             .i64 => |values| values.len,
             .f64 => |values| values.len,
@@ -131,6 +149,10 @@ pub const ColumnBatch = struct {
 
     pub fn validate(self: ColumnBatch) !void {
         for (self.columns) |column| {
+            if (column.values == .dictionary_bytes) {
+                const dictionary = column.values.dictionary_bytes;
+                for (dictionary.indices, 0..) |id, index| if (!column.nulls.isNull(index) and id >= dictionary.values.len) return error.RowSourceDictionaryIndexOutOfBounds;
+            }
             if (column.rowCount() != self.row_refs.len) return error.RowSourceColumnLengthMismatch;
             if (column.nulls.bytes.len != 0 and column.nulls.bytes.len != self.row_refs.len) {
                 return error.RowSourceNullBitmapLengthMismatch;

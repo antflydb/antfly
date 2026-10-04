@@ -85,7 +85,9 @@ scratch memory as it scans, under a shared 64 MiB scan allocation budget and a
 
 Parquet cursors decode each column dictionary once and retain one decoded page
 per projected column, aligning page boundaries while preserving physical row
-ordinals. Prefetch targets exact next-page ranges and next-group header probes
+ordinals. Native SQL keeps byte dictionary indices through scan vectors and
+normalizes referenced dictionary entries once, using declared SQL coercion.
+Missing evolved optional fields also project NULL when matching equality deletes. Prefetch targets exact next-page ranges and next-group header probes
 so decoder reads reuse the versioned cache entries.
 The active page set retains the 32 MiB input/decoded budgets; oversized individual
 pages/dictionaries still fail. Iceberg file pruning uses spec/source field IDs
@@ -101,7 +103,15 @@ pattern sets use external DISTINCT and a reusable file, reading one pattern per 
 Sorted/grouped/window pgwire results can spool final rows and serve bounded portal
 pages without retaining the entire response or rescanning sources. HTTP JSON
 response limits and bounded materialization for blocking external decision
-projections remain. These layers use the same native snapshot-bound providers.
+projections remain. These layers use the same native snapshot-bound providers. Execution batches
+remain independent of delivery page sizes. Eligible exact aggregates use up to
+four contiguous pinned file or row-group partitions, private worker readers and
+local typed states merged in source order. Floating-point, DISTINCT and pattern
+reductions retain ordered execution; exhausted local memory retries through the
+pinned serial spilling scan. Shared scheduling bounds all workers and releases
+speculative warming admission on completion. Sequential sort/join/group spills
+use typed, checksummed column blocks where multiple rows fit, compact records
+for wide rows, and optional Snappy compression.
 
 ## Relationship To Arrow, Parquet, Iceberg, And Lance
 

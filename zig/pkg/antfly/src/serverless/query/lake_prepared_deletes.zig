@@ -16,7 +16,10 @@ pub const Prepared = struct {
     equality: []Equality,
     positions: std.AutoHashMapUnmanaged(Position, void) = .empty,
     columns: []const []const u8,
+    files: std.StringHashMapUnmanaged(FileIndex) = .empty,
     decoded_pages: usize = 0,
+    mutex: std.atomic.Mutex = .unlocked,
+    const FileIndex = struct { index: usize, equality: []const usize = &.{}, prefixes: ?[]const u64 = null };
     const Equality = struct { file: usize, keys: std.StringHashMapUnmanaged(void) = .empty };
     const Position = struct { file: usize, ordinal: u64 };
     pub fn create(a: A, request: iceberg.DeleteRowRefsReadRequest) !*Prepared {
@@ -80,27 +83,56 @@ pub const Prepared = struct {
         }
         self.equality = equalities.items;
         self.columns = columns.items;
+        for (request.data_inventory.files, 0..) |file, index| {
+            var applicable: std.ArrayList(usize) = .empty;
+            for (self.equality, 0..) |entry, equality_index| {
+                if (try iceberg.equalityDeleteAppliesToFile(file, request.delete_plan.files[entry.file])) try applicable.append(owned, equality_index);
+            }
+            try self.files.put(owned, file.file_id, .{ .index = index, .equality = applicable.items });
+        }
         return self;
     }
     pub fn destroy(self: *Prepared, a: A) void {
         self.arena.deinit();
         a.destroy(self);
     }
-    pub fn matches(self: *const Prepared, a: A, file: @import("../external_source/types.zig").FileEntry, batch: types.ColumnBatch, index: usize) !bool {
+    pub fn matches(self: *Prepared, a: A, file: @import("../external_source/types.zig").FileEntry, batch: types.ColumnBatch, index: usize) !bool {
         const ref = batch.row_refs[index];
-        const data_index = for (self.request.data_inventory.files, 0..) |candidate, i| {
-            if (std.mem.eql(u8, candidate.file_id, file.file_id)) break i;
-        } else return error.ExternalSourceFileNotFound;
-        var ordinal = ref.external.row_ordinal;
-        for (file.row_groups[0..ref.external.row_group_ordinal]) |group| ordinal += group.row_count;
-        if (self.positions.contains(.{ .file = data_index, .ordinal = ordinal })) return true;
-        for (self.equality) |equality| {
+        const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
+        if (self.positions.count() != 0) {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            const prefixes = self.positionPrefixes(info, file) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            self.mutex.unlock();
+            const ordinal = try std.math.add(u64, ref.external.row_ordinal, prefixes[ref.external.row_group_ordinal]);
+            if (self.positions.contains(.{ .file = info.index, .ordinal = ordinal })) return true;
+        }
+        for (info.equality) |equality_index| {
+            const equality = self.equality[equality_index];
             const delete_file = self.request.delete_plan.files[equality.file];
-            if (!try iceberg.equalityDeleteAppliesToRowRef(self.request.data_inventory, delete_file, ref)) continue;
-            const key = try deletes.equalityKeyFromBatchRowAlloc(a, batch, index, delete_file.equality_columns);
+            const key = try deletes.projectedEqualityKeyFromBatchRowAlloc(a, batch, index, delete_file.equality_columns);
             defer a.free(key);
             if (equality.keys.contains(key)) return true;
         }
         return false;
+    }
+    pub fn bindFile(self: *Prepared, file: @import("../external_source/types.zig").FileEntry) !void {
+        if (self.positions.count() == 0) return;
+        const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
+        _ = try self.positionPrefixes(info, file);
+    }
+    fn positionPrefixes(self: *Prepared, info: *FileIndex, file: @import("../external_source/types.zig").FileEntry) ![]const u64 {
+        if (info.prefixes == null) {
+            const prefixes = try self.arena.allocator().alloc(u64, file.row_groups.len);
+            var total: u64 = 0;
+            for (file.row_groups, prefixes) |group, *prefix| {
+                prefix.* = total;
+                total = try std.math.add(u64, total, group.row_count);
+            }
+            info.prefixes = prefixes;
+        }
+        return info.prefixes.?;
     }
 };

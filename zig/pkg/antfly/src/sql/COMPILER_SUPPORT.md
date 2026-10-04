@@ -228,9 +228,12 @@ OFFSET+LIMIT rows (plus one overflow witness without an explicit LIMIT), owns
 only competitive rows, and preserves stable tie ordering. Primary-key ascending
 order and simple COUNT retain their native fast paths.
 
-Lake execution requests up to 1,024 typed rows independently of the 256-row
-delivery page. Joins consume native column pages without a JSON row cursor;
-global COUNT, integer SUM and boolean reductions consume contiguous vectors.
+Lake execution requests up to 1,024 typed rows independently of delivery page
+size. Projected batches remain pending across bounded delivery pages. Joins
+batch key expression evaluation and probe admission, while preserving input
+order and delaying later-lane errors until consumed. Grouped reductions resolve
+group IDs once per batch and update state by aggregate column; global COUNT,
+integer SUM and boolean reductions consume contiguous vectors.
 Retained join/group strings and exact decimals use adaptive dictionaries,
 switching to flat owned references for high-cardinality inputs.
 
@@ -242,9 +245,26 @@ Parsed footers and decoded vectors use immutable, version/credential-scoped
 cache leases with bounded eviction. Duplicate range reads share one in-flight
 request; next-group evidence and next-file metadata use shared bounded
 scheduling and join before cursor teardown. Iceberg delete indexes are prepared
-once per pinned source and applied directly to column batches.
+once per pinned source and applied directly to column batches. Missing evolved
+optional equality-delete fields use SQL NULL; malformed delete files still fail.
+Native byte dictionaries retain compact indices through scanning and normalize
+only referenced dictionary values once per expression input. Declared SQL types
+use the same coercion rules as scalar evaluation.
+
+Eligible COUNT, integer SUM and boolean reductions split pinned lake scans into
+up to four contiguous file or row-group partitions. Workers own private readers
+and bounded local state; deterministic exact merging preserves first-occurrence
+group order. Memory pressure falls back to the original pinned serial spilling
+scan. Floating-point, DISTINCT and pattern reductions keep ordered execution.
+All workers share process-wide scheduling admission. Speculative next-group
+warming reserves 4 MiB and releases admission at completion, independently of
+its cursor-owned join handle.
 
 Sort spill uses bounded eight-way merging and releases sealed write buffers.
+Sequential sort, join and group runs pack homogeneous columns, null flags and
+ordinals into checksummed blocks, with optional Snappy compression. Wide rows
+and singleton blocks use compact record framing without additional staging
+copies. Random-access chains retain individually framed records.
 Exact COUNT, integer SUM and boolean aggregates partition updates into bounded
 typed reducers; oversized partitions use sorted partial merging. Floating-point,
 distinct and pattern aggregates preserve their ordered merge paths. A final
@@ -252,8 +272,9 @@ ORDER BY reuses a window sort when its complete physical key and null ordering
 match, preserving original-row tie order and expression errors.
 
 The deterministic spill tests compare identical inputs and memory budgets:
-eight-way sorting writes 1,855,824 bytes versus 3,952,320 for binary merging;
-partitioned aggregation writes 671,744 bytes versus 3,797,502 for sorted updates.
+eight-way sorting and partitioned aggregation both write fewer bytes than their
+binary-merge and sorted-update counterparts. Current measurements are recorded
+in `bench/baselines/native-lake-batch-block-refinements.json`.
 These measure temporary I/O, not overall query speed. The independent PyArrow
 end-to-end test covers compressed indexed pages, dictionary/plain encodings,
 nulls, SQL joins/groups/windows, HTTP, pgwire streaming and cold restart.

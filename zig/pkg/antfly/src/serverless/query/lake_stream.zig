@@ -57,6 +57,8 @@ pub const Stream = struct {
     stats: Stats = .{},
     files: []usize,
     file_index: usize = 0,
+    partition_index: usize = 0,
+    partition_count: usize = 1,
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
     group_index: usize = 0,
     current: ?parquet.OwnedBatch = null,
@@ -100,9 +102,9 @@ pub const Stream = struct {
         // by the same scheduler used by kernels, spill writes and prefetch.
         var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(std.heap.page_allocator, worker_reader.reader(), inventory, inventory.files[0].file_id, ordinal, names, .{
             .max_rows = self.limits.max_row_group_rows,
-            .max_input_bytes = self.limits.max_input_bytes,
-            .max_decoded_bytes = self.limits.max_decoded_bytes,
-            .max_struct_allocation_bytes = self.limits.max_decoded_bytes,
+            .max_input_bytes = @min(self.limits.max_input_bytes, 2 * 1024 * 1024),
+            .max_decoded_bytes = @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024),
+            .max_struct_allocation_bytes = @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024),
         });
         defer cursor.deinit();
         // Avoid recursively reserving scheduler slots from an admitted task.
@@ -114,7 +116,7 @@ pub const Stream = struct {
         try worker_reader.context.ensureActive();
     }
     fn startLookahead(self: *Stream) void {
-        if (self.identity_only) return;
+        if (self.identity_only or self.partition_count != 1) return;
         if (self.lookahead != null) return;
         const reader = self.source.scanner.shared_reader orelse return;
         const io = reader.context.io orelse return;
@@ -136,7 +138,7 @@ pub const Stream = struct {
         self.lookahead_names = stable_names;
         self.lookahead_required = stable_required;
         self.lookahead_cancelled.store(false, .release);
-        self.lookahead = @import("../../sql/parallel_scheduler.zig").global().submit(io, self.limits.max_input_bytes +| self.limits.max_decoded_bytes, warmGroup, .{ self, plan.inventory, ordinal, stable_names, stable_required });
+        self.lookahead = @import("../../sql/parallel_scheduler.zig").global().submitTransient(io, @min(self.limits.max_input_bytes, 2 * 1024 * 1024) +| @min(self.limits.max_decoded_bytes, 2 * 1024 * 1024), warmGroup, .{ self, plan.inventory, ordinal, stable_names, stable_required });
         if (self.lookahead != null) self.lookahead_started += 1 else self.freeLookaheadDescriptors();
     }
     fn freeLookaheadDescriptors(self: *Stream) void {
@@ -224,6 +226,24 @@ pub const Stream = struct {
         }.less);
         return .{ .alloc = alloc, .source = source, .columns = columns, .predicates = predicates, .context = context, .limits = limits, .files = files, .schema_contract = if (source.iceberg_schema) |schema| schema.columns else &.{} };
     }
+    pub fn partitionCount(self: *Stream, maximum: usize) !usize {
+        if (self.files.len == 0 or maximum < 2 or self.source.scanner.shared_reader == null) return 1;
+        // Resolve delete indexes on the coordinator, then share immutable
+        // membership sets. Footer preparation warms the shared parsed cache.
+        try self.loadFile(self.files[0]);
+        defer self.clearFile();
+        if (self.source.prepared_deletes) |prepared| if (prepared.positions.count() != 0) {
+            // Prefix storage belongs to the snapshot arena. Prepare it before
+            // workers start so it never allocates through a shared owner arena.
+            try prepared.bindFile(self.discovered.?.inventory.files[0]);
+            for (self.files[1..]) |index| {
+                self.clearFile();
+                try self.loadFile(index);
+                try prepared.bindFile(self.discovered.?.inventory.files[0]);
+            }
+        };
+        return @min(maximum, if (self.files.len == 1) self.discovered.?.row_group_plan.row_groups.len else self.files.len);
+    }
     pub fn deinit(self: *Stream) void {
         self.clearFile();
         self.alloc.free(self.files);
@@ -274,6 +294,7 @@ pub const Stream = struct {
                 while (self.group_index < plan.row_group_plan.row_groups.len) {
                     const input = plan.row_group_plan.row_groups[self.group_index];
                     self.group_index += 1;
+                    if (self.partition_count > 1 and self.files.len == 1 and (self.group_index - 1) * self.partition_count / plan.row_group_plan.row_groups.len != self.partition_index) continue;
                     const group = for (plan.inventory.files[0].row_groups) |candidate| {
                         if (candidate.ordinal == input.row_group_ordinal) break candidate;
                     } else return error.InvalidParquetRowGroupBatch;
@@ -331,6 +352,7 @@ pub const Stream = struct {
             if (self.file_index == self.files.len) return null;
             const index = self.files[self.file_index];
             self.file_index += 1;
+            if (self.partition_count > 1 and self.files.len > 1 and (self.file_index - 1) * self.partition_count / self.files.len != self.partition_index) continue;
             const file = self.source.inventory.files[index];
             if (!self.fileMatches(file)) {
                 self.stats.files_pruned += 1;
@@ -340,6 +362,7 @@ pub const Stream = struct {
         }
     }
     fn prefetchNext(self: *Stream) !void {
+        if (self.partition_count != 1) return;
         const reader = self.source.scanner.shared_reader orelse return;
         if (reader.context.io == null) return;
         try self.context.ensureActive();

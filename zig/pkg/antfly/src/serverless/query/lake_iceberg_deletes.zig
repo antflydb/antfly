@@ -215,19 +215,34 @@ pub fn equalityKeyFromBatchRowAlloc(
     row_idx: usize,
     equality_columns: []const []const u8,
 ) ![]u8 {
+    return equalityKeyFromBatchRow(alloc, batch, row_idx, equality_columns, false);
+}
+
+/// Data files are projected by field ID before delete matching. An absent
+/// optional field has the same NULL key as an explicitly null cell. Delete
+/// files still use the strict entry point so malformed delete schemas fail.
+pub fn projectedEqualityKeyFromBatchRowAlloc(alloc: Allocator, batch: rowsource.ColumnBatch, row_idx: usize, equality_columns: []const []const u8) ![]u8 {
+    return equalityKeyFromBatchRow(alloc, batch, row_idx, equality_columns, true);
+}
+fn equalityKeyFromBatchRow(alloc: Allocator, batch: rowsource.ColumnBatch, row_idx: usize, equality_columns: []const []const u8, missing_is_null: bool) ![]u8 {
     try validateEqualityColumns(equality_columns);
     try batch.validate();
     if (row_idx >= batch.rowCount()) return error.ExternalSourceRowOutOfBounds;
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     for (equality_columns) |column_name| {
-        const column = batch.findColumn(column_name) orelse return error.IcebergEqualityDeleteColumnNotFound;
+        const column = batch.findColumn(column_name) orelse {
+            if (!missing_is_null) return error.IcebergEqualityDeleteColumnNotFound;
+            try out.append(alloc, 0);
+            continue;
+        };
         if (column.nulls.isNull(row_idx)) {
             try out.append(alloc, 0);
             continue;
         }
         switch (column.values) {
             .bytes => |values| try appendBytesEqualityKeyPart(alloc, &out, values[row_idx]),
+            .dictionary_bytes => |values| try appendBytesEqualityKeyPart(alloc, &out, values.at(row_idx)),
             .json, .vector_f32 => return error.UnsupportedIcebergEqualityDeleteColumn,
             .i64 => |values| {
                 try out.append(alloc, 2);
@@ -728,4 +743,16 @@ fn testEqualityProjectedRowAlloc(
         .row_ref = .{ .relational_key = row_key },
         .cells = cells,
     };
+}
+
+test "external lake projected absent equality fields have explicit null keys" {
+    const a = std.testing.allocator;
+    const missing: rowsource.ColumnBatch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "r" }}, .columns = &.{} };
+    const explicit: rowsource.ColumnBatch = .{ .snapshot = missing.snapshot, .row_refs = missing.row_refs, .columns = &.{.{ .name = "added", .nulls = .{ .bytes = &.{1} }, .values = .{ .i64 = &.{0} } }} };
+    const left = try projectedEqualityKeyFromBatchRowAlloc(a, missing, 0, &.{"added"});
+    defer a.free(left);
+    const right = try equalityKeyFromBatchRowAlloc(a, explicit, 0, &.{"added"});
+    defer a.free(right);
+    try std.testing.expectEqualSlices(u8, right, left);
+    try std.testing.expectError(error.IcebergEqualityDeleteColumnNotFound, equalityKeyFromBatchRowAlloc(a, missing, 0, &.{"added"}));
 }

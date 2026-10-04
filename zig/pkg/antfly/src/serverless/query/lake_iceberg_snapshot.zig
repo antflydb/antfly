@@ -1024,6 +1024,10 @@ pub fn equalityDeleteAppliesToRowRef(
         else => return false,
     };
     const file = inventory.fileById(external.file_id) orelse return error.ExternalSourceFileNotFound;
+    return equalityDeleteAppliesToFile(file, delete_file);
+}
+
+pub fn equalityDeleteAppliesToFile(file: external_source.FileEntry, delete_file: IcebergDeleteFile) !bool {
     const data_sequence = file.data_sequence_number orelse try icebergDataSequenceFromFileVersion(file.version_id);
     if (data_sequence >= delete_file.data_sequence_number) return false;
     // An unpartitioned delete spec is global. Partitioned deletes must match
@@ -1050,6 +1054,7 @@ pub fn positionDeleteRowFromBatch(batch: rowsource.ColumnBatch, row_idx: usize) 
     if (path_column.nulls.isNull(row_idx) or position_column.nulls.isNull(row_idx)) return error.InvalidIcebergPositionDelete;
     const path = switch (path_column.values) {
         .bytes => |values| values[row_idx],
+        .dictionary_bytes => |values| values.at(row_idx),
         else => return error.UnsupportedIcebergPositionDeleteColumn,
     };
     const position = switch (position_column.values) {

@@ -29,7 +29,7 @@ pub const Grouped = struct {
     pending: ?operators.Row = null,
     output_count: usize = 0,
     partitioned: bool = false,
-    partitions: [8]?spill.File = @splat(null),
+    partitions: [8]?spill.Sequential = @splat(null),
     partition_index: usize = 0,
     local: ?*operators.Grouped = null,
     fallback: ?*Grouped = null,
@@ -96,7 +96,7 @@ pub const Grouped = struct {
         }
         const index = hash.final() % self.partitions.len;
         if (self.partitions[index] == null) {
-            self.partitions[index] = try self.sort.manager.create();
+            self.partitions[index] = try spill.Sequential.init(self.sort.manager, @min(4096, self.bytes / 128));
             self.partitions[index].?.buffer_bytes = 512;
         }
         _ = try self.partitions[index].?.append(row, spill.none);

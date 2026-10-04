@@ -33,6 +33,7 @@ pub const Cursor = struct {
         required: bool = true,
         directory: ?@import("lake_parquet_metadata.zig").PageDirectory = null,
         index_loaded: bool = false,
+        directory_index: usize = 0,
         pruned: bool = false,
         chunk: external.ColumnChunk,
         offset: u64,
@@ -96,9 +97,10 @@ pub const Cursor = struct {
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         while (column.offset < end) {
             if (column.directory) |directory| {
-                const indexed = for (directory.pages) |candidate| {
-                    if (candidate.offset == column.offset) break candidate;
-                } else null;
+                // Offsets advance monotonically, including skipped pages. Walk each
+                // directory entry once instead of searching from its beginning.
+                while (column.directory_index < directory.pages.len and directory.pages[column.directory_index].offset < column.offset) column.directory_index += 1;
+                const indexed = if (column.directory_index < directory.pages.len and directory.pages[column.directory_index].offset == column.offset) directory.pages[column.directory_index] else null;
                 if (indexed) |entry| {
                     if (entry.first != column.first) return error.InvalidParquetMetadata;
                     if (entry.first + entry.rows <= self.position) {
@@ -168,6 +170,7 @@ pub const Cursor = struct {
             limits.max_decoded_bytes = self.limits.max_decoded_bytes / share - dictionary_bytes;
             limits.max_struct_allocation_bytes /= @max(@as(usize, 1), self.columns.len);
             limits.page_row_count = count;
+            limits.preserve_dictionary = true;
             limits.page_encoding = parsed.header.encoding;
             limits.max_rows = @max(limits.max_rows, count);
             const input = [_]parquet.ColumnChunkInput{.{ .column_id = column.chunk.column_id, .bytes = encoded, .dictionary = if (column.dictionary) |*dictionary| dictionary else null }};
@@ -336,6 +339,7 @@ pub const Cursor = struct {
             const begin: usize = @intCast(self.position - column.first);
             var vector = decoded;
             vector.values = switch (decoded.values) {
+                .dictionary_bytes => |values| .{ .dictionary_bytes = .{ .values = values.values, .indices = values.indices[begin..][0..count] } },
                 inline else => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), values[begin..][0..count]),
             };
             if (decoded.nulls.bytes.len != 0) vector.nulls.bytes = decoded.nulls.bytes[begin..][0..count];

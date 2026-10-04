@@ -11,8 +11,8 @@ const A = std.mem.Allocator;
 pub const Pair = struct { left: ?[]const Datum, right: ?[]const Datum, match: ?usize = null };
 pub const Join = struct {
     const Task = struct {
-        build: ?spill.File = null,
-        probes: ?spill.File = null,
+        build: ?spill.Sequential = null,
+        probes: ?spill.Sequential = null,
         used_bits: u64,
         depth: usize = 0,
         fn close(self: *Task) void {
@@ -28,8 +28,8 @@ pub const Join = struct {
     partitions: usize,
     outer_left: bool,
     outer_right: bool,
-    build: [16]?spill.File = @splat(null),
-    probes: [16]?spill.File = @splat(null),
+    build: [16]?spill.Sequential = @splat(null),
+    probes: [16]?spill.Sequential = @splat(null),
     partition: usize = 0,
     active: ?Task = null,
     pending: [8]Task = undefined,
@@ -98,7 +98,7 @@ pub const Join = struct {
         const partition: usize = @intCast((hash orelse 0) & (self.partitions - 1));
         const slot = if (build) &self.build[partition] else &self.probes[partition];
         if (slot.* == null) {
-            slot.* = try self.manager.create();
+            slot.* = try spill.Sequential.init(self.manager, @min(4096, self.limits.bytes / 128));
             // Both sides may keep sixteen open partition files. Reserve a
             // bounded share for their I/O buffers rather than exhausting a
             // small statement before a build partition can be loaded.
@@ -110,8 +110,8 @@ pub const Join = struct {
         self.matched = true;
         if (self.outer_right) try self.hash.?.markMatched(index);
     }
-    fn partitionFile(self: *Join) !spill.File {
-        var file = try self.manager.create();
+    fn partitionFile(self: *Join) !spill.Sequential {
+        var file = try spill.Sequential.init(self.manager, @min(4096, self.limits.bytes / 128));
         file.buffer_bytes = @max(128, @min(4096, self.limits.bytes / 128));
         return file;
     }
@@ -193,6 +193,10 @@ pub const Join = struct {
         return true;
     }
     pub fn next(self: *Join) !?Pair {
+        if (!self.finished) {
+            for (&self.build) |*file| if (file.*) |*open| try open.seal();
+            for (&self.probes) |*file| if (file.*) |*open| try open.seal();
+        }
         self.finished = true;
         _ = self.candidate.reset(.free_all);
         while (try self.prepare()) {

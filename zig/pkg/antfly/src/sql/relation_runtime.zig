@@ -284,6 +284,13 @@ fn Engine(comptime Context: type) type {
             hash_join: ?*operators.HashJoin = null,
             partition_join: ?*@import("partition_join.zig").Join = null,
             probe: ?operators.HashJoin.Probe = null,
+            probe_arena: std.heap.ArenaAllocator,
+            probe_rows: []const []const Datum = &.{},
+            probe_batch: []operators.HashJoin.Probe = &.{},
+            probe_index: usize = 0,
+            probe_errors: []?anyerror = &.{},
+            probe_input_error: ?anyerror = null,
+            probe_source_exhausted: bool = false,
             scan_filter: ?*@import("dynamic_filter.zig").Filter = null,
             left_values: ?[]const Datum = null,
             left_matched: bool = false,
@@ -316,7 +323,7 @@ fn Engine(comptime Context: type) type {
             fn createRecursive(engine: *Self, node: *const binding.Node, recursive_id: ?usize) anyerror!*Iterator {
                 const alloc = engine.context.alloc;
                 const self = try alloc.create(Iterator);
-                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .recursive_id = recursive_id };
+                self.* = .{ .engine = engine, .node = node, .arena = .init(alloc), .scratch = .init(alloc), .probe_arena = .init(alloc), .recursive_id = recursive_id };
                 errdefer self.deinit();
                 if (recursive_id) |id| if (!dependsOn(node, id)) {
                     self.cached_rows = try engine.staticRows(node);
@@ -350,6 +357,7 @@ fn Engine(comptime Context: type) type {
                 if (self.partition_join) |join| join.close();
                 if (self.scan_filter) |filter| filter.close();
                 if (!self.borrowed_hash) if (self.hash_join) |join| join.deinit();
+                self.probe_arena.deinit();
                 self.arena.deinit();
                 self.scratch.deinit();
                 self.engine.context.alloc.destroy(self);
@@ -689,6 +697,72 @@ fn Engine(comptime Context: type) type {
                 for (programs, result) |program, *out| out.* = try self.engine.context.evaluate(alloc, program, values);
                 return result;
             }
+            fn keyBatch(self: *Iterator, a: Allocator, programs: []const scalar.Program, rows: []const []const Datum, errors: ?[]?anyerror) ![]const []const Datum {
+                const cells = try a.alloc(Datum, rows.len * programs.len);
+                @memset(cells, .{});
+                const keys_ = try a.alloc([]const Datum, rows.len);
+                for (keys_, 0..) |*row, index| row.* = cells[index * programs.len ..][0..programs.len];
+                for (programs, 0..) |*program, slot| {
+                    const values = @import("vector_eval.zig").evaluate(a, program, rows, self.engine.context.parameters) catch |err| blk: {
+                        if (errors == null) return err;
+                        break :blk null;
+                    };
+                    for (rows, 0..) |row, index| {
+                        if (errors) |flags| if (flags[index] != null) continue;
+                        cells[index * programs.len + slot] = if (values) |vector| vector[index] else self.engine.context.evaluate(a, program.*, row) catch |err| blk: {
+                            if (errors) |flags| {
+                                flags[index] = err;
+                                break :blk .{};
+                            }
+                            return err;
+                        };
+                    }
+                }
+                return keys_;
+            }
+            fn fillProbes(self: *Iterator, programs: []const scalar.Program) !bool {
+                if (self.probe_input_error) |err| return err;
+                if (self.probe_source_exhausted) return false;
+                _ = self.probe_arena.reset(.free_all);
+                const a = self.probe_arena.allocator();
+                var rows: std.ArrayList([]const Datum) = .empty;
+                const count = @min(self.engine.context.limits.execution_batch_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.left.?.node.columns.len * @sizeOf(Datum) * 16)));
+                var retained: usize = 0;
+                while (rows.items.len < count) {
+                    const row = (self.left.?.next(a) catch |err| blk: {
+                        self.probe_input_error = err;
+                        break :blk null;
+                    }) orelse {
+                        self.probe_source_exhausted = true;
+                        break;
+                    };
+                    const owned = try a.alloc(Datum, row.len);
+                    for (row, owned) |value, *cell| cell.* = try operators.cloneDatum(a, value);
+                    try rows.append(a, owned);
+                    for (owned) |value| retained +|= try operators.datumBytes(value);
+                    if (retained >= self.engine.context.limits.retained_bytes / 32) break;
+                }
+                self.probe_rows = rows.items;
+                self.probe_index = 0;
+                if (rows.items.len == 0) {
+                    if (self.probe_input_error) |err| return err;
+                    return false;
+                }
+                self.probe_errors = try a.alloc(?anyerror, rows.items.len);
+                @memset(self.probe_errors, null);
+                const keys_ = try self.keyBatch(a, programs, rows.items, self.probe_errors);
+                self.probe_batch = self.hash_join.?.probeBatch(a, keys_) catch blk: {
+                    const probes = try a.alloc(operators.HashJoin.Probe, keys_.len);
+                    for (keys_, probes, self.probe_errors) |keys__, *probe_, *failure| {
+                        probe_.* = self.hash_join.?.probe(keys__) catch |err| inner: {
+                            failure.* = failure.* orelse err;
+                            break :inner .{ .owner = self.hash_join.?, .keys = keys__, .cursor = null };
+                        };
+                    }
+                    break :blk probes;
+                };
+                return true;
+            }
             fn combine(self: *Iterator, alloc: Allocator, left: ?[]const Datum, right: ?[]const Datum) ![]const Datum {
                 const width = self.node.operation.join.left.columns.len;
                 const values = try alloc.alloc(Datum, self.node.columns.len);
@@ -755,11 +829,26 @@ fn Engine(comptime Context: type) type {
                     if (!shared and kind != .left and kind != .full) try self.prepareScanFilter(if (self.flipped_join) join.right_keys else join.left_keys);
                     var scratch = std.heap.ArenaAllocator.init(self.engine.context.alloc);
                     defer scratch.deinit();
-                    while (try self.right.?.next(scratch.allocator())) |values| {
-                        const key_values = try self.keys(scratch.allocator(), if (self.flipped_join) join.left_keys else join.right_keys, values);
-                        try self.hash_join.?.add(values, key_values);
-                        if (self.scan_filter) |filter| try filter.add(key_values);
+                    while (true) {
                         _ = scratch.reset(.free_all);
+                        const a = scratch.allocator();
+                        var rows: std.ArrayList([]const Datum) = .empty;
+                        const count = @min(self.engine.context.limits.execution_batch_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.right.?.node.columns.len * @sizeOf(Datum) * 16)));
+                        var retained: usize = 0;
+                        while (rows.items.len < count) {
+                            const values = try self.right.?.next(a) orelse break;
+                            const owned = try a.alloc(Datum, values.len);
+                            for (values, owned) |value, *cell| cell.* = try operators.cloneDatum(a, value);
+                            try rows.append(a, owned);
+                            for (owned) |value| retained +|= try operators.datumBytes(value);
+                            if (retained >= self.engine.context.limits.retained_bytes / 32) break;
+                        }
+                        if (rows.items.len == 0) break;
+                        const keys_ = try self.keyBatch(a, if (self.flipped_join) join.left_keys else join.right_keys, rows.items, null);
+                        for (rows.items, keys_) |values, key_values| {
+                            try self.hash_join.?.add(values, key_values);
+                            if (self.scan_filter) |filter| try filter.add(key_values);
+                        }
                     }
                     if (self.scan_filter) |filter| {
                         filter.sealed = true;
@@ -823,16 +912,17 @@ fn Engine(comptime Context: type) type {
                         }
                         return null;
                     }
-                    _ = self.arena.reset(.free_all);
-                    const left = try self.left.?.next(self.arena.allocator()) orelse {
-                        self.eof = true;
-                        continue;
-                    };
-                    const owned = try self.arena.allocator().alloc(Datum, left.len);
-                    for (left, owned) |value, *out| out.* = try operators.cloneDatum(self.arena.allocator(), value);
-                    self.left_values = owned;
+                    if (self.probe_index == self.probe_rows.len) {
+                        if (!try self.fillProbes(if (self.flipped_join) join.right_keys else join.left_keys)) {
+                            self.eof = true;
+                            continue;
+                        }
+                    }
+                    if (self.probe_errors[self.probe_index]) |err| return err;
+                    self.left_values = self.probe_rows[self.probe_index];
                     self.left_matched = false;
-                    self.probe = try self.hash_join.?.probe(try self.keys(self.arena.allocator(), if (self.flipped_join) join.right_keys else join.left_keys, owned));
+                    self.probe = self.probe_batch[self.probe_index];
+                    self.probe_index += 1;
                 }
             }
         };

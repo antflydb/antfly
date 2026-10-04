@@ -90,7 +90,7 @@ fn columnValues(context: anytype, bound: *const binding.Bound, a: std.mem.Alloca
     for (values, 0..) |*value, index| value.* = try context.evaluate(a, program.*, try bound.input.columnCells(a, page, index));
     return values;
 }
-fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, a: std.mem.Allocator, page: catalog.ColumnPage) !void {
+pub fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, a: std.mem.Allocator, page: catalog.ColumnPage) !void {
     const predicates = if (bound.input.predicate) |*program| try columnValues(context, bound, a, page, program) else null;
     var selection: std.ArrayList(usize) = .empty;
     for (page.selection, 0..) |physical, index| {
@@ -136,15 +136,9 @@ fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *operators
         for (inputs, columns) |input, *column| column.* = input;
         try grouped.addGlobalColumns(columns, accepted.selection.len);
     } else {
-        // One transient row boundary per batch, rather than a Datum matrix.
-        // Retained keys and state live in the operator's typed columns.
-        const row_keys = try a.alloc(Datum, keys.len);
-        const row_inputs = try a.alloc(Datum, inputs.len);
-        for (0..accepted.selection.len) |index| {
-            for (keys, row_keys) |column, *cell| cell.* = column[index];
-            for (inputs, row_inputs) |column, *cell| cell.* = column[index];
-            try grouped.add(row_keys, row_inputs);
-        }
+        const columns = try a.alloc([]const Datum, inputs.len);
+        for (inputs, columns) |input, *column| column.* = input;
+        try grouped.addColumns(keys, columns, accepted.selection.len);
     }
 }
 
@@ -228,7 +222,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             try grouped.addGlobalCount(count);
             metadata_counted = true;
         };
-        while (!predicates.empty and !metadata_counted) {
+        const parallel = !external and !predicates.empty and !metadata_counted and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.execution_batch_rows });
+        while (!predicates.empty and !metadata_counted and !parallel) {
             try context.checkpoint();
             pages += 1;
             if (pages > context.limits.scan_pages) return error.SqlProgramLimitExceeded;

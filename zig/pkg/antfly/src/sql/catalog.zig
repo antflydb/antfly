@@ -154,6 +154,7 @@ pub const ColumnPage = struct {
             .f64 => |values| .{ .float = values[index] },
             .bool => |values| .{ .bool = values[index] },
             .bytes => |values| .{ .string = values[index] },
+            .dictionary_bytes => |values| .{ .string = values.at(index) },
             .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
             .vector_f32 => return error.UnsupportedSqlExecution,
         };
@@ -174,6 +175,10 @@ pub const Cursor = struct {
     next_columns: ?*const fn (*anyopaque, std.mem.Allocator, u32) anyerror!ColumnPage = null,
     /// Borrow immutable filter evidence before any pull; false declines it.
     set_dynamic_filter: ?*const fn (*anyopaque, *const @import("dynamic_filter.zig").Filter) anyerror!bool = null,
+    /// Split an unopened pinned scan into disjoint, ordered partitions. Child
+    /// cursors share the snapshot and are closed before their parent. Providers
+    /// decline when they cannot preserve contiguous source order.
+    split_scan: ?*const fn (*anyopaque, std.mem.Allocator, usize) anyerror!?[]Cursor = null,
     /// Exact snapshot count; null means the retained cursor must be scanned.
     /// Providers may use metadata only after accounting for filters/deletes.
     count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,

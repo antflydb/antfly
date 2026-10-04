@@ -641,6 +641,42 @@ pub const HashJoin = struct {
         }
         return .{ .owner = self, .keys = keys, .cursor = if (try keyHash(keys)) |hashed| self.heads.get(hashed) else null };
     }
+    /// Seed probe chains for a whole batch before traversing candidates. Hash
+    /// each key column together and keep per-lane NULL semantics. Returned
+    /// probes borrow their batch keys until all lanes have been consumed.
+    pub fn probeBatch(self: *HashJoin, a: Allocator, keys: []const []const Datum) ![]Probe {
+        self.sealed = true;
+        const probes = try a.alloc(Probe, keys.len);
+        errdefer a.free(probes);
+        const hashes = try a.alloc(std.hash.Wyhash, keys.len);
+        defer a.free(hashes);
+        for (hashes, probes, keys) |*hash, *probe_, row| {
+            if (self.key_count != null and row.len != self.key_count.?) return error.InvalidSqlBackendResponse;
+            hash.* = .init(0);
+            probe_.* = .{ .owner = self, .keys = row, .cursor = null };
+        }
+        const width = if (keys.len == 0) 0 else keys[0].len;
+        for (0..width) |column| for (keys, hashes) |row, *hash| {
+            if (row.len != width) return error.InvalidSqlBackendResponse;
+            if (for (row) |cell| {
+                if (cell.sql_null) break true;
+            } else false) continue;
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(u64, &bytes, try scalar.semanticHash(row[column].value), .little);
+            hash.update(&bytes);
+        };
+        for (keys, hashes, probes) |row, *hash, *probe_| {
+            if (for (row) |cell| {
+                if (cell.sql_null) break true;
+            } else false) continue;
+            const value = hash.final();
+            if (self.disk != null) {
+                const head = self.disk_heads[value & (self.disk_heads.len - 1)];
+                probe_.cursor = if (head == @import("spill.zig").none) null else @intCast(head);
+            } else probe_.cursor = self.heads.get(value);
+        }
+        return probes;
+    }
     /// Mark only after the complete ON residual accepts this candidate.
     pub fn markMatched(self: *HashJoin, index: usize) !void {
         if (self.disk) |*file| {
@@ -790,6 +826,47 @@ pub const Grouped = struct {
         };
     }
 
+    /// Resolve a vector of group IDs once, then update state by aggregate
+    /// column. No per-row Datum matrix is constructed. Admission is checked
+    /// before mutating groups; spill paths retain their ordered row fallback.
+    pub fn addColumns(self: *Grouped, keys: []const []const Datum, inputs: []const []const Datum, count: usize) !void {
+        if (self.failed or self.finished or inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
+        for (keys) |column| if (column.len != count) return error.InvalidSqlBackendResponse;
+        for (inputs) |column| if (column.len != count) return error.InvalidSqlBackendResponse;
+        if (count == 0) return;
+        const a = self.backing;
+        const row_keys = try a.alloc(Datum, keys.len);
+        defer a.free(row_keys);
+        const row_inputs = try a.alloc(Datum, inputs.len);
+        defer a.free(row_inputs);
+        var needed: usize = 4096 + count *| (512 + self.specs.len *| @sizeOf(Aggregate) *| 2);
+        for (keys) |column| for (column) |value| {
+            needed +|= (try datumBytes(value)) *| 4;
+        };
+        var fast = self.external == null and needed <= self.budget.limit -| self.budget.live and self.budget.live <= self.budget.limit / 2;
+        for (self.specs) |spec| if (spec.distinct or spec.kind == .pattern_set) {
+            fast = false;
+        };
+        if (!fast) {
+            for (0..count) |index| {
+                for (keys, row_keys) |column, *cell| cell.* = column[index];
+                for (inputs, row_inputs) |column, *cell| cell.* = column[index];
+                try self.add(row_keys, row_inputs);
+            }
+            return;
+        }
+        const ids = try a.alloc(usize, count);
+        defer a.free(ids);
+        self.key_count = keys.len;
+        errdefer self.failed = true;
+        for (ids, 0..) |*id, index| {
+            for (keys, row_keys) |column, *cell| cell.* = column[index];
+            id.* = try self.resolveGroup(row_keys);
+            self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+        }
+        for (self.state_columns, inputs) |*column, values| try column.updateBatch(self.budget.allocator(), ids, values);
+    }
+
     /// Global COUNT, integer SUM and boolean reductions do not need a hash
     /// probe per row. Validate the batch before changing state; unsupported
     /// kinds, DISTINCT, mixed values and disk groups retain ordered updates.
@@ -804,6 +881,36 @@ pub const Grouped = struct {
         try self.add(keys, inputs);
         const index = self.last_group orelse return error.InvalidSqlBackendResponse;
         self.groups.items[index].ordinal = if (index >= prior_groups) ordinal else @min(self.groups.items[index].ordinal, ordinal);
+    }
+    /// Merge exact local reducers in contiguous partition order. Ordinals are
+    /// translated by the preceding partition's accepted-row count, preserving
+    /// first-occurrence ordering without retaining input rows.
+    pub fn mergeExact(self: *Grouped, source: *const Grouped, ordinal_base: u64) !void {
+        if (self.failed or self.finished or source.external != null or self.specs.len != source.specs.len) return error.InvalidSqlBackendResponse;
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const states = try self.backing.alloc(Aggregate, self.specs.len);
+        defer self.backing.free(states);
+        const empty = try self.backing.alloc(Datum, self.specs.len);
+        defer self.backing.free(empty);
+        @memset(empty, .{});
+        for (source.groups.items, 0..) |group, index| {
+            _ = arena.reset(.free_all);
+            const keys = try source.key_columns.row(arena.allocator(), index);
+            const ordinal = std.math.add(u64, ordinal_base, group.ordinal) catch return error.SqlNumericOutOfRange;
+            for (source.state_columns, states) |*column, *state| state.* = try column.snapshot(arena.allocator(), index);
+            self.key_count = keys.len;
+            if (self.external == null and self.limits.spill != null and !try self.canRetain(keys, empty)) try self.startSpill();
+            if (self.external) |external| {
+                try external.partial(keys, states, ordinal);
+            } else {
+                const previous = self.groups.items.len;
+                const slot = try self.resolveGroup(keys);
+                self.groups.items[slot].ordinal = if (slot >= previous) ordinal else @min(self.groups.items[slot].ordinal, ordinal);
+                for (self.state_columns, states) |*column, state| try column.mergeExact(slot, state);
+            }
+        }
+        self.rows_seen = std.math.add(u64, self.rows_seen, source.rows_seen) catch return error.SqlNumericOutOfRange;
     }
     pub fn importPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
         if (cells.len != self.specs.len * 7 or self.external != null) return error.InvalidSqlSpill;
@@ -978,6 +1085,12 @@ pub const Grouped = struct {
     fn update(self: *Grouped, keys: []const Datum, inputs: []const Datum) !void {
         if (inputs.len != self.specs.len or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
         self.key_count = keys.len;
+        const slot = try self.resolveGroup(keys);
+        for (self.state_columns, inputs) |*column, value| try column.update(self.budget.allocator(), slot, value);
+        self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+    }
+
+    fn resolveGroup(self: *Grouped, keys: []const Datum) !usize {
         var hasher = std.hash.Wyhash.init(0);
         for (keys) |key| {
             var bytes: [9]u8 = undefined;
@@ -995,8 +1108,7 @@ pub const Grouped = struct {
         }
         if (slot == null) slot = try self.appendGroup(keys, hash);
         self.last_group = slot;
-        for (self.state_columns, inputs) |*column, value| try column.update(self.budget.allocator(), slot.?, value);
-        self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
+        return slot.?;
     }
 
     fn appendGroup(self: *Grouped, keys: []const Datum, hash: u64) !usize {

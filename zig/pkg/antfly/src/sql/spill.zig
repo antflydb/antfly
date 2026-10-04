@@ -479,6 +479,250 @@ const Decoder = struct {
     }
 };
 
+/// Sequential native runs use typed column blocks when multiple rows fit;
+/// wide rows retain the compact record framing without extra staging copies.
+/// Random-access hash chains
+/// keep File's independently framed records. Logical offsets here are row
+/// ordinals; readers consume blocks in order and may restart at ordinal zero.
+pub const Sequential = struct {
+    file: File,
+    size: u64 = 0,
+    block_bytes: usize,
+    buffer_bytes: ?usize = null,
+    write_arena: std.heap.ArenaAllocator,
+    read_arena: std.heap.ArenaAllocator,
+    pending: std.ArrayList(Row) = .empty,
+    pending_bytes: usize = 0,
+    read_rows: []const Row = &.{},
+    read_first: u64 = 0,
+    read_offset: u64 = 0,
+    pub fn init(manager: *Manager, bytes: usize) !Sequential {
+        return .{ .file = try manager.create(), .block_bytes = @max(128, @min(bytes, manager.max_record_bytes / 4)), .write_arena = .init(manager.alloc), .read_arena = .init(manager.alloc) };
+    }
+    pub fn close(self: *Sequential) void {
+        self.pending.deinit(self.file.manager.alloc);
+        self.write_arena.deinit();
+        self.read_arena.deinit();
+        self.file.close();
+    }
+    pub fn append(self: *Sequential, row: Row, link: u64) !u64 {
+        if (link != none) return error.InvalidSqlSpill;
+        try self.file.manager.check();
+        var bytes: usize = @sizeOf(Row);
+        for (row.values) |value| bytes +|= try operators.datumBytes(value);
+        for (row.keys) |value| bytes +|= try operators.datumBytes(value);
+        if (self.pending.items.len != 0 and (self.pending.items.len >= 256 or bytes > self.block_bytes -| self.pending_bytes or row.values.len != self.pending.items[0].values.len or row.keys.len != self.pending.items[0].keys.len)) try self.flush();
+        if (bytes > self.block_bytes / 2) {
+            try self.flush();
+            self.file.buffer_bytes = self.buffer_bytes;
+            _ = try self.file.append(row, none);
+            const offset = self.size;
+            self.size += 1;
+            return offset;
+        }
+        const a = self.write_arena.allocator();
+        const values = try a.alloc(Datum, row.values.len);
+        const keys = try a.alloc(Datum, row.keys.len);
+        for (row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
+        for (row.keys, keys) |value, *out| out.* = try operators.cloneDatum(a, value);
+        try self.pending.append(self.file.manager.alloc, .{ .values = values, .keys = keys, .ordinal = row.ordinal });
+        self.pending_bytes +|= bytes;
+        const offset = self.size;
+        self.size += 1;
+        return offset;
+    }
+    fn tag(value: Datum) u8 {
+        if (value.patterns != null) return 255;
+        return switch (value.value) {
+            .null => 0,
+            .bool => 1,
+            .integer => 2,
+            .float => 3,
+            .number_string => 4,
+            .string => 5,
+            else => 255,
+        };
+    }
+    fn encodeColumns(encoder: *Encoder, rows: []const Row, keys: bool) !void {
+        const width = if (keys) rows[0].keys.len else rows[0].values.len;
+        for (0..width) |column| {
+            var kind: ?u8 = null;
+            for (rows) |row| {
+                const value = (if (keys) row.keys else row.values)[column];
+                if (value.sql_null or (value.value == .null and value.patterns == null)) continue;
+                const actual = tag(value);
+                kind = if (kind == null or kind.? == actual) actual else 255;
+            }
+            const type_ = kind orelse 0;
+            try encoder.append(&.{type_});
+            if (type_ == 255) {
+                for (rows) |row| try encoder.cells((if (keys) row.keys else row.values)[column..][0..1]);
+                continue;
+            }
+            for (0..(rows.len + 3) / 4) |group| {
+                var flags: u8 = 0;
+                for (0..4) |lane| {
+                    const index = group * 4 + lane;
+                    if (index >= rows.len) break;
+                    const value = (if (keys) rows[index].keys else rows[index].values)[column];
+                    const flag: u8 = if (value.sql_null) 1 else if (value.value == .null) 2 else 0;
+                    flags |= flag << @as(u3, @intCast(lane * 2));
+                }
+                try encoder.append(&.{flags});
+            }
+            for (rows) |row| {
+                const value = (if (keys) row.keys else row.values)[column];
+                if (value.sql_null or value.value == .null) continue;
+                switch (type_) {
+                    1 => try encoder.append(&.{@intFromBool(value.value.bool)}),
+                    2 => try encoder.word(@bitCast(value.value.integer)),
+                    3 => try encoder.word(@bitCast(value.value.float)),
+                    4 => try encoder.text(value.value.number_string),
+                    5 => try encoder.text(value.value.string),
+                    else => return error.InvalidSqlSpill,
+                }
+            }
+        }
+    }
+    pub fn flush(self: *Sequential) !void {
+        const rows = self.pending.items;
+        if (rows.len == 0) return;
+        if (rows.len == 1) {
+            self.file.buffer_bytes = self.buffer_bytes;
+            _ = try self.file.append(rows[0], none);
+            self.pending.clearRetainingCapacity();
+            _ = self.write_arena.reset(.free_all);
+            self.pending_bytes = 0;
+            return;
+        }
+        const manager = self.file.manager;
+        var bytes: std.ArrayList(u8) = .empty;
+        defer bytes.deinit(manager.alloc);
+        var encoder: Encoder = .{ .manager = manager, .a = manager.alloc, .bytes = &bytes, .limit = manager.max_record_bytes };
+        try encoder.word(rows.len);
+        try encoder.word(rows[0].values.len);
+        try encoder.word(rows[0].keys.len);
+        for (rows) |row| try encoder.word(row.ordinal);
+        try encodeColumns(&encoder, rows, false);
+        try encodeColumns(&encoder, rows, true);
+        const compressed = if (manager.compression == .snappy and bytes.items.len >= 1024) try snappy.encode(manager.alloc, bytes.items) else null;
+        defer if (compressed) |value| manager.alloc.free(value);
+        const use_compressed = compressed != null and compressed.?.len + 32 < bytes.items.len;
+        const stored = if (use_compressed) compressed.? else bytes.items;
+        var header: [17]u8 = undefined;
+        std.mem.writeInt(u64, header[0..8], stored.len, .little);
+        std.mem.writeInt(u64, header[8..16], std.hash.Wyhash.hash(0, bytes.items), .little);
+        header[16] = @intFromBool(use_compressed);
+        self.file.buffer_bytes = self.buffer_bytes;
+        const offset = self.file.size;
+        try self.file.writeRaw(offset, &header);
+        try self.file.writeRaw(offset + header.len, stored);
+        manager.compressed_records += @intFromBool(use_compressed);
+        self.pending.clearRetainingCapacity();
+        _ = self.write_arena.reset(.free_all);
+        self.pending_bytes = 0;
+    }
+    pub fn seal(self: *Sequential) !void {
+        try self.flush();
+        self.pending.clearAndFree(self.file.manager.alloc);
+        try self.file.seal();
+    }
+    fn decodeColumns(decoder: *Decoder, rows: []Row, keys: bool) !void {
+        const width = if (keys) rows[0].keys.len else rows[0].values.len;
+        for (0..width) |column| {
+            const type_ = try decoder.byte();
+            if (type_ == 255) {
+                for (rows) |row| {
+                    const values = try decoder.cells();
+                    if (values.len != 1) return error.InvalidSqlSpill;
+                    @constCast(if (keys) row.keys else row.values)[column] = values[0];
+                }
+                continue;
+            }
+            if (type_ > 5) return error.InvalidSqlSpill;
+            const len = (rows.len + 3) / 4;
+            if (len > decoder.bytes.len - decoder.position) return error.InvalidSqlSpill;
+            const flags = decoder.bytes[decoder.position..][0..len];
+            decoder.position += len;
+            for (rows, 0..) |row, index| {
+                const flag = (flags[index / 4] >> @as(u3, @intCast((index % 4) * 2))) & 3;
+                if (flag == 3) return error.InvalidSqlSpill;
+                const value = &@constCast(if (keys) row.keys else row.values)[column];
+                value.* = .{ .sql_null = flag == 1 };
+                if (flag != 0) continue;
+                value.value = switch (type_) {
+                    0 => .null,
+                    1 => blk: {
+                        const boolean = try decoder.byte();
+                        if (boolean > 1) return error.InvalidSqlSpill;
+                        break :blk .{ .bool = boolean == 1 };
+                    },
+                    2 => .{ .integer = @bitCast(try decoder.word()) },
+                    3 => .{ .float = @bitCast(try decoder.word()) },
+                    4 => .{ .number_string = try decoder.text() },
+                    5 => .{ .string = try decoder.text() },
+                    else => unreachable,
+                };
+            }
+        }
+    }
+    pub fn read(self: *Sequential, a: Allocator, offset: u64) !Decoded {
+        try self.seal();
+        if (offset >= self.size) return error.InvalidSqlSpill;
+        if (offset == 0 and self.read_first != 0) {
+            self.read_first = 0;
+            self.read_offset = 0;
+            self.read_rows = &.{};
+        }
+        if (self.read_rows.len == 0 or offset == self.read_first + self.read_rows.len) {
+            self.read_first = offset;
+            _ = self.read_arena.reset(.free_all);
+            const owned = self.read_arena.allocator();
+            var header: [17]u8 = undefined;
+            try self.file.readRaw(self.read_offset, &header);
+            // File records have the sentinel link's 0xff at this byte;
+            // typed blocks use only 0/1. Both retain checksum validation.
+            if (header[16] == 255) {
+                var record = try self.file.read(a, self.read_offset);
+                if (record.next != none or record.matched) return error.InvalidSqlSpill;
+                self.read_offset = record.following;
+                self.read_first = offset + 1;
+                self.read_rows = &.{};
+                record.following = offset + 1;
+                return record;
+            }
+            const len = std.mem.readInt(u64, header[0..8], .little);
+            if (header[16] > 1 or len > self.file.manager.max_record_bytes or len > self.file.size -| (self.read_offset + header.len)) return error.InvalidSqlSpill;
+            const encoded = try owned.alloc(u8, @intCast(len));
+            try self.file.readRaw(self.read_offset + header.len, encoded);
+            const payload = if (header[16] != 0) blk: {
+                if (try snappy.decodedLen(encoded) > self.file.manager.max_record_bytes) return error.InvalidSqlSpill;
+                break :blk try snappy.decode(owned, encoded);
+            } else encoded;
+            if (std.hash.Wyhash.hash(0, payload) != std.mem.readInt(u64, header[8..16], .little)) return error.InvalidSqlSpill;
+            var decoder: Decoder = .{ .manager = self.file.manager, .a = owned, .bytes = payload };
+            const count = try decoder.count();
+            const width = try decoder.count();
+            const key_width = try decoder.count();
+            if (count == 0 or count > 256 or count > self.size - offset or width > 1024 or key_width > 256) return error.InvalidSqlSpill;
+            const rows = try owned.alloc(Row, count);
+            for (rows) |*row| row.* = .{ .ordinal = try decoder.word(), .values = try owned.alloc(Datum, width), .keys = try owned.alloc(Datum, key_width) };
+            try decodeColumns(&decoder, rows, false);
+            try decodeColumns(&decoder, rows, true);
+            if (decoder.position != payload.len) return error.InvalidSqlSpill;
+            self.read_rows = rows;
+            self.read_offset += header.len + len;
+        }
+        if (offset < self.read_first or offset >= self.read_first + self.read_rows.len) return error.InvalidSqlSpill;
+        const row = self.read_rows[@intCast(offset - self.read_first)];
+        const values = try a.alloc(Datum, row.values.len);
+        const keys = try a.alloc(Datum, row.keys.len);
+        for (row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
+        for (row.keys, keys) |value, *out| out.* = try operators.cloneDatum(a, value);
+        return .{ .row = .{ .values = values, .keys = keys, .ordinal = row.ordinal }, .next = none, .matched = false, .following = offset + 1 };
+    }
+};
+
 pub const Sort = struct {
     manager: *Manager,
     a: Allocator,
@@ -488,9 +732,9 @@ pub const Sort = struct {
     arena: std.heap.ArenaAllocator,
     rows: std.ArrayList(Row) = .empty,
     estimated: usize = 0,
-    runs: [32]?File = @splat(null),
+    runs: [32]?Sequential = @splat(null),
     run_levels: [32]u8 = @splat(0),
-    outputs: [8]?File = @splat(null),
+    outputs: [8]?Sequential = @splat(null),
     heads: [8]?Decoded = @splat(null),
     head_arenas: [8]std.heap.ArenaAllocator = undefined,
     output_count: usize = 0,
@@ -551,7 +795,7 @@ pub const Sort = struct {
     fn flush(self: *Sort) !void {
         if (self.rows.items.len == 0) return;
         try self.sortRows();
-        var run = try self.manager.create();
+        var run = try Sequential.init(self.manager, self.blockBytes());
         errdefer run.close();
         for (self.rows.items) |row| _ = try run.append(row, none);
         _ = self.arena.reset(.free_all);
@@ -594,7 +838,7 @@ pub const Sort = struct {
                     level = @max(level, self.run_levels[index]);
                 }
             }
-            var inputs: [8]*File = undefined;
+            var inputs: [8]*Sequential = undefined;
             inputs[0] = &run;
             for (indices[0..count], inputs[1 .. count + 1]) |index, *file| file.* = &self.runs[index].?;
             const combined = try self.mergeMany(inputs[0 .. count + 1]);
@@ -607,19 +851,26 @@ pub const Sort = struct {
             level = std.math.add(u8, level, 1) catch return error.SqlProgramLimitExceeded;
         }
     }
+    fn blockBytes(self: *const Sort) usize {
+        // Below 64 KiB there is insufficient workspace to amortize block
+        // decoding across merge heads. A 128-byte target selects records.
+        if (self.memory_bytes < 64 * 1024) return 128;
+        return @min(32 * 1024, @max(128, self.memory_bytes / 64));
+    }
     fn fanIn(self: *const Sort) usize {
-        const head_bytes = self.max_row_bytes *| 4 +| self.manager.buffer_bytes *| 2 +| 512;
+        const block_workspace = if (self.blockBytes() > 128) self.blockBytes() *| 8 else 0;
+        const head_bytes = self.max_row_bytes *| 4 +| self.manager.buffer_bytes *| 2 +| block_workspace +| 512;
         return @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes)));
     }
-    fn readRun(self: *Sort, file: *File, a: Allocator, offset: u64) !Decoded {
+    fn readRun(self: *Sort, file: *Sequential, a: Allocator, offset: u64) !Decoded {
         if (offset == 0) try file.seal();
         var decoded = try file.read(a, offset);
         decoded.row.normalized = @import("sort_key.zig").encode(decoded.row.keys, self.orders);
         return decoded;
     }
-    fn mergeMany(self: *Sort, inputs: []const *File) !File {
+    fn mergeMany(self: *Sort, inputs: []const *Sequential) !Sequential {
         std.debug.assert(inputs.len >= 2 and inputs.len <= self.fanIn());
-        var output = try self.manager.create();
+        var output = try Sequential.init(self.manager, self.blockBytes());
         errdefer output.close();
         var arenas: [8]std.heap.ArenaAllocator = undefined;
         var heads: [8]?Decoded = @splat(null);
@@ -662,7 +913,7 @@ pub const Sort = struct {
         }
         for (&self.runs) |*slot| if (slot.*) |*run| {
             if (self.output_count == fan_in) {
-                var inputs: [8]*File = undefined;
+                var inputs: [8]*Sequential = undefined;
                 for (self.outputs[0..self.output_count], inputs[0..self.output_count]) |*file, *input| input.* = &file.*.?;
                 const combined = try self.mergeMany(inputs[0..self.output_count]);
                 for (self.outputs[0..self.output_count]) |*file| {
@@ -861,4 +1112,59 @@ test "SQL multiway spill reduces rewrite bytes under the same memory budget" {
     }
     try std.testing.expect(written[1] < written[0] * 3 / 4);
     std.debug.print("SQL spill merge bytes: binary={d} multiway={d}\n", .{ written[0], written[1] });
+}
+
+test "SQL typed sequential blocks preserve tags nulls compression restart and quota" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 64 * 1024);
+    defer file.close();
+    for (0..512) |index| _ = try file.append(.{ .values = &.{ Datum.json(.{ .integer = 9007199254740993 }), Datum.json(.null), .{}, Datum.json(.{ .number_string = "1.0000000000000001" }), Datum.json(.{ .string = "repeated native block value" }) }, .keys = &.{Datum.json(.{ .integer = @intCast(index) })}, .ordinal = index }, none);
+    try file.seal();
+    try std.testing.expect(manager.compressed_records != 0);
+    for (0..2) |_| for (0..512) |index| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const row = try file.read(arena.allocator(), index);
+        try std.testing.expectEqual(@as(u64, index), row.row.ordinal);
+        try std.testing.expectEqual(@as(i64, 9007199254740993), row.row.values[0].value.integer);
+        try std.testing.expect(!row.row.values[1].sql_null and row.row.values[1].value == .null);
+        try std.testing.expect(row.row.values[2].sql_null);
+        try std.testing.expectEqualStrings("1.0000000000000001", row.row.values[3].value.number_string);
+        try std.testing.expectEqual(@as(i64, @intCast(index)), row.row.keys[0].value.integer);
+    };
+    try std.testing.expect(manager.live_bytes <= manager.max_bytes);
+    manager.max_bytes = manager.live_bytes;
+    _ = try file.append(.{ .values = &.{Datum.json(.{ .integer = 1 })}, .keys = &.{}, .ordinal = 512 }, none);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, file.flush());
+}
+
+test "SQL sequential runs mix wide records and typed blocks across restarts" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    defer manager.deinit();
+    var file = try Sequential.init(&manager, 4096);
+    defer file.close();
+    const wide = [_]u8{'w'} ** 4096;
+    for (0..17) |index| {
+        const value = if (index % 8 == 0) Datum.json(.{ .string = &wide }) else Datum.json(.{ .integer = @intCast(index) });
+        _ = try file.append(.{ .values = &.{value}, .keys = &.{}, .ordinal = index }, none);
+    }
+    for (0..2) |_| for (0..17) |index| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const row = try file.read(arena.allocator(), index);
+        try std.testing.expectEqual(@as(u64, index), row.row.ordinal);
+        try std.testing.expectEqual(@as(u64, index + 1), row.following);
+        if (index % 8 == 0) try std.testing.expectEqualStrings(&wide, row.row.values[0].value.string) else try std.testing.expectEqual(@as(i64, @intCast(index)), row.row.values[0].value.integer);
+    };
 }

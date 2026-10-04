@@ -2138,6 +2138,50 @@ pub fn decodePlainFixedLenByteArrayDictionaryPageAlloc(
     }, page_payload, type_length);
 }
 
+/// Decode dictionary IDs without expanding/copying a byte payload per row.
+/// A page owns its dictionary so decoded-cache eviction cannot borrow a cursor.
+pub fn decodeByteDictionaryVectorAlloc(a: Allocator, header: Header, dictionary: []const []const u8, payload: []const u8, optional: bool) !struct { values: @import("../../storage/rowsource/types.zig").DictionaryBytes, nulls: []u8 } {
+    try header.validateDictionaryRequired();
+    const count: usize = header.value_count;
+    if (header.data_payload_offset > payload.len) return error.InvalidParquetPage;
+    if (optional and (header.page_type != .data_page_v2 or header.repetition_level_bytes != 0 or header.definition_level_bytes == 0 or header.definition_level_bytes > payload.len)) return error.UnsupportedParquetPage;
+    const levels = if (optional) try decodeHybridLevelsAlloc(a, payload[0..header.definition_level_bytes], 1, count) else null;
+    defer if (levels) |values| a.free(values);
+    var present: usize = if (optional) 0 else count;
+    if (levels) |values| for (values) |value| {
+        if (value > 1) return error.InvalidParquetPage;
+        present += value;
+    };
+    const data = payload[header.data_payload_offset..];
+    if (present != 0 and (data.len == 0 or data[0] > 32)) return error.InvalidParquetPage;
+    const decoded = try decodeHybridIndexesAlloc(a, if (present == 0) &.{} else data[1..], if (present == 0) 0 else @intCast(data[0]), present);
+    defer a.free(decoded);
+    const indices = try a.alloc(u32, count);
+    errdefer a.free(indices);
+    const nulls: []u8 = if (optional) try a.alloc(u8, count) else &.{};
+    errdefer if (optional) a.free(nulls);
+    var next: usize = 0;
+    for (indices, 0..) |*id, row| {
+        const is_null = if (levels) |values| values[row] == 0 else false;
+        if (optional) nulls[row] = @intFromBool(is_null);
+        id.* = 0;
+        if (!is_null) {
+            if (decoded[next] >= dictionary.len) return error.InvalidParquetPage;
+            id.* = @intCast(decoded[next]);
+            next += 1;
+        }
+    }
+    const values = try a.alloc([]const u8, dictionary.len);
+    errdefer a.free(values);
+    var initialized: usize = 0;
+    errdefer for (values[0..initialized]) |value| a.free(value);
+    for (dictionary, values) |source, *value| {
+        value.* = try a.dupe(u8, source);
+        initialized += 1;
+    }
+    return .{ .values = .{ .values = values, .indices = indices }, .nulls = nulls };
+}
+
 pub fn decodeDictionaryByteArrayDataPageAlloc(
     alloc: Allocator,
     header: Header,
