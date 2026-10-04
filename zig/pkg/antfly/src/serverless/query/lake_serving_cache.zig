@@ -22,18 +22,57 @@ const ObjectReader = @import("lake_object_reader.zig").ObjectStorageRangeReader;
 const Allocator = std.mem.Allocator;
 pub const Cache = struct {
     alloc: Allocator,
+    decoded: @import("lake_decoded_cache.zig").Cache,
     mutex: std.atomic.Mutex = .unlocked,
     entries: std.StringHashMapUnmanaged(Entry) = .empty,
+    flights: std.StringHashMapUnmanaged(*Flight) = .empty,
     max_bytes: usize = 64 * 1024 * 1024,
     max_entries: usize = 4096,
     stats: Stats = .{},
     tick: u64 = 0,
+    const Flight = struct { key: []u8, event: std.Io.Event = .unset, refs: usize = 1 };
+    const Claim = struct { flight: *Flight, leader: bool };
+    fn begin(self: *Cache, key: []const u8) !?Claim {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (self.flights.get(key)) |flight| {
+            flight.refs += 1;
+            return .{ .flight = flight, .leader = false };
+        }
+        if (self.flights.count() >= 512) return null;
+        const flight = try self.alloc.create(Flight);
+        errdefer self.alloc.destroy(flight);
+        const owned = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned);
+        flight.* = .{ .key = owned };
+        try self.flights.put(self.alloc, owned, flight);
+        return .{ .flight = flight, .leader = true };
+    }
+    fn releaseFlight(self: *Cache, flight: *Flight) void {
+        flight.refs -= 1;
+        if (flight.refs == 0) {
+            self.alloc.free(flight.key);
+            self.alloc.destroy(flight);
+        }
+    }
+    fn finish(self: *Cache, claim: Claim, io: std.Io) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (claim.leader) {
+            _ = self.flights.remove(claim.flight.key);
+            claim.flight.event.set(io);
+        }
+        self.releaseFlight(claim.flight);
+    }
     const Entry = struct { bytes: []u8, touched: u64 };
     pub const Stats = struct { hits: u64 = 0, misses: u64 = 0, stored_bytes: usize = 0, evictions: u64 = 0 };
     pub fn init(alloc: Allocator) Cache {
-        return .{ .alloc = alloc };
+        return .{ .alloc = alloc, .decoded = .{ .a = alloc } };
     }
     pub fn deinit(self: *Cache) void {
+        self.decoded.deinit();
+        std.debug.assert(self.flights.count() == 0);
+        self.flights.deinit(self.alloc);
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
@@ -115,8 +154,13 @@ pub const Reader = struct {
         const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = prefetchCanceled };
         worker.context.cancellation = token;
         worker.base.cancellation = token;
-        const bytes = try readPlanned(&worker, std.heap.page_allocator, read);
-        defer std.heap.page_allocator.free(bytes);
+        if (read.purpose == .parquet_footer) {
+            const lease = try worker.footerRead(read);
+            defer lease.release();
+        } else {
+            const bytes = try readPlanned(&worker, std.heap.page_allocator, read);
+            defer std.heap.page_allocator.free(bytes);
+        }
     }
     fn prefetchCanceled(raw: *const anyopaque) bool {
         const self: *const Reader = @ptrCast(@alignCast(raw));
@@ -142,6 +186,42 @@ pub const Reader = struct {
     pub fn reader(self: *Reader) parquet.ObjectRangeReader {
         return .{ .ctx = self, .read_range_alloc = readRange, .read_planned_range_alloc = readPlanned };
     }
+    pub fn objectKey(self: *Reader, a: Allocator, read: ranges.RangeRead, interpretation: []const u8) ![32]u8 {
+        const key = try read.cacheKeyAlloc(a);
+        defer a.free(key);
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        hash.update(&self.scope);
+        hash.update(key);
+        hash.update(interpretation);
+        return hash.finalResult();
+    }
+    pub fn footer(self: *Reader, file: @import("../external_source/types.zig").FileEntry) !@import("lake_decoded_cache.zig").Lease {
+        try self.context.ensureActive();
+        const read = try ranges.planParquetFooterRead(try ranges.objectRefForExternalFileUri(file), 64 * 1024);
+        return self.footerRead(read);
+    }
+    fn footerRead(self: *Reader, read: ranges.RangeRead) !@import("lake_decoded_cache.zig").Lease {
+        try self.context.ensureActive();
+        const key = try self.objectKey(std.heap.page_allocator, read, "parsed-footer-v1");
+        if (self.cache.decoded.lookup(key)) |lease| return lease;
+        const lease = try self.cache.decoded.create(32 * 1024 * 1024);
+        errdefer lease.release();
+        const a = lease.item.arena.allocator();
+        const tail = try self.reader().readPlannedAlloc(a, read);
+        defer a.free(tail);
+        const footer_api = @import("lake_parquet_footer.zig");
+        const preflight = try footer_api.parseFooterPreflight(read.object.byte_len, read.range.offset, tail);
+        if (preflight.metadataSlice(tail)) |bytes| {
+            lease.item.payload = .{ .footer = try @import("lake_parquet_metadata.zig").parseFooterMetadataAlloc(a, bytes, read.object.byte_len) };
+        } else {
+            const bytes = try self.reader().readPlannedAlloc(a, try footer_api.planFooterMetadataRead(read.object, read.range.offset, tail));
+            defer a.free(bytes);
+            lease.item.payload = .{ .footer = try @import("lake_parquet_metadata.zig").parseFooterMetadataAlloc(a, bytes, read.object.byte_len) };
+        }
+        try self.context.ensureActive();
+        self.cache.decoded.publish(key, lease);
+        return lease;
+    }
     fn readRange(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, offset: u64, len: usize) ![]u8 {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try self.context.ensureActive();
@@ -162,6 +242,32 @@ pub const Reader = struct {
             try self.context.ensureActive();
             return bytes;
         }
+        var claim: ?Cache.Claim = null;
+        if (self.context.io) |io| {
+            while (true) {
+                claim = self.cache.begin(key) catch null;
+                if (claim == null or claim.?.leader) break;
+                const waiting = claim.?;
+                claim = null;
+                {
+                    defer self.cache.finish(waiting, io);
+                    while (!waiting.flight.event.isSet()) {
+                        try self.context.ensureActive();
+                        waiting.flight.event.waitTimeout(io, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } }) catch |err| switch (err) {
+                            error.Timeout => continue,
+                            else => return err,
+                        };
+                    }
+                }
+                try self.context.ensureActive();
+                if (try self.cache.lookup(alloc, key)) |bytes| return bytes;
+                // A failed/canceled speculative leader does not poison other
+                // requests. Retry under this reader's own cancellation token.
+            }
+        }
+        defer if (claim) |active| self.cache.finish(active, self.context.io.?);
+        // Close the lookup/claim race without issuing a duplicate read.
+        if (claim != null) if (try self.cache.lookup(alloc, key)) |bytes| return bytes;
         const bytes = try self.base.parquetReader().readPlannedAlloc(alloc, read);
         errdefer alloc.free(bytes);
         try self.context.ensureActive();
@@ -246,6 +352,21 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     try std.testing.expectEqualStrings("ijkl", bytes);
     try std.testing.expectEqual(@as(usize, 4), slow.entered.load(.acquire));
     try std.testing.expect(cache.snapshot().hits > 0);
+    // Concurrent misses for an identical immutable range share one provider
+    // request. Each waiter remains cancelable under its own read context.
+    reader.scope[0] = 2;
+    slow.gate.store(false, .release);
+    const identical_before = slow.entered.load(.acquire);
+    try reader.prefetch(&.{ reads[0], reads[0], reads[0], reads[0] });
+    for (0..200) |_| {
+        if (slow.entered.load(.acquire) > identical_before) break;
+        try std.testing.io.sleep(.fromMilliseconds(10), .awake);
+    }
+    try std.testing.expectEqual(identical_before + 1, slow.entered.load(.acquire));
+    slow.gate.store(true, .release);
+    reader.drain(false);
+    try std.testing.expectEqual(identical_before + 1, slow.entered.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), cache.flights.count());
     // A fresh scope misses the prior cache. Cancellation drains blocked jobs
     // before their provider/metadata owners go out of scope.
     slow.gate.store(false, .release);

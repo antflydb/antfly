@@ -346,6 +346,7 @@ pub const ServingSource = struct {
     iceberg_schema: ?@import("lake_schema.zig").Detected = null,
     partition_rules: ?@import("lake_partition_pruning.zig").Rules = null,
     context_store: ?*@import("lake_read_context.zig").Store = null,
+    prepared_deletes: ?*@import("lake_prepared_deletes.zig").Prepared = null,
 
     pub fn open(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: configured_store.BindingObjectStoreOpenOptions) !ServingSource {
         return openWithContext(alloc, schema, options, .{});
@@ -440,6 +441,7 @@ pub const ServingSource = struct {
     }
 
     pub fn deinit(self: *ServingSource) void {
+        if (self.prepared_deletes) |prepared| prepared.destroy(self.alloc);
         if (self.scanner.shared_reader) |reader| {
             reader.drain(true);
             self.alloc.destroy(reader);

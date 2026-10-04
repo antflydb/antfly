@@ -12,8 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-//! Sorted partial aggregation: spill mergeable states, then reduce one key at
-//! a time. Raw updates retain arrival ordinals within each key's merge stream.
+//! Partition exact typed states before reducing; use ordered merging for
+//! order-sensitive aggregates and partitions that exceed bounded admission.
 const std = @import("std");
 const operators = @import("operators.zig");
 const scalar = @import("scalar.zig");
@@ -28,12 +28,26 @@ pub const Grouped = struct {
     read_arena: std.heap.ArenaAllocator,
     pending: ?operators.Row = null,
     output_count: usize = 0,
+    partitioned: bool = false,
+    partitions: [8]?spill.File = @splat(null),
+    partition_index: usize = 0,
+    local: ?*operators.Grouped = null,
+    fallback: ?*Grouped = null,
+    bytes: usize,
     pub fn init(a: Allocator, manager: *spill.Manager, specs: []const operators.AggregateSpec, key_count: usize, bytes: usize) !Grouped {
         const orders = try a.alloc(operators.Order, key_count);
         @memset(orders, .{});
-        return .{ .a = a, .sort = spill.Sort.init(a, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(a), .read_arena = std.heap.ArenaAllocator.init(a) };
+        return .{ .a = a, .sort = spill.Sort.init(a, manager, orders, bytes / 4), .specs = specs, .state_arena = std.heap.ArenaAllocator.init(a), .read_arena = std.heap.ArenaAllocator.init(a), .bytes = bytes, .partitioned = bytes >= 64 * 1024 and for (specs) |spec| {
+            if (spec.distinct or !(spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and spec.input_type == .integer))) break false;
+        } else true };
     }
     pub fn deinit(self: *Grouped) void {
+        for (&self.partitions) |*file| if (file.*) |*open| open.close();
+        if (self.local) |local| local.deinit();
+        if (self.fallback) |fallback| {
+            fallback.deinit();
+            self.a.destroy(fallback);
+        }
         self.a.free(self.sort.orders);
         self.sort.deinit();
         self.state_arena.deinit();
@@ -55,12 +69,12 @@ pub const Grouped = struct {
             cells[5] = Datum.json(.{ .bool = state.boolean });
             cells[6] = if (state.selected) |selected| selected.row.values[0] else .{};
         }
-        try self.sort.add(.{ .keys = keys, .values = values, .ordinal = ordinal });
+        try self.append(.{ .keys = keys, .values = values, .ordinal = ordinal });
         for (states, 0..) |state, slot| if (state.distinct) {
             for (state.distinct_values.items) |entry| {
-                try self.sort.add(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), entry.row.row.values[0] }, .ordinal = ordinal });
+                try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), entry.row.row.values[0] }, .ordinal = ordinal });
             }
-            if (state.kind == .pattern_set and state.patterns.?.has_null) try self.sort.add(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
+            if (state.kind == .pattern_set and state.patterns.?.has_null) try self.append(.{ .keys = keys, .values = &.{ Datum.json(.{ .integer = @intCast(slot) }), .{} }, .ordinal = ordinal });
         };
     }
     pub fn add(self: *Grouped, keys: []const Datum, inputs: []const Datum, ordinal: u64) !void {
@@ -68,7 +82,91 @@ pub const Grouped = struct {
         defer self.a.free(values);
         values[0] = Datum.json(.{ .bool = false });
         @memcpy(values[1..], inputs);
-        try self.sort.add(.{ .keys = keys, .values = values, .ordinal = ordinal });
+        try self.append(.{ .keys = keys, .values = values, .ordinal = ordinal });
+    }
+    fn append(self: *Grouped, row: operators.Row) !void {
+        if (!self.partitioned) return self.sort.add(row);
+        var hash = std.hash.Wyhash.init(0);
+        for (row.keys) |key| {
+            const value = if (key.sql_null) 0 else try scalar.semanticHash(key.value);
+            var bytes: [9]u8 = undefined;
+            bytes[0] = @intFromBool(key.sql_null);
+            std.mem.writeInt(u64, bytes[1..9], value, .little);
+            hash.update(&bytes);
+        }
+        const index = hash.final() % self.partitions.len;
+        if (self.partitions[index] == null) {
+            self.partitions[index] = try self.sort.manager.create();
+            self.partitions[index].?.buffer_bytes = 512;
+        }
+        _ = try self.partitions[index].?.append(row, spill.none);
+    }
+    fn nativeInputs(self: *Grouped, values: []const Datum) bool {
+        if (values.len != self.specs.len) return false;
+        for (values, self.specs) |value, spec| {
+            if (value.sql_null or spec.kind == .count) continue;
+            if (spec.kind == .sum and value.value != .integer) return false;
+            if ((spec.kind == .bool_and or spec.kind == .bool_or) and value.value != .bool) return false;
+        }
+        return true;
+    }
+    fn nextPartition(self: *Grouped, out: Allocator) anyerror!?operators.GroupResult {
+        while (true) {
+            if (self.local) |local| {
+                if (try local.nextResult(out)) |result| {
+                    self.output_count += 1;
+                    return result;
+                }
+                local.deinit();
+                self.local = null;
+            }
+            if (self.fallback) |fallback| {
+                if (try fallback.next(out)) |result| {
+                    self.output_count += 1;
+                    return result;
+                }
+                fallback.deinit();
+                self.a.destroy(fallback);
+                self.fallback = null;
+            }
+            if (self.partition_index == self.partitions.len) return null;
+            const index = self.partition_index;
+            self.partition_index += 1;
+            const file = if (self.partitions[index]) |*open| open else continue;
+            try file.seal();
+            self.local = try operators.Grouped.create(self.a, self.specs, .{ .bytes = self.bytes / 2, .groups = std.math.maxInt(usize) });
+            var offset: u64 = 0;
+            var scratch = std.heap.ArenaAllocator.init(self.a);
+            defer scratch.deinit();
+            while (offset < file.size) {
+                try self.sort.manager.check();
+                _ = scratch.reset(.retain_capacity);
+                const row = try file.read(scratch.allocator(), offset);
+                offset = row.following;
+                if (row.row.values.len == 0 or row.row.values[0].value != .bool) return error.InvalidSqlSpill;
+                const partial_state = row.row.values[0].value.bool;
+                if (self.fallback == null and ((!partial_state and !self.nativeInputs(row.row.values[1..])) or !try self.local.?.canRetain(row.row.keys, if (partial_state) &.{} else row.row.values[1..]))) {
+                    const fallback = try self.a.create(Grouped);
+                    errdefer self.a.destroy(fallback);
+                    fallback.* = try Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes);
+                    fallback.partitioned = false;
+                    errdefer fallback.deinit();
+                    try self.local.?.exportPartial(fallback);
+                    self.local.?.deinit();
+                    self.local = null;
+                    self.fallback = fallback;
+                }
+                if (self.fallback) |fallback| {
+                    try fallback.append(row.row);
+                } else if (partial_state) {
+                    try self.local.?.importPartial(row.row.keys, row.row.values[1..], row.row.ordinal);
+                } else {
+                    try self.local.?.addOrdered(row.row.keys, row.row.values[1..], row.row.ordinal);
+                }
+            }
+            file.close();
+            self.partitions[index] = null;
+        }
     }
     fn same(left: []const Datum, right: []const Datum) !bool {
         if (left.len != right.len) return error.InvalidSqlSpill;
@@ -76,6 +174,7 @@ pub const Grouped = struct {
         return true;
     }
     pub fn next(self: *Grouped, out: Allocator) !?operators.GroupResult {
+        if (self.partitioned) return self.nextPartition(out);
         _ = self.state_arena.reset(.free_all);
         const a = self.state_arena.allocator();
         var row = self.pending orelse (try self.sort.next(self.read_arena.allocator())) orelse return null;
@@ -151,7 +250,7 @@ pub const Grouped = struct {
         self.output_count += 1;
         return .{ .keys = output_keys, .aggregates = aggregates, .ordinal = ordinal };
     }
-    fn merge(state: *operators.Aggregate, cells: []const Datum) !void {
+    pub fn merge(state: *operators.Aggregate, cells: []const Datum) !void {
         const count = std.math.cast(u64, cells[0].value.integer) orelse return error.InvalidSqlSpill;
         if (count == 0) return;
         const total = std.math.add(u64, state.count, count) catch return error.SqlNumericOutOfRange;
@@ -185,3 +284,64 @@ pub const Grouped = struct {
         state.count = total;
     }
 };
+
+test "SQL partitioned typed aggregation reduces repeated updates and preserves ordinals" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var written: [2]u64 = undefined;
+    for ([_]bool{ false, true }, 0..) |partitioned, run| {
+        var budget: @import("memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
+        const a = budget.allocator();
+        {
+            var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false, .compression = .none };
+            defer manager.deinit();
+            var group = try Grouped.init(a, &manager, &.{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer } }, 1, 128 * 1024);
+            group.partitioned = partitioned;
+            defer group.deinit();
+            for (0..8192) |index| {
+                const key = Datum.json(.{ .integer = @intCast(index % 128) });
+                try group.add(&.{key}, &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = @intCast(index % 7) }) }, index);
+            }
+            var seen: [128]bool = @splat(false);
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            while (true) {
+                _ = scratch.reset(.retain_capacity);
+                const result = (try group.next(scratch.allocator())) orelse break;
+                const key: usize = @intCast(result.keys[0].value.integer);
+                try std.testing.expect(!seen[key]);
+                seen[key] = true;
+                var sum: i64 = 0;
+                for (0..64) |index| sum += @intCast((key + index * 128) % 7);
+                try std.testing.expectEqual(@as(i64, 64), result.aggregates[0].value.integer);
+                try std.testing.expectEqual(sum, result.aggregates[1].value.integer);
+                try std.testing.expectEqual(@as(u64, key), result.ordinal);
+            }
+            for (seen) |found| try std.testing.expect(found);
+            written[run] = manager.written_bytes;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expect(written[1] < written[0] / 2);
+    std.debug.print("SQL aggregate spill bytes: sorted={d} partitioned={d}\n", .{ written[0], written[1] });
+}
+
+test "SQL partitioned integer aggregation preserves invalid input errors" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    const a = std.testing.allocator;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .async_writes = false };
+    defer manager.deinit();
+    var group = try Grouped.init(a, &manager, &.{.{ .kind = .sum, .input_type = .integer }}, 1, 128 * 1024);
+    defer group.deinit();
+    const key = Datum.json(.{ .integer = 7 });
+    try group.add(&.{key}, &.{Datum.json(.{ .integer = 1 })}, 3);
+    try group.add(&.{key}, &.{Datum.json(.{ .float = 2.5 })}, 4);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try std.testing.expectError(error.SqlTypeMismatch, group.next(arena.allocator()));
+}

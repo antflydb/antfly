@@ -38,6 +38,20 @@ pub fn plan(a: std.mem.Allocator, bound: anytype) ![]usize {
     }
     return roots;
 }
+/// A final ORDER BY can consume a window's physical order directly. Require
+/// the full key, including partition keys, so original-ordinal tie ordering
+/// remains identical to a fresh sort. Expressions/decision keys stay opaque.
+pub fn finalOrder(sort: binding.Sort, programs: []const @import("scalar.zig").Program, orders: []const @import("ast.zig").Order) bool {
+    if (programs.len == 0 or programs.len != sort.partition.len + sort.order.len or programs.len != orders.len) return false;
+    for (programs, orders, 0..) |program, order, index| {
+        if (program.instructions.len != 1 or program.instructions[0].operation != .column) return false;
+        const column = if (index < sort.partition.len) sort.partition[index] else sort.order[index - sort.partition.len];
+        const direction: @import("operators.zig").Order = if (index < sort.partition.len) .{} else sort.directions[index - sort.partition.len];
+        if (program.instructions[0].operation.column != column or order.descending != direction.descending or (order.nulls_first orelse order.descending) != (direction.nulls_first orelse direction.descending)) return false;
+    }
+    return true;
+}
+
 test "SQL window ordering reuse retains navigation and ROWS tie semantics" {
     const a = std.testing.allocator;
     const sorts = [_]binding.Sort{

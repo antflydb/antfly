@@ -103,17 +103,14 @@ fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *operators
     }
     var accepted = page;
     accepted.selection = selection.items;
-    const keys = try a.alloc([]Datum, selection.items.len);
-    const inputs = try a.alloc([]Datum, selection.items.len);
-    for (keys, inputs) |*key, *input| {
-        key.* = try a.alloc(Datum, bound.group_count);
-        input.* = try a.alloc(Datum, bound.inputs.len);
+    const keys = try a.alloc([]const Datum, bound.group_count);
+    const inputs = try a.alloc([]Datum, bound.inputs.len);
+    for (inputs) |*input| {
+        input.* = try a.alloc(Datum, selection.items.len);
         @memset(input.*, .{});
     }
-    for (bound.input.projections[0..bound.group_count], 0..) |optional, k| {
-        const values = try columnValues(context, bound, a, accepted, &optional.?);
-        for (keys, values) |key, value| key[k] = value;
-    }
+    for (bound.input.projections[0..bound.group_count], keys) |optional, *key|
+        key.* = try columnValues(context, bound, a, accepted, &optional.?);
     for (bound.inputs, bound.filters, 0..) |input, filter, k| {
         const filters = if (filter) |slot| try columnValues(context, bound, a, accepted, &bound.input.projections[slot].?) else null;
         var filtered: std.ArrayList(usize) = .empty;
@@ -131,10 +128,24 @@ fn addColumns(context: anytype, bound: *const binding.Bound, grouped: *operators
         selected.selection = filtered.items;
         if (input) |slot| {
             const values = try columnValues(context, bound, a, selected, &bound.input.projections[slot].?);
-            for (positions.items, values) |index, value| inputs[index][k] = value;
-        } else for (positions.items) |index| inputs[index][k] = Datum.json(.{ .integer = 1 });
+            for (positions.items, values) |index, value| inputs[k][index] = value;
+        } else for (positions.items) |index| inputs[k][index] = Datum.json(.{ .integer = 1 });
     }
-    if (bound.group_count == 0) try grouped.addGlobalBatch(inputs) else for (keys, inputs) |key, input| try grouped.add(key, input);
+    if (bound.group_count == 0) {
+        const columns = try a.alloc([]const Datum, inputs.len);
+        for (inputs, columns) |input, *column| column.* = input;
+        try grouped.addGlobalColumns(columns, accepted.selection.len);
+    } else {
+        // One transient row boundary per batch, rather than a Datum matrix.
+        // Retained keys and state live in the operator's typed columns.
+        const row_keys = try a.alloc(Datum, keys.len);
+        const row_inputs = try a.alloc(Datum, inputs.len);
+        for (0..accepted.selection.len) |index| {
+            for (keys, row_keys) |column, *cell| cell.* = column[index];
+            for (inputs, row_inputs) |column, *cell| cell.* = column[index];
+            try grouped.add(row_keys, row_inputs);
+        }
+    }
 }
 
 fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {
@@ -223,8 +234,8 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             if (pages > context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var arena = std.heap.ArenaAllocator.init(context.alloc);
             defer arena.deinit();
-            if (!external) if (try scan.columns(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.page_rows })) |column_page| {
-                if (column_page.selection.len > context.limits.page_rows) return error.InvalidSqlBackendResponse;
+            if (!external) if (try scan.columns(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.execution_batch_rows })) |column_page| {
+                if (column_page.selection.len > context.limits.execution_batch_rows) return error.InvalidSqlBackendResponse;
                 if (column_page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
                 visited += column_page.selection.len;
                 try addColumns(context, bound, grouped, arena.allocator(), column_page);

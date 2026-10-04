@@ -606,8 +606,8 @@ pub const HashJoin = struct {
         self.key_count = keys.len;
         if (self.disk == null and self.limits.spill != null) {
             var estimate: usize = 4096;
-            for (values) |value| estimate +|= (try datumBytes(value)) *| 4;
-            for (keys) |value| estimate +|= (try datumBytes(value)) *| 4;
+            estimate +|= (try self.value_columns.appendBytes(values)) *| 4;
+            estimate +|= (try self.key_columns.appendBytes(keys)) *| 4;
             if (self.budget.live > self.budget.limit / 2 or estimate > self.budget.limit -| self.budget.live) try self.startSpill();
         }
         if (self.disk != null) {
@@ -675,7 +675,7 @@ pub const HashJoin = struct {
 /// pointers valid through map growth and result handoff.
 pub const Grouped = struct {
     pub const Limits = struct { groups: usize = 10000, bytes: usize = 8 * 1024 * 1024, spill: ?*@import("spill.zig").Manager = null };
-    const Group = struct { next: ?usize };
+    const Group = struct { next: ?usize, ordinal: u64 };
     backing: Allocator,
     budget: MemoryBudget,
     specs: []AggregateSpec,
@@ -687,6 +687,7 @@ pub const Grouped = struct {
     heads: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     rows_seen: u64 = 0,
     hash_probes: u64 = 0,
+    last_group: ?usize = null,
     failed: bool = false,
     finished: bool = false,
     key_count: ?usize = null,
@@ -717,7 +718,7 @@ pub const Grouped = struct {
             const a = scratch.allocator();
             const states = try a.alloc(Aggregate, self.specs.len);
             for (self.state_columns, states) |column, *state| state.* = try column.snapshot(a, index);
-            try external.partial(try self.key_columns.row(a, index), states, index);
+            try external.partial(try self.key_columns.row(a, index), states, self.groups.items[index].ordinal);
         }
         self.clearGroups();
         self.external = external;
@@ -792,6 +793,43 @@ pub const Grouped = struct {
     /// Global COUNT, integer SUM and boolean reductions do not need a hash
     /// probe per row. Validate the batch before changing state; unsupported
     /// kinds, DISTINCT, mixed values and disk groups retain ordered updates.
+    pub fn canRetain(self: *const Grouped, keys: []const Datum, inputs: []const Datum) !bool {
+        var needed: usize = 4096 + self.specs.len * @sizeOf(Aggregate) * 2;
+        needed +|= (try self.key_columns.appendBytes(keys)) *| 4;
+        for (inputs) |input| needed +|= (try datumBytes(input)) *| 4;
+        return self.budget.live <= self.budget.limit / 2 and needed <= self.budget.limit -| self.budget.live;
+    }
+    pub fn addOrdered(self: *Grouped, keys: []const Datum, inputs: []const Datum, ordinal: u64) !void {
+        const prior_groups = self.groups.items.len;
+        try self.add(keys, inputs);
+        const index = self.last_group orelse return error.InvalidSqlBackendResponse;
+        self.groups.items[index].ordinal = if (index >= prior_groups) ordinal else @min(self.groups.items[index].ordinal, ordinal);
+    }
+    pub fn importPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
+        if (cells.len != self.specs.len * 7 or self.external != null) return error.InvalidSqlSpill;
+        const inputs = try self.backing.alloc(Datum, self.specs.len);
+        defer self.backing.free(inputs);
+        @memset(inputs, .{});
+        try self.addOrdered(keys, inputs, ordinal);
+        const index = self.last_group.?;
+        for (self.state_columns, 0..) |*column, slot| {
+            var state = try column.snapshot(self.backing, index);
+            try @import("spill_grouped.zig").Grouped.merge(&state, cells[slot * 7 ..][0..7]);
+            column.set(index, state);
+        }
+    }
+    pub fn exportPartial(self: *Grouped, external: *@import("spill_grouped.zig").Grouped) !void {
+        var scratch = std.heap.ArenaAllocator.init(self.backing);
+        defer scratch.deinit();
+        for (self.groups.items, 0..) |group, index| {
+            _ = scratch.reset(.free_all);
+            const a = scratch.allocator();
+            const states = try a.alloc(Aggregate, self.specs.len);
+            for (self.state_columns, states) |column, *state| state.* = try column.snapshot(a, index);
+            try external.partial(try self.key_columns.row(a, index), states, group.ordinal);
+        }
+    }
+
     pub fn addGlobalBatch(self: *Grouped, inputs: []const []const Datum) !void {
         if (self.failed or self.finished or (self.key_count != null and self.key_count.? != 0)) return error.InvalidSqlBackendResponse;
         var supported = self.external == null;
@@ -845,6 +883,69 @@ pub const Grouped = struct {
         self.rows_seen = std.math.add(u64, self.rows_seen, remaining.len) catch return error.SqlNumericOutOfRange;
     }
 
+    pub fn addGlobalColumns(self: *Grouped, inputs: []const []const Datum, row_count: usize) !void {
+        if (self.failed or self.finished or (self.key_count != null and self.key_count.? != 0)) return error.InvalidSqlBackendResponse;
+        var supported = self.external == null;
+        for (self.specs) |spec| supported = supported and !spec.distinct and (spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and spec.input_type == .integer));
+        if (inputs.len != self.specs.len) return error.InvalidSqlBackendResponse;
+        for (inputs, self.specs) |column, spec| {
+            if (column.len != row_count) return error.InvalidSqlBackendResponse;
+            for (column) |value| {
+                if (value.sql_null or spec.kind == .count) continue;
+                if ((spec.kind == .sum and value.value != .integer) or ((spec.kind == .bool_and or spec.kind == .bool_or) and value.value != .bool)) supported = false;
+            }
+        }
+        const row = try self.backing.alloc(Datum, inputs.len);
+        defer self.backing.free(row);
+        if (!supported) {
+            for (0..row_count) |index| {
+                for (inputs, row) |column, *cell| cell.* = column[index];
+                try self.add(&.{}, row);
+            }
+            return;
+        }
+        if (row_count == 0) return;
+        // First-row admission retains the usual spill/budget decision.
+        for (inputs, row) |column, *cell| cell.* = column[0];
+        try self.add(&.{}, row);
+        if (self.external != null) {
+            for (1..row_count) |index| {
+                for (inputs, row) |column, *cell| cell.* = column[index];
+                try self.add(&.{}, row);
+            }
+            return;
+        }
+        errdefer self.failed = true;
+        const remaining = row_count - 1;
+        for (self.state_columns, 0..) |*states, column| {
+            var snapshot = try states.snapshot(self.backing, 0);
+            const state = &snapshot;
+            var index: usize = 0;
+            while (index < remaining) {
+                var counts: [4]u64 = @splat(0);
+                var integers: [4]i128 = @splat(0);
+                var booleans: [4]bool = @splat(state.kind == .bool_and);
+                const count = @min(@as(usize, 4), remaining - index);
+                for (0..count) |lane| {
+                    const value = inputs[column][1 + index + lane];
+                    if (value.sql_null) continue;
+                    counts[lane] = 1;
+                    if (state.kind == .sum) integers[lane] = value.value.integer;
+                    if (state.kind == .bool_and or state.kind == .bool_or) booleans[lane] = value.value.bool;
+                }
+                const added = @reduce(.Add, @as(@Vector(4, u64), counts));
+                if (added > @as(u64, std.math.maxInt(i64)) - state.count) return error.SqlNumericOutOfRange;
+                state.count += added;
+                if (state.kind == .sum) state.integer_sum = std.math.add(i128, state.integer_sum, @reduce(.Add, @as(@Vector(4, i128), integers))) catch return error.SqlNumericOutOfRange;
+                if (state.kind == .bool_and) state.boolean = state.boolean and @reduce(.And, @as(@Vector(4, bool), booleans));
+                if (state.kind == .bool_or) state.boolean = state.boolean or @reduce(.Or, @as(@Vector(4, bool), booleans));
+                index += count;
+            }
+            states.set(0, snapshot);
+        }
+        self.rows_seen = std.math.add(u64, self.rows_seen, remaining) catch return error.SqlNumericOutOfRange;
+    }
+
     pub fn ensureGlobalGroup(self: *Grouped) !void {
         if (self.rows_seen != 0 or self.groups.items.len != 0) return;
         self.key_count = 0;
@@ -871,7 +972,7 @@ pub const Grouped = struct {
         const values = try alloc.alloc(Datum, self.specs.len);
         errdefer alloc.free(values);
         for (self.state_columns, values) |*column, *value| value.* = try column.finish(index);
-        return .{ .keys = try self.key_columns.row(self.results.allocator(), index), .aggregates = values, .ordinal = index };
+        return .{ .keys = try self.key_columns.row(self.results.allocator(), index), .aggregates = values, .ordinal = self.groups.items[index].ordinal };
     }
 
     fn update(self: *Grouped, keys: []const Datum, inputs: []const Datum) !void {
@@ -893,6 +994,7 @@ pub const Grouped = struct {
             slot = group.next;
         }
         if (slot == null) slot = try self.appendGroup(keys, hash);
+        self.last_group = slot;
         for (self.state_columns, inputs) |*column, value| try column.update(self.budget.allocator(), slot.?, value);
         self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
     }
@@ -905,7 +1007,7 @@ pub const Grouped = struct {
         _ = try self.key_columns.append(keys);
         for (self.state_columns) |*column| try column.append(alloc);
         const index = self.groups.items.len;
-        self.groups.appendAssumeCapacity(.{ .next = self.heads.get(hash) });
+        self.groups.appendAssumeCapacity(.{ .next = self.heads.get(hash), .ordinal = self.rows_seen });
         self.heads.putAssumeCapacity(hash, index);
         return index;
     }

@@ -53,6 +53,16 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     var columns: std.ArrayList([]const u8) = .empty;
     for (request.fields) |field| try appendColumn(owned, &columns, table, field);
     for (request.conditions) |condition| try appendColumn(owned, &columns, table, condition.column);
+    if (source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |name| {
+        // Equality columns are scan evidence even when absent from SELECT.
+        var found = false;
+        for (columns.items) |prior| if (std.mem.eql(u8, prior, name)) {
+            found = true;
+            break;
+        };
+        if (!found) try columns.append(owned, name);
+    };
+    const identity_only = columns.items.len == 0;
     if (columns.items.len == 0) {
         if (table.columns.len == 0) return error.InvalidSqlBackendResponse;
         try columns.append(owned, table.columns[0].path);
@@ -80,6 +90,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     const normalized = try context.platformDeadline();
     var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
+    stream.identity_only = identity_only;
     if (source.iceberg_schema != null or std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
         var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;
         for (table.columns) |column| {
@@ -103,6 +114,12 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     const before = if (request.before) |v| try owned.dupe(u8, v) else null;
     const primary_key = if (request.primary_key) |v| try owned.dupe(u8, v) else null;
     owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key };
+    var filter_columns: std.ArrayList([]const u8) = .empty;
+    for (conditions) |condition| try appendColumn(owned, &filter_columns, table, condition.column);
+    if (source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |name| try filter_columns.append(owned, name);
+    owner.stream.filter_columns = filter_columns.items;
+    if (source.scanner.iceberg_delete_plan != null or conditions.len != 0 or after != null or before != null or primary_key != null)
+        owner.stream.filter = .{ .ptr = owner, .any_match = Owner.anyMatch };
     var estimated_rows: u64 = 0;
     var estimated_bytes: u64 = 0;
     for (source.inventory.files) |file| {
@@ -188,6 +205,45 @@ const Owner = struct {
     position: usize = 0,
     exhausted: bool = false,
 
+    fn matchesAt(self: *Owner, a: Allocator, batch: @import("../storage/rowsource/types.zig").ColumnBatch, index: usize, physical: @import("../storage/rowsource/types.zig").ColumnBatch) !bool {
+        try self.context.ensureActive();
+        if (try self.stream.isDeletedBatch(a, physical, index)) return false;
+        const one: catalog.ColumnPage = .{ .batch = batch, .selection = &.{index} };
+        if (self.after != null or self.before != null or self.primary_key != null) {
+            const id = (try one.cell(a, 0, "_id")).value.string;
+            if (self.after) |after| if (std.mem.order(u8, id, after) != .gt) return false;
+            if (self.before) |before| if (std.mem.order(u8, id, before) != .lt) return false;
+            if (self.primary_key) |key| if (!std.mem.eql(u8, id, key)) return false;
+        }
+        if (self.dynamic) |filter| {
+            const keys = try a.alloc(scalar.Datum, filter.columns.len);
+            for (filter.columns, keys) |key, *value| {
+                const cell = try one.cell(a, 0, key.name);
+                value.* = .{ .value = if (cell.sql_null) .null else try @import("../sql/describe.zig").coerceAlloc(a, cell.value, key.type), .sql_null = cell.sql_null };
+            }
+            if (!try filter.contains(keys)) return false;
+        }
+        return matchesColumns(one, a, self.table, self.conditions);
+    }
+    fn anyMatch(raw: *anyopaque, batch: @import("../storage/rowsource/types.zig").ColumnBatch) !bool {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const vectors = try scratch.allocator().dupe(@import("../storage/rowsource/types.zig").ColumnVector, batch.columns);
+        for (vectors) |*vector| for (self.table.columns) |definition| if (std.mem.eql(u8, definition.path, vector.name)) {
+            vector.name = definition.name;
+            break;
+        };
+        var view = batch;
+        view.columns = vectors;
+        var row_scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer row_scratch.deinit();
+        for (0..batch.rowCount()) |index| {
+            _ = row_scratch.reset(.retain_capacity);
+            if (try self.matchesAt(row_scratch.allocator(), view, index, batch)) return true;
+        }
+        return false;
+    }
     fn countRows(raw: *anyopaque) !?u64 {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.dynamic != null or self.conditions.len != 0 or self.after != null or self.before != null or self.primary_key != null or self.batch != null) return null;
@@ -220,6 +276,18 @@ const Owner = struct {
                 try predicates.append(a, .{ .column = column.path, .op = if (lower) .gte else .lte, .value = physical });
             }
         }
+        var filter_columns: std.ArrayList([]const u8) = .empty;
+        try filter_columns.appendSlice(a, self.stream.filter_columns);
+        var scan_columns: std.ArrayList([]const u8) = .empty;
+        try scan_columns.appendSlice(a, self.stream.columns);
+        for (filter.columns) |key| {
+            try appendColumn(a, &filter_columns, self.table, key.name);
+            try appendColumn(a, &scan_columns, self.table, key.name);
+        }
+        self.stream.columns = scan_columns.items;
+        if (filter_columns.items.len != 0) self.stream.identity_only = false;
+        self.stream.filter_columns = filter_columns.items;
+        self.stream.filter = .{ .ptr = self, .any_match = anyMatch };
         self.stream.predicates = predicates.items;
         self.dynamic = filter;
         return true;
@@ -262,26 +330,9 @@ const Owner = struct {
                 try self.context.ensureActive();
                 const index = self.position;
                 self.position += 1;
-                if (self.stream.isDeleted(batch.row_refs[index])) continue;
                 var temporary = std.heap.ArenaAllocator.init(self.alloc);
                 defer temporary.deinit();
-                const a = temporary.allocator();
-                const one: catalog.ColumnPage = .{ .batch = view, .selection = &.{index} };
-                if (self.after != null or self.before != null or self.primary_key != null) {
-                    const id = (try one.cell(a, 0, "_id")).value.string;
-                    if (self.after) |after| if (std.mem.order(u8, id, after) != .gt) continue;
-                    if (self.before) |before| if (std.mem.order(u8, id, before) != .lt) continue;
-                    if (self.primary_key) |key| if (!std.mem.eql(u8, id, key)) continue;
-                }
-                if (self.dynamic) |filter| {
-                    const keys = try a.alloc(scalar.Datum, filter.columns.len);
-                    for (filter.columns, keys) |key, *value| {
-                        const cell = try one.cell(a, 0, key.name);
-                        value.* = .{ .value = if (cell.sql_null) .null else try @import("../sql/describe.zig").coerceAlloc(a, cell.value, key.type), .sql_null = cell.sql_null };
-                    }
-                    if (!try filter.contains(keys)) continue;
-                }
-                if (!try matchesColumns(one, a, self.conditions)) continue;
+                if (!try self.matchesAt(temporary.allocator(), view, index, batch)) continue;
                 selected[count] = index;
                 count += 1;
             }
@@ -330,7 +381,7 @@ const Owner = struct {
     }
 };
 
-fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, conditions: []const catalog.Condition) !bool {
+fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, table: catalog.Table, conditions: []const catalog.Condition) !bool {
     for (conditions) |condition| {
         const cell = try page.cell(alloc, 0, condition.column);
         if (condition.op == .is_null) {
@@ -342,7 +393,9 @@ fn matchesColumns(page: catalog.ColumnPage, alloc: Allocator, conditions: []cons
             continue;
         }
         if (cell.sql_null or condition.value == .null) return false;
-        const order = try scalar.compare(cell.value, condition.value);
+        const kind = (try table.column(condition.column)).type;
+        const stored = try @import("lake_values.zig").comparisonValue(alloc, cell.value, kind);
+        const order = try scalar.compare(stored, condition.value);
         const match = switch (condition.op) {
             .eq => order == .eq,
             .neq => order != .eq,
@@ -445,10 +498,13 @@ const TestLake = struct {
         }
     };
     fn populate(self: *TestLake, alloc: Allocator, count: usize, values: []const i64) !void {
-        var client = self.memory.client();
-        try client.makeBucket("bucket");
         const data = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .values = values, .field_id = 1, .write_statistics = true, .page_rows = self.page_rows }});
         defer alloc.free(data);
+        try self.populateData(alloc, count, data);
+    }
+    fn populateData(self: *TestLake, alloc: Allocator, count: usize, data: []const u8) !void {
+        var client = self.memory.client();
+        try client.makeBucket("bucket");
         for (0..count) |i| {
             const key = try std.fmt.allocPrint(alloc, "events/{d}.parquet", .{i});
             defer alloc.free(key);
@@ -460,11 +516,44 @@ const TestLake = struct {
         self.source = .{ .alloc = alloc, .store = .{ .alloc = alloc, .client = client, .owns_client = false, .bucket = @constCast("bucket"), .prefix = @constCast("events") }, .inventory = self.inventory, .scanner = serving.PinnedExternalObjectStorageLakeRowsScanner.init(self.inventory, self.meter.client()) };
     }
     fn deinit(self: *TestLake, alloc: Allocator) void {
+        if (self.source.prepared_deletes) |prepared| prepared.destroy(alloc);
         if (self.source.scanner.shared_reader) |reader| alloc.destroy(reader);
         self.inventory.deinit(alloc);
         self.memory.deinit();
     }
 };
+
+test "lake SQL late projection skips rejected page payloads and preserves alignment" {
+    const a = std.testing.allocator;
+    var predicates: [1024]i64 = @splat(0);
+    @memset(predicates[768..], 1);
+    var payload: [1024]i64 = undefined;
+    for (&payload, 0..) |*value, index| value.* = @intCast(index);
+    const data = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{
+        .{ .column_id = "amount", .values = &predicates, .page_rows = 256 },
+        .{ .column_id = "payload", .values = &payload, .page_rows = 128 },
+    });
+    defer a.free(data);
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populateData(a, 1, data);
+    defer lake.deinit(a);
+    lake.table.columns = &.{ .{ .name = "amount", .path = "amount", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .integer } };
+    const cursor = try openPinned(a, lake.table, .{ .fields = &.{"payload"}, .conditions = &.{.{ .column = "amount", .op = .eq, .value = .{ .integer = 1 } }}, .limit = 17 }, .{}, &lake.source);
+    defer cursor.close(cursor.ptr);
+    var total: usize = 0;
+    while (true) {
+        const page = try cursor.next(cursor.ptr, a, 17);
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expectEqual(@as(i64, @intCast(768 + total)), row.value.object.get("payload").?.integer);
+            total += 1;
+        }
+        if (page.after == null) break;
+    }
+    try std.testing.expectEqual(@as(usize, 256), total);
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
+    try std.testing.expectEqual(@as(usize, 6), owner.stream.page_cursor.?.pages_decoded);
+}
 
 test "lake SQL stream is lazy prunes pages and fences changed objects" {
     const alloc = std.testing.allocator;
@@ -505,6 +594,21 @@ test "lake SQL stream is lazy prunes pages and fences changed objects" {
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, stale.next(stale.ptr, alloc, 1));
 }
 
+test "lake SQL pushed number predicates retain declared coercion" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 1, &.{9007199254740993});
+    defer lake.deinit(a);
+    lake.table.columns = &.{.{ .name = "amount", .path = "amount", .type = .number }};
+    const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .conditions = &.{.{ .column = "amount", .op = .eq, .value = .{ .float = 9007199254740992.0 } }}, .limit = 1 }, .{}, &lake.source);
+    defer cursor.close(cursor.ptr);
+    const page = try cursor.next(cursor.ptr, a, 1);
+    defer page.deinit();
+    const coerced = try @import("../sql/describe.zig").coerceAlloc(a, .{ .integer = 9007199254740993 }, .number);
+    try std.testing.expectEqual(std.math.Order.eq, try scalar.compare(coerced, .{ .float = 9007199254740992.0 }));
+    try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+}
+
 test "lake SQL shared cache reuses ranges across scans without refreshing pinned versions" {
     const alloc = std.testing.allocator;
     var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(alloc) };
@@ -522,7 +626,7 @@ test "lake SQL shared cache reuses ranges across scans without refreshing pinned
         try std.testing.expectEqual(@as(usize, 3), page.rows.len);
         if (iteration == 1) try std.testing.expectEqual(before, lake.meter.reads);
     }
-    try std.testing.expect(cache.snapshot().hits >= 2);
+    try std.testing.expect(cache.decoded.hits >= 2);
 }
 
 test "lake SQL typed stream scans a million rows with memory bounded by one row group" {
@@ -572,6 +676,17 @@ test "lake SQL metadata count avoids decoded rows and typed pages preserve null 
     const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
     try std.testing.expectEqual(@as(usize, 0), owner.stream.stats.groups_decoded);
     try std.testing.expectEqual(@as(usize, 2), owner.stream.stats.files_opened);
+    const identities = try openPinned(alloc, lake.table, .{ .fields = &.{"_id"}, .limit = 10 }, .{}, &lake.source);
+    defer identities.close(identities.ptr);
+    const ids = try identities.next(identities.ptr, alloc, 10);
+    defer ids.deinit();
+    try std.testing.expectEqual(@as(usize, 5), ids.rows.len);
+    const identity_owner: *Owner = @ptrCast(@alignCast(identities.ptr));
+    try std.testing.expectEqual(@as(usize, 0), identity_owner.stream.page_cursor.?.pages_decoded);
+    const more_ids = try identities.next(identities.ptr, alloc, 10);
+    defer more_ids.deinit();
+    try std.testing.expectEqual(@as(usize, 5), more_ids.rows.len);
+    try std.testing.expectEqual(@as(usize, 0), identity_owner.stream.page_cursor.?.pages_decoded);
     const filtered = try openPinned(alloc, lake.table, .{ .fields = &.{}, .conditions = &.{.{ .column = "amount", .op = .gt, .value = .{ .integer = 3 } }}, .limit = 1 }, .{}, &lake.source);
     defer filtered.close(filtered.ptr);
     try std.testing.expect((try filtered.count_rows.?(filtered.ptr)) == null);
@@ -592,6 +707,7 @@ test "lake SQL typed stream applies Iceberg equality and position deletes before
     try lake.populate(alloc, 1, &.{ 1, 2, 3, 4, 5 });
     defer lake.deinit(alloc);
     lake.inventory.format = .iceberg;
+    lake.inventory.files[0].row_count = 5;
     lake.inventory.files[0].data_sequence_number = 5;
     lake.inventory.files[0].partition_spec_id = 0;
     lake.source.inventory = lake.inventory;
@@ -623,6 +739,14 @@ test "lake SQL typed stream applies Iceberg equality and position deletes before
     const end = try cursor.next(cursor.ptr, alloc, 1);
     defer end.deinit();
     try std.testing.expectEqual(@as(usize, 0), end.rows.len);
+    const prepared = lake.source.prepared_deletes.?;
+    const alias = try openPinned(alloc, lake.table, .{ .fields = &.{"amount"}, .limit = 8 }, .{}, &lake.source);
+    defer alias.close(alias.ptr);
+    const alias_page = try alias.next(alias.ptr, alloc, 8);
+    defer alias_page.deinit();
+    try std.testing.expectEqual(@as(usize, 3), alias_page.rows.len);
+    try std.testing.expectEqual(prepared, lake.source.prepared_deletes.?);
+    try std.testing.expectEqual(@as(usize, 3), prepared.decoded_pages);
     var mismatched = lake.table;
     mismatched.external_base_source.?.binding.schema_fingerprint = "another-schema";
     try std.testing.expectError(error.ExternalLakeSnapshotMismatch, openPinned(alloc, mismatched, .{ .fields = &.{}, .limit = 1 }, .{}, &lake.source));
@@ -752,7 +876,9 @@ test "lake SQL dynamic scan filters prune groups before decoding and filter sele
     defer filter.close();
     try filter.add(&.{scalar.Datum.json(.{ .integer = 3 })});
     filter.sealed = true;
-    const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 2 }, .{}, &lake.source);
+    // Dynamic evidence must be decoded even when the original projection
+    // needs metadata identities only.
+    const cursor = try openPinned(a, lake.table, .{ .fields = &.{"_id"}, .limit = 2 }, .{}, &lake.source);
     defer cursor.close(cursor.ptr);
     try std.testing.expect(try cursor.set_dynamic_filter.?(cursor.ptr, filter));
     try std.testing.expectEqual(@as(?u64, null), try cursor.count_rows.?(cursor.ptr));

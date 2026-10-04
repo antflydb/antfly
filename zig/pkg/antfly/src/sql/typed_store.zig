@@ -7,14 +7,65 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 const Datum = scalar.Datum;
 const A = std.mem.Allocator;
+const Dictionary = struct {
+    values: std.ArrayList([]const u8) = .empty,
+    indices: std.ArrayList(u32) = .empty,
+    lookup: std.StringHashMapUnmanaged(u32) = .empty,
+    flat: ?std.ArrayList([]const u8) = null,
+    const empty: Dictionary = .{};
+    fn deinit(self: *Dictionary, a: A) void {
+        self.values.deinit(a);
+        self.indices.deinit(a);
+        self.lookup.deinit(a);
+        if (self.flat) |*values| values.deinit(a);
+    }
+    fn append(self: *Dictionary, a: A, owned: A, value: ?[]const u8) !void {
+        // High-cardinality columns revert to flat storage after a bounded
+        // sample; dictionary overhead must not penalize unique identifiers.
+        if (self.flat == null and self.values.items.len >= 512 and self.values.items.len > self.indices.items.len / 2) {
+            var flat: std.ArrayList([]const u8) = .empty;
+            errdefer flat.deinit(a);
+            try flat.ensureTotalCapacity(a, self.indices.items.len + 1);
+            for (self.indices.items) |index| flat.appendAssumeCapacity(self.values.items[index]);
+            self.values.clearAndFree(a);
+            self.indices.clearAndFree(a);
+            self.lookup.clearAndFree(a);
+            self.flat = flat;
+        }
+        if (self.flat) |*values| {
+            try values.append(a, if (value) |bytes| try owned.dupe(u8, bytes) else &.{});
+            return;
+        }
+        const text = value orelse {
+            try self.indices.append(a, 0);
+            return;
+        };
+        if (self.lookup.get(text)) |index| {
+            try self.indices.append(a, index);
+            return;
+        }
+        const index = std.math.cast(u32, self.values.items.len) orelse return error.SqlProgramLimitExceeded;
+        const bytes = try owned.dupe(u8, text);
+        try self.values.append(a, bytes);
+        try self.lookup.put(a, bytes, index);
+        try self.indices.append(a, index);
+    }
+    fn resizeNulls(self: *Dictionary, a: A, count: usize) !void {
+        try self.indices.resize(a, count);
+        @memset(self.indices.items, 0);
+    }
+    fn getText(self: Dictionary, row: usize) []const u8 {
+        return if (self.flat) |values| values.items[row] else self.values.items[self.indices.items[row]];
+    }
+};
 const Column = struct {
     const Values = union(enum) {
         unknown,
         integers: std.ArrayList(i64),
         numbers: std.ArrayList(f64),
         booleans: std.ArrayList(bool),
-        strings: std.ArrayList([]const u8),
-        decimals: std.ArrayList([]const u8),
+        strings: Dictionary,
+        decimals: Dictionary,
         encoded: std.ArrayList(std.json.Value),
     };
     values: Values = .unknown,
@@ -39,8 +90,8 @@ const Column = struct {
             .integers => |v| .{ .integer = v.items[row] },
             .numbers => |v| .{ .float = v.items[row] },
             .booleans => |v| .{ .bool = v.items[row] },
-            .strings => |v| .{ .string = v.items[row] },
-            .decimals => |v| .{ .number_string = v.items[row] },
+            .strings => |v| .{ .string = v.getText(row) },
+            .decimals => |v| .{ .number_string = v.getText(row) },
             .encoded => |v| v.items[row],
         };
         return .{ .value = value, .sql_null = false, .patterns = if (self.patterns.items.len == 0) null else self.patterns.items[row] };
@@ -66,6 +117,7 @@ const Column = struct {
             };
             switch (self.values) {
                 .unknown => unreachable,
+                .strings, .decimals => |*values| try values.resizeNulls(a, row),
                 inline else => |*values| {
                     try values.resize(a, row);
                     @memset(values.items, switch (@typeInfo(@TypeOf(values.items)).pointer.child) {
@@ -105,8 +157,8 @@ const Column = struct {
             .integers => |*v| try v.append(a, if (value.sql_null) 0 else value.value.integer),
             .numbers => |*v| try v.append(a, if (value.sql_null) 0 else value.value.float),
             .booleans => |*v| try v.append(a, !value.sql_null and value.value.bool),
-            .strings => |*v| try v.append(a, if (value.sql_null) &.{} else try owned.dupe(u8, value.value.string)),
-            .decimals => |*v| try v.append(a, if (value.sql_null) &.{} else try owned.dupe(u8, value.value.number_string)),
+            .strings => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.string),
+            .decimals => |*v| try v.append(a, owned, if (value.sql_null) null else value.value.number_string),
             .encoded => |*v| try v.append(a, if (value.sql_null) .null else (try @import("operators.zig").cloneDatum(owned, value)).value),
         }
     }
@@ -125,6 +177,21 @@ pub const Store = struct {
         for (self.columns) |*column| column.deinit(self.a);
         self.a.free(self.columns);
         self.arena.deinit();
+    }
+    /// Conservative admission estimate that recognizes already retained
+    /// dictionary bytes. Capacity growth is still enforced by the allocator.
+    pub fn appendBytes(self: *const Store, values: []const Datum) !usize {
+        var bytes: usize = 0;
+        for (values, 0..) |value, index| {
+            var repeated = false;
+            if (!value.sql_null and index < self.columns.len) {
+                const column = self.columns[index];
+                if (column.values == .strings and value.value == .string) repeated = column.values.strings.lookup.contains(value.value.string);
+                if (column.values == .decimals and value.value == .number_string) repeated = column.values.decimals.lookup.contains(value.value.number_string);
+            }
+            bytes +|= if (repeated) @sizeOf(Datum) else try @import("operators.zig").datumBytes(value);
+        }
+        return bytes;
     }
     pub fn append(self: *Store, values: []const Datum) !usize {
         if (self.failed or (self.initialized and values.len != self.columns.len)) return error.InvalidSqlBackendResponse;
@@ -222,4 +289,20 @@ test "SQL typed store promotions and ragged widths release every allocation fail
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL typed dictionaries retain repeated payloads once and preserve promotion" {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 256 * 1024 };
+    const a = budget.allocator();
+    {
+        var store = Store.init(a);
+        defer store.deinit();
+        var payload: [1024]u8 = @splat('x');
+        for (0..10_000) |index| _ = try store.append(&.{if (index % 7 == 0) Datum{} else Datum.json(.{ .string = &payload })});
+        try std.testing.expectEqual(@as(usize, 1), store.columns[0].values.strings.values.items.len);
+        payload[0] = 'y';
+        try std.testing.expectEqual(@as(u8, 'x'), (try store.cell(a, 1, 0)).value.string[0]);
+        try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
 }

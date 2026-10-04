@@ -9,7 +9,7 @@ const parquet = @import("lake_parquet_rowgroup.zig");
 const external = @import("../external_source/mod.zig");
 const storage = @import("../../storage/object_storage.zig");
 const A = std.mem.Allocator;
-pub const Column = struct { name: []const u8, kind: []const u8, required: bool, field_id: ?i32 = null };
+pub const Column = struct { name: []const u8, kind: []const u8, required: bool, field_id: ?i32 = null, iceberg_type: []const u8 = "" };
 pub const Detected = struct {
     arena: std.heap.ArenaAllocator,
     columns: []const Column,
@@ -142,7 +142,7 @@ pub fn icebergSchema(a: A, bytes: []const u8, snapshot: ?[]const u8) !Detected {
             const scale = std.fmt.parseInt(i32, std.mem.trim(u8, params[comma + 1 .. params.len - 1], " "), 10) catch return error.UnsupportedExternalLakeSchemaType;
             @import("lake_decimal.zig").validate(precision, scale) catch return error.UnsupportedExternalLakeSchemaType;
         }
-        column.* = .{ .name = field.name, .kind = kind, .required = field.required, .field_id = field.id };
+        column.* = .{ .name = field.name, .kind = kind, .required = field.required, .field_id = field.id, .iceberg_type = field.type_name };
     }
     const fingerprint = try iceberg.schemaFingerprintAlloc(owned, root.object, schema_id);
     return .{ .arena = arena, .columns = columns, .fingerprint = fingerprint };

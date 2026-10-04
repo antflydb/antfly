@@ -17,14 +17,27 @@ pub const Cursor = struct {
     limits: parquet.MaterializationLimits,
     columns: []Column,
     position: u64 = 0,
+    /// Residual evidence is evaluated before projected payloads are decoded.
+    filter: ?Filter = null,
+    prune_ptr: ?*anyopaque = null,
+    prune_page: ?*const fn (*anyopaque, external.ColumnChunk, @import("lake_parquet_metadata.zig").IndexedPage) bool = null,
     shared_reader: ?*@import("lake_serving_cache.zig").Reader = null,
     dictionary_decodes: usize = 0,
     pages_decoded: usize = 0,
     output: std.heap.ArenaAllocator,
+    pub const Filter = struct {
+        ptr: *anyopaque,
+        any_match: *const fn (*anyopaque, types.ColumnBatch) anyerror!bool,
+    };
     const Column = struct {
+        required: bool = true,
+        directory: ?@import("lake_parquet_metadata.zig").PageDirectory = null,
+        index_loaded: bool = false,
+        pruned: bool = false,
         chunk: external.ColumnChunk,
         offset: u64,
         decoded: ?parquet.OwnedBatch = null,
+        cached: ?@import("lake_decoded_cache.zig").Lease = null,
         dictionary: ?page.Dictionary = null,
         first: u64 = 0,
         count: usize = 0,
@@ -47,6 +60,8 @@ pub const Cursor = struct {
     pub fn deinit(self: *Cursor) void {
         for (self.columns) |*column| {
             if (column.decoded) |*decoded| decoded.deinit(self.a);
+            if (column.cached) |lease| lease.release();
+            if (column.directory) |*directory| directory.deinit();
             if (column.dictionary) |*dictionary| dictionary.deinit(self.a);
         }
         self.a.free(self.columns);
@@ -55,20 +70,81 @@ pub const Cursor = struct {
     fn read(self: *Cursor, offset: u64, len: usize) ![]u8 {
         return self.reader.readPlannedAlloc(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_column_chunk });
     }
+    fn loadIndex(self: *Cursor, column: *Column) !void {
+        if (column.index_loaded) return;
+        column.index_loaded = true;
+        const offset = column.chunk.offset_index_offset orelse return;
+        const len = column.chunk.offset_index_length.?;
+        const budget = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
+        if (len > budget or (column.chunk.column_index_length orelse 0) > budget - len) return error.ParquetPageTooLarge;
+        const offsets = try self.reader.readPlannedAlloc(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_page_index });
+        defer self.a.free(offsets);
+        const bounds = if (column.chunk.column_index_offset) |start| try self.reader.readPlannedAlloc(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = start, .len = column.chunk.column_index_length.? }, .purpose = .parquet_page_index }) else null;
+        defer if (bounds) |bytes| self.a.free(bytes);
+        column.directory = try @import("lake_parquet_metadata.zig").parsePageDirectory(self.a, offsets, bounds, column.chunk, self.group.row_count, self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len));
+    }
     fn advance(self: *Cursor, column: *Column) !void {
         if (column.decoded) |*decoded| decoded.deinit(self.a);
         column.decoded = null;
+        if (column.cached) |lease| lease.release();
+        column.cached = null;
         column.first += column.count;
         column.count = 0;
         column.consumed = 0;
+        column.pruned = false;
+        if (self.filter != null) try self.loadIndex(column);
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         while (column.offset < end) {
+            if (column.directory) |directory| {
+                const indexed = for (directory.pages) |candidate| {
+                    if (candidate.offset == column.offset) break candidate;
+                } else null;
+                if (indexed) |entry| {
+                    if (entry.first != column.first) return error.InvalidParquetMetadata;
+                    if (entry.first + entry.rows <= self.position) {
+                        column.offset += entry.len;
+                        column.first += entry.rows;
+                        continue;
+                    }
+                    if (column.required and self.prune_page != null and !self.prune_page.?(self.prune_ptr.?, column.chunk, entry)) {
+                        column.pruned = true;
+                        column.offset += entry.len;
+                        column.count = entry.rows;
+                        column.consumed = @intCast(self.position - column.first);
+                        return;
+                    }
+                }
+            }
             const parsed = try self.header(column);
             const len = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
             if (len > end - column.offset) return error.InvalidParquetPage;
+            // Skip payloads whose row ordinals precede the next survivor.
+            // Header validation still fences malformed row counts/ranges.
+            if (parsed.header.page_type == .data_page or parsed.header.page_type == .data_page_v2) {
+                const count: usize = parsed.header.value_count;
+                if (count == 0 or column.first + count > self.group.row_count) return error.ParquetRowGroupRowCountMismatch;
+                if (column.first + count <= self.position) {
+                    column.offset += len;
+                    column.first += count;
+                    continue;
+                }
+            }
             const dictionary_bytes = if (column.dictionary) |dictionary| dictionary.retainedBytes() else 0;
             const share = @max(@as(usize, 1), self.columns.len);
             if (len > self.limits.max_input_bytes / share or parsed.header.uncompressed_page_size +| dictionary_bytes > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+            var cache_key: ?[32]u8 = null;
+            if (self.shared_reader) |reader| if (parsed.header.page_type == .data_page or parsed.header.page_type == .data_page_v2) {
+                const interpretation = try std.json.Stringify.valueAlloc(self.a, .{ .version = "decoded-page-v1", .chunk = column.chunk, .limits = self.limits, .columns = self.columns.len }, .{});
+                defer self.a.free(interpretation);
+                cache_key = try reader.objectKey(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk }, interpretation);
+                if (reader.cache.decoded.lookup(cache_key.?)) |lease| {
+                    column.cached = lease;
+                    column.offset += len;
+                    column.count = parsed.header.value_count;
+                    column.consumed = @intCast(self.position - column.first);
+                    return;
+                }
+            };
             const encoded = try self.read(column.offset, len);
             defer self.a.free(encoded);
             column.offset += len;
@@ -94,8 +170,20 @@ pub const Cursor = struct {
             limits.page_row_count = count;
             limits.page_encoding = parsed.header.encoding;
             limits.max_rows = @max(limits.max_rows, count);
-            column.decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &.{.{ .column_id = column.chunk.column_id, .bytes = encoded, .dictionary = if (column.dictionary) |*dictionary| dictionary else null }}, limits);
+            const input = [_]parquet.ColumnChunkInput{.{ .column_id = column.chunk.column_id, .bytes = encoded, .dictionary = if (column.dictionary) |*dictionary| dictionary else null }};
+            if (cache_key) |key| {
+                const cache = &self.shared_reader.?.cache.decoded;
+                const lease = try cache.create(self.limits.max_decoded_bytes / share *| 4 +| self.limits.max_struct_allocation_bytes);
+                errdefer lease.release();
+                const decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(lease.item.arena.allocator(), self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
+                lease.item.payload = .{ .columns = decoded.columns };
+                cache.publish(key, lease);
+                column.cached = lease;
+            } else {
+                column.decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &input, limits);
+            }
             column.count = count;
+            column.consumed = @intCast(self.position - column.first);
             self.pages_decoded += 1;
             if (column.first + count == self.group.row_count and column.offset != end) return error.ParquetRowGroupRowCountMismatch;
             return;
@@ -152,6 +240,7 @@ pub const Cursor = struct {
         var reads: [4]ranges.RangeRead = undefined;
         var count: usize = 0;
         for (self.columns) |*column| {
+            if (self.filter != null and !column.required) continue;
             if (count == reads.len) break;
             if (column.consumed != column.count) continue;
             const parsed = try self.header(column);
@@ -175,10 +264,19 @@ pub const Cursor = struct {
         try worker.advance(column);
         return .{ .pages = worker.pages_decoded, .dictionaries = worker.dictionary_decodes };
     }
-    fn advanceColumns(self: *Cursor) !void {
+    fn advanceColumns(self: *Cursor, required_only: bool) !void {
+        // Index arenas outlive this call. Their backing allocator must be the
+        // cursor allocator, never the temporary worker locking adapter.
+        if (self.filter != null) for (self.columns) |*column| {
+            if (!required_only or column.required) try self.loadIndex(column);
+        };
         const io = if (self.shared_reader) |reader| reader.context.io else null;
         if (io == null or self.columns.len < 2) {
-            for (self.columns) |*column| if (column.consumed == column.count) try self.advance(column);
+            for (self.columns) |*column| {
+                if (required_only and !column.required) continue;
+                if (column.first + column.count <= self.position) try self.advance(column);
+                column.consumed = @intCast(self.position - column.first);
+            }
             return;
         }
         var allocator: DecodeAllocator = .{ .backing = self.a };
@@ -192,7 +290,7 @@ pub const Cursor = struct {
         var next_column: usize = 0;
         while (next_column < self.columns.len) {
             for (&pending) |*future| {
-                while (next_column < self.columns.len and self.columns[next_column].consumed != self.columns[next_column].count) next_column += 1;
+                while (next_column < self.columns.len and ((required_only and !self.columns[next_column].required) or self.columns[next_column].first + self.columns[next_column].count > self.position)) next_column += 1;
                 if (next_column == self.columns.len) break;
                 const column = &self.columns[next_column];
                 future.* = @import("../../sql/parallel_scheduler.zig").global().submit(io.?, (self.limits.max_input_bytes +| self.limits.max_decoded_bytes) / self.columns.len, decode, .{ self.*, column, allocator.allocator() }) orelse {
@@ -217,33 +315,69 @@ pub const Cursor = struct {
             };
             if (failure) |err| return err;
         }
+        for (self.columns) |*column| if (!required_only or column.required) {
+            column.consumed = @intCast(self.position - column.first);
+        };
     }
-    pub fn next(self: *Cursor) !?types.ColumnBatch {
-        _ = self.output.reset(.free_all);
-        if (self.position == self.group.row_count) return null;
-        try self.advanceColumns();
-        var count: usize = 4096;
-        for (self.columns) |*column| {
-            count = @min(count, column.count - column.consumed);
-        }
-        if (count == 0 or self.columns.len == 0) return error.InvalidParquetPage;
+    /// Worker-owned lookahead prepares only predicate evidence. SQL residual
+    /// evaluation and projection admission stay on the consuming pipeline.
+    pub fn prepareEvidence(self: *Cursor) !void {
+        try self.advanceColumns(true);
+    }
+    fn batch(self: *Cursor, count: usize, required_only: bool) !types.ColumnBatch {
         const a = self.output.allocator();
         const refs = try a.alloc(types.RowRef, count);
         const binding = @import("../external_source/rowsource_bridge.zig").bindingFromValidatedInventory(self.inventory);
         for (refs, 0..) |*ref, index| ref.* = try @import("../../storage/rowsource/external.zig").makeRowRef(binding, self.file.file_id, self.group.ordinal, self.position + index);
-        const vectors = try a.alloc(types.ColumnVector, self.columns.len);
-        for (self.columns, vectors) |*column, *vector| {
-            const decoded = column.decoded.?.columns[0];
-            const start = column.consumed;
-            vector.* = decoded;
+        var vectors: std.ArrayList(types.ColumnVector) = .empty;
+        for (self.columns) |*column| {
+            if (required_only and !column.required) continue;
+            const decoded = if (column.cached) |lease| lease.item.payload.columns[0] else column.decoded.?.columns[0];
+            const begin: usize = @intCast(self.position - column.first);
+            var vector = decoded;
             vector.values = switch (decoded.values) {
-                inline else => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), values[start..][0..count]),
+                inline else => |values, tag| @unionInit(types.ColumnValues, @tagName(tag), values[begin..][0..count]),
             };
-            if (decoded.nulls.bytes.len != 0) vector.nulls.bytes = decoded.nulls.bytes[start..][0..count];
-            column.consumed += count;
+            if (decoded.nulls.bytes.len != 0) vector.nulls.bytes = decoded.nulls.bytes[begin..][0..count];
+            try vectors.append(a, vector);
         }
-        self.position += count;
-        try self.prefetchPages();
-        return .{ .snapshot = binding.snapshot(), .row_refs = refs, .columns = vectors };
+        return .{ .snapshot = binding.snapshot(), .row_refs = refs, .columns = vectors.items };
+    }
+    pub fn next(self: *Cursor) !?types.ColumnBatch {
+        while (self.position < self.group.row_count) {
+            _ = self.output.reset(.free_all);
+            if (self.columns.len == 0) {
+                const count: usize = @intCast(@min(@as(u64, 4096), self.group.row_count - self.position));
+                const result = try self.batch(count, false);
+                self.position += count;
+                if (self.filter) |filter| if (!try filter.any_match(filter.ptr, result)) continue;
+                return result;
+            }
+            if (self.filter) |filter| {
+                try self.advanceColumns(true);
+                var count: usize = 4096;
+                for (self.columns) |column| if (column.required) {
+                    count = @min(count, column.count - column.consumed);
+                };
+                if (count == 0 or self.columns.len == 0) return error.InvalidParquetPage;
+                const rejected = for (self.columns) |column| {
+                    if (column.required and column.pruned) break true;
+                } else false;
+                if (rejected or !try filter.any_match(filter.ptr, try self.batch(count, true))) {
+                    self.position += count;
+                    continue;
+                }
+            }
+            try self.advanceColumns(false);
+            var count: usize = 4096;
+            for (self.columns) |column| count = @min(count, column.count - column.consumed);
+            if (count == 0 or self.columns.len == 0) return error.InvalidParquetPage;
+            const result = try self.batch(count, false);
+            for (self.columns) |*column| column.consumed += count;
+            self.position += count;
+            try self.prefetchPages();
+            return result;
+        }
+        return null;
     }
 };

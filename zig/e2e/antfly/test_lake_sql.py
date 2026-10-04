@@ -51,6 +51,9 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         compression="snappy",
         use_dictionary=dictionary,
         row_group_size=173,
+        write_page_index=True,
+        data_page_size=256,
+        write_batch_size=32,
         data_page_version="2.0",
     )
     # file:// addresses Antfly's filesystem object-store namespace. The object
@@ -67,13 +70,16 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
     try:
 
         def request(method, path, payload=None):
-            response = requests.request(
-                method,
-                server.api_url + path,
-                json=payload,
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
-                timeout=60,
-            )
+            try:
+                response = requests.request(
+                    method,
+                    server.api_url + path,
+                    json=payload,
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=60,
+                )
+            except requests.RequestException as exc:
+                pytest.fail(f"{exc}\n{server.debug_logs()}")
             assert response.ok, (
                 response.text + "\n" + server.log_path.read_text()[-8000:]
             )

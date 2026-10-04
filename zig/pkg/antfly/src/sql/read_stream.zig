@@ -221,7 +221,7 @@ pub const Stream = struct {
     pub fn open(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: runtime.Limits) !?*Stream {
         if (compiled.statement != .select) return null;
         if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
-        if (limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
+        if (limits.execution_batch_rows == 0 or limits.execution_batch_rows > 4096 or limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0 or limits.scan_pages == 0) return error.InvalidSqlLimit;
         try backend.vtable.checkpoint(backend.ptr);
         const self = try alloc.create(Stream);
         errdefer alloc.destroy(self);
@@ -712,8 +712,13 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
         const stream = (try Stream.open(std.heap.page_allocator, backend, &compiled, &.{}, .{ .result_rows = 2, .page_rows = 16, .retained_bytes = 256 * 1024 })).?;
         defer stream.close();
         try std.testing.expect(stream.spool != null);
-        try std.testing.expect(stream.spool.?.sorted != null);
-        try std.testing.expectEqual(@as(usize, 0), stream.spool.?.rows.len);
+        if (std.mem.indexOf(u8, sql, "row_number()") != null) {
+            try std.testing.expect(stream.spool.?.sorted == null);
+            try std.testing.expectEqual(expected, stream.spool.?.rows.len);
+        } else {
+            try std.testing.expect(stream.spool.?.sorted != null);
+            try std.testing.expectEqual(@as(usize, 0), stream.spool.?.rows.len);
+        }
         const reads = fixture.calls;
         var seen: usize = 0;
         while (true) {

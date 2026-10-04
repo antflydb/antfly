@@ -228,6 +228,36 @@ OFFSET+LIMIT rows (plus one overflow witness without an explicit LIMIT), owns
 only competitive rows, and preserves stable tie ordering. Primary-key ascending
 order and simple COUNT retain their native fast paths.
 
+Lake execution requests up to 1,024 typed rows independently of the 256-row
+delivery page. Joins consume native column pages without a JSON row cursor;
+global COUNT, integer SUM and boolean reductions consume contiguous vectors.
+Retained join/group strings and exact decimals use adaptive dictionaries,
+switching to flat owned references for high-cardinality inputs.
+
+Parquet scans evaluate predicate and delete evidence before projected payloads.
+Standard offset/column indexes can skip page reads, while Iceberg manifest
+bounds resolve through field IDs. Unknown encodings remain conservative.
+Identity-only scans generate row references without decoding data pages.
+Parsed footers and decoded vectors use immutable, version/credential-scoped
+cache leases with bounded eviction. Duplicate range reads share one in-flight
+request; next-group evidence and next-file metadata use shared bounded
+scheduling and join before cursor teardown. Iceberg delete indexes are prepared
+once per pinned source and applied directly to column batches.
+
+Sort spill uses bounded eight-way merging and releases sealed write buffers.
+Exact COUNT, integer SUM and boolean aggregates partition updates into bounded
+typed reducers; oversized partitions use sorted partial merging. Floating-point,
+distinct and pattern aggregates preserve their ordered merge paths. A final
+ORDER BY reuses a window sort when its complete physical key and null ordering
+match, preserving original-row tie order and expression errors.
+
+The deterministic spill tests compare identical inputs and memory budgets:
+eight-way sorting writes 1,855,824 bytes versus 3,952,320 for binary merging;
+partitioned aggregation writes 671,744 bytes versus 3,797,502 for sorted updates.
+These measure temporary I/O, not overall query speed. The independent PyArrow
+end-to-end test covers compressed indexed pages, dictionary/plain encodings,
+nulls, SQL joins/groups/windows, HTTP, pgwire streaming and cold restart.
+
 SQL sessions admit READ COMMITTED. Repeatable-read and serializable require
 explicitly capable read/write providers: coordinated owner snapshots, replicated
 tracking activation, durable range observations and owner-fenced atomic prepare.

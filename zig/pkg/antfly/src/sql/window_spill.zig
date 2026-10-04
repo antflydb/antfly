@@ -68,6 +68,7 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
     input.close();
     input_owned = false;
     const roots = try @import("ordering_reuse.zig").plan(context.arena, bound);
+    var physical_order: ?@import("window_binding.zig").Sort = null;
     for (bound.sorts, 0..) |specification, root| {
         if (roots[root] != root) continue;
         var arena = std.heap.ArenaAllocator.init(context.alloc);
@@ -142,6 +143,7 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
         rows.deinit();
         rows = next;
         rows_owned = true;
+        physical_order = specification;
     }
-    return try window.finishCells(context, statement, &rows);
+    return try window.finishOrderedCells(context, statement, &rows, physical_order);
 }

@@ -116,6 +116,96 @@ pub fn parseFooterMetadataAllocWithLimits(
     return footer;
 }
 
+pub const IndexedPage = struct {
+    offset: u64,
+    len: usize,
+    first: u64,
+    rows: usize = 0,
+    min: ?[]const u8 = null,
+    max: ?[]const u8 = null,
+    all_null: bool = false,
+};
+pub const PageDirectory = struct {
+    arena: std.heap.ArenaAllocator,
+    pages: []IndexedPage,
+    pub fn deinit(self: *PageDirectory) void {
+        self.arena.deinit();
+    }
+};
+fn pageIndexReader(bytes: []const u8, limit: usize) !Reader {
+    return .{ .bytes = bytes, .budget = try bounded_decode.Budget.init(bytes.len, .{ .max_artifact_bytes = limit, .max_allocation_bytes = limit, .max_elements = 1_000_000 }), .remaining_skip_operations = 4_000_000, .max_nesting_depth = 64 };
+}
+/// Decode both standard Thrift indexes and validate the row/range alignment
+/// before using any bound as negative evidence.
+pub fn parsePageDirectory(a: Allocator, offset_bytes: []const u8, column_bytes: ?[]const u8, chunk: external_source.ColumnChunk, row_count: u64, limit: usize) !PageDirectory {
+    var arena = std.heap.ArenaAllocator.init(a);
+    errdefer arena.deinit();
+    const owned = arena.allocator();
+    var reader = try pageIndexReader(offset_bytes, limit);
+    var previous: i16 = 0;
+    var pages: ?[]IndexedPage = null;
+    while (try reader.readFieldHeader(&previous)) |field| {
+        if (field.id != 1) {
+            try reader.skip(field.type);
+            continue;
+        }
+        if (pages != null or field.type != .list) return error.InvalidParquetMetadata;
+        const list = try reader.readListHeader();
+        if (list.elem_type != .struct_ or list.len == 0) return error.InvalidParquetMetadata;
+        try reader.admitAllocation(IndexedPage, list.len);
+        pages = try owned.alloc(IndexedPage, list.len);
+        for (pages.?) |*out| {
+            var id: i16 = 0;
+            var offset: ?u64 = null;
+            var size: ?usize = null;
+            var first: ?u64 = null;
+            while (try reader.readFieldHeader(&id)) |entry| switch (entry.id) {
+                1 => offset = try reader.readRequiredU64(entry.type),
+                2 => size = @intCast(try reader.readRequiredI32NonNegative(entry.type)),
+                3 => first = try reader.readRequiredU64(entry.type),
+                else => try reader.skip(entry.type),
+            };
+            out.* = .{ .offset = offset orelse return error.InvalidParquetMetadata, .len = size orelse return error.InvalidParquetMetadata, .first = first orelse return error.InvalidParquetMetadata };
+        }
+    }
+    const directory = pages orelse return error.InvalidParquetMetadata;
+    if (reader.cursor != offset_bytes.len or directory[0].first != 0) return error.InvalidParquetMetadata;
+    const end = try std.math.add(u64, chunk.file_offset, chunk.compressed_len);
+    for (directory, 0..) |*out, index| {
+        const following = if (index + 1 < directory.len) directory[index + 1].first else row_count;
+        if (out.len == 0 or out.offset < chunk.file_offset or out.offset > end or out.len > end - out.offset or following <= out.first) return error.InvalidParquetMetadata;
+        if (index + 1 < directory.len and directory[index + 1].offset < out.offset + out.len) return error.InvalidParquetMetadata;
+        out.rows = std.math.cast(usize, following - out.first) orelse return error.InvalidParquetMetadata;
+    }
+    if (column_bytes) |bytes| {
+        reader = try pageIndexReader(bytes, limit);
+        previous = 0;
+        var found: u8 = 0;
+        while (try reader.readFieldHeader(&previous)) |field| {
+            if (field.id < 1 or field.id > 3) {
+                try reader.skip(field.type);
+                continue;
+            }
+            const mask = @as(u8, 1) << @as(u3, @intCast(field.id - 1));
+            if (found & mask != 0 or field.type != .list) return error.InvalidParquetMetadata;
+            found |= mask;
+            const list = try reader.readListHeader();
+            if (list.len != directory.len or (field.id == 1 and list.elem_type != .boolean_true) or (field.id != 1 and list.elem_type != .binary)) return error.InvalidParquetMetadata;
+            for (directory) |*out| {
+                if (field.id == 1) {
+                    out.all_null = switch (try reader.readByte()) {
+                        1 => true,
+                        2 => false,
+                        else => return error.InvalidParquetMetadata,
+                    };
+                } else if (field.id == 2) out.min = try reader.readBinaryAlloc(owned) else out.max = try reader.readBinaryAlloc(owned);
+            }
+        }
+        if (reader.cursor != bytes.len or found != 7) return error.InvalidParquetMetadata;
+    }
+    return .{ .arena = arena, .pages = directory };
+}
+
 fn mapDecodeLimitError(err: anyerror) anyerror {
     return switch (err) {
         error.DecodedArtifactTooLarge => error.ParquetMetadataTooLarge,
@@ -293,6 +383,10 @@ fn cloneFileAlloc(alloc: Allocator, file: external_source.FileEntry) !external_s
     errdefer freeMaybeOwnedRowGroups(alloc, row_groups);
     const partition_values = try clonePartitionValuesAlloc(alloc, file.partition_values);
     errdefer freeMaybeOwnedPartitionValues(alloc, partition_values);
+    const lower_bounds = try external_source.FieldMetric.cloneAll(alloc, file.lower_bounds);
+    errdefer external_source.FieldMetric.freeAll(alloc, lower_bounds);
+    const upper_bounds = try external_source.FieldMetric.cloneAll(alloc, file.upper_bounds);
+    errdefer external_source.FieldMetric.freeAll(alloc, upper_bounds);
 
     return .{
         .file_id = file_id,
@@ -305,6 +399,8 @@ fn cloneFileAlloc(alloc: Allocator, file: external_source.FileEntry) !external_s
         .partition_spec_id = file.partition_spec_id,
         .partition_field_count = file.partition_field_count,
         .partition_values = partition_values,
+        .lower_bounds = lower_bounds,
+        .upper_bounds = upper_bounds,
         .row_groups = row_groups,
     };
 }
@@ -326,6 +422,10 @@ fn cloneFileWithFooterAlloc(
     errdefer freeMaybeOwnedRowGroups(alloc, row_groups);
     const partition_values = try clonePartitionValuesAlloc(alloc, file.partition_values);
     errdefer freeMaybeOwnedPartitionValues(alloc, partition_values);
+    const lower_bounds = try external_source.FieldMetric.cloneAll(alloc, file.lower_bounds);
+    errdefer external_source.FieldMetric.freeAll(alloc, lower_bounds);
+    const upper_bounds = try external_source.FieldMetric.cloneAll(alloc, file.upper_bounds);
+    errdefer external_source.FieldMetric.freeAll(alloc, upper_bounds);
 
     return .{
         .file_id = file_id,
@@ -338,6 +438,8 @@ fn cloneFileWithFooterAlloc(
         .partition_spec_id = file.partition_spec_id,
         .partition_field_count = file.partition_field_count,
         .partition_values = partition_values,
+        .lower_bounds = lower_bounds,
+        .upper_bounds = upper_bounds,
         .row_groups = row_groups,
     };
 }
@@ -433,6 +535,10 @@ fn cloneColumnChunkAlloc(alloc: Allocator, chunk: external_source.ColumnChunk) !
         .encoding = encoding,
         .physical_type = physical_type,
         .type_length = chunk.type_length,
+        .offset_index_offset = chunk.offset_index_offset,
+        .offset_index_length = chunk.offset_index_length,
+        .column_index_offset = chunk.column_index_offset,
+        .column_index_length = chunk.column_index_length,
         .logical_type = logical_type,
         .decimal_precision = chunk.decimal_precision,
         .decimal_scale = chunk.decimal_scale,
@@ -838,6 +944,10 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
     var previous_field_id: i16 = 0;
     var chunk_file_offset: ?u64 = null;
     var metadata: ?ColumnMetadata = null;
+    var offset_index_offset: ?u64 = null;
+    var offset_index_length: ?u32 = null;
+    var column_index_offset: ?u64 = null;
+    var column_index_length: ?u32 = null;
     errdefer if (metadata) |*meta| meta.deinit(alloc);
 
     while (try reader.readFieldHeader(&previous_field_id)) |field| {
@@ -847,6 +957,10 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
                 if (field.type != .struct_) return error.InvalidParquetMetadata;
                 metadata = try parseColumnMetadata(alloc, reader);
             },
+            4 => offset_index_offset = try reader.readRequiredU64(field.type),
+            5 => offset_index_length = @intCast(try reader.readRequiredI32NonNegative(field.type)),
+            6 => column_index_offset = try reader.readRequiredU64(field.type),
+            7 => column_index_length = @intCast(try reader.readRequiredI32NonNegative(field.type)),
             else => try reader.skip(field.type),
         }
     }
@@ -872,6 +986,10 @@ fn parseColumnChunk(alloc: Allocator, reader: *Reader, file_len: u64) !external_
         .stats_min_f64 = meta.stats_min_f64,
         .stats_max_f64 = meta.stats_max_f64,
         .nullable = false,
+        .offset_index_offset = offset_index_offset,
+        .offset_index_length = offset_index_length,
+        .column_index_offset = column_index_offset,
+        .column_index_length = column_index_length,
     };
     chunk.validate(file_len) catch return error.InvalidParquetMetadata;
     meta.disown();

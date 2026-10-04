@@ -50,6 +50,7 @@ pub const Stream = struct {
     alloc: Allocator,
     source: *serving.ServingSource,
     columns: []const []const u8,
+    identity_only: bool = false,
     predicates: []const Predicate,
     context: Context,
     limits: Limits,
@@ -65,8 +66,119 @@ pub const Stream = struct {
     file_columns: []const []const u8 = &.{},
     file_logical_names: []const []const u8 = &.{},
     file_predicates: []const Predicate = &.{},
+    filter: ?@import("lake_parquet_cursor.zig").Cursor.Filter = null,
+    filter_columns: []const []const u8 = &.{},
     mapped_columns: std.ArrayList(types.ColumnVector) = .empty,
+    lookahead: ?@import("../../sql/parallel_scheduler.zig").Task(anyerror!void) = null,
+    lookahead_cancelled: std.atomic.Value(bool) = .init(false),
+    lookahead_started: usize = 0,
+    lookahead_names: []const []const u8 = &.{},
+    lookahead_required: []const bool = &.{},
 
+    fn lookaheadCanceled(raw: *const anyopaque) bool {
+        const self: *const Stream = @ptrCast(@alignCast(raw));
+        if (self.lookahead_cancelled.load(.acquire)) return true;
+        self.context.ensureActive() catch return true;
+        return false;
+    }
+    fn joinLookahead(self: *Stream, cancel: bool) void {
+        if (cancel) self.lookahead_cancelled.store(true, .release);
+        if (self.lookahead) |*task| {
+            const io = self.source.scanner.shared_reader.?.context.io.?;
+            if (cancel) task.cancel(io) catch {} else task.await(io) catch {};
+            self.lookahead = null;
+        }
+    }
+    fn warmGroup(self: *Stream, inventory: external.Inventory, ordinal: u32, names: []const []const u8, required: []const bool) anyerror!void {
+        const reader = self.source.scanner.shared_reader.?;
+        var worker_reader: @import("lake_serving_cache.zig").Reader = .{ .cache = reader.cache, .base = reader.base, .scope = reader.scope, .context = reader.context };
+        const token: @import("../../storage/object_storage.zig").CancellationToken = .{ .ptr = self, .is_cancelled_fn = lookaheadCanceled };
+        worker_reader.context.cancellation = token;
+        worker_reader.base.cancellation = token;
+        // Worker allocations never mutate a statement arena. Decoded buffers
+        // belong to the bounded shared cache, and temporary work is admitted
+        // by the same scheduler used by kernels, spill writes and prefetch.
+        var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(std.heap.page_allocator, worker_reader.reader(), inventory, inventory.files[0].file_id, ordinal, names, .{
+            .max_rows = self.limits.max_row_group_rows,
+            .max_input_bytes = self.limits.max_input_bytes,
+            .max_decoded_bytes = self.limits.max_decoded_bytes,
+            .max_struct_allocation_bytes = self.limits.max_decoded_bytes,
+        });
+        defer cursor.deinit();
+        // Avoid recursively reserving scheduler slots from an admitted task.
+        worker_reader.context.io = null;
+        cursor.shared_reader = &worker_reader;
+        for (cursor.columns, required) |*column, needed| column.required = needed;
+        try worker_reader.context.ensureActive();
+        try cursor.prepareEvidence();
+        try worker_reader.context.ensureActive();
+    }
+    fn startLookahead(self: *Stream) void {
+        if (self.identity_only) return;
+        if (self.lookahead != null) return;
+        const reader = self.source.scanner.shared_reader orelse return;
+        const io = reader.context.io orelse return;
+        const plan = self.discovered orelse return;
+        const current = self.page_cursor orelse return;
+        const ordinal = for (plan.row_group_plan.row_groups[self.group_index..]) |input| {
+            if (groupMayMatch(plan.inventory.files[0].row_groups[input.row_group_ordinal], self.groupPredicates())) break input.row_group_ordinal;
+        } else return;
+        // Names and masks live in the current cursor until clearFile joins.
+        const stable_names = self.alloc.alloc([]const u8, current.columns.len) catch return;
+        const stable_required = self.alloc.alloc(bool, current.columns.len) catch {
+            self.alloc.free(stable_names);
+            return;
+        };
+        for (current.columns, stable_names, stable_required) |column, *name, *needed| {
+            name.* = column.chunk.column_id;
+            needed.* = column.required;
+        }
+        self.lookahead_names = stable_names;
+        self.lookahead_required = stable_required;
+        self.lookahead_cancelled.store(false, .release);
+        self.lookahead = @import("../../sql/parallel_scheduler.zig").global().submit(io, self.limits.max_input_bytes +| self.limits.max_decoded_bytes, warmGroup, .{ self, plan.inventory, ordinal, stable_names, stable_required });
+        if (self.lookahead != null) self.lookahead_started += 1 else self.freeLookaheadDescriptors();
+    }
+    fn freeLookaheadDescriptors(self: *Stream) void {
+        self.alloc.free(self.lookahead_names);
+        self.alloc.free(self.lookahead_required);
+        self.lookahead_names = &.{};
+        self.lookahead_required = &.{};
+    }
+    fn anyMatch(raw: *anyopaque, batch: types.ColumnBatch) anyerror!bool {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        const filter = self.filter.?;
+        return filter.any_match(filter.ptr, try self.logicalBatch(batch));
+    }
+
+    fn pageMayMatch(raw: *anyopaque, chunk: external.ColumnChunk, page: @import("lake_parquet_metadata.zig").IndexedPage) bool {
+        const self: *Stream = @ptrCast(@alignCast(raw));
+        for (self.groupPredicates()) |predicate| {
+            if (!std.mem.eql(u8, predicate.column, chunk.column_id)) continue;
+            if (page.all_null) return false;
+            if (chunk.logical_type.len != 0 and !std.mem.eql(u8, chunk.logical_type, "string") and !std.mem.startsWith(u8, chunk.logical_type, "int")) continue;
+            const min = page.min orelse continue;
+            const max = page.max orelse continue;
+            const matches = switch (predicate.value) {
+                .integer => |value| blk: {
+                    const low = metricInteger(min) orelse continue;
+                    const high = metricInteger(max) orelse continue;
+                    if (low > high) continue;
+                    break :blk rangeMayMatch(i64, low, high, value, predicate.op);
+                },
+                .bytes => |value| blk: {
+                    if (std.mem.order(u8, min, max) == .gt) continue;
+                    break :blk rangeMayMatch([]const u8, min, max, value, predicate.op);
+                },
+                .boolean => |value| blk: {
+                    if (min.len != 1 or max.len != 1 or max[0] > 1 or min[0] > max[0]) continue;
+                    break :blk rangeMayMatch(u8, min[0], max[0], @intFromBool(value), predicate.op);
+                },
+            };
+            if (!matches) return false;
+        }
+        return true;
+    }
     fn leafFor(expected: @import("lake_schema.zig").Column, leaves: []const @import("lake_parquet_metadata.zig").SchemaColumn) ?@import("lake_parquet_metadata.zig").SchemaColumn {
         for (leaves) |leaf| {
             if (if (expected.field_id) |id| leaf.field_id == id else std.mem.eql(u8, leaf.column_id, expected.name)) return leaf;
@@ -94,10 +206,7 @@ pub const Stream = struct {
         return if (self.source.inventory.format == .iceberg) self.file_predicates else self.predicates;
     }
     fn fileMatches(self: Stream, file: external.FileEntry) bool {
-        // Iceberg file statistics are keyed by field identity. Footer-bound
-        // physical predicates are used for row groups; partition rules already
-        // resolve source IDs against the selected schema.
-        return (self.source.inventory.format == .iceberg or fileMayMatch(file, self.predicates)) and
+        return (if (self.source.inventory.format == .iceberg) icebergFileMayMatch(file, self.schema_contract, self.predicates) else fileMayMatch(file, self.predicates)) and
             (if (self.source.partition_rules) |rules| @import("lake_partition_pruning.zig").mayMatch(rules.items, file, self.predicates) else true);
     }
 
@@ -126,6 +235,8 @@ pub const Stream = struct {
         self.current = null;
     }
     fn clearFile(self: *Stream) void {
+        self.joinLookahead(true);
+        self.freeLookaheadDescriptors();
         if (self.source.scanner.shared_reader) |reader| reader.drain(true);
         self.clearBatch();
         if (self.page_cursor) |*cursor| cursor.deinit();
@@ -154,6 +265,8 @@ pub const Stream = struct {
                     if (cursor.position == cursor.group.row_count) try self.prefetchNext();
                     return try self.logicalBatch(batch);
                 }
+                self.joinLookahead(false);
+                self.freeLookaheadDescriptors();
                 cursor.deinit();
                 self.page_cursor = null;
             }
@@ -169,7 +282,7 @@ pub const Stream = struct {
                         continue;
                     }
                     if (group.row_count > self.limits.max_examined_rows -| self.stats.rows_examined) return error.LakeRowsScanBudgetExceeded;
-                    self.page_cursor = try @import("lake_parquet_cursor.zig").Cursor.init(self.alloc, self.source.scanner.reader(), plan.inventory, input.file_id, input.row_group_ordinal, if (self.schema_contract.len != 0) self.file_columns else self.columns, .{
+                    self.page_cursor = try @import("lake_parquet_cursor.zig").Cursor.init(self.alloc, self.source.scanner.reader(), plan.inventory, input.file_id, input.row_group_ordinal, if (self.identity_only) &.{} else if (self.schema_contract.len != 0) self.file_columns else self.columns, .{
                         .max_rows = self.limits.max_row_group_rows,
                         .max_struct_allocation_bytes = self.limits.max_decoded_bytes,
                         .max_input_bytes = self.limits.max_input_bytes,
@@ -179,9 +292,39 @@ pub const Stream = struct {
                     self.stats.rows_examined += group.row_count;
                     try self.context.ensureActive();
                     self.page_cursor.?.shared_reader = self.source.scanner.shared_reader;
+                    self.page_cursor.?.prune_ptr = self;
+                    self.page_cursor.?.prune_page = pageMayMatch;
+                    if (self.filter != null) {
+                        var required: usize = 0;
+                        for (self.page_cursor.?.columns) |*column| {
+                            column.required = false;
+                            var logical = column.chunk.column_id;
+                            if (self.source.inventory.format == .iceberg and self.schema_contract.len != 0) {
+                                for (self.file_columns, self.file_logical_names) |physical, name| if (std.mem.eql(u8, physical, logical)) {
+                                    logical = @constCast(name);
+                                    break;
+                                };
+                            }
+                            for (self.filter_columns) |name| if (std.mem.eql(u8, name, logical)) {
+                                column.required = true;
+                                required += 1;
+                                break;
+                            };
+                        }
+                        // A driver supplies row ordinals for ID-only or missing
+                        // nullable predicates; other columns remain deferred.
+                        if (required == 0 and self.page_cursor.?.columns.len != 0) self.page_cursor.?.columns[0].required = true;
+                        self.page_cursor.?.filter = .{ .ptr = self, .any_match = anyMatch };
+                    }
                     const batch = try self.page_cursor.?.next();
+                    if (batch == null) {
+                        self.page_cursor.?.deinit();
+                        self.page_cursor = null;
+                        continue;
+                    }
+                    self.startLookahead();
                     if (self.page_cursor.?.position == group.row_count) try self.prefetchNext();
-                    return if (batch) |present| try self.logicalBatch(present) else null;
+                    return try self.logicalBatch(batch.?);
                 }
                 self.clearFile();
             }
@@ -241,9 +384,11 @@ pub const Stream = struct {
         var inventory = self.source.inventory;
         inventory.files = self.source.inventory.files[index..][0..1];
         inventory.deleted_row_groups = &.{};
-        if (self.schema_contract.len != 0) {
-            var footer = try @import("lake_schema.zig").readFooter(self.alloc, self.source.scanner.reader(), inventory.files[0]);
-            defer footer.deinit(self.alloc);
+        if (self.schema_contract.len != 0 or self.source.scanner.shared_reader != null) {
+            const lease = if (self.source.scanner.shared_reader) |reader| try reader.footer(inventory.files[0]) else null;
+            defer if (lease) |borrowed| borrowed.release();
+            var footer = if (lease) |borrowed| borrowed.item.payload.footer else try @import("lake_schema.zig").readFooter(self.alloc, self.source.scanner.reader(), inventory.files[0]);
+            defer if (lease == null) footer.deinit(self.alloc);
             if (footer.schema_columns.len == 0) return error.ExternalLakeSchemaUnavailable;
             if (self.source.inventory.format == .iceberg) {
                 for (footer.schema_columns, 0..) |leaf, i| {
@@ -268,7 +413,7 @@ pub const Stream = struct {
             for (self.columns) |wanted| {
                 const expected = for (self.schema_contract) |column| {
                     if (std.mem.eql(u8, column.name, wanted)) break column;
-                } else return error.ExternalLakeSchemaMismatch;
+                } else if (self.schema_contract.len == 0) @as(@import("lake_schema.zig").Column, .{ .name = wanted, .kind = "", .required = false }) else return error.ExternalLakeSchemaMismatch;
                 if (leafFor(expected, footer.schema_columns)) |leaf| {
                     const name = try self.alloc.dupe(u8, leaf.column_id);
                     columns.append(self.alloc, name) catch |err| {
@@ -324,11 +469,11 @@ pub const Stream = struct {
             }
         }.less);
         if (self.source.scanner.iceberg_delete_plan) |delete_plan| {
-            self.deleted = try iceberg.readDeleteRowRefsAlloc(self.alloc, .{
+            if (self.source.prepared_deletes == null) self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.create(self.source.alloc, .{
                 .reader = self.source.scanner.reader(),
                 .client = self.source.scanner.object_reader.client,
                 .cache = self.source.scanner.cache,
-                .data_inventory = self.discovered.?.inventory,
+                .data_inventory = self.source.inventory,
                 .delete_plan = delete_plan,
                 .coalesce_options = self.source.scanner.coalesce_options,
                 .materialization_limits = .{ .max_struct_allocation_bytes = self.limits.max_decoded_bytes, .max_input_bytes = self.limits.max_input_bytes, .max_decoded_bytes = self.limits.max_decoded_bytes },
@@ -346,6 +491,12 @@ pub const Stream = struct {
         }
         self.file_index = self.files.len;
         return total;
+    }
+    pub fn isDeletedBatch(self: Stream, a: Allocator, batch: types.ColumnBatch, index: usize) !bool {
+        if (self.isDeleted(batch.row_refs[index])) return true;
+        if (self.source.prepared_deletes) |prepared|
+            return prepared.matches(a, self.discovered.?.inventory.files[0], batch, index);
+        return false;
     }
     pub fn isDeleted(self: Stream, ref: types.RowRef) bool {
         var low: usize = 0;
@@ -397,6 +548,48 @@ pub fn groupMayMatch(group: external.RowGroup, predicates: []const Predicate) bo
     };
     return true;
 }
+fn metricValue(metrics: []const external.FieldMetric, id: i32) ?[]const u8 {
+    for (metrics) |metric| if (metric.field_id == id) return metric.value;
+    return null;
+}
+fn metricInteger(bytes: []const u8) ?i64 {
+    return switch (bytes.len) {
+        4 => std.mem.readInt(i32, bytes[0..4], .little),
+        8 => std.mem.readInt(i64, bytes[0..8], .little),
+        else => null,
+    };
+}
+pub fn icebergFileMayMatch(file: external.FileEntry, schema: []const @import("lake_schema.zig").Column, predicates: []const Predicate) bool {
+    for (predicates) |predicate| {
+        const column = for (schema) |candidate| {
+            if (std.mem.eql(u8, candidate.name, predicate.column)) break candidate;
+        } else continue;
+        const id = column.field_id orelse continue;
+        const min = metricValue(file.lower_bounds, id) orelse continue;
+        const max = metricValue(file.upper_bounds, id) orelse continue;
+        const matches = switch (predicate.value) {
+            .integer => |value| blk: {
+                // Timestamp and decimal bounds require their original Iceberg
+                // unit/type. Unknown annotations must remain residual.
+                if (!std.mem.eql(u8, column.kind, "integer")) continue;
+                const low = metricInteger(min) orelse continue;
+                const high = metricInteger(max) orelse continue;
+                if (low > high) continue;
+                break :blk rangeMayMatch(i64, low, high, value, predicate.op);
+            },
+            .bytes => |value| blk: {
+                if (!std.mem.eql(u8, column.iceberg_type, "string") or std.mem.order(u8, min, max) == .gt) continue;
+                break :blk rangeMayMatch([]const u8, min, max, value, predicate.op);
+            },
+            .boolean => |value| blk: {
+                if (!std.mem.eql(u8, column.kind, "boolean") or min.len != 1 or max.len != 1 or max[0] > 1 or min[0] > max[0]) continue;
+                break :blk rangeMayMatch(u8, min[0], max[0], @intFromBool(value), predicate.op);
+            },
+        };
+        if (!matches) return false;
+    }
+    return true;
+}
 pub fn fileMayMatch(file: external.FileEntry, predicates: []const Predicate) bool {
     if (file.row_groups.len == 0) return true;
     for (file.row_groups) |group| if (groupMayMatch(group, predicates)) return true;
@@ -415,4 +608,24 @@ test "external lake pruning preserves exact integers and unknown annotated stati
     try std.testing.expect(groupMayMatch(group, &.{.{ .column = "n", .op = .eq, .value = .{ .integer = 0 } }}));
     group.column_chunks = &.{};
     try std.testing.expect(groupMayMatch(group, &.{.{ .column = "n", .op = .eq, .value = .{ .integer = 0 } }}));
+}
+
+test "external lake Iceberg file bounds resolve field IDs and preserve unknown decimal encodings" {
+    var min: [8]u8 = undefined;
+    var max: [8]u8 = undefined;
+    std.mem.writeInt(i64, &min, 9007199254740993, .little);
+    std.mem.writeInt(i64, &max, 9007199254740995, .little);
+    var lower = [_]external.FieldMetric{.{ .field_id = 7, .value = &min }};
+    var upper = [_]external.FieldMetric{.{ .field_id = 7, .value = &max }};
+    const file: external.FileEntry = .{ .file_id = @constCast("f"), .object_uri = @constCast("s3://b/f"), .etag = @constCast("v1"), .byte_len = 10, .row_count = 3, .row_groups = &.{}, .lower_bounds = &lower, .upper_bounds = &upper };
+    const schema = [_]@import("lake_schema.zig").Column{.{ .name = "renamed", .kind = "integer", .required = false, .field_id = 7, .iceberg_type = "long" }};
+    try std.testing.expect(!icebergFileMayMatch(file, &schema, &.{.{ .column = "renamed", .op = .eq, .value = .{ .integer = 9007199254740992 } }}));
+    try std.testing.expect(icebergFileMayMatch(file, &schema, &.{.{ .column = "renamed", .op = .gte, .value = .{ .integer = 9007199254740993 } }}));
+    var changed = schema;
+    changed[0].field_id = 8;
+    try std.testing.expect(icebergFileMayMatch(file, &changed, &.{.{ .column = "renamed", .op = .eq, .value = .{ .integer = 0 } }}));
+    changed[0].field_id = 7;
+    changed[0].kind = "string";
+    changed[0].iceberg_type = "decimal(18,2)";
+    try std.testing.expect(icebergFileMayMatch(file, &changed, &.{.{ .column = "renamed", .op = .eq, .value = .{ .bytes = "0.00" } }}));
 }

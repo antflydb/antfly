@@ -142,11 +142,11 @@ pub const File = struct {
         try self.awaitWrite();
         try self.manager.check();
         if (self.manager.async_writes and self.write_buffer.len >= 4096 and self.write_len >= self.write_buffer.len / 2) {
-            if (self.spare.len == 0) self.spare = try self.manager.alloc.alloc(u8, self.write_buffer.len);
-            const job = self.write_job orelse blk: {
-                const created = try self.manager.alloc.create(WriteJob);
-                self.write_job = created;
-                break :blk created;
+            const job = self.prepareAsync() orelse {
+                try self.file.writePositionalAll(self.manager.io, self.write_buffer[0..self.write_len], self.write_start);
+                self.manager.write_calls += 1;
+                self.write_len = 0;
+                return;
             };
             job.* = .{ .io = self.manager.io, .file = self.file, .buffer = self.write_buffer, .len = self.write_len, .offset = self.write_start };
             const future = @import("parallel_scheduler.zig").global().submit(self.manager.io, job.buffer.len, WriteJob.write, .{job}) orelse {
@@ -164,6 +164,28 @@ pub const File = struct {
         }
         self.manager.write_calls += 1;
         self.write_len = 0;
+    }
+    fn prepareAsync(self: *File) ?*WriteJob {
+        if (self.spare.len == 0) self.spare = self.manager.alloc.alloc(u8, self.write_buffer.len) catch return null;
+        if (self.write_job) |job| return job;
+        const job = self.manager.alloc.create(WriteJob) catch {
+            self.manager.alloc.free(self.spare);
+            self.spare = &.{};
+            return null;
+        };
+        self.write_job = job;
+        return job;
+    }
+    /// Sorted runs become immutable before merging. Reclaim writer buffers
+    /// so each merge head retains only its reader buffer and decoded record.
+    pub fn seal(self: *File) !void {
+        try self.flush();
+        self.manager.alloc.free(self.write_buffer);
+        self.write_buffer = &.{};
+        self.manager.alloc.free(self.spare);
+        self.spare = &.{};
+        if (self.write_job) |job| self.manager.alloc.destroy(job);
+        self.write_job = null;
     }
     pub fn flush(self: *File) !void {
         try self.submit();
@@ -462,10 +484,12 @@ pub const Sort = struct {
     a: Allocator,
     orders: []const operators.Order,
     memory_bytes: usize,
+    merge_fan_in: usize = 8,
     arena: std.heap.ArenaAllocator,
     rows: std.ArrayList(Row) = .empty,
     estimated: usize = 0,
     runs: [32]?File = @splat(null),
+    run_levels: [32]u8 = @splat(0),
     outputs: [8]?File = @splat(null),
     heads: [8]?Decoded = @splat(null),
     head_arenas: [8]std.heap.ArenaAllocator = undefined,
@@ -533,49 +557,87 @@ pub const Sort = struct {
         _ = self.arena.reset(.free_all);
         self.rows.clearAndFree(self.a);
         self.estimated = 0;
-        for (&self.runs) |*slot| {
-            if (slot.*) |*old| {
-                const combined = try self.merge(old, &run);
-                old.close();
-                run.close();
-                slot.* = null;
-                run = combined;
-            } else {
-                slot.* = run;
+        var level: u8 = 0;
+        const fan_in = self.fanIn();
+        while (true) {
+            var indices: [8]usize = undefined;
+            var count: usize = 0;
+            var empty: ?usize = null;
+            for (self.runs, self.run_levels, 0..) |slot, candidate_level, index| {
+                if (slot == null) {
+                    empty = index;
+                } else if (candidate_level == level and count < fan_in - 1) {
+                    indices[count] = index;
+                    count += 1;
+                }
+            }
+            if (count < fan_in - 1 and empty != null) {
+                self.runs[empty.?] = run;
+                self.run_levels[empty.?] = level;
                 return;
             }
+            // A full directory can occur with many unequal levels. Compact
+            // the smallest levels first rather than repeatedly rewriting the
+            // largest run; fan-in still obeys the decoded-head memory budget.
+            if (empty == null and count < fan_in - 1) {
+                count = 0;
+                var order: [32]usize = undefined;
+                for (&order, 0..) |*index, i| index.* = i;
+                std.mem.sort(usize, &order, self, struct {
+                    fn less(sort: *Sort, a: usize, b: usize) bool {
+                        return sort.run_levels[a] < sort.run_levels[b];
+                    }
+                }.less);
+                for (order[0 .. fan_in - 1]) |index| {
+                    indices[count] = index;
+                    count += 1;
+                    level = @max(level, self.run_levels[index]);
+                }
+            }
+            var inputs: [8]*File = undefined;
+            inputs[0] = &run;
+            for (indices[0..count], inputs[1 .. count + 1]) |index, *file| file.* = &self.runs[index].?;
+            const combined = try self.mergeMany(inputs[0 .. count + 1]);
+            run.close();
+            for (indices[0..count]) |index| {
+                self.runs[index].?.close();
+                self.runs[index] = null;
+            }
+            run = combined;
+            level = std.math.add(u8, level, 1) catch return error.SqlProgramLimitExceeded;
         }
-        return error.SqlProgramLimitExceeded;
+    }
+    fn fanIn(self: *const Sort) usize {
+        const head_bytes = self.max_row_bytes *| 4 +| self.manager.buffer_bytes *| 2 +| 512;
+        return @min(@min(self.outputs.len, @max(@as(usize, 2), self.merge_fan_in)), @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes)));
     }
     fn readRun(self: *Sort, file: *File, a: Allocator, offset: u64) !Decoded {
+        if (offset == 0) try file.seal();
         var decoded = try file.read(a, offset);
         decoded.row.normalized = @import("sort_key.zig").encode(decoded.row.keys, self.orders);
         return decoded;
     }
-    fn merge(self: *Sort, left: *File, right: *File) !File {
+    fn mergeMany(self: *Sort, inputs: []const *File) !File {
+        std.debug.assert(inputs.len >= 2 and inputs.len <= self.fanIn());
         var output = try self.manager.create();
         errdefer output.close();
-        var la = std.heap.ArenaAllocator.init(self.a);
-        defer la.deinit();
-        var ra = std.heap.ArenaAllocator.init(self.a);
-        defer ra.deinit();
-        var lp: u64 = 0;
-        var rp: u64 = 0;
-        var l: ?Decoded = if (left.size != 0) try self.readRun(left, la.allocator(), 0) else null;
-        var r: ?Decoded = if (right.size != 0) try self.readRun(right, ra.allocator(), 0) else null;
-        while (l != null or r != null) {
+        var arenas: [8]std.heap.ArenaAllocator = undefined;
+        var heads: [8]?Decoded = @splat(null);
+        for (arenas[0..inputs.len]) |*arena| arena.* = std.heap.ArenaAllocator.init(self.a);
+        defer for (arenas[0..inputs.len]) |*arena| arena.deinit();
+        for (inputs, arenas[0..inputs.len], heads[0..inputs.len]) |file, *arena, *head|
+            head.* = if (file.size != 0) try self.readRun(file, arena.allocator(), 0) else null;
+        while (true) {
             try self.manager.check();
-            if (r == null or (l != null and (try operators.compareRows(l.?.row, r.?.row, self.orders)) != .gt)) {
-                _ = try output.append(l.?.row, none);
-                lp = l.?.following;
-                _ = la.reset(.retain_capacity);
-                l = if (lp < left.size) try self.readRun(left, la.allocator(), lp) else null;
-            } else {
-                _ = try output.append(r.?.row, none);
-                rp = r.?.following;
-                _ = ra.reset(.retain_capacity);
-                r = if (rp < right.size) try self.readRun(right, ra.allocator(), rp) else null;
-            }
+            var selected: ?usize = null;
+            for (heads[0..inputs.len], 0..) |head, index| if (head) |value| {
+                if (selected == null or (try operators.compareRows(value.row, heads[selected.?].?.row, self.orders)) == .lt) selected = index;
+            };
+            const index = selected orelse break;
+            const head = heads[index].?;
+            _ = try output.append(head.row, none);
+            _ = arenas[index].reset(.retain_capacity);
+            heads[index] = if (head.following < inputs[index].size) try self.readRun(inputs[index], arenas[index].allocator(), head.following) else null;
         }
         self.manager.merges += 1;
         return output;
@@ -593,21 +655,22 @@ pub const Sort = struct {
         try self.flush();
         // Bound decoded heads and I/O buffers; stream the final merge instead
         // of writing and rereading another complete sorted run.
-        const head_bytes = self.max_row_bytes *| 4 +| self.manager.buffer_bytes *| 2 +| 512;
-        const fan_in = @min(self.outputs.len, @max(@as(usize, 2), self.memory_bytes / @max(1, head_bytes)));
+        const fan_in = self.fanIn();
         errdefer {
             for (self.outputs[0..self.output_count]) |*file| if (file.*) |*active| active.close();
             self.output_count = 0;
         }
         for (&self.runs) |*slot| if (slot.*) |*run| {
             if (self.output_count == fan_in) {
-                const combined = try self.merge(&self.outputs[0].?, &self.outputs[1].?);
-                self.outputs[0].?.close();
-                self.outputs[1].?.close();
+                var inputs: [8]*File = undefined;
+                for (self.outputs[0..self.output_count], inputs[0..self.output_count]) |*file, *input| input.* = &file.*.?;
+                const combined = try self.mergeMany(inputs[0..self.output_count]);
+                for (self.outputs[0..self.output_count]) |*file| {
+                    file.*.?.close();
+                    file.* = null;
+                }
                 self.outputs[0] = combined;
-                self.output_count -= 1;
-                self.outputs[1] = self.outputs[self.output_count];
-                self.outputs[self.output_count] = null;
+                self.output_count = 1;
             }
             self.outputs[self.output_count] = run.*;
             self.output_count += 1;
@@ -763,4 +826,39 @@ test "SQL buffered spill joins outstanding writes on cancelled close" {
     file.close();
     try std.testing.expectEqual(@as(usize, 0), manager.files);
     try std.testing.expectEqual(@as(u64, 0), manager.live_bytes);
+}
+
+test "SQL multiway spill reduces rewrite bytes under the same memory budget" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var written: [2]u64 = undefined;
+    for ([_]usize{ 2, 8 }, 0..) |fan_in, run| {
+        var budget: @import("memory_budget.zig") = .{ .backing = std.heap.page_allocator, .limit = 256 * 1024 };
+        const a = budget.allocator();
+        {
+            var manager: Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none, .async_writes = false };
+            defer manager.deinit();
+            var sort = Sort.init(a, &manager, &.{.{}}, 64 * 1024);
+            sort.merge_fan_in = fan_in;
+            defer sort.deinit();
+            for (0..8192) |index| {
+                const value = Datum.json(.{ .integer = @intCast(8191 - index) });
+                try sort.add(.{ .values = &.{value}, .keys = &.{value}, .ordinal = index });
+            }
+            var scratch = std.heap.ArenaAllocator.init(a);
+            defer scratch.deinit();
+            for (0..8192) |index| {
+                _ = scratch.reset(.retain_capacity);
+                const row = (try sort.next(scratch.allocator())).?;
+                try std.testing.expectEqual(@as(i64, @intCast(index)), row.values[0].value.integer);
+            }
+            try std.testing.expect((try sort.next(a)) == null);
+            written[run] = manager.written_bytes;
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live);
+    }
+    try std.testing.expect(written[1] < written[0] * 3 / 4);
+    std.debug.print("SQL spill merge bytes: binary={d} multiway={d}\n", .{ written[0], written[1] });
 }

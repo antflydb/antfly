@@ -599,7 +599,7 @@ pub fn readDeleteRowRefsAlloc(
 /// Equality identity belongs to the Iceberg field ID, independent of the
 /// physical name in each data/delete file. Normalize only the owned metadata;
 /// offsets still point to the original physical chunks.
-fn discoverEqualityColumnsAlloc(a: Allocator, request: DeleteRowRefsReadRequest, inventory: external_source.Inventory, ids: []const i32, names: []const []const u8) !lake_parquet_rowgroup.DiscoveredObjectRangeRowGroupPlan {
+pub fn discoverEqualityColumnsAlloc(a: Allocator, request: DeleteRowRefsReadRequest, inventory: external_source.Inventory, ids: []const i32, names: []const []const u8) !lake_parquet_rowgroup.DiscoveredObjectRangeRowGroupPlan {
     const metadata = @import("lake_parquet_metadata.zig");
     const footers = try a.alloc(metadata.FileFooter, inventory.files.len);
     defer a.free(footers);
@@ -899,7 +899,7 @@ fn equalityDeleteFileInventoryAlloc(
     );
 }
 
-fn singleDeleteFileInventoryAlloc(
+pub fn singleDeleteFileInventoryAlloc(
     alloc: Allocator,
     data_inventory: external_source.Inventory,
     delete_file: IcebergDeleteFile,
@@ -1014,7 +1014,7 @@ fn rebindRowRefToInventory(inventory: external_source.Inventory, row_ref: rowsou
     } };
 }
 
-fn equalityDeleteAppliesToRowRef(
+pub fn equalityDeleteAppliesToRowRef(
     inventory: external_source.Inventory,
     delete_file: IcebergDeleteFile,
     row_ref: rowsource.RowRef,
@@ -1043,7 +1043,7 @@ fn equalityDeleteAppliesToRowRef(
     return partitionValuesEqual(file.partition_values, delete_file.partition_values);
 }
 
-fn positionDeleteRowFromBatch(batch: rowsource.ColumnBatch, row_idx: usize) !lake_iceberg_deletes.PositionDeleteRow {
+pub fn positionDeleteRowFromBatch(batch: rowsource.ColumnBatch, row_idx: usize) !lake_iceberg_deletes.PositionDeleteRow {
     if (row_idx >= batch.rowCount()) return error.ExternalSourceRowOutOfBounds;
     const path_column = batch.findColumn("file_path") orelse return error.IcebergPositionDeleteColumnNotFound;
     const position_column = batch.findColumn("pos") orelse return error.IcebergPositionDeleteColumnNotFound;
@@ -1060,7 +1060,7 @@ fn positionDeleteRowFromBatch(batch: rowsource.ColumnBatch, row_idx: usize) !lak
     return .{ .data_file_path = path, .row_position = @intCast(position) };
 }
 
-fn positionDeleteAppliesToFile(file: external_source.FileEntry, delete_file: IcebergDeleteFile) !bool {
+pub fn positionDeleteAppliesToFile(file: external_source.FileEntry, delete_file: IcebergDeleteFile) !bool {
     const data_sequence = file.data_sequence_number orelse return error.UnsupportedIcebergDeletes;
     if (data_sequence > delete_file.data_sequence_number) return false;
     const data_spec_id = file.partition_spec_id orelse return error.UnsupportedIcebergPartitionDeleteScope;

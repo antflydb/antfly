@@ -276,6 +276,7 @@ fn Engine(comptime Context: type) type {
             left: ?*Iterator = null,
             right: ?*Iterator = null,
             page: ?catalog.Page = null,
+            column_page: ?catalog.ColumnPage = null,
             page_index: usize = 0,
             pages: usize = 0,
             eof: bool = false,
@@ -388,6 +389,35 @@ fn Engine(comptime Context: type) type {
                         break :blk values;
                     },
                     .scan => |scan| blk: {
+                        const cursor = self.engine.cursors[scan.index];
+                        if (cursor.next_columns) |pull| {
+                            while (self.column_page == null or self.page_index == self.column_page.?.selection.len) {
+                                if (self.eof) break :blk null;
+                                self.column_page = null;
+                                _ = self.arena.reset(.free_all);
+                                self.pages += 1;
+                                if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+                                const wanted: u32 = @intCast(@min(self.engine.context.limits.execution_batch_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
+                                self.column_page = try pull(cursor.ptr, self.arena.allocator(), wanted);
+                                try self.column_page.?.batch.validate();
+                                if (self.column_page.?.selection.len > wanted) return error.InvalidSqlBackendResponse;
+                                self.page_index = 0;
+                                self.eof = self.column_page.?.after == null;
+                            }
+                            const page = self.column_page.?;
+                            const index = self.page_index;
+                            self.page_index += 1;
+                            self.engine.visited += 1;
+                            if (self.engine.visited > self.engine.context.limits.scan_rows) return error.SqlProgramLimitExceeded;
+                            const values = try alloc.alloc(Datum, self.node.columns.len);
+                            for (scan.source_columns, self.node.columns, values) |name, column, *out| {
+                                const cell = try page.cell(alloc, index, name);
+                                // Values borrow the current page until the next pull.
+                                // Retaining operators own typed copies at admission.
+                                out.* = .{ .value = try describe.coerceAlloc(alloc, cell.value, column.type), .sql_null = cell.sql_null, .patterns = cell.patterns };
+                            }
+                            break :blk values;
+                        }
                         while (self.page == null or self.page_index == self.page.?.rows.len) {
                             if (self.eof) break :blk null;
                             if (self.page) |page| page.deinit();
@@ -395,7 +425,6 @@ fn Engine(comptime Context: type) type {
                             _ = self.arena.reset(.free_all);
                             self.pages += 1;
                             if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
-                            const cursor = self.engine.cursors[scan.index];
                             self.page = try cursor.next(cursor.ptr, self.arena.allocator(), @intCast(@min(self.engine.context.limits.page_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16)))));
                             if (self.page.?.rows.len > self.engine.context.limits.page_rows) return error.InvalidSqlBackendResponse;
                             self.page_index = 0;

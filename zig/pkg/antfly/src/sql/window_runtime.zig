@@ -707,9 +707,45 @@ fn rowOrdinal(cells: anytype, index: usize) !u64 {
     return if (@TypeOf(cells) == *disk.Rows) (try cells.row(index)).ordinal else index;
 }
 pub fn finishCells(context: anytype, statement: ast.Select, cells: anytype) !@import("runtime.zig").Output {
+    return finishOrderedCells(context, statement, cells, null);
+}
+pub fn finishOrderedCells(context: anytype, statement: ast.Select, cells: anytype, physical_order: ?binding.Sort) !@import("runtime.zig").Output {
     const bound = context.binding.window.?;
     const limit = try context.count(statement.limit, context.limits.result_rows);
     const offset = try context.count(statement.offset, 0);
+    if (physical_order) |sort| if (@import("ordering_reuse.zig").finalOrder(sort, bound.orders, statement.order_by) and
+        !@import("decision_eval.zig").hasExternalPrograms(bound.outputs))
+    {
+        const count = @min(limit, cells.len -| offset);
+        const rows = try context.arena.alloc([]const Json, if (context.sink == null) count else 0);
+        const flags = try context.arena.alloc([]const bool, rows.len);
+        var scratch = std.heap.ArenaAllocator.init(context.alloc);
+        defer scratch.deinit();
+        for (0..cells.len) |index| {
+            try context.checkpoint();
+            _ = scratch.reset(.retain_capacity);
+            const a = scratch.allocator();
+            const input = try rowCells(cells, a, index);
+            const values = try a.alloc(Datum, bound.outputs.len);
+            // Keep expression error/evaluation order even outside LIMIT.
+            for (bound.outputs, values) |program, *out| out.* = try context.evaluate(a, program, input);
+            if (index < offset or index - offset >= count) continue;
+            if (context.sink) |sink| {
+                try sink.append(sink.ptr, values);
+            } else {
+                const output = try context.arena.alloc(Json, values.len);
+                const nulls = try context.arena.alloc(bool, values.len);
+                for (values, output, nulls) |value, *cell, *is_null| {
+                    cell.* = try context.outputValue(value.value);
+                    is_null.* = value.sql_null;
+                }
+                rows[index - offset] = output;
+                flags[index - offset] = nulls;
+            }
+        }
+        if (statement.limit == null and cells.len -| offset > limit) return error.SqlResultTooLarge;
+        return .{ .columns = context.binding.columns, .rows = rows, .sql_nulls = flags, .command_tag = "SELECT" };
+    };
     var output_state = std.heap.ArenaAllocator.init(context.alloc);
     defer output_state.deinit();
     const alloc = output_state.allocator();

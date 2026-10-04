@@ -30,6 +30,8 @@ pub const Limits = struct {
     scan_rows: usize = 10_000_000,
     retained_bytes: usize = 64 * 1024 * 1024,
     page_rows: u32 = 256,
+    /// Native execution batches are independent of response/decision pages.
+    execution_batch_rows: u32 = 1024,
     page_bytes: usize = 256 * 1024,
     scan_pages: usize = 65_536,
     spill_bytes: u64 = 1024 * 1024 * 1024,
@@ -108,7 +110,7 @@ pub const Result = struct {
 
 pub fn execute(alloc: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, parameters: []const Json, limits: Limits) !Result {
     if (limits.result_rows == 0 or limits.result_rows > 4096 or limits.mutation_rows == 0 or limits.mutation_rows > 4096 or
-        limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0) return error.InvalidSqlLimit;
+        limits.execution_batch_rows == 0 or limits.execution_batch_rows > 4096 or limits.page_rows == 0 or limits.page_rows > 4096 or limits.page_bytes == 0 or limits.scan_rows == 0) return error.InvalidSqlLimit;
     if (parameters.len != compiled.parameter_count) return error.InvalidSqlParameters;
     try backend.vtable.checkpoint(backend.ptr);
     var pinned_settings: ?@import("setting_catalog.zig").View = null;
@@ -3187,4 +3189,53 @@ test "SQL nested blocking result ownership unwinds allocation failures" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Scenario.run, .{});
+}
+
+test "SQL joins consume native column batches without invoking the JSON cursor" {
+    const Native = struct {
+        fn rows(_: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
+            return error.UnexpectedJsonCursor;
+        }
+        fn columns(raw: *anyopaque, a: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            const state: *TestBackend.Statement.State = @ptrCast(@alignCast(raw));
+            const total = state.owner.backend.row_count;
+            const first = if (state.after) |key| (try std.fmt.parseInt(usize, key, 10)) + 1 else 0;
+            const count = @min(limit, total - first);
+            const refs = try a.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
+            const values = try a.alloc(i64, count);
+            const selection = try a.alloc(usize, count);
+            for (refs, values, selection, first..) |*ref, *value, *selected, index| {
+                ref.* = .{ .relational_key = try std.fmt.allocPrint(a, "{d}", .{index}) };
+                value.* = @intCast(index);
+                selected.* = index - first;
+            }
+            if (state.after) |key| state.owner.alloc.free(key);
+            state.after = if (first + count < total) try std.fmt.allocPrint(state.owner.alloc, "{d}", .{first + count - 1}) else null;
+            const vectors = try a.alloc(@import("../storage/rowsource/types.zig").ColumnVector, 1);
+            vectors[0] = .{ .name = "id", .values = .{ .i64 = values } };
+            return .{ .batch = .{ .snapshot = .{ .table_id = "things", .snapshot_id = "pinned" }, .row_refs = refs, .columns = vectors }, .selection = selection, .after = state.after };
+        }
+        fn open(raw: *anyopaque, a: std.mem.Allocator, scans: []const catalog.StatementScan) !catalog.StatementRead {
+            const statement = try TestBackend.openStatement(raw, a, scans);
+            const owner: *TestBackend.Statement = @ptrCast(@alignCast(statement.ptr));
+            for (owner.cursors) |*cursor| {
+                cursor.next = rows;
+                cursor.next_columns = columns;
+            }
+            return statement;
+        }
+    };
+    var fixture: TestBackend = .{ .row_count = 1537 };
+    var backend = fixture.coordinated();
+    var vtable = backend.vtable.*;
+    vtable.open_statement = Native.open;
+    backend.vtable = &vtable;
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT count(*), sum(l.id) FROM things l JOIN things r ON l.id=r.id", .{});
+    defer compiled.deinit();
+    var result = try execute(std.testing.allocator, backend, &compiled, &.{}, .{ .page_rows = 7, .execution_batch_rows = 1024 });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("1537", result.output.rows[0][0].string);
+    try std.testing.expectEqualStrings("1180416", result.output.rows[0][1].string);
+    try std.testing.expectEqual(@as(usize, 0), fixture.pages);
+    try std.testing.expectEqual(fixture.statement_opens, fixture.statement_closes);
 }
