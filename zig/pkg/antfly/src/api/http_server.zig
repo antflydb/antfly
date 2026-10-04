@@ -3902,6 +3902,7 @@ pub const ApiHttpServer = struct {
     /// parameter state; every execution still binds against its own snapshot.
     sql_plan_cache: sql_plan_cache.Cache,
     sql_schema_cache: sql_schema_cache.Cache,
+    lake_read_cache: @import("../serverless/query/lake_serving_cache.zig").Cache,
     pgwire_listener: ?*@import("sql_pgwire.zig").Listener = null,
     embedding_provider_runtime: managed_embedder.ProviderRuntime,
     incoming_graph_routes: distributed_graph.IncomingSourceGroupCache,
@@ -4110,6 +4111,7 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
             .sql_plan_cache = sql_plan_cache.Cache.init(owner_alloc, .{}),
             .sql_schema_cache = sql_schema_cache.Cache.init(owner_alloc),
+            .lake_read_cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(owner_alloc),
             .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
@@ -4624,6 +4626,7 @@ pub const ApiHttpServer = struct {
         self.query_embedding_cache.deinit(self.inferenceCacheBudget());
         self.sql_plan_cache.deinit(queryEmbeddingCacheIo(self.cfg));
         self.sql_schema_cache.deinit();
+        self.lake_read_cache.deinit();
         self.embedding_provider_runtime.deinit();
         self.incoming_graph_routes.deinit();
         self.local_resource_manager.deinit(self.owner_alloc);
@@ -13577,6 +13580,7 @@ pub const ApiHttpServer = struct {
             // conservative do-not-retry signal if a legacy adapter reports a
             // partial outcome, without advertising a partial public commit.
             error.RaftBatchWritePartialOutcome => return error.WriteOutcomeUnknown,
+            error.ExternalLakeReadOnly => return error.ExternalLakeReadOnly,
             error.HAReadOnlyStandby => return error.HAReadOnlyStandby,
             error.HAPromotedStandbyRequiresPrimaryOpen => return error.HAPromotedStandbyRequiresPrimaryOpen,
             error.HAFencedPrimary => return error.HAFencedPrimary,
@@ -16153,7 +16157,11 @@ pub const ApiHttpServer = struct {
     /// Resolve public, namespace-relative REFERENCES names once at DDL ingress.
     /// Stored constraints use immutable identities, so rename never retargets
     /// an FK and drop/recreate cannot silently attach it to a different table.
-    pub fn bindForeignKeySchema(self: *ApiHttpServer, alloc: std.mem.Allocator, scope: system_catalog.Target, child: []const u8, proposed: []const u8, before: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) ![]u8 {
+    pub fn bindForeignKeySchema(self: *ApiHttpServer, alloc: std.mem.Allocator, scope: system_catalog.Target, child: []const u8, proposed_json: []const u8, before: []const u8, identity: ?AuthenticatedIdentity, context: api_operation.RequestContext) ![]u8 {
+        const normalized = try context.platformDeadline();
+        const inferred = if (before.len == 0) try @import("lake_schema_detection.zig").prepare(alloc, proposed_json, .{ .node_config = self.cfg.node_config, .secret_store = self.cfg.secret_store }, .{ .io = self.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }) else null;
+        defer if (inferred) |bytes| alloc.free(bytes);
+        const proposed = inferred orelse proposed_json;
         if (self.source.vtable.system_catalog == null) {
             if (!try foreignKeyParentsAllowed(alloc, identity, proposed)) return error.Forbidden;
             return alloc.dupe(u8, proposed);
@@ -19463,7 +19471,9 @@ pub const ApiHttpServer = struct {
         defer definitions.deinit();
         const listed = try tables_api.buildTableListWithDefinitions(arena, &snapshot, null, storage_statuses, &definitions);
         for (listed) |*item| item.name = labels.get(item.name) orelse return error.InvalidCatalogRecord;
-        std.mem.sort(metadata_openapi.TableStatus, listed, {}, struct {
+        // TableStatus includes the complete schema and can exceed the bit-size
+        // supported by std.mem.sort's SIMD rotation path.
+        std.sort.pdq(metadata_openapi.TableStatus, listed, {}, struct {
             fn less(_: void, l: metadata_openapi.TableStatus, r: metadata_openapi.TableStatus) bool {
                 return std.mem.lessThan(u8, l.name, r.name);
             }
@@ -24496,6 +24506,10 @@ fn contextualJsonResponseOmitNullOptionals(alloc: std.mem.Allocator, status: u16
 
 fn contextualWitnessDDLError(alloc: std.mem.Allocator, err: anyerror) !contextual_operations.OwnedResponse {
     return switch (err) {
+        error.UnsupportedExternalLakeSchemaType => contextualJsonErrorResponse(alloc, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
+        error.ExternalLakeSchemaMismatch => contextualJsonErrorResponse(alloc, 409, "lake files have incompatible column types or the supplied schema fingerprint does not match the detected schema"),
+        error.ExternalLakeSchemaUnavailable => contextualJsonErrorResponse(alloc, 400, "lake schema metadata is unavailable; Parquet inference requires at least one file with a schema"),
+        error.ExternalLakeSchemaTooLarge => contextualJsonErrorResponse(alloc, 400, "detected lake schema exceeds the 1024-column limit"),
         error.ReservedForeignKeySupportIndex => contextualJsonErrorResponse(alloc, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => contextualJsonErrorResponse(alloc, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => contextualJsonErrorResponse(alloc, 409, "foreign-key support changed or is still building; refresh the schema and retry"),

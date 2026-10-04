@@ -45,6 +45,8 @@ pub const Table = struct {
     physical_name: []const u8,
     schema_version: u32,
     storage_mode: enum { relational, document } = .relational,
+    /// External bindings are read-only and pinned by the serving cursor.
+    external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     columns: []const Column,
     indexes: []const Index = &.{},
     /// Request-owned logical authority. Never use a mutable adapter's last
@@ -99,8 +101,9 @@ pub const Row = struct {
     /// Authoritative native null flags aligned with value.object insertion
     /// order. Null means a legacy JSON-only backend without that distinction.
     sql_nulls: ?[]const bool = null,
+    pattern_sources: ?[]const ?*@import("scalar.zig").PatternSet = null,
 
-    pub const Cell = struct { value: std.json.Value, sql_null: bool };
+    pub const Cell = struct { value: std.json.Value, sql_null: bool, patterns: ?*@import("scalar.zig").PatternSet = null };
 
     /// Decoding is explicit about the SQL/JSON null boundary. The native
     /// projection's field names are literal names, never dotted JSON paths.
@@ -112,7 +115,7 @@ pub const Row = struct {
         const value = self.value.object.values()[index];
         const sql_null = if (self.sql_nulls) |flags| flags[index] else value == .null;
         if (sql_null and value != .null) return error.InvalidSqlBackendResponse;
-        return .{ .value = value, .sql_null = sql_null };
+        return .{ .value = value, .sql_null = sql_null, .patterns = if (self.pattern_sources) |sources| if (index < sources.len) sources[index] else return error.InvalidSqlBackendResponse else null };
     }
 };
 pub const Page = struct {
@@ -130,12 +133,43 @@ pub const Page = struct {
     }
 };
 
+/// Borrowed typed vectors plus a page-owned selection. Vectors remain valid
+/// until the cursor's next pull or close; consumers retain only their results.
+/// SQL names are literal, and null bitmaps distinguish SQL NULL from JSON null.
+pub const ColumnPage = struct {
+    batch: @import("../storage/rowsource/types.zig").ColumnBatch,
+    selection: []const usize,
+    after: ?[]const u8 = null,
+    pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
+        if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
+        const index = self.selection[row];
+        if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
+        if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.row_refs[index]) }, .sql_null = false };
+        const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
+        if (column.nulls.isNull(index)) return .{ .value = .null, .sql_null = true };
+        const value: std.json.Value = switch (column.values) {
+            .i64 => |values| .{ .integer = values[index] },
+            .f64 => |values| .{ .float = values[index] },
+            .bool => |values| .{ .bool = values[index] },
+            .bytes => |values| .{ .string = values[index] },
+            .json => |values| try std.json.parseFromSliceLeaky(std.json.Value, alloc, values[index], .{ .allocate = .alloc_always, .parse_numbers = false }),
+            .vector_f32 => return error.UnsupportedSqlExecution,
+        };
+        return .{ .value = value, .sql_null = false };
+    }
+};
+
 /// Owned statement read view. Opening pins data, not just routing metadata.
 /// Page values belong to the next() allocator; the cursor lives until close().
 pub const Cursor = struct {
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, u32) anyerror!Page,
     close: *const fn (*anyopaque) void,
+    /// Optional native column path; consumers may fall back to next().
+    next_columns: ?*const fn (*anyopaque, std.mem.Allocator, u32) anyerror!ColumnPage = null,
+    /// Exact snapshot count; null means the retained cursor must be scanned.
+    /// Providers may use metadata only after accounting for filters/deletes.
+    count_rows: ?*const fn (*anyopaque) anyerror!?u64 = null,
 };
 
 pub const StatementScan = struct { table: Table, request: Scan };
@@ -203,6 +237,8 @@ pub const DdlReceipt = struct {
 pub const DdlOutcome = struct { mutation_outcome: ?MutationOutcome = .committed, receipt: ?DdlReceipt = null };
 
 pub const Backend = struct {
+    execution_io: ?std.Io = null,
+    spill_manager: ?*@import("spill.zig").Manager = null,
     decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     ptr: *anyopaque,
     vtable: *const VTable,

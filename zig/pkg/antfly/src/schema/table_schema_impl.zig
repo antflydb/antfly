@@ -26,6 +26,7 @@ const relational_native = @import("../storage/relational_index.zig");
 pub const TableSchema = struct {
     version: u32 = 0,
     storage_mode: StorageMode = .document,
+    external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     default_type: []const u8 = "",
     ttl_duration_ns: u64 = 0,
     ttl_field: []const u8 = "_timestamp",
@@ -41,6 +42,7 @@ pub const TableSchema = struct {
     generated_columns: ?std.json.Parsed(std.json.Value) = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
+        if (self.external_base_source) |*source| source.deinit(alloc);
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.checks) |*checks| checks.deinit();
         if (self.unique_constraints) |*constraints| constraints.deinit();
@@ -2347,6 +2349,17 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             parsed.storage_mode = std.meta.stringToEnum(StorageMode, storage_mode.string) orelse return error.InvalidSchemaUpdateRequest;
         }
     }
+    if (root.get("base_source")) |base_source| {
+        if (base_source != .null) {
+            if (base_source != .object) return error.InvalidSchemaUpdateRequest;
+            const kind = base_source.object.get("kind") orelse return error.InvalidSchemaUpdateRequest;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "external")) return error.InvalidSchemaUpdateRequest;
+        }
+        const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(bytes);
+        parsed.external_base_source = try @import("../serverless/external_source/schema_binding.zig").externalBindingFromSchemaJsonAlloc(alloc, bytes);
+        if (parsed.external_base_source != null and parsed.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+    }
     if (root.get("default_type")) |default_type| {
         if (default_type != .null) {
             alloc.free(parsed.default_type);
@@ -2480,6 +2493,9 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
         }
         parsed.enforce_types = true;
+    }
+    if (parsed.external_base_source) |source| {
+        if (source.binding.format == .lance or parsed.ttl_duration_ns != 0 or parsed.relational_indexes != null or parsed.checks != null or parsed.unique_constraints != null or parsed.foreign_keys != null or parsed.column_defaults != null or parsed.generated_columns != null) return error.InvalidSchemaUpdateRequest;
     }
     return parsed;
 }

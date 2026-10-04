@@ -255,6 +255,7 @@ pub const TableSchema = struct {
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
     storage_mode: StorageMode = .document,
+    external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     /// Immutable provenance of the validation contract, persisted per epoch.
     /// Runtime-only embedders have no public constraints to restore. A schema
     /// derived from the public API must never silently lose those constraints.
@@ -281,7 +282,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 14;
+pub const storage_format_version: u32 = 15;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -331,6 +332,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     var projection_schema = schema;
     projection_schema.declared_fields = &.{};
     projection_schema.storage_mode = .document;
+    projection_schema.external_base_source = null;
     projection_schema.relational_columns = &.{};
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
@@ -347,6 +349,10 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     std.debug.assert(format_version >= 11 and format_version <= storage_format_version);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
     try validateRelationalSchema(alloc, schema);
+    if (schema.external_base_source) |source| {
+        if (schema.storage_mode != .relational) return error.InvalidSchema;
+        try source.binding.validateReadOnlyMvp();
+    }
     if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
         return error.InvalidSchema;
     }
@@ -481,9 +487,16 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         }
     }
 
-    const result = try alloc.dupe(u8, buf.items);
-    buf.deinit(alloc);
-    return result;
+    if (format_version >= 15) {
+        try buf.append(alloc, @intFromBool(schema.external_base_source != null));
+        if (schema.external_base_source) |source| {
+            const bytes = try std.json.Stringify.valueAlloc(alloc, source.binding, .{});
+            defer alloc.free(bytes);
+            try appendStr(&buf, alloc, bytes);
+        }
+    } else if (schema.external_base_source != null) return error.UnsupportedVersion;
+
+    return buf.toOwnedSlice(alloc);
 }
 
 /// Deserialize a TableSchema from bytes. Dupes all string data so the result
@@ -993,8 +1006,23 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk columns;
     } else &.{};
 
+    const external = if (fmt_version >= 15 and data[pos] == 1) blk: {
+        pos += 1;
+        const bytes = readStr(data, &pos);
+        var parsed = try std.json.parseFromSlice(@import("../serverless/external_source/catalog_binding.zig").Binding, alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (storage_mode != .relational) return error.InvalidSchema;
+        try parsed.value.validateReadOnlyMvp();
+        const borrowed: @import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = .{ .binding = parsed.value, .table_id = undefined, .source_uri = undefined, .schema_fingerprint = undefined };
+        break :blk try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, borrowed);
+    } else blk: {
+        if (fmt_version >= 15) pos += 1;
+        break :blk null;
+    };
+
     const result: TableSchema = .{
         .version = version,
+        .external_base_source = external,
         .default_type = default_type,
         .ttl_duration_ns = ttl_duration_ns,
         .ttl_field = ttl_field,
@@ -1220,6 +1248,10 @@ fn validateSerializedSchema(data: []const u8) !void {
             if ((try cursor.readU8()) >= std.meta.fields(RelationalJsonKind).len) return error.InvalidSchema;
         }
     }
+    if (format_version >= 15) {
+        if (try cursor.readU8() > 1) return error.InvalidSchema;
+        if (data[cursor.pos - 1] == 1) try cursor.readStr();
+    }
     try cursor.finish();
 }
 
@@ -1250,6 +1282,10 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
 
 /// Free a schema returned by deserializeSchema.
 pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
+    if (s.external_base_source) |source| {
+        var owned = source;
+        owned.deinit(alloc);
+    }
     alloc.free(s.default_type);
     alloc.free(s.ttl_field);
     for (s.exact_fields) |field| {
@@ -2568,7 +2604,7 @@ test "schema serialize/deserialize round-trip" {
     defer alloc.free(data);
 
     var format_pos: usize = 4;
-    try std.testing.expectEqual(@as(u32, 14), readU32(data, &format_pos));
+    try std.testing.expectEqual(storage_format_version, readU32(data, &format_pos));
 
     const loaded = try deserializeSchema(alloc, data);
     defer freeSchema(alloc, loaded);

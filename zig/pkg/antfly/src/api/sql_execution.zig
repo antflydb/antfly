@@ -388,7 +388,7 @@ pub const Adapter = struct {
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .execution_io = self.server.embedding_provider_runtime.io, .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -478,6 +478,7 @@ pub const Adapter = struct {
         const definition = table.query_definition orelse return error.InvalidSqlBackendResponse;
         if (table.table_id == 0 or definition.table_id != table.table_id) return error.InvalidSqlBackendResponse;
         var binding = try self.server.sql_schema_cache.resolve(self.server.sqlPlanCacheIo(), alloc, definition.schema_json, table.table_id, table.name);
+        if (binding.external_base_source != null and action != .read) return error.ExternalLakeReadOnly;
         binding.scope = .{ .database = try alloc.dupe(u8, target.database), .namespace = try alloc.dupe(u8, target.namespace), .name = try alloc.dupe(u8, target.table), .revision = snapshot.revision };
         self.revision = snapshot.revision;
         self.target = target;
@@ -501,12 +502,15 @@ pub const Adapter = struct {
 
     fn verify(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
         try self.context.ensureActive();
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+        const temporary = arena.allocator();
         // A renamed/reused logical name never silently retargets a prepared
         // statement. The coordinator still applies its own durable auth fence.
         const scope = table.scope orelse return error.InvalidSqlBackendResponse;
         const target: system_catalog.Target = .{ .database = scope.database, .namespace = scope.namespace, .table = scope.name };
-        const bytes = try self.server.source.systemCatalog(alloc, self.context, .{ .resolve_many = .{ .targets = &.{target}, .expected_revision = scope.revision } });
-        const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, alloc, bytes, .{});
+        const bytes = try self.server.source.systemCatalog(temporary, self.context, .{ .resolve_many = .{ .targets = &.{target}, .expected_revision = scope.revision } });
+        const snapshot = try std.json.parseFromSliceLeaky(system_catalog.ResolvedMany, temporary, bytes, .{});
         if (snapshot.revision != scope.revision or snapshot.tables.len != 1) return error.CatalogGenerationChanged;
         const current = snapshot.tables[0] orelse return error.CatalogGenerationChanged;
         if (current.table_id != table.id or !std.mem.eql(u8, current.name, table.physical_name)) return error.CatalogGenerationChanged;
@@ -627,6 +631,7 @@ pub const Adapter = struct {
 
     fn openScan(ptr: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !?catalog.Cursor {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        if (table.external_base_source != null) return try self.openLakeScan(alloc, table, request);
         if (self.range_reads != null) {
             const statement = try openStatement(ptr, alloc, &.{.{ .table = table, .request = request }});
             errdefer statement.close(statement.ptr);
@@ -646,6 +651,101 @@ pub const Adapter = struct {
             return try @import("sql_session_overlay.zig").open(alloc, native_cursor, staged, table, ordered, row_filter);
         }
         return openNativeScan(ptr, alloc, table, request);
+    }
+
+    pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
+        try self.verify(alloc, table);
+        try self.checkLakeRead(alloc, table);
+        const cursor = try @import("lake_sql_cursor.zig").openWithCache(alloc, table, request, self.context, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store }, &self.server.lake_read_cache, self.server.embedding_provider_runtime.io);
+        errdefer cursor.close(cursor.ptr);
+        try self.verify(alloc, table);
+        return cursor;
+    }
+
+    fn checkLakeRead(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table) !void {
+        // External snapshots cannot provide native serializable range proofs.
+        if (self.range_reads != null or self.dynamic_snapshot != null) return error.UnsupportedSqlExecution;
+        if (try self.rowPolicyProof(alloc, table)) |proof| {
+            if (self.policy_proofs == null) alloc.free(proof);
+            return error.RowPolicyUnsupported;
+        }
+        if (try http_server.resolveEffectiveRowFilterJson(alloc, self.identity.*, table.physical_name)) |filter| {
+            alloc.free(filter);
+            return error.RowPolicyUnsupported;
+        }
+    }
+
+    const LakeStatement = struct {
+        alloc: std.mem.Allocator,
+        cursors: []catalog.Cursor,
+        sources: std.AutoHashMapUnmanaged(u64, *@import("../serverless/query/lake_serving.zig").ServingSource) = .empty,
+        opened: usize = 0,
+        native: ?catalog.StatementRead = null,
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (self.cursors[0..self.opened]) |cursor| cursor.close(cursor.ptr);
+            if (self.native) |value| value.close(value.ptr);
+            var values = self.sources.valueIterator();
+            while (values.next()) |source| {
+                source.*.deinit();
+                self.alloc.destroy(source.*);
+            }
+            self.sources.deinit(self.alloc);
+            self.alloc.free(self.cursors);
+            self.alloc.destroy(self);
+        }
+    };
+
+    fn openLakeStatement(self: *Adapter, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
+        if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
+        const owner = try alloc.create(LakeStatement);
+        const cursors = alloc.alloc(catalog.Cursor, requests.len) catch |err| {
+            alloc.destroy(owner);
+            return err;
+        };
+        owner.* = .{ .alloc = alloc, .cursors = cursors };
+        // owner owns cursors after allocation; avoid double free on failure.
+        return self.fillLakeStatement(alloc, owner, requests) catch |err| {
+            LakeStatement.close(owner);
+            return err;
+        };
+    }
+
+    fn fillLakeStatement(self: *Adapter, alloc: std.mem.Allocator, owner: *LakeStatement, requests: []const catalog.StatementScan) !catalog.StatementRead {
+        var scratch = std.heap.ArenaAllocator.init(alloc);
+        defer scratch.deinit();
+        var native: std.ArrayList(catalog.StatementScan) = .empty;
+        // Pin every external table once; repeated aliases share the inventory.
+        for (requests) |request| {
+            if (request.table.external_base_source != null) {
+                try self.verify(scratch.allocator(), request.table);
+                try self.checkLakeRead(scratch.allocator(), request.table);
+                if (owner.sources.contains(request.table.id)) continue;
+                const source = try alloc.create(@import("../serverless/query/lake_serving.zig").ServingSource);
+                errdefer alloc.destroy(source);
+                const schema: @import("../storage/schema.zig").TableSchema = .{ .storage_mode = .relational, .external_base_source = request.table.external_base_source };
+                const normalized = try self.context.platformDeadline();
+                source.* = try @import("../serverless/query/lake_serving.zig").ServingSource.openWithContext(alloc, schema, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store }, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+                errdefer source.deinit();
+                try source.attachCache(&self.server.lake_read_cache, request.table.external_base_source.?.binding, .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+                try owner.sources.put(alloc, request.table.id, source);
+            } else try native.append(scratch.allocator(), request);
+        }
+        if (native.items.len != 0) owner.native = try openStatement(self, alloc, native.items);
+        var native_index: usize = 0;
+        for (requests, owner.cursors) |request, *cursor| {
+            if (request.table.external_base_source != null) {
+                cursor.* = try @import("lake_sql_cursor.zig").openPinned(alloc, request.table, request.request, self.context, owner.sources.get(request.table.id).?);
+                errdefer cursor.close(cursor.ptr);
+                try self.verify(scratch.allocator(), request.table);
+            } else {
+                cursor.* = owner.native.?.cursors[native_index];
+                cursor.close = StatementRead.borrowedClose;
+                native_index += 1;
+            }
+            owner.opened += 1;
+        }
+        return .{ .ptr = owner, .cursors = owner.cursors, .close = LakeStatement.close };
     }
 
     const SingleStatementCursor = struct {
@@ -797,8 +897,9 @@ pub const Adapter = struct {
         return .{ .ptr = retained, .cursors = cursors, .close = DynamicStatementRead.close };
     }
 
-    fn openStatement(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) !catalog.StatementRead {
+    fn openStatement(ptr: *anyopaque, alloc: std.mem.Allocator, requests: []const catalog.StatementScan) anyerror!catalog.StatementRead {
         const self: *Adapter = @ptrCast(@alignCast(ptr));
+        for (requests) |request| if (request.table.external_base_source != null) return self.openLakeStatement(alloc, requests);
         if (self.dynamic_snapshot != null) return self.openDynamicStatement(alloc, requests);
         if (requests.len == 0 or requests.len > 64) return error.SqlProgramLimitExceeded;
         const read_source = self.server.table_reads orelse return error.TableNotFound;

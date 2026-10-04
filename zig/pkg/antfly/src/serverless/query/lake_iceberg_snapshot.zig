@@ -227,6 +227,7 @@ pub fn readSnapshotInventoryAlloc(
 
     const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null, request.limits.metadata_object_bytes);
     defer alloc.free(metadata_bytes);
+    if (try emptyInventoryAlloc(alloc, request, metadata_bytes)) |inventory| return inventory;
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
         request.metadata_uri,
@@ -290,6 +291,39 @@ pub fn readSnapshotInventoryAlloc(
     });
 }
 
+fn emptyInventoryAlloc(alloc: Allocator, request: SnapshotReadRequest, bytes: []const u8) !?external_source.Inventory {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, bytes, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidIcebergMetadata;
+    const root = parsed.value.object;
+    if (root.get("snapshots")) |snapshots| {
+        if (snapshots != .array) return error.InvalidIcebergMetadata;
+        if (snapshots.array.items.len != 0) return null;
+    }
+    if (root.get("current-snapshot-id")) |snapshot| {
+        if (snapshot != .null and (snapshot != .integer or snapshot.integer != -1)) return null;
+    }
+    if (request.requested_snapshot_id != null) return error.IcebergSnapshotMismatch;
+    const version = root.get("format-version") orelse return error.InvalidIcebergMetadata;
+    if (version != .integer or (version.integer != 1 and version.integer != 2)) return error.UnsupportedIcebergMetadataVersion;
+    const location = root.get("location") orelse return error.InvalidIcebergMetadata;
+    const uuid = root.get("table-uuid") orelse return error.InvalidIcebergMetadata;
+    if (location != .string or uuid != .string or location.string.len == 0 or uuid.string.len == 0) return error.InvalidIcebergMetadata;
+    var detected = try @import("lake_schema.zig").icebergSchema(alloc, bytes, null);
+    defer detected.deinit();
+    const source_id = try alloc.dupe(u8, request.source_id);
+    errdefer alloc.free(source_id);
+    const uri = try alloc.dupe(u8, location.string);
+    errdefer alloc.free(uri);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const snapshot_id = try std.fmt.allocPrint(alloc, "empty:{s}:{s}", .{ uuid.string, std.fmt.bytesToHex(digest, .lower) });
+    errdefer alloc.free(snapshot_id);
+    const fingerprint = try alloc.dupe(u8, detected.fingerprint);
+    errdefer alloc.free(fingerprint);
+    return .{ .format = .iceberg, .source_id = source_id, .source_uri = uri, .snapshot_id = snapshot_id, .schema_fingerprint = fingerprint, .files = try alloc.alloc(external_source.FileEntry, 0) };
+}
+
 pub fn readSnapshotInventoryAndDeletePlanAlloc(
     alloc: Allocator,
     request: SnapshotReadRequest,
@@ -300,6 +334,7 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
 
     const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null, request.limits.metadata_object_bytes);
     defer alloc.free(metadata_bytes);
+    if (try emptyInventoryAlloc(alloc, request, metadata_bytes)) |inventory| return .{ .inventory = inventory, .delete_plan = .{ .files = &.{} } };
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
         request.metadata_uri,
@@ -1024,7 +1059,7 @@ fn sortAndDeduplicateExternalRowRefs(refs: []rowsource.RowRef) usize {
     return out;
 }
 
-fn externalRowRefLessThan(_: void, left_ref: rowsource.RowRef, right_ref: rowsource.RowRef) bool {
+pub fn externalRowRefLessThan(_: void, left_ref: rowsource.RowRef, right_ref: rowsource.RowRef) bool {
     const left = switch (left_ref) {
         .external => |value| value,
         else => return false,
@@ -1309,7 +1344,7 @@ fn hasManifestSummary(manifest_entry: iceberg_avro.ManifestListEntry) bool {
         manifest_entry.deleted_rows_count != 0;
 }
 
-fn readFullObjectAlloc(
+pub fn readFullObjectAlloc(
     alloc: Allocator,
     client: *object_storage.ObjectStorage,
     cache: ?*lake_parquet_rowgroup.ObjectRangeCache,

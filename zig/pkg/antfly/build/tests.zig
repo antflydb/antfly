@@ -1827,6 +1827,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         api_http_runtime_tests,
         api_http_runtime_filters,
     );
+    b.step("lake-api-test", "Run mounted API lake and SQL integration tests").dependOn(&run_api_http_runtime_tests.step);
     const relational_index_http_tests = b.addTest(.{
         .name = "relational-index-http-tests",
         .root_module = api_http_runtime_test_mod,
@@ -2494,6 +2495,28 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_lake_scaffold_tests = addFilteredTestRunArtifact(b, lake_scaffold_tests);
+    const lake_integration_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_integration_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, lake_integration_mod, true, true);
+    lake_integration_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const lake_integration_tests = b.addTest(.{
+        .root_module = lake_integration_mod,
+        .filters = &.{ "lake SQL", "external lake" },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const lake_refinement_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_refinement_bench_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, lake_refinement_bench_mod, true, true);
+    lake_refinement_bench_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const lake_refinement_bench = b.addTest(.{ .root_module = lake_refinement_bench_mod, .filters = &.{"native dictionary refinement benchmark"} });
+    b.step("lake-native-refinement-bench", "Compare repeated and reused native Parquet dictionary decoding").dependOn(&b.addRunArtifact(lake_refinement_bench).step);
     const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
     lake_test_step.dependOn(&run_lake_scaffold_tests.step);
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);
@@ -5619,6 +5642,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("replay-document-integration-test", "Verify replay consumers across text, algebraic, graph and document bodies")
         .dependOn(&b.addRunArtifact(replay_document_integration_tests).step);
 
+    const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple } });
+    b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,

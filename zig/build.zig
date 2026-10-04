@@ -1168,6 +1168,22 @@ pub fn create(b: *std.Build) ?Artifacts {
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
     sql_test_mod.link_libc = link_libc;
+    const refinement_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sql_refinement_bench_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.storage_boundary.configureSources(refinement_bench_mod, false, false);
+    refinement_bench_mod.addImport("sql_parser", sql_parser_mod);
+    refinement_bench_mod.addImport("antfly_platform", platform_mod);
+    refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    refinement_bench_mod.addImport("antfly_regex", regex_mod);
+    refinement_bench_mod.addImport("antfly_hash", hash_mod);
+    refinement_bench_mod.addImport("bloom", bloom_mod);
+    refinement_bench_mod.link_libc = link_libc;
+    const refinement_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native refinements benchmark"} });
+    b.step("sql-native-refinement-bench", "Compare native expression, aggregate and window spill refinements").dependOn(&b.addRunArtifact(refinement_bench).step);
+
     antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;

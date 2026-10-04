@@ -9,6 +9,170 @@ The implementation now includes scalar and aggregate execution, joins and CTEs,
 native catalog DDL, durable READ COMMITTED sessions/savepoints, and public SQL
 interfaces. It does not yet reproduce the mega branch's complete SQL behavior.
 
+### External lake SQL integration
+
+Relational table schemas can attach a read-only Parquet prefix or Iceberg table
+with `base_source`. The attachment persists with the native schema and is
+resolved through the catalog for public typed-row queries and SQL over HTTP or
+pgwire. Table creation can infer `document_schemas` and `schema_fingerprint`
+from lake metadata. For example, this table schema needs no column declaration:
+
+```json
+{
+  "storage_mode": "relational",
+  "base_source": {
+    "kind": "external",
+    "table_id": "events",
+    "format": "parquet",
+    "uri": "s3://analytics/events",
+    "credentials": {"ref": "analytics-lake", "scope": "events"},
+    "snapshot": {"mode": "current"},
+    "write_policy": "read_only"
+  }
+}
+```
+
+Creation reads Parquet footers or the selected Iceberg schema, without decoding
+rows. Parquet inference combines all listed files, marks absent/nullable fields
+optional, and rejects incompatible types. Iceberg uses field IDs, types and
+requiredness from metadata; a pinned snapshot uses its schema. Empty Iceberg
+tables are supported. The discovered columns and fingerprint are persisted
+before catalog publication, so SQL Describe and Execute use stable types.
+
+Inference supports flat booleans, integers, floating-point numbers, UTF-8 strings,
+timestamps and decimal strings that preserve precision. Decimal values use exact
+integer-and-scale decoding up to precision 38, including 16-byte binary values,
+and retain trailing fractional zeros. They have SQL string semantics; casts to
+floating-point numbers are explicit. Timestamp filters compare exact signed
+epoch nanoseconds, accepting timezone offsets and dates before 1970. Nested, binary and
+unsupported logical types fail explicitly. Parquet inference needs a schema-bearing
+file. Missing optional columns become SQL NULL; incompatible types and missing
+required columns fail scans. New fields do not silently expand the catalog.
+Explicit schemas/fingerprints remain supported; omitted fingerprints default to
+`auto`. Schema discovery also runs through MCP and SQL catalog creation.
+
+Credential references use configured `external_io` connections with `lake_read`
+capability and enforce their bucket/prefix scope. Iceberg attachments use
+`format: "iceberg"` and the snapshot schema fingerprint (for example,
+`iceberg-schema:7`). A snapshot selector can instead pin an Iceberg snapshot ID
+or a Parquet object-version digest. Filesystem sources use the existing
+filesystem object-store layout under its `antfly` bucket.
+
+Each SQL statement pins source inventories and object versions. Repeated table
+aliases share the inventory, and mixed joins retain the native statement read.
+SQL applies its existing projections, predicates, aggregates, joins, CTEs, set
+operations and windows to lake cursors. Public row queries apply residual
+predicates before limits and emit snapshot-derived `_id` values. Iceberg reads
+apply the existing position/equality delete machinery. Provider reads receive
+the request's cancellation and deadline.
+
+Lake cursors pull typed column batches, retaining one file's footer/delete
+metadata and one decoded page per projected column. Opening a pinned cursor does not read data
+pages; the first page need not wait for later files. Aggregate execution consumes
+selected typed cells directly, and row objects are created at the row API
+boundary. Physical snapshot identities use opaque versioned `lake1:` IDs with
+numeric row-group/row ordinals. File metadata is ordered by identity before
+scanning, so pagination needs no full row sort. IDs are stable within a snapshot;
+clients must preserve them verbatim and must not parse or synthesize them.
+
+Simple integer, string and boolean comparisons prune disjoint row groups from
+footer min/max statistics, and files can be skipped when their known row groups
+are all disjoint. Iceberg partition pruning resolves each file's spec ID and source
+field IDs, then conservatively projects identity, bucket, truncate and temporal
+predicates. Unknown specs, transforms, values and comparisons remain residual. Missing statistics, annotated decimal/timestamp types and
+unsupported comparisons stay residual; predicates and Iceberg position/equality
+deletes are evaluated before page limits. Exact unfiltered `COUNT(*)` uses footer
+row counts only when no deletes or cursor constraints apply. Other aggregates,
+filtered counts and delete-bearing counts scan the selected rows normally.
+
+API SQL reads share a server-owned 64 MiB range cache (at most 4,096 entries).
+Keys bind the credential reference/scope, source endpoint, object version and
+byte range. Unversioned reads bypass it; cache hits still check cancellation and
+deadlines. Shared cached bytes are separate from each statement's memory budget.
+The cursor prefetches exact upcoming data-page ranges, next-group header probes
+(or the next file's footer) through the existing I/O runtime: at most four
+concurrent reads and 32 MiB of requested ranges per lookahead batch. Worker buffers use
+independent allocations outside the SQL arena; provider response copies can add
+temporary memory. Closing or canceling a cursor cancels and joins every worker
+before releasing source metadata. Prefetch failures stay speculative: required
+reads still enforce pinned versions, deadlines and cancellation.
+
+Each stream admits at most 100,000,000 examined rows. Parquet decoding aligns
+independent column pages and decodes each column dictionary once. The 32 MiB
+input/decoded budgets apply to the active page set, rather than the entire row group. Large
+individual pages and dictionaries can still fail admission. SQL defaults admit
+10,000,000 scanned rows, 65,536 scan pages and 64 MiB retained bytes per statement.
+Nested pipelines reduce internal page sizes under smaller budgets.
+
+Blocking sorts, grouped aggregates (including DISTINCT inputs), hash-join build
+rows and window partitions spill through a shared statement owner. Sorts merge
+bounded runs and stream past OFFSET; groups merge partial states one key at a
+time; joins persist outer-join match markers. Window passes retain partition
+rows, peer/group directories and aggregate frame trees on disk, with small
+tracked caches. Separate cell records store window outputs without rewriting
+the original row payload for each function. Ranking, navigation,
+ROWS/RANGE/GROUPS and frame exclusions keep their existing semantics. Quantified pattern sets use external DISTINCT and a
+reusable statement-owned file; matching retains one pattern at a time.
+
+API SQL statements default to a shared 1 GiB live spill quota and at most 64
+open spill files per statement. `sql.runtime.Limits` exposes `spill_bytes`
+(`0` disables spilling) and `spill_root` (default `/tmp`). Temporary directories
+and files are private; files are immediately unlinked while open, and handles
+and directories are cleaned up on completion, cancellation and error. Spill
+records preserve exact numeric tags, SQL/JSON null distinction and row order,
+with length and checksum validation. Disk exhaustion and oversized records
+still return errors.
+
+Pgwire can deliver sorted, grouped and window results from a disk spool in bounded
+pages, beyond the materialized response row cap. Execution pins one statement
+cut and writes final rows once; later portal pulls read the spool without
+rescanning source data. Explicit SQL LIMIT/OFFSET, ordering and NULL flags are
+preserved. HTTP JSON response limits remain; blocking projections involving
+external decision providers retain the existing bounded materialization path.
+
+Numeric and boolean expression batches use bounded instruction-major kernels,
+including four-lane exact integer and floating-point arithmetic/comparisons.
+String comparisons and boolean unary operations also run by batch. Live
+intermediate vectors reuse workspace slots; global COUNT, integer SUM and
+boolean reductions avoid per-row grouping probes. Mixed numeric values retain
+scalar conversion semantics. Lazy expressions (CASE, AND/OR) and
+unsupported types/functions use the scalar evaluator.
+
+Repeatable native microbenchmarks run with
+`zig build sql-native-refinement-bench lake-native-refinement-bench -Doptimize=ReleaseFast`
+from `zig/`. The measured baseline and refined paths validate equivalent outputs
+and alternate execution order across three samples at each size. Raw samples,
+fixture details and median timings are in
+[`native-sql-refinements.json`](../zig/bench/baselines/native-sql-refinements.json).
+These measure CPU kernels and local temporary-file writes; remote lake latency
+and end-to-end query throughput need separate measurement. Vector batching
+uses more bounded workspace than row-at-a-time scalar evaluation, while reuse
+lets long expressions run without retaining one vector per instruction.
+
+The regression fixture scans 131,072 and 1,048,576 integer rows in 65,536-row
+Parquet groups under a 32 MiB tracking allocator. Peak tracked allocations are
+7,081,607 and 7,081,721 bytes respectively: input growth adds file metadata rather
+than retaining all rows. This measures cursor memory for that fixture, not
+process memory or query latency. Tests also verify lazy first-page I/O, warm
+range reuse, pruning without decoded pages, changed-object rejection, exact
+large integers, SQL/JSON null distinction and Iceberg deletes before limits.
+Forced-spill SQL tests execute sorting with large OFFSET, grouping with DISTINCT,
+and joins under a 256 KiB statement budget. Operator tests cover duplicate join
+keys and unmatched rows; spill tests cover quota failures, cancellation, checksum
+corruption and cleanup. Prefetch tests prove overlapping reads, warm reuse and
+provider-token cancellation independent of the worker I/O runtime. Kernel tests
+compare results and numeric errors with the scalar evaluator.
+
+`EXPLAIN` identifies `Lake Scan`; verbose plans include the source format and
+configured snapshot selector without opening the source. Unsupported Parquet
+encodings fail through the existing lake engine. Source attachments reject native write constraints, indexes, defaults,
+generated columns and TTL. SQL mutations and public batches reject writes;
+existing native tables cannot acquire or remove an attachment through a schema
+update. External scans reject native serializable range-proof requests and
+active row policies or row filters. Public secondary-index cursors and explicit
+collations are unsupported. Lake sidecar and operational engine APIs remain the
+existing standalone interfaces.
+
 ### Pre-merge activation work
 
 Standalone ordinary FK publication now uses the durable native owner-control
@@ -293,10 +457,11 @@ per correlation key rather than the ordered-comparison MIN/MAX shortcut.
 The inner source is captured once, while the step-limited scalar matcher folds
 ANY/SOME/ALL (including per-pattern NOT forms) with SQL empty-set and NULL
 semantics. Empty global aggregates contain no synthetic NULL member; large
-sets fail the retained-byte limit. Arbitrary pattern matching still has a
+sets use external DISTINCT and reusable disk state when spilling is enabled.
+Without spill I/O they retain the memory quota. Arbitrary pattern matching still has a
 bounded per-outer-row probe cost rather than an index shortcut. Pattern state
 is allocated only for this internal aggregate; the ordinary 10,000-row grouped
-benchmark retains its 1,912-byte peak after the change. Pattern and operand
+benchmark stays below 2 KiB of operator state. Pattern and operand
 parameters infer string independently of the aggregate's JSON result type.
 
 Named WINDOW definitions resolve in query-local scopes before publication of the

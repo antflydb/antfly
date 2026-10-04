@@ -1,0 +1,113 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Elastic-2.0
+//! Repeatable native microbenchmarks. Fixtures live outside measured budgets;
+//! both paths produce and validate the same outputs. No timing assertions.
+const std = @import("std");
+const scalar = @import("scalar.zig");
+const Datum = scalar.Datum;
+const operators = @import("operators.zig");
+const disk = @import("disk_rows.zig");
+const spill = @import("spill.zig");
+fn now() i96 {
+    return std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+}
+fn expression(vector: bool, program: *const scalar.Program, rows: []const []const Datum, count: usize) !struct { ns: i96, peak: usize, checksum: f64 } {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    var checksum: f64 = 0;
+    const start = now();
+    for (0..count / rows.len) |_| {
+        _ = arena.reset(.free_all);
+        const a = arena.allocator();
+        const values = if (vector) (try @import("vector_eval.zig").evaluate(a, program, rows, &.{})).? else blk: {
+            const values = try a.alloc(Datum, rows.len);
+            for (rows, values) |row, *value| value.* = try program.evaluate(a, row, &.{}, .{});
+            break :blk values;
+        };
+        for (values) |value| checksum += value.value.float;
+    }
+    return .{ .ns = now() - start, .peak = budget.peak, .checksum = checksum };
+}
+fn aggregation(batched: bool, rows: []const []const Datum, count: usize) !struct { ns: i96, probes: u64, peak: usize, sum: i64 } {
+    const specs = [_]operators.AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .bool_or } };
+    var groups = try operators.Grouped.create(std.testing.allocator, &specs, .{});
+    defer groups.deinit();
+    const start = now();
+    for (0..count / rows.len) |_| {
+        if (batched) try groups.addGlobalBatch(rows) else for (rows) |row| try groups.add(&.{}, row);
+    }
+    const elapsed = now() - start;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const result = try groups.resultAt(arena.allocator(), 0);
+    try std.testing.expectEqual(@as(i64, @intCast(count)), result.aggregates[0].value.integer);
+    try std.testing.expect(result.aggregates[2].value.bool);
+    return .{ .ns = elapsed, .probes = groups.hash_probes, .peak = groups.budget.peak, .sum = result.aggregates[1].value.integer };
+}
+fn windows(overlay: bool, count: usize) !struct { ns: i96, bytes: u64 } {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows = try disk.Rows.init(a, &manager, 3);
+    defer rows.deinit();
+    const text = [_]u8{'x'} ** 8192;
+    for (0..count) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .string = &text }), .{}, .{} }, .keys = &.{}, .ordinal = index });
+    const before = manager.written_bytes;
+    const start = now();
+    if (overlay) try rows.enableColumnUpdates(1);
+    for (1..3) |column| for (0..count) |index| try rows.setCell(index, column, Datum.json(.{ .integer = @intCast(index + column) }));
+    const elapsed = now() - start;
+    const written = manager.written_bytes - before;
+    for (0..count) |index| {
+        const row = try rows.row(index);
+        try std.testing.expectEqual(@as(i64, @intCast(index + 1)), row.values[1].value.integer);
+        try std.testing.expectEqual(@as(i64, @intCast(index + 2)), row.values[2].value.integer);
+        try std.testing.expectEqualStrings(&text, row.values[0].value.string);
+    }
+    return .{ .ns = elapsed, .bytes = written };
+}
+test "native refinements benchmark" {
+    const a = std.testing.allocator;
+    var compiled = try @import("compiler.zig").compileScalar(a, "(n + 1.25) * 2.0 - 3.0", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .number }}, &.{}, .{});
+    defer program.deinit();
+    var numeric: [1024][1]Datum = undefined;
+    var aggregate: [1024][3]Datum = undefined;
+    var numeric_rows: [1024][]const Datum = undefined;
+    var aggregate_rows: [1024][]const Datum = undefined;
+    for (&numeric, &aggregate, &numeric_rows, &aggregate_rows, 0..) |*n, *agg, *nr, *ar, index| {
+        n.* = .{Datum.json(.{ .float = @as(f64, @floatFromInt(index)) / 8.0 })};
+        agg.* = .{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .integer = @intCast(index % 7) }), Datum.json(.{ .bool = index % 2 == 0 }) };
+        nr.* = n;
+        ar.* = agg;
+    }
+    _ = try expression(false, &program, &numeric_rows, 1024);
+    _ = try expression(true, &program, &numeric_rows, 1024);
+    for ([_]usize{ 262144, 1048576 }) |count| for (0..3) |sample| {
+        const first_expression = try expression(sample % 2 != 0, &program, &numeric_rows, count);
+        const second_expression = try expression(sample % 2 == 0, &program, &numeric_rows, count);
+        const baseline = if (sample % 2 == 0) first_expression else second_expression;
+        const refined = if (sample % 2 == 0) second_expression else first_expression;
+        try std.testing.expectEqual(baseline.checksum, refined.checksum);
+        std.debug.print("native_refinement {{\"case\":\"float_expression\",\"rows\":{d},\"sample\":{d},\"scalar_ns\":{d},\"vector_ns\":{d},\"scalar_peak_bytes\":{d},\"vector_peak_bytes\":{d}}}\n", .{ count, sample, baseline.ns, refined.ns, baseline.peak, refined.peak });
+        const first_group = try aggregation(sample % 2 != 0, &aggregate_rows, count);
+        const second_group = try aggregation(sample % 2 == 0, &aggregate_rows, count);
+        const scalar_group = if (sample % 2 == 0) first_group else second_group;
+        const batch_group = if (sample % 2 == 0) second_group else first_group;
+        try std.testing.expectEqual(scalar_group.sum, batch_group.sum);
+        std.debug.print("native_refinement {{\"case\":\"global_aggregate\",\"rows\":{d},\"sample\":{d},\"scalar_ns\":{d},\"batch_ns\":{d},\"scalar_probes\":{d},\"batch_probes\":{d},\"scalar_peak_bytes\":{d},\"batch_peak_bytes\":{d}}}\n", .{ count, sample, scalar_group.ns, batch_group.ns, scalar_group.probes, batch_group.probes, scalar_group.peak, batch_group.peak });
+    };
+    for ([_]usize{ 512, 4096 }) |count| for (0..3) |sample| {
+        const first_window = try windows(sample % 2 != 0, count);
+        const second_window = try windows(sample % 2 == 0, count);
+        const baseline = if (sample % 2 == 0) first_window else second_window;
+        const refined = if (sample % 2 == 0) second_window else first_window;
+        std.debug.print("native_refinement {{\"case\":\"wide_window_updates\",\"rows\":{d},\"sample\":{d},\"row_ns\":{d},\"cell_ns\":{d},\"row_written_bytes\":{d},\"cell_written_bytes\":{d}}}\n", .{ count, sample, baseline.ns, refined.ns, baseline.bytes, refined.bytes });
+    };
+}
