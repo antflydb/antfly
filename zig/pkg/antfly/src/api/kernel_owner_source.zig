@@ -4215,7 +4215,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !client.QueryResponse {
         try table_reads.checkQueryDeadline(req);
         try self.prepareQueryRead(group_id, req, consistency);
-        const request_json = try table_reads.encodeStorageKernelQueryRequest(alloc, req);
+        const request_json = try @import("local_query_contract.zig").encodeStorageKernelQueryRequestForExecution(alloc, req, raw_search_result);
         defer alloc.free(request_json);
         var lease = try self.acquireWithControls(group_id, table_name, .from(req));
         defer lease.deinit();
