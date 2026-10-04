@@ -155,7 +155,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const replay_allocation_tests = b.addTest(.{
         .root_module = replay_allocation_mod,
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
-        .filters = &.{ "storage.db.derived.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves" },
+        .filters = &.{ "storage.db.derived.", "storage.db.artifact_ids.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves" },
     });
     b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
         .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
@@ -5590,6 +5590,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     });
     b.step("document-lookup-bench", "Build validated real document collector allocation/timing benchmark")
         .dependOn(&b.addInstallArtifact(document_lookup_bench, .{ .dest_sub_path = "document-lookup-bench" }).step);
+
+    const document_collector_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "document collectors release",
+            "document collectors sparse",
+            "document collectors embedding identity",
+            "document collectors duplicate delete",
+            "document collectors asset projection",
+            "document collectors ordinary slab",
+            "document collectors JSON string",
+            "document collectors JSON numeric",
+            "document collectors JSON media",
+            "db replay applies dense embeddings from artifact payloads",
+            "db replay applies sparse embeddings from artifact payloads",
+            "db replay blocks and preserves corrupt dense embedding artifacts",
+            "db replay blocks and preserves corrupt sparse embedding artifacts",
+            "graph projection preserves numeric literals in direct materialization",
+            "collectDocumentWrites batches sorted document reads",
+            "collectDocumentWrites skips missing out-of-range",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-collector-test", "Verify synchronous document collector ownership and allocation failures")
+        .dependOn(&b.addRunArtifact(document_collector_tests).step);
 
     const replay_document_integration_filters = [_][]const u8{
         "document collectors release",

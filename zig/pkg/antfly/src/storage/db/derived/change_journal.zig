@@ -130,10 +130,36 @@ pub const BorrowedBinaryRecordScratch = struct {
             self.target_hints.capacity * @sizeOf(TargetHint);
     }
 
-    pub fn trimRetainedCapacity(self: *BorrowedBinaryRecordScratch, alloc: Allocator, max_bytes: usize) void {
+    pub inline fn trimRetainedCapacity(self: *BorrowedBinaryRecordScratch, alloc: Allocator, max_bytes: usize) void {
         if (self.retainedCapacityBytes() <= max_bytes) return;
-        self.deinit(alloc);
-        self.* = .{};
+        self.trimOversizedBuffers(alloc, max_bytes);
+    }
+
+    noinline fn trimOversizedBuffers(self: *BorrowedBinaryRecordScratch, alloc: Allocator, max_bytes: usize) void {
+        // Discard the largest buffers first, preserving ordinary-size scratch
+        // after an exceptional record. Trimming never allocates or retains
+        // more than the caller's aggregate capacity limit.
+        while (self.retainedCapacityBytes() > max_bytes) {
+            const capacities = [_]usize{
+                self.changed_doc_keys.capacity * @sizeOf([]const u8),
+                self.deleted_doc_keys.capacity * @sizeOf([]const u8),
+                self.overwritten_doc_keys.capacity * @sizeOf([]const u8),
+                self.changed_artifact_keys.capacity * @sizeOf([]const u8),
+                self.target_hints.capacity * @sizeOf(TargetHint),
+            };
+            var largest: usize = 0;
+            for (capacities, 0..) |bytes, i| if (bytes > capacities[largest]) {
+                largest = i;
+            };
+            switch (largest) {
+                0 => self.changed_doc_keys.clearAndFree(alloc),
+                1 => self.deleted_doc_keys.clearAndFree(alloc),
+                2 => self.overwritten_doc_keys.clearAndFree(alloc),
+                3 => self.changed_artifact_keys.clearAndFree(alloc),
+                4 => self.target_hints.clearAndFree(alloc),
+                else => unreachable,
+            }
+        }
     }
 
     fn reset(self: *BorrowedBinaryRecordScratch) void {
@@ -1517,4 +1543,22 @@ test "change journal selected decode rejects impossible list counts before alloc
     defer scratch.deinit(alloc);
     try std.testing.expectError(error.UnexpectedEndOfInput, decodeBinaryRecordBorrowedScratch(alloc, payload, &scratch));
     try std.testing.expectEqual(@as(usize, 0), scratch.changed_doc_keys.capacity);
+}
+
+test "change journal trimming preserves small buffers after an oversized record" {
+    const alloc = std.testing.allocator;
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    try scratch.changed_doc_keys.ensureTotalCapacity(alloc, 8192);
+    try scratch.deleted_doc_keys.append(alloc, "deleted");
+    try scratch.target_hints.append(alloc, .full_text);
+    const deleted_pointer = scratch.deleted_doc_keys.items.ptr;
+    const hint_pointer = scratch.target_hints.items.ptr;
+    scratch.trimRetainedCapacity(alloc, 4096);
+    try std.testing.expectEqual(@as(usize, 0), scratch.changed_doc_keys.capacity);
+    try std.testing.expectEqual(deleted_pointer, scratch.deleted_doc_keys.items.ptr);
+    try std.testing.expectEqual(hint_pointer, scratch.target_hints.items.ptr);
+    try std.testing.expect(scratch.retainedCapacityBytes() <= 4096);
+    scratch.trimRetainedCapacity(alloc, 0);
+    try std.testing.expectEqual(@as(usize, 0), scratch.retainedCapacityBytes());
 }
