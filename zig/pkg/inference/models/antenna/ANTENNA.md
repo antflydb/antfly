@@ -630,7 +630,10 @@ different sizes; see the report for caveats).
   step-0 typed-decision eval on the clean trunk, against
   0.387 for released Laya-large and about 0.62 for Laya's full step-0
   fine-tune. The trunk stays bit-identical, so it keeps serving the GLiNER
-  heads.
+  heads. Fine-tuning the whole trunk does not beat it on average: 0.505
+  over three seeds on Laya's step-0 recipe, against 0.439 for plain
+  ModernBERT-base and 0.621 for Laya-large. Details: LAYA.md, "Base-size
+  encoder (step 2d)".
 - **Embeddings (step 7):** the shared trunk does not embed well.
   - A head on the frozen trunk reaches 55% of granite-embedding-english-r2's
     SQuAD retrieval NDCG@10 (0.454 against 0.823).

@@ -1400,6 +1400,57 @@ rows, calibration on `b77/calibration.jsonl`):
   own confusions) instead of random ones, a larger `top_k`, and a
   `mass_cutoff` shortlist instead of a fixed size.
 
+### Base-size encoder (step 2d, 2026-10-03)
+
+Can a ModernBERT-base encoder replace Laya-large (395M) at about 40% of its
+size? Two base trunks were tested:
+- **ModernBERT-base:** plain `answerdotai/ModernBERT-base`.
+- **Antenna-base:** the Antenna trunk (run21), ModernBERT-base feature-distilled
+  from gliner2.5-base's encoder ([ANTENNA.md](../antenna/ANTENNA.md)).
+
+Both start from the released checkpoint's decision settings with a fresh
+768-wide head (`scripts/antenna/init_decision_head.py`, `--hf-encoder` or
+`--student`). Training is unpacked on `s0-train`, evaluated on `s0-eval`
+(760 decisions), RLCD, on resident Metal.
+
+**Documented step-0 recipe** (1 epoch, gradient accumulation 5, encoder rate
+2.5e-5, head rate 1e-4):
+
+| Trunk | Seed 42 | Seed 43 | Seed 44 | Mean | Train time | Peak footprint |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Laya-large | 0.599 | 0.628 | 0.637 | **0.621** | 22 min | 26.4 GB |
+| Antenna-base | 0.555 | 0.466 | 0.493 | **0.505** | 12 min | 11.5 GB |
+| ModernBERT-base | 0.451 | 0.446 | 0.421 | **0.439** | 12 min | 11.5 GB |
+
+Laya-large's seeds are the ones in [Packed vs unpacked at equal budget](#packed-vs-unpacked-at-equal-budget-2026-09-26).
+Rerunning seed 42 on this machine gave 0.600.
+
+**Three epochs, no accumulation** (15× the updates, otherwise the same):
+
+| Trunk | Seed 42 | Seed 43 |
+| --- | ---: | ---: |
+| Laya-large | 0.447 | |
+| Antenna-base | 0.662 | 0.488 |
+| Antenna-base, LoRA rank 16 (base frozen) | 0.563 | |
+| ModernBERT-base | 0.453 | 0.467 |
+
+For reference, a head trained on the frozen Antenna trunk scores 0.511 (Open-Jev,
+then `s0-train`; see ANTENNA.md).
+
+**Reading.**
+- **Gate not met.** Neither base trunk comes within tolerance of Laya-large:
+  Antenna-base trails by 0.12 and ModernBERT-base by 0.18.
+- **The GLiNER distillation helps decisions.** Antenna-base beats plain
+  ModernBERT-base by 0.07 on the documented recipe and by 0.11 on the
+  longer one.
+- **Fine-tuning the trunk buys little for Antenna.** Averaged over seeds,
+  full fine-tunes of Antenna-base (0.505 and 0.575) are close to the
+  frozen-trunk head (0.511), which keeps the trunk shared with the GLiNER
+  heads.
+- **The longer recipe is unstable.** Antenna-base scored 0.662 and 0.488 on
+  two seeds, and it drops Laya-large to 0.447. Use the documented recipe for
+  comparisons.
+
 ### Trainer throughput
 
 Measured 2026-09-25 on the same machine: packed question mode, batch size 1,
@@ -2293,7 +2344,7 @@ Ordered to make Laya more Jev-like at the lowest cost. Each step has a gate.
 | 2a. Long-context teacher (Qwen3-14B) | labels only | done; see [Long-context teacher (step 2a)](#long-context-teacher-step-2a) | Score each label's likelihood, fit a temperature on gold. Adopt only if it agrees with gold better than the Laya teacher. Extends `prepare_laya_packed_distillation.py` to states Laya cannot see |
 | 2b. Two-stage choice for many options | same fine-tune | implemented and measured; **negative result** | Candidate mode shortlists, then one question-mode branch compares the finalists, mirroring Jev's reported procedure. On Banking77, stage 2 made accuracy *worse* than stage 1 alone on the same checkpoint (0.8475 → 0.8350 mean over 2 seeds), despite 99%+ top-8 recall. Not adopted; see [Two-stage choice](#two-stage-choice-roadmap-2b) |
 | 2c. 8k states | yes | Fused segment attention op done (forward+backward, no `[L,L]` tensor), admission raised to `seq_len` 8192, both backends (CPU native; Metal on the ModernBERT device kernels without dropout, host-bridged with it), `zig build test -- --test-filter laya` green on CPU and Metal; long-state smoke test at 2k OOM'd under this session's system-wide memory pressure before completing one step (15-22 GB used on a loaded 36 GB machine), 4k/8k not attempted; fine-tune on teacher-labelled long states not started | Forward and gradients match the dense path (unpacked, local window, tree-packed, with and without dropout) on both backends; step time/memory at 4k/8k and a real long-state fine-tune remain open, the former blocked on this machine having headroom to rerun the smoke test |
-| 2d. ModernBERT-base student | yes | not started | ~150M parameters, about 2–3× cheaper than Laya-large; keep if its agreement with the teacher stays within tolerance of the large model |
+| 2d. ModernBERT-base student | yes | measured; gate **not met**. Three seeds on the step-0 recipe: Antenna-base trunk 0.505, plain ModernBERT-base 0.439, Laya-large 0.621. Half the train time and 44% of the peak memory; see [Base-size encoder](#base-size-encoder-step-2d-2026-10-03) | ~150M parameters, about 2–3× cheaper than Laya-large; keep if its agreement with the teacher stays within tolerance of the large model |
 
 On size and speed: an encoder student beats a small decoder student (for
 example Qwen3.5-0.8B, as in `jevre`) at every length targeted here. At 8k it
