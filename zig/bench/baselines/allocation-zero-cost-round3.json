@@ -1,0 +1,1215 @@
+{
+  "baseline_commit": "e7674bc690426e6571603484db6a62e7db8a36ce",
+  "source_sha256": {
+    "baseline": {
+      "zig/pkg/antfly/src/storage/db/db.zig": "21ec15587e8f3607af3b88e792face36cd7eda8f5101685e1c926e6efa4b62af",
+      "zig/pkg/antfly/src/storage/vector_payload_store.zig": "dab092414f49e02f49a81292125b015e3dbefb3a2b539105456ae3df3a542977",
+      "zig/pkg/antfly/src/storage/vector_block_store.zig": "08978f721db6cf788d2b1e4b97ff2e31f613f9dd85c978e63c4fd80d5083a90d",
+      "zig/pkg/antfly/src/allocation_bench_support.zig": "69220f413423581055bf79e594bfc5ca988dfd22038099b35e44d715aced87db",
+      "zig/pkg/antfly/src/vector_payload_bench.zig": "0163d1a9299f22f6a8b60ff1d72e46b22330abf15153cfc87847437959f3e024",
+      "zig/pkg/antfly/src/replay_allocation_bench.zig": "83458c0c67499108548d34ee52881a2a752219c8cc9f9ce12736da25ef61d21e"
+    },
+    "changed": {
+      "zig/pkg/antfly/src/storage/db/db.zig": "7b46478cf73fbf23ece1c0b87076b15145831b36f852a5acb516b4f70a9fb357",
+      "zig/pkg/antfly/src/storage/vector_payload_store.zig": "d0605260dbc23a9622041e0de676c536fd737f377da2a5ddb6ace3404acd0225",
+      "zig/pkg/antfly/src/storage/vector_block_store.zig": "08978f721db6cf788d2b1e4b97ff2e31f613f9dd85c978e63c4fd80d5083a90d",
+      "zig/pkg/antfly/src/allocation_bench_support.zig": "69220f413423581055bf79e594bfc5ca988dfd22038099b35e44d715aced87db",
+      "zig/pkg/antfly/src/vector_payload_bench.zig": "0163d1a9299f22f6a8b60ff1d72e46b22330abf15153cfc87847437959f3e024",
+      "zig/pkg/antfly/src/replay_allocation_bench.zig": "83458c0c67499108548d34ee52881a2a752219c8cc9f9ce12736da25ef61d21e"
+    }
+  },
+  "binary_sha256": {
+    "baseline": {
+      "document-lookup-bench": "048b068a3689c8dda87e61d8d41111c388dc7fe3094d4f8920f3490750f85c5b",
+      "vector-payload-bench": "b2b2fd1f36165d0573ae918f8a32bf18848d7d4abd1b9e182116f0d7ac767fbc",
+      "replay-allocation-bench": "0b81ec5f02d3076f9f5d7889f2d10b4d82b7be28624348a037e08f67e10b2646"
+    },
+    "changed": {
+      "document-lookup-bench": "1de39cb2bdadfa27e0292aa82d0ba3a2490d25e9bca68d3573d464243168fe5d",
+      "vector-payload-bench": "37ce6c74ec86e6ce4c63921ca93cbee3b1c35f1cf03e6dbe6db669f9809d18ff",
+      "replay-allocation-bench": "4d7db02c558380565ae71be2c79cb63c9143ec4ce37faa1168482c9a7797d196"
+    }
+  },
+  "document_fixture_sha256": "d8704a6eda4c7f134d430981e8bb843c7e470719ee4609b41b386cedaaddc2c0",
+  "platform": "macOS ARM64",
+  "zig": "0.16.0",
+  "optimize": "ReleaseFast",
+  "samples": 332,
+  "summary": {
+    "document-text-10000-32-counted": {
+      "elapsed_ns": {
+        "baseline": 2807000,
+        "changed": 2950000
+      },
+      "allocations": {
+        "baseline": 10626,
+        "changed": 10626
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moving_remaps": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moved_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 2260000,
+        "changed": 2260000
+      },
+      "peak_live_bytes": {
+        "baseline": 7232,
+        "changed": 7232
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -5.515512378564713,
+        12.59364966107741,
+        6.8400427502671945,
+        -19.999999999999996,
+        -0.834542815674888,
+        9.198706431908011,
+        -3.142458100558654,
+        -13.313529570618421,
+        8.615611192930771,
+        6.147690069116041,
+        0.9797060881735487
+      ],
+      "paired_median_percent": 0.9797060881735487,
+      "bootstrap_ci95_percent": [
+        -5.515512378564713,
+        8.615611192930771
+      ]
+    },
+    "document-text-10000-32-timing": {
+      "elapsed_ns": {
+        "baseline": 2619000,
+        "changed": 2670000
+      },
+      "allocations": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moving_remaps": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moved_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "peak_live_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        8.820160366552109,
+        -0.08045052292839916,
+        8.278955954322997,
+        -4.680851063829783,
+        -4.268529297632906,
+        -4.421518054532059,
+        4.514672686230248,
+        -11.457349700975762,
+        -1.8927444794952675,
+        -2.9090909090909056,
+        15.341365461847388
+      ],
+      "paired_median_percent": -1.8927444794952675,
+      "bootstrap_ci95_percent": [
+        -4.421518054532059,
+        8.278955954322997
+      ]
+    },
+    "document-text_asset-10000-32-counted": {
+      "elapsed_ns": {
+        "baseline": 4880000,
+        "changed": 3973000
+      },
+      "allocations": {
+        "baseline": 30626,
+        "changed": 10626
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 50625,
+        "changed": 10625
+      },
+      "moving_remaps": {
+        "baseline": 20313,
+        "changed": 313
+      },
+      "moved_bytes": {
+        "baseline": 3395184,
+        "changed": 115184
+      },
+      "allocated_bytes": {
+        "baseline": 5910016,
+        "changed": 2630016
+      },
+      "peak_live_bytes": {
+        "baseline": 5492,
+        "changed": 5316
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -13.62040288301608,
+        -17.599243856332702,
+        -25.716814159292035,
+        -26.234309623430963,
+        -30.245901639344265,
+        -16.74689129562775,
+        -21.08234378041659,
+        -20.73571272169915,
+        -8.959670027497712,
+        -16.52949245541838,
+        -21.929432782492185
+      ],
+      "paired_median_percent": -20.73571272169915,
+      "bootstrap_ci95_percent": [
+        -25.716814159292035,
+        -16.52949245541838
+      ]
+    },
+    "document-text_asset-10000-32-timing": {
+      "elapsed_ns": {
+        "baseline": 4013000,
+        "changed": 3752000
+      },
+      "allocations": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moving_remaps": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moved_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "peak_live_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -7.2402444757874935,
+        -10.063965884861403,
+        -14.388755317181435,
+        -2.865686518813859,
+        -9.542645241038317,
+        15.058882485592573,
+        -3.7246963562753033,
+        -3.597122302158273,
+        -13.387015601409157,
+        -20.951219512195117,
+        -7.08035003977725
+      ],
+      "paired_median_percent": -7.2402444757874935,
+      "bootstrap_ci95_percent": [
+        -13.387015601409157,
+        -3.597122302158273
+      ]
+    },
+    "document-text_asset_escaped-10000-256-counted": {
+      "elapsed_ns": {
+        "baseline": 4662000,
+        "changed": 3740000
+      },
+      "allocations": {
+        "baseline": 30158,
+        "changed": 10158
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 50352,
+        "changed": 10352
+      },
+      "moving_remaps": {
+        "baseline": 20080,
+        "changed": 80
+      },
+      "moved_bytes": {
+        "baseline": 3358752,
+        "changed": 78752
+      },
+      "allocated_bytes": {
+        "baseline": 6867232,
+        "changed": 3587232
+      },
+      "peak_live_bytes": {
+        "baseline": 66548,
+        "changed": 66372
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -23.57171394326808,
+        -17.085976810325963,
+        -13.78515444905486,
+        -21.047206761492475,
+        -15.255731922398585,
+        -27.57508566821205,
+        -21.150556030795553,
+        -24.23852423852424,
+        -18.26215022091311,
+        -22.093023255813947,
+        -16.760531651272814
+      ],
+      "paired_median_percent": -21.047206761492475,
+      "bootstrap_ci95_percent": [
+        -23.57171394326808,
+        -16.760531651272814
+      ]
+    },
+    "document-text_asset_escaped-10000-256-timing": {
+      "elapsed_ns": {
+        "baseline": 4132000,
+        "changed": 3605000
+      },
+      "allocations": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moving_remaps": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moved_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "peak_live_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -14.45018796992481,
+        -19.795221843003407,
+        -26.036109971276154,
+        -3.978388998035365,
+        -8.93854748603352,
+        -30.111448834853093,
+        -19.87494417150514,
+        -6.873184898354312,
+        -19.572143832498867,
+        -8.558444837162337,
+        -11.659302896416301
+      ],
+      "paired_median_percent": -14.45018796992481,
+      "bootstrap_ci95_percent": [
+        -19.87494417150514,
+        -8.558444837162337
+      ]
+    },
+    "document-text_asset_large-2000-32-counted": {
+      "elapsed_ns": {
+        "baseline": 14964000,
+        "changed": 14260000
+      },
+      "allocations": {
+        "baseline": 6126,
+        "changed": 2126
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 26125,
+        "changed": 16125
+      },
+      "moving_remaps": {
+        "baseline": 11689,
+        "changed": 4066
+      },
+      "moved_bytes": {
+        "baseline": 24270721,
+        "changed": 3208719
+      },
+      "allocated_bytes": {
+        "baseline": 30558016,
+        "changed": 15368016
+      },
+      "peak_live_bytes": {
+        "baseline": 172103,
+        "changed": 167024
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -9.667916443492231,
+        -1.034181720502314,
+        -8.954729237091541,
+        -4.704624431970061,
+        -7.840403638053505,
+        -8.575435784411944,
+        2.1646829539917922,
+        -3.941963694183115,
+        -4.745902201495101,
+        -1.2037600595117381,
+        -4.829922933829389
+      ],
+      "paired_median_percent": -4.745902201495101,
+      "bootstrap_ci95_percent": [
+        -8.575435784411944,
+        -1.2037600595117381
+      ]
+    },
+    "document-text_asset_large-2000-32-timing": {
+      "elapsed_ns": {
+        "baseline": 14572000,
+        "changed": 14364000
+      },
+      "allocations": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moving_remaps": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moved_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "peak_live_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        0.3682236617797541,
+        -0.15089163237311798,
+        2.148997134670494,
+        -3.1536537927202013,
+        2.3222681293631586,
+        -7.638476265927241,
+        3.929597701149423,
+        -2.8777941373310134,
+        -5.730141749130779,
+        -3.479275322536368,
+        7.035821321535618
+      ],
+      "paired_median_percent": -0.15089163237311798,
+      "bootstrap_ci95_percent": [
+        -3.479275322536368,
+        2.3222681293631586
+      ]
+    },
+    "document-text_mixed-10000-256-counted": {
+      "elapsed_ns": {
+        "baseline": 3407000,
+        "changed": 3142000
+      },
+      "allocations": {
+        "baseline": 12776,
+        "changed": 10276
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 6799,
+        "changed": 1799
+      },
+      "moving_remaps": {
+        "baseline": 2717,
+        "changed": 216
+      },
+      "moved_bytes": {
+        "baseline": 1579696,
+        "changed": 1167672
+      },
+      "allocated_bytes": {
+        "baseline": 3966798,
+        "changed": 3556798
+      },
+      "peak_live_bytes": {
+        "baseline": 87990,
+        "changed": 87896
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -8.7248322147651,
+        10.489930868650443,
+        -11.321855850598194,
+        -11.09480481361902,
+        -5.039414414414411,
+        20.210896309314585,
+        3.313452617627566,
+        -19.562811289429995,
+        -23.774866569626397,
+        0.8495909376966537,
+        0.8214849921011069
+      ],
+      "paired_median_percent": -5.039414414414411,
+      "bootstrap_ci95_percent": [
+        -11.321855850598194,
+        3.313452617627566
+      ]
+    },
+    "document-text_mixed-10000-256-timing": {
+      "elapsed_ns": {
+        "baseline": 3110000,
+        "changed": 3096000
+      },
+      "allocations": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "resize_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "remap_calls": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moving_remaps": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moved_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "peak_live_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -27.758420441347276,
+        -0.6995230524642237,
+        -0.46265697290152064,
+        9.399293286219091,
+        12.987012987012992,
+        -2.1718895439031938,
+        5.417376490630321,
+        -1.4954486345903795,
+        -2.6432943795214214,
+        -12.45872110477334,
+        -3.7942122186495175
+      ],
+      "paired_median_percent": -1.4954486345903795,
+      "bootstrap_ci95_percent": [
+        -3.7942122186495175,
+        5.417376490630321
+      ]
+    },
+    "vector-False-ingest-5000-counted": {
+      "run_ns": {
+        "baseline": 38390000,
+        "changed": 37731000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 248610000,
+        "changed": 256425000
+      },
+      "allocations": {
+        "baseline": 85308,
+        "changed": 85308
+      },
+      "resize_calls": {
+        "baseline": 509,
+        "changed": 509
+      },
+      "remap_calls": {
+        "baseline": 12492,
+        "changed": 12492
+      },
+      "moving_remaps": {
+        "baseline": 3029,
+        "changed": 2966
+      },
+      "moved_bytes": {
+        "baseline": 116573101,
+        "changed": 113849865
+      },
+      "allocated_bytes": {
+        "baseline": 359582909,
+        "changed": 359582909
+      },
+      "peak_additional_live_bytes": {
+        "baseline": 33892176,
+        "changed": 33892176
+      },
+      "pairs": 1,
+      "paired_changes_percent": [
+        -1.716592862724664
+      ],
+      "paired_median_percent": -1.716592862724664,
+      "bootstrap_ci95_percent": [
+        -1.716592862724664,
+        -1.716592862724664
+      ]
+    },
+    "vector-False-ingest-5000-timing": {
+      "run_ns": {
+        "baseline": 43380000,
+        "changed": 43247000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 258576000,
+        "changed": 264230000
+      },
+      "pairs": 7,
+      "paired_changes_percent": [
+        2.208245981830892,
+        -0.7745504840940498,
+        1.4116543557275207,
+        -0.6645728071373314,
+        -0.987757373400111,
+        7.257560888571679,
+        -4.795950086593548
+      ],
+      "paired_median_percent": -0.6645728071373314,
+      "bootstrap_ci95_percent": [
+        -0.987757373400111,
+        2.208245981830892
+      ]
+    },
+    "vector-False-retry-20000-counted": {
+      "run_ns": {
+        "baseline": 939246000,
+        "changed": 60769000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 3000,
+        "changed": 1000
+      },
+      "allocations": {
+        "baseline": 43290,
+        "changed": 43290
+      },
+      "resize_calls": {
+        "baseline": 2035,
+        "changed": 2035
+      },
+      "remap_calls": {
+        "baseline": 20000,
+        "changed": 20000
+      },
+      "moving_remaps": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moved_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 289421658,
+        "changed": 289421658
+      },
+      "peak_additional_live_bytes": {
+        "baseline": 1037090,
+        "changed": 1037090
+      },
+      "pairs": 1,
+      "paired_changes_percent": [
+        -93.53002301846375
+      ],
+      "paired_median_percent": -93.53002301846375,
+      "bootstrap_ci95_percent": [
+        -93.53002301846375,
+        -93.53002301846375
+      ]
+    },
+    "vector-False-retry-20000-timing": {
+      "run_ns": {
+        "baseline": 945321000,
+        "changed": 67384000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 5000,
+        "changed": 1000
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -92.93385607474451,
+        -92.83438779307778,
+        -92.9708406265568,
+        -92.94775335389213,
+        -92.91916043247133,
+        -92.84727896367411,
+        -93.00455227328173,
+        -92.82269275152296,
+        -93.14051956182801,
+        -92.85819314285834,
+        -93.23465809028284
+      ],
+      "paired_median_percent": -92.93385607474451,
+      "bootstrap_ci95_percent": [
+        -93.00455227328173,
+        -92.84727896367411
+      ]
+    },
+    "vector-False-retry-mixed-20000-counted": {
+      "run_ns": {
+        "baseline": 967748000,
+        "changed": 74518000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 22735000,
+        "changed": 26041000
+      },
+      "allocations": {
+        "baseline": 47787,
+        "changed": 47787
+      },
+      "resize_calls": {
+        "baseline": 2035,
+        "changed": 2035
+      },
+      "remap_calls": {
+        "baseline": 20920,
+        "changed": 20920
+      },
+      "moving_remaps": {
+        "baseline": 269,
+        "changed": 269
+      },
+      "moved_bytes": {
+        "baseline": 2015241,
+        "changed": 2015241
+      },
+      "allocated_bytes": {
+        "baseline": 296416561,
+        "changed": 296416561
+      },
+      "peak_additional_live_bytes": {
+        "baseline": 2046516,
+        "changed": 2046516
+      },
+      "pairs": 1,
+      "paired_changes_percent": [
+        -92.29985492090917
+      ],
+      "paired_median_percent": -92.29985492090917,
+      "bootstrap_ci95_percent": [
+        -92.29985492090917,
+        -92.29985492090917
+      ]
+    },
+    "vector-False-retry-mixed-20000-timing": {
+      "run_ns": {
+        "baseline": 1006199000,
+        "changed": 82293000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 21641000,
+        "changed": 23351000
+      },
+      "pairs": 7,
+      "paired_changes_percent": [
+        -91.85054832748727,
+        -91.81592862027858,
+        -89.97053539487288,
+        -91.5776649119921,
+        -91.57383380424747,
+        -91.66333485011938,
+        -91.55081525580158
+      ],
+      "paired_median_percent": -91.5776649119921,
+      "bootstrap_ci95_percent": [
+        -91.81592862027858,
+        -91.55081525580158
+      ]
+    },
+    "vector-True-ingest-5000-counted": {
+      "run_ns": {
+        "baseline": 38028000,
+        "changed": 38666000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 242092000,
+        "changed": 260729000
+      },
+      "allocations": {
+        "baseline": 85308,
+        "changed": 85308
+      },
+      "resize_calls": {
+        "baseline": 509,
+        "changed": 509
+      },
+      "remap_calls": {
+        "baseline": 12492,
+        "changed": 12492
+      },
+      "moving_remaps": {
+        "baseline": 3093,
+        "changed": 3021
+      },
+      "moved_bytes": {
+        "baseline": 119059899,
+        "changed": 113285449
+      },
+      "allocated_bytes": {
+        "baseline": 359582909,
+        "changed": 359582909
+      },
+      "peak_additional_live_bytes": {
+        "baseline": 33892176,
+        "changed": 33892176
+      },
+      "pairs": 1,
+      "paired_changes_percent": [
+        1.677711160197748
+      ],
+      "paired_median_percent": 1.677711160197748,
+      "bootstrap_ci95_percent": [
+        1.677711160197748,
+        1.677711160197748
+      ]
+    },
+    "vector-True-ingest-5000-timing": {
+      "run_ns": {
+        "baseline": 44419000,
+        "changed": 45303000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 269732000,
+        "changed": 258499000
+      },
+      "pairs": 7,
+      "paired_changes_percent": [
+        -1.87392017011474,
+        4.342531535050442,
+        -1.828046556653684,
+        -0.14653831413306007,
+        2.0768060155760493,
+        5.160396953611812,
+        0.7629003558718761
+      ],
+      "paired_median_percent": 0.7629003558718761,
+      "bootstrap_ci95_percent": [
+        -1.828046556653684,
+        4.342531535050442
+      ]
+    },
+    "vector-True-retry-20000-counted": {
+      "run_ns": {
+        "baseline": 945196000,
+        "changed": 61751000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 4000,
+        "changed": 1000
+      },
+      "allocations": {
+        "baseline": 43290,
+        "changed": 43290
+      },
+      "resize_calls": {
+        "baseline": 2035,
+        "changed": 2035
+      },
+      "remap_calls": {
+        "baseline": 20000,
+        "changed": 20000
+      },
+      "moving_remaps": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "moved_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 289421658,
+        "changed": 289421658
+      },
+      "peak_additional_live_bytes": {
+        "baseline": 1037090,
+        "changed": 1037090
+      },
+      "pairs": 1,
+      "paired_changes_percent": [
+        -93.46685766761603
+      ],
+      "paired_median_percent": -93.46685766761603,
+      "bootstrap_ci95_percent": [
+        -93.46685766761603,
+        -93.46685766761603
+      ]
+    },
+    "vector-True-retry-20000-timing": {
+      "run_ns": {
+        "baseline": 950756000,
+        "changed": 69001000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 6000,
+        "changed": 1000
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -92.74707198735072,
+        -93.47619258128812,
+        -92.70846158348655,
+        -92.85357709532154,
+        -92.82694753055728,
+        -92.51451109347803,
+        -92.67888614361216,
+        -92.70830050156437,
+        -92.66049462464325,
+        -92.79846774566765,
+        -92.78098063651703
+      ],
+      "paired_median_percent": -92.74707198735072,
+      "bootstrap_ci95_percent": [
+        -92.82694753055728,
+        -92.67888614361216
+      ]
+    },
+    "vector-True-retry-mixed-20000-counted": {
+      "run_ns": {
+        "baseline": 1025736000,
+        "changed": 78052000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 20808000,
+        "changed": 24908000
+      },
+      "allocations": {
+        "baseline": 47787,
+        "changed": 47787
+      },
+      "resize_calls": {
+        "baseline": 2035,
+        "changed": 2035
+      },
+      "remap_calls": {
+        "baseline": 20920,
+        "changed": 20920
+      },
+      "moving_remaps": {
+        "baseline": 271,
+        "changed": 277
+      },
+      "moved_bytes": {
+        "baseline": 2036969,
+        "changed": 2165017
+      },
+      "allocated_bytes": {
+        "baseline": 296416561,
+        "changed": 296416561
+      },
+      "peak_additional_live_bytes": {
+        "baseline": 2046516,
+        "changed": 2046516
+      },
+      "pairs": 1,
+      "paired_changes_percent": [
+        -92.39063462723351
+      ],
+      "paired_median_percent": -92.39063462723351,
+      "bootstrap_ci95_percent": [
+        -92.39063462723351,
+        -92.39063462723351
+      ]
+    },
+    "vector-True-retry-mixed-20000-timing": {
+      "run_ns": {
+        "baseline": 1011740000,
+        "changed": 84625000
+      },
+      "final_checkpoint_ns": {
+        "baseline": 22141000,
+        "changed": 23436000
+      },
+      "pairs": 7,
+      "paired_changes_percent": [
+        -91.31786381654166,
+        -91.69664215642986,
+        -92.7891173884464,
+        -91.40900275179985,
+        -90.80870764784622,
+        -91.20335976320922,
+        -91.70142526736117
+      ],
+      "paired_median_percent": -91.40900275179985,
+      "bootstrap_ci95_percent": [
+        -91.70142526736117,
+        -91.20335976320922
+      ]
+    }
+  },
+  "vector_phase_summary": {
+    "False-ingest": {
+      "preparation_ns": {
+        "baseline": 27186000,
+        "changed": 27212000
+      },
+      "prepare_lock_wait_ns": {
+        "baseline": 1000,
+        "changed": 0
+      },
+      "decode_outside_lock_ns": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "durable_append_ns": {
+        "baseline": 7642000,
+        "changed": 7807000
+      },
+      "checkpoint_ns": {
+        "baseline": 258218000,
+        "changed": 263872000
+      },
+      "prepared_payloads": {
+        "baseline": 5000,
+        "changed": 5000
+      },
+      "retained_payloads": {
+        "baseline": 5000,
+        "changed": 5000
+      }
+    },
+    "False-retry": {
+      "preparation_ns": {
+        "baseline": 879014000,
+        "changed": 4087000
+      },
+      "prepare_lock_wait_ns": {
+        "baseline": 6000,
+        "changed": 3000
+      },
+      "decode_outside_lock_ns": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "durable_append_ns": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "checkpoint_ns": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "prepared_payloads": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "retained_payloads": {
+        "baseline": 20000,
+        "changed": 20000
+      }
+    },
+    "False-retry-mixed": {
+      "preparation_ns": {
+        "baseline": 936132000,
+        "changed": 16570000
+      },
+      "prepare_lock_wait_ns": {
+        "baseline": 8000,
+        "changed": 3000
+      },
+      "decode_outside_lock_ns": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "durable_append_ns": {
+        "baseline": 12559000,
+        "changed": 11228000
+      },
+      "checkpoint_ns": {
+        "baseline": 21144000,
+        "changed": 22922000
+      },
+      "prepared_payloads": {
+        "baseline": 157,
+        "changed": 157
+      },
+      "retained_payloads": {
+        "baseline": 20157,
+        "changed": 20157
+      }
+    },
+    "True-ingest": {
+      "preparation_ns": {
+        "baseline": 27998000,
+        "changed": 28763000
+      },
+      "prepare_lock_wait_ns": {
+        "baseline": 2000,
+        "changed": 1000
+      },
+      "decode_outside_lock_ns": {
+        "baseline": 15000,
+        "changed": 18000
+      },
+      "durable_append_ns": {
+        "baseline": 7937000,
+        "changed": 8030000
+      },
+      "checkpoint_ns": {
+        "baseline": 269355000,
+        "changed": 258155000
+      },
+      "prepared_payloads": {
+        "baseline": 5000,
+        "changed": 5000
+      },
+      "retained_payloads": {
+        "baseline": 5000,
+        "changed": 5000
+      }
+    },
+    "True-retry": {
+      "preparation_ns": {
+        "baseline": 883748000,
+        "changed": 4518000
+      },
+      "prepare_lock_wait_ns": {
+        "baseline": 8000,
+        "changed": 2000
+      },
+      "decode_outside_lock_ns": {
+        "baseline": 74000,
+        "changed": 64000
+      },
+      "durable_append_ns": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "checkpoint_ns": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "prepared_payloads": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "retained_payloads": {
+        "baseline": 20000,
+        "changed": 20000
+      }
+    },
+    "True-retry-mixed": {
+      "preparation_ns": {
+        "baseline": 940751000,
+        "changed": 18035000
+      },
+      "prepare_lock_wait_ns": {
+        "baseline": 11000,
+        "changed": 5000
+      },
+      "decode_outside_lock_ns": {
+        "baseline": 76000,
+        "changed": 61000
+      },
+      "durable_append_ns": {
+        "baseline": 15173000,
+        "changed": 11926000
+      },
+      "checkpoint_ns": {
+        "baseline": 21583000,
+        "changed": 22916000
+      },
+      "prepared_payloads": {
+        "baseline": 157,
+        "changed": 157
+      },
+      "retained_payloads": {
+        "baseline": 20157,
+        "changed": 20157
+      }
+    }
+  },
+  "tests": {
+    "focused_release_safe": 209,
+    "counter_tests": 2,
+    "build_steps": "27/27",
+    "skipped": 0,
+    "failed": 0,
+    "leaked": 0
+  },
+  "method": [
+    "Compare previous PR head e7674bc690 against the final recorded production sources. Baseline production is unchanged; baseline and candidate have identical expanded benchmark fixtures and counter instrumentation.",
+    "Frozen binaries prevent provenance mixing. Alternate baseline/candidate execution order. Document fixtures include in-process warmup and validate exact output strings, checksums, and zero retained diagnostic allocations. Setup is excluded.",
+    "Document fixtures have eleven paired counted/timing runs each. Vector production timing uses eleven pairs for 20k durable retries and seven pairs for 20k mixed retries / 5k fresh ingest, all at 1536 dimensions, with group commit separately disabled and enabled.",
+    "Each vector variant gets a fresh directory; retry/mixed setup is performed with the baseline binary outside the timer. Background checkpoint is disabled. Expected prepared-payload counts and complete reference-array checksums match between variants.",
+    "Vector counted runs use one pair per fixture/setting as diagnostics, separate from production smp allocator timing. Document counted runs also use the diagnostic C allocator rather than the production allocator.",
+    "allocations counts successful raw alloc calls only. resize_calls and remap_calls count attempted calls, including refusals. moving_remaps counts successful pointer changes; moved_bytes sums the requested new sizes of those moves.",
+    "allocated_bytes is cumulative successful logical requested-storage growth. live/peak are caller-visible requested storage, not allocator overhead, transient backend realloc overlap, RSS, or complete physical allocation costs. Reporting serialization is excluded from vector counter snapshots.",
+    "Timing statistics are paired medians with deterministic 10,000-resample bootstrap 95% intervals, seed 9713. Intervals spanning zero do not establish equivalence or universal zero runtime cost.",
+    "Artifact-only dense/sparse replay bypasses the document-filter sets when no documents exist. Selected real dense/sparse artifact replay and corrupt-artifact integration tests pass; no separate throughput claim is made for that shortcut.",
+    "Direct JSON writing preserves std.json.fmt escaping and output-list ownership on success and allocation failure. Tests cover empty/plain/quoted/control/Unicode/large strings and prove the pre-reserved path works with an allocator refusing every allocation.",
+    "Durable retry eligibility validates identity/dimensions/exact-representation metadata under the pinned Opened lease. Retry success no longer checksums existing payload bytes; it is not a payload integrity scrub. Actual reads and GC copies still check payload/residual CRCs and reject corruption. Both float32 and float16-residual corruption, wrong dimensions, group settings, and unchanged retry WAL are covered.",
+    "Prior full-text repair integration failure remains unresolved; these focused gates are not a complete integration run. Prior main-baseline timing uncertainty is not automatically replaced by this comparison against the previous PR head.",
+    "Vector counter snapshots cover the run, final checkpoint, and reference sidecar write; initial open/setup and reporting are excluded. run_ns and final_checkpoint_ns are separate timings."
+  ]
+}
