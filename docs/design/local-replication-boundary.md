@@ -376,3 +376,36 @@ DB supplies the authoritative current index set and optional live runtime sample
 The visibility-hook routing guard covers the extracted `query_visibility.zig`
 definition as well as the legacy inline location, preventing server table/group
 identity or a DB pointer from becoming fields of the shared local hook.
+
+`storage/db/document_collectors.zig` owns synchronous document materialization,
+text projections and their retained output buffers over borrowed stores/managers.
+DB retains the source selection and publication fences. `result_collectors.zig`
+owns scan rows and enrichment arrays until their public result is fully assembled.
+Artifact conversion consumes its input on success and failure, including its
+first allocation; each entry is adopted only after its identity clone succeeds.
+A partially finished result releases transferred slices while the collector
+releases unfinished lists. Allocation-failure sweeps cover conversion and scan
+collection.
+
+`storage/db/managed_admission_owner.zig` owns requested/completed generations and
+single-flight drain admission. Each successful pass acknowledges only the demand
+captured before that pass; raced requests force another pass and failures retain
+pending demand. DB continues to own structural serialization, apply fencing and
+durable admission markers. Scheduler name lookups use directory methods while
+DB retains the existing control/scheduler lock ordering.
+
+`storage/db/publication_recovery_owner.zig` owns the retry registration's owner
+ID, immutable callback binding, durable jobs and maintenance probes. It binds
+only after DB reaches a stable address. Close permanently stops admission,
+disarms the probe, drains claimed callbacks through the runtime owner barrier,
+and waits for direct admission borrows before releasing their context. Retry
+policy remains in `publication_outbox_recovery.zig`; fenced scans, delivery
+acknowledgement and durable receipt deletion remain in DB. Empty outboxes can
+retain a probe to observe notifications from TTL callbacks.
+
+Public enrichment result builders reserve list capacity before constructing an
+owned entry. Generator configuration, planned requests, index-name lists,
+chunk-cache adoption and public artifact conversion each unwind their own
+partial allocations; only complete values transfer into the result collector.
+Allocation-failure sweeps cover both these owners and the real
+`DB.computeEnrichments` chunk/dense-provider path.

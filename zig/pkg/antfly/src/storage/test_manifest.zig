@@ -21,6 +21,11 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("db/managed_admission_owner.zig");
+    _ = @import("db/result_collectors.zig");
+    _ = @import("db/document_collectors.zig");
+    _ = @import("db/publication_recovery_owner.zig");
+
     _ = @import("db/embedding_activity_cache.zig");
     _ = @import("db/coalesced_job_admission.zig");
     _ = @import("db/dense_publication_admission.zig");

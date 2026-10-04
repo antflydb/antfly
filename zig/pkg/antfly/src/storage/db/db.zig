@@ -12,6 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const document_collectors = @import("document_collectors.zig");
+const result_collectors = @import("result_collectors.zig");
 const independent_maintenance = @import("independent_maintenance.zig");
 const portable_activation_recovery = @import("portable_activation_recovery.zig");
 const quarantine_recovery = @import("quarantine_recovery.zig");
@@ -1701,7 +1703,7 @@ const LocalMutationExecution = struct {
     comptime {
         // Borrowed execution must never gain DB destruction or resident
         // callbacks: its address is valid only for this synchronous invocation.
-        for (.{ "close", "closeOwned", "deinitWrapperState", "startResidentBackgroundWorkersIfNeeded", "armDurableReplicationRecoveryProbe", "reconcilePublishedSchemaIndexes", "reconcileSchemaPass" }) |operation| {
+        for (.{ "close", "closeOwned", "deinitWrapperState", "startResidentBackgroundWorkersIfNeeded", "reconcilePublishedSchemaIndexes", "reconcileSchemaPass" }) |operation| {
             if (@hasDecl(@This(), operation)) @compileError("borrowed mutation receiver exposes an owning operation: " ++ operation);
         }
         for (.{ "generation_read_lease", "owned_backend_runtime", "owned_resource_manager", "source_vector_storage", "stable_address" }) |field| {
@@ -4601,10 +4603,6 @@ const LocalExecutionState = struct {
     /// first hot-standby mutation. Once crossed, foreground commits append under the
     /// apply/log ordering fences and may await independent LSNs concurrently.
     durable_replication_startup_barrier_pending: std.atomic.Value(bool) = .init(true),
-    /// Owner-scoped recovery keeps remote acknowledgement off the open/read
-    /// path. The startup barrier orders crash-left obligations before new WAL
-    /// records; steady-state mutations then wait on independent LSN watermarks.
-    publication_outbox_recovery: @import("publication_outbox_recovery.zig").Driver = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested. The owner-scoped
     /// durable lane is drained before DB teardown, so jobs may safely borrow
     /// this DB while keeping schema publication latency independent of index
@@ -4673,7 +4671,10 @@ pub const DB = struct {
     status_publication_mutex: std.atomic.Mutex = .unlocked,
     status_publication_revision: u64 = 0,
     repair_cleanup_owner_id: u64,
-    replication_recovery_owner_id: u64 = 0,
+    /// Owner-scoped recovery keeps remote acknowledgement off the open/read
+    /// path. The startup barrier orders crash-left obligations before new WAL
+    /// records; steady-state mutations then wait on independent LSN watermarks.
+    publication_recovery: @import("publication_recovery_owner.zig").Owner,
     algebraic_hll_owner_id: u64 = 0,
     owned_backend_runtime: ?background_runtime_mod.BackendRuntimeHandle,
     owned_resource_manager: ?*resource_manager_mod.ResourceManager,
@@ -4763,9 +4764,7 @@ pub const DB = struct {
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
     // in flight; the mutex makes concurrent drainers a single-flight loop.
-    managed_admission_materialization_requested: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    managed_admission_materialization_completed: @import("antfly_platform").atomic.Value(u64) = .init(0),
-    managed_admission_materialization_mutex: std.atomic.Mutex = .unlocked,
+    managed_admission: @import("managed_admission_owner.zig").Owner = .{},
     snapshot_publication_mutex: std.atomic.Mutex = .unlocked,
     index_repair_mutex: std.atomic.Mutex = .unlocked,
     generation_replace_mutex: std.atomic.Mutex = .unlocked,
@@ -5423,31 +5422,19 @@ pub const DB = struct {
         }
     }
 
-    const DurableReplicationRecoveryWork = struct {
-        fn run(ptr: *anyopaque) anyerror!void {
-            const self: *DB = @ptrCast(@alignCast(ptr));
-            self.runDurableReplicationOutboxRecovery();
-        }
-
-        fn deinit(_: *anyopaque) void {}
-    };
-
     /// Queue remote acknowledgement without coupling it to DB open or reads.
     /// The dedicated owner gives this retry state an independent maintenance
     /// probe and makes close a lifetime barrier for every borrowed callback.
-    fn publicationOutboxRecoveryPort(self: *DB) @import("publication_outbox_recovery.zig").Driver.Port {
-        return .{ .ptr = self, .eligible = outboxRecoveryEligible, .closing = outboxRecoveryClosing, .pending = outboxRecoveryPending, .may_disarm = outboxRecoveryMayDisarm, .now = outboxRecoveryNow, .drain = outboxRecoveryDrain, .submit = outboxRecoverySubmit, .arm = outboxRecoveryArm, .disarm = outboxRecoveryDisarm, .retry_delay = outboxRecoveryDelay, .report = outboxRecoveryReport };
+    fn publicationOutboxRecoveryPort(self: *DB) @import("publication_recovery_owner.zig").Owner.Port {
+        return .{ .ptr = self, .eligible = outboxRecoveryEligible, .closing = outboxRecoveryClosing, .pending = outboxRecoveryPending, .may_disarm = outboxRecoveryMayDisarm, .now = outboxRecoveryNow, .drain = outboxRecoveryDrain, .retry_delay = outboxRecoveryDelay, .report = outboxRecoveryReport };
     }
 
     fn scheduleDurableReplicationOutboxRecovery(self: *DB) void {
-        self.local_execution.publication_outbox_recovery.schedule(self.publicationOutboxRecoveryPort());
-    }
-    fn runDurableReplicationOutboxRecovery(self: *DB) void {
-        self.local_execution.publication_outbox_recovery.run(self.publicationOutboxRecoveryPort());
+        self.publication_recovery.schedule(self.publicationOutboxRecoveryPort());
     }
     fn outboxRecoveryEligible(ptr: *anyopaque) bool {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        return self.stable_address and self.replication_recovery_owner_id != 0 and
+        return self.stable_address and
             !self.async_context.background_closing.load(.acquire) and
             !openModeRequiresReadOnlyBackends(self.open_mode) and !self.backend_runtime.durable_jobs.executesInline();
     }
@@ -5471,39 +5458,13 @@ pub const DB = struct {
         const self: *DB = @ptrCast(@alignCast(ptr));
         try self.flushDurableReplicationOutboxes();
     }
-    fn outboxRecoverySubmit(ptr: *anyopaque) !void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        try self.backend_runtime.durable_jobs.submit(.{ .owner_id = self.replication_recovery_owner_id, .class = .maintenance, .ptr = self, .run = DurableReplicationRecoveryWork.run, .deinit = DurableReplicationRecoveryWork.deinit });
-    }
-    fn outboxRecoveryArm(ptr: *anyopaque) void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        self.armDurableReplicationRecoveryProbe();
-    }
-    fn outboxRecoveryDisarm(ptr: *anyopaque) void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
-    }
     fn outboxRecoveryDelay(ptr: *anyopaque, failure_streak: u32) u64 {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        return portableActivationRetryDelayNs(self.core.path, @as(u64, @truncate(self.root_incarnation)) ^ self.replication_recovery_owner_id, failure_streak);
+        return portableActivationRetryDelayNs(self.core.path, @as(u64, @truncate(self.root_incarnation)) ^ self.publication_recovery.owner_id, failure_streak);
     }
     fn outboxRecoveryReport(ptr: *anyopaque, failure: @import("publication_outbox_recovery.zig").Driver.Failure, err: anyerror, failures: u32, delay_ns: u64) void {
         const self: *DB = @ptrCast(@alignCast(ptr));
-        std.log.warn("hot_standby publication recovery {s} failed path={s} err={s} failures={d} next_retry_ms={d}", .{ @tagName(failure), self.core.path, @errorName(err), failures, delay_ns / std.time.ns_per_ms });
-    }
-
-    fn armDurableReplicationRecoveryProbe(self: *DB) void {
-        self.backend_runtime.armOwnerMaintenanceProbe(self.replication_recovery_owner_id, .{
-            .ptr = self,
-            .run = durableReplicationRecoveryMaintenanceProbeMain,
-        }) catch |err| {
-            std.log.warn("hot_standby recovery supervisor unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
-        };
-    }
-
-    fn durableReplicationRecoveryMaintenanceProbeMain(ptr: *anyopaque) void {
-        const self: *DB = @ptrCast(@alignCast(ptr));
-        self.scheduleDurableReplicationOutboxRecovery();
+        std.log.warn("publication recovery {s} failed path={s} err={s} failures={d} next_retry_ms={d}", .{ @tagName(failure), self.core.path, @errorName(err), failures, delay_ns / std.time.ns_per_ms });
     }
 
     fn attachAlgebraicHllMaintenanceLane(self: *DB) !void {
@@ -5632,10 +5593,10 @@ pub const DB = struct {
             var repair_cleanup_owner_transferred = false;
             errdefer if (!repair_cleanup_owner_transferred)
                 backend_runtime.durable_jobs.closeOwner(repair_cleanup_owner_id);
-            const replication_recovery_owner_id = try backend_runtime.allocOwnerId();
-            var replication_recovery_owner_transferred = false;
-            errdefer if (!replication_recovery_owner_transferred)
-                backend_runtime.durable_jobs.closeOwner(replication_recovery_owner_id);
+            var publication_recovery = try @import("publication_recovery_owner.zig").Owner.init(backend_runtime);
+            var publication_recovery_transferred = false;
+            errdefer if (!publication_recovery_transferred)
+                publication_recovery.deinit();
             var primary_lsm_background_executor: lsm_backend_mod.BackgroundExecutor = undefined;
             var effective_primary_backend = opts.primary_backend;
             var effective_index_backends = opts.index_backends;
@@ -5818,7 +5779,7 @@ pub const DB = struct {
                 .backend_owner_id = backend_owner_id,
                 .status_owner_epoch = @import("publication.zig").allocateOwnerEpoch(),
                 .repair_cleanup_owner_id = repair_cleanup_owner_id,
-                .replication_recovery_owner_id = replication_recovery_owner_id,
+                .publication_recovery = publication_recovery,
                 .owned_backend_runtime = owned_backend_runtime,
                 .owned_resource_manager = owned_resource_manager,
                 .index_repair_clock = opts.index_repair_clock,
@@ -5853,7 +5814,7 @@ pub const DB = struct {
             core_owner_transferred = true;
             backend_owner_transferred = true;
             repair_cleanup_owner_transferred = true;
-            replication_recovery_owner_transferred = true;
+            publication_recovery_transferred = true;
             var executor_ready = false;
             owned_async_context = null;
             owned_backend_runtime = null;
@@ -6794,7 +6755,7 @@ pub const DB = struct {
         self.stable_address = true;
         // TTL callbacks retain only stable context, never this movable wrapper.
         // The resident probe observes their atomic outbox notification.
-        if (self.local_execution.replication_async_effect_mirror != null) self.armDurableReplicationRecoveryProbe();
+        if (self.local_execution.replication_async_effect_mirror != null) self.publication_recovery.watch(self.publicationOutboxRecoveryPort());
         self.scheduleDurableReplicationOutboxRecovery();
         self.startArtifactRepairMetadataWorkerIfNeeded();
         self.startQuarantineRetryWorkerIfNeeded();
@@ -7686,10 +7647,7 @@ pub const DB = struct {
             self.backend_runtime.durable_jobs.closeOwner(self.algebraic_hll_owner_id);
             self.algebraic_hll_owner_id = 0;
         }
-        if (self.replication_recovery_owner_id != 0) {
-            self.backend_runtime.durable_jobs.closeOwner(self.replication_recovery_owner_id);
-            self.replication_recovery_owner_id = 0;
-        }
+        self.publication_recovery.deinit();
         self.backend_runtime.durable_jobs.closeOwner(self.repair_cleanup_owner_id);
         self.backend_runtime.durable_jobs.closeOwner(self.backend_owner_id);
         self.clearLiveDocSetCache();
@@ -18629,12 +18587,11 @@ pub const DB = struct {
     }
 
     fn requestManagedAdmissionMaterialization(self: *DB) void {
-        _ = self.managed_admission_materialization_requested.fetchAdd(1, .release);
+        self.managed_admission.request();
     }
 
     fn managedAdmissionMaterializationPending(self: *const DB) bool {
-        return self.managed_admission_materialization_completed.load(.acquire) !=
-            self.managed_admission_materialization_requested.load(.acquire);
+        return self.managed_admission.pending();
     }
 
     /// Drain every generation observed while a pass is in flight. A marker
@@ -18649,15 +18606,12 @@ pub const DB = struct {
 
     /// The caller already owns index structural serialization.
     fn drainManagedIndexAdmissionsUnderStructuralGuard(self: *DB, alloc: Allocator) !void {
-        lockAtomicWithBackoff(&self.managed_admission_materialization_mutex);
-        defer self.managed_admission_materialization_mutex.unlock();
+        try self.managed_admission.drain(alloc, .{ .ptr = self, .pass = managedAdmissionPass });
+    }
 
-        while (true) {
-            const target_generation = self.managed_admission_materialization_requested.load(.acquire);
-            if (self.managed_admission_materialization_completed.load(.acquire) == target_generation) return;
-            try self.materializeManagedIndexAdmissionsOnce(alloc);
-            self.managed_admission_materialization_completed.store(target_generation, .release);
-        }
+    fn managedAdmissionPass(ptr: *anyopaque, alloc: Allocator) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        try self.materializeManagedIndexAdmissionsOnce(alloc);
     }
 
     fn materializeManagedIndexAdmissionsOnce(self: *DB, alloc: Allocator) !void {
@@ -19776,10 +19730,7 @@ pub const DB = struct {
             // pending to terminal (or back) between classification and claim.
             lockAtomic(&self.async_context.index_repair_control_mutex);
             lockAtomic(&self.async_context.index_repair_scheduler_mutex);
-            const existing = if (self.async_context.index_repair_scheduler.by_name.get(cfg.name)) |record_index|
-                self.async_context.index_repair_scheduler.records.items[record_index]
-            else
-                null;
+            const existing = self.async_context.index_repair_scheduler.lookupByName(cfg.name);
             self.async_context.index_repair_scheduler_mutex.unlock();
             if (existing) |record| {
                 if (comptime builtin.is_test) {
@@ -34447,8 +34398,8 @@ pub const DB = struct {
 
         for (writes) |write| {
             var extracted = try mapper.extractWrite(alloc, write.key, write.value);
-            try augmentExtractedWriteWithGraphFieldEdges(self, alloc, write.key, write.value, &extracted);
             defer extracted.deinit(alloc);
+            try augmentExtractedWriteWithGraphFieldEdges(self, alloc, write.key, write.value, &extracted);
 
             if (extracted.cleaned_value) |cleaned| {
                 try cleaned_writes.append(alloc, .{
@@ -34501,34 +34452,13 @@ pub const DB = struct {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
-        var artifact_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-        errdefer {
-            for (artifact_writes.items) |write| {
-                alloc.free(@constCast(write.key));
-                alloc.free(@constCast(write.value));
-            }
-            artifact_writes.deinit(alloc);
-        }
-        var documents = std.ArrayListUnmanaged(types.EnrichmentDocumentWrite).empty;
-        errdefer {
-            for (documents.items) |*doc| doc.deinit(alloc);
-            documents.deinit(alloc);
-        }
-        var dense_embeddings = std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite).empty;
-        errdefer {
-            for (dense_embeddings.items) |*embedding| embedding.deinit(alloc);
-            dense_embeddings.deinit(alloc);
-        }
-        var failed_keys = std.ArrayListUnmanaged([]u8).empty;
-        errdefer {
-            for (failed_keys.items) |key| alloc.free(key);
-            failed_keys.deinit(alloc);
-        }
+        var collector: result_collectors.Enrichments = .{ .alloc = alloc };
+        defer collector.deinit();
 
         for (writes) |write| {
             var extracted = try mapper.extractWrite(alloc, write.key, write.value);
-            try augmentExtractedWriteWithGraphFieldEdges(self, alloc, write.key, write.value, &extracted);
             defer extracted.deinit(alloc);
+            try augmentExtractedWriteWithGraphFieldEdges(self, alloc, write.key, write.value, &extracted);
             const cleaned = extracted.cleaned_value orelse continue;
 
             var explicit_dense = std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite).empty;
@@ -34581,9 +34511,9 @@ pub const DB = struct {
 
             for (generated) |request| {
                 switch (request.kind) {
-                    .chunk_text => try computeChunkRequest(alloc, self, cleaned, request, &artifact_writes, &documents, &chunk_cache),
-                    .dense_embedding => computeDenseRequest(alloc, self, cleaned, request, &artifact_writes, &dense_embeddings, &chunk_cache) catch |err| switch (err) {
-                        error.MissingDenseEmbedder => try appendUniqueOwnedKey(alloc, &failed_keys, write.key),
+                    .chunk_text => try computeChunkRequest(alloc, self, cleaned, request, &collector.artifacts, &collector.documents, &chunk_cache),
+                    .dense_embedding => computeDenseRequest(alloc, self, cleaned, request, &collector.artifacts, &collector.dense, &chunk_cache) catch |err| switch (err) {
+                        error.MissingDenseEmbedder => try appendUniqueOwnedKey(alloc, &collector.failed, write.key),
                         else => return err,
                     },
                     else => {},
@@ -34591,13 +34521,7 @@ pub const DB = struct {
             }
         }
 
-        const public_artifact_writes = try externalizeArtifactWritesAlloc(alloc, try artifact_writes.toOwnedSlice(alloc));
-        return .{
-            .artifact_writes = public_artifact_writes,
-            .documents = try documents.toOwnedSlice(alloc),
-            .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
-            .failed_keys = try failed_keys.toOwnedSlice(alloc),
-        };
+        return try collector.finish();
     }
 
     fn deleteIndexWhileEnrichmentQuiesced(self: *DB, name: []const u8) !bool {
@@ -35723,7 +35647,7 @@ pub const DB = struct {
             const node = &compiled.nodes[ordinal];
             lockAtomic(&self.async_context.index_repair_scheduler_mutex);
             const existing = self.async_context.index_repair_scheduler.initialized and
-                self.async_context.index_repair_scheduler.by_name.contains(node.name);
+                self.async_context.index_repair_scheduler.containsName(node.name);
             self.async_context.index_repair_scheduler_mutex.unlock();
             if (existing) continue;
             var structural = self.beginIndexStructuralMutation("artifact baseline adoption", node.name);
@@ -44040,63 +43964,13 @@ pub const DB = struct {
 
     pub fn scan(self: *DB, alloc: Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions) !types.ScanResult {
         if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
-        const Collector = struct {
-            alloc: Allocator,
-            include_documents: bool,
-            hashes: std.ArrayListUnmanaged(types.ScanHash) = .empty,
-            documents: std.ArrayListUnmanaged(types.ScanDocument) = .empty,
-
-            fn deinit(collector: *@This()) void {
-                for (collector.hashes.items) |*entry| entry.deinit(collector.alloc);
-                collector.hashes.deinit(collector.alloc);
-                for (collector.documents.items) |*document| document.deinit(collector.alloc);
-                collector.documents.deinit(collector.alloc);
-            }
-
-            fn visit(raw_context: ?*anyopaque, entry: types.ScanVisitEntry) anyerror!void {
-                const collector: *@This() = @ptrCast(@alignCast(raw_context orelse return error.InvalidArgument));
-                try collector.hashes.ensureUnusedCapacity(collector.alloc, 1);
-                if (collector.include_documents) try collector.documents.ensureUnusedCapacity(collector.alloc, 1);
-                const hash_id = try collector.alloc.dupe(u8, entry.id);
-                errdefer collector.alloc.free(hash_id);
-                const row_cursor = if (entry.relational_cursor) |value| try collector.alloc.dupe(u8, value) else null;
-                errdefer if (row_cursor) |value| collector.alloc.free(value);
-                const json_null_fields = try types.cloneJsonNullFields(collector.alloc, entry.json_null_fields);
-                errdefer {
-                    for (json_null_fields) |field| collector.alloc.free(field);
-                    collector.alloc.free(json_null_fields);
-                }
-                if (collector.include_documents) {
-                    const document_id = try collector.alloc.dupe(u8, entry.id);
-                    errdefer collector.alloc.free(document_id);
-                    const document_json = try collector.alloc.dupe(u8, entry.document_json orelse return error.InvalidState);
-                    errdefer collector.alloc.free(document_json);
-                    collector.documents.appendAssumeCapacity(.{ .id = document_id, .json = document_json });
-                }
-                collector.hashes.appendAssumeCapacity(.{
-                    .id = hash_id,
-                    .hash = entry.hash,
-                    .content_hash = entry.content_hash,
-                    .relational_schema_version = entry.relational_schema_version,
-                    .relational_cursor = row_cursor,
-                    .json_null_fields = json_null_fields,
-                });
-            }
-        };
-
-        var collector = Collector{ .alloc = alloc, .include_documents = opts.include_documents };
-        errdefer collector.deinit();
+        var collector = result_collectors.Scan{ .alloc = alloc, .include_documents = opts.include_documents };
+        defer collector.deinit();
         try self.scanVisit(alloc, from_key, to_key, opts, .{
             .context = &collector,
-            .visit = Collector.visit,
+            .visit = result_collectors.Scan.visit,
         });
-        const hashes = try collector.hashes.toOwnedSlice(alloc);
-        errdefer {
-            for (hashes) |*entry| entry.deinit(alloc);
-            if (hashes.len > 0) alloc.free(hashes);
-        }
-        const documents = try collector.documents.toOwnedSlice(alloc);
-        return .{ .hashes = hashes, .documents = documents };
+        return try collector.finish();
     }
 
     pub const StatementReadFence = struct {
@@ -50205,10 +50079,7 @@ fn assetPayloadJsonValue(alloc: Allocator, content_type: []const u8, raw: []cons
     return .{ .string = try alloc.dupe(u8, raw) };
 }
 
-fn assetContentTypeIsJson(content_type: []const u8) bool {
-    const media_type = std.mem.trim(u8, if (std.mem.indexOfScalar(u8, content_type, ';')) |semi| content_type[0..semi] else content_type, &std.ascii.whitespace);
-    return std.mem.eql(u8, media_type, "application/json") or std.mem.endsWith(u8, media_type, "+json");
-}
+const assetContentTypeIsJson = document_collectors.assetContentTypeIsJson;
 
 fn projectLookupStoredBytes(self: *DB, alloc: Allocator, doc_key: []const u8, raw: []const u8, opts: types.LookupOptions) ![]u8 {
     return try db_query_projection.projectLookupStoredBytes(alloc, doc_key, raw, opts, .{
@@ -51992,7 +51863,7 @@ fn getOrCreateChunks(
 
     const source_text = if (request.source_template.len > 0)
         renderSourceTemplateText(alloc, db, request.source_template, doc_value) catch |err| switch (err) {
-            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            error.OutOfMemory, error.PermanentPromptFailure, error.TransientPromptFailure => return err,
             else => null,
         }
     else
@@ -52012,6 +51883,7 @@ fn getOrCreateChunks(
         try chunker_mod.chunkTextWithConfigJson(alloc, source_text.?, request.chunker_json)
     else
         try chunker_mod.chunkText(alloc, source_text.?, request.chunk_size, request.chunk_overlap);
+    errdefer chunker_mod.freeChunks(alloc, chunks);
     try cache.append(alloc, .{
         .key = cache_key,
         .chunks = chunks,
@@ -52045,10 +51917,7 @@ fn appendChunkArtifactWrites(
         defer alloc.free(key);
         const payload = try buildChunkArtifactPayloadAlloc(scratch, doc_key, artifact_name, source_field, chunk, include_payload);
 
-        try artifact_writes.append(alloc, .{
-            .key = try alloc.dupe(u8, key),
-            .value = try alloc.dupe(u8, payload),
-        });
+        try result_collectors.appendArtifact(alloc, artifact_writes, key, payload);
 
         _ = arena_state.reset(.retain_capacity);
     }
@@ -52081,13 +51950,15 @@ fn appendDerivedDenseEmbeddingForConsumers(
 ) !void {
     _ = vector;
     for (consumer_indexes) |index_name| {
-        try out.append(alloc, .{
-            .index_name = try alloc.dupe(u8, index_name),
-            .parent_doc_key = if (parent_doc_key) |key| try alloc.dupe(u8, key) else null,
-            .doc_key = try alloc.dupe(u8, doc_key),
-            .artifact_key = try alloc.dupe(u8, artifact_key),
-            .vector = &.{},
-        });
+        try out.ensureUnusedCapacity(alloc, 1);
+        const owned_name = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(owned_name);
+        const owned_doc = try alloc.dupe(u8, doc_key);
+        errdefer alloc.free(owned_doc);
+        const owned_artifact = try alloc.dupe(u8, artifact_key);
+        errdefer alloc.free(owned_artifact);
+        const owned_parent = if (parent_doc_key) |key| try alloc.dupe(u8, key) else null;
+        out.appendAssumeCapacity(.{ .index_name = owned_name, .parent_doc_key = owned_parent, .doc_key = owned_doc, .artifact_key = owned_artifact, .vector = &.{} });
     }
 }
 
@@ -52103,13 +51974,14 @@ fn appendDerivedSparseEmbeddingForConsumers(
     _ = indices;
     _ = values;
     for (consumer_indexes) |index_name| {
-        try out.append(alloc, .{
-            .index_name = try alloc.dupe(u8, index_name),
-            .doc_key = try alloc.dupe(u8, doc_key),
-            .artifact_key = try alloc.dupe(u8, artifact_key),
-            .indices = &.{},
-            .values = &.{},
-        });
+        try out.ensureUnusedCapacity(alloc, 1);
+        const owned_name = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(owned_name);
+        const owned_doc = try alloc.dupe(u8, doc_key);
+        errdefer alloc.free(owned_doc);
+        const owned_artifact = try alloc.dupe(u8, artifact_key);
+        errdefer alloc.free(owned_artifact);
+        out.appendAssumeCapacity(.{ .index_name = owned_name, .doc_key = owned_doc, .artifact_key = owned_artifact, .indices = &.{}, .values = &.{} });
     }
 }
 
@@ -57176,20 +57048,8 @@ fn computeChunkRequest(
         const key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
         defer alloc.free(key);
 
-        var doc = types.EnrichmentDocumentWrite{
-            .key = try alloc.dupe(u8, key),
-            .value = undefined,
-            .target_index_names = try alloc.alloc([]u8, text_indexes.len),
-        };
-        errdefer doc.deinit(alloc);
-
-        for (text_indexes, 0..) |index_name, i| {
-            doc.target_index_names[i] = try alloc.dupe(u8, index_name);
-        }
         const payload = try buildChunkArtifactPayloadAlloc(scratch, request.doc_key, artifact_name, request.source_field, chunk, true);
-        doc.value = try alloc.dupe(u8, payload);
-
-        try documents.append(alloc, doc);
+        try result_collectors.appendDocument(alloc, documents, key, payload, text_indexes);
 
         _ = arena_state.reset(.retain_capacity);
     }
@@ -58534,10 +58394,11 @@ fn chunkEmbeddingSourcesForRequest(
     for (chunks) |chunk| {
         const chunk_text = chunk.text orelse continue;
         if (chunk_text.len == 0) continue;
-        try sources.append(alloc, .{
-            .key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id)),
-            .text = try alloc.dupe(u8, chunk_text),
-        });
+        try sources.ensureUnusedCapacity(alloc, 1);
+        const key = try internal_keys.chunkArtifactKeyAlloc(alloc, request.doc_key, artifact_name, @intCast(chunk.chunk_id));
+        errdefer alloc.free(key);
+        const text = try alloc.dupe(u8, chunk_text);
+        sources.appendAssumeCapacity(.{ .key = key, .text = text });
         chunks_created.* += 1;
     }
     // Inline chunks are derived from this document revision. An empty set is
@@ -58546,32 +58407,7 @@ fn chunkEmbeddingSourcesForRequest(
     return try sources.toOwnedSlice(alloc);
 }
 
-fn appendDenseEmbeddingForConsumers(
-    alloc: Allocator,
-    dense_embeddings: *std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite),
-    doc_key: []const u8,
-    parent_doc_key: ?[]const u8,
-    artifact_key: []const u8,
-    vector: []const f32,
-    consumer_indexes: []const []const u8,
-) !void {
-    _ = parent_doc_key;
-    const public_artifact = try artifact_ids.resolvePublicArtifactIdentityAlloc(alloc, artifact_key);
-    defer {
-        var owned = public_artifact;
-        owned.deinit(alloc);
-    }
-
-    for (consumer_indexes) |index_name| {
-        try dense_embeddings.append(alloc, .{
-            .index_name = try alloc.dupe(u8, index_name),
-            .doc_key = try alloc.dupe(u8, doc_key),
-            .artifact_id = try alloc.dupe(u8, public_artifact.id),
-            .artifact_ref = try public_artifact.artifact_ref.?.clone(alloc),
-            .vector = try alloc.dupe(f32, vector),
-        });
-    }
-}
+const appendDenseEmbeddingForConsumers = result_collectors.appendDenseEmbeddingForConsumers;
 
 fn flushGeneratedDenseChunkBatch(
     alloc: Allocator,
@@ -60347,13 +60183,7 @@ fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template_mod.ContentPa
     return try out.toOwnedSlice(alloc);
 }
 
-fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    // Transfer the existing output buffer to the writer and restore ownership
-    // on every exit, including a partially written string after allocation failure.
-    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, out);
-    defer out.* = writer.toArrayList();
-    writer.writer.print("{f}", .{std.json.fmt(value, .{})}) catch return error.OutOfMemory;
-}
+const appendJsonString = document_collectors.appendJsonString;
 
 fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
     var out = try alloc.alloc([]const u8, keys.len);
@@ -60838,35 +60668,7 @@ fn externalizeSearchResultArtifactIds(alloc: Allocator, result: *types.SearchRes
     try db_query_result_shape.externalizeSearchResultArtifactIds(alloc, result);
 }
 
-fn externalizeArtifactWritesAlloc(alloc: Allocator, writes: []types.BatchWrite) ![]types.ArtifactWrite {
-    var out = try alloc.alloc(types.ArtifactWrite, writes.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |*write| write.deinit(alloc);
-        alloc.free(out);
-        for (writes[initialized..]) |write| {
-            alloc.free(@constCast(write.key));
-            alloc.free(@constCast(write.value));
-        }
-        alloc.free(writes);
-    }
-
-    for (writes, 0..) |write, i| {
-        var identity = try artifact_ids.resolvePublicArtifactIdentityAlloc(alloc, write.key);
-        defer identity.deinit(alloc);
-
-        out[i] = .{
-            .id = try alloc.dupe(u8, identity.id),
-            .value = @constCast(write.value),
-            .artifact_ref = try identity.artifact_ref.?.clone(alloc),
-        };
-        initialized += 1;
-        alloc.free(@constCast(write.key));
-    }
-
-    alloc.free(writes);
-    return out;
-}
+const externalizeArtifactWritesAlloc = result_collectors.externalizeArtifactWritesAlloc;
 
 fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void {
     try db_query_result_shape.dedupeSearchHitsById(alloc, result);
@@ -69873,30 +69675,9 @@ fn managedIndexRecordApplicability(
     }
 }
 
-const OwnedBatchWrites = struct {
-    alloc: Allocator,
-    items: []types.BatchWrite = &.{},
-    missing_required: usize = 0,
+const OwnedBatchWrites = document_collectors.OwnedBatchWrites;
 
-    fn deinit(self: *@This()) void {
-        for (self.items) |item| self.alloc.free(@constCast(item.value));
-        if (self.items.len > 0) self.alloc.free(self.items);
-        self.* = undefined;
-    }
-};
-
-const CollectDocumentWritesProfile = struct {
-    scan_ns: u64 = 0,
-    sort_ns: u64 = 0,
-    read_ns: u64 = 0,
-    materialize_ns: u64 = 0,
-    input_documents: usize = 0,
-    pending_documents: usize = 0,
-    output_writes: usize = 0,
-    missing_required: usize = 0,
-    inline_hits: usize = 0,
-    store_hits: usize = 0,
-};
+const CollectDocumentWritesProfile = document_collectors.CollectDocumentWritesProfile;
 
 const CollectSparseFieldWritesProfile = struct {
     scan_ns: u64 = 0,
@@ -70033,42 +69814,15 @@ const OwnedSparseEmbeddingWrites = struct {
     }
 };
 
-const CollectTextDocumentWritesOptions = struct {
-    prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
-    relational_base_rows: bool = false,
-    /// Set once replay of this window has retried error.ReplayDocumentNotVisible
-    /// past the bounded limit (see ResourceManager.shouldEscalateReplayDocumentNotVisible).
-    /// A document that is still missing is then skipped and logged once
-    /// instead of counted toward missing_required, so the window can advance
-    /// instead of retrying forever.
-    tolerate_missing_replay_documents: bool = false,
-};
+const CollectTextDocumentWritesOptions = document_collectors.CollectTextDocumentWritesOptions;
 
-const CollectDocumentWritesOptions = struct {
-    prefer_inline_when_store_tip_matches_sequence: ?u64 = null,
-    prefer_available_inline_values: bool = false,
-    skip_doc_keys: ?*const std.StringHashMapUnmanaged(void) = null,
-    relational_base_rows: bool = false,
-};
+const CollectDocumentWritesOptions = document_collectors.CollectDocumentWritesOptions;
 
-fn replayDocumentStoreKeyAlloc(alloc: Allocator, key: []const u8, relational_base_rows: bool) ![]u8 {
-    return if (internal_keys.isInternalUserKey(key))
-        try alloc.dupe(u8, key)
-    else if (relational_base_rows)
-        try relational_store.keyAlloc(alloc, key)
-    else
-        try internal_keys.documentKeyAlloc(alloc, key);
-}
+const replayDocumentStoreKeyAlloc = document_collectors.replayDocumentStoreKeyAlloc;
 
-fn replayDocumentKeyInRange(byte_range: types.ByteRange, key: []const u8) bool {
-    return internal_keys.isInternalUserKey(key) or byte_range.contains(key);
-}
+const replayDocumentKeyInRange = document_collectors.replayDocumentKeyInRange;
 
-fn replayDocumentIsDurablyDeleted(alloc: Allocator, txn: anytype, doc_key: []const u8) !bool {
-    const ordinal = (try doc_identity.lookupOrdinalTxn(alloc, txn, doc_key)) orelse return false;
-    const state = (try doc_identity.lookupStateTxn(txn, ordinal)) orelse return false;
-    return !state.isLive();
-}
+const replayDocumentIsDurablyDeleted = document_collectors.replayDocumentIsDurablyDeleted;
 
 const OwnedSparseFieldWrites = struct {
     alloc: Allocator,
@@ -70261,180 +70015,13 @@ fn collectSparseFieldWritesProfiled(
     };
 }
 
-fn collectDocumentWrites(
-    alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    documents: []const derived_types.DerivedDocument,
-    byte_range: types.ByteRange,
-) !OwnedBatchWrites {
-    return try collectDocumentWritesProfiled(alloc, store, null, documents, byte_range, .{}, null);
-}
+const collectDocumentWrites = document_collectors.collectDocumentWrites;
 
 // Count contiguous store hits first. Inline fallbacks require inspecting
 // pending metadata only when that metadata actually contains inline values.
-fn availableDocumentValueCount(pending: anytype, values: []const ?[]const u8, has_inline: bool) usize {
-    var count: usize = 0;
-    for (values) |value| count += @intFromBool(value != null);
-    if (has_inline) {
-        for (pending, values) |item, value| {
-            count += @intFromBool(value == null and item.inline_value != null);
-        }
-    }
-    return count;
-}
+const availableDocumentValueCount = document_collectors.availableDocumentValueCount;
 
-fn collectDocumentWritesProfiled(
-    alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    index_manager: ?*index_manager_mod.IndexManager,
-    documents: []const derived_types.DerivedDocument,
-    byte_range: types.ByteRange,
-    opts: CollectDocumentWritesOptions,
-    profile: ?*CollectDocumentWritesProfile,
-) !OwnedBatchWrites {
-    const PendingDocumentWrite = struct {
-        doc_key: []const u8,
-        store_key: []const u8,
-        inline_value: ?[]const u8,
-    };
-
-    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
-    defer lookup_keys.deinit();
-    // Temporary descriptors cannot escape the synchronous read/apply below.
-    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
-    const descriptor_alloc = descriptor_buffer.get();
-    var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
-    defer {
-        pending.deinit(descriptor_alloc);
-    }
-    // A bounded small batch fits entirely on the stack. Reserve once so
-    // append does not repeatedly enter the capacity-growth path. Larger
-    // batches keep lazy growth proportional to the selected documents.
-    if (documents.len <= 64) {
-        comptime std.debug.assert(64 * @sizeOf(PendingDocumentWrite) <= 4096);
-        try pending.ensureTotalCapacityPrecise(descriptor_alloc, documents.len);
-    }
-
-    var has_pending_inline = false;
-    var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-    errdefer {
-        for (writes.items) |item| alloc.free(@constCast(item.value));
-        writes.deinit(alloc);
-    }
-
-    var txn = try store.beginProbeTxn();
-    defer txn.abort();
-    var missing_required: usize = 0;
-    const trust_inline = opts.prefer_available_inline_values or
-        if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
-            store.nextReplaySequence(sequence + 1) == sequence + 1
-        else
-            false;
-
-    if (profile) |p| p.input_documents = documents.len;
-    const scan_start_ns = if (profile != null) monotonicTimeNs() else 0;
-    for (documents) |doc| {
-        if (doc.action != .upsert) continue;
-        if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
-        if (opts.skip_doc_keys) |skip_doc_keys| {
-            if (skip_doc_keys.contains(doc.key)) continue;
-        }
-        if (trust_inline and doc.cleaned_value != null) {
-            const owned_value = try alloc.dupe(u8, doc.cleaned_value.?);
-            writes.append(alloc, .{
-                .key = doc.key,
-                .value = owned_value,
-            }) catch |err| {
-                alloc.free(owned_value);
-                return err;
-            };
-            if (profile) |p| p.inline_hits += 1;
-            continue;
-        }
-        try pending.append(descriptor_alloc, .{
-            .doc_key = doc.key,
-            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
-            .inline_value = doc.cleaned_value,
-        });
-        has_pending_inline = has_pending_inline or doc.cleaned_value != null;
-    }
-    if (profile) |p| {
-        p.scan_ns = monotonicTimeNs() - scan_start_ns;
-        p.pending_documents = pending.items.len;
-        p.output_writes = writes.items.len;
-    }
-
-    if (pending.items.len == 0) {
-        return .{
-            .alloc = alloc,
-            .items = try writes.toOwnedSlice(alloc),
-        };
-    }
-
-    const SortContext = struct {};
-    const sort_start_ns = if (profile != null) monotonicTimeNs() else 0;
-    std.mem.sort(PendingDocumentWrite, pending.items, SortContext{}, struct {
-        fn lessThan(_: SortContext, lhs: PendingDocumentWrite, rhs: PendingDocumentWrite) bool {
-            return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
-        }
-    }.lessThan);
-    if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
-
-    var read_scratch = try document_read_scratch.Scratch.init(descriptor_alloc, pending.items.len);
-    defer read_scratch.deinit();
-    const read_keys = read_scratch.keys;
-    const read_values = read_scratch.values;
-
-    for (pending.items, 0..) |item, i| {
-        read_keys[i] = item.store_key;
-    }
-    const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
-    try txn.getManySorted(read_keys, read_values);
-    if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
-
-    const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
-    try writes.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, writes.items.len, available_values));
-
-    const materialize_start_ns = if (profile != null) monotonicTimeNs() else 0;
-    for (pending.items, 0..) |item, i| {
-        const value = if (read_values[i]) |store_value| blk: {
-            if (profile) |p| p.store_hits += 1;
-            break :blk store_value;
-        } else if (item.inline_value) |inline_value| blk: {
-            if (profile) |p| p.inline_hits += 1;
-            break :blk inline_value;
-        } else {
-            if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
-            missing_required += 1;
-            continue;
-        };
-        const owned_value = if (read_values[i] != null)
-            if (index_manager) |manager|
-                try manager.materializeStoredValueAlloc(alloc, item.store_key, value)
-            else
-                try relational_store.materializeStoredValueAlloc(alloc, item.store_key, value)
-        else
-            try alloc.dupe(u8, value);
-        writes.append(alloc, .{
-            .key = item.doc_key,
-            .value = owned_value,
-        }) catch |err| {
-            alloc.free(owned_value);
-            return err;
-        };
-    }
-    if (profile) |p| {
-        p.materialize_ns = monotonicTimeNs() - materialize_start_ns;
-        p.output_writes = writes.items.len;
-        p.missing_required = missing_required;
-    }
-
-    return .{
-        .alloc = alloc,
-        .items = try writes.toOwnedSlice(alloc),
-        .missing_required = missing_required,
-    };
-}
+const collectDocumentWritesProfiled = document_collectors.collectDocumentWritesProfiled;
 
 fn appendUniqueBorrowedKeyWithSet(
     alloc: Allocator,
@@ -70551,291 +70138,20 @@ fn attachPreparedUpsertDocumentProjections(
     }
 }
 
-const CollectedTextDocumentWrites = struct {
-    alloc: Allocator,
-    docs: std.ArrayListUnmanaged(mapper.MapperDoc) = .empty,
-    owned_values: std.ArrayListUnmanaged([]u8) = .empty,
-    // Exact-size batch ownership for ordinary store-backed JSON. Slices in
-    // docs remain stable after the read transaction and this result move.
-    document_bytes: []u8 = &.{},
-    materialized_documents: std.ArrayListUnmanaged(index_manager_mod.IndexManager.MaterializedStoredDocument) = .empty,
-    missing_required: usize = 0,
+const CollectedTextDocumentWrites = document_collectors.CollectedTextDocumentWrites;
 
-    fn deinit(self: *@This()) void {
-        for (self.materialized_documents.items) |*doc| doc.deinit(self.alloc);
-        self.materialized_documents.deinit(self.alloc);
-        for (self.owned_values.items) |value| self.alloc.free(value);
-        self.owned_values.deinit(self.alloc);
-        self.alloc.free(self.document_bytes);
-        self.docs.deinit(self.alloc);
-        self.* = undefined;
-    }
-};
+const ordinaryTextDocument = document_collectors.ordinaryTextDocument;
 
-fn ordinaryTextDocument(doc_key: []const u8, store_key: []const u8) bool {
-    return !internal_keys.isInternalUserKey(doc_key) and !internal_keys.isRelationalRowKey(store_key);
-}
-
-fn collectTextDocumentWritesForIndex(
-    alloc: Allocator,
-    store: *docstore_mod.DocStore,
-    index_manager: *index_manager_mod.IndexManager,
-    documents: []const derived_types.DerivedDocument,
-    index_name: []const u8,
-    chunk_backed: bool,
-    byte_range: types.ByteRange,
-    opts: CollectTextDocumentWritesOptions,
-) !CollectedTextDocumentWrites {
-    const PendingTextWrite = struct {
-        doc_key: []const u8,
-        store_key: []const u8,
-        inline_value: ?[]const u8,
-    };
-
-    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
-    defer lookup_keys.deinit();
-    // Temporary descriptors cannot escape the synchronous read/apply below.
-    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
-    const descriptor_alloc = descriptor_buffer.get();
-    var pending = std.ArrayListUnmanaged(PendingTextWrite).empty;
-    defer {
-        pending.deinit(descriptor_alloc);
-    }
-    // A bounded small batch fits entirely on the stack. Reserve once so
-    // append does not repeatedly enter the capacity-growth path. Larger
-    // batches keep lazy growth proportional to the selected documents.
-    if (documents.len <= 64) {
-        comptime std.debug.assert(64 * @sizeOf(PendingTextWrite) <= 4096);
-        try pending.ensureTotalCapacityPrecise(descriptor_alloc, documents.len);
-    }
-
-    var has_pending_inline = false;
-    var result = CollectedTextDocumentWrites{ .alloc = alloc };
-    errdefer result.deinit();
-    var schema_views = index_manager_mod.IndexManager.SchemaViewSet.init(index_manager);
-    defer schema_views.deinit();
-
-    const trust_inline = if (opts.prefer_inline_when_store_tip_matches_sequence) |sequence|
-        store.nextReplaySequence(sequence + 1) == sequence + 1
-    else
-        false;
-    const active_schema_version = index_manager.activeSchemaVersion();
-    const active_write_plan_generation = index_manager.writePlanGeneration();
-
-    for (documents) |doc| {
-        if (doc.action != .upsert) continue;
-        if (!replayDocumentKeyInRange(byte_range, doc.key)) continue;
-        if (!documentTargetsTextIndex(doc, index_name, chunk_backed)) continue;
-        if (trust_inline and doc.cleaned_value != null) {
-            const projected = try textualAssetFullTextProjectionAlloc(
-                alloc,
-                index_manager,
-                doc.key,
-                doc.cleaned_value.?,
-            );
-            if (projected) |value| result.owned_values.append(alloc, value) catch |err| {
-                alloc.free(value);
-                return err;
-            };
-            try result.docs.append(alloc, .{
-                .key = doc.key,
-                .value = projected orelse doc.cleaned_value.?,
-            });
-            continue;
-        }
-        if (trust_inline and doc.prepared_text_root != null and
-            active_schema_version != null and
-            active_schema_version.? == doc.prepared_schema_version and
-            active_write_plan_generation == doc.prepared_write_plan_generation)
-        {
-            try result.docs.append(alloc, .{
-                .key = doc.key,
-                .value = "",
-                .source_bytes = doc.prepared_text_source_bytes,
-                .root = doc.prepared_text_root,
-            });
-            continue;
-        }
-        try pending.append(descriptor_alloc, .{
-            .doc_key = doc.key,
-            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
-            .inline_value = doc.cleaned_value,
-        });
-        has_pending_inline = has_pending_inline or doc.cleaned_value != null;
-    }
-
-    if (pending.items.len == 0) return result;
-
-    var txn = try store.beginProbeTxn();
-    defer txn.abort();
-    const SortContext = struct {};
-    std.mem.sort(PendingTextWrite, pending.items, SortContext{}, struct {
-        fn lessThan(_: SortContext, lhs: PendingTextWrite, rhs: PendingTextWrite) bool {
-            return std.mem.order(u8, lhs.store_key, rhs.store_key) == .lt;
-        }
-    }.lessThan);
-
-    var read_scratch = try document_read_scratch.Scratch.init(descriptor_alloc, pending.items.len);
-    defer read_scratch.deinit();
-    const read_keys = read_scratch.keys;
-    const read_values = read_scratch.values;
-
-    for (pending.items, 0..) |item, i| {
-        read_keys[i] = item.store_key;
-    }
-    try txn.getManySorted(read_keys, read_values);
-
-    const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
-    try result.docs.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, result.docs.items.len, available_values));
-
-    // Read-transaction bytes cannot escape. Homogeneous ordinary batches
-    // share one exact-size slab. Mixed/internal batches keep lazy per-value
-    // ownership: the slab saved allocations there but regressed smp timings.
-    const document_bytes_len: ?usize = sizing: {
-        var bytes: usize = 0;
-        for (pending.items, read_values) |item, visible| {
-            if (!ordinaryTextDocument(item.doc_key, item.store_key)) break :sizing null;
-            if (visible) |value| bytes = try std.math.add(usize, bytes, value.len);
-        }
-        break :sizing bytes;
-    };
-    if (document_bytes_len) |bytes| {
-        if (bytes != 0) result.document_bytes = try alloc.alloc(u8, bytes);
-    } else if (pending.items.len >= 16 and pending.items.len <= 256) {
-        // Preserve the existing bounded reservation for public relational
-        // rows. Sorted mixed/internal batches normally exit on the first key.
-        const ordinary_rows = count: {
-            var rows: usize = 0;
-            for (pending.items, read_values) |candidate, visible| {
-                if (internal_keys.isInternalUserKey(candidate.doc_key)) break :count 0;
-                if (visible != null) rows += 1;
-            }
-            break :count rows;
-        };
-        if (ordinary_rows >= 16)
-            try result.materialized_documents.ensureTotalCapacityPrecise(alloc, ordinary_rows);
-    }
-    var document_bytes_offset: usize = 0;
-
-    for (pending.items, 0..) |item, i| {
-        const value = read_values[i] orelse item.inline_value orelse {
-            if (try replayDocumentIsDurablyDeleted(alloc, &txn, item.doc_key)) continue;
-            if (opts.tolerate_missing_replay_documents) {
-                std.log.warn(
-                    "full-text replay giving up on a document with no visible content after bounded retries index={s} key={s}",
-                    .{ index_name, item.doc_key },
-                );
-                if (index_manager.resource_manager) |manager| manager.recordReplayDocumentNotVisibleSkipped(resource_manager_mod.replayOwnerIdFromPtr(index_manager), index_name);
-                continue;
-            }
-            result.missing_required += 1;
-            continue;
-        };
-        const projected = try textualAssetFullTextProjectionAlloc(
-            alloc,
-            index_manager,
-            item.doc_key,
-            value,
-        );
-        if (projected) |owned| {
-            result.owned_values.append(alloc, owned) catch |err| {
-                alloc.free(owned);
-                return err;
-            };
-            try result.docs.append(alloc, .{ .key = item.doc_key, .value = owned });
-            continue;
-        }
-
-        // An inline replay fallback is already a JSON API representation. Only
-        // store-backed relational rows carry AROW bytes and require ordinal-
-        // native materialization through the pinned schema-view set.
-        if (read_values[i] == null) {
-            try result.docs.append(alloc, .{ .key = item.doc_key, .value = value });
-            continue;
-        }
-
-        if (document_bytes_len != null) {
-            const owned = result.document_bytes[document_bytes_offset..][0..value.len];
-            @memcpy(owned, value);
-            document_bytes_offset += value.len;
-            try result.docs.append(alloc, .{ .key = item.doc_key, .value = owned, .source_bytes = owned.len });
-            continue;
-        }
-
-        var materialized = try index_manager.materializeStoredDocumentWithSchemaViewsAlloc(
-            alloc,
-            item.store_key,
-            value,
-            &schema_views,
-        );
-        result.materialized_documents.append(alloc, materialized) catch |err| {
-            materialized.deinit(alloc);
-            return err;
-        };
-        const stable = &result.materialized_documents.items[result.materialized_documents.items.len - 1];
-        result.docs.append(alloc, .{
-            .key = item.doc_key,
-            .value = stable.value,
-            .source_bytes = stable.retainedBytes(),
-            .root = stable.root,
-            .root_arena = stable.root_arena,
-        }) catch |err| {
-            var removed = result.materialized_documents.pop().?;
-            removed.deinit(alloc);
-            return err;
-        };
-    }
-
-    return result;
-}
+const collectTextDocumentWritesForIndex = document_collectors.collectTextDocumentWritesForIndex;
 
 /// Full-text segments consume JSON objects, while textual asset artifacts are
 /// intentionally stored as their original bytes. Project a non-JSON asset to
 /// a stable one-field JSON document at the indexing boundary so live apply,
 /// journal catch-up, and rebuild all have identical behavior without changing
 /// the artifact returned to callers.
-fn textualAssetFullTextProjectionAlloc(
-    alloc: Allocator,
-    index_manager: *index_manager_mod.IndexManager,
-    key: []const u8,
-    raw: []const u8,
-) !?[]u8 {
-    const name_body = internal_keys.assetArtifactNameBody(key) orelse return null;
-    var name_buffer = std.heap.stackFallback(256, alloc);
-    const name_alloc = name_buffer.get();
-    var name_scratch = std.ArrayListUnmanaged(u8).empty;
-    defer name_scratch.deinit(name_alloc);
-    const name = (try internal_keys.decodeBodyView(name_body)) orelse blk: {
-        // Reserve once so short escaped names fit the bounded stack buffer.
-        // Longer names fall back to the caller's accounted allocator.
-        try name_scratch.ensureTotalCapacityPrecise(name_alloc, name_body.len);
-        break :blk try internal_keys.decodeBodyIntoList(&name_scratch, name_alloc, name_body);
-    };
-    const enrichment = index_manager.getEnrichment(.asset, name) orelse return null;
-    // The lookup borrows its name only for the call; release spill storage
-    // before allocating the projected value.
-    name_scratch.clearAndFree(name_alloc);
-    if (assetContentTypeIsJson(enrichment.content_type)) return null;
+const textualAssetFullTextProjectionAlloc = document_collectors.textualAssetFullTextProjectionAlloc;
 
-    const field = if (enrichment.source_field.len > 0) enrichment.source_field else "text";
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.append(alloc, '{');
-    try appendJsonString(alloc, &out, field);
-    try out.append(alloc, ':');
-    try appendJsonString(alloc, &out, raw);
-    try out.append(alloc, '}');
-    return try out.toOwnedSlice(alloc);
-}
-
-fn documentTargetsTextIndex(doc: derived_types.DerivedDocument, index_name: []const u8, is_chunk_index: bool) bool {
-    for (doc.targets) |target| {
-        if (target.kind != .full_text) continue;
-        if (std.mem.eql(u8, target.index_name, index_name)) return true;
-        if (!is_chunk_index and std.mem.eql(u8, target.index_name, "*")) return true;
-    }
-    return false;
-}
+const documentTargetsTextIndex = document_collectors.documentTargetsTextIndex;
 
 fn collectVectorReplayDeleteKeys(
     alloc: Allocator,
@@ -106818,6 +106134,17 @@ test "db computeEnrichments synchronously builds chunk and embedding outputs" {
     try std.testing.expectEqual(@as(u64, 1), runtime_stats.embed_batches_completed);
     try std.testing.expectEqual(@as(u64, 3), runtime_stats.embed_items_started);
     try std.testing.expectEqual(@as(u64, 3), runtime_stats.embed_items_completed);
+
+    const AllocationSweep = struct {
+        fn run(failing: Allocator, target: *DB) !void {
+            var computed = try target.computeEnrichments(failing, &.{.{ .key = "doc:a", .value = "{\"body\":\"abcdefghijklmno\"}" }});
+            defer computed.deinit(failing);
+            try std.testing.expect(computed.artifact_writes.len != 0);
+            try std.testing.expect(computed.documents.len != 0);
+            try std.testing.expect(computed.dense_embeddings.len != 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, AllocationSweep.run, .{&db});
 }
 
 test "db leased enrichment worker generates dense embeddings" {
@@ -155215,32 +154542,7 @@ fn jsonOutputAllocationBenchmark(case_name: []const u8, count: usize, batch: usi
     };
 }
 
-fn documentCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
-    var writes = try collectDocumentWritesProfiled(alloc, store, null, documents, .{ .start = "", .end = "" }, .{ .prefer_available_inline_values = inline_values }, null);
-    defer writes.deinit();
-    try std.testing.expectEqual(documents.len, writes.items.len);
-    for (writes.items) |write| try std.testing.expectEqualStrings("{\"title\":\"value\"}", write.value);
-}
-
-test "document collectors release owned values and pooled read scratch on allocation failures" {
-    const alloc = std.testing.allocator;
-    var backend = mem_backend_mod.Backend.init(alloc, .{});
-    defer backend.close();
-    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
-    defer store.close();
-    var names: [80][96]u8 = undefined;
-    var docs: [80]derived_types.DerivedDocument = undefined;
-    for (&names, &docs, 0..) |*name, *doc, i| {
-        @memset(name, 'x');
-        _ = try std.fmt.bufPrint(name[0..8], "{d:0>8}", .{i});
-        doc.* = .{ .key = name, .action = .upsert, .cleaned_value = "{\"title\":\"value\"}" };
-    }
-    const stored_key = try replayDocumentStoreKeyAlloc(alloc, docs[0].key, false);
-    defer alloc.free(stored_key);
-    try store.putBatch(&.{.{ .key = stored_key, .value = docs[0].cleaned_value.? }}, &.{});
-    for ([_]bool{ false, true }) |inline_values|
-        try std.testing.checkAllAllocationFailures(alloc, documentCollectorFailureSweep, .{ &store, @as([]const derived_types.DerivedDocument, &docs), inline_values });
-}
+const documentCollectorFailureSweep = document_collectors.documentCollectorFailureSweep;
 
 fn textCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, manager: *index_manager_mod.IndexManager, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
     var result = try collectTextDocumentWritesForIndex(alloc, store, manager, documents, "text", false, .{ .start = "", .end = "" }, .{ .prefer_inline_when_store_tip_matches_sequence = if (inline_values) 0 else null });

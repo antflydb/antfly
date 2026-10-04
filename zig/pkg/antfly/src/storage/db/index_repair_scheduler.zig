@@ -307,6 +307,15 @@ pub const Directory = struct {
         return .runnable;
     }
 
+    /// Borrowed record snapshot; the caller retains the scheduler/control fence.
+    pub fn lookupByName(self: *const @This(), name: []const u8) ?IndexRepairScheduleRecord {
+        const index = self.by_name.get(name) orelse return null;
+        return self.records.items[index];
+    }
+    pub fn containsName(self: *const @This(), name: []const u8) bool {
+        return self.by_name.contains(name);
+    }
+
     pub fn upsert(
         self: *@This(),
         alloc: Allocator,
