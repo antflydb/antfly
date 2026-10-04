@@ -2336,13 +2336,13 @@ pulls ahead well beyond 32k, where Laya's encoder was not pretrained anyway.
 From [Other decision models](#other-decision-models-research-2026-10-04),
 in order:
 
-1. **Serve OpenDecider-nano.** It needs no training: `laya.format:
-   "opendecider"` with `scripts/laya/prepare_opendecider.py`. Gate: matches
-   its PyTorch implementation on the typed-decisions test split.
-2. **Report on the community benchmark.** Score every model on the full
-   typed-decisions test split (2,000 decisions,
-   `scripts/laya/typed_decisions_bench.py`), the split OpenDecider, Laya and
-   Jev report, alongside the 760-decision step-0 eval.
+1. **Serve OpenDecider-nano.** Done: `laya.format: "opendecider"` with
+   `scripts/laya/prepare_opendecider.py`. It matches its PyTorch
+   implementation on the typed-decisions test split (see below).
+2. **Report on the community benchmark.** Done for every checkpoint so far
+   (below). Score new models on the full typed-decisions test split (2,000
+   decisions, `scripts/laya/typed_decisions_bench.py`), the split OpenDecider,
+   Laya and Jev report, alongside the 760-decision step-0 eval.
 3. **Teacher-distilled data at scale.** Build about 150,000–200,000
    decisions labelled by calibrated teachers (step 2a's Qwen3-14B scorer).
    Train unpacked first, to reproduce OpenDecider's result on our encoders,
@@ -2350,6 +2350,39 @@ in order:
 4. **Question-aware trunk as a supported mode,** if scale does not close the
    gap.
 5. **Confidence-gated escalation,** at the product level.
+
+### Community benchmark (2026-10-04)
+
+Every model on the full typed-decisions test split (2,000 decisions), scored
+against gold labels with `scripts/laya/typed_decisions_bench.py --gold`.
+States longer than a checkpoint's budget are cut (`--truncate-state`), as
+upstream does. Laya's 512 tokens cut 160 decisions; OpenDecider's 2,048 cut
+none. Step-0 fine-tunes use the documented recipe of [Base-size encoder](#base-size-encoder-step-2d-2026-10-03)
+unless noted.
+
+| Model | Accuracy | Choice | Score | Yes/no | ECE |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| OpenDecider-nano, served natively (Metal) | **0.796** | 0.762 | 0.769 | 0.867 | 0.164 |
+| Laya typed-decisions checkpoint (published, trained on the full train split) | 0.766 | 0.733 | 0.723 | 0.857 | |
+| Laya-large, step-0 fine-tune (seed 42) | 0.627 | 0.633 | 0.560 | 0.712 | 0.088 |
+| Antenna-base, step-0 fine-tune (3 seeds) | 0.533 (0.579 / 0.495 / 0.525) | | | | |
+| Antenna-base, frozen trunk + head (dec7) | 0.535 | 0.538 | 0.439 | 0.662 | 0.084 |
+| ModernBERT-base, step-0 fine-tune (3 seeds) | 0.472 (0.489 / 0.483 / 0.444) | | | | |
+| Released Laya-large, zero-shot | 0.361 | 0.288 | 0.323 | 0.487 | 0.175 |
+
+- **Parity.** Antfly's OpenDecider-nano matches the model's own PyTorch
+  implementation to 2.8e-6 in probability on every decision and reproduces its
+  published 0.796, 0.762, 0.769 and 0.867.
+- **Scoring.** The gold label and the argmax of the gold distribution
+  disagree on 31 decisions, so accuracy against gold labels (the Antz AI
+  harness, and every published number) differs slightly from `finetune eval
+  laya`'s, which scores the argmax.
+- **The gap is training data.** OpenDecider-nano and our step-0 fine-tunes
+  share the unpacked layout and scorer and have bases of similar size. It
+  leads Laya-large's step-0 fine-tune by 0.17 and Antenna-base by 0.26.
+  Laya's own checkpoint, trained on the full train split, sits in between.
+  That ranks priority 3, teacher-distilled data at scale, first among the
+  training work.
 
 Other open items:
 

@@ -77,7 +77,8 @@ label and its probability, plus `decisions` with:
 - `true_probability` for boolean tasks.
 - `confidence` and `confidence_method`. Choice and ordinal confidence measures
   normalized inverse entropy; boolean confidence is the larger class probability.
-- `act_probability`, the auxiliary action-head output.
+- `act_probability`, the auxiliary action-head output, for models that have
+  one (Laya checkpoints; not OpenDecider-nano).
 
 The action probability does not execute a tool. An agent can consume these
 results to select a tool or a bounded argument; application state, another
@@ -96,6 +97,48 @@ to the server's memory and executor limits.
 Checkpoint selection is explicit. Benchmark application-specific accuracy and
 calibration before choosing thresholds; model confidence does not establish that
 a tool choice is correct. This integration does not change the GLiNER v2 executor.
+
+## OpenDecider-nano
+
+[OpenDecider-nano](https://huggingface.co/manjunathshiva/opendecider-nano)
+(Apache 2.0) is a 400M decision model on an Ettin encoder, a ModernBERT
+architecture, with Laya's per-option `[MASK]` scoring. Antfly serves it
+through the same pipeline and endpoints:
+
+```sh
+uv run scripts/laya/prepare_opendecider.py manjunathshiva/opendecider-nano \
+  --revision <full-hugging-face-commit-sha> \
+  --output ./models/extractors/opendecider-nano
+```
+
+The importer merges the encoder and the separate head into one checkpoint and
+sets `laya.format: "opendecider"`. That format uses OpenDecider's prompt
+(`question:` and `input:` prefixes, its option text, "yes" before "no", no
+per-option token cap) and its marker head. It has no type embedding, head
+layers or action head, so decisions omit `act_probability`. It runs unpacked,
+with a 2,048-token budget; longer inputs are rejected, as for Laya.
+
+## Typed-decisions benchmark
+
+The community benchmark for typed-decision models is the
+`LocalLLaMA/typed-decisions` test split (400 cases, 2,000 decisions), scored
+per decision against the case's gold label. `scripts/laya/prepare_laya_training_data.sh`
+writes it as native records (`td/eval.jsonl`) and cases (`td/eval-cases.jsonl`).
+
+```sh
+antfly inference finetune eval laya ./models/extractors/opendecider-nano td/eval.jsonl \
+  --backend metal --truncate-state --predictions nano.jsonl
+uv run scripts/laya/typed_decisions_bench.py report nano.jsonl other.jsonl \
+  --gold td/eval-cases.jsonl
+```
+
+`--truncate-state` cuts states that do not fit the checkpoint, as upstream
+Laya and OpenDecider do; 160 of the 2,000 decisions exceed Laya's 512 tokens.
+Serving never truncates. `report` prints accuracy per question type, Brier
+score, ECE and a paired bootstrap interval against the first file.
+`typed_decisions_bench.py reference` runs OpenDecider-nano's own PyTorch code
+for comparison. On Metal, Antfly matches it to 3e-6 in probability and
+reproduces its published 0.796.
 
 ## Reference validation
 
