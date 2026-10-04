@@ -658,9 +658,14 @@ fn appendPendingDocumentGroup(
     sequence: u64,
     doc_key: []const u8,
 ) !void {
-    if (pending.getPtr(doc_key)) |existing| {
-        existing.sequence = sequence;
-        return;
+    // getOrPut grows before probing at capacity. Preserve allocation-free
+    // updates there; new keys otherwise need only one lookup.
+    const load_limit = @as(u64, pending.capacity()) * std.hash_map.default_max_load_percentage / 100;
+    if (pending.count() >= load_limit) {
+        if (pending.getPtr(doc_key)) |existing| {
+            existing.sequence = sequence;
+            return;
+        }
     }
     const gop = try pending.getOrPut(alloc, doc_key);
     if (!gop.found_existing) {
@@ -1556,4 +1561,19 @@ test "replay cursor exposes partial scan statistics on consumer failure for both
         try std.testing.expectEqual(@as(usize, 1), resumed.matched_entries);
         try std.testing.expectEqual(@as(u64, 3), resumed.last_sequence);
     }
+}
+
+test "replay source enrichment duplicate updates at map capacity do not allocate" {
+    const alloc = std.testing.allocator;
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    defer cleanupPendingDocumentGroupMap(alloc, &pending);
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }, 0..) |key, i|
+        try appendPendingDocumentGroup(alloc, &pending, i + 1, key);
+    try std.testing.expectEqual(@as(u32, 8), pending.capacity());
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    for (0..256) |i| try appendPendingDocumentGroup(failing.allocator(), &pending, i + 10, "a");
+    try std.testing.expectEqual(@as(u64, 265), pending.get("a").?.sequence);
+    try std.testing.expectEqual(@as(u32, 8), pending.capacity());
+    try std.testing.expectError(error.OutOfMemory, appendPendingDocumentGroup(failing.allocator(), &pending, 300, "g"));
+    try std.testing.expectEqual(@as(u32, 6), pending.count());
 }

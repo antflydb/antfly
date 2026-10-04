@@ -605,8 +605,13 @@ pub fn initializePristineVisibilitySummaryTxn(txn: *docstore_mod.DocStore.Txn, n
 
 pub fn lookupOrdinalTxn(alloc: Allocator, txn: anytype, doc_id: []const u8) !?DocOrdinal {
     const mutable_txn = txn;
-    const key = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id);
-    defer alloc.free(key);
+    const key_len = try std.math.add(usize, 2, internal_keys.encodedComponentLen(doc_id));
+    var inline_key: [256]u8 = undefined;
+    const key = if (key_len <= inline_key.len) inline_key[0..key_len] else try alloc.alloc(u8, key_len);
+    defer if (key_len > inline_key.len) alloc.free(key);
+    key[0] = internal_keys.identity_namespace;
+    key[1] = internal_keys.identity_doc_to_ordinal_kind;
+    _ = internal_keys.encodeComponent(key[2..], doc_id);
 
     const raw = mutable_txn.get(key) catch |err| switch (err) {
         error.NotFound => return null,
@@ -4065,4 +4070,34 @@ test "ordinal batch lookup rejects malformed values and propagates read failure 
     const empty = try lookupOrdinalsTxnAlloc(std.testing.allocator, &txn, &.{});
     defer std.testing.allocator.free(empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "ordinal batch lookup scalar uses inline escaped keys and falls back for long IDs" {
+    const Txn = struct {
+        expected: []const u8,
+        raw: []const u8 = &.{ 0, 0, 0, 7 },
+        missing: bool = false,
+        fn get(self: *@This(), key: []const u8) ![]const u8 {
+            try std.testing.expectEqualSlices(u8, self.expected, key);
+            if (self.missing) return error.NotFound;
+            return self.raw;
+        }
+    };
+    const alloc = std.testing.allocator;
+    const short = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, "a\x00b");
+    defer alloc.free(short);
+    var txn: Txn = .{ .expected = short };
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(?DocOrdinal, 7), try lookupOrdinalTxn(failing.allocator(), &txn, "a\x00b"));
+    txn.missing = true;
+    try std.testing.expectEqual(@as(?DocOrdinal, null), try lookupOrdinalTxn(failing.allocator(), &txn, "a\x00b"));
+    txn.missing = false;
+    txn.raw = "bad";
+    try std.testing.expectError(error.InvalidDocIdentity, lookupOrdinalTxn(failing.allocator(), &txn, "a\x00b"));
+    const long = [_]u8{0} ** 512;
+    const expected = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, &long);
+    defer alloc.free(expected);
+    txn = .{ .expected = expected };
+    try std.testing.expectError(error.OutOfMemory, lookupOrdinalTxn(failing.allocator(), &txn, &long));
+    try std.testing.expectEqual(@as(?DocOrdinal, 7), try lookupOrdinalTxn(alloc, &txn, &long));
 }

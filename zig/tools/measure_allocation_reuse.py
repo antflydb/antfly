@@ -34,7 +34,7 @@ def main():
     parser.add_argument('--replay-sources', nargs='+', choices=['journal', 'primary'], default=['journal'])
     parser.add_argument('--documents-per-record', nargs='+', type=int, default=[1, 128])
     parser.add_argument('--batches', nargs='+', type=int, default=[256, 1024])
-    parser.add_argument('--replay-operation', choices=['replay', 'enrichment', 'latest', 'ordinal'], default='replay')
+    parser.add_argument('--replay-operation', choices=['replay', 'enrichment', 'latest', 'ordinal', 'scalar_ordinal'], default='replay')
     parser.add_argument('--repetitions', type=int, default=1)
     parser.add_argument('--replay-measurements', nargs='+', choices=['counted', 'timing'], default=['counted'])
     parser.add_argument('--replay-only', action='store_true')

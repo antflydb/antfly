@@ -13,7 +13,7 @@ const indexes = @import("storage/db/catalog/index_manager.zig");
 const resources = @import("storage/resource_manager.zig");
 const time = @import("antfly_platform").time;
 
-const Operation = enum { replay, enrichment, latest, ordinal };
+const Operation = enum { replay, enrichment, latest, ordinal, scalar_ordinal };
 
 const Counter = @import("allocation_bench_support.zig").Counter;
 
@@ -50,9 +50,9 @@ pub fn main(init: std.process.Init) !void {
     const index: indexes.ManagedIndexRef = .{ .name = "title_body", .kind = kind };
     if (batch == 0 or documents_per_record == 0) return error.InvalidBatch;
     const counting = args.len <= 10 or !std.mem.eql(u8, args[10], "timing");
-    if (operation == .ordinal) {
+    if (operation == .ordinal or operation == .scalar_ordinal) {
         if (!primary or kind != .full_text or documents_per_record != 1 or repetitions != 1 or requested_budgeted) return error.InvalidOrdinalParameters;
-        return benchmarkOrdinals(count, batch, samples, counting, if (args.len > 11) args[11] else "short");
+        return benchmarkOrdinals(count, batch, samples, counting, if (args.len > 11) args[11] else "short", operation == .scalar_ordinal);
     }
     const setup = std.heap.smp_allocator;
     var log = try journal.Journal.open("allocation-benchmark-memory", .{
@@ -97,7 +97,7 @@ pub fn main(init: std.process.Init) !void {
         const started = time.monotonicNs();
         var windows: usize = 0;
         switch (operation) {
-            .ordinal => unreachable,
+            .ordinal, .scalar_ordinal => unreachable,
             .replay => {
                 const stats = try worker.catchUpIndexWithOptions(run_alloc, replay_source, index, 0, &consumer, Consumer.apply, .{
                     .resource_manager = if (budgeted) &manager else null,
@@ -127,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
         const elapsed = time.monotonicNs() - started;
         if (manager.snapshot().memory.used_bytes != 0) return error.LeakedReservation;
         const expected_count = switch (operation) {
-            .ordinal => unreachable,
+            .ordinal, .scalar_ordinal => unreachable,
             .replay => count,
             .enrichment => try std.math.divCeil(usize, count, repetitions),
             .latest => 0,
@@ -141,7 +141,7 @@ pub fn main(init: std.process.Init) !void {
 
 // Measures the production identity lookup helper with a validating borrowed
 // sorted-read callback. Backend I/O is excluded so key preparation is isolated.
-fn benchmarkOrdinals(count: usize, batch: usize, samples: usize, counting: bool, fixture: []const u8) !void {
+fn benchmarkOrdinals(count: usize, batch: usize, samples: usize, counting: bool, fixture: []const u8, scalar: bool) !void {
     const identity = @import("storage/db/doc_identity.zig");
     const internal = @import("storage/internal_keys.zig");
     const long = std.mem.eql(u8, fixture, "long");
@@ -169,6 +169,11 @@ fn benchmarkOrdinals(count: usize, batch: usize, samples: usize, counting: bool,
     const Txn = struct {
         values: []const [4]u8,
         missing: bool,
+        pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+            var result: [1]?[]const u8 = .{null};
+            try self.getManySorted(&.{key}, &result);
+            return result[0] orelse error.NotFound;
+        }
         pub fn getManySorted(self: *@This(), keys: []const []const u8, outputs: []?[]const u8) !void {
             for (keys, outputs, 0..) |key, *output, i| {
                 if (i > 0 and std.mem.order(u8, keys[i - 1], key) == .gt) return error.UnsortedIdentityRead;
@@ -190,18 +195,28 @@ fn benchmarkOrdinals(count: usize, batch: usize, samples: usize, counting: bool,
         var offset: usize = 0;
         while (offset < count) {
             const end = @min(count, offset + batch);
-            const ordinals = try identity.lookupOrdinalsTxnAlloc(alloc, &txn, ids[offset..end]);
-            defer alloc.free(ordinals);
-            for (ordinals, offset..) |ordinal, i| {
-                const number = count - 1 - i;
-                const expected: ?u32 = if (missing and number % 5 != 0) null else @intCast(number + 1);
-                if (ordinal != expected) return error.InvalidOrdinalResult;
-                checksum += ordinal orelse 0;
+            if (scalar) {
+                for (ids[offset..end], offset..) |id, i| {
+                    const ordinal = try identity.lookupOrdinalTxn(alloc, &txn, id);
+                    const number = count - 1 - i;
+                    const expected: ?u32 = if (missing and number % 5 != 0) null else @intCast(number + 1);
+                    if (ordinal != expected) return error.InvalidOrdinalResult;
+                    checksum += ordinal orelse 0;
+                }
+            } else {
+                const ordinals = try identity.lookupOrdinalsTxnAlloc(alloc, &txn, ids[offset..end]);
+                defer alloc.free(ordinals);
+                for (ordinals, offset..) |ordinal, i| {
+                    const number = count - 1 - i;
+                    const expected: ?u32 = if (missing and number % 5 != 0) null else @intCast(number + 1);
+                    if (ordinal != expected) return error.InvalidOrdinalResult;
+                    checksum += ordinal orelse 0;
+                }
             }
             offset = end;
         }
         const elapsed = time.monotonicNs() - started;
         if (counter.live != 0 or checksum != expected_checksum) return error.InvalidOrdinalsOrLeakedMemory;
-        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":false,\"documents_per_record\":1,\"index_kind\":\"full_text\",\"source\":\"primary\",\"operation\":\"ordinal\",\"repetitions\":1,\"case\":\"{s}\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, count, batch, fixture, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":false,\"documents_per_record\":1,\"index_kind\":\"full_text\",\"source\":\"primary\",\"operation\":\"{s}\",\"repetitions\":1,\"case\":\"{s}\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, count, batch, if (scalar) "scalar_ordinal" else "ordinal", fixture, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
     }
 }

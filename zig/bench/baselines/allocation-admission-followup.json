@@ -1,0 +1,864 @@
+{
+  "baseline_commit": "2919034929e94769bb3569af72d838e4cd97a14c",
+  "platform": "macOS ARM64",
+  "zig": "0.16.0",
+  "optimize": "ReleaseFast",
+  "samples": 772,
+  "notes": [
+    "Same harness in baseline and candidate. Alternating paired runs. Setup excluded; heap counters measure requested allocations, not RSS.",
+    "Production timing runs are separate from allocation counting. Replay controls compare against merged #961 and do not establish recovery of the earlier pre-merge small-record regression."
+  ],
+  "source_sha256": {
+    "zig/pkg/antfly/src/replay_allocation_bench.zig": "b5f075c20dc5f99df470e530e30b10758a23308bd6f27681e4fd2e5d4d265479",
+    "zig/pkg/antfly/src/vector_payload_bench.zig": "630fe94e4712d3f8eefc526525a020c4d583abbec9c86706a2210f9d08bed253",
+    "zig/pkg/antfly/src/storage/db/doc_identity.zig": "fc5a2d60feb747f25e305d3c96062f9b23bc5970aa4ed66f2503d85aa8321e54",
+    "zig/pkg/antfly/src/storage/db/derived/replay_source.zig": "ee842d1ef5764d5a18a16155a15238d96a37bbe896061aca4bc1fba8ffcf0e83",
+    "zig/pkg/antfly/src/storage/vector_payload_store.zig": "7531f3a50de35d70376f24d0f15860adc03afc5de1ffc5b993fb64ef48480190"
+  },
+  "measurements": [
+    {
+      "fixture": "scalar-short",
+      "summary": {
+        "replay-short-primary-full_text-1-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1711000,
+            "changed": 1179000,
+            "change_percent": -31.09292811221508
+          },
+          "allocations": {
+            "baseline": 50000,
+            "changed": 0,
+            "change_percent": -100.0
+          },
+          "allocated_bytes": {
+            "baseline": 1150000,
+            "changed": 0,
+            "change_percent": -100.0
+          },
+          "peak_live_bytes": {
+            "baseline": 23,
+            "changed": 0,
+            "change_percent": -100.0
+          },
+          "paired_elapsed_change_percent_median": -32.995226730310264
+        },
+        "replay-short-primary-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1367000,
+            "changed": 1311000,
+            "change_percent": -4.0965618141916575
+          },
+          "paired_elapsed_change_percent_median": 0.6139677666922472
+        }
+      }
+    },
+    {
+      "fixture": "scalar-long",
+      "summary": {
+        "replay-long-primary-full_text-1-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 15673000,
+            "changed": 15769000,
+            "change_percent": 0.612518343648305
+          },
+          "allocations": {
+            "baseline": 50000,
+            "changed": 50000,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 25850000,
+            "changed": 25850000,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 517,
+            "changed": 517,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": 0.42748676067121405
+        },
+        "replay-long-primary-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 14418000,
+            "changed": 14600000,
+            "change_percent": 1.262311000138716
+          },
+          "paired_elapsed_change_percent_median": 1.262311000138716
+        }
+      }
+    },
+    {
+      "fixture": "scalar-missing",
+      "summary": {
+        "replay-missing-primary-full_text-1-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1799000,
+            "changed": 1186000,
+            "change_percent": -34.07448582545859
+          },
+          "allocations": {
+            "baseline": 50000,
+            "changed": 0,
+            "change_percent": -100.0
+          },
+          "allocated_bytes": {
+            "baseline": 1150000,
+            "changed": 0,
+            "change_percent": -100.0
+          },
+          "peak_live_bytes": {
+            "baseline": 23,
+            "changed": 0,
+            "change_percent": -100.0
+          },
+          "paired_elapsed_change_percent_median": -31.5432447710571
+        },
+        "replay-missing-primary-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1352000,
+            "changed": 1189000,
+            "change_percent": -12.056213017751482
+          },
+          "paired_elapsed_change_percent_median": -11.963882618510159
+        }
+      }
+    },
+    {
+      "fixture": "enrichment-1",
+      "summary": {
+        "replay-journal-full_text-1-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 2204000,
+            "changed": 2049000,
+            "change_percent": -7.032667876588016
+          },
+          "allocations": {
+            "baseline": 10014,
+            "changed": 10014,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 1773592,
+            "changed": 1773592,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 1132315,
+            "changed": 1132315,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -4.376953997320232
+        },
+        "replay-journal-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 2261000,
+            "changed": 2089000,
+            "change_percent": -7.607253427686866
+          },
+          "paired_elapsed_change_percent_median": -7.535460992907805
+        },
+        "replay-journal-full_text-128-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 2133000,
+            "changed": 2090000,
+            "change_percent": -2.0159399906235387
+          },
+          "allocations": {
+            "baseline": 10015,
+            "changed": 10015,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 1777160,
+            "changed": 1777160,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 1135371,
+            "changed": 1135371,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -3.59778597785978
+        },
+        "replay-journal-full_text-128-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 2067000,
+            "changed": 2012000,
+            "change_percent": -2.660861151427185
+          },
+          "paired_elapsed_change_percent_median": -2.685546875
+        },
+        "replay-primary-full_text-1-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1689000,
+            "changed": 1594000,
+            "change_percent": -5.62462995855536
+          },
+          "allocations": {
+            "baseline": 10014,
+            "changed": 10014,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 1773592,
+            "changed": 1773592,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 1132315,
+            "changed": 1132315,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -4.921020656136088
+        },
+        "replay-primary-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1647000,
+            "changed": 1633000,
+            "change_percent": -0.850030358227083
+          },
+          "paired_elapsed_change_percent_median": -1.5078407720144793
+        },
+        "replay-primary-full_text-128-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 2096000,
+            "changed": 2053000,
+            "change_percent": -2.0515267175572505
+          },
+          "allocations": {
+            "baseline": 10015,
+            "changed": 10015,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 1777160,
+            "changed": 1777160,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 1135371,
+            "changed": 1135371,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -2.6119402985074647
+        },
+        "replay-primary-full_text-128-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 2052000,
+            "changed": 2023000,
+            "change_percent": -1.4132553606237774
+          },
+          "paired_elapsed_change_percent_median": -1.9461077844311392
+        }
+      }
+    },
+    {
+      "fixture": "enrichment-8",
+      "summary": {
+        "replay-journal-full_text-1-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1091000,
+            "changed": 1116000,
+            "change_percent": 2.29147571035746
+          },
+          "allocations": {
+            "baseline": 1261,
+            "changed": 1261,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 221718,
+            "changed": 221718,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 141705,
+            "changed": 141705,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": 3.558394160583944
+        },
+        "replay-journal-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1100000,
+            "changed": 1164000,
+            "change_percent": 5.818181818181811
+          },
+          "paired_elapsed_change_percent_median": 2.121504339440694
+        },
+        "replay-journal-full_text-128-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 282000,
+            "changed": 282000,
+            "change_percent": 0.0
+          },
+          "allocations": {
+            "baseline": 1262,
+            "changed": 1262,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 225286,
+            "changed": 225286,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 144761,
+            "changed": 144761,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": 0.0
+        },
+        "replay-journal-full_text-128-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 296000,
+            "changed": 293000,
+            "change_percent": -1.0135135135135087
+          },
+          "paired_elapsed_change_percent_median": -0.6756756756756799
+        },
+        "replay-primary-full_text-1-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 512000,
+            "changed": 509000,
+            "change_percent": -0.5859375
+          },
+          "allocations": {
+            "baseline": 1261,
+            "changed": 1261,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 221718,
+            "changed": 221718,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 141705,
+            "changed": 141705,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -0.3669724770642202
+        },
+        "replay-primary-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 527000,
+            "changed": 519000,
+            "change_percent": -1.5180265654648917
+          },
+          "paired_elapsed_change_percent_median": -1.17647058823529
+        },
+        "replay-primary-full_text-128-256-counted-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 257000,
+            "changed": 251000,
+            "change_percent": -2.3346303501945553
+          },
+          "allocations": {
+            "baseline": 1262,
+            "changed": 1262,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 225286,
+            "changed": 225286,
+            "change_percent": 0.0
+          },
+          "peak_live_bytes": {
+            "baseline": 144761,
+            "changed": 144761,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": 1.2396694214876103
+        },
+        "replay-primary-full_text-128-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 260000,
+            "changed": 254000,
+            "change_percent": -2.3076923076923106
+          },
+          "paired_elapsed_change_percent_median": -3.4615384615384603
+        }
+      }
+    },
+    {
+      "fixture": "replay-controls",
+      "summary": {
+        "replay-journal-algebraic-1-256-timing-budgeted": {
+          "elapsed_ns": {
+            "baseline": 2132000,
+            "changed": 2082000,
+            "change_percent": -2.3452157598499057
+          },
+          "paired_elapsed_change_percent_median": -2.3622047244094446
+        },
+        "replay-journal-algebraic-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1929000,
+            "changed": 1882000,
+            "change_percent": -2.436495593571797
+          },
+          "paired_elapsed_change_percent_median": -3.9103232533889476
+        },
+        "replay-journal-algebraic-128-256-timing-budgeted": {
+          "elapsed_ns": {
+            "baseline": 637000,
+            "changed": 639000,
+            "change_percent": 0.31397174254317317
+          },
+          "paired_elapsed_change_percent_median": 0.31201248049921304
+        },
+        "replay-journal-algebraic-128-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 431000,
+            "changed": 437000,
+            "change_percent": 1.39211136890951
+          },
+          "paired_elapsed_change_percent_median": 1.620370370370372
+        },
+        "replay-journal-full_text-1-256-timing-budgeted": {
+          "elapsed_ns": {
+            "baseline": 2155000,
+            "changed": 2114000,
+            "change_percent": -1.9025522041763332
+          },
+          "paired_elapsed_change_percent_median": -1.9379844961240345
+        },
+        "replay-journal-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1936000,
+            "changed": 1922000,
+            "change_percent": -0.723140495867769
+          },
+          "paired_elapsed_change_percent_median": 0.5165289256198413
+        },
+        "replay-journal-full_text-128-256-timing-budgeted": {
+          "elapsed_ns": {
+            "baseline": 632000,
+            "changed": 627000,
+            "change_percent": -0.7911392405063333
+          },
+          "paired_elapsed_change_percent_median": -0.7911392405063333
+        },
+        "replay-journal-full_text-128-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 434000,
+            "changed": 432000,
+            "change_percent": -0.4608294930875556
+          },
+          "paired_elapsed_change_percent_median": 0.46948356807512415
+        },
+        "replay-primary-algebraic-1-256-timing-budgeted": {
+          "elapsed_ns": {
+            "baseline": 1759000,
+            "changed": 1760000,
+            "change_percent": 0.05685048322909836
+          },
+          "paired_elapsed_change_percent_median": 3.74923171481254
+        },
+        "replay-primary-algebraic-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1634000,
+            "changed": 1459000,
+            "change_percent": -10.709914320685431
+          },
+          "paired_elapsed_change_percent_median": -4.873949579831938
+        },
+        "replay-primary-algebraic-128-256-timing-budgeted": {
+          "elapsed_ns": {
+            "baseline": 571000,
+            "changed": 577000,
+            "change_percent": 1.050788091068311
+          },
+          "paired_elapsed_change_percent_median": 0.8944543828264706
+        },
+        "replay-primary-algebraic-128-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 366000,
+            "changed": 373000,
+            "change_percent": 1.91256830601092
+          },
+          "paired_elapsed_change_percent_median": 1.1019283746556363
+        },
+        "replay-primary-full_text-1-256-timing-budgeted": {
+          "elapsed_ns": {
+            "baseline": 1644000,
+            "changed": 1584000,
+            "change_percent": -3.649635036496346
+          },
+          "paired_elapsed_change_percent_median": -5.596107055961075
+        },
+        "replay-primary-full_text-1-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 1307000,
+            "changed": 1323000,
+            "change_percent": 1.224177505738333
+          },
+          "paired_elapsed_change_percent_median": -1.7869907076483171
+        },
+        "replay-primary-full_text-128-256-timing-budgeted": {
+          "elapsed_ns": {
+            "baseline": 591000,
+            "changed": 599000,
+            "change_percent": 1.3536379018612488
+          },
+          "paired_elapsed_change_percent_median": 1.6920473773265554
+        },
+        "replay-primary-full_text-128-256-timing-unbudgeted": {
+          "elapsed_ns": {
+            "baseline": 401000,
+            "changed": 401000,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -0.7481296758104716
+        }
+      }
+    },
+    {
+      "fixture": "vectors",
+      "summary": {
+        "vector-ingest-journal-none-1-0-counted": {
+          "run_ns": {
+            "baseline": 10951000,
+            "changed": 13191000,
+            "change_percent": 20.45475299059447
+          },
+          "final_checkpoint_ns": {
+            "baseline": 100913000,
+            "changed": 95548000,
+            "change_percent": -5.316460713684068
+          },
+          "max_batch_ns": {
+            "baseline": 391000,
+            "changed": 1902000,
+            "change_percent": 386.44501278772384
+          },
+          "allocations": {
+            "baseline": 85265,
+            "changed": 85265,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 55552784,
+            "changed": 55552784,
+            "change_percent": 0.0
+          },
+          "peak_additional_live_bytes": {
+            "baseline": 4303805,
+            "changed": 4303805,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": 7.118353344768447
+        },
+        "vector-ingest-journal-none-1-0-timing": {
+          "run_ns": {
+            "baseline": 13888000,
+            "changed": 16635000,
+            "change_percent": 19.779665898617505
+          },
+          "final_checkpoint_ns": {
+            "baseline": 113635000,
+            "changed": 112679000,
+            "change_percent": -0.8412900954811509
+          },
+          "max_batch_ns": {
+            "baseline": 2924000,
+            "changed": 898000,
+            "change_percent": -69.28864569083447
+          },
+          "paired_elapsed_change_percent_median": 1.2331019364267393
+        },
+        "vector-retry-journal-none-1-0-counted": {
+          "run_ns": {
+            "baseline": 3447000,
+            "changed": 3611000,
+            "change_percent": 4.757760371337394
+          },
+          "final_checkpoint_ns": {
+            "baseline": 1000,
+            "changed": 1000,
+            "change_percent": 0.0
+          },
+          "max_batch_ns": {
+            "baseline": 121000,
+            "changed": 138000,
+            "change_percent": 14.049586776859503
+          },
+          "allocations": {
+            "baseline": 10867,
+            "changed": 10867,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 9140272,
+            "changed": 9140277,
+            "change_percent": 5.470296726706181e-05
+          },
+          "peak_additional_live_bytes": {
+            "baseline": 126172,
+            "changed": 126172,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": 10.174927113702626
+        },
+        "vector-retry-journal-none-1-0-timing": {
+          "run_ns": {
+            "baseline": 3833000,
+            "changed": 3683000,
+            "change_percent": -3.913383772501955
+          },
+          "final_checkpoint_ns": {
+            "baseline": 2000,
+            "changed": 2000,
+            "change_percent": 0.0
+          },
+          "max_batch_ns": {
+            "baseline": 165000,
+            "changed": 143000,
+            "change_percent": -13.33333333333333
+          },
+          "paired_elapsed_change_percent_median": -1.956691886250983
+        },
+        "vector-retry-mixed-journal-none-1-0-counted": {
+          "run_ns": {
+            "baseline": 6372000,
+            "changed": 5657000,
+            "change_percent": -11.220966729441306
+          },
+          "final_checkpoint_ns": {
+            "baseline": 7132000,
+            "changed": 7206000,
+            "change_percent": 1.0375771172181691
+          },
+          "max_batch_ns": {
+            "baseline": 310000,
+            "changed": 270000,
+            "change_percent": -12.903225806451612
+          },
+          "allocations": {
+            "baseline": 12209,
+            "changed": 12209,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 9590198,
+            "changed": 9590198,
+            "change_percent": 0.0
+          },
+          "peak_additional_live_bytes": {
+            "baseline": 162085,
+            "changed": 162085,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -11.220966729441306
+        },
+        "vector-retry-mixed-journal-none-1-0-timing": {
+          "run_ns": {
+            "baseline": 6484000,
+            "changed": 6425000,
+            "change_percent": -0.9099321406539129
+          },
+          "final_checkpoint_ns": {
+            "baseline": 7718000,
+            "changed": 7801000,
+            "change_percent": 1.0754081368230084
+          },
+          "max_batch_ns": {
+            "baseline": 293000,
+            "changed": 306000,
+            "change_percent": 4.436860068259385
+          },
+          "paired_elapsed_change_percent_median": 2.701406649616378
+        }
+      }
+    },
+    {
+      "fixture": "vectors-20k",
+      "summary": {
+        "vector-ingest-journal-none-1-0-counted": {
+          "run_ns": {
+            "baseline": 56458000,
+            "changed": 54948000,
+            "change_percent": -2.6745545361153478
+          },
+          "final_checkpoint_ns": {
+            "baseline": 200737000,
+            "changed": 203230000,
+            "change_percent": 1.2419235118588112
+          },
+          "max_batch_ns": {
+            "baseline": 933000,
+            "changed": 806000,
+            "change_percent": -13.61200428724545
+          },
+          "allocations": {
+            "baseline": 366829,
+            "changed": 366829,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 201805619,
+            "changed": 201805619,
+            "change_percent": 0.0
+          },
+          "peak_additional_live_bytes": {
+            "baseline": 17106329,
+            "changed": 17106329,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -1.5047307132459942
+        },
+        "vector-ingest-journal-none-1-0-timing": {
+          "run_ns": {
+            "baseline": 51077000,
+            "changed": 53468000,
+            "change_percent": 4.681167648843898
+          },
+          "final_checkpoint_ns": {
+            "baseline": 221898000,
+            "changed": 215387000,
+            "change_percent": -2.9342310430918728
+          },
+          "max_batch_ns": {
+            "baseline": 781000,
+            "changed": 806000,
+            "change_percent": 3.201024327784885
+          },
+          "paired_elapsed_change_percent_median": 4.9958849567364405
+        },
+        "vector-retry-journal-none-1-0-counted": {
+          "run_ns": {
+            "baseline": 65321000,
+            "changed": 63466000,
+            "change_percent": -2.839821803095477
+          },
+          "final_checkpoint_ns": {
+            "baseline": 3000,
+            "changed": 3000,
+            "change_percent": 0.0
+          },
+          "max_batch_ns": {
+            "baseline": 9999000,
+            "changed": 9662000,
+            "change_percent": -3.3703370337033745
+          },
+          "allocations": {
+            "baseline": 43447,
+            "changed": 43447,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 36551050,
+            "changed": 36551050,
+            "change_percent": 0.0
+          },
+          "peak_additional_live_bytes": {
+            "baseline": 126172,
+            "changed": 126172,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": -2.100683282747484
+        },
+        "vector-retry-journal-none-1-0-timing": {
+          "run_ns": {
+            "baseline": 65866000,
+            "changed": 64302000,
+            "change_percent": -2.3745179607081
+          },
+          "final_checkpoint_ns": {
+            "baseline": 2000,
+            "changed": 2000,
+            "change_percent": 0.0
+          },
+          "max_batch_ns": {
+            "baseline": 9775000,
+            "changed": 9572000,
+            "change_percent": -2.0767263427109994
+          },
+          "paired_elapsed_change_percent_median": 1.006589135517566
+        },
+        "vector-retry-mixed-journal-none-1-0-counted": {
+          "run_ns": {
+            "baseline": 72419000,
+            "changed": 72255000,
+            "change_percent": -0.22645990693049844
+          },
+          "final_checkpoint_ns": {
+            "baseline": 19766000,
+            "changed": 19403000,
+            "change_percent": -1.8364868966912917
+          },
+          "max_batch_ns": {
+            "baseline": 9368000,
+            "changed": 10091000,
+            "change_percent": 7.717762596071731
+          },
+          "allocations": {
+            "baseline": 47802,
+            "changed": 47802,
+            "change_percent": 0.0
+          },
+          "allocated_bytes": {
+            "baseline": 37887652,
+            "changed": 37887652,
+            "change_percent": 0.0
+          },
+          "peak_additional_live_bytes": {
+            "baseline": 262381,
+            "changed": 262381,
+            "change_percent": 0.0
+          },
+          "paired_elapsed_change_percent_median": 0.8751542279991975
+        },
+        "vector-retry-mixed-journal-none-1-0-timing": {
+          "run_ns": {
+            "baseline": 75136000,
+            "changed": 76263000,
+            "change_percent": 1.4999467632027308
+          },
+          "final_checkpoint_ns": {
+            "baseline": 20506000,
+            "changed": 19892000,
+            "change_percent": -2.9942455866575624
+          },
+          "max_batch_ns": {
+            "baseline": 10086000,
+            "changed": 10102000,
+            "change_percent": 0.1586357326987864
+          },
+          "paired_elapsed_change_percent_median": 1.4999467632027308
+        }
+      }
+    }
+  ],
+  "validation": {
+    "replay_identity_tests_passed": 110,
+    "vector_tests_passed": 75,
+    "source_audits": "storage coverage and embedded production boundary passed",
+    "baseline_regression_probe": "Both new admission-pressure tests fail on baseline with ResourceBudgetExceeded; baseline source restored after probe.",
+    "integration_suite": "The previously reported full-text repair failure is unresolved; broad DB integration suite not rerun in this follow-up."
+  },
+  "admission_cases": {
+    "durable_retry": {
+      "input_records": 256,
+      "dimensions": 3,
+      "baseline_write_scratch_bytes": 2630656,
+      "candidate_write_scratch_bytes": 0,
+      "available_headroom_bytes": 65536,
+      "group_commit_modes": [
+        false,
+        true
+      ]
+    },
+    "duplicate_fresh_write": {
+      "input_records": 1024,
+      "unique_records": 1,
+      "dimensions": 128,
+      "baseline_write_scratch_bytes": 5767168,
+      "candidate_write_scratch_bytes": 2100736,
+      "available_headroom_bytes": 3145728
+    },
+    "accounting": "Write scratch excludes separately charged decode/eligibility metadata. These are admitted credits, not RSS or actual heap savings."
+  }
+}
