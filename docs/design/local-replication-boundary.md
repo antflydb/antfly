@@ -353,6 +353,12 @@ critical sections. Optimistic projection construction leaves source admission
 open; only checkpoint commit closes it. DB retains catalog-incarnation checks,
 WAL commits, immutable-generation publication and apply/snapshot ordering.
 
+Schema reconciliation uses the same coalesced admission handshake as restart and
+cleanup jobs. Dense admission also owns finalization-pass handoff and pending
+checkpoint-name retirement; DB supplies the catalog eligibility predicate under
+the existing apply and admission fences. Pruning those volatile hints requires no
+temporary allocation and cannot discard durable publication work.
+
 `storage/db/local_runtime_owner.zig` owns stable allocation and destruction of
 resolution/promotion, TTL, transaction-recovery, text-merge, sparse-compaction and
 graph-metric runtimes.

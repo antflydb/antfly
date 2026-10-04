@@ -78405,14 +78405,14 @@ fn queueDenseProjectionFinalizationLocked(
     index_name: []const u8,
     applied_sequence: u64,
 ) !void {
-    ctx.dense_admission.finalization_requested = true;
+    ctx.dense_admission.requestFinalizationLocked();
     try ctx.dense_admission.deferCheckpointLocked(ctx.alloc, index_name, applied_sequence);
 }
 
 fn pendingDenseProjectionFinalizationSequence(ctx: *AsyncContext, index_name: []const u8) u64 {
     var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
     defer session_lock.unlock();
-    return ctx.dense_admission.pending.get(index_name) orelse 0;
+    return ctx.dense_admission.pendingCheckpointSequenceLocked(index_name);
 }
 
 fn clearPendingDenseProjectionFinalization(ctx: *AsyncContext, index_name: []const u8) void {
@@ -78610,14 +78610,15 @@ fn drainClaimedDenseProjectionFinalizations(ctx: *AsyncContext) !bool {
         completed = try finalizeCoveredDenseProjectionCheckpointsClaimed(ctx) or completed;
 
         var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
-        if (!ctx.dense_admission.finalization_requested) {
-            ctx.dense_admission.finalizing.store(false, .release);
-            session_lock.unlock();
-            return completed;
-        }
-        ctx.dense_admission.finalization_requested = false;
+        const repeat = ctx.dense_admission.completeFinalizationPassLocked();
         session_lock.unlock();
+        if (!repeat) return completed;
     }
+}
+
+fn denseProjectionCheckpointNeedsFinalization(manager: *index_manager_mod.IndexManager, index_name: []const u8) bool {
+    const checkpoint = manager.denseProjectionCheckpointMetadata(index_name) orelse return false;
+    return checkpoint.status == .rebuilding;
 }
 
 // Requires a shared apply lease and an active finalization claim. Session
@@ -78630,19 +78631,7 @@ fn finalizeCoveredDenseProjectionCheckpointsClaimed(ctx: *AsyncContext) !bool {
     {
         var session_lock = lockAtomicWithBackoffProfiled(&ctx.dense_admission.mutex, &ctx.stats.dense_finish_mutex);
         defer session_lock.unlock();
-        if (ctx.dense_admission.pending.count() != 0) {
-            const names = try ctx.alloc.alloc([]const u8, ctx.dense_admission.pending.count());
-            defer ctx.alloc.free(names);
-            var count: usize = 0;
-            var it = ctx.dense_admission.pending.keyIterator();
-            while (it.next()) |name| : (count += 1) names[count] = name.*;
-            for (names[0..count]) |index_name| {
-                const checkpoint = ctx.index_manager.denseProjectionCheckpointMetadata(index_name);
-                if (checkpoint != null and checkpoint.?.status == .rebuilding) continue;
-                const removed = ctx.dense_admission.pending.fetchRemove(index_name) orelse continue;
-                ctx.alloc.free(@constCast(removed.key));
-            }
-        }
+        ctx.dense_admission.pruneCheckpointsLocked(ctx.alloc, ctx.index_manager, denseProjectionCheckpointNeedsFinalization);
     }
 
     var completed = false;

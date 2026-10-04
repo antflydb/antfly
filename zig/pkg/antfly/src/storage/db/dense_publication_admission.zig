@@ -99,6 +99,32 @@ pub const Owner = struct {
         self.finalizing.store(false, .release);
         return requested;
     }
+    /// Retain the current claim when a source completion requested another pass.
+    pub fn completeFinalizationPassLocked(self: *Owner) bool {
+        if (self.finalization_requested) {
+            self.finalization_requested = false;
+            return true;
+        }
+        self.finalizing.store(false, .release);
+        return false;
+    }
+    pub fn requestFinalizationLocked(self: *Owner) void {
+        self.finalization_requested = true;
+    }
+    pub fn pendingCheckpointSequenceLocked(self: *const Owner, name: []const u8) u64 {
+        return self.pending.get(name) orelse 0;
+    }
+    /// The coordinator supplies catalog eligibility while this owner retires
+    /// obsolete hints and their names. The predicate must not mutate this map.
+    pub fn pruneCheckpointsLocked(self: *Owner, alloc: std.mem.Allocator, context: anytype, comptime keep: anytype) void {
+        var entries = self.pending.iterator();
+        while (entries.next()) |entry| {
+            if (keep(context, entry.key_ptr.*)) continue;
+            const name = entry.key_ptr.*;
+            self.pending.removeByPtr(entry.key_ptr);
+            alloc.free(@constCast(name));
+        }
+    }
     pub fn beginCommitLocked(self: *Owner) bool {
         if (self.hasSessionsOrWaiters() or self.committing.load(.acquire)) return false;
         self.committing.store(true, .release);
@@ -180,4 +206,33 @@ test "dense publication admission releases cancelled waiters and fences replay a
     owner.deferSequence(3);
     try std.testing.expectEqual(@as(u64, 7), owner.takeDeferredSequence());
     try std.testing.expectEqual(@as(u64, 0), owner.takeDeferredSequence());
+}
+
+test "dense publication admission retains finalization claims and retires only obsolete checkpoint hints" {
+    const Check = struct {
+        fn keep(_: void, name: []const u8) bool {
+            return std.mem.eql(u8, name, "live");
+        }
+        fn run(alloc: std.mem.Allocator) !void {
+            var owner: Owner = .{};
+            defer owner.deinit(alloc, undefined);
+            try owner.deferCheckpointLocked(alloc, "removed", 3);
+            try owner.deferCheckpointLocked(alloc, "live", 7);
+            try owner.deferCheckpointLocked(alloc, "completed", 9);
+            owner.pruneCheckpointsLocked(alloc, {}, keep);
+            try std.testing.expectEqual(@as(u32, 1), owner.pending.count());
+            try std.testing.expectEqual(@as(u64, 7), owner.pendingCheckpointSequenceLocked("live"));
+            try std.testing.expectEqual(@as(u64, 0), owner.pendingCheckpointSequenceLocked("removed"));
+            try std.testing.expect(owner.claimLocked());
+            owner.requestFinalizationLocked();
+            try std.testing.expect(owner.completeFinalizationPassLocked());
+            try std.testing.expect(owner.finalizing.load(.acquire));
+            try std.testing.expect(!owner.completeFinalizationPassLocked());
+            try std.testing.expect(!owner.finalizing.load(.acquire));
+            // A later source completion can acquire a fresh claim.
+            try std.testing.expect(owner.claimLocked());
+            try std.testing.expect(!owner.finishFinalizationLocked());
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const runtime = @import("../background_runtime.zig");
+const admission = @import("coalesced_job_admission.zig");
 /// Supervision only. DB's run-one-pass port retains schema-version fencing and
 /// durable building/failed/ready transitions. The durable owner lane must drain
 /// before this owner or its borrowed operation context is destroyed.
@@ -43,28 +44,20 @@ pub const Owner = struct {
             port.pass(port.ptr);
             return;
         }
-        while (true) {
-            const state = self.state.load(.acquire);
-            if (state == 2) return;
-            if (state == 1) {
-                if (self.state.cmpxchgWeak(1, 2, .acq_rel, .acquire) == null) return;
-                continue;
-            }
-            if (self.state.cmpxchgWeak(0, 1, .acq_rel, .acquire) != null) continue;
-            // Immutable across queued callbacks and successor flights.
-            if (!self.bound) {
-                self.port = port;
-                self.bound = true;
-            } else {
-                std.debug.assert(self.port.ptr == port.ptr and self.port.owner_id == port.owner_id);
-            }
-            port.lane.submit(.{ .owner_id = port.owner_id, .class = .maintenance, .ptr = self, .run = jobRun, .deinit = jobDeinit }) catch |err| {
-                std.log.warn("schema index reconciliation queue unavailable; using caller fallback err={s}", .{@errorName(err)});
-                self.run();
-            };
-            return;
+        if (!admission.request(&self.state)) return;
+        // Immutable across queued callbacks and successor flights.
+        if (!self.bound) {
+            self.port = port;
+            self.bound = true;
+        } else {
+            std.debug.assert(self.port.ptr == port.ptr and self.port.owner_id == port.owner_id);
         }
+        port.lane.submit(.{ .owner_id = port.owner_id, .class = .maintenance, .ptr = self, .run = jobRun, .deinit = jobDeinit }) catch |err| {
+            std.log.warn("schema index reconciliation queue unavailable; using caller fallback err={s}", .{@errorName(err)});
+            self.run();
+        };
     }
+
     pub fn stop(self: *Owner) void {
         self.stopping.store(true, .release);
     }
@@ -76,8 +69,7 @@ pub const Owner = struct {
                 return;
             }
             port.pass(port.ptr);
-            if (self.state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-            self.state.store(1, .release);
+            if (admission.settled(&self.state)) return;
         }
     }
 };
