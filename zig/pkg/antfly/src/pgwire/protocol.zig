@@ -1067,27 +1067,31 @@ pub const Session = struct {
                 cursor.exhausted = true;
                 break;
             };
-            var page_arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer page_arena.deinit();
-            const wanted: u32 = @intCast(@min(remaining, @min(self.limits.result_rows, 256)));
-            var page = stream.next(stream.context, page_arena.allocator(), req, wanted) catch |err| {
-                cursor.stream = null;
-                stream.close(stream.context);
-                return err;
-            };
-            defer page.result.deinit();
-            if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
-            if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
-            if (page.result.sql_nulls) |flags| if (flags.len != page.result.rows.len) return error.InvalidResult;
-            if (!fetch.move) for (page.result.rows, 0..) |row, index| try self.dataRow(page.result.columns, &.{}, row, if (page.result.sql_nulls) |flags| flags[index] else null);
-            cursor.fetched += page.result.rows.len;
-            remaining -= page.result.rows.len;
-            cursor.exhausted = page.exhausted;
+            {
+                var page_arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer page_arena.deinit();
+                const wanted: u32 = @intCast(@min(remaining, @min(self.limits.result_rows, 256)));
+                var page = stream.next(stream.context, page_arena.allocator(), req, wanted) catch |err| {
+                    cursor.stream = null;
+                    stream.close(stream.context);
+                    return err;
+                };
+                defer page.result.deinit();
+                if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
+                if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
+                if (page.result.sql_nulls) |flags| if (flags.len != page.result.rows.len) return error.InvalidResult;
+                if (!fetch.move) for (page.result.rows, 0..) |row, index| try self.dataRow(page.result.columns, &.{}, row, if (page.result.sql_nulls) |flags| flags[index] else null);
+                cursor.fetched += page.result.rows.len;
+                remaining -= page.result.rows.len;
+                cursor.exhausted = page.exhausted;
+                try self.writer.flush();
+            }
+            // Native pages borrow the stream's memory admission. Release the
+            // page before releasing the exhausted stream and its snapshots.
             if (cursor.exhausted) {
                 cursor.stream = null;
                 stream.close(stream.context);
             }
-            try self.writer.flush();
         }
         var tag: [64]u8 = undefined;
         try self.command(try std.fmt.bufPrint(&tag, "{s} {d}", .{ if (fetch.move) "MOVE" else "FETCH", cursor.fetched - fetched_before }));
@@ -1117,15 +1121,17 @@ pub const Session = struct {
         while (!cursor.exhausted and spool.rows.items.len < through) {
             try req.check();
             const stream = cursor.stream orelse return error.InvalidResult;
-            var arena = std.heap.ArenaAllocator.init(self.alloc);
-            defer arena.deinit();
-            const wanted: u32 = @intCast(@min(through - spool.rows.items.len, @min(self.limits.result_rows, 256)));
-            var page = try stream.next(stream.context, arena.allocator(), req, wanted);
-            defer page.result.deinit();
-            if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
-            if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
-            spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
-            cursor.exhausted = page.exhausted;
+            {
+                var arena = std.heap.ArenaAllocator.init(self.alloc);
+                defer arena.deinit();
+                const wanted: u32 = @intCast(@min(through - spool.rows.items.len, @min(self.limits.result_rows, 256)));
+                var page = try stream.next(stream.context, arena.allocator(), req, wanted);
+                defer page.result.deinit();
+                if (page.result.mutation_outcome != null or page.result.continuation != null or page.result.session_id != null or page.result.rows.len > wanted or !columnsEqual(cursor.description.columns, page.result.columns)) return error.InvalidResult;
+                if (page.result.rows.len == 0 and !page.exhausted) return error.InvalidResult;
+                spool.append(page.result, self.limits.cursor_rows) catch |err| return if (err == error.OutOfMemory) error.ProgramLimitExceeded else err;
+                cursor.exhausted = page.exhausted;
+            }
             if (cursor.exhausted) stream.detach.?(stream.context);
         }
     }

@@ -1151,7 +1151,14 @@ fn logicalTypeNameForConvertedTypeAlloc(alloc: Allocator, converted_type: i32) !
         5 => try alloc.dupe(u8, "decimal"),
         9 => try alloc.dupe(u8, "timestamp_millis"),
         10 => try alloc.dupe(u8, "timestamp_micros"),
-        11...14 => &.{},
+        11 => try alloc.dupe(u8, "uint8"),
+        12 => try alloc.dupe(u8, "uint16"),
+        13 => try alloc.dupe(u8, "uint32"),
+        14 => try alloc.dupe(u8, "uint64"),
+        15 => try alloc.dupe(u8, "int8"),
+        16 => try alloc.dupe(u8, "int16"),
+        17 => try alloc.dupe(u8, "int32"),
+        18 => try alloc.dupe(u8, "int64"),
         else => try alloc.dupe(u8, "unsupported"),
     };
 }
@@ -1192,6 +1199,10 @@ fn parseLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type
                 annotation.deinit(alloc);
                 annotation = .{ .name = try parseTimestampLogicalTypeNameAlloc(alloc, reader, field.type) };
             },
+            10 => {
+                annotation.deinit(alloc);
+                annotation = .{ .name = try parseIntegerLogicalTypeNameAlloc(alloc, reader, field.type) };
+            },
             else => {
                 annotation.deinit(alloc);
                 annotation = .{ .name = try alloc.dupe(u8, "unsupported") };
@@ -1200,6 +1211,30 @@ fn parseLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type
         }
     }
     return annotation;
+}
+
+fn parseIntegerLogicalTypeNameAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) ![]u8 {
+    if (field_type != .struct_) return error.InvalidParquetMetadata;
+    var previous: i16 = 0;
+    var width: ?u8 = null;
+    var signed: ?bool = null;
+    while (try reader.readFieldHeader(&previous)) |field| {
+        switch (field.id) {
+            1 => {
+                if (field.type != .byte) return error.InvalidParquetMetadata;
+                width = try reader.readByte();
+            },
+            2 => signed = switch (field.type) {
+                .boolean_true => true,
+                .boolean_false => false,
+                else => return error.InvalidParquetMetadata,
+            },
+            else => try reader.skip(field.type),
+        }
+    }
+    const bits = width orelse return error.InvalidParquetMetadata;
+    if (bits != 8 and bits != 16 and bits != 32 and bits != 64) return error.InvalidParquetMetadata;
+    return std.fmt.allocPrint(alloc, "{s}{d}", .{ if (signed orelse return error.InvalidParquetMetadata) "int" else "uint", bits });
 }
 
 fn parseDecimalLogicalTypeAnnotationAlloc(alloc: Allocator, reader: *Reader, field_type: CompactType) !LogicalTypeAnnotation {
@@ -2024,4 +2059,20 @@ fn buildSingleColumnTimestampMetadataFixture(alloc: Allocator, converted_type: ?
 
     try appendStop(&out, alloc);
     return out;
+}
+
+test "external lake integer annotations preserve legacy and modern signedness" {
+    const a = std.testing.allocator;
+    const names = [_][]const u8{ "uint8", "uint16", "uint32", "uint64", "int8", "int16", "int32", "int64" };
+    for (names, 11..) |name, converted| {
+        const legacy = try logicalTypeNameForConvertedTypeAlloc(a, @intCast(converted));
+        defer a.free(legacy);
+        try std.testing.expectEqualStrings(name, legacy);
+        const width: u8 = @as(u8, 8) << @as(u3, @intCast((converted - 11) % 4));
+        const bytes = [_]u8{ 0x13, width, if (converted < 15) 0x12 else 0x11, 0 };
+        var reader: Reader = .{ .bytes = &bytes, .budget = try bounded_decode.Budget.init(bytes.len, .{}), .remaining_skip_operations = 100, .max_nesting_depth = 10 };
+        const modern = try parseIntegerLogicalTypeNameAlloc(a, &reader, .struct_);
+        defer a.free(modern);
+        try std.testing.expectEqualStrings(name, modern);
+    }
 }

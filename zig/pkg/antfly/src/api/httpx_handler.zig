@@ -13760,8 +13760,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     }
     {
         // sql-0048/sql-0050 storage half: the cursor's blocking ORDER BY query
-        // falls back from pull streaming to a bounded native result. Its
-        // pgwire DECLARE/FETCH lifecycle is checked in protocol_test.zig.
+        // uses the bounded native spool. Verify pull ownership and ordering
+        // before exercising the pgwire DECLARE/FETCH lifecycle below.
         var user_store = usermgr.MemoryStore.init(alloc);
         defer user_store.deinit();
         var policies = casbin.MemoryAdapter.init(alloc);
@@ -13788,7 +13788,23 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
             .cancel_requested = &canceled,
         };
-        try std.testing.expect((try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) == null);
+        {
+            const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;
+            defer stream.close(stream.context);
+            const expected = [_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" };
+            var offset: usize = 0;
+            while (true) {
+                var page = try stream.next(stream.context, alloc, request, 2);
+                defer page.result.deinit();
+                for (page.result.rows) |row| {
+                    try std.testing.expect(offset < expected.len);
+                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), row[0].integer);
+                    offset += 1;
+                }
+                if (page.exhausted) break;
+            }
+            try std.testing.expectEqual(expected.len, offset);
+        }
         var result_arena = std.heap.ArenaAllocator.init(alloc);
         defer result_arena.deinit();
         var result = try wire_backend.vtable.execute(wire_backend.context, result_arena.allocator(), credential, request);

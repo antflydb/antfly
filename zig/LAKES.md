@@ -30,7 +30,10 @@ other native sources can adopt the same execution interface incrementally.
 
 Cursor identities bind source, snapshot, file and physical row ordinals. Ordering
 file metadata by identity and scanning ordinals in order preserves public `_id`
-pagination without sorting all rows. Safe min/max predicates prune row groups;
+pagination without sorting all rows. Public lower and upper continuation IDs
+must belong to a file in the opened source snapshot; stale, foreign or malformed
+IDs fail with `ExternalLakeSnapshotMismatch` instead of selecting newer rows.
+Safe min/max predicates prune row groups;
 unsupported comparisons remain residual. Unfiltered, delete-free `COUNT(*)`
 reads footer counts, and Iceberg deletes use the existing snapshot/sequence rules
 before emitting selected rows. API SQL reads reuse a bounded server-owned cache
@@ -63,6 +66,22 @@ footer or the selected Iceberg schema. Inference preserves requiredness and
 rejects incompatible or unsupported flat types; nested/binary schemas need a
 compatible source. SQL never changes catalog types while reading files. Empty
 Iceberg tables can serve zero rows. Optional missing Parquet columns are SQL NULL.
+Iceberg projection resolves the selected schema's field IDs against each footer,
+so renames preserve values and reused names with new IDs yield NULL for absent
+optional fields. Row-group pruning uses the same mapping. Required missing IDs,
+duplicate IDs and missing physical field IDs fail closed. Root attachments use
+the supported `metadata/version-hint.text` pointer; metadata directory listings
+never select a commit. Catalog-managed object-store tables supply an explicit committed
+metadata URI. Inventory, delete planning, fields and partitions share one read
+of that pinned metadata object.
+
+Parquet integer annotations retain both bit width and signedness in legacy and
+modern metadata. Signed integer annotations use native SQL integer decoding;
+unsigned annotations are rejected during inference and scanning until the SQL
+type system provides a lossless unsigned contract. They never become negative
+signed values. Public filtering normalizes operands once and releases row/page
+scratch memory as it scans, under a shared 64 MiB scan allocation budget and a
+32 MiB serialized result bound.
 
 Parquet cursors decode each column dictionary once and retain one decoded page
 per projected column, aligning page boundaries while preserving physical row
@@ -717,8 +736,9 @@ The concrete work left for the data-lake path is therefore:
    ETag/version identity while preserving those Iceberg sequence numbers. The
    Iceberg schema planning now also fails closed when the pinned schema carries
    top-level `struct`, `list`, or `map` fields, because Antfly's current scan
-   contract still resolves Parquet columns by flat names rather than Iceberg
-   field IDs. Parquet footer discovery and the external-source inventory codec
+   native scan contract supports flat fields. SQL serving resolves these by
+   Iceberg field ID, preserving renames and preventing name-reuse mistakes.
+   Parquet footer discovery and the external-source inventory codec
    now preserve optional Parquet schema field IDs on column chunks. Lazy footer
    discovery/enrichment accepts Iceberg inventories as well as raw Parquet
    inventories, carries those footer-derived field IDs into the enriched
@@ -726,8 +746,7 @@ The concrete work left for the data-lake path is therefore:
    lack those IDs so name-only Parquet metadata is not treated as
    schema-evolution-safe. The remaining work is to broaden equality deletes to
    nested/complex fields, tighten real-provider version/ETag fixtures, and use
-   field IDs for actual rename/reorder/nested read compatibility instead of only
-   enforcing their presence.
+   field IDs for nested read compatibility and the legacy row scanner.
 5. Complete sidecar builders over real external row refs: full-text, dense
    vector, sparse, graph, algebraic group-by, and algebraic expression-fold
    paths now consume pinned `RowSource` batches and publish declared sidecar

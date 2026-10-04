@@ -45,6 +45,8 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     try context.ensureActive();
     const binding = table.external_base_source orelse return error.InvalidSqlBackend;
     try @import("../serverless/query/lake_scan_plan.zig").validateBindingInventory(binding.binding, source.inventory);
+    if (request.after) |id| try @import("../storage/rowsource/identity.zig").validateContinuation(id, source.inventory);
+    if (request.before) |id| try @import("../storage/rowsource/identity.zig").validateContinuation(id, source.inventory);
     var arena = std.heap.ArenaAllocator.init(alloc);
     errdefer arena.deinit();
     const owned = arena.allocator();
@@ -78,7 +80,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     const normalized = try context.platformDeadline();
     var stream = try @import("../serverless/query/lake_stream.zig").Stream.init(alloc, source, columns.items, pruning.items, .{ .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, .{});
     errdefer stream.deinit();
-    if (std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
+    if (source.iceberg_schema != null or std.mem.startsWith(u8, binding.binding.schema_fingerprint, "parquet-schema:") or std.mem.indexOf(u8, binding.binding.schema_fingerprint, ":hash=") != null) {
         var contract: std.ArrayList(@import("../serverless/query/lake_schema.zig").Column) = .empty;
         for (table.columns) |column| {
             if (std.mem.eql(u8, column.name, "_id")) continue;
@@ -86,9 +88,21 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         }
         stream.schema_contract = contract.items;
     }
+    if (source.iceberg_schema) |selected| {
+        for (stream.schema_contract) |expected| {
+            const actual = for (selected.columns) |column| {
+                if (std.mem.eql(u8, column.name, expected.name)) break column;
+            } else return error.ExternalLakeSchemaMismatch;
+            if (!std.mem.eql(u8, actual.kind, expected.kind) or (expected.required and !actual.required)) return error.ExternalLakeSchemaMismatch;
+        }
+        stream.schema_contract = selected.columns;
+    }
     const owner = try alloc.create(Owner);
     errdefer alloc.destroy(owner);
-    owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = if (request.after) |v| try owned.dupe(u8, v) else null, .primary_key = if (request.primary_key) |v| try owned.dupe(u8, v) else null };
+    const after = if (request.after) |v| try owned.dupe(u8, v) else null;
+    const before = if (request.before) |v| try owned.dupe(u8, v) else null;
+    const primary_key = if (request.primary_key) |v| try owned.dupe(u8, v) else null;
+    owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key };
     return .{ .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .close = Owner.close };
 }
 
@@ -160,6 +174,7 @@ const Owner = struct {
     context: operation.RequestContext,
     source: ?*serving.ServingSource = null,
     after: ?[]const u8 = null,
+    before: ?[]const u8 = null,
     primary_key: ?[]const u8 = null,
     batch: ?@import("../storage/rowsource/types.zig").ColumnBatch = null,
     position: usize = 0,
@@ -167,7 +182,7 @@ const Owner = struct {
 
     fn countRows(raw: *anyopaque) !?u64 {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        if (self.conditions.len != 0 or self.after != null or self.primary_key != null or self.batch != null) return null;
+        if (self.conditions.len != 0 or self.after != null or self.before != null or self.primary_key != null or self.batch != null) return null;
         if (self.stream.source.inventory.deleted_row_groups.len != 0) return null;
         if (self.stream.source.scanner.iceberg_delete_plan) |plan| if (plan.files.len != 0) return null;
         return self.stream.countAll() catch |err| switch (err) {
@@ -214,9 +229,10 @@ const Owner = struct {
                 defer temporary.deinit();
                 const a = temporary.allocator();
                 const one: catalog.ColumnPage = .{ .batch = view, .selection = &.{index} };
-                if (self.after != null or self.primary_key != null) {
+                if (self.after != null or self.before != null or self.primary_key != null) {
                     const id = (try one.cell(a, 0, "_id")).value.string;
                     if (self.after) |after| if (std.mem.order(u8, id, after) != .gt) continue;
+                    if (self.before) |before| if (std.mem.order(u8, id, before) != .lt) continue;
                     if (self.primary_key) |key| if (!std.mem.eql(u8, id, key)) continue;
                 }
                 if (!try matchesColumns(one, a, self.conditions)) continue;
@@ -596,4 +612,86 @@ test "lake SQL Parquet page cursor preserves row ordinals and bounds decoded row
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
     try std.testing.expect(budget.peak < 256 * 1024);
+}
+
+test "lake SQL continuation validation and arena ownership survive reopening" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 1, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    const initial = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 1 }, .{}, &lake.source);
+    defer initial.close(initial.ptr);
+    const page = try initial.next(initial.ptr, a, 1);
+    defer page.deinit();
+    const token = page.rows[0].id;
+    const Failure = struct {
+        fn openClose(failing: Allocator, source: *serving.ServingSource, table: catalog.Table, after: []const u8) !void {
+            const cursor = try openPinned(failing, table, .{ .fields = &.{"amount"}, .after = after, .primary_key = after, .limit = 1 }, .{}, source);
+            defer cursor.close(cursor.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Failure.openClose, .{ &lake.source, lake.table, token });
+    const resumed = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .after = token, .limit = 1 }, .{}, &lake.source);
+    defer resumed.close(resumed.ptr);
+    const next = try resumed.next(resumed.ptr, a, 1);
+    defer next.deinit();
+    try std.testing.expectEqual(@as(i64, 2), next.rows[0].value.object.get("amount").?.integer);
+    const keyed = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .primary_key = token, .limit = 1 }, .{}, &lake.source);
+    defer keyed.close(keyed.ptr);
+    const exact = try keyed.next(keyed.ptr, a, 1);
+    defer exact.deinit();
+    try std.testing.expectEqualStrings(token, exact.rows[0].id);
+    const bounded = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .before = token, .limit = 1 }, .{}, &lake.source);
+    defer bounded.close(bounded.ptr);
+    const empty = try bounded.next(bounded.ptr, a, 1);
+    defer empty.deinit();
+    try std.testing.expectEqual(@as(usize, 0), empty.rows.len);
+    // Reopening after replacing the object creates a different inventory digest.
+    var client = lake.memory.client();
+    const bytes = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestSingleColumnPlainI64ParquetObjectAlloc(a, "amount", &.{ 4, 5 });
+    defer a.free(bytes);
+    var put = try client.putObject("bucket", "events/0.parquet", bytes, .{});
+    defer put.deinit(a);
+    var changed = try @import("../serverless/external_source/mod.zig").planParquetPrefixInventoryFromObjectStorageAlloc(a, .{ .client = client, .bucket = "bucket", .prefix = "events", .source_id = "events", .source_uri = "s3://bucket/events", .schema_fingerprint = "v1" });
+    defer changed.deinit(a);
+    var source = lake.source;
+    source.inventory = changed;
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, openPinned(a, lake.table, .{ .fields = &.{"amount"}, .after = token, .limit = 1 }, .{}, &source));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, openPinned(a, lake.table, .{ .fields = &.{"amount"}, .before = token, .limit = 1 }, .{}, &source));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, openPinned(a, lake.table, .{ .fields = &.{"amount"}, .after = "invalid", .limit = 1 }, .{}, &lake.source));
+}
+
+test "lake SQL Iceberg field identities govern renames name reuse and pruning" {
+    const a = std.testing.allocator;
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 1, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    const schema = @import("../serverless/query/lake_schema.zig");
+    var selected = try schema.icebergSchema(a, "{\"current-schema-id\":8,\"schemas\":[{\"schema-id\":8,\"fields\":[{\"id\":1,\"name\":\"renamed\",\"required\":true,\"type\":\"long\"},{\"id\":2,\"name\":\"amount\",\"required\":false,\"type\":\"long\"}]}]}", null);
+    defer selected.deinit();
+    lake.source.iceberg_schema = selected;
+    lake.source.inventory.format = .iceberg;
+    lake.table.external_base_source.?.binding.format = .iceberg;
+    lake.table.columns = &.{ .{ .name = "renamed", .path = "renamed", .type = .integer, .nullable = false }, .{ .name = "amount", .path = "amount", .type = .integer } };
+    const renamed = try openPinned(a, lake.table, .{ .fields = &.{"renamed"}, .conditions = &.{.{ .column = "renamed", .op = .gt, .value = .{ .integer = 1 } }}, .limit = 3 }, .{}, &lake.source);
+    defer renamed.close(renamed.ptr);
+    const page = try renamed.next(renamed.ptr, a, 3);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 2), page.rows.len);
+    try std.testing.expectEqual(@as(i64, 2), (try page.rows[0].cell("renamed")).value.integer);
+    const reused = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 3 }, .{}, &lake.source);
+    defer reused.close(reused.ptr);
+    const missing = try reused.next(reused.ptr, a, 3);
+    defer missing.deinit();
+    try std.testing.expectEqual(@as(usize, 3), missing.rows.len);
+    for (missing.rows) |row| try std.testing.expect((try row.cell("amount")).sql_null);
+    // Missing required field IDs fail rather than reading the reused name.
+    const saved = selected.columns;
+    selected.columns = &.{.{ .name = "amount", .kind = "integer", .required = true, .field_id = 2 }};
+    lake.source.iceberg_schema = selected;
+    defer selected.columns = saved;
+    lake.table.columns = &.{.{ .name = "amount", .path = "amount", .type = .integer, .nullable = false }};
+    const invalid = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 3 }, .{}, &lake.source);
+    defer invalid.close(invalid.ptr);
+    try std.testing.expectError(error.ExternalLakeSchemaMismatch, invalid.next(invalid.ptr, a, 3));
 }

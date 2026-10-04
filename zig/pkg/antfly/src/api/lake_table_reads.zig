@@ -20,7 +20,9 @@ const helpers = @import("http_route_helpers.zig");
 
 pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("../system_catalog/domain.zig").Target, expected_id: u64, request: helpers.OwnedScanKeysRequest) !?[]u8 {
     if (!adapter.server.source.vtable.supports_query_definitions) return null;
-    var arena = std.heap.ArenaAllocator.init(alloc);
+    var budget: @import("../sql/memory_budget.zig") = .{ .backing = alloc, .limit = 64 * 1024 * 1024 };
+    const scan_alloc = budget.allocator();
+    var arena = std.heap.ArenaAllocator.init(scan_alloc);
     defer arena.deinit();
     const a = arena.allocator();
     const definition_bytes = try adapter.server.source.systemCatalog(a, adapter.context, .{ .resolve_many = .{ .targets = &.{target}, .include_query_definitions = true } });
@@ -67,21 +69,30 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("../sy
         if (value == .string and (try table.column(condition.column)).type == .integer) value = .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidQueryRequest };
         try pushed.append(a, .{ .column = condition.column, .op = op, .value = value });
     }
-    const cursor = try adapter.openLakeScan(alloc, table, .{ .fields = fields.items, .conditions = pushed.items, .after = if (request.from.len == 0) null else request.from, .primary_order = true, .limit = request.opts.limit });
+    const conditions = try normalizeConditions(a, table, input_conditions);
+    const cursor = try adapter.openLakeScan(scan_alloc, table, .{ .fields = fields.items, .conditions = pushed.items, .after = if (request.from.len == 0) null else request.from, .before = if (request.to.len == 0) null else request.to, .primary_order = true, .limit = request.opts.limit });
     defer cursor.close(cursor.ptr);
     var output: std.Io.Writer.Allocating = .init(alloc);
     errdefer output.deinit();
     var remaining = request.opts.limit;
     while (remaining != 0) {
-        const page = try cursor.next(cursor.ptr, a, remaining);
+        const page = try cursor.next(cursor.ptr, scan_alloc, 256);
+        var scratch = std.heap.ArenaAllocator.init(scan_alloc);
+        defer scratch.deinit();
         defer page.deinit();
         for (page.rows) |row| {
-            if (!try matches(a, row, table, input_conditions)) continue;
+            if (remaining == 0) break;
+            _ = scratch.reset(.retain_capacity);
+            const row_alloc = scratch.allocator();
+            if (!try matchesNormalized(row_alloc, row, table, conditions)) continue;
             if (request.from.len != 0 and std.mem.order(u8, row.id, request.from) != .gt) continue;
             if (request.to.len != 0 and std.mem.order(u8, row.id, request.to) != .lt) continue;
             var projected = std.json.ObjectMap.empty;
-            for (native.fields) |name| try projected.put(a, name, (try row.cell(name)).value);
-            try std.json.Stringify.value(.{ ._id = row.id, .row = std.json.Value{ .object = projected }, .version = "0", .schema_version = table.schema_version }, .{}, &output.writer);
+            for (native.fields) |name| try projected.put(row_alloc, name, (try row.cell(name)).value);
+            var encoded: std.Io.Writer.Allocating = .init(row_alloc);
+            try std.json.Stringify.value(.{ ._id = row.id, .row = std.json.Value{ .object = projected }, .version = "0", .schema_version = table.schema_version }, .{}, &encoded.writer);
+            if (encoded.written().len >= 32 * 1024 * 1024 -| output.written().len) return error.SqlResultTooLarge;
+            try output.writer.writeAll(encoded.written());
             try output.writer.writeByte('\n');
             remaining -= 1;
         }
@@ -90,12 +101,26 @@ pub fn query(alloc: std.mem.Allocator, adapter: *Adapter, target: @import("../sy
     return try output.toOwnedSlice();
 }
 
-fn matches(a: std.mem.Allocator, row: catalog.Row, table: catalog.Table, conditions: []const @import("antfly_metadata_openapi").types.RelationalRowCondition) !bool {
+const Condition = @import("antfly_metadata_openapi").types.RelationalRowCondition;
+fn normalizeConditions(a: std.mem.Allocator, table: catalog.Table, input: []const Condition) ![]const Condition {
+    const result = try a.dupe(Condition, input);
+    for (result) |*condition| {
+        const kind = (try table.column(condition.column)).type;
+        var value = condition.value orelse .null;
+        if (value == .string and kind == .integer) value = .{ .integer = std.fmt.parseInt(i64, value.string, 10) catch return error.InvalidQueryRequest };
+        condition.value = if (condition.op == .is_null or condition.op == .is_not_null) .null else try @import("lake_values.zig").comparisonValue(a, value, kind);
+    }
+    return result;
+}
+fn matches(a: std.mem.Allocator, row: catalog.Row, table: catalog.Table, conditions: []const Condition) !bool {
+    return matchesNormalized(a, row, table, try normalizeConditions(a, table, conditions));
+}
+fn matchesNormalized(a: std.mem.Allocator, row: catalog.Row, table: catalog.Table, conditions: []const Condition) !bool {
     for (conditions) |condition| {
         const stored = try row.cell(condition.column);
         const kind = (try table.column(condition.column)).type;
         const cell: @import("../sql/scalar.zig").Datum = .{ .value = try @import("lake_values.zig").comparisonValue(a, stored.value, kind), .sql_null = stored.sql_null };
-        const operand = if (condition.op == .is_null or condition.op == .is_not_null) std.json.Value.null else try @import("lake_values.zig").comparisonValue(a, condition.value orelse .null, kind);
+        const operand = condition.value orelse .null;
         const match = switch (condition.op) {
             .is_null => cell.sql_null,
             .is_not_null => !cell.sql_null,

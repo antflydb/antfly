@@ -88,6 +88,8 @@ pub const Scan = struct {
     index_equality: ?IndexEquality = null,
     conditions: []const Condition = &.{},
     after: ?[]const u8 = null,
+    /// External scan upper bound, validated against the opened snapshot.
+    before: ?[]const u8 = null,
     limit: u32,
 };
 pub const Row = struct {

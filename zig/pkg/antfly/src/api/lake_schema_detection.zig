@@ -299,3 +299,46 @@ test "lake SQL inferred decimal128 and signed timestamps execute through Parquet
         try std.testing.expectEqual(@as(usize, 1), parameter_result.output.rows.len);
     }
 }
+
+test "external lake rejects uncommitted metadata and unsigned schema inference" {
+    const a = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("lake-commit-pointer");
+    defer directory.cleanup();
+    var fs = try @import("../storage/object_storage.zig").FilesystemObjectStorage.init(a, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const metadata_json = "{\"table-uuid\":\"orphan\",\"location\":\"object://antfly/\",\"format-version\":2,\"current-schema-id\":7,\"schemas\":[{\"schema-id\":7,\"fields\":[{\"id\":1,\"name\":\"amount\",\"required\":true,\"type\":\"long\"}]}]}";
+    var put = try client.putObject("antfly", "metadata/00099-uncommitted.metadata.json", metadata_json, .{});
+    put.deinit(a);
+    const input = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"iceberg\",\"uri\":\"file://{s}\"}}}}", .{directory.path()});
+    defer a.free(input);
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, prepare(a, input, .{}, .{}));
+    const Source = @import("../serverless/query/lake_serving.zig").ServingSource;
+    var orphan_binding = (try binding_api.externalBindingFromSchemaJsonAlloc(a, input)).?;
+    defer orphan_binding.deinit(a);
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, Source.open(a, .{ .storage_mode = .relational, .external_base_source = orphan_binding }, .{}));
+    try std.testing.expectError(error.ExternalLakeSnapshotMismatch, Source.icebergMetadataUriForOpenedStoreAlloc(a, client, "antfly", "", "object://antfly", null));
+    const explicit = try Source.icebergMetadataUriForOpenedStoreAlloc(a, client, "antfly", "", "object://antfly/metadata/00099-uncommitted.metadata.json", null);
+    defer a.free(explicit);
+    try std.testing.expectEqualStrings("object://antfly/metadata/00099-uncommitted.metadata.json", explicit);
+    // Invalid or dangling hints must not permit directory fallback either.
+    for ([_][]const u8{ "garbage", "", "99" }) |hint| {
+        put = try client.putObject("antfly", "metadata/version-hint.text", hint, .{});
+        put.deinit(a);
+        try std.testing.expectError(error.ExternalLakeSnapshotMismatch, prepare(a, input, .{}, .{}));
+    }
+    const parquet = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(a, &.{.{ .column_id = "amount", .converted_type = 14, .values = &.{ 0, std.math.maxInt(i64), std.math.minInt(i64), -1 } }});
+    defer a.free(parquet);
+    put = try client.putObject("antfly", "part.parquet", parquet, .{});
+    put.deinit(a);
+    const parquet_input = try std.fmt.allocPrint(a, "{{\"storage_mode\":\"relational\",\"base_source\":{{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"parquet\",\"uri\":\"file://{s}\"}}}}", .{directory.path()});
+    defer a.free(parquet_input);
+    try std.testing.expectError(error.UnsupportedExternalLakeSchemaType, prepare(a, parquet_input, .{}, .{}));
+    var explicit_binding = (try binding_api.externalBindingFromSchemaJsonAlloc(a, parquet_input)).?;
+    defer explicit_binding.deinit(a);
+    const table: @import("../sql/catalog.zig").Table = .{ .id = 7, .physical_name = "events", .schema_version = 1, .columns = &.{.{ .name = "amount", .path = "amount", .type = .integer }}, .external_base_source = explicit_binding };
+    const cursor = try @import("lake_sql_cursor.zig").open(a, table, .{ .fields = &.{"amount"}, .limit = 4 }, .{}, .{});
+    defer cursor.close(cursor.ptr);
+    try std.testing.expectError(error.UnsupportedParquetPage, cursor.next(cursor.ptr, a, 4));
+}

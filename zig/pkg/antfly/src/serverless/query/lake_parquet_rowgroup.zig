@@ -2956,6 +2956,11 @@ fn timestampI64ModeForColumnChunk(chunk: external_source.ColumnChunk, unit: Time
 }
 
 fn supportedColumnModeForColumnChunk(chunk: external_source.ColumnChunk) !SupportedColumnMode {
+    if (std.mem.startsWith(u8, chunk.logical_type, "uint") or std.mem.eql(u8, chunk.logical_type, "unsupported")) return error.UnsupportedParquetPage;
+    if (std.mem.startsWith(u8, chunk.logical_type, "int")) {
+        const physical = if (std.mem.eql(u8, chunk.logical_type, "int64")) "int64" else "int32";
+        if (!std.ascii.eqlIgnoreCase(chunk.physical_type, physical)) return error.UnsupportedParquetPage;
+    }
     if (std.ascii.eqlIgnoreCase(chunk.logical_type, "decimal")) {
         return .{ .decimal = try decimalModeForColumnChunk(chunk) };
     }

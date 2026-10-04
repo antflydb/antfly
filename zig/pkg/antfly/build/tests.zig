@@ -1827,7 +1827,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         api_http_runtime_tests,
         api_http_runtime_filters,
     );
-    b.step("lake-api-test", "Run mounted API lake and SQL integration tests").dependOn(&run_api_http_runtime_tests.step);
+
+    const lake_api_default_filters = [_][]const u8{ "lake SQL", "external lake", "httpx SQL executes one relational page with exact integer parameters" };
+    const lake_api_filters = selectTestFilters(b, &lake_api_default_filters);
+    const lake_api_tests = b.addTest(.{
+        .name = "lake-api-tests",
+        .root_module = api_http_runtime_test_mod,
+        .filters = @import("test_support.zig").compileFiltersWithAnchors(b, &.{"api module compiles"}, lake_api_filters),
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 17 else 7) * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-api-test", "Run mounted API lake and SQL integration tests").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, lake_api_tests, lake_api_filters).step);
     const relational_index_http_tests = b.addTest(.{
         .name = "relational-index-http-tests",
         .root_module = api_http_runtime_test_mod,

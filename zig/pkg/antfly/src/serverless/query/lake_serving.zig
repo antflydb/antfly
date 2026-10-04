@@ -343,6 +343,7 @@ pub const ServingSource = struct {
     store: object_store_support.OpenedObjectStore,
     inventory: external_source_api.Inventory,
     scanner: PinnedExternalObjectStorageLakeRowsScanner,
+    iceberg_schema: ?@import("lake_schema.zig").Detected = null,
     partition_rules: ?@import("lake_partition_pruning.zig").Rules = null,
     context_store: ?*@import("lake_read_context.zig").Store = null,
 
@@ -361,6 +362,8 @@ pub const ServingSource = struct {
         var client = context_store.client(alloc);
         const base = if (store.fs_client != null) try std.fmt.allocPrint(alloc, "object://{s}/{s}", .{ store.bucket, store.prefix }) else null;
         defer if (base) |value| alloc.free(value);
+        var iceberg_schema: ?@import("lake_schema.zig").Detected = null;
+        errdefer if (iceberg_schema) |*value| value.deinit();
         var partition_rules: ?@import("lake_partition_pruning.zig").Rules = null;
         errdefer if (partition_rules) |*rules| rules.deinit();
         var deletes: ?serverless_query.LakeIcebergDeletePlan = null;
@@ -378,12 +381,14 @@ pub const ServingSource = struct {
             .iceberg => blk: {
                 const uri = try icebergMetadataUriForOpenedStoreAlloc(alloc, client, store.bucket, store.prefix, binding.source_uri, base);
                 defer alloc.free(uri);
-                var snapshot = try serverless_query.readLakeIcebergSnapshotInventoryAndDeletePlanAlloc(alloc, .{
+                const metadata_bytes = try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, uri, .iceberg_metadata, null, 16 * 1024 * 1024);
+                defer alloc.free(metadata_bytes);
+                var snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(alloc, .{
                     .client = client,
                     .source_id = binding.table_id,
                     .metadata_uri = uri,
                     .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
-                });
+                }, metadata_bytes);
                 deletes = snapshot.delete_plan;
                 errdefer snapshot.inventory.deinit(alloc);
                 if (base) |object_base| {
@@ -391,11 +396,17 @@ pub const ServingSource = struct {
                     const uri_copy = try alloc.dupe(u8, binding.source_uri);
                     alloc.free(@constCast(snapshot.inventory.source_uri));
                     snapshot.inventory.source_uri = uri_copy;
+                } else if (std.mem.endsWith(u8, binding.source_uri, ".metadata.json")) {
+                    // Explicit object-store metadata locations are attachment
+                    // identities; the metadata's location names the data root.
+                    const uri_copy = try alloc.dupe(u8, binding.source_uri);
+                    alloc.free(@constCast(snapshot.inventory.source_uri));
+                    snapshot.inventory.source_uri = uri_copy;
                 }
-                if (snapshot.inventory.files.len != 0) {
-                    const metadata_bytes = try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, uri, .iceberg_metadata, null, 16 * 1024 * 1024);
-                    defer alloc.free(metadata_bytes);
-                    partition_rules = try @import("lake_partition_pruning.zig").parseAlloc(alloc, uri, metadata_bytes, snapshot.inventory.snapshot_id, binding.snapshot_mode.pinnedSnapshotId(), snapshot.inventory.schema_fingerprint);
+                {
+                    iceberg_schema = try @import("lake_schema.zig").icebergSchema(alloc, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId());
+                    if (!std.mem.eql(u8, iceberg_schema.?.fingerprint, snapshot.inventory.schema_fingerprint)) return error.ExternalLakeSnapshotMismatch;
+                    if (snapshot.inventory.files.len != 0) partition_rules = try @import("lake_partition_pruning.zig").parseAlloc(alloc, uri, metadata_bytes, snapshot.inventory.snapshot_id, binding.snapshot_mode.pinnedSnapshotId(), snapshot.inventory.schema_fingerprint);
                 }
                 try serverless_query.pinLakeIcebergInventoryDataFileObjectVersionsAlloc(alloc, client, &snapshot.inventory);
                 break :blk snapshot.inventory;
@@ -406,7 +417,7 @@ pub const ServingSource = struct {
         try serverless_query.validateLakeBindingInventory(binding, inventory);
         var scanner = PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client);
         scanner.iceberg_delete_plan = deletes;
-        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules };
+        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema };
     }
 
     pub fn attachCache(self: *ServingSource, cache: *@import("lake_serving_cache.zig").Cache, binding: @import("../external_source/catalog_binding.zig").Binding, context: @import("lake_read_context.zig").Context) !void {
@@ -435,6 +446,7 @@ pub const ServingSource = struct {
         }
         if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
         if (self.partition_rules) |*rules| rules.deinit();
+        if (self.iceberg_schema) |*value| value.deinit();
         self.inventory.deinit(self.alloc);
         self.store.deinit();
         if (self.context_store) |store| self.alloc.destroy(store);
@@ -459,39 +471,10 @@ pub const ServingSource = struct {
             return metadata_uri;
         }
 
-        var best_key: ?[]u8 = null;
-        defer if (best_key) |key| alloc.free(key);
-        var next_token: ?[]u8 = null;
-        defer if (next_token) |token| alloc.free(token);
-        while (true) {
-            var page = try storage_client.listObjects(bucket, .{
-                .prefix = metadata_prefix,
-                .recursive = true,
-                .continuation_token = next_token,
-                .max_keys = 1000,
-            });
-            defer page.deinit(alloc);
-
-            for (page.entries) |entry| {
-                if (!std.mem.endsWith(u8, entry.key, ".metadata.json")) continue;
-                if (best_key == null or std.mem.order(u8, best_key.?, entry.key) == .lt) {
-                    const next_best = try alloc.dupe(u8, entry.key);
-                    if (best_key) |old| alloc.free(old);
-                    best_key = next_best;
-                }
-            }
-
-            if (page.next_continuation_token) |token| {
-                const owned_next = try alloc.dupe(u8, token);
-                if (next_token) |old| alloc.free(old);
-                next_token = owned_next;
-            } else break;
-        }
-
-        const key = best_key orelse return error.ExternalLakeSnapshotMismatch;
-        const relative_key = relativeObjectKeyForPrefix(prefix, key);
-        const base_uri = object_uri_base orelse source_uri;
-        return try objectUriForRelativeKeyAlloc(alloc, base_uri, relative_key);
+        // A directory can contain uncommitted metadata from concurrent writers.
+        // Only an explicit metadata URI or the supported filesystem commit
+        // pointer may select a snapshot; listing order is never authority.
+        return error.ExternalLakeSnapshotMismatch;
     }
 
     fn icebergMetadataUriFromVersionHintAlloc(
@@ -506,7 +489,7 @@ pub const ServingSource = struct {
         const hint_key = try std.fmt.allocPrint(alloc, "{s}version-hint.text", .{metadata_prefix});
         defer alloc.free(hint_key);
         var hint = client.getObject(bucket, hint_key, .{}) catch |err| switch (err) {
-            error.FileNotFound => return null,
+            error.FileNotFound, error.ObjectNotFound => return null,
             else => return err,
         };
         defer hint.deinit(alloc);
@@ -517,7 +500,7 @@ pub const ServingSource = struct {
         const metadata_key = try std.fmt.allocPrint(alloc, "{s}v{d}.metadata.json", .{ metadata_prefix, version });
         defer alloc.free(metadata_key);
         var metadata_stat = client.statObject(bucket, metadata_key) catch |err| switch (err) {
-            error.FileNotFound => return null,
+            error.FileNotFound, error.ObjectNotFound => return null,
             else => return err,
         };
         defer metadata_stat.deinit(alloc);

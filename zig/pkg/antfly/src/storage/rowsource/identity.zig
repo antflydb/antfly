@@ -50,3 +50,18 @@ test "external lake identities sort numerically and bind the source snapshot" {
     defer alloc.free(changed);
     try std.testing.expect(!std.mem.eql(u8, b, changed));
 }
+
+/// Accept only identities issued for a file in this exact source snapshot.
+/// The existing lake1 digest includes source, snapshot and file identity, so
+/// validation preserves published IDs without introducing an unbound token.
+pub fn validateContinuation(id: []const u8, inventory: @import("../../serverless/external_source/types.zig").Inventory) !void {
+    if (id.len != 96 or !std.mem.startsWith(u8, id, "lake1:") or id[70] != ':' or id[79] != ':') return error.ExternalLakeSnapshotMismatch;
+    for (id[6..], 6..) |byte, offset| if (offset != 70 and offset != 79 and !((byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f'))) return error.ExternalLakeSnapshotMismatch;
+    _ = std.fmt.parseUnsigned(u32, id[71..79], 16) catch return error.ExternalLakeSnapshotMismatch;
+    _ = std.fmt.parseUnsigned(u64, id[80..96], 16) catch return error.ExternalLakeSnapshotMismatch;
+    for (inventory.files) |file| {
+        const digest = std.fmt.bytesToHex(fileDigest(inventory.source_id, inventory.snapshot_id, file.file_id), .lower);
+        if (std.mem.eql(u8, id[6..70], &digest)) return;
+    }
+    return error.ExternalLakeSnapshotMismatch;
+}

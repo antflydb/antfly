@@ -9,7 +9,7 @@ const parquet = @import("lake_parquet_rowgroup.zig");
 const external = @import("../external_source/mod.zig");
 const storage = @import("../../storage/object_storage.zig");
 const A = std.mem.Allocator;
-pub const Column = struct { name: []const u8, kind: []const u8, required: bool };
+pub const Column = struct { name: []const u8, kind: []const u8, required: bool, field_id: ?i32 = null };
 pub const Detected = struct {
     arena: std.heap.ArenaAllocator,
     columns: []const Column,
@@ -36,6 +36,11 @@ pub fn parquetKind(column: metadata.SchemaColumn) ![]const u8 {
         return "string";
     }
     if (std.mem.startsWith(u8, column.logical_type, "timestamp_")) return "datetime";
+    if (std.mem.startsWith(u8, column.logical_type, "int")) {
+        const physical = column.physical_type orelse return error.InvalidParquetMetadata;
+        if ((std.mem.eql(u8, column.logical_type, "int64") and physical != 2) or (!std.mem.eql(u8, column.logical_type, "int64") and physical != 1)) return error.InvalidParquetMetadata;
+        return "integer";
+    }
     if (column.logical_type.len != 0 and !std.mem.eql(u8, column.logical_type, "string")) return error.UnsupportedExternalLakeSchemaType;
     return switch (column.physical_type orelse return error.InvalidParquetMetadata) {
         0 => "boolean",
@@ -82,7 +87,7 @@ pub fn parquetSchema(a: A, inventory: external.Inventory, reader: parquet.Object
             return std.mem.order(u8, l.name, r.name) == .lt;
         }
     }.less);
-    const bytes = try std.json.Stringify.valueAlloc(owned, columns.items, .{});
+    const bytes = try std.json.Stringify.valueAlloc(owned, columns.items, .{ .emit_null_optional_fields = false });
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
     const fingerprint = try std.fmt.allocPrint(owned, "parquet-schema:{s}", .{std.fmt.bytesToHex(digest, .lower)});
@@ -107,9 +112,15 @@ pub fn icebergSchema(a: A, bytes: []const u8, snapshot: ?[]const u8) !Detected {
             if (id != .integer) return error.InvalidIcebergMetadata;
             const text = try std.fmt.allocPrint(owned, "{d}", .{id.integer});
             if (!std.mem.eql(u8, wanted, text)) continue;
-            const selected = entry.object.get("schema-id") orelse return error.ExternalLakeSchemaUnavailable;
-            if (selected != .integer) return error.InvalidIcebergMetadata;
-            schema_id = selected.integer;
+            if (entry.object.get("schema-id")) |selected| {
+                if (selected != .integer) return error.InvalidIcebergMetadata;
+                schema_id = selected.integer;
+            } else {
+                // Older metadata may omit schema-id on the current snapshot.
+                // A historical snapshot without one cannot be bound safely.
+                const current_snapshot = root.object.get("current-snapshot-id") orelse return error.ExternalLakeSchemaUnavailable;
+                if (current_snapshot != .integer or current_snapshot.integer != id.integer) return error.ExternalLakeSchemaUnavailable;
+            }
             found = true;
             break;
         }
@@ -131,7 +142,7 @@ pub fn icebergSchema(a: A, bytes: []const u8, snapshot: ?[]const u8) !Detected {
             const scale = std.fmt.parseInt(i32, std.mem.trim(u8, params[comma + 1 .. params.len - 1], " "), 10) catch return error.UnsupportedExternalLakeSchemaType;
             @import("lake_decimal.zig").validate(precision, scale) catch return error.UnsupportedExternalLakeSchemaType;
         }
-        column.* = .{ .name = field.name, .kind = kind, .required = field.required };
+        column.* = .{ .name = field.name, .kind = kind, .required = field.required, .field_id = field.id };
     }
     const fingerprint = try iceberg.schemaFingerprintAlloc(owned, root.object, schema_id);
     return .{ .arena = arena, .columns = columns, .fingerprint = fingerprint };
@@ -146,6 +157,11 @@ test "external lake Iceberg discovery selects pinned schema and preserves requir
     defer pinned.deinit();
     try std.testing.expectEqualStrings("new", current.columns[0].name);
     try std.testing.expectEqualStrings("old", pinned.columns[0].name);
+    try std.testing.expectEqual(@as(?i32, 1), current.columns[0].field_id);
+    var legacy_current = try icebergSchema(a, "{\"current-schema-id\":8,\"current-snapshot-id\":12,\"schemas\":[{\"schema-id\":8,\"fields\":[{\"id\":1,\"name\":\"new\",\"required\":false,\"type\":\"long\"}]}],\"snapshots\":[{\"snapshot-id\":12},{\"snapshot-id\":11}]}", "12");
+    defer legacy_current.deinit();
+    try std.testing.expectEqualStrings("new", legacy_current.columns[0].name);
+    try std.testing.expectError(error.ExternalLakeSchemaUnavailable, icebergSchema(a, "{\"current-schema-id\":8,\"current-snapshot-id\":12,\"snapshots\":[{\"snapshot-id\":11}]}", "11"));
     try std.testing.expect(!current.columns[0].required and pinned.columns[0].required);
     try std.testing.expectError(error.IcebergSnapshotMismatch, icebergSchema(a, bytes, "99"));
     try std.testing.expectError(error.UnsupportedExternalLakeSchemaType, parquetKind(.{ .column_id = @constCast("binary"), .nullable = false, .physical_type = 6 }));

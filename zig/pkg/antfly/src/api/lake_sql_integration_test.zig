@@ -169,5 +169,55 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trim(u8, ndjson, "\n"), .{});
         defer parsed.deinit();
         try std.testing.expectEqual(@as(i64, 4), parsed.value.object.get("row").?.object.get("amount").?.integer);
+        var resumed_request = request;
+        resumed_request.from = parsed.value.object.get("_id").?.string;
+        const resumed = (try @import("lake_table_reads.zig").query(alloc, &adapter, .{ .database = "default", .namespace = "public", .table = "events" }, 7, resumed_request)).?;
+        defer alloc.free(resumed);
+        var resumed_row = try std.json.parseFromSlice(std.json.Value, alloc, std.mem.trim(u8, resumed, "\n"), .{});
+        defer resumed_row.deinit();
+        try std.testing.expectEqual(@as(i64, 5), resumed_row.value.object.get("row").?.object.get("amount").?.integer);
+        // Reading ahead within a native page must not skip the public boundary.
+        resumed_request.to = resumed_row.value.object.get("_id").?.string;
+        const bounded = (try @import("lake_table_reads.zig").query(alloc, &adapter, .{ .database = "default", .namespace = "public", .table = "events" }, 7, resumed_request)).?;
+        defer alloc.free(bounded);
+        try std.testing.expectEqualStrings("", bounded);
+        resumed_request.to = "invalid";
+        try std.testing.expectError(error.ExternalLakeSnapshotMismatch, @import("lake_table_reads.zig").query(alloc, &adapter, .{ .database = "default", .namespace = "public", .table = "events" }, 7, resumed_request));
     }
+}
+
+test "lake SQL public residual scan reclaims page and distant timestamp memory" {
+    const alloc = std.testing.allocator;
+    var directory = try @import("../common/test_directory.zig").TestDirectory.init("lake-residual-memory");
+    defer directory.cleanup();
+    var fs = try @import("../storage/object_storage.zig").FilesystemObjectStorage.init(alloc, directory.path());
+    defer fs.deinit();
+    var client = fs.client();
+    try client.makeBucket("antfly");
+    const values = try alloc.alloc(i64, 20_000);
+    defer alloc.free(values);
+    @memset(values, 1);
+    const bytes = try @import("../serverless/query/lake_parquet_rowgroup.zig").buildTestPlainI64ParquetObjectAlloc(alloc, &.{.{ .column_id = "amount", .converted_type = 9, .values = values, .page_rows = 1024 }});
+    defer alloc.free(bytes);
+    var put = try client.putObject("antfly", "part.parquet", bytes, .{});
+    defer put.deinit(alloc);
+    const schema_json = try std.fmt.allocPrint(alloc, "{{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"amount\":{{\"type\":\"datetime\"}}}}}}}}}},\"base_source\":{{\"kind\":\"external\",\"table_id\":\"events\",\"format\":\"parquet\",\"uri\":\"file://{s}\",\"schema_fingerprint\":\"v1\"}}}}", .{directory.path()});
+    defer alloc.free(schema_json);
+    var fixture: Fixture = .{ .lake_schema = schema_json };
+    var runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
+    defer runtime.deinit();
+    var server = server_mod.ApiHttpServer.init(alloc, .{ .backend_runtime = runtime.ptr() }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog, .supports_query_definitions = true } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined } }, null);
+    defer server.deinit();
+    var identity: ?server_mod.AuthenticatedIdentity = null;
+    var adapter: Adapter = .{ .server = &server, .identity = &identity, .context = .{} };
+    var request = try @import("http_route_helpers.zig").parseRelationalRowQueryRequest(alloc, "{\"fields\":[\"amount\"],\"conditions\":[{\"column\":\"amount\",\"op\":\"is_not_distinct\",\"value\":\"2500-01-01\"}],\"limit\":1}");
+    defer request.deinit(alloc);
+    var budget: @import("../sql/memory_budget.zig") = .{ .backing = alloc, .limit = 4 * 1024 * 1024 };
+    {
+        const ndjson = (try @import("lake_table_reads.zig").query(budget.allocator(), &adapter, .{ .database = "default", .namespace = "public", .table = "events" }, 7, request)).?;
+        defer budget.allocator().free(ndjson);
+        try std.testing.expectEqualStrings("", ndjson);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live);
+    try std.testing.expect(budget.peak < budget.limit);
 }

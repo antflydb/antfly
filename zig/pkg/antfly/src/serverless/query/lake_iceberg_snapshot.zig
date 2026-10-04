@@ -334,6 +334,21 @@ pub fn readSnapshotInventoryAndDeletePlanAlloc(
 
     const metadata_bytes = try readFullObjectAlloc(alloc, &client, request.cache, request.metadata_uri, .iceberg_metadata, null, request.limits.metadata_object_bytes);
     defer alloc.free(metadata_bytes);
+    return planSnapshotInventoryAndDeletePlanFromMetadataAlloc(alloc, request, metadata_bytes);
+}
+
+/// One pinned metadata object governs inventory, deletes and schema selection.
+/// Callers that also bind fields/partitions reuse these exact bytes rather than
+/// independently reopening a metadata URI during source admission.
+pub fn planSnapshotInventoryAndDeletePlanFromMetadataAlloc(
+    alloc: Allocator,
+    request: SnapshotReadRequest,
+    metadata_bytes: []const u8,
+) !SnapshotWithDeletePlan {
+    try request.validate();
+    if (metadata_bytes.len == 0 or metadata_bytes.len > request.limits.metadata_object_bytes) return error.IcebergMetadataObjectTooLarge;
+    var client = request.client;
+    client.allocator = alloc;
     if (try emptyInventoryAlloc(alloc, request, metadata_bytes)) |inventory| return .{ .inventory = inventory, .delete_plan = .{ .files = &.{} } };
     var metadata_plan = try iceberg_metadata.parseMetadataPlanAlloc(
         alloc,
