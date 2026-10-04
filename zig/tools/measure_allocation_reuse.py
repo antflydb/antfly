@@ -39,7 +39,7 @@ def main():
     parser.add_argument('--replay-measurements', nargs='+', choices=['counted', 'timing'], default=['counted'])
     parser.add_argument('--replay-only', action='store_true')
     parser.add_argument('--vector-only', action='store_true')
-    parser.add_argument('--vector-modes', nargs='+', choices=['ingest', 'retry', 'retry-mixed'], default=['ingest'])
+    parser.add_argument('--vector-modes', nargs='+', choices=['ingest', 'retry', 'retry-mixed', 'session-only'], default=['ingest'])
     parser.add_argument('--document-lookup-only', action='store_true')
     parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'relational'], default=['short'])
     parser.add_argument('--ordinal-case', choices=['short', 'long', 'missing'], default='short')
@@ -49,6 +49,7 @@ def main():
     args.output.mkdir(parents=True, exist_ok=False)
     binaries = {'baseline': args.baseline_bin.resolve(), 'changed': args.candidate_bin.resolve()}
     results = []
+    session_checksums = set()
     env = os.environ.copy()
     env.pop('ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT', None)
 
@@ -89,7 +90,7 @@ def main():
                 label = f'vector-{fixture}-{mode}-{pair}-{variant}'
                 with tempfile.TemporaryDirectory(prefix='antfly-allocation-') as directory:
                     root = Path(directory) / 'source'
-                    if fixture != 'ingest':
+                    if fixture not in ('ingest', 'session-only'):
                         setup_env = env.copy()
                         setup_env.pop('ANTFLY_COUNT_BENCH_ALLOCATIONS', None)
                         run(label + '-setup', [binaries['baseline'] / 'vector-payload-bench', 'ingest', root,
@@ -97,13 +98,18 @@ def main():
                     lines = run(label, [binaries[variant] / 'vector-payload-bench', fixture, root,
                                         args.documents, args.dimensions], child_env)
                     data = json.loads(next(x[len('payload_bench '):] for x in lines if x.startswith('payload_bench ')))
-                    expected = (args.documents + 127) // 128 if fixture == 'retry-mixed' else 0 if fixture == 'retry' else args.documents
+                    if fixture == 'session-only':
+                        session_checksums.add(data['reference_checksum'])
+                        if len(session_checksums) != 1:
+                            raise ValueError('session preparation produced different references across runs')
+                    expected = (args.documents + 127) // 128 if fixture == 'retry-mixed' else 0 if fixture in ('retry', 'session-only') else args.documents
                     if data['stats']['prepared_payloads'] != expected:
                         raise ValueError('vector fixture did not prepare the expected number of payloads')
                     counts = next((json.loads(x[len('allocation_bench '):]) for x in lines
                                    if x.startswith('allocation_bench ')), {})
-                    run(label + '-verify', [binaries[variant] / 'vector-payload-bench', 'read-mixed' if fixture == 'retry-mixed' else 'read', root,
-                                           args.documents, args.dimensions], child_env)
+                    if fixture != 'session-only':
+                        run(label + '-verify', [binaries[variant] / 'vector-payload-bench', 'read-mixed' if fixture == 'retry-mixed' else 'read', root,
+                                               args.documents, args.dimensions], child_env)
                     results.append(dict(workload='vector', case=fixture, variant=variant, pair=pair,
                                         measurement=mode, **data, **counts))
                     print(label, data['run_ns'], flush=True)
