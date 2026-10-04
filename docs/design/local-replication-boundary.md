@@ -263,3 +263,35 @@ The independent-maintenance shutdown regression waits for the stop critical
 section to release its mutex, with a bounded deadline. This distinguishes the
 normal flag-before-unlock handoff from a join-under-lock regression without
 leaving a callback borrowed past owner destruction.
+
+## Bulk sessions, target tracking, and schema reconciliation
+
+`storage/db/bulk_ingest_session.zig` retains direct-write bulk admission and the
+active-session statistic. The unused buffered staging map and recursive flush
+path have been removed. Writes and transforms still commit through ordinary
+batch execution before session finish. The public bulk-coalescing statistics
+layout is preserved; obsolete staging counters remain zero. Scratch mutation
+execution has no resident bulk session.
+
+`storage/db/target_advance_tracker.zig` owns process-local maintenance handoffs,
+stuck-index observations, warning cooldowns, their owned index names, and a
+mutex. Diagnostic snapshots own their names independently of later clears.
+Allocation failure rolls back an inserted map reservation. DB still verifies
+durable counters, generation identity, coverage, and publication authority before
+turning a handoff into a rebuild or repair intent. The abandoned dense-maintenance
+cooldown map and urgent-score setting were removed; the live warning cooldown
+setting remains supported.
+
+`storage/db/schema_reconcile_owner.zig` owns admission, coalesced publication
+reruns, queued execution, synchronous fallback, and permanent stop state. Movable
+and inline handles complete on the caller without retaining a callback context.
+Queue rejection uses the same caller fallback. DB supplies one reconciliation
+pass and keeps schema-version checks and durable building/failed/ready states.
+Close stops admission before draining the durable owner lane, which protects the
+borrowed DB and reconciliation owner until queued work completes.
+
+Server group-created timestamp persistence and schema-upgrade assertions belong
+to the server integration suite. Local relational tests preserve opaque internal
+metadata through ordinary storage operations and have no server metadata import.
+Enrichment runtime replacement and dense replay session ownership remain separate
+follow-ons; their provider leases and durable publication fences are unchanged.

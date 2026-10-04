@@ -962,29 +962,7 @@ const AsyncContext = struct {
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
     enrichment_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
-    dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
-    target_advance_warning_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
-    /// Exact indexes whose replay watermark could not advance because the
-    /// physical dense generation did not match its durable artifact target.
-    /// The callback that discovers this runs without a stable DB owner, so it
-    /// records only a bounded process-local handoff. The DB-owned maintenance
-    /// pass immediately turns it into a durable rebuild cursor or generation
-    /// repair intent; a crash before that handoff simply rediscovers the same
-    /// debt from the durable counter on the next replay attempt.
-    target_advance_debt_mutex: std.atomic.Mutex = .unlocked,
-    target_advance_maintenance_pending: std.StringHashMapUnmanaged(TargetAdvanceMaintenanceDebt) = .empty,
-    /// First-observed monotonic time an exact index could not advance its
-    /// derived replay target, plus the last observed indexed/expected
-    /// counters at that moment. Populated unconditionally (cheap map upsert)
-    /// whenever `canAdvanceDerivedToTargetAsync` defers to artifact
-    /// maintenance; cleared the moment that index advances normally. This is
-    /// pure bookkeeping with no behavioral effect by itself -- background/
-    /// steady-state replay never reads it, so a legitimately slow (but still
-    /// progressing) embedding backlog is unaffected. `runUntilIdle`'s opt-in
-    /// no-progress guard (`ReplayDrainOptions.no_progress_timeout_ns`) is the
-    /// only reader: it fails fast with a named, bounded diagnostic instead of
-    /// looping on the same deferred check indefinitely.
-    target_advance_stuck: std.StringHashMapUnmanaged(TargetAdvanceStuckRecord) = .empty,
+    target_advance: @import("target_advance_tracker.zig").Tracker = .{},
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
     text_merge_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
@@ -1014,31 +992,11 @@ const AsyncContext = struct {
         var pending_finalization_it = self.pending_dense_projection_finalizations.keyIterator();
         while (pending_finalization_it.next()) |key| alloc.free(@constCast(key.*));
         self.pending_dense_projection_finalizations.deinit(alloc);
-        var maintenance_it = self.dense_maintenance_last_ns.iterator();
-        while (maintenance_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
-        self.dense_maintenance_last_ns.deinit(alloc);
-        var target_repair_it = self.target_advance_warning_last_ns.iterator();
-        while (target_repair_it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
-        self.target_advance_warning_last_ns.deinit(alloc);
-        var target_pending_it = self.target_advance_maintenance_pending.keyIterator();
-        while (target_pending_it.next()) |key| alloc.free(@constCast(key.*));
-        self.target_advance_maintenance_pending.deinit(alloc);
-        var target_stuck_it = self.target_advance_stuck.keyIterator();
-        while (target_stuck_it.next()) |key| alloc.free(@constCast(key.*));
-        self.target_advance_stuck.deinit(alloc);
+        self.target_advance.deinit(alloc);
     }
 };
 
-const TargetAdvanceStuckRecord = struct {
-    first_stuck_ns: u64,
-    indexed: u64,
-    expected: u64,
-};
-
-const TargetAdvanceMaintenanceDebt = struct {
-    config_hash: u64,
-    generation: u64,
-};
+const TargetAdvanceMaintenanceDebt = @import("target_advance_tracker.zig").Debt;
 
 fn indexRepairSupportsSnapshotCursor(kind: types.IndexKind) bool {
     return switch (kind) {
@@ -1185,7 +1143,6 @@ const dense_catch_up_default_deferred_hbc_leaf_splits_per_publish: usize = 64;
 const dense_catch_up_default_deferred_hbc_leaf_split_members_per_publish: usize = 16 * 1024;
 const dense_catch_up_default_maintenance_steps: usize = 8;
 const dense_catch_up_default_maintenance_cooldown_ns: u64 = 250 * std.time.ns_per_ms;
-const dense_catch_up_default_maintenance_urgent_score: u64 = 1_000_000;
 const artifact_repair_summary_dirty_marker = "dirty";
 // v2 adds exact per-(index, artifact source) counters. Presence alone is not a
 // sufficient readiness proof because v1 summaries remain durable on upgrade.
@@ -1703,8 +1660,6 @@ const LocalMutationExecution = struct {
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     last_run_until_idle_no_progress: ?DB.NoProgressDiagnostic = null,
     shadow: ?*ShadowState,
-    bulk_ingest_coalescer: DB.BulkIngestCoalescer = .{},
-    flushing_bulk_ingest_coalescer: bool = false,
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
     embedding_activity_cache_mutex: std.atomic.Mutex = .unlocked,
@@ -1792,9 +1747,8 @@ const LocalMutationExecution = struct {
         try self.executor.failIfUnhealthy();
     }
 
-    fn flushBulkIngestCoalescerWithAdmission(self: *@This(), _: types.SyncLevel, _: ?*BatchProfile, _: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) !void {
-        // A recovery invocation has no foreground buffered writes to flush.
-        std.debug.assert(!self.bulk_ingest_coalescer.active and !self.bulk_ingest_coalescer.hasPending());
+    fn bulkSessionActive(_: *@This()) bool {
+        return false;
     }
 
     fn deinitScratch(self: *@This()) void {
@@ -1808,7 +1762,6 @@ const LocalMutationExecution = struct {
         self.embedding_activity_cache.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
-        self.bulk_ingest_coalescer.deinit(self.alloc);
         self.bulk_ingest_identity_state.deinit(self.alloc);
         self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
     }
@@ -4721,7 +4674,7 @@ const LocalExecutionState = struct {
     /// durable lane is drained before DB teardown, so jobs may safely borrow
     /// this DB while keeping schema publication latency independent of index
     /// reconciliation cost.
-    schema_index_reconcile_state: std.atomic.Value(u8) = .init(0),
+    schema_reconcile: @import("schema_reconcile_owner.zig").Owner = .{},
     relational_index_maintenance_cursor: std.atomic.Value(usize) = .init(0),
     relational_index_maintenance_sweep: @import("relational_index_maintenance_sweep.zig").Sweep = .{},
     relational_index_retry_after_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
@@ -4851,8 +4804,7 @@ pub const DB = struct {
     /// line. Overwritten on each new occurrence; freed at `deinitWrapperState`.
     last_run_until_idle_no_progress: ?NoProgressDiagnostic = null,
     shadow: ?*ShadowState,
-    bulk_ingest_coalescer: @This().BulkIngestCoalescer = .{},
-    flushing_bulk_ingest_coalescer: bool = false,
+    bulk_ingest_session: @import("bulk_ingest_session.zig").State = .{},
     bulk_ingest_identity_all_new: bool = false,
     bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
     // Status snapshots are reconstructed from durable state on every poll, so
@@ -7883,6 +7835,7 @@ pub const DB = struct {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
+        self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
         self.artifact_producer_scheduler.deinit(self.alloc);
         self.stopPortableActivationRetryWorker();
@@ -7928,7 +7881,6 @@ pub const DB = struct {
         self.embedding_activity_cache.deinit(self.alloc);
         if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
         self.graph_restore_parse_cache = null;
-        self.bulk_ingest_coalescer.deinit(self.alloc);
         self.bulk_ingest_identity_state.deinit(self.alloc);
         self.bulk_ingest_identity_all_new = false;
         self.clearBulkIngestSeenDocKeysLocked();
@@ -8086,14 +8038,13 @@ pub const DB = struct {
             return err;
         };
         errdefer self.clearBulkIngestIdentityAllNewLocked();
-        self.bulk_ingest_coalescer.begin();
+        self.bulk_ingest_session.begin();
     }
 
     pub fn finishBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
         defer if (external_session_tracked) finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
         {
@@ -8110,7 +8061,7 @@ pub const DB = struct {
             resources.index_manager.finishSparseBulkIngestSessionsWithOptions(options) catch |err| {
                 if (first_err == null) first_err = err;
             };
-            self.bulk_ingest_coalescer.clear(self.alloc);
+            self.bulk_ingest_session.finish();
             self.clearBulkIngestIdentityAllNewLocked();
             if (first_err) |err| return err;
         }
@@ -8129,6 +8080,10 @@ pub const DB = struct {
         notifyQueryVisibilityHook(self.async_context, .publish);
     }
 
+    fn bulkSessionActive(self: *const DB) bool {
+        return self.bulk_ingest_session.active;
+    }
+
     pub fn beginDenseAutoBulkIngestSession(self: *DB) !void {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
@@ -8140,7 +8095,7 @@ pub const DB = struct {
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
         try resources.index_manager.beginDenseBulkIngestSessions();
-        self.bulk_ingest_coalescer.begin();
+        self.bulk_ingest_session.begin();
     }
 
     pub fn beginPrimaryStoreAutoBulkIngestSession(self: *DB) !void {
@@ -8154,24 +8109,23 @@ pub const DB = struct {
         errdefer resources.store.abortBulkIngestSession();
         try self.configureBulkIngestIdentityAllNewLocked();
         errdefer self.clearBulkIngestIdentityAllNewLocked();
-        self.bulk_ingest_coalescer.begin();
+        self.bulk_ingest_session.begin();
     }
 
     pub fn finishPrimaryStoreAutoBulkIngestSessionWithOptions(self: *DB, options: backend_types.BulkIngestFinishOptions) !void {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
             resources.store.finishBulkIngestSessionWithOptions(options) catch |err| {
-                self.bulk_ingest_coalescer.clear(self.alloc);
+                self.bulk_ingest_session.finish();
                 self.clearBulkIngestIdentityAllNewLocked();
                 return err;
             };
-            self.bulk_ingest_coalescer.clear(self.alloc);
+            self.bulk_ingest_session.finish();
             self.clearBulkIngestIdentityAllNewLocked();
         }
         flushDeferredExternalBulkExecutorNotificationOrTarget(
@@ -8200,7 +8154,6 @@ pub const DB = struct {
         var replication_mutation = self.acquireReplicationMutationShared();
         defer if (replication_mutation) |*lease| lease.release();
         try self.enforceReplicationWriteGate();
-        try self.flushBulkIngestCoalescerWithSyncLevel(.write, null);
         var external_session_tracked = true;
         defer if (external_session_tracked) finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
         {
@@ -8208,15 +8161,15 @@ pub const DB = struct {
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
             resources.store.flushBufferedWritesWithOptions(options) catch |err| {
-                self.bulk_ingest_coalescer.clear(self.alloc);
+                self.bulk_ingest_session.finish();
                 return err;
             };
             resources.index_manager.finishDenseBulkIngestSessionsWithOptions(options) catch |err| {
-                self.bulk_ingest_coalescer.clear(self.alloc);
+                self.bulk_ingest_session.finish();
                 self.clearBulkIngestIdentityAllNewLocked();
                 return err;
             };
-            self.bulk_ingest_coalescer.clear(self.alloc);
+            self.bulk_ingest_session.finish();
             self.clearBulkIngestIdentityAllNewLocked();
         }
         external_session_tracked = false;
@@ -8238,7 +8191,7 @@ pub const DB = struct {
         {
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
-            self.bulk_ingest_coalescer.clear(self.alloc);
+            self.bulk_ingest_session.finish();
             resources.index_manager.abortDenseBulkIngestSessions();
         }
         finishExternalDenseBulkSessionTrackedBestEffort(self.async_context);
@@ -8251,7 +8204,7 @@ pub const DB = struct {
         lockApply(self);
         defer self.core.unlockApply();
         const resources = self.core.batchExecutionResources();
-        self.bulk_ingest_coalescer.clear(self.alloc);
+        self.bulk_ingest_session.finish();
         self.clearBulkIngestIdentityAllNewLocked();
         resources.store.abortBulkIngestSession();
     }
@@ -8263,7 +8216,7 @@ pub const DB = struct {
         {
             defer self.core.unlockApply();
             const resources = self.core.batchExecutionResources();
-            self.bulk_ingest_coalescer.clear(self.alloc);
+            self.bulk_ingest_session.finish();
             self.clearBulkIngestIdentityAllNewLocked();
             resources.index_manager.abortAlgebraicBulkIngestSessions();
             resources.index_manager.abortSparseBulkIngestSessions();
@@ -8320,7 +8273,7 @@ pub const DB = struct {
         async_stats.dense_projection_finalizing =
             self.async_context.dense_projection_finalizing.load(.acquire) or
             self.core.index_manager.vectorBlockProjectionPending();
-        async_stats.bulk_coalescing = self.bulk_ingest_coalescer.stats.snapshot();
+        async_stats.bulk_coalescing = self.bulk_ingest_session.snapshot();
         async_stats.derived_workers = self.executor.snapshotStats();
         return async_stats;
     }
@@ -11327,7 +11280,7 @@ pub const DB = struct {
             preparation_alloc.free(items);
         };
         var apply_mutex_held = true;
-        var apply_lock_acquired_ns = monotonicTimeNs();
+        const apply_lock_acquired_ns = monotonicTimeNs();
         errdefer if (apply_mutex_held) unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
         // A durable epoch survives active-schema publication, not replacement
         // of the entire database namespace with reused version/transaction IDs.
@@ -11552,28 +11505,10 @@ pub const DB = struct {
             }
         }
 
-        if (self.bulk_ingest_coalescer.active and !self.flushing_bulk_ingest_coalescer) {
-            if (self.bulk_ingest_coalescer.hasPending()) {
-                unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
-                try self.flushBulkIngestCoalescerWithAdmission(req.sync_level, profile, &snapshot_mutation);
-                const reacquire_wait_start_ns = monotonicTimeNs();
-                try self.lockApplyForPortableRuntime();
-                if (profile) |active_profile| active_profile.apply_lock_wait_ns += monotonicTimeNs() - reacquire_wait_start_ns;
-                apply_mutex_held = true;
-                apply_lock_acquired_ns = monotonicTimeNs();
-                // A merge page's authority includes the exact durable cursor
-                // observed above. Flushing released that fence; another page
-                // or cancellation may have won meanwhile. Reprepare/recheck
-                // instead of committing the previously computed progress.
-                if (req.merge_page != null) return error.PreparedGenerationChanged;
-            }
-        }
-
         // Every batch on a graph database can change source inputs or remove
         // contributor state. Fence preparation through primary/replay commit,
         // including ordinary graph writes and document/relational deletes.
-        // Coalescer flushing above may run nested visibility waits, so acquire
-        // only after it finishes, without retaining a catalog lease.
+        // Acquire without retaining a catalog lease.
         if (!opts.bypass_replication_write_gate and self.async_context.primary_replication_append_pending.load(.acquire)) return error.ReplicationPublisherUnavailable;
         var graph_publication = if (self.core.index_manager.hasGraphIndexes())
             self.core.index_manager.beginGraphPrimaryMutation()
@@ -12221,7 +12156,7 @@ pub const DB = struct {
             for (overwrite_probe_entries.items, 0..) |entry, i| {
                 probe_keys[i] = entry.key;
             }
-            const overwrite_probe_admission: backend_types.Namespace.BlockCacheAdmission = if (opts.store_batch_options.mode == .bulk_ingest or self.bulk_ingest_coalescer.active) .transient else .retain;
+            const overwrite_probe_admission: backend_types.Namespace.BlockCacheAdmission = if (opts.store_batch_options.mode == .bulk_ingest or self.bulkSessionActive()) .transient else .retain;
             var overwrite_probe_txn = try self.core.store.beginProbeTxnWithBlockCacheAdmission(overwrite_probe_admission);
             defer overwrite_probe_txn.abort();
             try overwrite_probe_txn.getManySorted(probe_keys, probe_values);
@@ -12971,7 +12906,7 @@ pub const DB = struct {
         if (opts.row_policy_lease) |lease| try lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         const store_batch_options: backend_types.BatchOptions = if (opts.store_batch_options.mode != .default)
             opts.store_batch_options
-        else if (self.bulk_ingest_coalescer.active)
+        else if (self.bulkSessionActive())
             .{ .mode = .bulk_ingest, .defer_commit_flush = true }
         else
             .{};
@@ -14733,236 +14668,6 @@ pub const DB = struct {
         });
     }
 
-    const BulkIngestCoalescer = struct {
-        const Stats = struct {
-            active_session: std.atomic.Value(u8) = .init(0),
-            staged_keys: AtomicU64 = .init(0),
-            stage_batches: AtomicU64 = .init(0),
-            stage_writes: AtomicU64 = .init(0),
-            stage_deletes: AtomicU64 = .init(0),
-            stage_transforms: AtomicU64 = .init(0),
-            flush_calls: AtomicU64 = .init(0),
-            flushed_keys: AtomicU64 = .init(0),
-
-            fn snapshot(self: *const @This()) types.BulkCoalescingStats {
-                return .{
-                    .active_session = self.active_session.load(.monotonic) != 0,
-                    .staged_keys = self.staged_keys.load(.monotonic),
-                    .stage_batches = self.stage_batches.load(.monotonic),
-                    .stage_writes = self.stage_writes.load(.monotonic),
-                    .stage_deletes = self.stage_deletes.load(.monotonic),
-                    .stage_transforms = self.stage_transforms.load(.monotonic),
-                    .flush_calls = self.flush_calls.load(.monotonic),
-                    .flushed_keys = self.flushed_keys.load(.monotonic),
-                };
-            }
-        };
-
-        const Entry = struct {
-            key: []u8,
-            value: ?[]u8 = null,
-            kind: enum { write, delete },
-        };
-
-        const RequestView = struct {
-            writes: []types.BatchWrite = &.{},
-            deletes: [][]const u8 = &.{},
-
-            fn deinit(self: @This(), alloc: Allocator) void {
-                if (self.writes.len > 0) alloc.free(self.writes);
-                if (self.deletes.len > 0) alloc.free(self.deletes);
-            }
-        };
-
-        active: bool = false,
-        entries: std.ArrayListUnmanaged(Entry) = .empty,
-        positions: std.StringHashMapUnmanaged(usize) = .empty,
-        stats: Stats = .{},
-
-        fn begin(self: *@This()) void {
-            self.active = true;
-            self.stats.active_session.store(1, .monotonic);
-        }
-
-        fn deinit(self: *@This(), alloc: Allocator) void {
-            self.clear(alloc);
-            self.entries.deinit(alloc);
-            self.positions.deinit(alloc);
-            self.* = .{};
-        }
-
-        fn clear(self: *@This(), alloc: Allocator) void {
-            self.resetPending(alloc);
-            self.active = false;
-            self.stats.active_session.store(0, .monotonic);
-        }
-
-        fn resetPending(self: *@This(), alloc: Allocator) void {
-            for (self.entries.items) |entry| {
-                alloc.free(entry.key);
-                if (entry.value) |value| alloc.free(value);
-            }
-            self.entries.clearRetainingCapacity();
-            self.positions.clearRetainingCapacity();
-            self.stats.staged_keys.store(0, .monotonic);
-        }
-
-        fn hasPending(self: *const @This()) bool {
-            return self.entries.items.len > 0;
-        }
-
-        fn snapshotRequestView(self: *const @This(), alloc: Allocator) !RequestView {
-            var result = RequestView{};
-            errdefer result.deinit(alloc);
-
-            var write_count: usize = 0;
-            var delete_count: usize = 0;
-            for (self.entries.items) |entry| {
-                switch (entry.kind) {
-                    .write => write_count += 1,
-                    .delete => delete_count += 1,
-                }
-            }
-
-            if (write_count > 0) result.writes = try alloc.alloc(types.BatchWrite, write_count);
-            if (delete_count > 0) result.deletes = try alloc.alloc([]const u8, delete_count);
-
-            var write_index: usize = 0;
-            var delete_index: usize = 0;
-            for (self.entries.items) |entry| {
-                switch (entry.kind) {
-                    .write => {
-                        result.writes[write_index] = .{
-                            .key = entry.key,
-                            .value = entry.value.?,
-                        };
-                        write_index += 1;
-                    },
-                    .delete => {
-                        result.deletes[delete_index] = entry.key;
-                        delete_index += 1;
-                    },
-                }
-            }
-            return result;
-        }
-
-        fn stageBatch(self: *@This(), db: *DB, req: types.BatchRequest) !void {
-            std.debug.assert(self.active);
-            _ = self.stats.stage_batches.fetchAdd(1, .monotonic);
-            _ = self.stats.stage_writes.fetchAdd(@intCast(req.writes.len), .monotonic);
-            _ = self.stats.stage_deletes.fetchAdd(@intCast(req.deletes.len), .monotonic);
-            _ = self.stats.stage_transforms.fetchAdd(@intCast(req.transforms.len), .monotonic);
-
-            for (req.writes) |write| {
-                try self.stageWrite(db.alloc, write.key, write.value);
-            }
-            for (req.deletes) |key| {
-                try self.stageDelete(db.alloc, key);
-            }
-            for (req.transforms) |transform| {
-                try self.stageTransform(db, transform);
-            }
-            self.stats.staged_keys.store(@intCast(self.entries.items.len), .monotonic);
-        }
-
-        fn stageWrite(self: *@This(), alloc: Allocator, key: []const u8, value: []const u8) !void {
-            const gop = try self.positions.getOrPut(alloc, key);
-            if (!gop.found_existing) {
-                // Keep the borrowed map key until both owned storage and the
-                // entry are ready. Roll back the reservation on every failure.
-                errdefer _ = self.positions.remove(key);
-                const owned_key = try alloc.dupe(u8, key);
-                errdefer alloc.free(owned_key);
-                const owned_value = try alloc.dupe(u8, value);
-                errdefer alloc.free(owned_value);
-                const entry_index = self.entries.items.len;
-                try self.entries.append(alloc, .{
-                    .key = owned_key,
-                    .value = owned_value,
-                    .kind = .write,
-                });
-                gop.key_ptr.* = owned_key;
-                gop.value_ptr.* = entry_index;
-                return;
-            }
-
-            const entry = &self.entries.items[gop.value_ptr.*];
-            const replacement = try alloc.dupe(u8, value);
-            if (entry.value) |existing| alloc.free(existing);
-            entry.value = replacement;
-            entry.kind = .write;
-        }
-
-        fn stageDelete(self: *@This(), alloc: Allocator, key: []const u8) !void {
-            const gop = try self.positions.getOrPut(alloc, key);
-            if (!gop.found_existing) {
-                // Keep the borrowed map key until both owned storage and the
-                // entry are ready. Roll back the reservation on every failure.
-                errdefer _ = self.positions.remove(key);
-                const owned_key = try alloc.dupe(u8, key);
-                errdefer alloc.free(owned_key);
-                const entry_index = self.entries.items.len;
-                try self.entries.append(alloc, .{
-                    .key = owned_key,
-                    .kind = .delete,
-                });
-                gop.key_ptr.* = owned_key;
-                gop.value_ptr.* = entry_index;
-                return;
-            }
-
-            const entry = &self.entries.items[gop.value_ptr.*];
-            if (entry.value) |existing| {
-                alloc.free(existing);
-                entry.value = null;
-            }
-            entry.kind = .delete;
-        }
-
-        fn stageTransform(self: *@This(), db: *DB, transform: types.DocumentTransform) !void {
-            const existing = if (self.positions.get(transform.key)) |entry_index|
-                switch (self.entries.items[entry_index].kind) {
-                    .write => self.entries.items[entry_index].value,
-                    .delete => null,
-                }
-            else
-                try db.get(db.alloc, transform.key);
-            defer if (self.positions.get(transform.key) == null) {
-                if (existing) |body| db.alloc.free(body);
-            };
-
-            const resolved = try transform_mod.resolveDocumentTransform(db.alloc, existing, transform) orelse return;
-            errdefer db.alloc.free(resolved);
-            try self.stageWriteOwned(db.alloc, transform.key, resolved);
-        }
-
-        fn stageWriteOwned(self: *@This(), alloc: Allocator, key: []const u8, owned_value: []u8) !void {
-            const gop = try self.positions.getOrPut(alloc, key);
-            if (!gop.found_existing) {
-                // Keep the borrowed map key until both owned storage and the
-                // entry are ready. Roll back the reservation on every failure.
-                errdefer _ = self.positions.remove(key);
-                const owned_key = try alloc.dupe(u8, key);
-                errdefer alloc.free(owned_key);
-                const entry_index = self.entries.items.len;
-                try self.entries.append(alloc, .{
-                    .key = owned_key,
-                    .value = owned_value,
-                    .kind = .write,
-                });
-                gop.key_ptr.* = owned_key;
-                gop.value_ptr.* = entry_index;
-                return;
-            }
-
-            const entry = &self.entries.items[gop.value_ptr.*];
-            if (entry.value) |existing| alloc.free(existing);
-            entry.value = owned_value;
-            entry.kind = .write;
-        }
-    };
-
     fn resetCoalescedEntryToDelete(comptime T: type, entry: *CoalescedKeyValueRequest(T).Entry) void {
         if (entry.owned_value) {
             // Caller frees previous owned value before switching the entry.
@@ -15215,35 +14920,6 @@ pub const DB = struct {
             }
         }
         return result;
-    }
-
-    fn flushBulkIngestCoalescerWithSyncLevel(self: *DB, sync_level: types.SyncLevel, profile: ?*BatchProfile) anyerror!void {
-        return self.flushBulkIngestCoalescerWithAdmission(sync_level, profile, null);
-    }
-
-    fn flushBulkIngestCoalescerWithAdmission(self: *DB, sync_level: types.SyncLevel, profile: ?*BatchProfile, snapshot_mutation: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease) anyerror!void {
-        if (!self.bulk_ingest_coalescer.active or !self.bulk_ingest_coalescer.hasPending()) return;
-        _ = self.bulk_ingest_coalescer.stats.flush_calls.fetchAdd(1, .monotonic);
-        _ = self.bulk_ingest_coalescer.stats.flushed_keys.fetchAdd(@intCast(self.bulk_ingest_coalescer.entries.items.len), .monotonic);
-
-        try self.lockApplyForPortableRuntime();
-        var view = try self.bulk_ingest_coalescer.snapshotRequestView(self.alloc);
-        self.core.unlockApply();
-        defer view.deinit(self.alloc);
-
-        self.flushing_bulk_ingest_coalescer = true;
-        defer self.flushing_bulk_ingest_coalescer = false;
-
-        try self.batchInternal(.{
-            .writes = view.writes,
-            .deletes = view.deletes,
-            .sync_level = sync_level,
-        }, profile, .{ .store_batch_options = .{ .mode = .bulk_ingest, .defer_commit_flush = true }, .snapshot_mutation = snapshot_mutation });
-
-        try self.lockApplyForPortableRuntime();
-        defer self.core.unlockApply();
-        self.bulk_ingest_coalescer.resetPending(self.alloc);
-        self.bulk_ingest_coalescer.active = true;
     }
 
     pub fn get(self: *DB, alloc: Allocator, key: []const u8) !?[]u8 {
@@ -28180,57 +27856,20 @@ pub const DB = struct {
         }
     }
 
-    const SchemaIndexReconcileWork = struct {
-        fn run(ptr: *anyopaque) anyerror!void {
-            const self: *DB = @ptrCast(@alignCast(ptr));
-            self.runSchemaIndexReconcileWorker();
-        }
-
-        fn deinit(_: *anyopaque) void {}
-    };
-
-    /// Schema publication is the commit point. Reconciliation runs through an
-    /// owner-scoped durable lane and its catalog state remains the restart and
-    /// observability authority. Calls coalesce while a worker is active.
-    fn reconcilePublishedSchemaIndexes(self: *DB, schema_version: u32) void {
-        _ = schema_version;
-        // Value-returning DB.open deliberately permits its result to move.
-        // Only allocator-owned handles may enqueue callbacks retaining `self`;
-        // movable handles still run outside apply, but finish synchronously.
-        if (!self.stable_address or self.backend_runtime.durable_jobs.executesInline()) {
-            self.reconcileCurrentSchemaIndexesOnce();
-            return;
-        }
-        while (true) {
-            const state = self.local_execution.schema_index_reconcile_state.load(.acquire);
-            if (state == 2) return;
-            if (state == 1) {
-                if (self.local_execution.schema_index_reconcile_state.cmpxchgWeak(1, 2, .acq_rel, .acquire) == null) return;
-                continue;
-            }
-            if (self.local_execution.schema_index_reconcile_state.cmpxchgWeak(0, 1, .acq_rel, .acquire) != null) continue;
-            self.backend_runtime.durable_jobs.submit(.{
-                .owner_id = self.backend_owner_id,
-                .class = .maintenance,
-                .ptr = self,
-                .run = SchemaIndexReconcileWork.run,
-                .deinit = SchemaIndexReconcileWork.deinit,
-            }) catch |err| {
-                std.log.warn("schema index reconciliation queue unavailable; using caller fallback path={s} err={s}", .{ self.core.path, @errorName(err) });
-                self.runSchemaIndexReconcileWorker();
-            };
-            return;
-        }
+    fn reconcilePublishedSchemaIndexes(self: *DB, _: u32) void {
+        self.local_execution.schema_reconcile.schedule(.{
+            .ptr = self,
+            .lane = self.backend_runtime.durable_jobs,
+            .owner_id = self.backend_owner_id,
+            .stable_address = self.stable_address,
+            .closing = &self.async_context.background_closing,
+            .pass = reconcileSchemaPass,
+        });
     }
 
-    fn runSchemaIndexReconcileWorker(self: *DB) void {
-        while (true) {
-            self.reconcileCurrentSchemaIndexesOnce();
-            if (self.local_execution.schema_index_reconcile_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-            // A publication raced the active pass. Consume its coalesced rerun
-            // without another allocation or queue round-trip.
-            self.local_execution.schema_index_reconcile_state.store(1, .release);
-        }
+    fn reconcileSchemaPass(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.reconcileCurrentSchemaIndexesOnce();
     }
 
     fn reconcileCurrentSchemaIndexesOnce(self: *DB) void {
@@ -32118,7 +31757,6 @@ pub const DB = struct {
                             if (!previous.value.destination.eql(command.fence)) return error.IntegrityHandoffDestinationResetRequired;
                         }
                     }
-                    if (replication_lsn == null and self.bulk_ingest_coalescer.hasPending()) return error.IntegrityTopologyBusy;
                     const enrichment = self.enrichmentStatsWithSupervisorState(.{ .enabled = true });
                     const has_producers = enrichment.enabled or self.core.hasGeneratedEnrichmentTargets() or self.core.index_manager.enrichments.items.len != 0 or self.hasConfiguredResolvers();
                     if (replication_lsn == null and has_producers) {
@@ -35485,7 +35123,7 @@ pub const DB = struct {
         /// `runUntilIdle` sets this (from `run_until_idle_no_progress_timeout_ms`
         /// at open, see `OpenOptions`). Every pass through
         /// `runMaintenanceUntilWithOptions`'s catch-up loop checks
-        /// `AsyncContext.target_advance_stuck` (populated by
+        /// `AsyncContext.target_advance` (populated by
         /// `canAdvanceDerivedToTargetAsync`) and fails with
         /// `error.RunUntilIdleNoProgress` once any exact index has been unable
         /// to advance its replay target for at least this long, instead of
@@ -41808,7 +41446,7 @@ pub const DB = struct {
         // durable store is still unsafe to replace while a caller owns or is
         // waiting on an in-memory write/projection lease; the authoritative
         // publication check holds apply-exclusive and closes the final race.
-        if (self.bulk_ingest_coalescer.active or asyncContextHasActiveDenseBulkWork(self.async_context)) return error.WriterLocked;
+        if (self.bulkSessionActive() or asyncContextHasActiveDenseBulkWork(self.async_context)) return error.WriterLocked;
         return true;
     }
 
@@ -64717,7 +64355,6 @@ var dense_catch_up_deferred_hbc_leaf_split_members_cache = std.atomic.Value(usiz
 var dense_catch_up_bulk_rebuild_hbc_leaf_min_members_cache = std.atomic.Value(usize).init(0);
 var dense_catch_up_maintenance_steps_cache = std.atomic.Value(usize).init(0);
 var dense_catch_up_maintenance_cooldown_ns_cache = AtomicU64.init(0);
-var dense_catch_up_maintenance_urgent_score_cache = AtomicU64.init(0);
 var dense_catch_up_startup_max_records_cache = std.atomic.Value(usize).init(0);
 var dense_catch_up_startup_max_chunk_bytes_cache = AtomicU64.init(0);
 var dense_posting_idle_max_postings_cache = std.atomic.Value(usize).init(0);
@@ -64808,14 +64445,6 @@ fn denseCatchUpMaintenanceCooldownNs() u64 {
         &dense_catch_up_maintenance_cooldown_ns_cache,
         "ANTFLY_DENSE_CATCH_UP_MAINTENANCE_COOLDOWN_NS",
         dense_catch_up_default_maintenance_cooldown_ns,
-    );
-}
-
-fn denseCatchUpMaintenanceUrgentScore() u64 {
-    return cachedEnvU64(
-        &dense_catch_up_maintenance_urgent_score_cache,
-        "ANTFLY_DENSE_CATCH_UP_MAINTENANCE_URGENT_SCORE",
-        dense_catch_up_default_maintenance_urgent_score,
     );
 }
 
@@ -65211,38 +64840,12 @@ fn shouldDeferAppliedSequenceFlush(ctx: *const AsyncContext, force: bool) bool {
     return ctx.active_dense_catch_up_sessions.load(.monotonic) != 0;
 }
 
-fn shouldRunDenseCatchUpMaintenance(ctx: *AsyncContext, index_name: []const u8, score: u64, now_ns: u64) bool {
-    if (score == 0) return false;
-    const cooldown_ns = denseCatchUpMaintenanceCooldownNs();
-    if (cooldown_ns == 0) return true;
-    if (score >= denseCatchUpMaintenanceUrgentScore()) return true;
-    const last_ns = ctx.dense_maintenance_last_ns.get(index_name) orelse return true;
-    return now_ns -| last_ns >= cooldown_ns;
-}
-
-fn noteDenseCatchUpMaintenanceRun(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) !void {
-    const gop = try ctx.dense_maintenance_last_ns.getOrPut(ctx.alloc, index_name);
-    if (!gop.found_existing) {
-        errdefer _ = ctx.dense_maintenance_last_ns.remove(index_name);
-        gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
-    }
-    gop.value_ptr.* = now_ns;
-}
-
 fn shouldLogTargetAdvanceDebt(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) bool {
-    const cooldown_ns = denseCatchUpMaintenanceCooldownNs();
-    if (cooldown_ns == 0) return true;
-    const last_ns = ctx.target_advance_warning_last_ns.get(index_name) orelse return true;
-    return now_ns -| last_ns >= cooldown_ns;
+    return ctx.target_advance.shouldLog(index_name, now_ns, denseCatchUpMaintenanceCooldownNs());
 }
 
 fn noteTargetAdvanceDebtLogged(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) !void {
-    const gop = try ctx.target_advance_warning_last_ns.getOrPut(ctx.alloc, index_name);
-    if (!gop.found_existing) {
-        errdefer _ = ctx.target_advance_warning_last_ns.remove(index_name);
-        gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
-    }
-    gop.value_ptr.* = now_ns;
+    return ctx.target_advance.noteLogged(ctx.alloc, index_name, now_ns);
 }
 
 test "async dense catch-up tokens bind one exact session" {
@@ -65314,14 +64917,7 @@ fn recordTargetAdvanceMaintenanceDebt(
     index_name: []const u8,
     debt: TargetAdvanceMaintenanceDebt,
 ) !void {
-    lockAtomic(&ctx.target_advance_debt_mutex);
-    defer ctx.target_advance_debt_mutex.unlock();
-    const gop = try ctx.target_advance_maintenance_pending.getOrPut(ctx.alloc, index_name);
-    if (!gop.found_existing) {
-        errdefer _ = ctx.target_advance_maintenance_pending.remove(index_name);
-        gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
-    }
-    gop.value_ptr.* = debt;
+    return ctx.target_advance.recordDebt(ctx.alloc, index_name, debt);
 }
 
 fn targetAdvanceMaintenanceDebtPending(
@@ -65329,17 +64925,11 @@ fn targetAdvanceMaintenanceDebtPending(
     index_name: []const u8,
     identity: TargetAdvanceMaintenanceDebt,
 ) bool {
-    lockAtomic(&ctx.target_advance_debt_mutex);
-    defer ctx.target_advance_debt_mutex.unlock();
-    const debt = ctx.target_advance_maintenance_pending.get(index_name) orelse return false;
-    return debt.config_hash == identity.config_hash and debt.generation == identity.generation;
+    return ctx.target_advance.debtPending(index_name, identity);
 }
 
 fn clearTargetAdvanceMaintenanceDebt(ctx: *AsyncContext, index_name: []const u8) void {
-    lockAtomic(&ctx.target_advance_debt_mutex);
-    defer ctx.target_advance_debt_mutex.unlock();
-    const entry = ctx.target_advance_maintenance_pending.fetchRemove(index_name) orelse return;
-    ctx.alloc.free(@constCast(entry.key));
+    return ctx.target_advance.clearDebt(ctx.alloc, index_name);
 }
 
 /// Called every time `canAdvanceDerivedToTargetAsync` cannot advance an
@@ -65347,58 +64937,23 @@ fn clearTargetAdvanceMaintenanceDebt(ctx: *AsyncContext, index_name: []const u8)
 /// `checkTargetAdvanceNoProgress` on a foreground `runUntilIdle` drain. Both
 /// sites may run on different threads from a background derived-executor
 /// worker's callback invocation (hosted/multi-worker profiles), so this map
-/// shares `target_advance_debt_mutex` with `target_advance_maintenance_pending`
+/// uses the tracker mutex
 /// rather than relying on the caller's transient apply-exclusive hold.
 fn noteTargetAdvanceStuck(ctx: *AsyncContext, index_name: []const u8, now_ns: u64, indexed: u64, expected: u64) !void {
-    lockAtomic(&ctx.target_advance_debt_mutex);
-    defer ctx.target_advance_debt_mutex.unlock();
-    const gop = try ctx.target_advance_stuck.getOrPut(ctx.alloc, index_name);
-    if (!gop.found_existing) {
-        errdefer _ = ctx.target_advance_stuck.remove(index_name);
-        gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
-        gop.value_ptr.* = .{ .first_stuck_ns = now_ns, .indexed = indexed, .expected = expected };
-        return;
-    }
-    gop.value_ptr.indexed = indexed;
-    gop.value_ptr.expected = expected;
+    return ctx.target_advance.noteStuck(ctx.alloc, index_name, now_ns, indexed, expected);
 }
 
 fn clearTargetAdvanceStuck(ctx: *AsyncContext, index_name: []const u8) void {
-    lockAtomic(&ctx.target_advance_debt_mutex);
-    defer ctx.target_advance_debt_mutex.unlock();
-    const entry = ctx.target_advance_stuck.fetchRemove(index_name) orelse return;
-    ctx.alloc.free(@constCast(entry.key));
+    return ctx.target_advance.clearStuck(ctx.alloc, index_name);
 }
 
 /// Snapshot of `target_advance_stuck` older than `timeout_ns`, or null if
 /// none. Copies out under the shared mutex so the caller can log/stash the
 /// diagnostic and return without holding it.
-const TargetAdvanceStuckSnapshot = struct {
-    /// Owned copy, duped while `target_advance_debt_mutex` is held; the map's
-    /// own key may be freed by a concurrent `clearTargetAdvanceStuck` the
-    /// instant this function returns, so the caller cannot safely borrow it.
-    index_name: []u8,
-    record: TargetAdvanceStuckRecord,
-
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        alloc.free(self.index_name);
-        self.* = undefined;
-    }
-};
+const TargetAdvanceStuckSnapshot = @import("target_advance_tracker.zig").Snapshot;
 
 fn oldestTargetAdvanceStuck(ctx: *AsyncContext, timeout_ns: u64, now_ns: u64) !?TargetAdvanceStuckSnapshot {
-    lockAtomic(&ctx.target_advance_debt_mutex);
-    defer ctx.target_advance_debt_mutex.unlock();
-    var it = ctx.target_advance_stuck.iterator();
-    while (it.next()) |stuck_entry| {
-        const stuck_ns = now_ns -| stuck_entry.value_ptr.first_stuck_ns;
-        if (stuck_ns < timeout_ns) continue;
-        return .{
-            .index_name = try ctx.alloc.dupe(u8, stuck_entry.key_ptr.*),
-            .record = stuck_entry.value_ptr.*,
-        };
-    }
-    return null;
+    return ctx.target_advance.oldestStuck(ctx.alloc, timeout_ns, now_ns);
 }
 
 test "async context dense catch-up session tracking suppresses local bulk sessions" {
@@ -65732,24 +65287,6 @@ test "dense target advance is blocked while external bulk session is active" {
     try std.testing.expect(!can_advance);
 }
 
-test "dense catch-up maintenance cooldown skips light repeated maintenance" {
-    var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
-    var ctx = AsyncContext{
-        .alloc = std.testing.allocator,
-        .store = undefined,
-        .index_manager = undefined,
-        .apply_mutex = &apply_mutex,
-    };
-    defer ctx.deinit(std.testing.allocator);
-
-    const now_ns = std.time.ns_per_s;
-    try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns));
-    try noteDenseCatchUpMaintenanceRun(&ctx, "vec", now_ns);
-    try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", denseCatchUpMaintenanceUrgentScore(), now_ns + 1));
-    try std.testing.expect(!shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
-    try std.testing.expect(shouldRunDenseCatchUpMaintenance(&ctx, "vec", 1, now_ns + denseCatchUpMaintenanceCooldownNs()));
-}
-
 test "target advance debt logging is rate limited without doing repair work" {
     var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
     var ctx = AsyncContext{
@@ -65765,99 +65302,6 @@ test "target advance debt logging is rate limited without doing repair work" {
     try noteTargetAdvanceDebtLogged(&ctx, "idx", now_ns);
     try std.testing.expect(!shouldLogTargetAdvanceDebt(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
     try std.testing.expect(shouldLogTargetAdvanceDebt(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs()));
-}
-
-test "db target advance tracking rolls back allocation failures" {
-    const Check = struct {
-        const Mode = enum { debt, stuck, maintenance, warning };
-        fn run(alloc: Allocator, mode: Mode) !void {
-            var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
-            var ctx = AsyncContext{
-                .alloc = alloc,
-                .store = undefined,
-                .index_manager = undefined,
-                .apply_mutex = &apply_mutex,
-            };
-            defer ctx.deinit(alloc);
-            const result = switch (mode) {
-                .stuck => noteTargetAdvanceStuck(&ctx, "idx", 10, 3, 9),
-                .debt => recordTargetAdvanceMaintenanceDebt(&ctx, "idx", .{ .config_hash = 11, .generation = 7 }),
-                .maintenance => noteDenseCatchUpMaintenanceRun(&ctx, "idx", 10),
-                .warning => noteTargetAdvanceDebtLogged(&ctx, "idx", 10),
-            };
-            result catch |err| {
-                try std.testing.expectEqual(@as(u32, 0), ctx.target_advance_maintenance_pending.count());
-                try std.testing.expectEqual(@as(u32, 0), ctx.target_advance_stuck.count());
-                try std.testing.expectEqual(@as(u32, 0), ctx.dense_maintenance_last_ns.count());
-                try std.testing.expectEqual(@as(u32, 0), ctx.target_advance_warning_last_ns.count());
-                return err;
-            };
-            if (mode == .stuck) {
-                try noteTargetAdvanceStuck(&ctx, "idx", 20, 5, 9);
-                const record = ctx.target_advance_stuck.get("idx").?;
-                try std.testing.expectEqual(@as(u64, 10), record.first_stuck_ns);
-                try std.testing.expectEqual(@as(u64, 5), record.indexed);
-            } else if (mode == .debt) {
-                try recordTargetAdvanceMaintenanceDebt(&ctx, "idx", .{ .config_hash = 12, .generation = 8 });
-                try std.testing.expect(targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 12, .generation = 8 }));
-            }
-        }
-    };
-    inline for (.{ Check.Mode.debt, Check.Mode.stuck, Check.Mode.maintenance, Check.Mode.warning }) |mode| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{mode});
-    }
-}
-
-test "db bulk coalescer rolls back every insertion allocation failure" {
-    const Check = struct {
-        const Mode = enum { write, delete, owned };
-        fn stage(alloc: Allocator, coalescer: *DB.BulkIngestCoalescer, mode: Mode) !void {
-            switch (mode) {
-                .write => try coalescer.stageWrite(alloc, "key", "body"),
-                .delete => try coalescer.stageDelete(alloc, "key"),
-                .owned => {
-                    const owned = try alloc.dupe(u8, "body");
-                    // Ownership transfers only after successful staging.
-                    errdefer alloc.free(owned);
-                    try coalescer.stageWriteOwned(alloc, "key", owned);
-                },
-            }
-        }
-        fn run(alloc: Allocator, mode: Mode) !void {
-            var coalescer: DB.BulkIngestCoalescer = .{};
-            defer coalescer.deinit(alloc);
-            stage(alloc, &coalescer, mode) catch |err| {
-                try std.testing.expectEqual(@as(u32, 0), coalescer.positions.count());
-                try std.testing.expectEqual(@as(usize, 0), coalescer.entries.items.len);
-                return err;
-            };
-            try std.testing.expectEqual(@as(usize, 0), coalescer.positions.get("key").?);
-            try std.testing.expectEqualStrings("key", coalescer.entries.items[0].key);
-        }
-    };
-    inline for (.{ Check.Mode.write, Check.Mode.delete, Check.Mode.owned }) |mode| {
-        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{mode});
-    }
-}
-
-test "db bulk coalescer preserves replacements on allocation failure" {
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    const alloc = failing.allocator();
-    var coalescer: DB.BulkIngestCoalescer = .{};
-    defer coalescer.deinit(alloc);
-    try coalescer.stageWrite(alloc, "key", "old");
-    const freed_before = failing.freed_bytes;
-    failing.fail_index = failing.alloc_index;
-    try std.testing.expectError(error.OutOfMemory, coalescer.stageWrite(alloc, "key", "replacement"));
-    try std.testing.expectEqual(freed_before, failing.freed_bytes);
-    try std.testing.expectEqualStrings("old", coalescer.entries.items[0].value.?);
-    failing.fail_index = std.math.maxInt(usize);
-    try coalescer.stageWrite(alloc, "key", "replacement");
-    try std.testing.expectEqualStrings("replacement", coalescer.entries.items[0].value.?);
-    try coalescer.stageDelete(alloc, "key");
-    try std.testing.expect(coalescer.entries.items[0].value == null);
-    try coalescer.stageWrite(alloc, "key", "after-delete");
-    try std.testing.expectEqualStrings("after-delete", coalescer.entries.items[0].value.?);
 }
 
 test "target advance maintenance handoff is exact-incarnation scoped" {
@@ -84749,7 +84193,7 @@ test "owned db reconciles published schema indexes on its durable worker lane" {
     db.backend_runtime.durable_jobs.drainOwner(db.backend_owner_id);
 
     try std.testing.expectEqual(table_catalog_mod.IndexState.ready, db.core.table_catalog.index_state);
-    try std.testing.expectEqual(@as(u8, 0), db.local_execution.schema_index_reconcile_state.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 0), db.local_execution.schema_reconcile.state.load(.acquire));
 }
 
 test "relational columnar dirty scans intersect query and shard bounds before decoding" {
@@ -87811,8 +87255,7 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         const stored_public_v1 = try db.core.store.get(alloc, public_v1_key);
         defer alloc.free(stored_public_v1);
         try std.testing.expectEqualStrings(schema_json, stored_public_v1);
-        try std.testing.expectEqual(@as(u64, 1234), try @import("../server_group_metadata.zig").ensureGroupCreatedAtMillis(&db, alloc, 7, 1234));
-        try std.testing.expectEqual(@as(?u64, 1234), try @import("../server_group_metadata.zig").getGroupCreatedAtMillis(&db, alloc, 7));
+        try db.batch(.{ .writes = &.{.{ .key = "\x00\x00__metadata__:local_test", .value = "opaque" }} });
         try db.addIndex(.{ .name = "ft_rows", .kind = .full_text, .config_json = "{}" });
 
         try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{
@@ -87876,7 +87319,9 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
         const raw = (try db.get(alloc, "row:a")) orelse return error.TestExpectedEqual;
         defer alloc.free(raw);
-        try std.testing.expectEqual(@as(?u64, 1234), try @import("../server_group_metadata.zig").getGroupCreatedAtMillis(&db, alloc, 7));
+        const metadata = (try db.get(alloc, "\x00\x00__metadata__:local_test")).?;
+        defer alloc.free(metadata);
+        try std.testing.expectEqualStrings("opaque", metadata);
         try std.testing.expectEqualStrings(
             "{\"id\":\"a\",\"count\":9007199254740993,\"status\":\"active\",\"title\":\"replayed relational row\",\"payload\":{\"n\":0.10000000000000001}}",
             raw,
@@ -88190,7 +87635,7 @@ test "db portable import target rejects active in-memory bulk leases" {
     db.async_context.portable_runtime_activation_pending.store(true, .release);
     try std.testing.expectError(error.PortableRuntimeActivationPending, db.beginBulkIngestSession());
     try std.testing.expectEqual(@as(u32, 0), db.async_context.active_external_dense_bulk_sessions.load(.acquire));
-    try std.testing.expect(!db.bulk_ingest_coalescer.active);
+    try std.testing.expect(!db.bulk_ingest_session.active);
     db.async_context.portable_runtime_activation_pending.store(false, .release);
 
     try db.beginBulkIngestSession();

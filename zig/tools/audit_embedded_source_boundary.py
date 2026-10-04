@@ -280,6 +280,9 @@ def check_replication_contract(relative: str, source: str) -> None:
         "storage/db/query_visibility.zig",
         "storage/db/source_pin_cleanup_owner.zig",
         "storage/db/applied_sequence_coalescer.zig",
+        "storage/db/bulk_ingest_session.zig",
+        "storage/db/target_advance_tracker.zig",
+        "storage/db/schema_reconcile_owner.zig",
     }:
         return
     source = mask_literals(production_source(source))

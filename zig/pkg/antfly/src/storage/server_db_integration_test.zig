@@ -4189,3 +4189,33 @@ test "server ordered graph cleanup applies complete planner pages and duplicate 
     try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key));
     try std.testing.expect((try db.prepareGraphEndpointCleanupBatch(alloc)) == null);
 }
+
+test "server group timestamp survives relational schema upgrade and reopen" {
+    const metadata = @import("server_group_metadata.zig");
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("server-group-schema");
+    defer directory.cleanup();
+    const schema_v1 = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}";
+    const schema_v2 = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"note\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}";
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_v1);
+        try std.testing.expectEqual(@as(u64, 1234), try metadata.ensureGroupCreatedAtMillis(&db, alloc, 7, 1234));
+    }
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_v2);
+        try std.testing.expectEqual(@as(?u64, 1234), try metadata.getGroupCreatedAtMillis(&db, alloc, 7));
+        try std.testing.expectEqual(@as(u64, 1234), try metadata.ensureGroupCreatedAtMillis(&db, alloc, 7, 5678));
+        const raw = (try db.get(alloc, "\x00\x00__metadata__:data_group_created_at:7")).?;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings("1234", raw);
+    }
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try std.testing.expectEqual(@as(?u64, 1234), try metadata.getGroupCreatedAtMillis(&db, alloc, 7));
+    }
+}
