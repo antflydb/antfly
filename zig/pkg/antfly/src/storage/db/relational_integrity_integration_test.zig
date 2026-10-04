@@ -594,7 +594,7 @@ test "child FK generation schema install commits catalog and source release with
     fence.transition_id = 12;
     fence.admission_epoch = 2;
     try db.applyRelationalTopologyControl(.{ .action = .begin, .fence = fence }, null);
-    const publication: db_mod.DB.PublishedChildSchema = .{ .fence = fence, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest, .raft_entry = .{ .term = 1, .index = 1 } };
+    const publication: db_mod.DB.PublishedChildSchema = .{ .fence = fence, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest, .ordered_receipt = .{ .term = 1, .index = 1 } };
     var changed = publication;
     changed.after_catalog_digest = @splat(9);
     try std.testing.expectError(error.IntegrityCatalogChanged, db.installPublishedChildSchema(alloc, after_json, changed));
@@ -602,8 +602,8 @@ test "child FK generation schema install commits catalog and source release with
     changed.before_schema_json_digest = @splat(9);
     try std.testing.expectError(error.IntegrityCatalogChanged, db.installPublishedChildSchema(alloc, after_json, changed));
     const command: topology.Command = .{ .action = .install_child_schema, .fence = fence, .child_schema_install = .{ .schema_json = after_json, .before_schema_json_digest = before_schema_json_digest, .schema_json_digest = schema_json_digest, .before_catalog_digest = before_digest, .after_catalog_digest = after_digest } };
-    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.raft_entry);
-    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.raft_entry);
+    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.ordered_receipt);
+    try server_test_adapter.applyOrdered(&db, .{ .relational_topology = command }, publication.ordered_receipt);
     const installed = (try db.getSchemaJson(alloc)).?;
     defer alloc.free(installed);
     try std.testing.expectEqualStrings(after_json, installed);
@@ -634,8 +634,8 @@ test "child FK generation schema install commits catalog and source release with
         .schema_json_digest = schema_json_digest,
         .before_catalog_digest = before_digest,
         .after_catalog_digest = @splat(9),
-        .applied_term = publication.raft_entry.term,
-        .applied_index = publication.raft_entry.index,
+        .applied_term = publication.ordered_receipt.term,
+        .applied_index = publication.ordered_receipt.index,
     });
     defer alloc.free(bad_payload);
     const bad_record: @import("replication_record.zig").Record = .{
@@ -655,8 +655,8 @@ test "child FK generation schema install commits catalog and source release with
         .schema_json_digest = schema_json_digest,
         .before_catalog_digest = before_digest,
         .after_catalog_digest = after_digest,
-        .applied_term = publication.raft_entry.term,
-        .applied_index = publication.raft_entry.index,
+        .applied_term = publication.ordered_receipt.term,
+        .applied_index = publication.ordered_receipt.index,
     });
     defer alloc.free(payload);
     const record: @import("replication_record.zig").Record = .{
@@ -1440,9 +1440,13 @@ test "relational integrity restore follower repairs projection and CHECK debt be
         }
         try std.testing.expect(validated);
         try applyRestoreReplica(&target, .{ .restore_staging = .{ .finish = .{ .scope = scope.digest(), .phase = .published } } }, validate_index + 1, ha);
-        var result = try target.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = 1 });
+        // Verify every restored row is query-visible. A one-hit window has
+        // only a bounded total after stored-row visibility validation.
+        var result = try target.search(alloc, .{ .index_name = "text", .full_text = .{ .match = .{ .field = "text", .text = "keyword" } }, .limit = row_count });
         defer result.deinit();
+        try std.testing.expectEqual(@as(usize, row_count), result.hits.len);
         try std.testing.expectEqual(@as(u32, row_count), result.total_hits);
+        try std.testing.expectEqual(.exact, result.total_hits_relation);
     }
 }
 
@@ -1753,7 +1757,7 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
     const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-2pc-slots", .{tmp.sub_path}, 0);
     var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
     defer primary.close();
-    target.local_execution.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    target.local_execution.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .async } });
     defer target.local_execution.replication_async_batch_mirror = null;
     var view = target.core.acquireSchemaView().?;
     defer view.release();
@@ -1765,8 +1769,8 @@ test "relational integrity scoped two phase resolution mirrors binary claims thr
     const address = try integrity.Address.init(try binding(&target, .unique, "pk"), tuple.items);
     const transaction = try target.beginTransactionScoped(@splat(18), 100, 100, &.{}, false, false, scope.digest());
     try target.writeTransaction(transaction, .{ .restore_staging_scope = scope.digest(), .relational_schema_version = 1, .integrity_commands = &.{.{ .address = address, .operation = .{ .establish = .{ .tuple = tuple.items, .parent_table = "parents", .parent_key = "p", .schema_version = 1 } } }} });
-    try target.resolveReplicatedTransactionAtRaftEntry(transaction, .committed, 200, .full_index, .none, .{ .term = 1, .index = 1 }, null);
-    try target.resolveReplicatedTransactionAtRaftEntry(transaction, .committed, 200, .full_index, .none, .{ .term = 1, .index = 1 }, null);
+    try target.resolveReplicatedTransactionAtOrderedReceipt(transaction, .committed, 200, .full_index, .none, .{ .term = 1, .index = 1 }, null);
+    try target.resolveReplicatedTransactionAtOrderedReceipt(transaction, .committed, 200, .full_index, .none, .{ .term = 1, .index = 1 }, null);
     try std.testing.expectEqual(@as(u64, 1), primary.lastLsn());
     var entry = (try primary.log.entryAt(alloc, 1)).?;
     defer entry.deinit(alloc);
@@ -1808,7 +1812,7 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     const slots_path = try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/live-slots", .{tmp.sub_path}, 0);
     var primary = try primary_mod.Primary.open(alloc, log_path, slots_path, .{ .cluster_id = 1, .timeline_id = 1, .epoch = 1, .table_id = 10, .shard_id = 11 }, .{});
     defer primary.close();
-    db.local_execution.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    db.local_execution.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .async } });
     defer db.local_execution.replication_async_batch_mirror = null;
     var view = db.core.acquireSchemaView().?;
     defer view.release();
@@ -1876,9 +1880,11 @@ test "relational integrity live two phase HA replay preserves rows and binary cl
     const invalid_key = invalid_address.claimKey();
     const invalid_value = try claim.encode(alloc, invalid_address);
     defer alloc.free(invalid_value);
-    const invalid_lsn = try effects.appendBatchMutationRequest(alloc, &primary, .{
+    const invalid_payload = try effects.encodeBatchMutationRequestAlloc(alloc, .{
         .writes = &.{.{ .key = &invalid_key, .value = invalid_value }},
-    }, .{});
+    });
+    defer alloc.free(invalid_payload);
+    const invalid_lsn = try primary.append(.{ .payload_codec = .json, .payload = invalid_payload });
     var invalid_entry = (try primary.log.entryAt(alloc, invalid_lsn)).?;
     defer invalid_entry.deinit(alloc);
     try std.testing.expectError(error.IntegrityCatalogChanged, replication_ingress.applyRecord(&replica, invalid_entry.record));
@@ -2125,7 +2131,7 @@ test "relational integrity topology handoff transfers routed companions with res
     const parent_acknowledge: topology.Command = .{ .action = .acknowledge_parent_retirement, .fence = parent_fence, .parent_activation = .{ .plan_id = @splat(4), .plan_digest = @splat(5), .publication_digest = retirement.publicationDigest(@splat(4), @splat(5)) } };
     const source_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 601, .peer_group_id = 602, .role = .split_source, .namespace = source_owner.namespace, .catalog_digest = source_owner.catalog_digest, .admission_epoch = source_owner.next_epoch + 1 };
     const destination_fence: topology.Fence = .{ .transition_id = 800, .attempt = 1, .owner_group_id = 602, .peer_group_id = 601, .role = .split_destination, .namespace = destination_owner.namespace, .catalog_digest = destination_owner.catalog_digest };
-    try std.testing.expectError(error.GenerationRetirementAcknowledgementPending, source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null));
+    try std.testing.expectError(error.IntegrityTopologyBusy, source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null));
     try source.applyRelationalTopologyControl(parent_acknowledge, null);
     try source.applyRelationalTopologyControl(.{ .action = .begin, .fence = source_fence }, null);
     try destination.applyRelationalTopologyControl(.{ .action = .begin, .fence = destination_fence }, null);
@@ -2271,7 +2277,7 @@ fn testMergeIntegrityHandoff(comptime rollback: bool, comptime empty: bool, comp
     var primary: @import("../hot_standby/primary.zig").Primary = if (ha) try @import("../hot_standby/primary.zig").Primary.open(alloc, try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-log", .{tmp.sub_path}, 0), try std.fmt.allocPrintSentinel(owned, ".zig-cache/tmp/{s}/ha-slots", .{tmp.sub_path}, 0), .{ .cluster_id = 901, .timeline_id = 1, .epoch = 1 }, .{}) else undefined;
     defer if (ha) primary.close();
     const source_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 901 }, .primary_backend = .{ .lsm = .{} } };
-    const destination_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 902 }, .primary_backend = .{ .lsm = .{} }, .replication_async_batch_mirror = if (ha) .{ .publisher = hot_standby_publisher_adapter.bind(&primary) } else null, .replication_write_gate = if (ha) .{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) } else null };
+    const destination_options: db_mod.OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .identity_namespace = .{ .table_id = 900, .shard_id = 902 }, .primary_backend = .{ .lsm = .{} }, .replication_async_batch_mirror = if (ha) hot_standby_publisher_adapter.bindMirror(&primary, .{}) else null, .replication_write_gate = if (ha) .{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) } else null };
     var source = try db_mod.DB.open(alloc, source_path, source_options);
     defer source.close();
     var destination = try db_mod.DB.open(alloc, destination_path, destination_options);
@@ -2405,8 +2411,8 @@ fn verifyMergeReplicationReplay(primary: *@import("../hot_standby/primary.zig").
     while (lsn <= primary.lastLsn()) : (lsn += 1) {
         var entry = (try primary.log.entryAt(std.testing.allocator, lsn)) orelse return error.TestUnexpectedResult;
         defer entry.deinit(std.testing.allocator);
-        try replication_ingress.applyRecord(&standby, entry.record);
-        try replication_ingress.applyRecord(&standby, entry.record);
+        try replication_ingress.applyRecord(standby, entry.record);
+        try replication_ingress.applyRecord(standby, entry.record);
     }
     try std.testing.expect((try standby.relationalTopologyStatus()).fence == null);
     try std.testing.expectEqualStrings(if (rollback) "m" else "", standby.getRange().end);

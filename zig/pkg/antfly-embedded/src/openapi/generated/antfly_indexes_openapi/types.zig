@@ -2746,6 +2746,10 @@ pub const DistanceMetric = enum {
 
 /// A typed, weighted connection between documents
 pub const Edge = struct {
+    /// Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+    edge_id: ?[]const u8 = null,
+    /// Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
+    owner_document: ?[]const u8 = null,
     /// Base64-encoded source document key
     source: []const u8,
     /// Base64-encoded target document key
@@ -2762,6 +2766,8 @@ pub const Edge = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_id", "edge_id", true },
+        .{ "owner_document", "owner_document", true },
         .{ "source", "source", false },
         .{ "target", "target", false },
         .{ "type", "type", false },
@@ -2781,6 +2787,14 @@ pub const Edge = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_id) |value| {
+            try jw.objectField("edge_id");
+            try jw.write(value);
+        }
+        if (self.owner_document) |value| {
+            try jw.objectField("owner_document");
+            try jw.write(value);
+        }
         try jw.objectField("source");
         try jw.write(self.source);
         try jw.objectField("target");
@@ -3714,11 +3728,11 @@ pub const EnrichmentConfig = struct {
     full_text_index: ?bool = null,
     /// Produced asset content type for asset enrichments.
     content_type: ?[]const u8 = null,
-    /// Write-only producer configuration. Cannot be combined with producer_json or transcriber.
+    /// Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle.
     producer: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
     producer_json: ?[]const u8 = null,
-    /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
+    /// Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission.
     neighbor_context: ?EnrichmentNeighborContextConfig = null,
     /// Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity.
     execution: ?ExecutionPolicy = null,
@@ -4595,8 +4609,10 @@ pub const GraphArtifactContextConfig = struct {
     }
 };
 
-/// Maps each artifact item to an edge type, weight, and public metadata.
+/// Maps each artifact item to a relationship identity, type, weight, and public metadata.
 pub const GraphArtifactEdgeMappingConfig = struct {
+    /// Stable application relationship ID. Required with nodes.source. Replays update the same identity; distinct IDs preserve parallel relationships.
+    edge_id: ?GraphTemplateValue = null,
     type: ?GraphTemplateValue = null,
     weight: ?GraphTemplateValue = null,
     /// JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses.
@@ -4604,6 +4620,7 @@ pub const GraphArtifactEdgeMappingConfig = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_id", "edge_id", true },
         .{ "type", "type", true },
         .{ "weight", "weight", true },
         .{ "metadata", "metadata", true },
@@ -4619,6 +4636,10 @@ pub const GraphArtifactEdgeMappingConfig = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_id) |value| {
+            try jw.objectField("edge_id");
+            try jw.write(value);
+        }
         if (self.type) |value| {
             try jw.objectField("type");
             try jw.write(value);
@@ -4638,11 +4659,14 @@ pub const GraphArtifactEdgeMappingConfig = struct {
 /// Maps each artifact item to graph node identifiers.
 pub const GraphArtifactNodeMappingConfig = struct {
     model: ?[]const u8 = null,
+    /// Logical source endpoint. When set, edge.edge_id is required; the artifact document remains the durable owner.
+    source: ?GraphTemplateValue = null,
     target: ?GraphTemplateValue = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
         .{ "model", "model", true },
+        .{ "source", "source", true },
         .{ "target", "target", true },
     };
 
@@ -4658,6 +4682,10 @@ pub const GraphArtifactNodeMappingConfig = struct {
         try jw.beginObject();
         if (self.model) |value| {
             try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.source) |value| {
+            try jw.objectField("source");
             try jw.write(value);
         }
         if (self.target) |value| {
@@ -4837,10 +4865,43 @@ pub const GraphBindingNode = struct {
 
 /// A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive.
 pub const GraphBindingsResult = struct {
+    /// Evaluated values parallel to returned rows, when decision evaluation was requested.
+    computed: ?[]const std.json.ArrayHashMap(std.json.Value) = null,
     /// Stable discriminator for the graph result shape.
     kind: []const u8,
     rows: []const GraphResultRow,
     stats: GraphResultStats,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "computed", "computed", true },
+        .{ "kind", "kind", false },
+        .{ "rows", "rows", false },
+        .{ "stats", "stats", false },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.computed) |value| {
+            try jw.objectField("computed");
+            try jw.write(value);
+        }
+        try jw.objectField("kind");
+        try jw.write(self.kind);
+        try jw.objectField("rows");
+        try jw.write(self.rows);
+        try jw.objectField("stats");
+        try jw.write(self.stats);
+        try jw.endObject();
+    }
 };
 
 pub const GraphBindingsReturn = struct {
@@ -5975,8 +6036,9 @@ pub const GraphIndexStats = struct {
     }
 };
 
-/// Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction and type, and are ordered best-first by the selected objective.
+/// Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction, type, edge ID and fact owner, and are ordered best-first by the selected objective.
 pub const GraphKShortestPaths = struct {
+    edge_filter: ?GraphRelationshipFilter = null,
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     /// Stored-edge direction relative to each expanded path node; defaults to `out`.
@@ -5996,6 +6058,7 @@ pub const GraphKShortestPaths = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_filter", "edge_filter", true },
         .{ "from", "from", false },
         .{ "to", "to", false },
         .{ "direction", "direction", true },
@@ -6019,6 +6082,10 @@ pub const GraphKShortestPaths = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_filter) |value| {
+            try jw.objectField("edge_filter");
+            try jw.write(value);
+        }
         try jw.objectField("from");
         try jw.write(self.from);
         try jw.objectField("to");
@@ -6120,6 +6187,7 @@ pub const GraphMatch = struct {
 
 /// Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary.
 pub const GraphMatchEdge = struct {
+    edge_filter: ?GraphRelationshipFilter = null,
     from: antfly_graph_identifier_openapi.GraphIdentifier,
     to: antfly_graph_identifier_openapi.GraphIdentifier,
     /// Stored-edge direction relative to `from`; defaults to `out`.
@@ -6132,6 +6200,7 @@ pub const GraphMatchEdge = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_filter", "edge_filter", true },
         .{ "from", "from", false },
         .{ "to", "to", false },
         .{ "direction", "direction", true },
@@ -6151,6 +6220,10 @@ pub const GraphMatchEdge = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_filter) |value| {
+            try jw.objectField("edge_filter");
+            try jw.write(value);
+        }
         try jw.objectField("from");
         try jw.write(self.from);
         try jw.objectField("to");
@@ -7342,6 +7415,10 @@ pub const GraphPath = struct {
 
 /// One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables.
 pub const GraphPathEdge = struct {
+    /// Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+    edge_id: ?[]const u8 = null,
+    /// Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
+    owner_document: ?[]const u8 = null,
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     direction: GraphPathEdgeDirection,
@@ -7352,6 +7429,8 @@ pub const GraphPathEdge = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_id", "edge_id", true },
+        .{ "owner_document", "owner_document", true },
         .{ "from", "from", false },
         .{ "to", "to", false },
         .{ "direction", "direction", false },
@@ -7370,6 +7449,14 @@ pub const GraphPathEdge = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_id) |value| {
+            try jw.objectField("edge_id");
+            try jw.write(value);
+        }
+        if (self.owner_document) |value| {
+            try jw.objectField("owner_document");
+            try jw.write(value);
+        }
         try jw.objectField("from");
         try jw.write(self.from);
         try jw.objectField("to");
@@ -7587,6 +7674,7 @@ pub const GraphQuery = union(enum) {
 
 /// Deprecated graph_searches traversal and path parameters.
 pub const GraphQueryParams = struct {
+    edge_filter: ?GraphRelationshipFilter = null,
     /// At most 64 unique edge types totaling at most 64 KiB.
     edge_types: ?[]const GraphEdgeType = null,
     direction: ?EdgeDirection = null,
@@ -7604,6 +7692,7 @@ pub const GraphQueryParams = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_filter", "edge_filter", true },
         .{ "edge_types", "edge_types", true },
         .{ "direction", "direction", true },
         .{ "max_depth", "max_depth", true },
@@ -7629,6 +7718,10 @@ pub const GraphQueryParams = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_filter) |value| {
+            try jw.objectField("edge_filter");
+            try jw.write(value);
+        }
         if (self.edge_types) |value| {
             try jw.objectField("edge_types");
             try jw.write(value);
@@ -7720,6 +7813,90 @@ pub const GraphQueryType = enum {
             .{ "pattern", .pattern },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// AND predicates applied to every relationship before neighbor admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a created_at value. Invalid timestamp properties never match.
+pub const GraphRelationshipFilter = struct {
+    properties: ?[]const GraphRelationshipPropertyPredicate = null,
+    /// Require metadata.valid_at <= instant < metadata.invalid_at.
+    valid_at: ?[]const u8 = null,
+    /// Require metadata.created_at <= instant < metadata.expired_at.
+    known_at: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "properties", "properties", true },
+        .{ "valid_at", "valid_at", true },
+        .{ "known_at", "known_at", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.properties) |value| {
+            try jw.objectField("properties");
+            try jw.write(value);
+        }
+        if (self.valid_at) |value| {
+            try jw.objectField("valid_at");
+            try jw.write(value);
+        }
+        if (self.known_at) |value| {
+            try jw.objectField("known_at");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const GraphRelationshipPropertyPredicate = struct {
+    /// JSON pointer to /metadata/... or /edge_id, /owner_document, /source, /target, /type, /weight, /created_at, /updated_at.
+    field: []const u8,
+    op: []const u8,
+    /// Non-null scalar comparison value. Omit for is_null and is_not_null.
+    value: ?std.json.Value = null,
+    /// Datetime compares RFC3339 instants rather than string ordering.
+    value_type: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "field", "field", false },
+        .{ "op", "op", false },
+        .{ "value", "value", true },
+        .{ "value_type", "value_type", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("field");
+        try jw.write(self.field);
+        try jw.objectField("op");
+        try jw.write(self.op);
+        if (self.value) |value| {
+            try jw.objectField("value");
+            try jw.write(value);
+        }
+        if (self.value_type) |value| {
+            try jw.objectField("value_type");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -8239,6 +8416,7 @@ pub const GraphRowCountTarget = enum {
 
 /// Find the best path from `from` to `to` in the requested stored-edge direction.
 pub const GraphShortestPath = struct {
+    edge_filter: ?GraphRelationshipFilter = null,
     from: GraphPathEndpoint,
     to: GraphPathEndpoint,
     /// Stored-edge direction relative to each expanded path node; defaults to `out`.
@@ -8257,6 +8435,7 @@ pub const GraphShortestPath = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_filter", "edge_filter", true },
         .{ "from", "from", false },
         .{ "to", "to", false },
         .{ "direction", "direction", true },
@@ -8279,6 +8458,10 @@ pub const GraphShortestPath = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_filter) |value| {
+            try jw.objectField("edge_filter");
+            try jw.write(value);
+        }
         try jw.objectField("from");
         try jw.write(self.from);
         try jw.objectField("to");
@@ -8329,6 +8512,7 @@ pub const GraphTemplateValue = std.json.Value;
 
 /// Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge.
 pub const GraphTraversal = struct {
+    edge_filter: ?GraphRelationshipFilter = null,
     start: GraphNodeSelector,
     /// Stored-edge direction relative to each expanded node; defaults to `out`.
     direction: ?EdgeDirection = null,
@@ -8358,6 +8542,7 @@ pub const GraphTraversal = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_filter", "edge_filter", true },
         .{ "start", "start", false },
         .{ "direction", "direction", true },
         .{ "edge_types", "edge_types", true },
@@ -8385,6 +8570,10 @@ pub const GraphTraversal = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_filter) |value| {
+            try jw.objectField("edge_filter");
+            try jw.write(value);
+        }
         try jw.objectField("start");
         try jw.write(self.start);
         if (self.direction) |value| {
@@ -9798,6 +9987,10 @@ pub const Path = struct {
 };
 
 pub const PathEdge = struct {
+    /// Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple.
+    edge_id: ?[]const u8 = null,
+    /// Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion.
+    owner_document: ?[]const u8 = null,
     source: ?[]const u8 = null,
     target: ?[]const u8 = null,
     type: ?[]const u8 = null,
@@ -9806,6 +9999,8 @@ pub const PathEdge = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_id", "edge_id", true },
+        .{ "owner_document", "owner_document", true },
         .{ "source", "source", true },
         .{ "target", "target", true },
         .{ "type", "type", true },
@@ -9823,6 +10018,14 @@ pub const PathEdge = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_id) |value| {
+            try jw.objectField("edge_id");
+            try jw.write(value);
+        }
+        if (self.owner_document) |value| {
+            try jw.objectField("owner_document");
+            try jw.write(value);
+        }
         if (self.source) |value| {
             try jw.objectField("source");
             try jw.write(value);
@@ -10036,6 +10239,7 @@ pub const PathWeightMode = enum {
 
 /// Deprecated linear graph_searches pattern edge.
 pub const PatternEdgeStep = struct {
+    edge_filter: ?GraphRelationshipFilter = null,
     /// Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB.
     types: ?[]const GraphEdgeType = null,
     direction: ?EdgeDirection = null,
@@ -10046,6 +10250,7 @@ pub const PatternEdgeStep = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "edge_filter", "edge_filter", true },
         .{ "types", "types", true },
         .{ "direction", "direction", true },
         .{ "min_hops", "min_hops", true },
@@ -10064,6 +10269,10 @@ pub const PatternEdgeStep = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.edge_filter) |value| {
+            try jw.objectField("edge_filter");
+            try jw.write(value);
+        }
         if (self.types) |value| {
             try jw.objectField("types");
             try jw.write(value);
@@ -10094,11 +10303,13 @@ pub const PatternEdgeStep = struct {
 
 /// Deprecated graph_searches pattern response row.
 pub const PatternMatch = struct {
+    _computed: ?std.json.ArrayHashMap(std.json.Value) = null,
     bindings: ?std.json.ArrayHashMap(LegacyGraphResultNode) = null,
     path: ?[]const PathEdge = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "_computed", "_computed", true },
         .{ "bindings", "bindings", true },
         .{ "path", "path", true },
     };
@@ -10113,6 +10324,10 @@ pub const PatternMatch = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self._computed) |value| {
+            try jw.objectField("_computed");
+            try jw.write(value);
+        }
         if (self.bindings) |value| {
             try jw.objectField("bindings");
             try jw.write(value);
@@ -10434,9 +10649,9 @@ pub const StatefulGraphQueryResults = std.json.ArrayHashMap(StatefulGraphResult)
 
 /// Graph result emitted by the stateful compatibility transport. Canonical graph_queries produce GraphResult; deprecated graph_searches may produce LegacyGraphSearchResult during the compatibility window.
 pub const StatefulGraphResult = union(enum) {
+    graph_bindings_result: *GraphBindingsResult,
     graph_nodes_result: *GraphNodesResult,
     graph_aggregates_result: *GraphAggregatesResult,
-    graph_bindings_result: *GraphBindingsResult,
     graph_paths_result: *GraphPathsResult,
     legacy_graph_search_result: *LegacyGraphSearchResult,
 
@@ -10478,9 +10693,9 @@ pub const StatefulGraphResult = union(enum) {
         const probe = try std.json.parseFromSliceLeaky(Probe, allocator, input, probe_options);
         switch (probe.kind) {
             .value => |disc_str| {
+                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "nodes")) return .{ .graph_nodes_result = try parseStructuralVariantFromSlice(GraphNodesResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "aggregates")) return .{ .graph_aggregates_result = try parseStructuralVariantFromSlice(GraphAggregatesResult, allocator, input, options) };
-                if (std.mem.eql(u8, disc_str, "bindings")) return .{ .graph_bindings_result = try parseStructuralVariantFromSlice(GraphBindingsResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "paths")) return .{ .graph_paths_result = try parseStructuralVariantFromSlice(GraphPathsResult, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "legacy")) return .{ .legacy_graph_search_result = try parseStructuralVariantFromSlice(LegacyGraphSearchResult, allocator, input, options) };
                 return error.UnexpectedToken;
@@ -10506,6 +10721,10 @@ pub const StatefulGraphResult = union(enum) {
             .string => |value| value,
             else => return error.UnexpectedToken,
         };
+        if (std.mem.eql(u8, disc_str, "bindings")) {
+            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .graph_bindings_result = parsed };
+        }
         if (std.mem.eql(u8, disc_str, "nodes")) {
             const parsed = try parseStructuralVariant(GraphNodesResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_nodes_result = parsed };
@@ -10513,10 +10732,6 @@ pub const StatefulGraphResult = union(enum) {
         if (std.mem.eql(u8, disc_str, "aggregates")) {
             const parsed = try parseStructuralVariant(GraphAggregatesResult, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .graph_aggregates_result = parsed };
-        }
-        if (std.mem.eql(u8, disc_str, "bindings")) {
-            const parsed = try parseStructuralVariant(GraphBindingsResult, allocator, source, options) orelse return error.UnexpectedToken;
-            return .{ .graph_bindings_result = parsed };
         }
         if (std.mem.eql(u8, disc_str, "paths")) {
             const parsed = try parseStructuralVariant(GraphPathsResult, allocator, source, options) orelse return error.UnexpectedToken;
@@ -10531,9 +10746,9 @@ pub const StatefulGraphResult = union(enum) {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
+            .graph_bindings_result => |v| try jw.write(v.*),
             .graph_nodes_result => |v| try jw.write(v.*),
             .graph_aggregates_result => |v| try jw.write(v.*),
-            .graph_bindings_result => |v| try jw.write(v.*),
             .graph_paths_result => |v| try jw.write(v.*),
             .legacy_graph_search_result => |v| try jw.write(v.*),
         }

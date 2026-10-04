@@ -42,6 +42,7 @@ pub const AddTestsResult = struct {
     run_lib_api_storage_authority_tests: *std.Build.Step.Run,
     api_table_writes_docid_test_mod: *std.Build.Module,
     write_implementation_tests: *std.Build.Step.Compile,
+    public_api_parity_tests: *std.Build.Step.Compile,
     api_table_reads_docid_test_mod: *std.Build.Module,
     run_lib_api_docid_tests: *std.Build.Step.Run,
     api_derived_coverage_test_mod: *std.Build.Module,
@@ -67,6 +68,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const public_api_parity_default_filters = [_][]const u8{
         "SQL API cross-table MERGE retains both source and target range proofs",
         "api http server authenticates bounded online merge owner routes",
+        "online merge private standalone rewrite port pins authority and never fabricates Raft coordinates",
         "online merge private port fences owners cancellation and deadlines before dispatch",
         "online merge private port preserves source recovery errors through foreign runtime dispatch",
         "join planning",
@@ -167,7 +169,6 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api http server prefers metadata-owned restore over inline write-source restore",
         "api http server does not retry authoritative metadata table-exists conflict",
         "api http server retries interrupted metadata restore publication",
-        "public API request body limit matches Go linear merge contract",
         "api query contract parses direct JSON-pointer path aliases",
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
@@ -222,6 +223,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "encode query request rejects invalid public phrase geo and ip values",
         "optional pure should preserves zero baseline and text scores",
         "remote query preserves optional should and named filter bindings",
+        "api query contract graph evaluation preserves base hit paging and shard windows",
         "distributed reranking widens retrieval and stays coordinator owned",
         "reranker candidate and output windows have distinct bounds",
         "reranker admission precedes candidate rendering",
@@ -302,14 +304,31 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "public api multi-node integration routes CRUD from a non-host node",
     };
     const public_api_parity_runtime_filters = selectTestFilters(b, &public_api_parity_default_filters);
+    // The public-api-parity e2e filters boot a real multi-node server (see
+    // "public api multi-node e2e routes CRUD from a non-host node" and
+    // friends), which reaches the real storage-kernel owner through
+    // api/kernel_owner_source.zig regardless of the control-only source
+    // selection. Clone antfly_test_mod's root instead of reusing it directly
+    // so only this one compile carries the storage owner archive; root
+    // composition links it below rather than every antfly_test_mod consumer.
+    const public_api_parity_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, public_api_parity_test_mod, true, true);
+    public_api_parity_test_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    public_api_parity_test_mod.addAnonymousImport("lmdb_vopr_source", .{
+        .root_source_file = b.path("lib/lmdb/src/lmdb_vopr.zig"),
+    });
     const public_api_parity_tests = b.addTest(.{
-        .root_module = antfly_test_mod,
+        .root_module = public_api_parity_test_mod,
         .filters = compileFiltersWithAnchors(b, &.{"api module compiles"}, public_api_parity_runtime_filters),
         // The macOS debug root includes the complete public transport,
-        // generated-contract, and native-index surface. ReleaseSafe test
-        // compilation currently peaks above 13 GiB; reserve the measured
+        // generated-contract, and native-index surface. Debug test
+        // compilation currently peaks at 15.09 GB; reserve the measured
         // envelope so the scheduler does not reject a successful compile.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 15 else 7) * 1024 * 1024 * 1024,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
@@ -396,6 +415,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         &lib_api_auth_default_filters,
     );
     const lib_api_auth_tests = b.addTest(.{
+        // macOS Debug measured 11.43 GB for the linked auth surface.
+        .max_rss = if (target.result.os.tag == .macos) 12 * 1024 * 1024 * 1024 else 0,
         .root_module = antfly_test_mod,
         .filters = lib_api_auth_runtime_filters,
         .test_runner = .{
@@ -1114,6 +1135,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "owner-local delayed statement scans",
             "relational row query retained owner holds admission and releases failed opens",
             "table reads translate request deadlines into the routing clock",
+            "api query contract graph evaluation preserves base hit paging and shard windows",
             "distributed reranking widens retrieval and stays coordinator owned",
             "reranker candidate and output windows have distinct bounds",
             "reranker paging preserves the underlying retrieval total",
@@ -1284,6 +1306,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "distributed graph edge reader routes outgoing and fans out incoming adjacency",
             "distributed graph edges response round trips owned edges",
             "distributed graph retries once on topology change and succeeds",
+            "distributed K path identity preserves same type fact ids",
+            "distributed graph identity hashing",
+            "distributed weighted fact paths",
+            "distributed graph expand request preserves algebraic semiring planning flag",
+            "canonical relationship predicates",
+            "projected graph endpoint routing recognizes every source form",
+            "distributed graph edge reader finds fact owners outside the source endpoint shard",
+            "distributed graph edges response round trips owned edges",
+            "internal batch parser owns and round trips graph mutations",
+            "internal batch graph endpoint cleanup command",
+            "graph cleanup owner replay afterimages",
+            "Yen scratch reservations fail before allocation and release exactly",
             "graph workers report retired ranges as topology unavailability",
             "distributed graph incoming probe expands only positive source shards",
             "graph hydrate incoming probe wire carries pinned clock and physical allowance",
@@ -1647,7 +1681,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-relational-rows-test", "Run generated relational row and schema boundary contracts").dependOn(&addFilteredTestRunArtifact(b, api_relational_row_contract_tests).step);
     const restore_lookup_authority_tests = b.addTest(.{
         .root_module = api_public_table_http_docid_test_mod,
-        .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope" },
+        .filters = &.{ "private restore lookup plan identity", "compiled lookup wire preserves binary scope", "ancestors-only hierarchy survives the internal wire re-encode without a stray group_by" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-api-restore-lookup-authority-test", "Run private restore lookup authority parsing and compiled wire regressions").dependOn(&addFilteredTestRunArtifact(b, restore_lookup_authority_tests).step);
@@ -2401,6 +2435,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_storage_authority_tests = run_lib_api_storage_authority_tests,
         .api_table_writes_docid_test_mod = api_table_writes_docid_test_mod,
         .write_implementation_tests = write_implementation_tests,
+        .public_api_parity_tests = public_api_parity_tests,
         .api_table_reads_docid_test_mod = api_table_reads_docid_test_mod,
         .run_lib_api_docid_tests = run_lib_api_docid_tests,
         .api_derived_coverage_test_mod = api_derived_coverage_test_mod,

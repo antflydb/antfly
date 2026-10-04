@@ -19,35 +19,73 @@
 const std = @import("std");
 const outbox = @import("durable_outbox.zig");
 const Namespace = @import("doc_identity_namespace.zig").Namespace;
-pub const policy = @import("replication_policy.zig");
 const mutation_barrier_mod = @import("antfly_runtime_abi").mutation_barrier;
 
-pub const SyncWaitFn = *const fn (
-    ctx: *anyopaque,
-    publisher_ctx: *anyopaque,
-    target_lsn: u64,
-    policy: policy.SyncPolicy,
-) anyerror!void;
+/// A borrowed callback capture copied with its binding. Captures may contain
+/// pointers and slices, but never owned resources or pointers into themselves.
+/// Copying a binding preserves its configuration without allocating or borrowing
+/// a temporary adapter. Referenced objects must outlive every binding copy.
+pub const BorrowedCapture = struct {
+    bytes: [256]u8 align(16) = @splat(0),
+    type_id: ?*const anyopaque = null,
+
+    fn typeId(comptime T: type) *const anyopaque {
+        const Tag = struct {
+            const Value = T;
+            var identity: u8 = 0;
+        };
+        return &Tag.identity;
+    }
+
+    pub fn init(comptime T: type, value: T) BorrowedCapture {
+        comptime {
+            if (@sizeOf(T) > 256 or @alignOf(T) > 16)
+                @compileError("borrowed replication capture exceeds capacity or alignment");
+        }
+        var capture: BorrowedCapture = .{ .type_id = typeId(T) };
+        const ptr: *T = @ptrCast(@alignCast(&capture.bytes));
+        ptr.* = value;
+        return capture;
+    }
+
+    pub fn read(self: *const BorrowedCapture, comptime T: type) T {
+        comptime {
+            if (@sizeOf(T) > 256 or @alignOf(T) > 16)
+                @compileError("borrowed replication capture exceeds capacity or alignment");
+        }
+        std.debug.assert(self.type_id == typeId(T));
+        const ptr: *const T = @ptrCast(@alignCast(&self.bytes));
+        return ptr.*;
+    }
+};
+
+pub const CommitRequirements = struct {
+    synchronous: bool = false,
+    durable_outbox: bool = false,
+    preflight: bool = false,
+};
 
 pub const AsyncEffectMirror = struct {
     publisher: Publisher,
-    /// Shared across every writer owned by one hot standby runtime. Mutations hold a
-    /// shared lease through WAL publication and the sync durability decision;
-    /// seed capture takes the exclusive lease before choosing its checkpoint.
+    /// Shared local mutation lease, including checkpoint capture.
     mutation_barrier: ?*mutation_barrier_mod.MutationBarrier = null,
-    /// Serializes the final write-gate check, WAL append, and acknowledgement
-    /// with a node-local promotion fence.
+    /// Serializes write admission, publication, and final acknowledgement.
     transition_mutex: ?*std.atomic.Mutex = null,
-    last_lsn: ?*@import("antfly_platform").atomic.Value(u64) = null,
-    failure_count: ?*@import("antfly_platform").atomic.Value(u64) = null,
-    sync_policy: policy.SyncPolicy = .{},
-    sync_wait_ctx: ?*anyopaque = null,
-    sync_wait_fn: ?SyncWaitFn = null,
-    last_gate_lsn: ?*@import("antfly_platform").atomic.Value(u64) = null,
-    last_gate_action: ?*std.atomic.Value(u8) = null,
-    sync_reject_count: ?*@import("antfly_platform").atomic.Value(u64) = null,
-    sync_wait_count: ?*@import("antfly_platform").atomic.Value(u64) = null,
-    sync_degraded_count: ?*@import("antfly_platform").atomic.Value(u64) = null,
+    requirements: CommitRequirements = .{},
+    capture: BorrowedCapture = .{},
+
+    pub fn eql(self: AsyncEffectMirror, other: AsyncEffectMirror) bool {
+        return self.publisher.ptr == other.publisher.ptr and self.publisher.vtable == other.publisher.vtable and
+            self.mutation_barrier == other.mutation_barrier and self.transition_mutex == other.transition_mutex and
+            std.meta.eql(self.requirements, other.requirements) and self.publisher.vtable.equal_capture(self, other);
+    }
+
+    pub fn notePublished(self: AsyncEffectMirror, lsn: u64) void {
+        self.publisher.vtable.note_published(self, lsn);
+    }
+    pub fn noteFailure(self: AsyncEffectMirror) void {
+        self.publisher.vtable.note_failure(self);
+    }
 };
 
 pub const AsyncBatchMirror = AsyncEffectMirror;
@@ -68,6 +106,17 @@ pub const Publisher = struct {
         recover: *const fn (AsyncEffectMirror, outbox.Kind, outbox.DurableReplicationOutbox, Namespace) anyerror!u64,
         preflight: *const fn (AsyncEffectMirror, bool) anyerror!void,
         complete: *const fn (AsyncEffectMirror, u64) anyerror!void,
+        note_published: *const fn (AsyncEffectMirror, u64) void = ignorePublished,
+        note_failure: *const fn (AsyncEffectMirror) void = ignoreFailure,
+        equal_capture: *const fn (AsyncEffectMirror, AsyncEffectMirror) bool = equalEmptyCapture,
+
+        fn equalEmptyCapture(a: AsyncEffectMirror, b: AsyncEffectMirror) bool {
+            // Captured publishers must provide semantic equality.
+            return a.capture.type_id == null and b.capture.type_id == null;
+        }
+
+        fn ignorePublished(_: AsyncEffectMirror, _: u64) void {}
+        fn ignoreFailure(_: AsyncEffectMirror) void {}
     };
 
     pub fn nextLsn(self: Publisher) u64 {
@@ -103,17 +152,20 @@ pub const Publisher = struct {
 pub const BorrowedWriteGate = struct {
     ptr: *const anyopaque,
     check_fn: *const fn (*const anyopaque) anyerror!void,
+    allows_background_work: bool = true,
     pub fn check(self: BorrowedWriteGate) !void {
         try self.check_fn(self.ptr);
     }
 };
 
-pub const FencedWriteGate = struct {
-    primary: *const anyopaque,
-    fence_store: *const anyopaque,
-    node_id: []const u8,
-    check_fn: *const fn (FencedWriteGate) anyerror!void,
-    pub fn check(self: FencedWriteGate) !void {
+/// Borrowed admission with a by-value callback capture. Equality belongs to
+/// the adapter; comparing opaque bytes would compare undefined padding.
+pub const CapturedWriteGate = struct {
+    capture: BorrowedCapture,
+    check_fn: *const fn (CapturedWriteGate) anyerror!void,
+    equal_fn: *const fn (CapturedWriteGate, CapturedWriteGate) bool,
+    allows_background_work: bool = true,
+    pub fn check(self: CapturedWriteGate) !void {
         try self.check_fn(self);
     }
 };
@@ -126,7 +178,7 @@ pub const PublishedWriteState = struct {
     pub const VTable = struct {
         check: *const fn (*const anyopaque, ?u64) anyerror!void,
         generation: *const fn (*const anyopaque) u64,
-        is_standby: *const fn (*const anyopaque) bool,
+        allows_background_work: *const fn (*const anyopaque) bool,
     };
     pub fn checkWrite(self: PublishedWriteState, generation: ?u64) !void {
         try self.vtable.check(self.ptr, generation);
@@ -134,25 +186,65 @@ pub const PublishedWriteState = struct {
     pub fn currentGeneration(self: PublishedWriteState) u64 {
         return self.vtable.generation(self.ptr);
     }
-    pub fn isStandbyRole(self: PublishedWriteState) bool {
-        return self.vtable.is_standby(self.ptr);
+    pub fn allowsBackgroundWork(self: PublishedWriteState) bool {
+        return self.vtable.allows_background_work(self.ptr);
     }
 };
 
 pub const SharedWriteGate = struct { state: PublishedWriteState, generation: ?u64 = null };
 
 pub const WriteGate = union(enum) {
-    primary: BorrowedWriteGate,
-    fenced_primary: FencedWriteGate,
-    standby: BorrowedWriteGate,
+    borrowed: BorrowedWriteGate,
+    captured: CapturedWriteGate,
     shared: SharedWriteGate,
 
     pub fn check(self: WriteGate) !void {
         switch (self) {
-            .primary, .standby => |gate| try gate.check(),
-            .fenced_primary => |gate| try gate.check(),
+            .borrowed => |gate| try gate.check(),
+            .captured => |gate| try gate.check(),
             .shared => |shared| try shared.state.checkWrite(shared.generation),
         }
+    }
+
+    pub fn allowsBackgroundWork(self: WriteGate) bool {
+        return switch (self) {
+            .borrowed => |gate| gate.allows_background_work,
+            .captured => |gate| gate.allows_background_work,
+            .shared => |gate| gate.state.allowsBackgroundWork(),
+        };
+    }
+
+    /// Maintenance planning needs both scheduling permission and current write
+    /// admission, including an owner's pinned generation. A denial leaves work
+    /// queued; mutation execution must check again under its commit barriers.
+    pub fn allowsBackgroundWrite(self: WriteGate) bool {
+        if (!self.allowsBackgroundWork()) return false;
+        self.check() catch return false;
+        return true;
+    }
+
+    pub fn currentGeneration(self: WriteGate) ?u64 {
+        return switch (self) {
+            .shared => |gate| gate.state.currentGeneration(),
+            else => null,
+        };
+    }
+
+    pub fn eql(self: WriteGate, other: WriteGate) bool {
+        return switch (self) {
+            .borrowed => |left| switch (other) {
+                .borrowed => |right| left.ptr == right.ptr and left.check_fn == right.check_fn and left.allows_background_work == right.allows_background_work,
+                else => false,
+            },
+            .captured => |left| switch (other) {
+                .captured => |right| left.check_fn == right.check_fn and left.equal_fn == right.equal_fn and left.allows_background_work == right.allows_background_work and left.equal_fn(left, right),
+                else => false,
+            },
+            .shared => |left| switch (other) {
+                .shared => |right| left.state.ptr == right.state.ptr and left.state.vtable == right.state.vtable and left.generation == right.generation,
+                else => false,
+            },
+        };
     }
 
     pub fn pinned(self: WriteGate) WriteGate {
@@ -175,27 +267,31 @@ test "storage.hot_standby engine shared admission pins generation across role ch
         }
         fn check(ptr: *const anyopaque, generation: ?u64) !void {
             const self = cast(ptr);
-            if (generation) |expected| if (expected != self.generation) return error.HAFencedPrimary;
-            if (self.standby) return error.HAReadOnlyStandby;
+            if (generation) |expected| if (expected != self.generation) return error.StaleWriteAdmission;
+            if (self.standby) return error.WriteAdmissionRejected;
         }
         fn current(ptr: *const anyopaque) u64 {
             return cast(ptr).generation;
         }
-        fn isStandby(ptr: *const anyopaque) bool {
-            return cast(ptr).standby;
+        fn allowsBackground(ptr: *const anyopaque) bool {
+            return !cast(ptr).standby;
         }
-        const vtable: PublishedWriteState.VTable = .{ .check = check, .generation = current, .is_standby = isStandby };
+        const vtable: PublishedWriteState.VTable = .{ .check = check, .generation = current, .allows_background_work = allowsBackground };
     };
     var state: State = .{};
     const gate: WriteGate = .{ .shared = .{ .state = .{ .ptr = &state, .vtable = &State.vtable } } };
     const pinned = gate.pinned();
     try pinned.check();
+    try std.testing.expect(pinned.allowsBackgroundWrite());
     state.generation += 1;
-    try std.testing.expectError(error.HAFencedPrimary, pinned.check());
+    try std.testing.expectError(error.StaleWriteAdmission, pinned.check());
+    try std.testing.expect(!pinned.allowsBackgroundWrite());
     try gate.check();
+    try std.testing.expect(gate.allowsBackgroundWrite());
     state.standby = true;
-    try std.testing.expectError(error.HAReadOnlyStandby, gate.check());
-    try std.testing.expect(gate.shared.state.isStandbyRole());
+    try std.testing.expectError(error.WriteAdmissionRejected, gate.check());
+    try std.testing.expect(!gate.allowsBackgroundWork());
+    try std.testing.expect(!gate.allowsBackgroundWrite());
 }
 
 pub fn requiresDurableLifecycleReplication(req: @import("types.zig").BatchRequest) bool {
@@ -203,4 +299,27 @@ pub fn requiresDurableLifecycleReplication(req: @import("types.zig").BatchReques
         req.relational_topology != null or req.relational_generation_gc != null or req.split_transition != null or
         req.split_checkpoint != null or req.split_replication != null or
         req.merge_checkpoint != null or req.merge_replication != null or req.merge_proof_adoption != null;
+}
+
+test "storage.hot_standby borrowed admission controls maintenance independently of errors" {
+    const Check = struct {
+        fn allow(_: *const anyopaque) !void {}
+        fn reject(_: *const anyopaque) !void {
+            return error.WriteAdmissionRejected;
+        }
+    };
+    var context: u8 = 0;
+    const writable: WriteGate = .{ .borrowed = .{ .ptr = &context, .check_fn = Check.allow } };
+    const read_only: WriteGate = .{ .borrowed = .{ .ptr = &context, .check_fn = Check.reject, .allows_background_work = false } };
+    try writable.check();
+    try std.testing.expect(writable.allowsBackgroundWork());
+    try std.testing.expect(writable.allowsBackgroundWrite());
+    try std.testing.expectError(error.WriteAdmissionRejected, read_only.check());
+    try std.testing.expect(!read_only.allowsBackgroundWork());
+    try std.testing.expect(!read_only.allowsBackgroundWrite());
+    const denied: WriteGate = .{ .borrowed = .{ .ptr = &context, .check_fn = Check.reject } };
+    try std.testing.expect(denied.allowsBackgroundWork());
+    try std.testing.expect(!denied.allowsBackgroundWrite());
+    try std.testing.expect(!writable.eql(read_only));
+    try std.testing.expect(writable.eql(writable.pinned()));
 }

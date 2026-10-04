@@ -500,6 +500,7 @@ from .graph_artifact_source_config_format import GraphArtifactSourceConfigFormat
 from .graph_binding_node import GraphBindingNode
 from .graph_binding_node_document import GraphBindingNodeDocument
 from .graph_bindings_result import GraphBindingsResult
+from .graph_bindings_result_computed_item import GraphBindingsResultComputedItem
 from .graph_bindings_result_kind import GraphBindingsResultKind
 from .graph_bindings_return import GraphBindingsReturn
 from .graph_bounded_traversal_config import GraphBoundedTraversalConfig
@@ -615,6 +616,10 @@ from .graph_query_unsupported_error import GraphQueryUnsupportedError
 from .graph_query_unsupported_error_error import GraphQueryUnsupportedErrorError
 from .graph_query_unsupported_error_reason import GraphQueryUnsupportedErrorReason
 from .graph_query_unsupported_error_status import GraphQueryUnsupportedErrorStatus
+from .graph_relationship_filter import GraphRelationshipFilter
+from .graph_relationship_property_predicate import GraphRelationshipPropertyPredicate
+from .graph_relationship_property_predicate_op import GraphRelationshipPropertyPredicateOp
+from .graph_relationship_property_predicate_value_type import GraphRelationshipPropertyPredicateValueType
 from .graph_resolver_config import GraphResolverConfig
 from .graph_resolver_config_candidate_search import GraphResolverConfigCandidateSearch
 from .graph_resolver_config_fusion_combine import GraphResolverConfigFusionCombine
@@ -998,6 +1003,7 @@ from .path_weight_mode import PathWeightMode
 from .pattern_edge_step import PatternEdgeStep
 from .pattern_match import PatternMatch
 from .pattern_match_bindings import PatternMatchBindings
+from .pattern_match_computed import PatternMatchComputed
 from .pattern_step import PatternStep
 from .permission import Permission
 from .permission_type import PermissionType
@@ -1017,6 +1023,18 @@ from .query_candidate_budget_exceeded_error_error import QueryCandidateBudgetExc
 from .query_candidate_budget_exceeded_error_status import QueryCandidateBudgetExceededErrorStatus
 from .query_dependency_error import QueryDependencyError
 from .query_dependency_error_code import QueryDependencyErrorCode
+from .query_evaluation import QueryEvaluation
+from .query_evaluation_aggregations import QueryEvaluationAggregations
+from .query_evaluation_aggregations_additional_property import QueryEvaluationAggregationsAdditionalProperty
+from .query_evaluation_aggregations_additional_property_type import QueryEvaluationAggregationsAdditionalPropertyType
+from .query_evaluation_compute import QueryEvaluationCompute
+from .query_evaluation_order_by_item import QueryEvaluationOrderByItem
+from .query_evaluation_scope import QueryEvaluationScope
+from .query_evaluation_where import QueryEvaluationWhere
+from .query_expression import QueryExpression
+from .query_expression_call import QueryExpressionCall
+from .query_expression_criteria_type_0 import QueryExpressionCriteriaType0
+from .query_expression_questions import QueryExpressionQuestions
 from .query_filter_error import QueryFilterError
 from .query_filter_error_error import QueryFilterErrorError
 from .query_filter_error_field import QueryFilterErrorField
@@ -1024,6 +1042,7 @@ from .query_filter_error_status import QueryFilterErrorStatus
 from .query_hierarchy import QueryHierarchy
 from .query_highlight import QueryHighlight
 from .query_hit import QueryHit
+from .query_hit_computed import QueryHitComputed
 from .query_hit_hierarchy import QueryHitHierarchy
 from .query_hit_hierarchy_ancestors import QueryHitHierarchyAncestors
 from .query_hit_hierarchy_level import QueryHitHierarchyLevel
@@ -1044,6 +1063,7 @@ from .query_result import QueryResult
 from .query_result_base import QueryResultBase
 from .query_result_base_aggregations import QueryResultBaseAggregations
 from .query_result_base_analyses import QueryResultBaseAnalyses
+from .query_result_base_evaluation import QueryResultBaseEvaluation
 from .query_result_base_graph_metric_results import QueryResultBaseGraphMetricResults
 from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
@@ -1872,6 +1892,7 @@ __all__ = (
     "GraphBindingNode",
     "GraphBindingNodeDocument",
     "GraphBindingsResult",
+    "GraphBindingsResultComputedItem",
     "GraphBindingsResultKind",
     "GraphBindingsReturn",
     "GraphBoundedTraversalConfig",
@@ -1987,6 +2008,10 @@ __all__ = (
     "GraphQueryUnsupportedErrorError",
     "GraphQueryUnsupportedErrorReason",
     "GraphQueryUnsupportedErrorStatus",
+    "GraphRelationshipFilter",
+    "GraphRelationshipPropertyPredicate",
+    "GraphRelationshipPropertyPredicateOp",
+    "GraphRelationshipPropertyPredicateValueType",
     "GraphResolverConfig",
     "GraphResolverConfigCandidateSearch",
     "GraphResolverConfigFusionCombine",
@@ -2366,6 +2391,7 @@ __all__ = (
     "PatternEdgeStep",
     "PatternMatch",
     "PatternMatchBindings",
+    "PatternMatchComputed",
     "PatternStep",
     "Permission",
     "PermissionType",
@@ -2385,6 +2411,18 @@ __all__ = (
     "QueryCandidateBudgetExceededErrorStatus",
     "QueryDependencyError",
     "QueryDependencyErrorCode",
+    "QueryEvaluation",
+    "QueryEvaluationAggregations",
+    "QueryEvaluationAggregationsAdditionalProperty",
+    "QueryEvaluationAggregationsAdditionalPropertyType",
+    "QueryEvaluationCompute",
+    "QueryEvaluationOrderByItem",
+    "QueryEvaluationScope",
+    "QueryEvaluationWhere",
+    "QueryExpression",
+    "QueryExpressionCall",
+    "QueryExpressionCriteriaType0",
+    "QueryExpressionQuestions",
     "QueryFilterError",
     "QueryFilterErrorError",
     "QueryFilterErrorField",
@@ -2392,6 +2430,7 @@ __all__ = (
     "QueryHierarchy",
     "QueryHighlight",
     "QueryHit",
+    "QueryHitComputed",
     "QueryHitHierarchy",
     "QueryHitHierarchyAncestors",
     "QueryHitHierarchyLevel",
@@ -2412,6 +2451,7 @@ __all__ = (
     "QueryResultBase",
     "QueryResultBaseAggregations",
     "QueryResultBaseAnalyses",
+    "QueryResultBaseEvaluation",
     "QueryResultBaseGraphMetricResults",
     "QueryScoreDetails",
     "QueryStrategy",

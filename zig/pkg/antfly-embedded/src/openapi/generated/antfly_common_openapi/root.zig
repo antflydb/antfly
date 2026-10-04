@@ -11,6 +11,7 @@ pub const CdcConnectionVariant = types.CdcConnectionVariant;
 pub const Config = types.Config;
 pub const ConnectionConfig = types.ConnectionConfig;
 pub const ConnectionKind = types.ConnectionKind;
+pub const DeciderConfig = types.DeciderConfig;
 pub const ExternalIoConnectionConfig = types.ExternalIoConnectionConfig;
 pub const ExternalIoConnectionVariant = types.ExternalIoConnectionVariant;
 pub const ExternalIoProtocol = types.ExternalIoProtocol;

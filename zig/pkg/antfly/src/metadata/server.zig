@@ -300,6 +300,7 @@ pub const MetadataServer = struct {
             _ = public_write_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
+            public_read_source.decision_registry = if (cfg.api_server_cfg.node_config) |node_config| &node_config.registry else null;
             _ = public_read_source.withBackendRuntime(backend_runtime);
             _ = public_read_source.withInferenceAPIURL(if (cfg.api_server_cfg.node_config) |node_config| node_config.inference.api_url else null);
             _ = public_read_source.withSecretStore(cfg.api_server_cfg.secret_store);
@@ -1811,8 +1812,9 @@ test "metadata server can expose admin listener endpoints" {
         .content_type = "application/json",
     });
     defer authenticated_policy_status.deinit(std.heap.page_allocator);
-    try std.testing.expectEqual(@as(u16, 409), authenticated_policy_status.status);
-    try std.testing.expectEqualStrings("RowPolicyCatalogChanged", authenticated_policy_status.body);
+    // Authenticated status reads distinguish an absent policy from errors.
+    try std.testing.expectEqual(@as(u16, 200), authenticated_policy_status.status);
+    try std.testing.expectEqualStrings("null", authenticated_policy_status.body);
 
     // A forged service header must not reach the decoder-activation probe.
     // This exercises the real host authentication middleware, not just the

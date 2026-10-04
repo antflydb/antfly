@@ -35,11 +35,11 @@ pub const legacy_standby_replication_status = legacy_standby_replication ++ "/st
 
 // Deprecated aliases for the canonical constants above; remove after 0.4.
 pub const ha = standby;
-pub const ha_replication = standby_replication;
-pub const ha_replication_identify = standby_replication_identify;
-pub const ha_replication_slots = standby_replication_slots;
-pub const ha_replication_start = standby_replication_start;
-pub const ha_replication_status = standby_replication_status;
+pub const hot_standby_replication = standby_replication;
+pub const hot_standby_replication_identify = standby_replication_identify;
+pub const hot_standby_replication_slots = standby_replication_slots;
+pub const hot_standby_replication_start = standby_replication_start;
+pub const hot_standby_replication_status = standby_replication_status;
 
 const alias_pairs = [_][2][]const u8{
     .{ legacy_standby_replication_identify, standby_replication_identify },
@@ -77,14 +77,14 @@ test "internal routes define standby replication paths and their legacy aliases"
     try std.testing.expectEqualStrings(standby_replication_status, canonicalReplicationPath(standby_replication_status));
     try std.testing.expectEqualStrings(legacy_standby_replication_start, legacyReplicationPath(standby_replication_start));
     try std.testing.expectEqualStrings("/internal/v1/other", canonicalReplicationPath("/internal/v1/other"));
-    try std.testing.expectEqualStrings(standby_replication_identify, ha_replication_identify);
+    try std.testing.expectEqualStrings(standby_replication_identify, hot_standby_replication_identify);
 }
 
 test "internal routes match generated OpenAPI standby replication operations" {
-    for (expected_ha_replication_routes) |route| {
+    for (expected_hot_standby_replication_routes) |route| {
         try expectGeneratedRoute(route.operation_id, route.method, route.full_path);
     }
-    try expectEveryGeneratedHAReplicationRouteCovered();
+    try expectEveryGeneratedHotStandbyReplicationRouteCovered();
 }
 
 const ExpectedRoute = struct {
@@ -93,7 +93,7 @@ const ExpectedRoute = struct {
     full_path: []const u8,
 };
 
-const expected_ha_replication_routes = [_]ExpectedRoute{
+const expected_hot_standby_replication_routes = [_]ExpectedRoute{
     .{ .operation_id = "identifyHAReplicationSystem", .method = "GET", .full_path = standby_replication_identify },
     .{ .operation_id = "createHAReplicationStreamingSlot", .method = "POST", .full_path = standby_replication_slots },
     .{ .operation_id = "startHAReplication", .method = "POST", .full_path = standby_replication_start },
@@ -115,10 +115,10 @@ fn expectGeneratedRoute(operation_id: []const u8, method: []const u8, full_path:
     return error.TestExpectedGeneratedRoute;
 }
 
-fn expectEveryGeneratedHAReplicationRouteCovered() !void {
+fn expectEveryGeneratedHotStandbyReplicationRouteCovered() !void {
     for (openapi.server.routes) |generated| {
         if (!std.mem.startsWith(u8, generated.path, "/standby/replication/")) continue;
-        if (expectedHAReplicationRoute(generated) != null) continue;
+        if (expectedHotStandbyReplicationRoute(generated) != null) continue;
 
         std.debug.print(
             "generated internal OpenAPI HA replication route {s} {s} ({s}) is not covered by zig/pkg/antfly/src/internal/routes.zig\n",
@@ -128,8 +128,8 @@ fn expectEveryGeneratedHAReplicationRouteCovered() !void {
     }
 }
 
-fn expectedHAReplicationRoute(generated: openapi.server.Route) ?ExpectedRoute {
-    for (expected_ha_replication_routes) |expected| {
+fn expectedHotStandbyReplicationRoute(generated: openapi.server.Route) ?ExpectedRoute {
+    for (expected_hot_standby_replication_routes) |expected| {
         if (!std.mem.eql(u8, generated.operation_id, expected.operation_id)) continue;
         if (!std.mem.eql(u8, generated.method, expected.method)) continue;
         if (!std.mem.startsWith(u8, expected.full_path, base)) continue;

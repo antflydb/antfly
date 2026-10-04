@@ -755,7 +755,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/unit-chunk-receiver", .{tmp.sub_path});
     defer alloc.free(path);
-    var db = try @import("db.zig").DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    var db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     var db_open = true;
     defer if (db_open) db.close();
     try db.setSchemaJson(alloc, "{}");
@@ -886,7 +886,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 3, .little);
-        try txn.put(&keys.raft_document_applied_entry_key, &marker);
+        try txn.put(&keys.ordered_document_applied_entry_key, &marker);
         try txn.commit();
     }
     var actual_inputs = inputs;
@@ -963,7 +963,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 4, .little);
-        try txn.put(&keys.raft_document_applied_entry_key, &marker);
+        try txn.put(&keys.ordered_document_applied_entry_key, &marker);
         try txn.commit();
     }
     var current = try db.core.store.beginReadTxn();
@@ -1015,7 +1015,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     var marker: [16]u8 = undefined;
     std.mem.writeInt(u64, marker[0..8], 1, .little);
     std.mem.writeInt(u64, marker[8..16], 5, .little);
-    try txn.put(&keys.raft_document_applied_entry_key, &marker);
+    try txn.put(&keys.ordered_document_applied_entry_key, &marker);
     try std.testing.expectError(error.EnrichmentSourceChanged, captured.token.validateInputs(alloc, &txn));
     var absent = try captureUnit(alloc, &txn, request, authority, source[0], unit_key);
     defer absent.deinit();
@@ -1570,7 +1570,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     defer closure.deinit();
     try closure.requireCurrent(&txn, db.root_incarnation);
     std.mem.writeInt(u64, marker[8..16], 11, .little);
-    try txn.put(&keys.raft_document_applied_entry_key, &marker);
+    try txn.put(&keys.ordered_document_applied_entry_key, &marker);
     try txn.commit();
     txn_open = false;
     current.abort();
@@ -1579,7 +1579,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
     read_open = false;
     db.close();
     db_open = false;
-    db = try @import("db.zig").DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
     db_open = true;
     // Lost-reply retry is applied through the real ordered control path after
     // restart, with no re-enumeration or second advancement of the prefix.
@@ -1653,7 +1653,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         defer alloc.free(reopened_child_manifest);
         try writer.put(reopened_child_manifest, &empty_manifest);
         std.mem.writeInt(u64, marker[8..16], 13, .little);
-        try writer.put(&keys.raft_document_applied_entry_key, &marker);
+        try writer.put(&keys.ordered_document_applied_entry_key, &marker);
         try writer.commit();
     }
     {
@@ -1677,7 +1677,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         defer alloc.free(raw_only);
         try writer.put(raw_only, "historical payload without an inventory");
         std.mem.writeInt(u64, marker[8..16], 14, .little);
-        try writer.put(&keys.raft_document_applied_entry_key, &marker);
+        try writer.put(&keys.ordered_document_applied_entry_key, &marker);
         try writer.commit();
     }
     {
@@ -1773,7 +1773,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
         }
         db.close();
         db_open = false;
-        db = try @import("db.zig").DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+        db = try @import("antfly_source_root").antfly_sources.physical_db.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 0x0101010101010101, .shard_id = 0x0101010101010101, .range_id = 0x0101010101010101 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
         db_open = true;
         var snapshot = try db.core.store.beginReadTxn();
         defer snapshot.abort();
@@ -1907,7 +1907,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             _ = try replacement.publish(&writer, empty_generation.core.spec.id(), Guard{});
             try AcceptedFixture.stage(alloc, &writer, parent, parent_proof.proof, &replacement, .{ .raft = .{ .term = 1, .index = 15 } });
             std.mem.writeInt(u64, marker[8..16], 15, .little);
-            try writer.put(&keys.raft_document_applied_entry_key, &marker);
+            try writer.put(&keys.ordered_document_applied_entry_key, &marker);
             try writer.commit();
         }
         // A lost retirement reply remains idempotent after a newer accepted
@@ -2051,7 +2051,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
             _ = try fresh.publish(&writer, replacement_id, Guard{});
             try AcceptedFixture.stage(alloc, &writer, parent, parent_proof.proof, &fresh, .{ .raft = .{ .term = 1, .index = 16 } });
             std.mem.writeInt(u64, marker[8..16], 16, .little);
-            try writer.put(&keys.raft_document_applied_entry_key, &marker);
+            try writer.put(&keys.ordered_document_applied_entry_key, &marker);
             try writer.commit();
         }
         var fresh_page = blk: {

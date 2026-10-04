@@ -2970,6 +2970,7 @@ fn aggregateTextMergeStats(dst: *db_mod.types.TextMergeStats, src: db_mod.types.
     dst.quarantined_merges += src.quarantined_merges;
     dst.quarantined_segments += src.quarantined_segments;
     dst.deferred_for_pressure += src.deferred_for_pressure;
+    dst.forced_drains += src.forced_drains;
     if (dst.last_merge_error.len == 0 and src.last_merge_error.len > 0) dst.last_merge_error = src.last_merge_error;
     if (src.retry_after_ns > 0 and (dst.retry_after_ns == 0 or src.retry_after_ns < dst.retry_after_ns)) dst.retry_after_ns = src.retry_after_ns;
 }

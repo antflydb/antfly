@@ -47,7 +47,7 @@ pub const State = struct {
     const storage_write_vtable: storage_contract.PublishedWriteState.VTable = .{
         .check = checkStorageWrite,
         .generation = storageGeneration,
-        .is_standby = storageIsStandby,
+        .allows_background_work = storageAllowsBackgroundWork,
     };
 
     fn checkStorageWrite(ptr: *const anyopaque, generation: ?u64) !void {
@@ -60,9 +60,9 @@ pub const State = struct {
         return self.currentGeneration();
     }
 
-    fn storageIsStandby(ptr: *const anyopaque) bool {
+    fn storageAllowsBackgroundWork(ptr: *const anyopaque) bool {
         const self: *const State = @ptrCast(@alignCast(ptr));
-        return self.isStandbyRole();
+        return !self.isStandbyRole();
     }
 
     role: std.atomic.Value(u8) = .init(@intFromEnum(Role.disabled)),

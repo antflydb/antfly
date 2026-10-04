@@ -141,6 +141,12 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
             .max_pending_bytes = self.config.max_pending_bytes,
         };
     }
+
+    pub fn overlayRuntimeStats(self: *@This(), snapshot: *types.TextMergeStats) void {
+        snapshot.enabled = self.config.enabled;
+        snapshot.max_pending_segments = self.config.max_pending_segments;
+        snapshot.max_pending_bytes = self.config.max_pending_bytes;
+    }
 } else struct {
     const ProducerAdmissionWaiter = struct {
         previous: ?*ProducerAdmissionWaiter = null,
@@ -378,7 +384,36 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn runOnce(self: *TextMergeRuntime) !bool {
         var maybe_task: ?index_manager_mod.IndexManager.TextMergeTask = null;
-        if (!self.apply_mutex.tryLockExclusive()) return false;
+        const io = self.io orelse return false;
+        // A bare tryLockExclusive() has no writer-preference: under a
+        // continuous stream of overlapping shared (replay) acquisitions it
+        // can miss every gap indefinitely, silently starving the scheduler
+        // that is supposed to relieve the very segment-count pressure the
+        // replayer is blocked on. Register as a real (bounded) exclusive
+        // waiter so the writer-preferring ApplyRwLock stops admitting new
+        // shared holders once we start waiting, so this worker wins the
+        // very next release instead of only winning if it happens to poll
+        // during a gap. The deadline still degrades to the same
+        // idle_interval_ms-cadence retry as a plain failed tryLockExclusive
+        // when it cannot get in.
+        self.apply_mutex.lockExclusiveDeadlineIo(io, .fromNow(io, .{
+            .raw = .fromMilliseconds(@intCast(self.config.idle_interval_ms)),
+            .clock = .awake,
+        })) catch |err| switch (err) {
+            error.Timeout => return false,
+            error.Canceled => {
+                // The maintenance scheduler cancels and re-arms its own
+                // wakeup as an ordinary part of rescheduling this worker
+                // (for example when notify() wakes it early); that is not
+                // the same as a graceful runtime shutdown. Only a genuine
+                // shutdown should stop workerStep from ever calling this
+                // again — treat any other cancellation exactly like a
+                // timeout so the worker keeps retrying at the normal
+                // cadence instead of going permanently idle.
+                if (isShutdown(self)) return err;
+                return false;
+            },
+        };
         maybe_task = self.index_manager.beginTextMergeTask() catch |err| {
             self.apply_mutex.unlockExclusive();
             return err;
@@ -408,7 +443,11 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                 return err;
             }
             if (isRecoverableMergeAdmissionError(err)) {
-                self.index_manager.cancelTextMergeTask(&task);
+                if (err == error.ResourceBudgetExceeded) {
+                    self.index_manager.noteTextMergeResourceBudgetExceeded(&task);
+                } else {
+                    self.index_manager.cancelTextMergeTask(&task);
+                }
                 self.deferForFdAdmissionError(err, execute_fd_epoch);
                 self.apply_mutex.unlockExclusive();
                 self.signalProducerAdmissionChanged();
@@ -444,7 +483,11 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                             return prepare_err;
                         }
                         if (isRecoverableMergeAdmissionError(prepare_err)) {
-                            self.index_manager.cancelTextMergeTask(&task);
+                            if (prepare_err == error.ResourceBudgetExceeded) {
+                                self.index_manager.noteTextMergeResourceBudgetExceeded(&task);
+                            } else {
+                                self.index_manager.cancelTextMergeTask(&task);
+                            }
                             self.deferForFdAdmissionError(prepare_err, finish_fd_epoch);
                             self.apply_mutex.unlockExclusive();
                             self.signalProducerAdmissionChanged();
@@ -464,7 +507,11 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
                     return err;
                 }
                 if (isRecoverableMergeAdmissionError(err)) {
-                    self.index_manager.cancelTextMergeTask(&task);
+                    if (err == error.ResourceBudgetExceeded) {
+                        self.index_manager.noteTextMergeResourceBudgetExceeded(&task);
+                    } else {
+                        self.index_manager.cancelTextMergeTask(&task);
+                    }
                     self.deferForFdAdmissionError(err, finish_fd_epoch);
                     self.apply_mutex.unlockExclusive();
                     self.signalProducerAdmissionChanged();
@@ -823,7 +870,19 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
 
     pub fn statsAssumeApplyLockHeld(self: *TextMergeRuntime) types.TextMergeStats {
         var snapshot = self.index_manager.textMergeStatsSnapshot();
+        self.overlayRuntimeStats(&snapshot);
+        return snapshot;
+    }
 
+    /// Fill in the runtime-owned fields that `IndexManager`'s own stats
+    /// builders (`textMergeStatsSnapshot`/`textMergeStatsForIndex` and their
+    /// variants) cannot see, because producer backpressure (events, elapsed
+    /// time, timeouts, failures, and the configured pending thresholds) is
+    /// tracked on the runtime, not the index manager. Every caller that
+    /// builds a `TextMergeStats` snapshot for an external consumer (/metrics,
+    /// the index status endpoint) must call this or those fields silently
+    /// read zero even while backpressure is actively engaged.
+    pub fn overlayRuntimeStats(self: *TextMergeRuntime, snapshot: *types.TextMergeStats) void {
         const backpressure = if (self.io) |io| blk: {
             self.mutex.lockUncancelable(io);
             const events = self.backpressure_events;
@@ -840,7 +899,6 @@ pub const TextMergeRuntime = if (builtin.os.tag == .freestanding) struct {
         snapshot.backpressure_failures = backpressure[3];
         snapshot.max_pending_segments = self.config.max_pending_segments;
         snapshot.max_pending_bytes = self.config.max_pending_bytes;
-        return snapshot;
     }
 
     fn backpressureNeeded(self: *TextMergeRuntime) bool {
@@ -890,7 +948,17 @@ fn workerStep(runtime: *TextMergeRuntime) ?u64 {
         runtime.native_storage_pool.releaseDescriptorsForTest(io, 1);
     }
     const ran = runtime.runOnce() catch |err| {
-        if (err == error.Canceled) return null;
+        if (err == error.Canceled) {
+            // A canceled wait is not necessarily a graceful shutdown: the
+            // maintenance scheduler itself can cancel and re-arm this
+            // worker's own wakeup as ordinary rescheduling (for example a
+            // notify() while a wait is already in flight). Stopping this
+            // worker forever on every such cancellation would leave
+            // compaction_pending set with nothing left to service it.
+            // Only a genuine shutdown should end the schedule loop.
+            if (isShutdown(runtime)) return null;
+            return @max(1, runtime.config.idle_interval_ms);
+        }
         if (err != error.ResourceBudgetExceeded) std.log.err("text merge worker failed: {s}", .{@errorName(err)});
         return @max(1, runtime.config.error_interval_ms);
     };

@@ -604,7 +604,7 @@ pub fn collectObsoletePage(alloc: std.mem.Allocator, store: anytype, root: u128)
 
 test "ordered artifact inventory projection completion reconstructs independent receiver evidence" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const certificates = @import("artifact_projection_certificate.zig");
     const native = @import("artifact_native_stream.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -680,7 +680,7 @@ test "ordered artifact inventory projection completion reconstructs independent 
 
 test "ordered artifact inventory completion control verifies independent roots before atomic discharge" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const native = @import("artifact_native_stream.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -815,7 +815,7 @@ test "ordered artifact inventory completion control verifies independent roots b
 
 test "ordered artifact inventory completion leaves extraction-owned scope pending until certified" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-pending-extraction", .{tmp.sub_path});
@@ -845,7 +845,7 @@ test "ordered artifact inventory completion leaves extraction-owned scope pendin
 
 test "ordered artifact inventory completion never skips an unverified index requirement" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-pending-index", .{tmp.sub_path});

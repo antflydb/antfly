@@ -96,8 +96,8 @@ const BudgetOverridesMb = struct {
     scratch_budget_mb: usize = 0,
 };
 
-pub const parseBackendType = runtime_paths.parseBackendType;
-pub const parseOptionalBackendType = runtime_paths.parseOptionalBackendType;
+pub const parseBackendType = inference.backends.BackendType.parse;
+pub const parseOptionalBackendType = inference.backends.BackendType.parseOptional;
 
 fn parseKernelJitMode(value: []const u8) !inference.graph.kernel_jit.Mode {
     return std.meta.stringToEnum(inference.graph.kernel_jit.Mode, value) orelse error.InvalidArguments;

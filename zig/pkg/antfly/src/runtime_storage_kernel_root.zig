@@ -106,7 +106,7 @@ comptime {
     exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotCancel, "antfly_metadata_apply_prepared_snapshot_cancel");
     exportInternal(&storage_kernel_exports.metadataApplyPreparedSnapshotDestroy, "antfly_metadata_apply_prepared_snapshot_destroy");
     exportInternal(&storage_kernel_exports.metadataApplyStoreProjection, "antfly_metadata_apply_store_projection");
-    exportInternal(&storage_kernel_exports.metadataApplyStoreBindHA, "antfly_metadata_apply_store_bind_ha");
+    exportInternal(&storage_kernel_exports.metadataApplyStoreBindHotStandby, "antfly_metadata_apply_store_bind_ha");
     exportInternal(&storage_kernel_exports.metadataApplyStoreAddListeners, "antfly_metadata_apply_store_add_listeners");
     exportInternal(&storage_kernel_exports.metadataApplyStoreRemoveListeners, "antfly_metadata_apply_store_remove_listeners");
     exportInternal(&storage_kernel_exports.metadataReconcileReplicaRoot, "antfly_metadata_reconcile_replica_root");
@@ -134,9 +134,9 @@ comptime {
     exportInternal(&storage_kernel_exports.storageOwnerLocalTransition, "antfly_storage_owner_local_transition");
     exportInternal(&storage_kernel_exports.storageOwnerOpen, "antfly_storage_owner_open");
     exportInternal(&storage_kernel_exports.storageOwnerClose, "antfly_storage_owner_close");
-    exportInternal(&storage_kernel_exports.storageHASeedActivateJson, "antfly_storage_hot_standby_seed_activate_json");
-    exportInternal(&storage_kernel_exports.storageHASeedValidateJson, "antfly_storage_hot_standby_seed_validate_json");
-    exportInternal(&storage_kernel_exports.storageHASeedPruneJson, "antfly_storage_hot_standby_seed_prune_json");
+    exportInternal(&storage_kernel_exports.storageHotStandbySeedActivateJson, "antfly_storage_hot_standby_seed_activate_json");
+    exportInternal(&storage_kernel_exports.storageHotStandbySeedValidateJson, "antfly_storage_hot_standby_seed_validate_json");
+    exportInternal(&storage_kernel_exports.storageHotStandbySeedPruneJson, "antfly_storage_hot_standby_seed_prune_json");
     exportInternal(&storage_kernel_exports.storageOwnerConfigure, "antfly_storage_owner_configure");
     exportInternal(&storage_kernel_exports.storageOwnerReconcile, "antfly_storage_owner_reconcile");
     exportInternal(&storage_kernel_exports.storageOwnerPreflightWriteAdmission, "antfly_storage_owner_preflight_write_admission");

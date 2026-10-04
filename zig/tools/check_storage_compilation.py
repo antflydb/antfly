@@ -12,6 +12,7 @@ Every mutation lives in an isolated source overlay; the checkout is read only.
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import json
 import os
 import re
@@ -45,6 +46,35 @@ CONSUMERS = {
     "data-runtime-tests",
 }
 COMPILES = re.compile(r"compile (lib|test_obj|exe) (\S+) Debug \S+ (cached|success)\b")
+
+
+# Cache manifests track literal imports even in unselected test bodies. Skip
+# comments and strings, but deliberately retain imports inside tests/branches.
+IMPORT_TOKENS = re.compile(
+    r"//[^\n]*|(?m:^[ \t]*\\\\[^\n]*)|'(?:\\.|[^'\\])*'|"
+    r'"(?:\\.|[^"\\])*"|'
+    r'@import\s*\(\s*"(?P<path>[^"\\\n]+)"\s*\)'
+)
+
+
+def literal_import_path(root: Path, target: Path) -> list[Path] | None:
+    """Find an authored relative-import path that invalidates a source owner."""
+    root, target = root.resolve(), target.resolve()
+    pending = deque([(root, [root])])
+    seen = set()
+    while pending:
+        source, path = pending.popleft()
+        if source == target:
+            return path
+        if source in seen or not source.is_file():
+            continue
+        seen.add(source)
+        for token in IMPORT_TOKENS.finditer(source.read_text()):
+            relative = token.group("path")
+            if relative is not None and relative.endswith(".zig"):
+                imported = (source.parent / relative).resolve()
+                pending.append((imported, [*path, imported]))
+    return None
 
 
 def tree_rss(snapshot: str, root_pid: int) -> tuple[int, int]:

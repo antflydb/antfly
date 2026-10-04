@@ -113,6 +113,7 @@ pub const Adapter = struct {
     context: operation.RequestContext,
     database: []const u8 = "default",
     namespace: []const u8 = "public",
+    decision_provider: ?@import("../functions/decisions.zig").DecisionProvider = null,
     /// Pgwire retains the original durable owner scope independently of its
     /// mutable, freshly authorized lookup namespace. HTTP leaves this null.
     session_namespace: ?[]const u8 = null,
@@ -147,7 +148,30 @@ pub const Adapter = struct {
     /// exact serving generation, including a publication changed mid-read.
     policy_proofs: ?std.AutoHashMapUnmanaged(u64, ?[]u8) = null,
 
+    pub fn decisionRuntime(self: *Adapter) !?@import("../functions/runtime.zig").Runtime {
+        if (self.server.cfg.node_config) |config| {
+            if (config.registry.decider_configs.count() > 0) {
+                const normalized = try self.context.platformDeadline();
+                return .{
+                    .registry = &config.registry,
+                    .io = self.server.embedding_provider_runtime.io,
+                    .http = try self.server.embedding_provider_runtime.httpClient(),
+                    .context = .{ .io = self.server.embedding_provider_runtime.io, .deadline_ns = normalized.deadline_ns, .cancellation = normalized.cancellation },
+                    .secret_store = self.server.cfg.secret_store,
+                    .antfly_provider = self.server.antfly_provider,
+                    .antfly_url = config.inference.api_url,
+                };
+            }
+        }
+        return null;
+    }
+
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("../sql/compiler.zig").Compiled, parameters: []const std.json.Value, limits: @import("../sql/runtime.zig").Limits, guarded_backend: ?catalog.Backend) !@import("../sql/runtime.zig").Result {
+        var decision_runtime: ?@import("../functions/runtime.zig").Runtime = null;
+        const previous_provider = self.decision_provider;
+        defer self.decision_provider = previous_provider;
+        decision_runtime = try self.decisionRuntime();
+        if (decision_runtime) |*active| self.decision_provider = active.provider();
         if (self.policy_proofs != null) return error.InvalidSqlBackendResponse;
         self.policy_proofs = .empty;
         defer {
@@ -323,6 +347,7 @@ pub const Adapter = struct {
                     self.dynamic_table = table.physical_name;
                 }
                 var active_backend = guarded_backend orelse self.backend();
+                active_backend.decision_provider = self.decision_provider;
                 if (compiled.uses_current_setting and active_backend.setting_capture == null) active_backend.setting_capture = self.settingCapture();
                 if (guarded_backend != null) {
                     active_backend.atomic_statement_read_set = self.range_reads != null;
@@ -357,12 +382,13 @@ pub const Adapter = struct {
             return result;
         }
         var statement_backend = guarded_backend orelse self.backend();
+        statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
         return @import("../sql/runtime.zig").execute(alloc, statement_backend, compiled, parameters, limits);
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
-        return .{ .ptr = self, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
+        return .{ .ptr = self, .decision_provider = self.decision_provider, .predicate_only_mutations = true, .atomic_statement_read_set = self.active_transaction != null and self.range_reads != null, .coordinated_point_reads = self.active_transaction != null and self.range_reads != null, .coordinated_index_reads = self.active_transaction != null and self.range_reads != null and (self.staged == null or self.staged.?.tables.len == 0), .dynamic_statement_read_set = self.dynamic_snapshot != null, .vtable = &.{ .resolve_conflict_owners = resolveConflictOwners, .generate_row_id = generateRowId, .resolve = resolve, .scan = scan, .open_scan = openScan, .open_statement = openStatement, .mutate = mutate, .mutate_prepared = mutatePrepared, .prepare_mutations = prepareMutations, .ddl = ddl, .checkpoint = checkpoint } };
     }
 
     pub fn settingCapture(self: *Adapter) @FieldType(catalog.Backend, "setting_capture") {
@@ -1167,7 +1193,7 @@ test "SQL require-index equality uses exact native bounds only inside a guarded 
             if (call == .policy_publication_status) {
                 try std.testing.expect(context.row_policy_install_authority);
                 const mode: *u8 = @ptrCast(@alignCast(ptr));
-                if (mode.* == 0) return error.RowPolicyCatalogChanged;
+                if (mode.* == 0) return alloc.dupe(u8, "null");
                 const policies = @import("../system_catalog/policies.zig");
                 const owner: policies.Publication.OwnerIdentity = .{ .group_id = 1, .descriptor_digest = std.mem.zeroes([32]u8) };
                 const ack: policies.Publication.OwnerAck = .{ .owner = owner, .catalog_epoch = 1, .phase = if (mode.* == 3) .pending_disable else .pending_install, .applied_term = 1, .applied_index = 1, .bundle_digest = std.mem.zeroes([32]u8) };
@@ -1243,7 +1269,7 @@ test "SQL API document preparation uses native normalization and retains mutatio
         normalized: bool = false,
         closed: bool = false,
         fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
-            if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             return alloc.dupe(u8, "{\"revision\":3,\"tables\":[{\"table_id\":7,\"name\":\"physical\"}]}");
         }
         fn open(ptr: *anyopaque, _: std.mem.Allocator, name: []const u8, from: []const u8, to: []const u8, options: db_types.ScanOptions, _: @import("../raft/read_gate.zig").ReadConsistency) !?View {
@@ -1319,7 +1345,7 @@ test "SQL API guarded sessions retain reads and atomic MERGE writes across trans
         }
         fn resolve(_: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             if (call == .write_validation) return std.json.Stringify.valueAlloc(alloc, .{ .schema_json = schema }, .{});
-            if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             return std.json.Stringify.valueAlloc(alloc, .{ .revision = 2, .tables = .{.{ .table_id = 3, .name = "physical", .query_definition = .{ .table_id = 3, .schema_json = schema, .read_schema_json = "", .indexes_json = "{}" } }}, .logical_names = .{"docs"} }, .{});
         }
         fn snapshot(ptr: *anyopaque) !metadata.AdminSnapshot {
@@ -1652,7 +1678,7 @@ test "SQL API cross-table MERGE retains both source and target range proofs" {
         fn resolve(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (call == .write_validation) return std.json.Stringify.valueAlloc(alloc, .{ .schema_json = schema }, .{});
-            if (call == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
             const request = call.resolve_many;
             if (request.expected_revision) |revision| try std.testing.expectEqual(@as(u64, 2), revision);
@@ -2561,7 +2587,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
                 try std.testing.expect(context.row_policy_install_authority);
                 const self: *Self = @ptrCast(@alignCast(ptr));
                 self.publication_reads += 1;
-                return error.RowPolicyCatalogChanged;
+                return allocator.dupe(u8, "null");
             }
             if (call != .resolve_many) return error.TestUnexpectedCatalogCall;
             const request = call.resolve_many;

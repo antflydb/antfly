@@ -378,6 +378,11 @@ pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
     transforms: []const DocumentTransform = &.{},
+    /// Private owner-leader maintenance: one bounded durable endpoint page.
+    graph_endpoint_cleanup: bool = false,
+    /// Exact leader-selected effects; replicas must never replan this page.
+    graph_endpoint_cleanup_planned: bool = false,
+    graph_endpoint_cleanup_guards: []const @import("../graph_cleanup_contract.zig").Guard = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
@@ -462,6 +467,7 @@ pub const BatchRequest = struct {
 
 pub fn validateMergeArtifacts(req: BatchRequest) !void {
     if (req.merge_artifacts.len == 0) return;
+    if (req.graph_endpoint_cleanup) return validateGraphEndpointCleanupCommand(req);
     if (req.merge_replication == null or req.merge_checkpoint != null or
         req.split_checkpoint != null or req.split_replication != null or
         req.split_transition != null or req.merge_source_transition != null or
@@ -473,9 +479,10 @@ pub fn validateMergeArtifacts(req: BatchRequest) !void {
     for (req.merge_artifacts) |row| {
         if (!keys.isGraphEdgeArtifactKey(row.key) and !keys.isEmbeddingArtifactKey(row.key) and
             !keys.isDerivedEmbeddingArtifactKey(row.key) and !keys.isAssetArtifactKey(row.key) and
-            !keys.isGraphGlobalEdgeContenderKey(row.key) and
+            !keys.isGraphRetirementKey(row.key) and !keys.isGraphGlobalEdgeContenderKey(row.key) and
             !keys.isGraphEdgeTtlLifetimeKey(row.key) and !keys.isGraphEdgeTtlTombstoneKey(row.key))
             return error.InvalidBatchRequest;
+        if (keys.isGraphRetirementKey(row.key)) _ = @import("../graph_cleanup_contract.zig").retirementGeneration(row.value) catch return error.InvalidBatchRequest;
     }
 }
 
@@ -605,9 +612,11 @@ pub const ArtifactSourceRef = struct {
     unit_id: ?[]u8 = null,
 
     pub fn clone(self: ArtifactSourceRef, alloc: Allocator) !ArtifactSourceRef {
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
         return .{
             .kind = self.kind,
-            .name = try alloc.dupe(u8, self.name),
+            .name = name,
             .chunk_id = self.chunk_id,
             .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
         };
@@ -629,12 +638,18 @@ pub const ArtifactRef = struct {
     source: ?ArtifactSourceRef = null,
 
     pub fn clone(self: ArtifactRef, alloc: Allocator) !ArtifactRef {
+        const document_id = try alloc.dupe(u8, self.document_id);
+        errdefer alloc.free(document_id);
+        const name = try alloc.dupe(u8, self.name);
+        errdefer alloc.free(name);
+        const unit_id = if (self.unit_id) |id| try alloc.dupe(u8, id) else null;
+        errdefer if (unit_id) |id| alloc.free(id);
         return .{
-            .document_id = try alloc.dupe(u8, self.document_id),
-            .name = try alloc.dupe(u8, self.name),
+            .document_id = document_id,
+            .name = name,
             .kind = self.kind,
             .chunk_id = self.chunk_id,
-            .unit_id = if (self.unit_id) |unit_id| try alloc.dupe(u8, unit_id) else null,
+            .unit_id = unit_id,
             .source = if (self.source) |source| try source.clone(alloc) else null,
         };
     }
@@ -1802,6 +1817,15 @@ pub const GraphQueryTransport = struct {
 };
 
 pub const SearchRequest = struct {
+    pub fn hasHitEvaluation(self: @This()) bool {
+        return self.evaluation_limit > 0 and !self.evaluation_graph;
+    }
+
+    evaluation_json: []const u8 = "",
+    evaluation_limit: u32 = 0,
+    evaluation_matches: bool = false,
+    /// Graph evaluation owns a separate collection window; base hit paging is unchanged.
+    evaluation_graph: bool = false,
     /// Set only after catalog schema/index preparation; never populated by public JSON.
     prepared_read_table_id: u64 = 0,
     /// Request-owned routing map parallel to filter_doc_ids; never serialized.
@@ -1987,6 +2011,10 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
 };
 
 const hierarchy_children_rejected_fields = [_][]const u8{
+    "evaluation_json",
+    "evaluation_limit",
+    "evaluation_matches",
+    "evaluation_graph",
     "query",
     "index_name",
     "primary_text_index_name",
@@ -2454,6 +2482,7 @@ pub const GraphMetricRerankScoreDetails = struct {
 };
 
 pub const SearchHit = struct {
+    computed_json: ?[]u8 = null,
     id: []u8,
     /// Internal graph-hydration namespace. Null means the query's source
     /// table. This is not serialized as part of the public search-hit shape.
@@ -2481,6 +2510,7 @@ pub const SearchHit = struct {
         var cloned = SearchHit{ .id = try alloc.dupe(u8, self.id) };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.computed_json) |data| alloc.free(data);
             if (cloned.source_table) |table| alloc.free(table);
             if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
@@ -2491,6 +2521,7 @@ pub const SearchHit = struct {
             if (cloned.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
             freeHighlights(alloc, cloned.highlights);
         }
+        cloned.computed_json = if (self.computed_json) |data| try alloc.dupe(u8, data) else null;
         cloned.source_table = if (self.source_table) |table| try alloc.dupe(u8, table) else null;
         cloned.doc_ordinal = self.doc_ordinal;
         cloned.native_text_doc_id = self.native_text_doc_id;
@@ -2523,6 +2554,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.computed_json) |data| alloc.free(data);
         if (self.source_table) |table| alloc.free(table);
         if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
@@ -2672,15 +2704,15 @@ pub const ChunkHit = struct {
     artifact_ref: ?ArtifactRef = null,
 
     pub fn clone(self: ChunkHit, alloc: Allocator) !ChunkHit {
-        return .{
-            .id = try alloc.dupe(u8, self.id),
-            .score = self.score,
-            .distance = self.distance,
-            .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
-            .ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null,
-            .artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null,
-        };
+        var cloned: ChunkHit = .{ .id = try alloc.dupe(u8, self.id) };
+        errdefer cloned.deinit(alloc);
+        cloned.score = self.score;
+        cloned.distance = self.distance;
+        cloned.stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.ancestor_unit_data = if (self.ancestor_unit_data) |data| try alloc.dupe(u8, data) else null;
+        cloned.artifact_ref = if (self.artifact_ref) |artifact_ref| try artifact_ref.clone(alloc) else null;
+        return cloned;
     }
 
     pub fn deinit(self: *ChunkHit, alloc: Allocator) void {
@@ -2873,6 +2905,27 @@ pub const GraphSearchResult = struct {
     metric_status: []GraphMetricStatus = &.{},
     truncated: bool = false,
 
+    /// Borrowed dependency view: inference collection must not enlarge the
+    /// graph relation seen by subsequent named operations. Only the slice
+    /// containers belong to scratch; never deinit this view as an owned result.
+    pub fn dependencyView(self: GraphSearchResult, scratch: Allocator, limit: ?u32, source_table: []const u8) !GraphSearchResult {
+        const maximum = limit orelse return self;
+        if (self.matches.len <= maximum) return self;
+        var view = self;
+        view.matches = self.matches[0..maximum];
+        view.truncated = true;
+        var hits: std.ArrayList(SearchHit) = .empty;
+        for (self.hits) |hit| {
+            var included = false;
+            for (view.matches) |match| for (match.bindings) |binding| {
+                if (std.mem.eql(u8, hit.id, binding.node.key) and std.mem.eql(u8, hit.source_table orelse source_table, binding.node.table orelse source_table)) included = true;
+            };
+            if (included) try hits.append(scratch, hit);
+        }
+        view.hits = hits.items;
+        return view;
+    }
+
     /// Detach request-scoped retained-state release hooks at the result
     /// ownership boundary. The request budget remains consumptively charged,
     /// while result deinit continues to own and free the allocations.
@@ -3061,11 +3114,13 @@ pub const GraphPatternBinding = struct {
 };
 
 pub const GraphPatternMatch = struct {
+    computed_json: ?[]u8 = null,
     bindings: []GraphPatternBinding,
     path: []graph_query_mod.PathEdgeInfo,
     null_aliases: [][]u8 = &.{},
 
     pub fn deinit(self: *GraphPatternMatch, alloc: Allocator) void {
+        if (self.computed_json) |bytes| alloc.free(bytes);
         for (self.bindings) |*binding| binding.deinit(alloc);
         if (self.bindings.len > 0) alloc.free(self.bindings);
         for (self.path) |edge| {
@@ -3333,6 +3388,7 @@ pub const TextMergeStats = struct {
     last_merge_error: RuntimeErrorName = .{},
     retry_after_ns: u64 = 0,
     deferred_for_pressure: u64 = 0,
+    forced_drains: u64 = 0,
     backpressure_events: u64 = 0,
     backpressure_ns: u64 = 0,
     backpressure_timeouts: u64 = 0,
@@ -3484,6 +3540,7 @@ pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void 
     if (src.last_merge_error.len != 0) dst.last_merge_error = src.last_merge_error;
     dst.retry_after_ns = @max(dst.retry_after_ns, src.retry_after_ns);
     dst.deferred_for_pressure +|= src.deferred_for_pressure;
+    dst.forced_drains +|= src.forced_drains;
     dst.backpressure_events +|= src.backpressure_events;
     dst.backpressure_ns +|= src.backpressure_ns;
     dst.backpressure_timeouts +|= src.backpressure_timeouts;
@@ -4002,9 +4059,6 @@ pub const OrderedApplyReceipt = struct {
     term: u64,
     index: u64,
 };
-
-/// Server source compatibility; the durable term/index encoding is unchanged.
-pub const RaftAppliedEntryIdentity = OrderedApplyReceipt;
 
 pub const ArtifactRepairResult = struct {
     scanned: u64 = 0,
@@ -4766,6 +4820,10 @@ pub const DerivedWorkerStats = struct {
     replay_document_not_visible_retries: u64 = 0,
     artifact_repair_required_retries: u64 = 0,
     not_found_retries: u64 = 0,
+    /// Documents given up on by bounded replay-document-not-visible
+    /// escalation, summed across every index (see
+    /// ResourceManager.replayDocumentNotVisibleSkippedTotalAll).
+    replay_document_not_visible_skipped_total: u64 = 0,
 };
 
 pub const BulkCoalescingStats = struct {
@@ -4917,6 +4975,7 @@ pub fn accumulateAsyncIndexingStats(dst: *AsyncIndexingStats, src: AsyncIndexing
     dst.derived_workers.replay_document_not_visible_retries += src.derived_workers.replay_document_not_visible_retries;
     dst.derived_workers.artifact_repair_required_retries += src.derived_workers.artifact_repair_required_retries;
     dst.derived_workers.not_found_retries += src.derived_workers.not_found_retries;
+    dst.derived_workers.replay_document_not_visible_skipped_total += src.derived_workers.replay_document_not_visible_skipped_total;
 }
 
 pub fn freeResolverReplayDiagnostics(alloc: Allocator, stats: ResolverReplayDiagnostics) void {
@@ -5031,3 +5090,128 @@ pub const IndexTargetVisibility = struct {
     config_hash: u64,
     serving_set_effect: ServingSetEffect = .may_reduce,
 };
+
+/// New relationship keys and durable endpoint retirements require peers that
+/// understand their complete identities before any primary rows are applied.
+pub fn requiresGraphRelationshipProtocol(req: BatchRequest) bool {
+    const keys = @import("../internal_keys.zig");
+    // Document writes can embed relationship IDs or derive graph effects from
+    // the local catalog. Gate their complete apply contract before extraction.
+    // Deletes generate exact retirements during apply even when the input
+    // contains only legacy tuples or document keys. Classify those effects
+    // before proposal; inspecting only already-materialized rows is too late.
+    if (req.writes.len != 0 or req.graph_endpoint_cleanup or req.deletes.len != 0 or req.graph_deletes.len != 0 or req.transforms.len != 0 or req.merge_page != null) return true;
+    if (req.transaction) |control| {
+        if (control == .resolve and control.resolve.status == .committed) return true;
+        // Field-derived inline edges depend on the local graph catalog, so
+        // even ordinary document values can acquire durable endpoint guards.
+        if (control == .prepare and req.writes.len != 0) return true;
+    }
+    for (req.graph_writes) |write| if (write.edge_id.len != 0 or write.owner_document.len != 0) return true;
+    for (req.graph_deletes) |delete| if (delete.edge_id.len != 0 or delete.owner_document.len != 0) return true;
+    for (req.merge_artifacts) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
+    for (req.writes) |row| if (keys.isGraphRetirementKey(row.key) or keys.graphArtifactHasRelationshipId(row.key)) return true;
+    return false;
+}
+
+/// Shared binary-safe planner response and ordered maintenance request.
+/// Missing afterimages decode as an empty page for historical planners.
+pub const GraphEndpointCleanupStatus = struct {
+    pending: bool = false,
+    guards: []const @import("../graph_cleanup_contract.zig").Guard = &.{},
+    graph_deletes: []const GraphEdgeDelete = &.{},
+    deletes: []const []const u8 = &.{},
+    merge_artifacts: []const BatchWrite = &.{},
+
+    pub fn request(self: @This()) BatchRequest {
+        return .{
+            .graph_endpoint_cleanup = true,
+            .graph_endpoint_cleanup_planned = true,
+            .graph_endpoint_cleanup_guards = self.guards,
+            .graph_deletes = self.graph_deletes,
+            .deletes = self.deletes,
+            .merge_artifacts = self.merge_artifacts,
+            .sync_level = .write,
+        };
+    }
+};
+
+/// Cleanup is a private, effect-bearing command, never a flag that can be
+/// attached to a public mutation or a lifecycle control.
+pub fn validateGraphEndpointCleanupCommand(req: BatchRequest) !void {
+    for (req.graph_writes) |write| try @import("../../graph/mutation_identity.zig").validate(write.edge_id, write.owner_document, write.owner);
+    for (req.graph_deletes) |delete| try @import("../../graph/mutation_identity.zig").validate(delete.edge_id, delete.owner_document, delete.owner);
+    if (!req.graph_endpoint_cleanup) {
+        if (req.graph_endpoint_cleanup_planned or req.graph_endpoint_cleanup_guards.len != 0) return error.InvalidBatchRequest;
+        return;
+    }
+    if (req.graph_endpoint_cleanup_planned) try validatePlannedGraphEndpointCleanup(req);
+    const defaults = BatchRequest{};
+    inline for (std.meta.fields(BatchRequest)) |field| {
+        if (comptime !std.mem.eql(u8, field.name, "graph_endpoint_cleanup") and !std.mem.eql(u8, field.name, "graph_endpoint_cleanup_planned") and !std.mem.eql(u8, field.name, "timestamp_ns") and !std.mem.eql(u8, field.name, "sync_level")) {
+            if (comptime std.mem.eql(u8, field.name, "deletes") or std.mem.eql(u8, field.name, "graph_deletes") or std.mem.eql(u8, field.name, "graph_endpoint_cleanup_guards") or std.mem.eql(u8, field.name, "merge_artifacts")) {
+                if (!req.graph_endpoint_cleanup_planned and @field(req, field.name).len != 0) return error.InvalidBatchRequest;
+            } else {
+                const value = @field(req, field.name);
+                if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+                    if (value.len != 0) return error.InvalidBatchRequest;
+                } else if (!std.meta.eql(value, @field(defaults, field.name))) return error.InvalidBatchRequest;
+            }
+        }
+    }
+}
+
+/// Planned pages can only remove inline edges and this maintenance queue.
+/// In particular, the constraint exemption never admits a document deletion.
+fn validatePlannedGraphEndpointCleanup(req: BatchRequest) !void {
+    const keys = @import("../internal_keys.zig");
+    const contract = @import("../graph_cleanup_contract.zig");
+    if (req.graph_deletes.len + req.deletes.len + req.merge_artifacts.len > 256 or req.graph_endpoint_cleanup_guards.len > 256) return error.InvalidBatchRequest;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    for (req.graph_endpoint_cleanup_guards, 0..) |guard, i| {
+        if (guard.kind == .owner_replay and guard.generation == 0) return error.InvalidBatchRequest;
+        for (req.graph_endpoint_cleanup_guards[0..i]) |prior| if (guard.kind == prior.kind and std.mem.eql(u8, guard.endpoint, prior.endpoint)) return error.InvalidBatchRequest;
+    }
+    for (req.deletes) |key| {
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| {
+            covered = if (guard.kind == .endpoint) contract.matchesKey(key, guard.endpoint) else contract.matchesOwnerJobKey(key, guard.endpoint) or (keys.isGraphRetirementKey(key) and try contract.ownedBy(alloc, key, guard.endpoint));
+            if (covered) break;
+        }
+        if (!covered) return error.InvalidBatchRequest;
+    }
+    for (req.graph_deletes) |edge| {
+        if (edge.owner_document.len != 0 or edge.index_name.len == 0 or edge.source.len == 0 or edge.target.len == 0) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| if (guard.kind == .endpoint and std.mem.eql(u8, guard.endpoint, edge.target)) {
+            covered = true;
+            break;
+        };
+        if (!covered) return error.InvalidBatchRequest;
+    }
+    for (req.merge_artifacts) |row| {
+        if (row.json_null_fields.len != 0) return error.InvalidBatchRequest;
+        var covered = false;
+        for (req.graph_endpoint_cleanup_guards) |guard| {
+            if (guard.kind != .owner_replay) continue;
+            if (contract.matchesOwnerJobKey(row.key, guard.endpoint)) {
+                const next = try contract.decodeOwnerJob(row.key, row.value);
+                if (next.generation != guard.generation) return error.InvalidBatchRequest;
+                covered = true;
+            } else covered = contract.isReplayInput(row.key) and try contract.ownedBy(alloc, row.key, guard.endpoint);
+            if (covered) break;
+        }
+        if (!covered) return error.InvalidBatchRequest;
+    }
+}
+
+test "graph relationship protocol gates document effects before extraction" {
+    for ([_][]const u8{
+        "{\"_edges\":{\"g\":{\"R\":[{\"target\":\"b\",\"edge_id\":\"one\"},{\"target\":\"b\",\"edge_id\":\"two\"}]}}}",
+        "{\"links\":[\"b\"]}",
+        "{}",
+    }) |document| try std.testing.expect(requiresGraphRelationshipProtocol(.{ .writes = &.{.{ .key = "a", .value = document }} }));
+    try std.testing.expect(!requiresGraphRelationshipProtocol(.{}));
+}

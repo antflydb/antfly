@@ -871,7 +871,7 @@ fn publishSourceChildSchema(alloc: std.mem.Allocator, parent: *db.DB, source: *d
         .schema_json_digest = schema_digest,
         .before_catalog_digest = before_catalog_digest,
         .after_catalog_digest = after_catalog_digest,
-        .raft_entry = .{ .term = 1, .index = 1 },
+        .ordered_receipt = .{ .term = 1, .index = 1 },
     });
     try parent.applyRelationalTopologyControl(.{ .action = .acknowledge_child_generation, .fence = parent_fence, .child_generations = &.{transition} }, null);
     {
@@ -939,7 +939,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
         fixture.owner_uri = try listener.baseUri(a);
         fixture.owner_http = owner_transport.executor();
     }
-    server.cfg.ha_failover_safe_mutations_only = policy.failover_safe;
+    server.cfg.hot_standby_failover_safe_mutations_only = policy.failover_safe;
     server.cfg.restore_execution_guard = policy.guard;
     server.restore_leadership_term.store(policy.term, .release);
     server.restore_job_store.deinit();

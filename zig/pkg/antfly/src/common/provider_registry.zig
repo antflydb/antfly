@@ -17,6 +17,7 @@ const embeddings = @import("antfly_embeddings");
 const chunking = @import("antfly_chunking");
 const generating = @import("antfly_generating");
 const reranking = @import("antfly_reranking");
+const decisions = @import("../functions/decisions.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -63,6 +64,8 @@ pub const Registry = struct {
     default_chain: ?[]const u8 = null,
     reranker_configs: std.StringArrayHashMapUnmanaged(reranking.Config) = .{},
     default_reranker: ?[]const u8 = null,
+    decider_configs: std.StringArrayHashMapUnmanaged(decisions.DeciderConfig) = .{},
+    default_decider: ?[]const u8 = null,
     embedder_configs: std.StringArrayHashMapUnmanaged(embeddings.Config) = .{},
     default_embedder: ?[]const u8 = null,
     chunker_configs: std.StringArrayHashMapUnmanaged(chunking.Config) = .{},
@@ -109,6 +112,12 @@ pub const Registry = struct {
         }
         self.chunker_configs.deinit(self.allocator);
 
+        var decider_it = self.decider_configs.iterator();
+        while (decider_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.decider_configs.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -124,6 +133,15 @@ pub const Registry = struct {
         var registry = Registry.init(alloc);
         errdefer registry.deinit();
 
+        if (value.object.get("deciders")) |configs| {
+            if (configs != .object) return error.InvalidRegistryConfig;
+            var it = configs.object.iterator();
+            while (it.next()) |entry| {
+                var cfg = try decisions.parseConfig(alloc, entry.value_ptr.*);
+                defer cfg.deinit(alloc);
+                try registry.registerDeciderConfig(entry.key_ptr.*, cfg);
+            }
+        }
         if (value.object.get("generators")) |generators_value| {
             try parseGenerators(&registry, generators_value);
         }
@@ -141,6 +159,25 @@ pub const Registry = struct {
         }
 
         return registry;
+    }
+
+    pub fn getDeciderConfig(self: *const Registry, name: ?[]const u8) !decisions.DeciderConfig {
+        const resolved = name orelse self.default_decider orelse return error.NoDefaultDecider;
+        return self.decider_configs.get(resolved) orelse error.UnknownDecider;
+    }
+
+    pub fn registerDeciderConfig(self: *Registry, name: []const u8, cfg: decisions.DeciderConfig) !void {
+        try cfg.validate();
+        if (name.len == 0) return error.InvalidDeciderConfig;
+        const key = try self.allocator.dupe(u8, name);
+        errdefer self.allocator.free(key);
+        var owned = try cfg.clone(self.allocator);
+        errdefer owned.deinit(self.allocator);
+        const entry = try self.decider_configs.getOrPut(self.allocator, key);
+        if (entry.found_existing) return error.DuplicateDeciderName;
+        entry.key_ptr.* = key;
+        entry.value_ptr.* = owned;
+        if (self.default_decider == null) self.default_decider = key;
     }
 
     pub fn defaultGeneratorName(self: *const Registry) ?[]const u8 {

@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ..models.phrase_query import PhraseQuery
     from ..models.prefix_query import PrefixQuery
     from ..models.pruner import Pruner
+    from ..models.query_evaluation import QueryEvaluation
     from ..models.query_hierarchy import QueryHierarchy
     from ..models.query_highlight import QueryHighlight
     from ..models.query_request_aggregations import QueryRequestAggregations
@@ -64,6 +65,11 @@ class GlobalStatefulQueryRequest:
 
     Attributes:
         table (str): Name of the table to query. Example: wikipedia.
+        evaluate (QueryEvaluation | Unset): Evaluate expressions after global retrieval merging, before final
+            offset/limit. Candidates require candidate_count; matches require
+            max_rows and fail if the full qualifying population exceeds that budget.
+            Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+            be combined with evaluation. NULL inputs skip inference; errors fail.
         table_target (CatalogTableTarget | Unset): An explicit native table target. Components are literal names; dots
             do not qualify a string table name.
         query (QueryRequestQuery | Unset): Canonical public query AST. Prefer this field for new clients.
@@ -379,6 +385,7 @@ class GlobalStatefulQueryRequest:
     """
 
     table: str
+    evaluate: QueryEvaluation | Unset = UNSET
     table_target: CatalogTableTarget | Unset = UNSET
     query: QueryRequestQuery | Unset = UNSET
     full_text_search: (
@@ -531,6 +538,10 @@ class GlobalStatefulQueryRequest:
         from ..models.wildcard_query import WildcardQuery
 
         table = self.table
+
+        evaluate: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.evaluate, Unset):
+            evaluate = self.evaluate.to_dict()
 
         table_target: dict[str, Any] | Unset = UNSET
         if not isinstance(self.table_target, Unset):
@@ -824,6 +835,8 @@ class GlobalStatefulQueryRequest:
                 "table": table,
             }
         )
+        if evaluate is not UNSET:
+            field_dict["evaluate"] = evaluate
         if table_target is not UNSET:
             field_dict["table_target"] = table_target
         if query is not UNSET:
@@ -934,6 +947,7 @@ class GlobalStatefulQueryRequest:
         from ..models.phrase_query import PhraseQuery
         from ..models.prefix_query import PrefixQuery
         from ..models.pruner import Pruner
+        from ..models.query_evaluation import QueryEvaluation
         from ..models.query_hierarchy import QueryHierarchy
         from ..models.query_highlight import QueryHighlight
         from ..models.query_request_aggregations import QueryRequestAggregations
@@ -951,6 +965,13 @@ class GlobalStatefulQueryRequest:
 
         d = dict(src_dict)
         table = d.pop("table")
+
+        _evaluate = d.pop("evaluate", UNSET)
+        evaluate: QueryEvaluation | Unset
+        if isinstance(_evaluate, Unset):
+            evaluate = UNSET
+        else:
+            evaluate = QueryEvaluation.from_dict(_evaluate)
 
         _table_target = d.pop("table_target", UNSET)
         table_target: CatalogTableTarget | Unset
@@ -1839,6 +1860,7 @@ class GlobalStatefulQueryRequest:
 
         global_stateful_query_request = cls(
             table=table,
+            evaluate=evaluate,
             table_target=table_target,
             query=query,
             full_text_search=full_text_search,

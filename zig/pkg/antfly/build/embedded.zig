@@ -185,6 +185,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     });
     @call(.auto, configureEmbeddedModule, .{ b, antfly_imports.storage_boundary, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
     embedded_support_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
+    embedded_support_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
+    embedded_support_mod.addImport("antfly_inference_execution_context", antfly_imports.inference_execution_context);
+    embedded_support_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
     embedded_support_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
     embedded_support_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
     embedded_support_mod.addImport("antfly_public_limits", antfly_imports.public_limits);
@@ -518,6 +521,10 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi concurrent calls and closes on one handle never touch freed memory",
         "capi text and dense searches succeed while writes commit",
         "capi execute graph queries honors identity read generation",
+        "capi fact relationships preserve identities and filter before ranking",
+        "capi fact path serialization and parsing release partial allocations",
+        "capi fact algebraic paths retain provenance and respect frontier limits",
+        "capi fact edge cleanup releases the owned array exactly once",
         "capi search rejects stale identity generation before readable lease hook",
         "capi search json returns stamped identity generation",
         "packed dense response exposes public ids not doc ordinals",
@@ -546,8 +553,8 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     };
     const capi_tests = b.addTest(.{
         .root_module = capi_root_mod,
-        // Storage-backed Mach-O ReleaseSafe codegen needs 12 GiB headroom.
-        .max_rss = @as(usize, if (target.result.os.tag == .macos) 12 else 7) * 1024 * 1024 * 1024,
+        // Storage-backed Mach-O Debug codegen measured 13.51 GB.
+        .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
         .filters = selectTestFilters(b, &capi_default_filters),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),

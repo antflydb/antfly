@@ -156,11 +156,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     else
         false;
     const inference_blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
-    const inference_system_blas_available = link_libc and (target.result.os.tag == .macos or inference_blas_root_opt != null);
-    const inference_enable_system_blas = if (link_libc)
-        b.option(bool, "system-blas", "Enable system BLAS acceleration for native CPU math") orelse inference_system_blas_available
-    else
-        false;
+    const inference_blas = @import("pkg/inference/build/blas.zig").configure(b, link_libc, target.result.os.tag == .macos, inference_blas_root_opt != null);
+    const inference_enable_system_blas = inference_blas.system;
     const inference_blas_root = if (inference_enable_system_blas and target.result.os.tag != .macos)
         inference_blas_root_opt
     else
@@ -670,6 +667,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .wasm_memory_model = b.option([]const u8, "wasm-memory-model", "Inference WASM memory model: wasm32 or wasm64") orelse "wasm32",
             .enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU for inference WASM") orelse false,
             .enable_system_blas = inference_enable_system_blas,
+            .enable_runtime_openblas = inference_blas.runtime,
             .blas_root = inference_blas_root,
             .link_libc = link_libc,
             .skip_openapi = false,
@@ -812,6 +810,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     runtime_fs_mod.addImport("antfly_platform", platform_mod);
+    // usermgr/user_manager.zig and the storage it transitively reaches need
+    // these three ABI modules, which usermgr_mod didn't declare.
+    usermgr_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    usermgr_mod.addImport("antfly_cache_budget", cache_budget_mod);
+    usermgr_mod.addImport("antfly_runtime_fs", runtime_fs_mod);
     const provision_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/metadata/provision_contract.zig"),
         .target = target,
@@ -988,7 +991,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     inference_runtime_paths_mod.addImport("antfly_platform", platform_mod);
-    inference_runtime_paths_mod.addImport("inference_server", inference_server_mod);
     const inference_query_embedding_cache_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig"),
         .target = target,
@@ -1155,6 +1157,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    antfly_imports.configureRuntimeContracts(usermgr_mod);
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
@@ -1621,6 +1624,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
@@ -1801,9 +1805,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     }) });
+    graph_transfer_tests.root_module.addImport("antfly_hash", hash_mod);
     const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
     b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
-    owner_tests.unit_test_step.dependOn(&run_graph_transfer_tests.step);
+    // The storage lanes already own every named graph-transfer contract.
+    // Keep this focused target without compiling a duplicate aggregate image.
     const standalone_policy_ha_tests = owner_tests.standalone_policy_ha_tests;
     standalone_policy_ha_tests.root_module.addObject(consumer_test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
@@ -1815,6 +1821,24 @@ pub fn create(b: *std.Build) ?Artifacts {
     for ([_]*std.Build.Step.Run{ run_standalone_initial_fk_tests, run_standalone_policy_ha_tests }) |run| {
         owner_tests.storage_test_step.dependOn(&run.step);
         owner_tests.integration_test_step.dependOn(&run.step);
+    }
+
+    // These three compile real CLI/server boot paths (Lite command tests,
+    // the standalone runtime's HA/hot-standby/Lite surface, and the public
+    // API parity e2e suite) that reach the real storage-kernel owner through
+    // api/kernel_owner_source.zig the same way production does, independent
+    // of the control-only source selection most unit tests use. Each already
+    // compiles from its own dedicated module (not the shared antfly_test_mod
+    // or standalone_runtime_test_mod), so linking the owner archive here
+    // reaches only this one compile per fixture.
+    for ([_]*std.Build.Step.Compile{
+        owner_tests.lite_cmd_tests,
+        owner_tests.lib_standalone_runtime_tests,
+        owner_tests.public_api_parity_tests,
+    }) |tests| {
+        tests.root_module.addObject(consumer_test_metadata.object);
+        inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+            tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);

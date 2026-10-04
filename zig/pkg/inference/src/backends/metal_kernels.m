@@ -28772,28 +28772,21 @@ int termite_metal_decode_runtime_prepare_embedding_table_device(
     if (runtime == NULL || src_handle == NULL) return -1;
     if (runtime->device == nil || runtime->queue == nil) return -2;
     if (rows == 0 || dim == 0) return -3;
-    const uintptr_t source_id = (uintptr_t)src_handle;
     const size_t bytes = rows * dim * sizeof(float);
-    if (termite_metal_decode_runtime_select_embedding_cache(runtime, source_id, src_offset, rows, dim, bytes)) return 0;
-    @autoreleasepool {
-        id<MTLBuffer> src = (__bridge id<MTLBuffer>)src_handle;
-        if (src_offset + bytes > src.length) return -4;
-        id<MTLBuffer> dst = [runtime->device newBufferWithLength:bytes options:MTLResourceStorageModePrivate];
-        if (dst == nil) return -5;
-        const bool frame_owned = (runtime->active_frame_cb == nil);
-        id<MTLCommandBuffer> command_buffer = frame_owned
-            ? termite_metal_new_command_buffer(runtime->queue, __func__)
-            : runtime->active_frame_cb;
-        if (command_buffer == nil) return -6;
-        termite_metal_record_active_frame_blit_source(command_buffer, TERMITE_METAL_BLIT_SOURCE_EMBEDDING);
-        id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
-        if (blit == nil) return -7;
-        [blit copyFromBuffer:src sourceOffset:src_offset toBuffer:dst destinationOffset:0 size:bytes];
-        [blit endEncoding];
-        if (termite_metal_decode_runtime_finish_command_buffer(command_buffer, frame_owned, -8) != 0) return -8;
-        termite_metal_decode_runtime_store_embedding_cache(runtime, dst, 0, source_id, src_offset, rows, dim, bytes);
-        return 0;
-    }
+    id<MTLBuffer> src = (__bridge id<MTLBuffer>)src_handle;
+    if (src_offset + bytes > src.length) return -4;
+    // Read the device table in place. A device source is often a pooled
+    // activation buffer, so caching a copy keyed on its identity would serve
+    // stale rows once the pool hands the buffer to a later table of the same
+    // shape. The planned-range tracking orders this read after its producer.
+    runtime->generic_embedding_table_buffer = src;
+    runtime->generic_embedding_buffer_offset = src_offset;
+    runtime->generic_embedding_table_bytes = bytes;
+    runtime->generic_embedding_rows = rows;
+    runtime->generic_embedding_dim = dim;
+    runtime->generic_embedding_source_id = (uintptr_t)src_handle;
+    runtime->generic_embedding_source_offset = src_offset;
+    return 0;
 }
 
 int termite_metal_decode_runtime_prepare_quant_embedding_table(

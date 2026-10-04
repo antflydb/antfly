@@ -180,6 +180,12 @@ student (its encoder, a fresh decision head) for
 python init_decision_head.py --student <antenna student> --laya <prepared laya dir> --output <dir>
 ```
 
+`embedding_probe.py` and `embedding_unfreeze_probe.py` measure whether the
+trunk can embed: SQuAD retrieval for a head on the frozen trunk, and for the
+trunk with its top k layers trained (with the GLiNER extraction cost scored by
+`baselines.py` on the checkpoints they write). See
+work-log/completed/inference/antenna/2026-10-03-embedding-layout.md.
+
 `gap_probe.py` measures where a distilled student departs from its teacher:
 the distillation loss's z-space error per evaluation dataset (own and
 pool-style schemas) and pool, word rows and marker rows apart:

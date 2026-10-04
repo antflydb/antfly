@@ -625,9 +625,16 @@ test "opaque owner relational handoff preserves binary proofs across the compile
     const topology = @import("db/relational_integrity_topology_contract.zig");
     const handoff = @import("db/relational_integrity_handoff_contract.zig");
     const contract = @import("db/relational_transition_contract.zig");
-    const path = "/tmp/antfly-kernel-relational-handoff";
-    cleanup(path);
-    defer cleanup(path);
+    // A fixed /tmp literal collides with any other process (including a
+    // concurrent test run) that opens the same path, surfacing spurious
+    // GenerationTransitionActive failures. Use a per-run unique directory
+    // like the rest of this file's tests.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const path = try std.fmt.allocPrint(alloc, "{s}/relational-handoff", .{root});
+    defer alloc.free(path);
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","unique_constraints":[{"name":"uq","columns":["id"]}],"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"string"}},"additionalProperties":false}}}}
     ;
@@ -1614,6 +1621,28 @@ fn ownerStatusEventually(owner: *client.Owner) !client.Response {
     }
 }
 
+// textMemoryJson is, by design, an observational read that tries the owner's
+// apply lock without waiting (storageOwnerTextMemoryJson ->
+// trySnapshotTextMemoryAttributionStats): a concurrent background checkpoint
+// or compaction worker from a preceding reconcile/full-index batch can hold
+// that lock just long enough to surface a transient StorageBusy here, the
+// same category of contention ownerStatusEventually already retries for
+// runtimeStatusJson.
+fn ownerTextMemoryEventually(owner: *client.Owner, table_name: []const u8) !client.Response {
+    const time = @import("antfly_platform").time;
+    const deadline = time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (true) {
+        return owner.textMemoryJson(table_name) catch |err| switch (err) {
+            error.StorageBusy => {
+                if (time.monotonicNs() >= deadline) return err;
+                try std.testing.io.sleep(.fromMilliseconds(2), .awake);
+                continue;
+            },
+            else => return err,
+        };
+    }
+}
+
 test "opaque storage owner preserves dense profiles and captured identity" {
     const alloc = std.testing.allocator;
     const path = "/tmp/antfly-owner-dense-profile";
@@ -1666,12 +1695,19 @@ test "opaque storage owner preserves dense profiles and captured identity" {
 }
 
 test "opaque storage owner performs coarse batch and query on one live DB" {
-    const path = "/tmp/antfly-storage-kernel-owner-batch-query";
-    const backup_root = "/tmp/antfly-storage-kernel-owner-backups";
-    cleanup(path);
-    cleanup(backup_root);
-    defer cleanup(path);
-    defer cleanup(backup_root);
+    // A fixed /tmp literal collides with any other process (including a
+    // concurrent test run) that opens the same path, racing the storage
+    // owner's process-wide generation/lease lifecycle and surfacing spurious
+    // StorageBusy/LsmRootWriterAlreadyOpen failures. Use a per-run unique
+    // directory like the rest of this file's tests.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", std.testing.allocator);
+    defer std.testing.allocator.free(root);
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/batch-query", .{root});
+    defer std.testing.allocator.free(path);
+    const backup_root = try std.fmt.allocPrint(std.testing.allocator, "{s}/backups", .{root});
+    defer std.testing.allocator.free(backup_root);
 
     var owner = try client.Owner.open(.{
         .path = .fromSlice(path),
@@ -2138,7 +2174,7 @@ test "opaque storage owner performs coarse batch and query on one live DB" {
         "{\"inserts\":{\"doc:artifact\":{\"title\":\"artifact\",\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YQ==\"},\"doc:c\":{\"title\":\"gamma\",\"_embeddings\":{\"dense_idx\":[1,0,0]}},\"doc:d\":{\"title\":\"delta\",\"_embeddings\":{\"dense_idx\":[0,1,0]}}},\"sync_level\":\"full_index\"}",
     );
     defer indexed_batch.deinit();
-    var text_memory = try owner.textMemoryJson("docs");
+    var text_memory = try ownerTextMemoryEventually(&owner, "docs");
     defer text_memory.deinit();
     try std.testing.expect(std.mem.indexOf(u8, text_memory.bytes(), "\"text_indexes\":1") != null);
     var dense_response = try owner.queryJson(
@@ -2418,11 +2454,11 @@ test "opaque storage owner validates ABI and destruction is idempotent" {
         abi.Status.invalid_abi,
         abi.antfly_storage_owner_wait_for_sync(null, &invalid_sync),
     );
-    var invalid_ha: abi.HAReplicationRecordRequest = .{};
-    invalid_ha.version = abi.abi_version + 1;
+    var invalid_hot_standby: abi.HAReplicationRecordRequest = .{};
+    invalid_hot_standby.version = abi.abi_version + 1;
     try std.testing.expectEqual(
         abi.Status.invalid_abi,
-        abi.antfly_storage_owner_apply_hot_standby_replication_record(null, &invalid_ha),
+        abi.antfly_storage_owner_apply_hot_standby_replication_record(null, &invalid_hot_standby),
     );
     var invalid_backup: abi.BackupRequest = .{};
     invalid_backup.version = abi.abi_version + 1;
@@ -3200,41 +3236,41 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         // An opaque owner cannot retain a pointer to this stack-local Port;
         // only its heap-owned creator adapter survives each completed bind.
         try std.testing.expect(transition.tryLock());
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
         transition.unlock();
         try std.testing.expectError(error.MetadataHAMigrationAfterBinding, source.migrateStandaloneRestoreJobs(&.{}));
         try source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = initial } });
         var first = (try primary.log.entryAt(alloc, 1)).?;
         defer first.deinit(alloc);
-        try target.applyHARecord(first.record);
-        try target.applyHARecord(first.record);
+        try target.applyHotStandbyRecord(first.record);
+        try target.applyHotStandbyRecord(first.record);
         const actual = (try target.getRestoreJobValue(alloc, group, key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(initial, actual);
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.HASyncCommitWouldBlock, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = key, .value = updated } }));
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-        try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(io, root ++ "/checkpoint"));
+        try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(io, root ++ "/checkpoint"));
         try std.testing.expect(transition.tryLock());
         transition.unlock();
     }
     {
         var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
         defer source.deinit();
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
-        try source.flushHAOutbox();
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
+        try source.flushHotStandbyOutbox();
         try std.testing.expectEqual(@as(u64, 2), primary.lastLsn());
-        const checkpoint = try source.exportHACheckpoint(io, root ++ "/checkpoint");
+        const checkpoint = try source.exportHotStandbyCheckpoint(io, root ++ "/checkpoint");
         var restored = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/restored" });
         defer restored.deinit();
-        try restored.importHACheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes);
+        try restored.importHotStandbyCheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes);
         const actual = (try restored.getRestoreJobValue(alloc, group, key)).?;
         defer alloc.free(actual);
         try std.testing.expectEqualStrings(updated, actual);
         var second = (try primary.log.entryAt(alloc, 2)).?;
         defer second.deinit(alloc);
-        try restored.applyHARecord(second.record);
-        try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, restored.importHACheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes));
+        try restored.applyHotStandbyRecord(second.record);
+        try std.testing.expectError(error.MetadataHACheckpointTargetNotEmpty, restored.importHotStandbyCheckpoint(io, root ++ "/checkpoint", checkpoint.size_bytes));
         // Catalog outcomes cross the separately compiled owner boundary too.
         // A stale bootstrap CAS is definitely rejected, while a failed remote
         // acknowledgement after the exact catalog commit is ambiguous.
@@ -3242,7 +3278,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         try std.testing.expect(revision > 0);
         try std.testing.expectError(error.TableLifecycleConflict, source.replaceStandaloneCatalog(group, revision - 1, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision, try source.standaloneRevision());
-        try source.bindHA(.{ .primary = hot_standby_write_gate_adapter.bindPrimary(&primary) }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait });
+        try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
         try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision + 1, try source.standaloneRevision());
         const catalog = (try source.loadStandaloneCatalog(alloc)).?;
@@ -3283,26 +3319,25 @@ test "opaque metadata standby acknowledgement cannot retire an outbox across pro
     var promote: Promote = .{ .gate = &gate, .transition = &transition };
     var source = try metadata_apply_client.RaftApplyStore.init(alloc, .{ .root_dir = root ++ "/source" });
     defer source.deinit();
-    try source.bindHA(.{ .shared = .{ .state = gate.storageWriteState() } }, .{
-        .publisher = hot_standby_publisher_adapter.bind(&primary),
+    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{
         .transition_mutex = &transition,
         .sync_policy = .{ .mode = .remote_apply, .standby_names = &.{"standby-a"} },
         .sync_wait_ctx = &promote,
         .sync_wait_fn = Promote.wait,
-    });
+    }));
     const group = @import("../common/group_ids.zig").main_metadata_group_id;
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, source.applyStandaloneCommand(group, .{ .upsert_restore_job = .{
         .key = "\x00\x00__api_restore_jobs__:000000000000002a",
         .value = "{\"job_id\":42,\"phase\":\"queued\"}",
     } }));
-    try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint"));
+    try std.testing.expectError(error.MetadataHAOutboxPending, source.exportHotStandbyCheckpoint(std.testing.io, root ++ "/checkpoint"));
     try std.testing.expect(transition.tryLock());
     transition.unlock();
     const prior_lsn = primary.lastLsn();
-    try source.bindHA(.{ .shared = .{ .state = gate.storageWriteState() } }, .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .transition_mutex = &transition });
-    try source.flushHAOutbox();
+    try source.bindHotStandby(.{ .shared = .{ .state = gate.storageWriteState() } }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition }));
+    try source.flushHotStandbyOutbox();
     try std.testing.expectEqual(prior_lsn, primary.lastLsn());
-    _ = try source.exportHACheckpoint(std.testing.io, root ++ "/checkpoint");
+    _ = try source.exportHotStandbyCheckpoint(std.testing.io, root ++ "/checkpoint");
 }
 
 test "opaque metadata initial FK reservation preserves placement authority across snapshot" {
@@ -3872,6 +3907,40 @@ test "storage and shard query contracts preserve search effort" {
             try std.testing.expectEqual(@as(usize, 1), restored.req.dense_queries.len);
             if (effort == null) try std.testing.expect(std.mem.indexOf(u8, wire, "search_effort") == null);
         }
+    }
+}
+
+test "storage query contract embedding numbers preserve relationship precision" {
+    const alloc = std.testing.allocator;
+    const query = @import("../api/query_contract.zig");
+    const body =
+        \\{"embeddings":{"dense":[1,0.5,1e-3],"sparse":{"packed_indices":"AQAAAAUAAAA=","packed_values":"AAAAPwAAQD8=","k":4}},"indexes":["dense","sparse"],"limit":9,"graph_queries":{"walk":{"index":"g","traverse":{"start":{"keys":["Alice"]},"edge_filter":{"properties":[{"field":"/metadata/value","op":"eq","value":1.0000000000000001}]}}}}}
+    ;
+    var public = try query.parsePublicQueryRequest(alloc, null, "docs", body);
+    defer public.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 0.5, 0.001 }, public.req.dense_queries[0].query.vector);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 5 }, public.req.sparse_queries[0].query.indices);
+    try std.testing.expectEqual(@as(u32, 4), public.req.sparse_queries[0].query.k);
+    try std.testing.expectEqualStrings("1.0000000000000001", public.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+    const contract = @import("../api/local_query_contract.zig");
+    const wire = try contract.encodeStorageKernelQueryRequest(alloc, public.req);
+    defer alloc.free(wire);
+    var internal = try query.parseQueryRequest(alloc, null, "docs", wire);
+    defer internal.deinit(alloc);
+    try std.testing.expectEqualSlices(f32, public.req.dense_queries[0].query.vector, internal.req.dense_queries[0].query.vector);
+    try std.testing.expectEqual(@as(u32, 4), internal.req.sparse_queries[0].query.k);
+    try std.testing.expectEqualStrings("1.0000000000000001", internal.req.graph_queries[0].query.params.edge_filter.properties[0].value_json);
+    for ([_][]const u8{
+        \\{"embeddings":{"s":{"indices":[-1],"values":[1]}}}
+        ,
+        \\{"embeddings":{"s":{"indices":[1],"values":[1],"k":4294967296}}}
+        ,
+        \\{"embeddings":{"d":[1e100]}}
+        ,
+        \\{"embeddings":{"d":"AACAfw=="}}
+        ,
+    }) |invalid| {
+        try std.testing.expectError(error.InvalidQueryRequest, query.parsePublicQueryRequest(alloc, null, "docs", invalid));
     }
 }
 
