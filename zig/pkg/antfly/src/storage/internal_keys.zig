@@ -2157,16 +2157,22 @@ pub fn isEmbeddingArtifactKey(key: []const u8) bool {
 }
 
 pub fn isAssetArtifactKey(key: []const u8) bool {
-    if (!isInternalUserKey(key)) return false;
-    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    return assetArtifactNameBody(key) != null;
+}
+
+/// Validates a top-level asset key and borrows its encoded name component.
+/// Decode only this component when the caller does not need document identity.
+pub inline fn assetArtifactNameBody(key: []const u8) ?[]const u8 {
+    if (!isInternalUserKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1) orelse return null;
     var pos = doc_term + 2;
-    if (pos >= key.len or key[pos] != artifact_kind) return false;
+    if (pos >= key.len or key[pos] != artifact_kind) return null;
     pos += 1;
-    if (!componentEquals(key, pos, "asset")) return false;
-    const type_term = findComponentTerminator(key, pos) orelse return false;
+    if (!componentEquals(key, pos, "asset")) return null;
+    const type_term = findComponentTerminator(key, pos) orelse return null;
     pos = type_term + 2;
-    const name_term = findComponentTerminator(key, pos) orelse return false;
-    return name_term + 2 == key.len;
+    const name_term = findComponentTerminator(key, pos) orelse return null;
+    return if (name_term + 2 == key.len) key[pos..name_term] else null;
 }
 
 pub fn matchesAssetArtifactName(key: []const u8, artifact_name: []const u8) bool {

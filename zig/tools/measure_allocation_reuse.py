@@ -6,10 +6,19 @@ Example:
     --baseline-bin ../.worktrees/baseline/zig/zig-out/bin \
     --candidate-bin zig-out/bin --output /tmp/allocation-comparison
 
+JSON document fixtures interpret --documents as renders, and --document-batches
+as numeric fields per render (json_numbers) or input media bytes (json_media).
+Fixture setup is outside measurement and uses the C allocator; measured document
+collectors use either the diagnostic counter or the production smp allocator.
+
 Replay counted timings include diagnostic counter overhead. Replay timing runs
 use the production smp allocator without counting. Vector timing runs disable
 counting and retain the benchmark's normal allocator. Heap counts are requested
 bytes through the benchmark allocator, not RSS or complete process allocation.
+allocations counts successful raw allocs. resize_calls/remap_calls count attempts;
+moving_remaps/moved_bytes count successful pointer changes and their new sizes.
+allocated_bytes counts successful logical storage growth, excluding transient
+backend realloc overlap.
 """
 
 import argparse
@@ -32,6 +41,12 @@ def main():
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--vector-samples", type=int, default=3)
     parser.add_argument(
+        "--vector-measurements",
+        nargs="+",
+        choices=["counted", "timing"],
+        default=["counted", "timing"],
+    )
+    parser.add_argument(
         "--index-kinds",
         nargs="+",
         choices=["full_text", "algebraic"],
@@ -47,7 +62,14 @@ def main():
     parser.add_argument("--batches", nargs="+", type=int, default=[256, 1024])
     parser.add_argument(
         "--replay-operation",
-        choices=["replay", "enrichment", "latest", "ordinal"],
+        choices=[
+            "replay",
+            "enrichment",
+            "latest",
+            "ordinal",
+            "scalar_ordinal",
+            "scratch_trim",
+        ],
         default="replay",
     )
     parser.add_argument("--repetitions", type=int, default=1)
@@ -62,14 +84,35 @@ def main():
     parser.add_argument(
         "--vector-modes",
         nargs="+",
-        choices=["ingest", "retry", "retry-mixed"],
+        choices=["ingest", "retry", "retry-mixed", "session-only"],
         default=["ingest"],
     )
     parser.add_argument("--document-lookup-only", action="store_true")
+    parser.add_argument("--document-batches", nargs="+", type=int, default=[256])
+    parser.add_argument("--document-value-bytes", type=int, default=4096)
     parser.add_argument(
         "--document-cases",
         nargs="+",
-        choices=["short", "long", "missing", "sparse", "text", "relational"],
+        choices=[
+            "short",
+            "long",
+            "missing",
+            "sparse",
+            "sparse_large",
+            "text_large",
+            "embedding_identity",
+            "embedding_identity_chunk",
+            "text",
+            "text_asset",
+            "text_asset_large",
+            "text_asset_escaped",
+            "text_mixed",
+            "text_missing",
+            "delete_set",
+            "relational",
+            "json_numbers",
+            "json_media",
+        ],
         default=["short"],
     )
     parser.add_argument(
@@ -84,6 +127,8 @@ def main():
             args.vector_samples,
             *args.documents_per_record,
             *args.batches,
+            *args.document_batches,
+            args.document_value_bytes,
             args.repetitions,
         )
         <= 0
@@ -95,6 +140,7 @@ def main():
         "changed": args.candidate_bin.resolve(),
     }
     results = []
+    session_checksums = set()
     env = os.environ.copy()
     env.pop("ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT", None)
 
@@ -170,7 +216,7 @@ def main():
         (
             []
             if args.replay_only or args.document_lookup_only
-            else ["counted", "timing"]
+            else args.vector_measurements
         ),
     ):
         child_env = env.copy()
@@ -187,7 +233,7 @@ def main():
                     prefix="antfly-allocation-"
                 ) as directory:
                     root = Path(directory) / "source"
-                    if fixture != "ingest":
+                    if fixture not in ("ingest", "session-only"):
                         setup_env = env.copy()
                         setup_env.pop("ANTFLY_COUNT_BENCH_ALLOCATIONS", None)
                         run(
@@ -219,11 +265,17 @@ def main():
                             if x.startswith("payload_bench ")
                         )
                     )
+                    if fixture == "session-only":
+                        session_checksums.add(data["reference_checksum"])
+                        if len(session_checksums) != 1:
+                            raise ValueError(
+                                "session preparation produced different references across runs"
+                            )
                     expected = (
                         (args.documents + 127) // 128
                         if fixture == "retry-mixed"
                         else 0
-                        if fixture == "retry"
+                        if fixture in ("retry", "session-only")
                         else args.documents
                     )
                     if data["stats"]["prepared_payloads"] != expected:
@@ -238,17 +290,18 @@ def main():
                         ),
                         {},
                     )
-                    run(
-                        label + "-verify",
-                        [
-                            binaries[variant] / "vector-payload-bench",
-                            "read-mixed" if fixture == "retry-mixed" else "read",
-                            root,
-                            args.documents,
-                            args.dimensions,
-                        ],
-                        child_env,
-                    )
+                    if fixture != "session-only":
+                        run(
+                            label + "-verify",
+                            [
+                                binaries[variant] / "vector-payload-bench",
+                                "read-mixed" if fixture == "retry-mixed" else "read",
+                                root,
+                                args.documents,
+                                args.dimensions,
+                            ],
+                            child_env,
+                        )
                     results.append(
                         dict(
                             workload="vector",
@@ -263,15 +316,20 @@ def main():
                     print(label, data["run_ns"], flush=True)
                     save()
     if args.document_lookup_only:
-        for fixture, pair in itertools.product(
-            args.document_cases, range(args.samples)
+        for fixture, batch, pair in itertools.product(
+            args.document_cases, args.document_batches, range(args.samples)
         ):
             for variant in (
                 ["baseline", "changed"] if pair % 2 == 0 else ["changed", "baseline"]
             ):
-                label = f"document-{fixture}-{pair}-{variant}"
+                label = f"document-{fixture}-{batch}-{pair}-{variant}"
                 child_env = env.copy()
                 child_env["ANTFLY_DOCUMENT_BENCH_CASE"] = fixture
+                child_env["ANTFLY_DOCUMENT_BENCH_BATCH"] = str(batch)
+                child_env["ANTFLY_DOCUMENT_BENCH_DOCUMENTS"] = str(args.documents)
+                child_env["ANTFLY_DOCUMENT_BENCH_VALUE_BYTES"] = str(
+                    args.document_value_bytes
+                )
                 lines = run(
                     label, [binaries[variant] / "document-lookup-bench"], child_env
                 )
@@ -288,7 +346,11 @@ def main():
                         "both document collector binaries must emit counted and timing results"
                     )
                 for data in measurements:
-                    if data.get("case", "short") != fixture:
+                    if (
+                        data.get("case", "short") != fixture
+                        or data["batch"] != batch
+                        or data["documents"] != args.documents
+                    ):
                         raise ValueError(
                             "both document collector binaries must support the requested fixture"
                         )
@@ -296,6 +358,7 @@ def main():
                         dict(
                             workload="document",
                             source="primary",
+                            value_bytes=args.document_value_bytes,
                             variant=variant,
                             pair=pair,
                             **data,
@@ -307,20 +370,28 @@ def main():
                     flush=True,
                 )
                 save()
-    for workload, fixture in {
-        (x["workload"], x.get("case", "default"))
-        for x in results
-        if x["workload"] in ("replay", "document")
+
+    def checksum_fixture(x):
+        # The delete-set microbenchmark visits six keys per batch; its checksum
+        # intentionally depends on batch size. Ordinary document/replay sums
+        # remain invariant across batching.
+        return (
+            x["workload"],
+            x.get("case", "default"),
+            x["batch"] if x.get("case") == "delete_set" else None,
+        )
+
+    for fixture in {
+        checksum_fixture(x) for x in results if x["workload"] in ("replay", "document")
     }:
         checksums = {
             x["checksum"]
             for x in results
-            if x["workload"] == workload and x.get("case", "default") == fixture
+            if x["workload"] in ("replay", "document")
+            and checksum_fixture(x) == fixture
         }
         if len(checksums) > 1:
-            raise ValueError(
-                f"baseline and candidate checksums differ for {workload}/{fixture}"
-            )
+            raise ValueError(f"baseline and candidate checksums differ for {fixture}")
 
     def measurement_mode(x, workload):
         measurement = x.get("measurement", "counted")
@@ -374,6 +445,7 @@ def main():
                     "peak_additional_live_bytes",
                 ]
             )
+            fields += ["resize_calls", "remap_calls", "moving_remaps", "moved_bytes"]
             if workload in ("replay", "document") and mode.startswith("timing"):
                 fields = ["elapsed_ns"]
             stats = {

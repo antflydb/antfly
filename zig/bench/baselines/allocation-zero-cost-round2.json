@@ -1,0 +1,1402 @@
+{
+  "baseline_commit": "4a10b7222d9e17a13e78f3bb827cfb30e9600ffd",
+  "source_sha256": {
+    "baseline": {
+      "zig/pkg/antfly/src/storage/internal_keys.zig": "a3d743ba203f9e96ce4e0a57948fa4ee73fc671efb897cced3280cf89c575faa",
+      "zig/pkg/antfly/src/storage/db/db.zig": "6fcce006464501408d724a12160dfa3063adb1fb7a6850d0515c88fd6509d59b",
+      "zig/pkg/antfly/src/storage/db/derived/replay_source.zig": "ee842d1ef5764d5a18a16155a15238d96a37bbe896061aca4bc1fba8ffcf0e83",
+      "zig/pkg/antfly/src/storage/vector_payload_store.zig": "dab092414f49e02f49a81292125b015e3dbefb3a2b539105456ae3df3a542977",
+      "zig/pkg/antfly/src/replay_allocation_bench.zig": "396404ecaf653d2bb773a7e48f63174633f6696802ff31aba744f1acd87757ce"
+    },
+    "changed": {
+      "zig/pkg/antfly/src/storage/internal_keys.zig": "20e1392c5dd2b0e312e6b819cac3414f9849ca628f07817f298334ed6e54d3e2",
+      "zig/pkg/antfly/src/storage/db/db.zig": "43cb4ff93b9cc069183dc49b337b83edfcfb68b9ec41f023cd9fbf441f500c67",
+      "zig/pkg/antfly/src/storage/db/derived/replay_source.zig": "436aad9cfe1d5e40f59794c33c35ca9013795d3772e30174d070b39f0f6b4734",
+      "zig/pkg/antfly/src/storage/vector_payload_store.zig": "dab092414f49e02f49a81292125b015e3dbefb3a2b539105456ae3df3a542977",
+      "zig/pkg/antfly/src/replay_allocation_bench.zig": "396404ecaf653d2bb773a7e48f63174633f6696802ff31aba744f1acd87757ce"
+    }
+  },
+  "platform": "macOS ARM64",
+  "zig": "0.16.0",
+  "optimize": "ReleaseFast",
+  "notes": [
+    "Baseline is PR head 4a10b7222d with identical benchmark fixture changes only. Final candidate matches the recorded source and immutable binary hashes.",
+    "Alternating paired process execution with in-process warmup; setup excluded. Allocation-counting runs are separate from production-allocator timing. Each of three final document confirmations has 11 pairs at 10k documents; the separately identified intermediate candidate has ten fixtures.",
+    "Requested backing-heap counters do not measure RSS or stack memory. This experiment does not establish equivalence or universal zero cost.",
+    "Text descriptor reservation is restricted to batches of 16..256 containing entirely public document IDs, and counts visible store values. Mixed/internal batches and inline-only fallback rows retain lazy growth.",
+    "Asset projection validates the key and decodes only its name. Plain names borrow input; escaped names use a bounded 256-byte stack fallback and the caller allocator for larger spills.",
+    "Asset Boolean classification has identical ARM64 instruction count and opcode sequence to baseline; assembly comparison is binary-specific.",
+    "A duplicate-map hot capacity guard reduced requested heap but slowed the duplicate-heavy microbenchmark by about 25%; rejected. Final normal getOrPut path is retained, with a duplicate check only following allocation failure and rollback following output-list failure. No steady-state allocation saving is claimed for this helper.",
+    "A reservation prepass that parsed asset keys a second time slowed mixed documents/assets; rejected. A cheap namespace check with partial reservation still regressed mixed batches by about 16%; final reservation is disabled for any internal-key batch.",
+    "The no-hint enrichment callback bypass is normally excluded by production scanners. Deferred scratch trimming is defensive cleanup, not evidence of a production memory leak.",
+    "Vector preparation is unchanged in this round. Prior group-commit durable-retry uncertainty remains unresolved; universal zero runtime cost remains unproven.",
+    "203 focused ReleaseSafe tests passed, with zero skipped/failed/leaked and 27/27 build steps. Boundary and storage-shard audits pass. Earlier full-text repair integration failure remains unresolved; the broad integration suite was not rerun.",
+    "Final journal enrichment timing measured +0.82%, with bootstrap interval +0.32% to +1.95%; primary enrichment timing was inconclusive. Requested allocation counters were unchanged. This observed small slowdown is retained as a limitation."
+  ],
+  "binary_sha256": {
+    "baseline": {
+      "document-lookup-bench": "56bb74f9c6ef50feb6899a4b790faf61ad27dd5071d7f0e64584e65b4d0cf189",
+      "replay-allocation-bench": "eafc06216d926e4673f8ee45c08e21dac088c463af16efacb843df7940b0bf9d"
+    },
+    "changed": {
+      "document-lookup-bench": "c97d650f4ca7d46d001faa77c7a73bf2ca208585446fab0d1824b88d90fc7db4",
+      "replay-allocation-bench": "1e926f12b9d2110cb047ebdd31643d195f10e91f665e2b173357ad5e2394760f"
+    }
+  },
+  "document_summary": {
+    "text-10000-32-counted": {
+      "elapsed_ns": {
+        "baseline": 2725000,
+        "changed": 2653000
+      },
+      "allocations": {
+        "baseline": 10626,
+        "changed": 10626
+      },
+      "allocated_bytes": {
+        "baseline": 2589560,
+        "changed": 2260000
+      },
+      "peak_live_bytes": {
+        "baseline": 8288,
+        "changed": 7232
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -12.284927735719197,
+        5.926202012672377,
+        1.8804061677322403,
+        0.0,
+        -7.036091870215088,
+        1.0078387458006821,
+        -2.2115739034279436,
+        -8.048868127919507,
+        -7.285714285714285,
+        -10.354815351194791,
+        -2.5321100917431227
+      ],
+      "paired_median_percent": -2.5321100917431227,
+      "bootstrap_ci95_percent": [
+        -8.048868127919507,
+        1.0078387458006821
+      ]
+    },
+    "text-10000-32-timing": {
+      "elapsed_ns": {
+        "baseline": 2638000,
+        "changed": 2408000
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -2.9262582910651536,
+        -9.76902688375615,
+        -7.48401654757428,
+        -9.890936442271524,
+        -5.230043255996852,
+        -9.340866290018834,
+        -10.240733664501334,
+        -5.913570887035635,
+        -5.0847457627118615,
+        -11.170011359333587,
+        -1.8035303146584858
+      ],
+      "paired_median_percent": -7.48401654757428,
+      "bootstrap_ci95_percent": [
+        -9.890936442271524,
+        -5.0847457627118615
+      ]
+    },
+    "text_asset-10000-32-counted": {
+      "elapsed_ns": {
+        "baseline": 4597000,
+        "changed": 4067000
+      },
+      "allocations": {
+        "baseline": 50626,
+        "changed": 30626
+      },
+      "allocated_bytes": {
+        "baseline": 6170016,
+        "changed": 5910016
+      },
+      "peak_live_bytes": {
+        "baseline": 5518,
+        "changed": 5492
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -16.339323025491016,
+        -10.03066141042488,
+        -10.152284263959388,
+        -6.3947078280044085,
+        -11.412924424972616,
+        -12.650343642611684,
+        -14.415365132967494,
+        -5.742875788557756,
+        -9.963960144159422,
+        -9.203420342034207,
+        -17.068607068607065
+      ],
+      "paired_median_percent": -10.152284263959388,
+      "bootstrap_ci95_percent": [
+        -14.415365132967494,
+        -9.203420342034207
+      ]
+    },
+    "text_asset-10000-32-timing": {
+      "elapsed_ns": {
+        "baseline": 3908000,
+        "changed": 3608000
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -10.354291417165673,
+        -10.260957689384343,
+        -9.172431462977194,
+        -5.757420675537361,
+        -10.38265306122449,
+        -8.216328653146121,
+        -5.445671718469047,
+        0.49350649350650144,
+        -10.533945397438993,
+        -3.8361845515811344,
+        -10.06979062811565
+      ],
+      "paired_median_percent": -9.172431462977194,
+      "bootstrap_ci95_percent": [
+        -10.354291417165673,
+        -5.445671718469047
+      ]
+    },
+    "text_mixed-10000-256-counted": {
+      "elapsed_ns": {
+        "baseline": 2868000,
+        "changed": 2786000
+      },
+      "allocations": {
+        "baseline": 15276,
+        "changed": 12776
+      },
+      "allocated_bytes": {
+        "baseline": 3999298,
+        "changed": 3966798
+      },
+      "peak_live_bytes": {
+        "baseline": 88016,
+        "changed": 87990
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -12.243525058863103,
+        -6.9656812776078825,
+        -2.214411247803161,
+        -11.467444120505343,
+        -1.6237204376985503,
+        -4.85036119711042,
+        4.264392324093813,
+        -2.8591352859135277,
+        4.2298202326401135,
+        -0.4585537918871285,
+        -3.8540949759119036
+      ],
+      "paired_median_percent": -2.8591352859135277,
+      "bootstrap_ci95_percent": [
+        -6.9656812776078825,
+        -0.4585537918871285
+      ]
+    },
+    "text_mixed-10000-256-timing": {
+      "elapsed_ns": {
+        "baseline": 2715000,
+        "changed": 2634000
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -3.955223880597014,
+        -9.646976581614819,
+        5.782688766114186,
+        2.3943135054246056,
+        -4.668838219326821,
+        6.49011562849684,
+        -1.8271792919680285,
+        -2.1997836278398797,
+        -7.226771092915629,
+        -1.8122508155128725,
+        0.03835826620637306
+      ],
+      "paired_median_percent": -1.8271792919680285,
+      "bootstrap_ci95_percent": [
+        -4.668838219326821,
+        2.3943135054246056
+      ]
+    }
+  },
+  "intermediate_candidate": {
+    "source": {
+      "baseline_commit": "4a10b7222d9e17a13e78f3bb827cfb30e9600ffd",
+      "source_sha256": {
+        "baseline": {
+          "zig/pkg/antfly/src/storage/internal_keys.zig": "a3d743ba203f9e96ce4e0a57948fa4ee73fc671efb897cced3280cf89c575faa",
+          "zig/pkg/antfly/src/storage/db/db.zig": "6fcce006464501408d724a12160dfa3063adb1fb7a6850d0515c88fd6509d59b",
+          "zig/pkg/antfly/src/storage/db/derived/replay_source.zig": "ee842d1ef5764d5a18a16155a15238d96a37bbe896061aca4bc1fba8ffcf0e83",
+          "zig/pkg/antfly/src/storage/vector_payload_store.zig": "dab092414f49e02f49a81292125b015e3dbefb3a2b539105456ae3df3a542977",
+          "zig/pkg/antfly/src/replay_allocation_bench.zig": "396404ecaf653d2bb773a7e48f63174633f6696802ff31aba744f1acd87757ce"
+        },
+        "changed": {
+          "zig/pkg/antfly/src/storage/internal_keys.zig": "20e1392c5dd2b0e312e6b819cac3414f9849ca628f07817f298334ed6e54d3e2",
+          "zig/pkg/antfly/src/storage/db/db.zig": "10498e9ba1809b59514b127bb988176c342ad015b07977cc8344eb1ad530e314",
+          "zig/pkg/antfly/src/storage/db/derived/replay_source.zig": "436aad9cfe1d5e40f59794c33c35ca9013795d3772e30174d070b39f0f6b4734",
+          "zig/pkg/antfly/src/storage/vector_payload_store.zig": "dab092414f49e02f49a81292125b015e3dbefb3a2b539105456ae3df3a542977",
+          "zig/pkg/antfly/src/replay_allocation_bench.zig": "396404ecaf653d2bb773a7e48f63174633f6696802ff31aba744f1acd87757ce"
+        }
+      }
+    },
+    "binary_sha256": {
+      "baseline": {
+        "document-lookup-bench": "56bb74f9c6ef50feb6899a4b790faf61ad27dd5071d7f0e64584e65b4d0cf189",
+        "replay-allocation-bench": "eafc06216d926e4673f8ee45c08e21dac088c463af16efacb843df7940b0bf9d"
+      },
+      "changed": {
+        "document-lookup-bench": "7f6228a635eb4d1566cee1de5688bf5289c45956bd40e4ea726cbf2574f9de8e",
+        "replay-allocation-bench": "1e926f12b9d2110cb047ebdd31643d195f10e91f665e2b173357ad5e2394760f"
+      }
+    },
+    "document_summary": {
+      "delete_set-10000-32-counted": {
+        "elapsed_ns": {
+          "baseline": 1064000,
+          "changed": 1054000
+        },
+        "allocations": {
+          "baseline": 939,
+          "changed": 939
+        },
+        "allocated_bytes": {
+          "baseline": 187800,
+          "changed": 187800
+        },
+        "peak_live_bytes": {
+          "baseline": 600,
+          "changed": 600
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          0.6685768863419206,
+          -1.388888888888884,
+          0.9310986964618184,
+          -1.8060836501901156,
+          -3.6832412523020275,
+          -0.7611798287345373,
+          -0.3759398496240629,
+          -5.431878895814779,
+          0.6679389312977069,
+          2.0329138431752103,
+          -3.548085901027076
+        ],
+        "paired_median_percent": -0.7611798287345373,
+        "bootstrap_ci95_percent": [
+          -3.548085901027076,
+          0.6685768863419206
+        ]
+      },
+      "delete_set-10000-32-timing": {
+        "elapsed_ns": {
+          "baseline": 1045000,
+          "changed": 1039000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -1.5311004784688942,
+          -2.1596244131455444,
+          -6.660583941605836,
+          2.062868369351678,
+          3.5363457760314354,
+          -2.376425855513309,
+          6.660137120470133,
+          -2.57633587786259,
+          2.0568070519098924,
+          1.3552758954501476,
+          -6.776556776556775
+        ],
+        "paired_median_percent": -1.5311004784688942,
+        "bootstrap_ci95_percent": [
+          -2.57633587786259,
+          2.062868369351678
+        ]
+      },
+      "text-10000-8-counted": {
+        "elapsed_ns": {
+          "baseline": 3199000,
+          "changed": 3131000
+        },
+        "allocations": {
+          "baseline": 12500,
+          "changed": 12500
+        },
+        "allocated_bytes": {
+          "baseline": 2480000,
+          "changed": 2480000
+        },
+        "peak_live_bytes": {
+          "baseline": 1984,
+          "changed": 1984
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          3.9357166284027523,
+          -6.093514328808447,
+          -2.3494374586366606,
+          -16.24569460390356,
+          -5.35066505441354,
+          0.7653812187224052,
+          5.702917771883298,
+          -0.03197953309881374,
+          -10.12816505157862,
+          0.029895366218246622,
+          1.0174880763116123
+        ],
+        "paired_median_percent": -0.03197953309881374,
+        "bootstrap_ci95_percent": [
+          -6.093514328808447,
+          1.0174880763116123
+        ]
+      },
+      "text-10000-8-timing": {
+        "elapsed_ns": {
+          "baseline": 2901000,
+          "changed": 2794000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          11.773417252869312,
+          -3.8790470372632835,
+          -2.3322569070685306,
+          -1.259622113365988,
+          -4.998276456394346,
+          -5.624012638230647,
+          4.63672873311427,
+          -2.6819923371647514,
+          -9.514237855946394,
+          -5.414667580534616,
+          -10.260533933740756
+        ],
+        "paired_median_percent": -3.8790470372632835,
+        "bootstrap_ci95_percent": [
+          -5.624012638230647,
+          -1.259622113365988
+        ]
+      },
+      "text-10000-32-counted": {
+        "elapsed_ns": {
+          "baseline": 2912000,
+          "changed": 2774000
+        },
+        "allocations": {
+          "baseline": 10626,
+          "changed": 10626
+        },
+        "allocated_bytes": {
+          "baseline": 2589560,
+          "changed": 2260000
+        },
+        "peak_live_bytes": {
+          "baseline": 8288,
+          "changed": 7232
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          1.1263639563533934,
+          -5.085361423901203,
+          9.228601620288824,
+          -13.285401688027509,
+          -3.8162782843633947,
+          -7.508978126020239,
+          -25.42275723703067,
+          0.1790189760114469,
+          -7.417582417582413,
+          -9.523809523809524,
+          -19.406674907292953
+        ],
+        "paired_median_percent": -7.417582417582413,
+        "bootstrap_ci95_percent": [
+          -13.285401688027509,
+          0.1790189760114469
+        ]
+      },
+      "text-10000-32-timing": {
+        "elapsed_ns": {
+          "baseline": 2850000,
+          "changed": 2634000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -1.7530772099962677,
+          -7.584830339321358,
+          6.082036775106081,
+          -5.598320503848841,
+          -11.450131233595794,
+          -13.261528105015142,
+          -14.807017543859647,
+          -1.9453797231575032,
+          -14.851485148514854,
+          -1.4008620689655138,
+          -14.991304347826084
+        ],
+        "paired_median_percent": -7.584830339321358,
+        "bootstrap_ci95_percent": [
+          -14.807017543859647,
+          -1.7530772099962677
+        ]
+      },
+      "text-10000-256-counted": {
+        "elapsed_ns": {
+          "baseline": 2715000,
+          "changed": 2748000
+        },
+        "allocations": {
+          "baseline": 10236,
+          "changed": 10236
+        },
+        "allocated_bytes": {
+          "baseline": 3854096,
+          "changed": 3493648
+        },
+        "peak_live_bytes": {
+          "baseline": 98728,
+          "changed": 89488
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          6.319417847567976,
+          -0.11219147344802005,
+          12.182741116751261,
+          -5.33650577838205,
+          -0.5788712011577379,
+          -6.777163904235728,
+          0.3491078355314148,
+          -4.647731464404281,
+          -4.429240187252425,
+          -4.021628928692122,
+          20.695040999609525
+        ],
+        "paired_median_percent": -0.5788712011577379,
+        "bootstrap_ci95_percent": [
+          -4.647731464404281,
+          6.319417847567976
+        ]
+      },
+      "text-10000-256-timing": {
+        "elapsed_ns": {
+          "baseline": 2785000,
+          "changed": 2612000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -6.9470521967705645,
+          -5.089934940681207,
+          -1.796200345423138,
+          -0.0718132854578113,
+          -11.460517120894476,
+          -6.110711718188355,
+          -9.405594405594409,
+          -16.51907356948229,
+          4.698749526335733,
+          -11.012937835279269,
+          5.925118138858587
+        ],
+        "paired_median_percent": -6.110711718188355,
+        "bootstrap_ci95_percent": [
+          -11.012937835279269,
+          -0.0718132854578113
+        ]
+      },
+      "text_asset-10000-32-counted": {
+        "elapsed_ns": {
+          "baseline": 4951000,
+          "changed": 4369000
+        },
+        "allocations": {
+          "baseline": 50626,
+          "changed": 30626
+        },
+        "allocated_bytes": {
+          "baseline": 6170016,
+          "changed": 5910016
+        },
+        "peak_live_bytes": {
+          "baseline": 5518,
+          "changed": 5492
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -20.36608863198458,
+          -6.389010030527698,
+          -15.532215713997177,
+          -17.83814589665653,
+          -9.730807577268196,
+          -16.546128064914445,
+          -8.297302861848877,
+          -1.107732406602957,
+          -19.31597357170618,
+          3.0652173913043423,
+          -6.923732424371543
+        ],
+        "paired_median_percent": -9.730807577268196,
+        "bootstrap_ci95_percent": [
+          -17.83814589665653,
+          -6.389010030527698
+        ]
+      },
+      "text_asset-10000-32-timing": {
+        "elapsed_ns": {
+          "baseline": 4220000,
+          "changed": 3875000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -22.255574614065175,
+          -0.20387359836900876,
+          -12.55768763662861,
+          -4.4202730849340455,
+          -7.024694317909375,
+          -1.8867924528301883,
+          -8.349101229895927,
+          -5.875328397420587,
+          -18.201948627103636,
+          -12.397468947738455,
+          -12.843601895734603
+        ],
+        "paired_median_percent": -8.349101229895927,
+        "bootstrap_ci95_percent": [
+          -12.843601895734603,
+          -4.4202730849340455
+        ]
+      },
+      "text_asset-10000-256-counted": {
+        "elapsed_ns": {
+          "baseline": 5097000,
+          "changed": 4417000
+        },
+        "allocations": {
+          "baseline": 50158,
+          "changed": 30158
+        },
+        "allocated_bytes": {
+          "baseline": 7127232,
+          "changed": 6867232
+        },
+        "peak_live_bytes": {
+          "baseline": 66574,
+          "changed": 66548
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -16.043402441387332,
+          -12.820996978851962,
+          -7.330827067669176,
+          -46.04977047596037,
+          -18.81498920933883,
+          -11.313938011028712,
+          -5.665127989928664,
+          -17.47554191444466,
+          -10.617839607201308,
+          -7.354202401372212,
+          -9.893920848633208
+        ],
+        "paired_median_percent": -11.313938011028712,
+        "bootstrap_ci95_percent": [
+          -17.47554191444466,
+          -7.354202401372212
+        ]
+      },
+      "text_asset-10000-256-timing": {
+        "elapsed_ns": {
+          "baseline": 4344000,
+          "changed": 4037000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -9.98147290412228,
+          -18.0409175449473,
+          -14.681081081081082,
+          -56.61995398452206,
+          -6.852791878172592,
+          -5.962343096234313,
+          -6.37505816658911,
+          -7.754551584625757,
+          -10.013812154696133,
+          0.07127583749109156,
+          7.3988439306358345
+        ],
+        "paired_median_percent": -7.754551584625757,
+        "bootstrap_ci95_percent": [
+          -14.681081081081082,
+          -5.962343096234313
+        ]
+      },
+      "text_asset_escaped-10000-8-counted": {
+        "elapsed_ns": {
+          "baseline": 4978000,
+          "changed": 4604000
+        },
+        "allocations": {
+          "baseline": 52500,
+          "changed": 32500
+        },
+        "allocated_bytes": {
+          "baseline": 6150000,
+          "changed": 5870000
+        },
+        "peak_live_bytes": {
+          "baseline": 1575,
+          "changed": 1548
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -22.931654676258994,
+          -5.9919339350873795,
+          -8.957880166106392,
+          -4.8533663775299445,
+          -6.910167818361302,
+          -6.3247863247863245,
+          -1.8280433909200533,
+          -9.411024942360092,
+          -0.9440034327397595,
+          -10.9343125254998,
+          -14.20568227290916
+        ],
+        "paired_median_percent": -6.910167818361302,
+        "bootstrap_ci95_percent": [
+          -10.9343125254998,
+          -4.8533663775299445
+        ]
+      },
+      "text_asset_escaped-10000-8-timing": {
+        "elapsed_ns": {
+          "baseline": 4505000,
+          "changed": 4375000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -5.1181956191715505,
+          2.0504058094831246,
+          0.9351892127011707,
+          -5.216426193118762,
+          -3.938174888841839,
+          4.005756776205316,
+          12.649164677804304,
+          1.9914651493598834,
+          3.9138082673702668,
+          2.655286865813178,
+          1.606893339543558
+        ],
+        "paired_median_percent": 1.9914651493598834,
+        "bootstrap_ci95_percent": [
+          -3.938174888841839,
+          3.9138082673702668
+        ]
+      },
+      "text_asset_escaped-10000-32-counted": {
+        "elapsed_ns": {
+          "baseline": 4830000,
+          "changed": 4338000
+        },
+        "allocations": {
+          "baseline": 50626,
+          "changed": 30626
+        },
+        "allocated_bytes": {
+          "baseline": 6190016,
+          "changed": 5910016
+        },
+        "peak_live_bytes": {
+          "baseline": 5519,
+          "changed": 5492
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -9.565217391304348,
+          -17.067159581022796,
+          -9.686115925284033,
+          -12.967998326709896,
+          -3.913423699169216,
+          -3.360987024037443,
+          -10.537680846469444,
+          -6.108897742363872,
+          -16.163265306122454,
+          -7.385496183206108,
+          -12.115072933549431
+        ],
+        "paired_median_percent": -9.686115925284033,
+        "bootstrap_ci95_percent": [
+          -12.967998326709896,
+          -6.108897742363872
+        ]
+      },
+      "text_asset_escaped-10000-32-timing": {
+        "elapsed_ns": {
+          "baseline": 4149000,
+          "changed": 3841000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -2.833291171262331,
+          -18.609022556390975,
+          -7.789770061004219,
+          -4.297719087635055,
+          1.3684744044602182,
+          -7.364532019704429,
+          -9.76138828633406,
+          -1.566384883142713,
+          -11.909497762307309,
+          -12.802926383173297,
+          -9.22484134179511
+        ],
+        "paired_median_percent": -7.789770061004219,
+        "bootstrap_ci95_percent": [
+          -11.909497762307309,
+          -2.833291171262331
+        ]
+      },
+      "text_asset_escaped-10000-256-counted": {
+        "elapsed_ns": {
+          "baseline": 5091000,
+          "changed": 4291000
+        },
+        "allocations": {
+          "baseline": 50158,
+          "changed": 30158
+        },
+        "allocated_bytes": {
+          "baseline": 7147232,
+          "changed": 6867232
+        },
+        "peak_live_bytes": {
+          "baseline": 66575,
+          "changed": 66548
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -20.25142408171282,
+          -11.303789338471415,
+          -59.41320293398533,
+          -11.440030557677616,
+          -12.414821124361165,
+          -5.224043715846993,
+          -10.881349126681394,
+          -20.559305689488905,
+          -8.682698446477977,
+          -21.24028067513749,
+          -18.28475960646
+        ],
+        "paired_median_percent": -12.414821124361165,
+        "bootstrap_ci95_percent": [
+          -20.559305689488905,
+          -10.881349126681394
+        ]
+      },
+      "text_asset_escaped-10000-256-timing": {
+        "elapsed_ns": {
+          "baseline": 4171000,
+          "changed": 3893000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          -9.062574922081035,
+          -2.704056084126194,
+          -17.951448040885865,
+          2.6461390425787767,
+          0.60882800608828,
+          -2.4513520343694695,
+          -8.976701690269529,
+          -7.581395348837205,
+          0.6516290726817031,
+          -12.102054639873561,
+          -16.013071895424837
+        ],
+        "paired_median_percent": -7.581395348837205,
+        "bootstrap_ci95_percent": [
+          -12.102054639873561,
+          0.60882800608828
+        ]
+      },
+      "text_mixed-10000-256-counted": {
+        "elapsed_ns": {
+          "baseline": 3159000,
+          "changed": 2990000
+        },
+        "allocations": {
+          "baseline": 15276,
+          "changed": 12776
+        },
+        "allocated_bytes": {
+          "baseline": 3999298,
+          "changed": 3915318
+        },
+        "peak_live_bytes": {
+          "baseline": 88016,
+          "changed": 86670
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          6.555227794165841,
+          -23.801874163319948,
+          -5.5388320288982555,
+          -0.29479200786112214,
+          -8.024883359253499,
+          4.800817160367732,
+          -12.124089901867684,
+          -4.316780266147358,
+          -7.380560131795722,
+          -10.228919153868443,
+          -9.173754556500613
+        ],
+        "paired_median_percent": -7.380560131795722,
+        "bootstrap_ci95_percent": [
+          -10.228919153868443,
+          -0.29479200786112214
+        ]
+      },
+      "text_mixed-10000-256-timing": {
+        "elapsed_ns": {
+          "baseline": 2827000,
+          "changed": 3229000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          15.960555149744348,
+          21.791999999999987,
+          1.1677934849416038,
+          16.08157806753594,
+          21.58741019500514,
+          16.552222623780267,
+          10.4374784705477,
+          26.219288595526223,
+          12.368896925858941,
+          10.505836575875493,
+          15.859346968066014
+        ],
+        "paired_median_percent": 15.960555149744348,
+        "bootstrap_ci95_percent": [
+          10.505836575875493,
+          21.58741019500514
+        ]
+      }
+    }
+  },
+  "replay_summary": {
+    "journal-counted": {
+      "elapsed_ns": {
+        "baseline": 10320000,
+        "changed": 10268000
+      },
+      "allocations": {
+        "baseline": 50016,
+        "changed": 50016
+      },
+      "allocated_bytes": {
+        "baseline": 7527160,
+        "changed": 7527160
+      },
+      "peak_live_bytes": {
+        "baseline": 4840200,
+        "changed": 4840200
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -4.650346582433973,
+        -1.8063028439661788,
+        -0.6298449612403112,
+        1.1235955056179803,
+        0.09752291788569512,
+        1.242358509169783,
+        1.835317460317465,
+        1.3618490457466104,
+        1.1271985229812431,
+        -0.7325301204819223,
+        -1.2196293095169453
+      ],
+      "paired_median_percent": 0.09752291788569512,
+      "bootstrap_ci95_percent": [
+        -1.2196293095169453,
+        1.242358509169783
+      ]
+    },
+    "journal-timing": {
+      "elapsed_ns": {
+        "baseline": 10062000,
+        "changed": 10198000
+      },
+      "allocations": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "peak_live_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        0.8211496094532311,
+        -0.42049677293174437,
+        0.2765158996642203,
+        0.39908211114436654,
+        4.3780193236715,
+        0.31802822500497374,
+        1.946302026150315,
+        1.203393174196088,
+        2.107984488416026,
+        1.3971462544589697,
+        0.3740157480314865
+      ],
+      "paired_median_percent": 0.8211496094532311,
+      "bootstrap_ci95_percent": [
+        0.31802822500497374,
+        1.946302026150315
+      ]
+    },
+    "primary-counted": {
+      "elapsed_ns": {
+        "baseline": 10258000,
+        "changed": 10239000
+      },
+      "allocations": {
+        "baseline": 50016,
+        "changed": 50016
+      },
+      "allocated_bytes": {
+        "baseline": 7527160,
+        "changed": 7527160
+      },
+      "peak_live_bytes": {
+        "baseline": 4840200,
+        "changed": 4840200
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        0.6947201270345316,
+        -1.0467144795503036,
+        0.8481185416260528,
+        -0.7163601161665034,
+        0.8470402836600055,
+        0.818298333826295,
+        -1.3155330344961969,
+        -3.7840845854201444,
+        -2.397195376160699,
+        -0.5200667255421454,
+        0.7166699391321529
+      ],
+      "paired_median_percent": -0.5200667255421454,
+      "bootstrap_ci95_percent": [
+        -1.3155330344961969,
+        0.818298333826295
+      ]
+    },
+    "primary-timing": {
+      "elapsed_ns": {
+        "baseline": 9878000,
+        "changed": 9877000
+      },
+      "allocations": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "allocated_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "peak_live_bytes": {
+        "baseline": 0,
+        "changed": 0
+      },
+      "pairs": 11,
+      "paired_changes_percent": [
+        -0.5177139376713047,
+        -1.3071243264817456,
+        2.372356884992266,
+        0.3427419354838701,
+        0.7498715973292214,
+        -1.7920421180520396,
+        1.3786008230452618,
+        -0.6954944058058632,
+        7.643376413570269,
+        1.326179388540183,
+        -1.4271457085828332
+      ],
+      "paired_median_percent": 0.3427419354838701,
+      "bootstrap_ci95_percent": [
+        -1.3071243264817456,
+        1.3786008230452618
+      ]
+    }
+  },
+  "asset_classifier_assembly": {
+    "baseline": {
+      "instructions": 118,
+      "opcodes": [
+        "stp",
+        "mov",
+        "cbz",
+        "ldrb",
+        "cmp",
+        "ccmp",
+        "b.hs",
+        "mov",
+        "mov",
+        "ldp",
+        "ret",
+        "mov",
+        "mov",
+        "b",
+        "mov",
+        "add",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cbnz",
+        "ldrb",
+        "cmp",
+        "b.eq",
+        "cbnz",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "add",
+        "mov",
+        "mov",
+        "b",
+        "mov",
+        "mov",
+        "add",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cbnz",
+        "ldrb",
+        "cmp",
+        "b.eq",
+        "cbnz",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "mov",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "b",
+        "mov",
+        "mov",
+        "add",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cbnz",
+        "ldrb",
+        "cmp",
+        "b.eq",
+        "cbnz",
+        "add",
+        "cmp",
+        "b.hs",
+        "add",
+        "b",
+        "mov",
+        "mov",
+        "add",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cbnz",
+        "ldrb",
+        "cmp",
+        "b.eq",
+        "add",
+        "cmp",
+        "cset",
+        "cmp",
+        "csel",
+        "b"
+      ]
+    },
+    "changed": {
+      "instructions": 118,
+      "opcodes": [
+        "stp",
+        "mov",
+        "cbz",
+        "ldrb",
+        "cmp",
+        "ccmp",
+        "b.hs",
+        "mov",
+        "mov",
+        "ldp",
+        "ret",
+        "mov",
+        "mov",
+        "b",
+        "mov",
+        "add",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cbnz",
+        "ldrb",
+        "cmp",
+        "b.eq",
+        "cbnz",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "add",
+        "mov",
+        "mov",
+        "b",
+        "mov",
+        "mov",
+        "add",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cbnz",
+        "ldrb",
+        "cmp",
+        "b.eq",
+        "cbnz",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "mov",
+        "ldrb",
+        "cmp",
+        "b.ne",
+        "add",
+        "cmp",
+        "b.hs",
+        "b",
+        "mov",
+        "mov",
+        "add",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cbnz",
+        "ldrb",
+        "cmp",
+        "b.eq",
+        "cbnz",
+        "add",
+        "cmp",
+        "b.hs",
+        "add",
+        "b",
+        "mov",
+        "mov",
+        "add",
+        "add",
+        "cmp",
+        "b.hs",
+        "ldrb",
+        "cbnz",
+        "ldrb",
+        "cmp",
+        "b.eq",
+        "add",
+        "cmp",
+        "cset",
+        "cmp",
+        "csel",
+        "b"
+      ]
+    },
+    "same_instruction_count": true,
+    "same_opcode_sequence": true
+  },
+  "rejected_experiments": {
+    "source_sha256": {
+      "baseline": {
+        "zig/pkg/antfly/src/storage/internal_keys.zig": "a3d743ba203f9e96ce4e0a57948fa4ee73fc671efb897cced3280cf89c575faa",
+        "zig/pkg/antfly/src/storage/db/db.zig": "6fcce006464501408d724a12160dfa3063adb1fb7a6850d0515c88fd6509d59b",
+        "zig/pkg/antfly/src/storage/db/derived/replay_source.zig": "ee842d1ef5764d5a18a16155a15238d96a37bbe896061aca4bc1fba8ffcf0e83",
+        "zig/pkg/antfly/src/storage/vector_payload_store.zig": "dab092414f49e02f49a81292125b015e3dbefb3a2b539105456ae3df3a542977",
+        "zig/pkg/antfly/src/replay_allocation_bench.zig": "396404ecaf653d2bb773a7e48f63174633f6696802ff31aba744f1acd87757ce"
+      },
+      "changed": {
+        "zig/pkg/antfly/src/storage/internal_keys.zig": "20e1392c5dd2b0e312e6b819cac3414f9849ca628f07817f298334ed6e54d3e2",
+        "zig/pkg/antfly/src/storage/db/db.zig": "6e4f64eda005a6aff23e90b7531c4266da0ff49d1d2eda902ea2ccf15b01449a",
+        "zig/pkg/antfly/src/storage/db/derived/replay_source.zig": "436aad9cfe1d5e40f59794c33c35ca9013795d3772e30174d070b39f0f6b4734",
+        "zig/pkg/antfly/src/storage/vector_payload_store.zig": "dab092414f49e02f49a81292125b015e3dbefb3a2b539105456ae3df3a542977",
+        "zig/pkg/antfly/src/replay_allocation_bench.zig": "396404ecaf653d2bb773a7e48f63174633f6696802ff31aba744f1acd87757ce"
+      }
+    },
+    "binary_sha256": {
+      "baseline": {
+        "document-lookup-bench": "56bb74f9c6ef50feb6899a4b790faf61ad27dd5071d7f0e64584e65b4d0cf189"
+      },
+      "changed": {
+        "document-lookup-bench": "c3af1f561de4702e45705339775528e0d53b29f818e374dfee59b80f2b8a7ba4"
+      }
+    },
+    "summary": {
+      "text_mixed-10000-256-timing": {
+        "elapsed_ns": {
+          "baseline": 3853000,
+          "changed": 4462000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          9.69010175763183,
+          24.362181090545263,
+          11.030365948611465,
+          16.267029972752045,
+          24.636871508379897,
+          11.463590483056961,
+          32.54189944134078,
+          57.19332048811818,
+          -7.30365182591296,
+          0.9890945980218113,
+          9.962304792676369
+        ],
+        "paired_median_percent": 11.463590483056961,
+        "bootstrap_ci95_percent": [
+          9.69010175763183,
+          24.636871508379897
+        ]
+      },
+      "delete_set-10000-32-timing": {
+        "elapsed_ns": {
+          "baseline": 1088000,
+          "changed": 1371000
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          22.518382352941167,
+          70.50816696914701,
+          22.091974752028865,
+          25.139664804469277,
+          31.61413562559694,
+          25.0,
+          6.0842433697347875,
+          37.89752650176679,
+          23.70500438981562,
+          26.359447004608306,
+          29.44496707431796
+        ],
+        "paired_median_percent": 25.139664804469277,
+        "bootstrap_ci95_percent": [
+          22.518382352941167,
+          31.61413562559694
+        ]
+      },
+      "delete_set-10000-32-counted": {
+        "elapsed_ns": {
+          "baseline": 1138000,
+          "changed": 1449000
+        },
+        "allocations": {
+          "baseline": 939,
+          "changed": 626
+        },
+        "allocated_bytes": {
+          "baseline": 187800,
+          "changed": 95152
+        },
+        "peak_live_bytes": {
+          "baseline": 600,
+          "changed": 304
+        },
+        "pairs": 11,
+        "paired_changes_percent": [
+          78.97196261682242,
+          45.71932921447483,
+          29.885057471264375,
+          20.052083333333325,
+          29.49061662198391,
+          26.537785588752193,
+          16.006600660066006,
+          42.44288224956063,
+          22.538860103626934,
+          26.57777777777777,
+          34.56014362657092
+        ],
+        "paired_median_percent": 29.49061662198391,
+        "bootstrap_ci95_percent": [
+          22.538860103626934,
+          42.44288224956063
+        ]
+      }
+    }
+  }
+}

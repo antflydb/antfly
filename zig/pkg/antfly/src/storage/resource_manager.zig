@@ -3818,6 +3818,40 @@ pub const BudgetedAllocator = struct {
         free(ctx, memory, alignment, ret_addr);
     }
 
+    /// Operation-local raw allocation failure receipt, captured under the allocator lock.
+    /// Resize/remap refusals are advisory; a failed fallback alloc records its cause.
+    /// Shared owners' failures cannot misclassify this operation's backing OOM
+    /// as admission pressure. Storage remains owned by the original allocator.
+    pub const FailureTrackingAllocator = struct {
+        owner: *BudgetedAllocator,
+        last_failure: ?@FieldType(AllocationFailure, "cause") = null,
+
+        pub fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = trackedAlloc, .resize = trackedResize, .remap = trackedRemap, .free = trackedFree } };
+        }
+
+        fn trackedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            const result = alloc(self.owner, len, alignment, ra);
+            self.last_failure = if (result == null) self.owner.last_allocation_failure.?.cause else null;
+            return result;
+        }
+        fn trackedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return lockedResize(self.owner, memory, alignment, new_len, ra);
+        }
+        fn trackedRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return lockedRemap(self.owner, memory, alignment, new_len, ra);
+        }
+        fn trackedFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            lockedFree(self.owner, memory, alignment, ra);
+        }
+    };
+
     pub fn denied(self: *const BudgetedAllocator) bool {
         return self.budget_denied;
     }
@@ -3857,6 +3891,12 @@ pub const BudgetedAllocator = struct {
         const bytes = self.reservation.bytes -| @max(self.live_bytes, @max(self.pinned_bytes, self.reservation_floor));
         self.reservation.shrink(bytes);
         return bytes;
+    }
+
+    pub fn releaseUnusedCreditThreadSafe(self: *BudgetedAllocator) u64 {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.releaseUnusedCredit();
     }
 
     fn recordDenial(self: *BudgetedAllocator) void {
@@ -6187,4 +6227,31 @@ test "resource manager replay skip snapshots clean up every allocation failure" 
     for ([_]usize{ 0, 1, 17 }) |index_count| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{index_count});
     }
+}
+
+test "source vector payloads scoped allocator receipts distinguish admission and backing across shared failures" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
+    defer budget.deinit();
+    var first: BudgetedAllocator.FailureTrackingAllocator = .{ .owner = &budget };
+    var second: BudgetedAllocator.FailureTrackingAllocator = .{ .owner = &budget };
+    var held = try manager.reserve(.dense_source_payload_state, 64);
+    defer held.release();
+    try std.testing.expectError(error.OutOfMemory, first.allocator().alloc(u8, 1));
+    try std.testing.expect(first.last_failure == .admission);
+    held.release();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    budget.backing = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, second.allocator().alloc(u8, 1));
+    try std.testing.expect(second.last_failure == .backing);
+    try std.testing.expect(first.last_failure == .admission);
+    budget.backing = alloc;
+    const memory = try first.allocator().alloc(u8, 1);
+    // Allocations and frees are interchangeable with the original allocator.
+    budget.threadSafeAllocator().free(memory);
+    try std.testing.expect(first.last_failure == null);
 }

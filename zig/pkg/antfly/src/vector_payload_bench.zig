@@ -19,6 +19,7 @@ pub fn main(init: std.process.Init) !void {
     const root = args[2];
     const count = try std.fmt.parseInt(usize, args[3], 10);
     const dims = try std.fmt.parseInt(usize, args[4], 10);
+    const session_only = std.mem.eql(u8, args[1], "session-only");
     const retrying = std.mem.eql(u8, args[1], "retry");
     const mixed = std.mem.eql(u8, args[1], "retry-mixed") or std.mem.eql(u8, args[1], "read-mixed");
     const updating = std.mem.eql(u8, args[1], "update") or std.mem.eql(u8, args[1], "read-updated");
@@ -27,7 +28,7 @@ pub fn main(init: std.process.Init) !void {
     const storage = disk.storage();
     const refs_path = try std.fmt.allocPrint(alloc, "{s}{s}.refs", .{ root, if (updating) ".updated" else if (mixed) ".mixed" else "" });
     defer alloc.free(refs_path);
-    const writing = std.mem.eql(u8, args[1], "ingest") or std.mem.eql(u8, args[1], "update") or retrying or std.mem.eql(u8, args[1], "retry-mixed");
+    const writing = session_only or std.mem.eql(u8, args[1], "ingest") or std.mem.eql(u8, args[1], "update") or retrying or std.mem.eql(u8, args[1], "retry-mixed");
     if (!writing and !std.mem.eql(u8, args[1], "read") and !std.mem.eql(u8, args[1], "read-updated") and !std.mem.eql(u8, args[1], "read-mixed")) return error.InvalidMode;
     if (writing) {
         const current = try std.fmt.allocPrint(alloc, "{s}/CURRENT", .{root});
@@ -54,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
     for (vector, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 97)) / 97;
     var max_batch_ns: u64 = 0;
     var maintenance = Maintenance{ .store = &store, .io = init.io };
-    const background = writing and std.c.getenv("ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT") != null;
+    const background = writing and !session_only and std.c.getenv("ANTFLY_SOURCE_VECTOR_BACKGROUND_CHECKPOINT") != null;
     // The diagnostic counter is deliberately single-threaded so it does not
     // insert locks into every allocation. Keep its use out of concurrent runs.
     if (count_allocations and background) return error.AllocationCountingRequiresForegroundCheckpoint;
@@ -64,9 +65,7 @@ pub fn main(init: std.process.Init) !void {
         future.await(init.io) catch {};
     };
     const initial_live = allocation_counter.live;
-    allocation_counter.calls = 0;
-    allocation_counter.bytes = 0;
-    allocation_counter.peak = initial_live;
+    allocation_counter.resetActivity();
     const run_start = time.monotonicNs();
     var offset: usize = 0;
     while (offset < count) {
@@ -93,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
                 std.mem.doNotOptimizeAway(artifact.ptr);
             }
         }
-        if (writing) {
+        if (writing and !session_only) {
             try session.prepareCommit();
             session.committed = true;
         }
@@ -107,14 +106,18 @@ pub fn main(init: std.process.Init) !void {
         task = null;
     }
     const finish_start = time.monotonicNs();
-    if (writing) try store.checkpoint();
+    if (writing and !session_only) try store.checkpoint();
     const finish_ns = time.monotonicNs() - finish_start;
-    if (writing) try storage.writeFileAbsolute(refs_path, refs);
+    if (writing and !session_only) try storage.writeFileAbsolute(refs_path, refs);
+    if (session_only and store.statsSnapshot().prepared_payloads != 0) return error.UnexpectedDurablePreparation;
+    const reference_checksum = std.hash.Wyhash.hash(0, refs);
+    // Reporting is outside the measured work and must not inflate heap metrics.
+    const measured_allocations = allocation_counter;
     const stats = try std.json.Stringify.valueAlloc(alloc, store.statsSnapshot(), .{});
     defer alloc.free(stats);
-    std.debug.print("payload_bench {{\"mode\":\"{s}\",\"count\":{d},\"dims\":{d},\"open_ns\":{d},\"run_ns\":{d},\"final_checkpoint_ns\":{d},\"max_batch_ns\":{d},\"stats\":{s}}}\n", .{ args[1], count, dims, opened_ns, run_ns, finish_ns, max_batch_ns, stats });
-    if (count_allocations) std.debug.print("allocation_bench {{\"allocations\":{d},\"allocated_bytes\":{d},\"peak_additional_live_bytes\":{d}}}\n", .{
-        allocation_counter.calls, allocation_counter.bytes, allocation_counter.peak - initial_live,
+    std.debug.print("payload_bench {{\"mode\":\"{s}\",\"count\":{d},\"dims\":{d},\"open_ns\":{d},\"run_ns\":{d},\"final_checkpoint_ns\":{d},\"max_batch_ns\":{d},\"reference_checksum\":{d},\"stats\":{s}}}\n", .{ args[1], count, dims, opened_ns, run_ns, finish_ns, max_batch_ns, reference_checksum, stats });
+    if (count_allocations) std.debug.print("allocation_bench {{\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_additional_live_bytes\":{d}}}\n", .{
+        measured_allocations.calls, measured_allocations.resize_calls, measured_allocations.remap_calls, measured_allocations.moving_remaps, measured_allocations.moved_bytes, measured_allocations.bytes, measured_allocations.peak - initial_live,
     });
 }
 
