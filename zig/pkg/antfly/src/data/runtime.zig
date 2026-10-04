@@ -41366,7 +41366,8 @@ fn consumerTests() type {
                 },
             };
             page_request.merge_page.?.digest = pages.commandDigest(page_request);
-            try std.testing.expectEqual(data_raft_batch.merge_page_protocol_version, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            const merge_page_protocol = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
+            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
             const page_proposal = DataServer.raftBatchRequestForProtocol(page_request, true, 999);
             try std.testing.expectEqual(@as(u64, 0), page_proposal.timestamp_ns);
             const page_bytes = try data_raft_batch.encode(alloc, "docs", page_proposal);
@@ -41376,13 +41377,13 @@ fn consumerTests() type {
             try std.testing.expectEqualDeep(page_request.merge_page.?, page_decoded.batch.req.merge_page.?);
             try std.testing.expectEqualStrings(page_request.writes[0].value, page_decoded.batch.req.writes[0].value);
             page_request.merge_page.?.source.retention = .{ .epoch = 1, .after_sequence = 5 };
-            try std.testing.expectEqual(data_raft_batch.source_scope_protocol_version, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
             page_request.merge_page.?.digest = pages.commandDigest(page_request);
             const chunks = try pages.RowChunks(antfly.db.types.BatchRequest).init(page_request);
             const chunk = try chunks.requestAt(0);
-            try std.testing.expectEqual(data_raft_batch.source_scope_protocol_version, DataServer.requiredRaftBatchProtocolVersion(chunk));
+            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(chunk));
             page_request.merge_page.?.next_snapshot_position = .{ .object = 1, .offset = 8, .remaining = 0 };
-            try std.testing.expectEqual(data_raft_batch.source_pin_protocol_version, DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
             const source_request: antfly.db.types.BatchRequest = .{ .online_source = .{ .admit = .{ .scope = .{
                 .fence = .{ .transition_id = 1, .attempt = 1, .owner_group_id = 2, .peer_group_id = 3, .role = .merge_source, .namespace = .{ .table_id = 4, .shard_id = 2, .range_id = 6 }, .catalog_digest = @splat(1) },
                 .receiver_namespace = .{ .table_id = 4, .shard_id = 3, .range_id = 5 },
@@ -41425,7 +41426,7 @@ fn consumerTests() type {
             try inventory.validateRequest(accept_decoded.batch.req);
             try std.testing.expectEqualDeep(accept_proposal.artifact_catalog.?, accept_decoded.batch.req.artifact_catalog.?);
             page_request.merge_page.?.source.integrity = .{ .catalog_digest = @splat(2), .generation_set = @splat(3) };
-            try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(page_request));
+            try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(page_request));
             try std.testing.expectEqual(@as(u16, 12), DataServer.requiredRaftBatchProtocolVersion(.{
                 .restore_staging = .{ .finish = .{ .scope = @splat(4), .phase = .validated } },
             }));
