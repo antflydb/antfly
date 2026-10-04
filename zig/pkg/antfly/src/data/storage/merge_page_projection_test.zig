@@ -113,7 +113,7 @@ test "data raft merge pages persist atomic cursor through snapshot retry and pro
     checkpoint.page_source = pin;
     checkpoint.page_receiver_namespace = namespace;
     try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, command(&source, 3, .{ .merge_checkpoint = checkpoint }));
-    const active = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_page_protocol_version);
+    const active = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_retirements_protocol_version);
     defer alloc.free(active);
     try payload(&source, 3, active);
     try command(&source, 4, .{ .merge_checkpoint = checkpoint });
@@ -186,7 +186,7 @@ test "data raft merge pages snapshot locator requires protocol12 and fences curs
     checkpoint.page_source = pin;
     checkpoint.page_receiver_namespace = namespace;
     try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, command(&store, 3, .{ .merge_checkpoint = checkpoint }));
-    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.source_scope_protocol_version);
+    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_retirements_protocol_version);
     defer alloc.free(barrier);
     try payload(&store, 3, barrier);
     try command(&store, 4, .{ .merge_checkpoint = checkpoint });
@@ -238,7 +238,7 @@ test "data raft merge pages tail requires v12 and resumes fragments through snap
     checkpoint.page_source = pin;
     checkpoint.page_receiver_namespace = namespace;
     try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, command(&store, 3, .{ .merge_checkpoint = checkpoint }));
-    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.source_scope_protocol_version);
+    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_retirements_protocol_version);
     defer alloc.free(barrier);
     try payload(&store, 3, barrier);
     try command(&store, 4, .{ .merge_checkpoint = checkpoint });
@@ -424,7 +424,7 @@ test "data raft merge pages cleanup verifies pending put delete overlay and exac
         const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
         defer alloc.free(encoded);
         const operations = [_]shard.DataOperation{
-            .{ .set_raft_batch_protocol = batch.merge_page_protocol_version },
+            .{ .set_raft_batch_protocol = batch.merge_retirements_protocol_version },
             .{ .set_range = .{ .start = @constCast("m"), .end = @constCast("z") } },
             .{ .put = .{ .key = @constCast("m"), .value = @constCast("base") } },
             .{ .merge_receiver_checkpoint = .{ .checkpoint = accept } },

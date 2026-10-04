@@ -25668,7 +25668,7 @@ test "text query drops hits with missing stored documents and lowers total_hits"
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/text-missing-stored-drop", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var persistent = try persistent_mod.PersistentIndex.open(alloc, .{

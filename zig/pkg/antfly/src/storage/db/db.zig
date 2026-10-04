@@ -101631,7 +101631,6 @@ const TestAssetProducer = struct {
             .reader => self.reader_calls += 1,
             .transcriber => self.transcriber_calls += 1,
             .extractor => self.extractor_calls += 1,
-            .decision => return error.UnsupportedProducer,
         }
         if (request.producer_type == .extractor) {
             if (self.extractor_output) |output| return try alloc.dupe(u8, output);
@@ -120774,6 +120773,7 @@ test "db encodeThinReplayRecordPayload omits an edges-only document from full-te
         false,
         null,
         null,
+        null,
     );
     defer alloc.free(payload);
 
@@ -120815,6 +120815,7 @@ test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full
         &.{ true, true },
         51,
         false,
+        null,
         null,
         null,
     );
@@ -120865,6 +120866,7 @@ test "db encodeThinReplayRecordPayload keeps an edges-only sibling out of a full
         &.{ true, true },
         51,
         true, // include_generated_enrichment_hint: a generated-enrichment target exists somewhere on the table.
+        null,
         null,
         null,
     );

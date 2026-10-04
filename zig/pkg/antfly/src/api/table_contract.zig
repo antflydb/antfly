@@ -1447,12 +1447,20 @@ test "table contract enforces stable graph source identities and numeric targets
     defer std.testing.allocator.free(config_json);
     try std.testing.expect(std.mem.indexOf(u8, config_json, "\"target\":42") != null);
 
+    const numeric_source_json = try parseCreateIndexRequest(
+        std.testing.allocator,
+        "document_graph",
+        "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"},\"edge\":{\"edge_id\":\"fact:42\"}}]}",
+    );
+    defer std.testing.allocator.free(numeric_source_json);
+    try std.testing.expect(std.mem.indexOf(u8, numeric_source_json, "\"source\":42") != null);
+
     try std.testing.expectError(
         error.InvalidCreateIndexRequest,
         parseCreateIndexRequest(
             std.testing.allocator,
             "document_graph",
-            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":42,\"target\":\"doc:b\"}}]}",
+            "{\"type\":\"graph\",\"sources\":[{\"artifact\":\"relations_v1\",\"nodes\":{\"source\":true,\"target\":\"doc:b\"}}]}",
         ),
     );
 }

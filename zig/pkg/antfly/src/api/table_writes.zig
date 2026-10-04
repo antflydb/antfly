@@ -53038,8 +53038,9 @@ fn implementationTests() type {
                     "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
                 );
                 defer db.close();
+                // Special-field-only writes have no primary document for a dense hit.
                 try db.batch(.{
-                    .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
+                    .writes = &.{.{ .key = "doc:a", .value = "{\"text\":\"cached document\",\"_embeddings\":{\"semantic_idx\":[1,2]}}" }},
                     // The replay fields exercised below are supplied by the live
                     // status fixture. Make the separate read-cache/HBC precondition
                     // deterministic instead of racing asynchronous dense indexing.
