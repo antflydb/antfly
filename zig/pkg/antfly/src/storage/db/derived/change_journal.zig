@@ -1458,7 +1458,7 @@ test "change journal graph indexed record retains unique first occurrence orderi
         }
     };
     try Fixture.run(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "change journal borrowed binary scratch retention is bounded" {

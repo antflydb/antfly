@@ -2195,7 +2195,10 @@ test "catchUpIndex reclaims changing record shapes under a tight hard budget" {
     try std.testing.expectEqual(@as(usize, 20), capture.applied_deleted_keys);
     try std.testing.expectEqual(@as(u64, 0), manager.snapshot().memory.used_bytes);
     try std.testing.expectEqual(@as(usize, 2), retry.scanned_entries);
-    try std.testing.expectEqual(@as(usize, 2), retry.replay_scan_batches);
+    // ArrayList growth may require one bounded fresh-scratch retry between
+    // these record shapes. Both records must still fit the hard memory limit.
+    try std.testing.expect(retry.replay_scan_batches >= 2 and retry.replay_scan_batches <= 3);
+    try std.testing.expect(manager.snapshot().memory.peak_bytes <= 2000);
     try std.testing.expectEqual(@as(u64, 2), retry.last_applied_sequence);
     try std.testing.expectEqual(@as(usize, 8), capture.applied_documents);
 }
