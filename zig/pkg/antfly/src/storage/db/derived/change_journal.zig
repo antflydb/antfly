@@ -124,6 +124,18 @@ pub const BorrowedBinaryRecordScratch = struct {
         self.* = undefined;
     }
 
+    pub fn retainedCapacityBytes(self: *const BorrowedBinaryRecordScratch) usize {
+        return (self.changed_doc_keys.capacity + self.deleted_doc_keys.capacity +
+            self.overwritten_doc_keys.capacity + self.changed_artifact_keys.capacity) * @sizeOf([]const u8) +
+            self.target_hints.capacity * @sizeOf(TargetHint);
+    }
+
+    pub fn trimRetainedCapacity(self: *BorrowedBinaryRecordScratch, alloc: Allocator, max_bytes: usize) void {
+        if (self.retainedCapacityBytes() <= max_bytes) return;
+        self.deinit(alloc);
+        self.* = .{};
+    }
+
     fn reset(self: *BorrowedBinaryRecordScratch) void {
         self.changed_doc_keys.clearRetainingCapacity();
         self.deleted_doc_keys.clearRetainingCapacity();
@@ -650,8 +662,14 @@ fn decodeBinaryStringListBorrowedScratch(
 ) BinaryDecodeError![]const []const u8 {
     list.clearRetainingCapacity();
     const count = try cursor.readInt(u32);
-    if (count == 0) return &.{};
+    if (count == 0) {
+        list.clearAndFree(alloc);
+        return &.{};
+    }
 
+    if (count > cursor.remaining() / @sizeOf(u32)) return error.UnexpectedEndOfInput;
+    const useful_capacity = std.ArrayListUnmanaged([]const u8).growCapacity(count);
+    if (list.capacity > useful_capacity *| 2) list.clearAndFree(alloc);
     try list.ensureTotalCapacity(alloc, @intCast(count));
     var index: usize = 0;
     while (index < count) : (index += 1) {
@@ -778,34 +796,51 @@ pub fn decodeBinaryRecordBorrowed(alloc: Allocator, raw: []const u8) !BorrowedBi
     };
 }
 
-pub fn decodeBinaryRecordBorrowedScratch(
-    alloc: Allocator,
-    raw: []const u8,
-    scratch: *BorrowedBinaryRecordScratch,
-) !Record {
+/// Fields needed by a consumer. Unselected fields are still structurally
+/// validated, without allocating their descriptor arrays.
+pub const RecordFields = struct {
+    changed_doc_keys: bool = true,
+    deleted_doc_keys: bool = true,
+    overwritten_doc_keys: bool = true,
+    changed_artifact_keys: bool = true,
+};
+
+pub fn decodeBinaryRecordBorrowedScratch(alloc: Allocator, raw: []const u8, scratch: *BorrowedBinaryRecordScratch) !Record {
+    return decodeBinaryRecordBorrowedScratchSelected(alloc, raw, scratch, .{});
+}
+
+fn decodeSelectedList(alloc: Allocator, cursor: *BinaryCursor, list: *std.ArrayListUnmanaged([]const u8), present: bool, selected: bool) ![]const []const u8 {
+    if (!present) return &.{};
+    if (selected) return decodeBinaryStringListBorrowedScratch(alloc, cursor, list);
+    const count = try cursor.readInt(u32);
+    for (0..count) |_| _ = try cursor.readBytes(try cursor.readInt(u32));
+    return &.{};
+}
+
+pub fn decodeBinaryRecordBorrowedScratchSelected(alloc: Allocator, raw: []const u8, scratch: *BorrowedBinaryRecordScratch, fields: RecordFields) !Record {
     if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
     scratch.reset();
-
-    var cursor = BinaryCursor{
-        .raw = raw[binary_magic.len..],
-        .index = 0,
-    };
-
+    var cursor = BinaryCursor{ .raw = raw[binary_magic.len..], .index = 0 };
     const version = try cursor.readInt(u16);
     const sequence = try cursor.readInt(u64);
-    const target_hints = try decodeHintMaskBorrowedScratch(alloc, try cursor.readInt(u8), scratch);
+    const hint_mask = try cursor.readInt(u8);
     const field_mask: FieldMask = @bitCast(try cursor.readInt(u8));
-
-    var record: Record = .{
+    // Prior-window capacity for absent/unselected fields cannot displace the
+    // current record's working set, even when below the retention ceiling.
+    if (!field_mask.changed_doc_keys or !fields.changed_doc_keys) scratch.changed_doc_keys.clearAndFree(alloc);
+    if (!field_mask.deleted_doc_keys or !fields.deleted_doc_keys) scratch.deleted_doc_keys.clearAndFree(alloc);
+    if (!field_mask.overwritten_doc_keys or !fields.overwritten_doc_keys) scratch.overwritten_doc_keys.clearAndFree(alloc);
+    if (!field_mask.changed_artifact_keys or !fields.changed_artifact_keys) scratch.changed_artifact_keys.clearAndFree(alloc);
+    if (@popCount(hint_mask) <= 1) scratch.target_hints.clearAndFree(alloc);
+    const record: Record = .{
         .version = version,
         .sequence = sequence,
-        .target_hints = target_hints,
+        .target_hints = try decodeHintMaskBorrowedScratch(alloc, hint_mask, scratch),
+        .changed_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.changed_doc_keys, field_mask.changed_doc_keys, fields.changed_doc_keys),
+        .deleted_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.deleted_doc_keys, field_mask.deleted_doc_keys, fields.deleted_doc_keys),
+        .overwritten_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.overwritten_doc_keys, field_mask.overwritten_doc_keys, fields.overwritten_doc_keys),
+        .changed_artifact_keys = try decodeSelectedList(alloc, &cursor, &scratch.changed_artifact_keys, field_mask.changed_artifact_keys, fields.changed_artifact_keys),
     };
-
-    if (field_mask.changed_doc_keys) record.changed_doc_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.changed_doc_keys);
-    if (field_mask.deleted_doc_keys) record.deleted_doc_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.deleted_doc_keys);
-    if (field_mask.overwritten_doc_keys) record.overwritten_doc_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.overwritten_doc_keys);
-    if (field_mask.changed_artifact_keys) record.changed_artifact_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.changed_artifact_keys);
     if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
     return record;
 }
@@ -1424,4 +1459,62 @@ test "change journal graph indexed record retains unique first occurrence orderi
     };
     try Fixture.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "change journal borrowed binary scratch retention is bounded" {
+    const alloc = std.testing.allocator;
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    try scratch.changed_doc_keys.ensureTotalCapacity(alloc, 100);
+    const pointer = scratch.changed_doc_keys.items.ptr;
+    scratch.trimRetainedCapacity(alloc, scratch.retainedCapacityBytes());
+    try std.testing.expectEqual(pointer, scratch.changed_doc_keys.items.ptr);
+    scratch.trimRetainedCapacity(alloc, 0);
+    try std.testing.expectEqual(@as(usize, 0), scratch.retainedCapacityBytes());
+    try scratch.changed_doc_keys.append(alloc, "after trim");
+    try std.testing.expectEqualStrings("after trim", scratch.changed_doc_keys.items[0]);
+}
+
+test "change journal selected decode validates skipped lists without retaining them" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"changed"},
+        .deleted_doc_keys = &.{"deleted"},
+        .overwritten_doc_keys = &.{"overwritten"},
+        .changed_artifact_keys = &.{"artifact"},
+        .target_hints = &.{.graph},
+    });
+    defer alloc.free(payload);
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    _ = try decodeBinaryRecordBorrowedScratch(alloc, payload, &scratch);
+    const graph = try decodeBinaryRecordBorrowedScratchSelected(alloc, payload, &scratch, .{
+        .changed_doc_keys = false,
+        .overwritten_doc_keys = false,
+    });
+    try std.testing.expectEqualStrings("deleted", graph.deleted_doc_keys[0]);
+    try std.testing.expectEqualStrings("artifact", graph.changed_artifact_keys[0]);
+    try std.testing.expectEqual(@as(usize, 0), scratch.changed_doc_keys.capacity);
+    try std.testing.expectEqual(@as(usize, 0), scratch.overwritten_doc_keys.capacity);
+    const text = try decodeBinaryRecordBorrowedScratchSelected(alloc, payload, &scratch, .{ .changed_artifact_keys = false });
+    try std.testing.expectEqualStrings("changed", text.changed_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 0), scratch.changed_artifact_keys.capacity);
+    // A truncated ignored artifact is still corrupt, rather than silently accepted.
+    try std.testing.expectError(error.UnexpectedEndOfInput, decodeBinaryRecordBorrowedScratchSelected(alloc, payload[0 .. payload.len - 1], &scratch, .{ .changed_artifact_keys = false }));
+    const trailing = try std.mem.concat(alloc, u8, &.{ payload, "x" });
+    defer alloc.free(trailing);
+    try std.testing.expectError(error.InvalidBinaryRecord, decodeBinaryRecordBorrowedScratchSelected(alloc, trailing, &scratch, .{ .changed_artifact_keys = false }));
+}
+
+test "change journal selected decode rejects impossible list counts before allocating" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = &.{"key"} });
+    defer alloc.free(payload);
+    // The first list begins after magic, version, sequence, hints and fields.
+    @memset(payload[payload.len - 11 ..][0..4], 0xff);
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    try std.testing.expectError(error.UnexpectedEndOfInput, decodeBinaryRecordBorrowedScratch(alloc, payload, &scratch));
+    try std.testing.expectEqual(@as(usize, 0), scratch.changed_doc_keys.capacity);
 }

@@ -17,6 +17,34 @@ const time = @import("antfly_platform").time;
 const LiveSet = @import("source_vector_live_set.zig").LiveSet;
 const generation_publication = @import("generation_publication.zig");
 
+// Metadata grows with records that actually need appending. Keep superseded
+// buffers out of the payload decode arena and preserve cross-session deduplication.
+const PreparationMetadata = struct {
+    alloc: Allocator,
+    records: std.ArrayListUnmanaged(native.BatchRecord) = .empty,
+    seen: std.AutoHashMapUnmanaged(payload.Digest, void) = .empty,
+
+    fn deinit(self: *@This()) void {
+        self.records.deinit(self.alloc);
+        self.seen.deinit(self.alloc);
+    }
+
+    fn claim(self: *@This(), digest: payload.Digest) !bool {
+        // getOrPut grows before probing when the map is full. Check existing
+        // keys at that boundary so duplicates never trigger a needless grow.
+        const limit = @as(u64, self.seen.capacity()) * std.hash_map.default_max_load_percentage / 100;
+        if (self.seen.count() >= limit and self.seen.contains(digest)) return false;
+        return !(try self.seen.getOrPut(self.alloc, digest)).found_existing;
+    }
+
+    fn append(self: *@This(), digest: payload.Digest, record: native.BatchRecord) !bool {
+        if (!try self.claim(digest)) return false;
+        errdefer _ = self.seen.remove(digest);
+        try self.records.append(self.alloc, record);
+        return true;
+    }
+};
+
 pub const Stats = payload.Stats;
 
 // Filled only by the deterministic interleaving test below.
@@ -1706,18 +1734,14 @@ pub const Store = struct {
         var arena = std.heap.ArenaAllocator.init(self.alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
-        var records = std.ArrayListUnmanaged(native.BatchRecord).empty;
-        var seen = std.AutoHashMap(payload.Digest, void).init(scratch);
+        var metadata_buffer = std.heap.stackFallback(2048, self.alloc);
+        var metadata: PreparationMetadata = .{ .alloc = metadata_buffer.get() };
+        defer metadata.deinit();
+        const records = &metadata.records;
         const sequence = try std.math.add(u64, self.opened.store.covered_source_sequence, 1);
         var bytes: u64 = 0;
         var added_payloads: u64 = 0;
         var added_bytes: u64 = 0;
-        if (self.collection) |collection| try collection.tail.ensureUnusedCapacity(@intCast(prepared.len));
-        if (self.marking) |marking| {
-            try marking.tail.ensureUnusedCapacity(@intCast(prepared.len));
-            if (self.rescue_reappends) try marking.rescued.ensureUnusedCapacity(self.alloc, @intCast(prepared.len));
-            if (marking.running) try marking.pending_tail.ensureUnusedCapacity(self.alloc, prepared.len);
-        }
         for (prepared, 0..) |*item, item_index| {
             // A retry can reuse an already durable immutable payload.
             const found = try self.opened.get(&item.reference.digest, std.math.maxInt(u64), null);
@@ -1731,16 +1755,19 @@ pub const Store = struct {
                     if (self.rescue_reappends) {
                         if (marking.rescued.contains(item.reference.digest)) continue;
                         if (found.vector.dims != item.reference.dims) return error.VectorReferenceIdentityMismatch;
-                        marking.rescued.putAssumeCapacity(item.reference.digest, item.reference.dims);
+                        // Rescue receipts are rebuildable state. Grow only for
+                        // a unique rescue, before any durable append.
+                        try marking.rescued.put(self.alloc, item.reference.digest, item.reference.dims);
                         self.stats.deduplicated_reappend_payloads += 1;
                         self.stats.deduplicated_reappend_bytes += @as(u64, item.reference.dims) * 4;
                         continue;
                     }
                 } else continue;
             }
-            if ((try seen.getOrPut(item.reference.digest)).found_existing) continue;
+            if (!try metadata.claim(item.reference.digest)) continue;
+            errdefer _ = metadata.seen.remove(item.reference.digest);
             const vector = if (decoded) |vectors| vectors[item_index] else (try codec.denseEmbeddingVectorView(item.artifact)) orelse try codec.decodeDenseEmbeddingAlloc(scratch, item.artifact);
-            try records.append(scratch, .{
+            try records.append(metadata.alloc, .{
                 .kind = .upsert,
                 .key = &item.reference.digest,
                 .source_sequence = sequence,
@@ -1754,6 +1781,14 @@ pub const Store = struct {
             }
         }
         if (records.items.len == 0) return;
+        // Post-append updates must remain infallible. Reserve from the actual
+        // eligible unique records, after durable/duplicate short-circuiting.
+        const additions = std.math.cast(u32, records.items.len) orelse return error.Overflow;
+        if (self.collection) |collection| try collection.tail.ensureUnusedCapacity(additions);
+        if (self.marking) |marking| {
+            try marking.tail.ensureUnusedCapacity(additions);
+            if (marking.running) try marking.pending_tail.ensureUnusedCapacity(self.alloc, records.items.len);
+        }
         var encoded = try self.opened.store.encodeBatch(try self.opened.store.nextBatchId(), records.items, sequence);
         defer encoded.deinit();
         var successor = try self.opened.prepareWalSuccessor(self.alloc, &encoded, true);
@@ -4738,7 +4773,13 @@ test "source vector payloads elapsed marking budget yields before the row cap an
             };
             try MarkInterleaving.awaitFlag(&MarkInterleaving.entered);
             const wal_before = source.statsSnapshot().wal_bytes_written;
-            try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+            const tail_capacity = source.marking.?.tail.capacity();
+            const pending_capacity = source.marking.?.pending_tail.capacity;
+            const repeats = [_]payload.Prepared{.{ .reference = ref, .artifact = artifact }} ** 256;
+            try Store.prepare(&source, &repeats);
+            try std.testing.expectEqual(tail_capacity, source.marking.?.tail.capacity());
+            try std.testing.expectEqual(pending_capacity, source.marking.?.pending_tail.capacity);
+            try std.testing.expect(source.marking.?.rescued.capacity() <= 8);
             try std.testing.expectEqual(wal_before, source.statsSnapshot().wal_bytes_written);
             MarkInterleaving.resume_scan.store(true, .release);
             thread.join();
@@ -4822,7 +4863,12 @@ test "source vector payloads rescued preparations cannot certify an unchanged pr
         }
         try std.testing.expect(!try source.collectStepDeferredMark(&raw, 1));
         const bytes = source.stats.wal_bytes_written;
-        try Store.prepare(&source, &.{.{ .reference = ref, .artifact = old }});
+        const tail_capacity = source.marking.?.tail.capacity();
+        const repeats = [_]payload.Prepared{.{ .reference = ref, .artifact = old }} ** 256;
+        try Store.prepare(&source, &repeats);
+        try std.testing.expectEqual(tail_capacity, source.marking.?.tail.capacity());
+        try std.testing.expectEqual(@as(usize, 1), source.marking.?.rescued.count());
+        try std.testing.expect(source.marking.?.rescued.capacity() <= 8);
         try std.testing.expectEqual(bytes, source.stats.wal_bytes_written);
         // Do not commit the prepared reference. It remains conservatively live
         // for this cut; a clean receipt for the old epoch would leak it forever.
@@ -6714,4 +6760,77 @@ test "source vector payloads detached reader failure retains authority and retri
     while (!try source.collectStep(&raw, 1)) {}
     try source.advanceCollectionReaders();
     try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);
+}
+
+fn preparationMetadataFailures(alloc: Allocator) !void {
+    var buffer = std.heap.stackFallback(2048, alloc);
+    var metadata: PreparationMetadata = .{ .alloc = buffer.get() };
+    defer metadata.deinit();
+    for (0..128) |i| {
+        var digest: payload.Digest = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], i, .little);
+        try std.testing.expect(try metadata.append(digest, .{ .kind = .upsert, .key = "key", .source_sequence = 1, .revision = 1 }));
+        try std.testing.expect(!try metadata.append(digest, .{ .kind = .upsert, .key = "duplicate", .source_sequence = 2, .revision = 2 }));
+    }
+    try std.testing.expectEqual(@as(usize, 128), metadata.records.items.len);
+}
+
+test "source vector payloads preparation metadata grows only with eligible unique records" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var buffer = std.heap.stackFallback(2048, failing.allocator());
+    var metadata: PreparationMetadata = .{ .alloc = buffer.get() };
+    defer metadata.deinit();
+    try std.testing.expect(try metadata.append(@splat(0), .{ .kind = .upsert, .key = "one", .source_sequence = 1, .revision = 1 }));
+    try std.testing.expectEqual(@as(usize, 1), metadata.records.items.len);
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, preparationMetadataFailures, .{});
+}
+
+test "source vector payloads mixed retry appends only missing records and deduplicates grouped requests" {
+    const alloc = std.testing.allocator;
+    var memory = lsm.MemoryStorage.init(alloc);
+    defer memory.deinit();
+    var store = try Store.open(alloc, memory.storage(), "/mixed-preparation", false);
+    defer store.deinit();
+    const artifact = try codec.encodeDenseEmbeddingAlloc(alloc, 17, &.{ 0.5, 0.25 });
+    defer alloc.free(artifact);
+    var prepared: [130]payload.Prepared = undefined;
+    for (prepared[0..129], 0..) |*item, i| {
+        var name: [32]u8 = undefined;
+        const key = try @import("internal_keys.zig").embeddingArtifactKeyForDocumentAlloc(alloc, try std.fmt.bufPrint(&name, "document-{d}", .{i}), "model");
+        defer alloc.free(key);
+        item.* = .{ .reference = try payload.Reference.forArtifact(key, artifact), .artifact = artifact };
+    }
+    try store.prepareBatch(prepared[1..129]);
+    const previous = store.stats.prepared_payloads;
+    prepared[129] = prepared[0];
+    try store.prepareBatch(&prepared);
+    try std.testing.expectEqual(previous + 1, store.stats.prepared_payloads);
+    try store.prepareBatch(&prepared);
+    try std.testing.expectEqual(previous + 1, store.stats.prepared_payloads);
+    for (&prepared) |item| {
+        const found = try store.opened.get(&item.reference.digest, std.math.maxInt(u64), null);
+        try std.testing.expect(found == .vector);
+        try std.testing.expectEqual(@as(u32, 2), found.vector.dims);
+    }
+}
+
+test "source vector payloads duplicate metadata at its load limit does not grow" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var metadata: PreparationMetadata = .{ .alloc = failing.allocator() };
+    defer metadata.deinit();
+    try metadata.seen.ensureTotalCapacity(metadata.alloc, 1);
+    const capacity = metadata.seen.capacity();
+    const limit = @as(usize, capacity) * std.hash_map.default_max_load_percentage / 100;
+    var first: payload.Digest = @splat(0);
+    for (0..limit) |i| {
+        var digest: payload.Digest = @splat(0);
+        std.mem.writeInt(u64, digest[0..8], i, .little);
+        if (i == 0) first = digest;
+        try std.testing.expect(try metadata.claim(digest));
+    }
+    const allocations = failing.alloc_index;
+    for (0..256) |_| try std.testing.expect(!try metadata.claim(first));
+    try std.testing.expectEqual(capacity, metadata.seen.capacity());
+    try std.testing.expectEqual(allocations, failing.alloc_index);
 }

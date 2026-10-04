@@ -3192,6 +3192,24 @@ pub const ResourceManager = struct {
         return sliceStatsFromState(slice, state);
     }
 
+    /// Advisory headroom for sizing a bounded unit of work. Admission still
+    /// checks both limits atomically; concurrent users can consume this space.
+    /// Unlike snapshot(), this avoids collecting unrelated slice statistics.
+    pub fn availableAdmissionBytes(self: *ResourceManager, slice: Slice) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.slices[sliceIndex(slice)];
+        const slice_available = if (state.budget.hard_limit_bytes == 0)
+            std.math.maxInt(u64)
+        else
+            state.budget.hard_limit_bytes -| state.used_bytes;
+        const memory_available = if (self.memory.budget.hard_limit_bytes == 0)
+            std.math.maxInt(u64)
+        else
+            self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
+        return @min(slice_available, memory_available);
+    }
+
     /// Stable capacity, not momentary free space: durable transaction admission
     /// must not turn unrelated concurrent requests into permanent size limits.
     /// Zero means neither the node nor this slice has a hard limit.

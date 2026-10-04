@@ -146,6 +146,38 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_source_file = b.path("lib/lmdb/src/lmdb_vopr.zig"),
     });
 
+    const replay_allocation_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/replay_allocation_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, replay_allocation_mod, true, true);
+    const replay_allocation_tests = b.addTest(.{
+        .root_module = replay_allocation_mod,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+        .filters = &.{ "storage.db.derived.", "lookup scratch", "document read scratch", "ordinal batch lookup", "replay batcher", "dense replay preserves", "sparse replay preserves" },
+    });
+    b.step("replay-allocation-test", "Run replay ownership, scratch retention and window contracts")
+        .dependOn(&b.addRunArtifact(replay_allocation_tests).step);
+    const lookup_key_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lookup_key_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, lookup_key_bench_mod, true, true);
+    const lookup_key_bench = b.addExecutable(.{ .name = "lookup-key-bench", .root_module = lookup_key_bench_mod });
+    b.step("lookup-key-bench", "Measure document lookup key preparation with pooled and individual ownership")
+        .dependOn(&b.addInstallArtifact(lookup_key_bench, .{}).step);
+    const replay_allocation_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/replay_allocation_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, replay_allocation_bench_mod, true, true);
+    const replay_allocation_bench = b.addExecutable(.{ .name = "replay-allocation-bench", .root_module = replay_allocation_bench_mod });
+    b.step("replay-allocation-bench", "Build the allocation-counted replay benchmark")
+        .dependOn(&b.addInstallArtifact(replay_allocation_bench, .{}).step);
+
     const functions_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/functions_test_root.zig"),
         .target = target,
@@ -5549,6 +5581,44 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const run_index_maintenance_vopr = addFilteredTestRunArtifactWithRuntimeFilters(b, graph_metric_integration_tests, &.{"index maintenance VOPR "});
     vopr_test_step.dependOn(&run_index_maintenance_vopr.step);
 
+    const document_lookup_bench = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{"db document lookup allocation benchmark"},
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-lookup-bench", "Build validated real document collector allocation/timing benchmark")
+        .dependOn(&b.addInstallArtifact(document_lookup_bench, .{ .dest_sub_path = "document-lookup-bench" }).step);
+
+    const replay_document_integration_filters = [_][]const u8{
+        "document collectors release",
+        "collectDocumentWrites batches sorted document reads",
+        "collectDocumentWrites skips missing out-of-range",
+        "db reopens persisted index catalog and text index",
+        "db derived text replay admits natural segments below hard segment limit",
+        "db managed full text admission replays transitive artifact producers",
+        "db full text repair page replay is idempotent without compaction",
+        "db algebraic bulk ingest survives reopen with durable lsm primary backend",
+        "db managed algebraic admission builds and reopens an isolated generation",
+        "db algebraic generation build yields and resumes from its durable source cursor",
+        "db graph index reloads on reopen for neighbor queries with durable lsm primary backend",
+        "db enrichment graph ttl replay honors source tombstone",
+        "db document deletion retires graph source contender and due entry",
+        "db bulk ingest keeps direct writes visible before graph batch",
+        "db transaction committed transform appends derived replay from final value",
+        "db lookup projects nested document fields",
+        "db restore snapshot recreates text sparse and graph indexes for durable lsm primary backend",
+    };
+    const replay_document_integration_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &replay_document_integration_filters,
+        // DB codegen including collector failure sweeps peaked at 14.21 GB
+        // on macOS. Keep the declared bound above the measured requirement.
+        .max_rss = 14 * 1024 * 1024 * 1024,
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("replay-document-integration-test", "Verify replay consumers across text, algebraic, graph and document bodies")
+        .dependOn(&b.addRunArtifact(replay_document_integration_tests).step);
+
     const db_test_step = b.step("antfly-storage-db-test", "Run storage/db owner tests using the shared unit artifacts");
     const relational_index_lifecycle_tests = b.addTest(.{
         .root_module = db_test_mod,
@@ -6016,11 +6086,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.source_proof_batch.",
             "storage.db.backfill_state.",
             "storage.db.batcher.",
+            "storage.db.lookup_key_scratch.",
+            "storage.db.document_read_scratch.",
             "storage.db.config.",
             "storage.db.apply_receipts.",
             "storage.db.durable_outbox.",
             "storage.db.durable_outbox_store.",
             "storage.db.primary_effect.",
+            "storage.db.graph_edge_types.",
             "storage.db.replication_contract.",
             "storage.db.replication_ingress.",
             "storage.db.replication_effects.",
@@ -6171,6 +6244,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db_split_vopr.",
             "storage.derived_log_test_root.",
             "storage.docstore.",
+            "storage.document_mutation_revision.",
             "storage.enrichment.",
             "storage.filesystem_capacity.",
             "storage.generation_publication.",

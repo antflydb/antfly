@@ -285,6 +285,8 @@ const graph_pattern_mod = @import("../../graph/pattern.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
 const mapper = @import("document_mapper.zig");
 const relational_store = @import("relational_store.zig");
+const lookup_key_scratch = @import("lookup_key_scratch.zig");
+const document_read_scratch = @import("document_read_scratch.zig");
 const relational_columns = @import("relational_columns.zig");
 const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const planning_adapter_mod = @import("planning_adapter.zig");
@@ -45400,9 +45402,9 @@ pub const DB = struct {
         item.repair_degraded = true;
     }
 
-    fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !void {
+    fn populateDerivedCoverageCounts(self: *DB, index_name: []const u8, generation: u64, config_hash: u64, item: *types.DBIndexStats) !DerivedCoverageCounters {
         item.coverage_config_hash = config_hash;
-        const coverage_counts = try loadDerivedCoverageCounters(self.core.alloc, self.core.store, index_name, generation, null, null);
+        const coverage_counts = try loadDerivedCoverageCounters(self.core.alloc, self.core.store, index_name, generation, null, if (builtin.is_test) self.async_context else null);
         const produced = coverage_counts.produced;
         const skipped = coverage_counts.skipped;
         const terminal_failed = coverage_counts.terminal_failed;
@@ -45418,6 +45420,7 @@ pub const DB = struct {
         item.coverage_skipped_count = skipped orelse 0;
         item.coverage_terminal_failed_count = terminal_failed orelse 0;
         if (!item.coverage_summary_ready) item.repair_degraded = true;
+        return coverage_counts;
     }
 
     /// Whether producer-outcome coverage is meaningful for a graph or
@@ -45450,8 +45453,11 @@ pub const DB = struct {
             item.repair_degraded = true;
             return;
         }
-        try self.populateDerivedCoverageCounts(index_name, item.coverage_generation, item.coverage_config_hash, item);
-        try self.populateDensePublicationTarget(index_name, item);
+        const coverage_counts = try self.populateDerivedCoverageCounts(index_name, item.coverage_generation, item.coverage_config_hash, item);
+        // Publication cardinality and source outcomes belong to the same
+        // committed revision. Re-reading the artifact counter here could
+        // combine old source coverage with a newer publication target.
+        try self.populateDensePublicationTarget(index_name, coverage_counts, item);
     }
 
     /// Populate the exact physical cardinality expected from the current dense
@@ -45459,17 +45465,13 @@ pub const DB = struct {
     /// chunk-backed, and multi-source indexes use the write-maintained target
     /// counter because document outcomes cannot express their multiplicity.
     /// One-vector-per-document managed indexes use generation-scoped outcomes.
-    fn populateDensePublicationTarget(self: *DB, index_name: []const u8, item: *types.DBIndexStats) !void {
+    fn populateDensePublicationTarget(self: *DB, index_name: []const u8, coverage_counts: DerivedCoverageCounters, item: *types.DBIndexStats) !void {
         if (item.kind != .dense_vector) return;
         item.publication_target_count = 0;
         item.publication_target_ready = false;
         const entry = self.core.denseIndex(index_name) orelse return;
         if (densePublicationTargetUsesArtifactCounter(entry)) {
-            item.publication_target_count = (try loadDenseArtifactTargetCounter(
-                self.core.alloc,
-                self.core.store,
-                index_name,
-            )) orelse return;
+            item.publication_target_count = (try coverage_counts.artifactCount()) orelse return;
             item.publication_target_ready = true;
             return;
         }
@@ -45583,7 +45585,7 @@ pub const DB = struct {
             var item = types.DBIndexStats{ .name = index_ref.name, .kind = index_ref.kind };
             initializeDerivedCoverageIdentity(cfg.*, &item);
             if (item.coverage_identity_ready) {
-                try self.populateDerivedCoverageCounts(
+                _ = try self.populateDerivedCoverageCounts(
                     index_ref.name,
                     item.coverage_generation,
                     item.coverage_config_hash,
@@ -71835,13 +71837,14 @@ fn collectSparseFieldWritesProfiled(
 ) !OwnedSparseFieldWrites {
     const PendingDocumentWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
@@ -71897,7 +71900,7 @@ fn collectSparseFieldWritesProfiled(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
     }
@@ -71923,14 +71926,13 @@ fn collectSparseFieldWritesProfiled(
     }.lessThan);
     if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
-    const read_keys = try alloc.alloc([]const u8, pending.items.len);
-    defer alloc.free(read_keys);
-    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-    defer alloc.free(read_values);
+    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    defer read_scratch.deinit();
+    const read_keys = read_scratch.keys;
+    const read_values = read_scratch.values;
 
     for (pending.items, 0..) |item, i| {
         read_keys[i] = item.store_key;
-        read_values[i] = null;
     }
     const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
     try txn.getManySorted(read_keys, read_values);
@@ -71995,6 +71997,19 @@ fn collectDocumentWrites(
     return try collectDocumentWritesProfiled(alloc, store, null, documents, byte_range, .{}, null);
 }
 
+// Count contiguous store hits first. Inline fallbacks require inspecting
+// pending metadata only when that metadata actually contains inline values.
+fn availableDocumentValueCount(pending: anytype, values: []const ?[]const u8, has_inline: bool) usize {
+    var count: usize = 0;
+    for (values) |value| count += @intFromBool(value != null);
+    if (has_inline) {
+        for (pending, values) |item, value| {
+            count += @intFromBool(value == null and item.inline_value != null);
+        }
+    }
+    return count;
+}
+
 fn collectDocumentWritesProfiled(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -72006,16 +72021,18 @@ fn collectDocumentWritesProfiled(
 ) !OwnedBatchWrites {
     const PendingDocumentWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
+    var has_pending_inline = false;
     var writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
     errdefer {
         for (writes.items) |item| alloc.free(@constCast(item.value));
@@ -72041,18 +72058,22 @@ fn collectDocumentWritesProfiled(
         }
         if (trust_inline and doc.cleaned_value != null) {
             const owned_value = try alloc.dupe(u8, doc.cleaned_value.?);
-            try writes.append(alloc, .{
+            writes.append(alloc, .{
                 .key = doc.key,
                 .value = owned_value,
-            });
+            }) catch |err| {
+                alloc.free(owned_value);
+                return err;
+            };
             if (profile) |p| p.inline_hits += 1;
             continue;
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
+        has_pending_inline = has_pending_inline or doc.cleaned_value != null;
     }
     if (profile) |p| {
         p.scan_ns = monotonicTimeNs() - scan_start_ns;
@@ -72076,18 +72097,20 @@ fn collectDocumentWritesProfiled(
     }.lessThan);
     if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
-    const read_keys = try alloc.alloc([]const u8, pending.items.len);
-    defer alloc.free(read_keys);
-    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-    defer alloc.free(read_values);
+    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    defer read_scratch.deinit();
+    const read_keys = read_scratch.keys;
+    const read_values = read_scratch.values;
 
     for (pending.items, 0..) |item, i| {
         read_keys[i] = item.store_key;
-        read_values[i] = null;
     }
     const read_start_ns = if (profile != null) monotonicTimeNs() else 0;
     try txn.getManySorted(read_keys, read_values);
     if (profile) |p| p.read_ns = monotonicTimeNs() - read_start_ns;
+
+    const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
+    try writes.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, writes.items.len, available_values));
 
     const materialize_start_ns = if (profile != null) monotonicTimeNs() else 0;
     for (pending.items, 0..) |item, i| {
@@ -72109,10 +72132,13 @@ fn collectDocumentWritesProfiled(
                 try relational_store.materializeStoredValueAlloc(alloc, item.store_key, value)
         else
             try alloc.dupe(u8, value);
-        try writes.append(alloc, .{
+        writes.append(alloc, .{
             .key = item.doc_key,
             .value = owned_value,
-        });
+        }) catch |err| {
+            alloc.free(owned_value);
+            return err;
+        };
     }
     if (profile) |p| {
         p.materialize_ns = monotonicTimeNs() - materialize_start_ns;
@@ -72264,16 +72290,18 @@ fn collectTextDocumentWritesForIndex(
 ) !CollectedTextDocumentWrites {
     const PendingTextWrite = struct {
         doc_key: []const u8,
-        store_key: []u8,
+        store_key: []const u8,
         inline_value: ?[]const u8,
     };
 
+    var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
+    defer lookup_keys.deinit();
     var pending = std.ArrayListUnmanaged(PendingTextWrite).empty;
     defer {
-        for (pending.items) |item| alloc.free(item.store_key);
         pending.deinit(alloc);
     }
 
+    var has_pending_inline = false;
     var result = CollectedTextDocumentWrites{ .alloc = alloc };
     errdefer result.deinit();
     var schema_views = index_manager_mod.IndexManager.SchemaViewSet.init(index_manager);
@@ -72297,7 +72325,10 @@ fn collectTextDocumentWritesForIndex(
                 doc.key,
                 doc.cleaned_value.?,
             );
-            if (projected) |value| try result.owned_values.append(alloc, value);
+            if (projected) |value| result.owned_values.append(alloc, value) catch |err| {
+                alloc.free(value);
+                return err;
+            };
             try result.docs.append(alloc, .{
                 .key = doc.key,
                 .value = projected orelse doc.cleaned_value.?,
@@ -72319,9 +72350,10 @@ fn collectTextDocumentWritesForIndex(
         }
         try pending.append(alloc, .{
             .doc_key = doc.key,
-            .store_key = try replayDocumentStoreKeyAlloc(alloc, doc.key, opts.relational_base_rows),
+            .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
         });
+        has_pending_inline = has_pending_inline or doc.cleaned_value != null;
     }
 
     if (pending.items.len == 0) return result;
@@ -72335,16 +72367,18 @@ fn collectTextDocumentWritesForIndex(
         }
     }.lessThan);
 
-    const read_keys = try alloc.alloc([]const u8, pending.items.len);
-    defer alloc.free(read_keys);
-    const read_values = try alloc.alloc(?[]const u8, pending.items.len);
-    defer alloc.free(read_values);
+    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    defer read_scratch.deinit();
+    const read_keys = read_scratch.keys;
+    const read_values = read_scratch.values;
 
     for (pending.items, 0..) |item, i| {
         read_keys[i] = item.store_key;
-        read_values[i] = null;
     }
     try txn.getManySorted(read_keys, read_values);
+
+    const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
+    try result.docs.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, result.docs.items.len, available_values));
 
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
@@ -102911,85 +102945,118 @@ test "db document extraction skips stable unit local rewrites without text consu
 // "Two-Stream Execution Model" and DENSE_INDEXING_LIFECYCLE.md.
 test "db dense index consuming a chunk-then-embed source via plural sources config converges its target counter" {
     const alloc = std.testing.allocator;
+    const Admission = enum { before_rows, after_chunks, after_embeddings };
+    for ([_]Admission{ .before_rows, .after_chunks, .after_embeddings }) |admission| {
+        var path_tmp = try TestDirectory.init("db");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
 
-    var path_tmp = try TestDirectory.init("db");
-    defer path_tmp.cleanup();
-    const path = path_tmp.path().ptr;
-    defer cleanupTempDir(path);
+        const document = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYSBkZWx0YSBlcHNpbG9uIHpldGEgZXRhIHRoZXRhIGlvdGEga2FwcGEgbGFtYmRhIG11IG51IHhpIG9taWNyb24gcGkgcmhvIHNpZ21hIHRhdSB1cHNpbG9uIHBoaSBjaGkgcHNpIG9tZWdh\"}";
+        var counting = CountingDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .enrichment = .{
+                .owner_id = "worker-a",
+                .dense_embedder = counting.interface(),
+            },
+        });
+        defer db.close();
 
-    var counting = CountingDenseEmbedder{};
-    var db = try DB.open(alloc, std.mem.span(path), .{
-        .enrichment = .{
-            .owner_id = "worker-a",
-            .dense_embedder = counting.interface(),
-        },
-    });
-    defer db.close();
+        try db.addEnrichment(.{
+            .name = "document_units_v1",
+            .kind = .asset,
+            .field = "url",
+            .content_type = "application/json",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
+        });
+        try db.addEnrichment(.{
+            .name = "document_chunks_v1",
+            .kind = .chunk,
+            .field = "text",
+            .source_artifact_name = "document_units_v1",
+            .chunk_size = 8,
+        });
+        if (admission != .before_rows) {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
+            try db.runUntilIdle();
+        }
+        try db.addEnrichment(.{
+            .name = "document_chunk_dense_v1",
+            .kind = .embedding,
+            .field = "text",
+            .source_artifact_name = "document_chunks_v1",
+            .expected_dims = 3,
+        });
+        // Also exercise admission after the embeddings themselves are durable:
+        // the new consumer must bootstrap existing one-to-many artifacts.
+        if (admission == .after_embeddings) try db.runUntilIdle();
+        // Resolve the actual public config to storage config so the runtime and
+        // API observe precisely the same incarnation and config fingerprint.
+        const indexes_api = @import("../../api/indexes.zig");
+        var config = try std.json.parseFromSlice(std.json.Value, alloc,
+            \\{"name":"dv_document_chunks","type":"embeddings","dimension":3,"sources":[{"artifact":"document_chunk_dense_v1"}],"_index_incarnation":42}
+        , .{});
+        defer config.deinit();
+        const config_json = try @import("../../api/table_index_config.zig").extractIndexConfigJson(alloc, "dv_document_chunks", config.value);
+        defer alloc.free(config_json);
+        try db.addIndex(.{
+            .name = "dv_document_chunks",
+            .kind = .dense_vector,
+            .coverage_generation = 42,
+            .config_json = config_json,
+        });
+        if (admission == .before_rows) {
+            try db.batch(.{ .writes = &.{.{ .key = "doc:a", .value = document }}, .sync_level = .full_index });
+        }
+        try db.runUntilIdle();
 
-    try db.addEnrichment(.{
-        .name = "document_units_v1",
-        .kind = .asset,
-        .field = "url",
-        .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{}}",
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunks_v1",
-        .kind = .chunk,
-        .field = "text",
-        .source_artifact_name = "document_units_v1",
-        .chunk_size = 256,
-    });
-    try db.addEnrichment(.{
-        .name = "document_chunk_dense_v1",
-        .kind = .embedding,
-        .field = "text",
-        .source_artifact_name = "document_chunks_v1",
-        .expected_dims = 3,
-    });
-    // Dogfood's `chunk_vectors` declares its consumed embedding artifact via
-    // the plural `sources` array (one entry), not `embedding_name`. Both
-    // forms populate the same durable dense-artifact-counter machinery, but
-    // only `embedding_names` (plural) hit the missing-match bug.
-    try db.addIndex(.{
-        .name = "dv_document_chunks",
-        .kind = .dense_vector,
-        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"sources\":[{\"artifact\":\"document_chunk_dense_v1\"}]}",
-    });
+        try std.testing.expect(counting.calls > 0);
 
-    try db.batch(.{
-        .writes = &.{.{
-            .key = "doc:a",
-            .value = "{\"url\":\"data:text/plain;base64,YWxwaGEgYmV0YSBnYW1tYQ==\"}",
-        }},
-        .sync_level = .full_index,
-    });
-    try db.runUntilIdle();
+        const active_count = db.core.index_manager.denseIndex("dv_document_chunks").?.index.stats().active_count;
+        try std.testing.expect(active_count > 1);
+        const stats = try db.stats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        const item = for (stats.indexes) |item| {
+            if (std.mem.eql(u8, item.name, "dv_document_chunks")) break item;
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(item.publication_target_ready);
+        try std.testing.expectEqual(active_count, item.publication_target_count);
+        try std.testing.expect(item.coverage_summary_ready);
+        try std.testing.expectEqual(@as(u64, 1), item.coverage_produced_count);
+        const runtime_status = @import("../../api/runtime_status.zig");
+        var runtime_items = [_]runtime_status.LocalTableRuntimeStatus{.{
+            .group_id = 1,
+            .metadata = .{ .source = .live_writer_publish, .freshness = .fresh },
+            .stats = stats,
+        }};
+        var local_statuses = runtime_status.LocalTableRuntimeStatuses{ .items = &runtime_items };
+        const encoded = try indexes_api.encodeSingleIndexLookup(alloc, "dv_document_chunks", config.value, &local_statuses);
+        defer alloc.free(encoded);
+        try ant_json.testing.expectSubsetJsonText(alloc,
+            \\{"status":{"backfill_state":"ready","backfill_active":false,"backfill_progress":1.0,"rebuilding":false,"dense_publish_pending":false,"publication":{"complete":true},"coverage":{"complete":true,"healthy":true},"readiness":{"state":"ready","pending_reasons":[],"sources":[{"artifact":"document_chunk_dense_v1","state":"ready","pending_reasons":[]}]},"milestones":{"complete":{"reached":true}}}}
+        , encoded);
 
-    try std.testing.expect(counting.calls > 0);
+        // Before the fix this counter was permanently stuck at 0 (the guarded
+        // embedding-artifact write path never found a matching counter target),
+        // so `canAdvanceDerivedToTargetAsync` could never observe
+        // `denseCoverageMatchesTarget` and would defer to artifact maintenance
+        // forever.
+        try std.testing.expectEqual(
+            @as(?u64, active_count),
+            try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_document_chunks"),
+        );
 
-    const active_count = db.core.index_manager.denseIndex("dv_document_chunks").?.index.stats().active_count;
-    try std.testing.expect(active_count > 0);
-    // Before the fix this counter was permanently stuck at 0 (the guarded
-    // embedding-artifact write path never found a matching counter target),
-    // so `canAdvanceDerivedToTargetAsync` could never observe
-    // `denseCoverageMatchesTarget` and would defer to artifact maintenance
-    // forever.
-    try std.testing.expectEqual(
-        @as(?u64, active_count),
-        try DB.loadDenseArtifactTargetCounter(alloc, db.core.store, "dv_document_chunks"),
-    );
-
-    // The counter equality above proves the durable target watermark
-    // converges; also prove the index is actually searchable end to end.
-    var search_result = try db.search(alloc, .{
-        .index_name = "dv_document_chunks",
-        .query = .{ .dense_knn = .{ .vector = &.{ 0, 0, 0 }, .k = 5 } },
-        .limit = 5,
-        .search_effort = 1.0,
-    });
-    defer search_result.deinit();
-    try std.testing.expect(search_result.total_hits > 0);
+        // The counter equality above proves the durable target watermark
+        // converges; also prove the index is actually searchable end to end.
+        var search_result = try db.search(alloc, .{
+            .index_name = "dv_document_chunks",
+            .query = .{ .dense_knn = .{ .vector = &.{ 0, 0, 0 }, .k = 5 } },
+            .limit = 5,
+            .search_effort = 1.0,
+        });
+        defer search_result.deinit();
+        try std.testing.expect(search_result.total_hits > 0);
+    }
 }
 
 // `checkTargetAdvanceNoProgress` is `runUntilIdle`'s opt-in stall guard (task
@@ -130303,6 +130370,82 @@ test "db last dense catch-up lease finalizes every covered rebuilding generation
     }
 }
 
+test "db dense target reads atomic artifact and source coverage snapshot" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{
+        .start_index_workers = false,
+        .start_optional_runtime_workers = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer db.close();
+    try db.addIndex(.{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"external\":true}",
+        .coverage_generation = 42,
+    });
+    const Commit = struct {
+        fn counters(ctx: *AsyncContext, count: u64) !void {
+            const tags = [_][]const u8{ "produced", "skipped", "terminal_failed" };
+            var keys: [4][]u8 = undefined;
+            var initialized: usize = 0;
+            defer for (keys[0..initialized]) |key| ctx.alloc.free(key);
+            var value: [8]u8 = undefined;
+            std.mem.writeInt(u64, &value, count, .little);
+            const zero = [_]u8{0} ** 8;
+            var writes: [4]docstore_mod.KVPair = undefined;
+            for (tags, 0..) |tag, i| {
+                keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(ctx.alloc, "dense_idx", 42, tag);
+                initialized += 1;
+                writes[i] = .{ .key = keys[i], .value = if (i == 0) &value else &zero };
+            }
+            keys[3] = try DB.denseArtifactTargetCounterKeyAlloc(ctx.alloc, "dense_idx");
+            initialized += 1;
+            writes[3] = .{ .key = keys[3], .value = &value };
+            try ctx.store.putBatch(&writes, &.{});
+        }
+        fn afterCapture(ctx: *AsyncContext) !void {
+            test_dense_target_after_coverage_capture = null;
+            try counters(ctx, 2);
+        }
+    };
+    try Commit.counters(db.async_context, 1);
+    var item: types.DBIndexStats = .{
+        .name = "dense_idx",
+        .kind = .dense_vector,
+        .coverage_identity_ready = true,
+        .coverage_generation = 42,
+    };
+    // Commit a second source after status captures its coverage tuple. The
+    // publication target must still describe the first revision, rather than
+    // re-reading the new counter and reporting contradictory readiness facts.
+    test_dense_target_after_coverage_capture = Commit.afterCapture;
+    defer test_dense_target_after_coverage_capture = null;
+    try db.populateConfiguredDerivedCoverageCounts("dense_idx", &item);
+    try std.testing.expect(test_dense_target_after_coverage_capture == null);
+    try std.testing.expect(item.publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 1), item.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 1), item.publication_target_count);
+    try db.populateConfiguredDerivedCoverageCounts("dense_idx", &item);
+    try std.testing.expectEqual(@as(u64, 2), item.coverage_produced_count);
+    try std.testing.expectEqual(@as(u64, 2), item.publication_target_count);
+
+    // Missing/corrupt bootstrap metadata cannot be replaced with the source
+    // count: a document may produce many vectors, or none.
+    const counter_key = try DB.denseArtifactTargetCounterKeyAlloc(alloc, "dense_idx");
+    defer alloc.free(counter_key);
+    try db.core.store.putBatch(&.{}, &.{counter_key});
+    try db.populateConfiguredDerivedCoverageCounts("dense_idx", &item);
+    try std.testing.expect(!item.publication_target_ready);
+    try std.testing.expectEqual(@as(u64, 0), item.publication_target_count);
+    try db.core.store.put(counter_key, "invalid");
+    db.populateConfiguredDerivedCoverageCountsBestEffort("dense_idx", &item);
+    try std.testing.expect(!item.publication_target_ready);
+    try std.testing.expect(item.repair_degraded);
+}
+
 test "db dense target reads atomic outcome and source coverage snapshot" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -156767,4 +156910,167 @@ fn testChildRangeDestination(_: *anyopaque, range: types.DocumentArtifactChildRa
     if (!std.mem.eql(u8, range.route_status orelse "local_committed", "remote_committed")) return null;
     const owner = range.owner_group_id orelse return null;
     return if (owner == 0) null else owner;
+}
+
+test "db document lookup allocation benchmark" {
+    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const Case = enum { short, long, missing, sparse, text, relational };
+    const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
+    const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
+    const alloc = std.testing.allocator;
+    const count: usize = 50_000;
+    const batch_size = 256;
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var directory = try TestDirectory.init("collector-benchmark");
+    defer directory.cleanup();
+    var db: ?DB = if (fixture == .text or fixture == .relational) try DB.open(alloc, directory.path(), .{ .start_index_workers = false }) else null;
+    defer if (db) |*database| database.close();
+    const value = if (fixture == .sparse) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}" else "{\"title\":\"document value\"}";
+    const relational_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":false}}}}";
+    var packed_value: ?[]u8 = null;
+    defer if (packed_value) |packed_bytes| alloc.free(packed_bytes);
+    if (fixture == .relational) {
+        try db.?.setSchemaJson(alloc, relational_schema);
+        var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, relational_schema);
+        defer parsed_schema.deinit(alloc);
+        const runtime_schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+        defer schema_mod.freeSchema(alloc, runtime_schema);
+        var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, value, .{});
+        defer parsed_value.deinit();
+        packed_value = try mapper.buildRelationalRowValueForSchemaFromParsedAlloc(alloc, parsed_value.value, runtime_schema);
+    }
+    if (fixture == .text) try db.?.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
+    const names = try alloc.alloc([544]u8, count);
+    defer alloc.free(names);
+    const docs = try alloc.alloc(derived_types.DerivedDocument, count);
+    defer alloc.free(docs);
+    const stored = try alloc.alloc(docstore_mod.KVPair, count);
+    defer alloc.free(stored);
+    var initialized: usize = 0;
+    defer for (stored[0..initialized]) |write| alloc.free(write.key);
+    for (names, docs, stored, 0..) |*name, *doc, *write, i| {
+        const prefix = try std.fmt.bufPrint(name, "document-{d:0>10}", .{i});
+        const key = if (fixture == .long) blk: {
+            @memset(name[prefix.len..512], 'x');
+            // Exercise escaped component encoding and multiple key blocks.
+            name[100] = 0;
+            break :blk name[0..512];
+        } else prefix;
+        doc.* = .{ .key = key, .action = .upsert, .targets = &targets };
+        write.* = .{ .key = try replayDocumentStoreKeyAlloc(alloc, key, fixture == .relational), .value = packed_value orelse value };
+        initialized += 1;
+    }
+    const expected_count = if (fixture == .missing) count / 5 else count;
+    try store.putBatch(stored[0..expected_count], &.{});
+    for (0..2) |measurement| {
+        for (0..2) |sample| {
+            var counter: Counter = .{};
+            const run_alloc = if (measurement == 0) counter.allocator() else std.heap.smp_allocator;
+            var checksum: usize = 0;
+            var output_count: usize = 0;
+            const started = monotonicTimeNs();
+            var offset: usize = 0;
+            while (offset < count) {
+                const end = @min(count, offset + batch_size);
+                if (fixture == .sparse) {
+                    var writes = try collectSparseFieldWritesProfiled(run_alloc, &store, null, docs[offset..end], .{ .start = "", .end = "" }, "vec", .{}, null);
+                    defer writes.deinit();
+                    try std.testing.expectEqual(end - offset, writes.items.len);
+                    for (writes.items, docs[offset..end]) |write, doc| {
+                        try std.testing.expectEqualStrings(doc.key, write.doc_id);
+                        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, write.vec.indices);
+                        try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25 }, write.vec.values);
+                        for (write.doc_id) |byte| checksum +%= byte;
+                    }
+                    output_count += writes.items.len;
+                } else if (fixture == .text) {
+                    var writes = try collectTextDocumentWritesForIndex(run_alloc, &store, db.?.core.index_manager, docs[offset..end], "text", false, .{ .start = "", .end = "" }, .{});
+                    defer writes.deinit();
+                    try std.testing.expectEqual(end - offset, writes.docs.items.len);
+                    for (writes.docs.items, docs[offset..end]) |write, doc| {
+                        try std.testing.expectEqualStrings(doc.key, write.key);
+                        try std.testing.expectEqualStrings(value, write.value);
+                        for (write.key) |byte| checksum +%= byte;
+                    }
+                    output_count += writes.docs.items.len;
+                } else {
+                    var writes = try collectDocumentWritesProfiled(run_alloc, &store, if (db) |database| database.core.index_manager else null, docs[offset..end], .{ .start = "", .end = "" }, .{ .relational_base_rows = fixture == .relational }, null);
+                    defer writes.deinit();
+                    const available = @min(end, expected_count) -| offset;
+                    try std.testing.expectEqual(available, writes.items.len);
+                    for (writes.items, docs[offset .. offset + available]) |write, doc| {
+                        try std.testing.expectEqualStrings(doc.key, write.key);
+                        try std.testing.expectEqualStrings(value, write.value);
+                        for (write.key) |byte| checksum +%= byte;
+                    }
+                    output_count += writes.items.len;
+                }
+                offset = end;
+            }
+            const elapsed = monotonicTimeNs() - started;
+            try std.testing.expectEqual(expected_count, output_count);
+            try std.testing.expectEqual(@as(usize, 0), counter.live);
+            if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ @tagName(fixture), count, batch_size, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+        }
+    }
+}
+
+fn documentCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
+    var writes = try collectDocumentWritesProfiled(alloc, store, null, documents, .{ .start = "", .end = "" }, .{ .prefer_available_inline_values = inline_values }, null);
+    defer writes.deinit();
+    try std.testing.expectEqual(documents.len, writes.items.len);
+    for (writes.items) |write| try std.testing.expectEqualStrings("{\"title\":\"value\"}", write.value);
+}
+
+test "document collectors release owned values and pooled read scratch on allocation failures" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    var names: [80][96]u8 = undefined;
+    var docs: [80]derived_types.DerivedDocument = undefined;
+    for (&names, &docs, 0..) |*name, *doc, i| {
+        @memset(name, 'x');
+        _ = try std.fmt.bufPrint(name[0..8], "{d:0>8}", .{i});
+        doc.* = .{ .key = name, .action = .upsert, .cleaned_value = "{\"title\":\"value\"}" };
+    }
+    const stored_key = try replayDocumentStoreKeyAlloc(alloc, docs[0].key, false);
+    defer alloc.free(stored_key);
+    try store.putBatch(&.{.{ .key = stored_key, .value = docs[0].cleaned_value.? }}, &.{});
+    for ([_]bool{ false, true }) |inline_values|
+        try std.testing.checkAllAllocationFailures(alloc, documentCollectorFailureSweep, .{ &store, @as([]const derived_types.DerivedDocument, &docs), inline_values });
+}
+
+fn textCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, manager: *index_manager_mod.IndexManager, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
+    var result = try collectTextDocumentWritesForIndex(alloc, store, manager, documents, "text", false, .{ .start = "", .end = "" }, .{ .prefer_inline_when_store_tip_matches_sequence = if (inline_values) 0 else null });
+    defer result.deinit();
+    try std.testing.expectEqual(documents.len, result.docs.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, result.docs.items[0].value, "projected") != null);
+}
+
+test "document collectors release text projections and materialized values on allocation failures" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("text-collector-failures");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "caption", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "caption");
+    defer alloc.free(asset_key);
+    const key = try replayDocumentStoreKeyAlloc(alloc, "normal", false);
+    defer alloc.free(key);
+    try db.core.store.putBatch(&.{ .{ .key = asset_key, .value = "projected value" }, .{ .key = key, .value = "{\"title\":\"normal\"}" } }, &.{});
+    const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
+    const docs = [_]derived_types.DerivedDocument{
+        .{ .key = asset_key, .action = .upsert, .targets = &targets, .cleaned_value = "projected value" },
+        .{ .key = "normal", .action = .upsert, .targets = &targets, .cleaned_value = "{\"title\":\"normal\"}" },
+    };
+    for ([_]bool{ false, true }) |inline_values|
+        try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
 }
