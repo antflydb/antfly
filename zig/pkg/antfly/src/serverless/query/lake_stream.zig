@@ -108,7 +108,10 @@ pub const Stream = struct {
         if (self.source.scanner.shared_reader) |reader| reader.drain(false);
         while (true) {
             if (self.page_cursor) |*cursor| {
-                if (try cursor.next()) |batch| return batch;
+                if (try cursor.next()) |batch| {
+                    if (cursor.position == cursor.group.row_count) try self.prefetchNext();
+                    return batch;
+                }
                 cursor.deinit();
                 self.page_cursor = null;
             }
@@ -133,8 +136,10 @@ pub const Stream = struct {
                     self.stats.groups_decoded += 1;
                     self.stats.rows_examined += group.row_count;
                     try self.context.ensureActive();
-                    try self.prefetchNext();
-                    return try self.page_cursor.?.next();
+                    self.page_cursor.?.shared_reader = self.source.scanner.shared_reader;
+                    const batch = try self.page_cursor.?.next();
+                    if (self.page_cursor.?.position == group.row_count) try self.prefetchNext();
+                    return batch;
                 }
                 self.clearFile();
             }
@@ -165,19 +170,17 @@ pub const Stream = struct {
             const object = try range_io.objectRefForExternalFileUri(file);
             for (group.column_chunks) |chunk| {
                 for (self.columns) |column| if (std.mem.eql(u8, column, chunk.column_id)) {
-                    try reads.append(self.alloc, try range_io.planColumnChunkRead(object, chunk));
+                    try reads.append(self.alloc, .{ .object = object, .range = .{ .offset = chunk.file_offset, .len = @min(chunk.compressed_len, 512) }, .purpose = .parquet_column_chunk });
                     break;
                 };
             }
-            const physical = try range_io.coalescePhysicalReadsAlloc(self.alloc, reads.items, self.source.scanner.coalesce_options);
-            defer self.alloc.free(physical);
-            try reader.prefetch(physical);
+            try reader.prefetch(reads.items);
             return;
         }
         // Next-file footer lookahead also helps single-row-group datasets.
         for (self.files[self.file_index..]) |index| {
             const upcoming = self.source.inventory.files[index];
-            if (!fileMayMatch(upcoming, self.predicates)) continue;
+            if (!fileMayMatch(upcoming, self.predicates) or (if (self.source.partition_rules) |rules| !@import("lake_partition_pruning.zig").mayMatch(rules.items, upcoming, self.predicates) else false)) continue;
             const object = try @import("lake_range_io.zig").objectRefForExternalFileUri(upcoming);
             const footer = try @import("lake_range_io.zig").planParquetFooterRead(object, 64 * 1024);
             try reader.prefetch(&.{footer});

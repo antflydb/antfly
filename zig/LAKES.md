@@ -57,16 +57,21 @@ rejects incompatible or unsupported flat types; nested/binary schemas need a
 compatible source. SQL never changes catalog types while reading files. Empty
 Iceberg tables can serve zero rows. Optional missing Parquet columns are SQL NULL.
 
-Parquet cursors retain one decoded page per projected column and dictionary,
-aligning different page boundaries while preserving physical row ordinals.
+Parquet cursors decode each column dictionary once and retain one decoded page
+per projected column, aligning page boundaries while preserving physical row
+ordinals. Prefetch targets exact next-page ranges and next-group header probes
+so decoder reads reuse the versioned cache entries.
 The active page set retains the 32 MiB input/decoded budgets; oversized individual
 pages/dictionaries still fail. Iceberg file pruning uses spec/source field IDs
 and inclusive identity, bucket, truncate and temporal projections. Unknown
 transforms or values remain residual.
 
 Window partition rows, peer/group directories and frame trees now share the
-statement spill quota, with small tracked caches. Quantified pattern sets use
-external DISTINCT and a reusable file, reading one pattern per match step.
+statement spill quota, with small tracked caches. Separate cell records store
+window outputs without rewriting input payloads. Live expression vectors reuse
+workspace slots; floating-point SIMD, string comparisons, boolean unary kernels
+and batch global aggregate reductions extend native vector execution. Quantified
+pattern sets use external DISTINCT and a reusable file, reading one pattern per match step.
 Sorted/grouped/window pgwire results can spool final rows and serve bounded portal
 pages without retaining the entire response or rescanning sources. HTTP JSON
 response limits and bounded materialization for blocking external decision

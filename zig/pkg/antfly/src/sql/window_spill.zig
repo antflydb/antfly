@@ -129,6 +129,7 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
                 position = end;
             }
             try groups.append(partition.len);
+            try partition.enableColumnUpdates(bound.input.columns.len);
             const indices = disk.Identity{ .len = partition.len };
             for (bound.specs, 0..) |spec, column| if (spec.sort == sort_index) try window.evaluate(context, &partition, indices, specification, spec, bound.input.columns.len + column, &starts, &ends, &groups);
             for (0..partition.len) |index| try next.append(try partition.row(index));

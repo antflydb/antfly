@@ -2508,6 +2508,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const lake_refinement_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_refinement_bench_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, lake_refinement_bench_mod, true, true);
+    lake_refinement_bench_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const lake_refinement_bench = b.addTest(.{ .root_module = lake_refinement_bench_mod, .filters = &.{"native dictionary refinement benchmark"} });
+    b.step("lake-native-refinement-bench", "Compare repeated and reused native Parquet dictionary decoding").dependOn(&b.addRunArtifact(lake_refinement_bench).step);
     const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
     lake_test_step.dependOn(&run_lake_scaffold_tests.step);
     unit_test_step.dependOn(&run_lake_scaffold_tests.step);

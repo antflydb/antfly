@@ -21,37 +21,67 @@ const Binary = @import("ast.zig").Scalar.Binary;
 
 pub fn evaluate(a: std.mem.Allocator, program: *const scalar.Program, rows: []const []const Datum, parameters: []const std.json.Value) !?[]const Datum {
     // Kernel workspace is page-local and capped independently of SQL's budget.
-    if (program.instructions.len > 256 or rows.len > 4096 or program.instructions.len *| rows.len > 32768) return null;
+    if (program.instructions.len > 256 or rows.len > 4096 or program.instructions.len == 0) return null;
     if (program.root >= program.instructions.len) return error.InvalidSqlBackendResponse;
     for (program.instructions) |instruction| switch (instruction.operation) {
         .literal => |value| switch (value) {
-            .null, .bool, .integer, .float => {},
+            .null, .bool, .integer, .float, .string => {},
             else => return null,
         },
         .column => |ordinal| {
-            if (instruction.type.kind != .integer and instruction.type.kind != .number and instruction.type.kind != .boolean) return null;
+            if (instruction.type.kind != .integer and instruction.type.kind != .number and instruction.type.kind != .boolean and instruction.type.kind != .string) return null;
             for (rows) |row| {
                 if (ordinal >= row.len) return error.InvalidSqlBackendResponse;
                 switch (row[ordinal].value) {
-                    .null, .bool, .integer, .float => {},
+                    .null, .bool, .integer, .float, .string => {},
                     else => return null,
                 }
             }
         },
-        .parameter => if (instruction.type.kind != .integer and instruction.type.kind != .number and instruction.type.kind != .boolean) return null,
-        .unary => |u| if (u.op != .is_null and u.op != .is_not_null and u.op != .positive) return null,
+        .parameter => if (instruction.type.kind != .integer and instruction.type.kind != .number and instruction.type.kind != .boolean and instruction.type.kind != .string) return null,
+        .unary => {},
         .binary => |b| switch (b.op) {
             .add, .subtract, .multiply, .divide, .modulo, .eq, .neq, .lt, .lte, .gt, .gte, .is_distinct, .is_not_distinct => {},
             else => return null,
         },
         else => return null,
     };
+    var uses: [256]usize = @splat(0);
+    for (program.instructions, 0..) |instruction, index| {
+        var children: [2]u32 = undefined;
+        for (operands(instruction, &children)) |child| {
+            if (child >= index) return error.InvalidSqlBackendResponse;
+            uses[child] += 1;
+        }
+    }
+    uses[program.root] += 1;
+    var pending = uses;
+    var live: usize = 0;
+    var peak: usize = 0;
+    for (program.instructions, 0..) |instruction, index| {
+        live += 1;
+        peak = @max(peak, live);
+        var children: [2]u32 = undefined;
+        for (operands(instruction, &children)) |child| {
+            pending[child] -= 1;
+            if (pending[child] == 0) live -= 1;
+        }
+        if (pending[index] == 0) live -= 1;
+    }
+    if (peak *| rows.len > 32768) return null;
     const output = try a.alloc(Datum, rows.len);
+    errdefer a.free(output);
     if (rows.len == 0) return output;
-    const scratch = try a.alloc(Datum, program.instructions.len * rows.len);
+    const scratch = try a.alloc(Datum, peak * rows.len);
+    var slots: [256]usize = undefined;
+    var available: [256]usize = undefined;
+    for (available[0..peak], 0..) |*slot, index| slot.* = index;
+    var available_len = peak;
     defer a.free(scratch);
     for (program.instructions, 0..) |instruction, index| {
-        const target = scratch[index * rows.len ..][0..rows.len];
+        available_len -= 1;
+        slots[index] = available[available_len];
+        const target = scratch[slots[index] * rows.len ..][0..rows.len];
         switch (instruction.operation) {
             .literal => |v| @memset(target, Datum.fromJson(v)),
             .parameter => @memset(target, try program.evaluateInstruction(a, @intCast(index), parameters)),
@@ -61,13 +91,13 @@ pub fn evaluate(a: std.mem.Allocator, program: *const scalar.Program, rows: []co
             },
             .unary => |u| {
                 if (u.operand >= index) return error.InvalidSqlBackendResponse;
-                const input = scratch[u.operand * rows.len ..][0..rows.len];
-                for (target, input) |*out, value| out.* = if (u.op == .positive) (if (value.value == .null) Datum{} else if (value.value == .integer or value.value == .float) value else return error.SqlTypeMismatch) else Datum.json(.{ .bool = value.sql_null == (u.op == .is_null) });
+                const input = scratch[slots[u.operand] * rows.len ..][0..rows.len];
+                for (target, input) |*out, value| out.* = try unary(u.op, value);
             },
             .binary => |b| {
                 if (b.left >= index or b.right >= index) return error.InvalidSqlBackendResponse;
-                const left = scratch[b.left * rows.len ..][0..rows.len];
-                const right = scratch[b.right * rows.len ..][0..rows.len];
+                const left = scratch[slots[b.left] * rows.len ..][0..rows.len];
+                const right = scratch[slots[b.right] * rows.len ..][0..rows.len];
                 var begin: usize = 0;
                 while (begin < rows.len) {
                     // Exact signed integer arithmetic/comparisons use four SIMD lanes.
@@ -116,6 +146,57 @@ pub fn evaluate(a: std.mem.Allocator, program: *const scalar.Program, rows: []co
                             continue;
                         }
                     }
+                    if (begin + 4 <= rows.len and (comparison(b.op) or b.op == .add or b.op == .subtract or b.op == .multiply or b.op == .divide)) {
+                        var lhs_values: [4]f64 = undefined;
+                        var rhs_values: [4]f64 = undefined;
+                        var numbers = true;
+                        for (0..4) |lane| {
+                            const l = left[begin + lane];
+                            const r = right[begin + lane];
+                            if (l.sql_null or r.sql_null or l.value != .float or r.value != .float or !std.math.isFinite(l.value.float) or !std.math.isFinite(r.value.float)) {
+                                numbers = false;
+                                break;
+                            }
+                            lhs_values[lane] = l.value.float;
+                            rhs_values[lane] = r.value.float;
+                        }
+                        if (numbers) {
+                            const lhs: @Vector(4, f64) = lhs_values;
+                            const rhs: @Vector(4, f64) = rhs_values;
+                            if (comparison(b.op)) {
+                                const mask: [4]bool = switch (b.op) {
+                                    .eq => lhs == rhs,
+                                    .neq => lhs != rhs,
+                                    .lt => lhs < rhs,
+                                    .lte => lhs <= rhs,
+                                    .gt => lhs > rhs,
+                                    .gte => lhs >= rhs,
+                                    else => unreachable,
+                                };
+                                for (0..4) |lane| target[begin + lane] = Datum.json(.{ .bool = mask[lane] });
+                            } else {
+                                // Keep lane order for errors, including an overflow
+                                // before a later zero divisor. No reassociation/FMA.
+                                if (b.op == .divide and @reduce(.Or, rhs == @as(@Vector(4, f64), @splat(0)))) {
+                                    for (0..4) |lane| target[begin + lane] = try binary(b.op, left[begin + lane], right[begin + lane]);
+                                } else {
+                                    const result: [4]f64 = switch (b.op) {
+                                        .add => lhs + rhs,
+                                        .subtract => lhs - rhs,
+                                        .multiply => lhs * rhs,
+                                        .divide => lhs / rhs,
+                                        else => unreachable,
+                                    };
+                                    for (result, 0..) |value, lane| {
+                                        if (!std.math.isFinite(value)) return error.SqlNumericOutOfRange;
+                                        target[begin + lane] = Datum.json(.{ .float = value });
+                                    }
+                                }
+                            }
+                            begin += 4;
+                            continue;
+                        }
+                    }
                     target[begin] = try binary(b.op, left[begin], right[begin]);
                     begin += 1;
                 }
@@ -130,9 +211,53 @@ pub fn evaluate(a: std.mem.Allocator, program: *const scalar.Program, rows: []co
                 value.value = .{ .float = converted };
             }
         };
+        var children: [2]u32 = undefined;
+        for (operands(instruction, &children)) |child| {
+            uses[child] -= 1;
+            if (uses[child] == 0) {
+                available[available_len] = slots[child];
+                available_len += 1;
+            }
+        }
+        if (uses[index] == 0) {
+            available[available_len] = slots[index];
+            available_len += 1;
+        }
     }
-    @memcpy(output, scratch[program.root * rows.len ..][0..rows.len]);
+    @memcpy(output, scratch[slots[program.root] * rows.len ..][0..rows.len]);
     return output;
+}
+fn operands(instruction: scalar.Instruction, storage: *[2]u32) []const u32 {
+    return switch (instruction.operation) {
+        .unary => |u| blk: {
+            storage[0] = u.operand;
+            break :blk storage[0..1];
+        },
+        .binary => |b| blk: {
+            storage.* = .{ b.left, b.right };
+            break :blk storage;
+        },
+        else => &.{},
+    };
+}
+fn unary(op: @import("ast.zig").Scalar.Unary, value: Datum) !Datum {
+    if (op == .is_null or op == .is_not_null) return Datum.json(.{ .bool = value.sql_null == (op == .is_null) });
+    if (op == .is_true or op == .is_not_true or op == .is_false or op == .is_not_false) {
+        const target = op == .is_true or op == .is_not_true;
+        const matches = value.value == .bool and value.value.bool == target;
+        return Datum.json(.{ .bool = matches != (op == .is_not_true or op == .is_not_false) });
+    }
+    if (value.value == .null) return .{};
+    return switch (op) {
+        .positive => if (value.value == .integer or value.value == .float) value else error.SqlTypeMismatch,
+        .negative => switch (value.value) {
+            .integer => |v| Datum.json(.{ .integer = std.math.negate(v) catch return error.SqlNumericOutOfRange }),
+            .float => |v| if (std.math.isFinite(v)) Datum.json(.{ .float = -v }) else error.SqlNumericOutOfRange,
+            else => error.SqlTypeMismatch,
+        },
+        .not => if (value.value == .bool) Datum.json(.{ .bool = !value.value.bool }) else error.SqlTypeMismatch,
+        else => unreachable,
+    };
 }
 fn comparison(op: Binary) bool {
     return switch (op) {
@@ -207,4 +332,41 @@ test "SQL vector arithmetic preserves scalar overflow and mixed numeric semantic
         const vector = (try evaluate(arena.allocator(), &program, &cells, &.{})).?;
         for (cells, vector) |row, value| try std.testing.expectEqualDeep(try program.evaluate(arena.allocator(), row, &.{}, .{}), value);
     }
+}
+
+test "SQL vector live workspace supports long expressions floats strings and boolean unary kernels" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const cells = [_][]const Datum{ &.{Datum.json(.{ .float = 2.5 })}, &.{Datum.json(.{ .float = -0.0 })}, &.{Datum.json(.{ .float = 9 })}, &.{Datum.json(.{ .float = -4 })}, &.{.{}}, &.{Datum.json(.null)} };
+    for ([_][]const u8{ "n + 1.5", "n * 0.5", "n / 2.0", "n >= 0.0", "-n", "(n > 0.0) IS NOT TRUE", "NOT (n > 0.0)" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .number }}, &.{}, .{});
+        defer program.deinit();
+        const result = (try evaluate(arena.allocator(), &program, &cells, &.{})).?;
+        for (cells, result) |row, actual| try std.testing.expectEqualDeep(try program.evaluate(arena.allocator(), row, &.{}, .{}), actual);
+    }
+    var text = try @import("compiler.zig").compileScalar(a, "s < 'beta'", .{});
+    defer text.deinit();
+    var text_program = try scalar.bind(a, text.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+    defer text_program.deinit();
+    const strings = [_][]const Datum{ &.{Datum.json(.{ .string = "alpha" })}, &.{Datum.json(.{ .string = "beta" })}, &.{.{}}, &.{Datum.json(.null)} };
+    const result = (try evaluate(arena.allocator(), &text_program, &strings, &.{})).?;
+    for (strings, result) |row, actual| try std.testing.expectEqualDeep(try text_program.evaluate(arena.allocator(), row, &.{}, .{}), actual);
+    var expression: std.ArrayList(u8) = .empty;
+    defer expression.deinit(a);
+    try expression.appendSlice(a, "n");
+    for (0..40) |_| try expression.appendSlice(a, " + 1");
+    var compiled = try @import("compiler.zig").compileScalar(a, expression.items, .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "n", .type = .integer }}, &.{}, .{});
+    defer program.deinit();
+    const rows = [_][]const Datum{&.{Datum.json(.{ .integer = 2 })}} ** 1024;
+    var budget: @import("memory_budget.zig") = .{ .backing = a, .limit = 256 * 1024 };
+    const values = (try evaluate(budget.allocator(), &program, &rows, &.{})).?;
+    defer budget.allocator().free(values);
+    for (values) |value| try std.testing.expectEqual(@as(i64, 42), value.value.integer);
+    try std.testing.expect(budget.peak <= 256 * 1024);
+    try std.testing.expectEqual(values.len * @sizeOf(Datum), budget.live);
 }

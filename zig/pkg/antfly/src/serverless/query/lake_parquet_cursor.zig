@@ -17,18 +17,22 @@ pub const Cursor = struct {
     limits: parquet.MaterializationLimits,
     columns: []Column,
     position: u64 = 0,
+    shared_reader: ?*@import("lake_serving_cache.zig").Reader = null,
+    dictionary_decodes: usize = 0,
+    pages_decoded: usize = 0,
     output: std.heap.ArenaAllocator,
     const Column = struct {
         chunk: external.ColumnChunk,
         offset: u64,
         decoded: ?parquet.OwnedBatch = null,
-        dictionary: []u8 = &.{},
+        dictionary: ?page.Dictionary = null,
         first: u64 = 0,
         count: usize = 0,
         consumed: usize = 0,
     };
     pub fn init(a: A, reader: parquet.ObjectRangeReader, inventory: external.Inventory, file_id: []const u8, ordinal: u32, names: []const []const u8, limits: parquet.MaterializationLimits) !Cursor {
         const file = inventory.fileById(file_id) orelse return error.ExternalSourceFileNotFound;
+        if (ordinal >= file.row_groups.len) return error.ExternalSourceRowOutOfBounds;
         const group = file.row_groups[ordinal];
         const columns = try a.alloc(Column, names.len);
         errdefer a.free(columns);
@@ -43,7 +47,7 @@ pub const Cursor = struct {
     pub fn deinit(self: *Cursor) void {
         for (self.columns) |*column| {
             if (column.decoded) |*decoded| decoded.deinit(self.a);
-            self.a.free(column.dictionary);
+            if (column.dictionary) |*dictionary| dictionary.deinit(self.a);
         }
         self.a.free(self.columns);
         self.output.deinit();
@@ -59,29 +63,23 @@ pub const Cursor = struct {
         column.consumed = 0;
         const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
         while (column.offset < end) {
-            var probe_size: usize = @intCast(@min(end - column.offset, 512));
-            const parsed = while (true) {
-                const probe = try self.read(column.offset, probe_size);
-                defer self.a.free(probe);
-                const parsed = page.parsePageHeader(probe) catch |err| {
-                    const next_size = @min(end - column.offset, @min(probe_size * 2, 64 * 1024));
-                    if (next_size == probe_size) return err;
-                    probe_size = @intCast(next_size);
-                    continue;
-                };
-                break parsed;
-            };
-            try parsed.header.validateResourceLimits();
+            const parsed = try self.header(column);
             const len = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
             if (len > end - column.offset) return error.InvalidParquetPage;
-            if (len +| column.dictionary.len > self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len) or parsed.header.uncompressed_page_size > self.limits.max_decoded_bytes / @max(@as(usize, 1), self.columns.len)) return error.ParquetPageTooLarge;
+            const dictionary_bytes = if (column.dictionary) |dictionary| dictionary.retainedBytes() else 0;
+            const share = @max(@as(usize, 1), self.columns.len);
+            if (len > self.limits.max_input_bytes / share or parsed.header.uncompressed_page_size +| dictionary_bytes > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
             const encoded = try self.read(column.offset, len);
             defer self.a.free(encoded);
             column.offset += len;
             switch (parsed.header.page_type) {
                 .dictionary_page => {
-                    if (column.dictionary.len != 0 or column.first != 0) return error.InvalidParquetPage;
-                    column.dictionary = try self.a.dupe(u8, encoded);
+                    if (column.dictionary != null or column.first != 0) return error.InvalidParquetPage;
+                    var dictionary = try self.decodeDictionary(column.chunk, parsed.header, encoded[parsed.header_len..]);
+                    errdefer dictionary.deinit(self.a);
+                    if (dictionary.retainedBytes() > self.limits.max_decoded_bytes / share) return error.ParquetPageTooLarge;
+                    column.dictionary = dictionary;
+                    self.dictionary_decodes += 1;
                     continue;
                 },
                 .data_page, .data_page_v2 => {},
@@ -89,21 +87,69 @@ pub const Cursor = struct {
             }
             const count: usize = parsed.header.value_count;
             if (count == 0 or column.first + count > self.group.row_count) return error.ParquetRowGroupRowCountMismatch;
-            const input = try self.a.alloc(u8, column.dictionary.len + encoded.len);
-            defer self.a.free(input);
-            @memcpy(input[0..column.dictionary.len], column.dictionary);
-            @memcpy(input[column.dictionary.len..], encoded);
             var limits = self.limits;
-            limits.max_decoded_bytes /= @max(@as(usize, 1), self.columns.len);
+            limits.max_decoded_bytes = self.limits.max_decoded_bytes / share - dictionary_bytes;
             limits.max_struct_allocation_bytes /= @max(@as(usize, 1), self.columns.len);
             limits.page_row_count = count;
             limits.max_rows = @max(limits.max_rows, count);
-            column.decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &.{.{ .column_id = column.chunk.column_id, .bytes = input }}, limits);
+            column.decoded = try parquet.buildSupportedI64RowGroupBatchAllocWithLimits(self.a, self.inventory, self.file.file_id, self.group.ordinal, &.{.{ .column_id = column.chunk.column_id, .bytes = encoded, .dictionary = if (column.dictionary) |*dictionary| dictionary else null }}, limits);
             column.count = count;
+            self.pages_decoded += 1;
             if (column.first + count == self.group.row_count and column.offset != end) return error.ParquetRowGroupRowCountMismatch;
             return;
         }
         return error.ParquetRowGroupRowCountMismatch;
+    }
+    fn header(self: *Cursor, column: *const Column) !page.ParsedHeader {
+        const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
+        if (column.offset >= end) return error.InvalidParquetPage;
+        var probe_size: usize = @intCast(@min(end - column.offset, 512));
+        while (true) {
+            const probe = try self.read(column.offset, probe_size);
+            defer self.a.free(probe);
+            const parsed = page.parsePageHeader(probe) catch |err| {
+                const next_size = @min(end - column.offset, @min(probe_size * 2, 64 * 1024));
+                if (next_size == probe_size) return err;
+                probe_size = @intCast(next_size);
+                continue;
+            };
+            try parsed.header.validateResourceLimits();
+            return parsed;
+        }
+    }
+    fn decodeDictionary(self: *Cursor, chunk: external.ColumnChunk, header_value: page.Header, encoded: []const u8) !page.Dictionary {
+        const payload = try page.decodePagePayloadAlloc(self.a, header_value, try parquet.compressionCodecForColumnChunk(chunk), encoded);
+        defer payload.deinit(self.a);
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int32")) return .{ .i64 = try page.decodePlainI32DictionaryPageAsI64Alloc(self.a, header_value, payload.bytes) };
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "int64") or chunk.physical_type.len == 0) return .{ .i64 = try page.decodePlainI64DictionaryPageAlloc(self.a, header_value, payload.bytes) };
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "float")) return .{ .f64 = try page.decodePlainF32DictionaryPageAsF64Alloc(self.a, header_value, payload.bytes) };
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "double")) return .{ .f64 = try page.decodePlainF64DictionaryPageAlloc(self.a, header_value, payload.bytes) };
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "fixed_len_byte_array")) {
+            if (chunk.type_length <= 0) return error.UnsupportedParquetPage;
+            return .{ .bytes = try page.decodePlainFixedLenByteArrayDictionaryPageAlloc(self.a, header_value, payload.bytes, @intCast(chunk.type_length)) };
+        }
+        if (std.ascii.eqlIgnoreCase(chunk.physical_type, "byte_array")) return .{ .bytes = try page.decodePlainByteArrayDictionaryPageAlloc(self.a, header_value, payload.bytes) };
+        return error.UnsupportedParquetPage;
+    }
+    /// Inspect the next headers while this page is being consumed, then warm
+    /// the exact versioned ranges used by advance. Parallelism is bounded by
+    /// the shared reader's four workers and 32 MiB lookahead quota.
+    fn prefetchPages(self: *Cursor) !void {
+        const reader = self.shared_reader orelse return;
+        if (reader.context.io == null or self.position == self.group.row_count) return;
+        var reads: [4]ranges.RangeRead = undefined;
+        var count: usize = 0;
+        for (self.columns) |*column| {
+            if (count == reads.len) break;
+            if (column.consumed != column.count) continue;
+            const parsed = try self.header(column);
+            const len = std.math.add(usize, parsed.header_len, parsed.header.compressed_page_size) catch return error.ParquetPageTooLarge;
+            const end = std.math.add(u64, column.chunk.file_offset, column.chunk.compressed_len) catch return error.InvalidParquetPage;
+            if (len > end - column.offset or len > self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len)) return error.ParquetPageTooLarge;
+            reads[count] = .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = column.offset, .len = len }, .purpose = .parquet_column_chunk };
+            count += 1;
+        }
+        if (count != 0) try reader.prefetch(reads[0..count]);
     }
     pub fn next(self: *Cursor) !?types.ColumnBatch {
         _ = self.output.reset(.free_all);
@@ -130,6 +176,7 @@ pub const Cursor = struct {
             column.consumed += count;
         }
         self.position += count;
+        try self.prefetchPages();
         return .{ .snapshot = binding.snapshot(), .row_refs = refs, .columns = vectors };
     }
 };

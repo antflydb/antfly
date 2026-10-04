@@ -78,7 +78,7 @@ fn addRows(context: anytype, bound: *const binding.Bound, grouped: *operators.Gr
             inputs[i][k] = Datum.json(.{ .integer = 1 });
         }
     }
-    for (keys, inputs) |key, input| try grouped.add(key, input);
+    if (bound.group_count == 0) try grouped.addGlobalBatch(inputs) else for (keys, inputs) |key, input| try grouped.add(key, input);
 }
 
 fn addGroupedDecisionPages(context: anytype, bound: *const binding.Bound, grouped: *operators.Grouped, top: *operators.TopK, projection: @import("decision_eval.zig").SortedProjection) !void {

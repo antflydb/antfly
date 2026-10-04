@@ -62,6 +62,7 @@ pub const ColumnChunkInput = struct {
     column_id: []const u8,
     /// Raw column chunk bytes for one supported i64 column path.
     bytes: []const u8,
+    dictionary: ?*const parquet_page.Dictionary = null,
 
     pub fn validate(self: ColumnChunkInput) !void {
         if (self.column_id.len == 0) return error.InvalidParquetRowGroupBatch;
@@ -1959,11 +1960,11 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .dictionary_required => {
-                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression) };
+                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary)) };
                     null_bitmaps[idx] = &.{};
                 },
                 .dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary));
                     decoded_columns[idx] = .{ .i64 = decoded.values };
                     null_bitmaps[idx] = decoded.nulls;
                     decoded = undefined;
@@ -1994,14 +1995,14 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .timestamp_millis_dictionary_required, .timestamp_micros_dictionary_required, .timestamp_nanos_dictionary_required => {
-                    const values = try parquet_page.scanDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    const values = try parquet_page.scanDictionaryI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary));
                     errdefer alloc.free(values);
                     try scaleTimestampNsValues(values, timestampScaleFactorForMode(i64_mode));
                     decoded_columns[idx] = .{ .i64 = values };
                     null_bitmaps[idx] = &.{};
                 },
                 .timestamp_millis_dictionary_optional, .timestamp_micros_dictionary_optional, .timestamp_nanos_dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    var decoded = try parquet_page.scanOptionalDictionaryI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary));
                     errdefer decoded.deinit(alloc);
                     try scaleTimestampNsValues(decoded.values, timestampScaleFactorForMode(i64_mode));
                     decoded_columns[idx] = .{ .i64 = decoded.values };
@@ -2021,11 +2022,11 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .dictionary_required => {
-                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI32AsI64ColumnChunkAlloc(alloc, input.bytes, compression) };
+                    decoded_columns[idx] = .{ .i64 = try parquet_page.scanDictionaryI32AsI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary)) };
                     null_bitmaps[idx] = &.{};
                 },
                 .dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryI32AsI64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    var decoded = try parquet_page.scanOptionalDictionaryI32AsI64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.i64, input.dictionary));
                     decoded_columns[idx] = .{ .i64 = decoded.values };
                     null_bitmaps[idx] = decoded.nulls;
                     decoded = undefined;
@@ -2043,11 +2044,11 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .dictionary_required => {
-                    decoded_columns[idx] = .{ .f64 = try parquet_page.scanDictionaryF64ColumnChunkAlloc(alloc, input.bytes, compression) };
+                    decoded_columns[idx] = .{ .f64 = try parquet_page.scanDictionaryF64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.f64, input.dictionary)) };
                     null_bitmaps[idx] = &.{};
                 },
                 .dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryF64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    var decoded = try parquet_page.scanOptionalDictionaryF64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.f64, input.dictionary));
                     decoded_columns[idx] = .{ .f64 = decoded.values };
                     null_bitmaps[idx] = decoded.nulls;
                     decoded = undefined;
@@ -2063,18 +2064,18 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .float_dictionary_required => {
-                    decoded_columns[idx] = .{ .f64 = try parquet_page.scanDictionaryF32AsF64ColumnChunkAlloc(alloc, input.bytes, compression) };
+                    decoded_columns[idx] = .{ .f64 = try parquet_page.scanDictionaryF32AsF64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.f64, input.dictionary)) };
                     null_bitmaps[idx] = &.{};
                 },
                 .float_dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryF32AsF64ColumnChunkAlloc(alloc, input.bytes, compression);
+                    var decoded = try parquet_page.scanOptionalDictionaryF32AsF64ColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.f64, input.dictionary));
                     decoded_columns[idx] = .{ .f64 = decoded.values };
                     null_bitmaps[idx] = decoded.nulls;
                     decoded = undefined;
                 },
             },
             .decimal => |decimal_mode| {
-                var decoded = try scanDecimalAsF64ColumnChunkAlloc(alloc, input.bytes, compression, decimal_mode);
+                var decoded = try scanDecimalAsF64ColumnChunkAlloc(alloc, input.bytes, compression, decimal_mode, input.dictionary);
                 decoded_columns[idx] = .{ .f64 = decoded.values };
                 null_bitmaps[idx] = decoded.nulls;
                 decoded = undefined;
@@ -2103,11 +2104,11 @@ fn buildPlainI64RowGroupBatchAlloc(
                     decoded = undefined;
                 },
                 .dictionary_required => {
-                    decoded_columns[idx] = .{ .bytes = try parquet_page.scanDictionaryByteArrayColumnChunkAlloc(alloc, input.bytes, compression) };
+                    decoded_columns[idx] = .{ .bytes = try parquet_page.scanDictionaryByteArrayColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.bytes, input.dictionary)) };
                     null_bitmaps[idx] = &.{};
                 },
                 .dictionary_optional => {
-                    var decoded = try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAlloc(alloc, input.bytes, compression);
+                    var decoded = try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAllocCached(alloc, input.bytes, compression, try parquet_page.Dictionary.values(.bytes, input.dictionary));
                     decoded_columns[idx] = .{ .bytes = decoded.values };
                     null_bitmaps[idx] = decoded.nulls;
                     decoded = undefined;
@@ -3078,12 +3079,13 @@ fn scanDecimalAsF64ColumnChunkAlloc(
     bytes: []const u8,
     compression: parquet_page.CompressionCodec,
     mode: DecimalMode,
+    dictionary: ?*const parquet_page.Dictionary,
 ) !parquet_page.NullableF64Values {
     const unscaled = switch (mode.physical) {
-        .int32 => try scanDecimalInt32UnscaledAlloc(alloc, bytes, compression, mode),
-        .int64 => try scanDecimalInt64UnscaledAlloc(alloc, bytes, compression, mode),
-        .byte_array => try scanDecimalByteArrayUnscaledAlloc(alloc, bytes, compression, mode),
-        .fixed_len_byte_array => try scanDecimalFixedLenByteArrayUnscaledAlloc(alloc, bytes, compression, mode),
+        .int32 => try scanDecimalInt32UnscaledAlloc(alloc, bytes, compression, mode, dictionary),
+        .int64 => try scanDecimalInt64UnscaledAlloc(alloc, bytes, compression, mode, dictionary),
+        .byte_array => try scanDecimalByteArrayUnscaledAlloc(alloc, bytes, compression, mode, dictionary),
+        .fixed_len_byte_array => try scanDecimalFixedLenByteArrayUnscaledAlloc(alloc, bytes, compression, mode, dictionary),
     };
     errdefer {
         alloc.free(unscaled.values);
@@ -3109,11 +3111,12 @@ fn scanDecimalInt32UnscaledAlloc(
     bytes: []const u8,
     compression: parquet_page.CompressionCodec,
     mode: DecimalMode,
+    dictionary: ?*const parquet_page.Dictionary,
 ) !parquet_page.NullableI64Values {
     if (mode.dictionary) {
-        if (mode.nullable) return try parquet_page.scanOptionalDictionaryI32AsI64ColumnChunkAlloc(alloc, bytes, compression);
+        if (mode.nullable) return try parquet_page.scanOptionalDictionaryI32AsI64ColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.i64, dictionary));
         return .{
-            .values = try parquet_page.scanDictionaryI32AsI64ColumnChunkAlloc(alloc, bytes, compression),
+            .values = try parquet_page.scanDictionaryI32AsI64ColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.i64, dictionary)),
             .nulls = &.{},
         };
     }
@@ -3129,11 +3132,12 @@ fn scanDecimalInt64UnscaledAlloc(
     bytes: []const u8,
     compression: parquet_page.CompressionCodec,
     mode: DecimalMode,
+    dictionary: ?*const parquet_page.Dictionary,
 ) !parquet_page.NullableI64Values {
     if (mode.dictionary) {
-        if (mode.nullable) return try parquet_page.scanOptionalDictionaryI64ColumnChunkAlloc(alloc, bytes, compression);
+        if (mode.nullable) return try parquet_page.scanOptionalDictionaryI64ColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.i64, dictionary));
         return .{
-            .values = try parquet_page.scanDictionaryI64ColumnChunkAlloc(alloc, bytes, compression),
+            .values = try parquet_page.scanDictionaryI64ColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.i64, dictionary)),
             .nulls = &.{},
         };
     }
@@ -3149,11 +3153,12 @@ fn scanDecimalByteArrayUnscaledAlloc(
     bytes: []const u8,
     compression: parquet_page.CompressionCodec,
     mode: DecimalMode,
+    dictionary: ?*const parquet_page.Dictionary,
 ) !parquet_page.NullableI64Values {
     const decoded = if (mode.dictionary) blk: {
-        if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAlloc(alloc, bytes, compression);
+        if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryByteArrayColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.bytes, dictionary));
         break :blk parquet_page.NullableByteArrayValues{
-            .values = try parquet_page.scanDictionaryByteArrayColumnChunkAlloc(alloc, bytes, compression),
+            .values = try parquet_page.scanDictionaryByteArrayColumnChunkAllocCached(alloc, bytes, compression, try parquet_page.Dictionary.values(.bytes, dictionary)),
             .nulls = &.{},
         };
     } else blk: {
@@ -3171,12 +3176,13 @@ fn scanDecimalFixedLenByteArrayUnscaledAlloc(
     bytes: []const u8,
     compression: parquet_page.CompressionCodec,
     mode: DecimalMode,
+    dictionary: ?*const parquet_page.Dictionary,
 ) !parquet_page.NullableI64Values {
     if (mode.type_length == 0 or mode.type_length > 8) return error.UnsupportedParquetPage;
     const decoded = if (mode.dictionary) blk: {
-        if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryFixedLenByteArrayColumnChunkAlloc(alloc, bytes, compression, mode.type_length);
+        if (mode.nullable) break :blk try parquet_page.scanOptionalDictionaryFixedLenByteArrayColumnChunkAllocCached(alloc, bytes, compression, mode.type_length, try parquet_page.Dictionary.values(.bytes, dictionary));
         break :blk parquet_page.NullableByteArrayValues{
-            .values = try parquet_page.scanDictionaryFixedLenByteArrayColumnChunkAlloc(alloc, bytes, compression, mode.type_length),
+            .values = try parquet_page.scanDictionaryFixedLenByteArrayColumnChunkAllocCached(alloc, bytes, compression, mode.type_length, try parquet_page.Dictionary.values(.bytes, dictionary)),
             .nulls = &.{},
         };
     } else blk: {
@@ -3237,7 +3243,7 @@ fn decimalScaleDivisor(scale: i32) !f64 {
     return divisor;
 }
 
-fn compressionCodecForColumnChunk(chunk: external_source.ColumnChunk) !parquet_page.CompressionCodec {
+pub fn compressionCodecForColumnChunk(chunk: external_source.ColumnChunk) !parquet_page.CompressionCodec {
     if (chunk.compression_codec.len == 0 or
         std.ascii.eqlIgnoreCase(chunk.compression_codec, "uncompressed") or
         std.ascii.eqlIgnoreCase(chunk.compression_codec, "none"))
@@ -9308,3 +9314,94 @@ test "parquet row group rejects cumulative object input before reads" {
     ));
     try std.testing.expectEqual(@as(usize, 0), reader_impl.calls);
 }
+
+test "parquet page cursor reuses decoded dictionaries aligns nullable columns and prefetches exact pages" {
+    const a = std.testing.allocator;
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    try appendPlainI64DictionaryPage(&bytes, a, &.{ 10, 20 });
+    const first_start = bytes.items.len;
+    for (0..8) |_| try appendDictionaryI64DataPage(&bytes, a, 3, 1, &.{ 3, 0b00000110 });
+    const amount_end = bytes.items.len;
+    const amount_page_len = (amount_end - first_start) / 8;
+    try appendPlainByteArrayDictionaryPage(&bytes, a, &.{ "alpha", "beta" });
+    for (0..3) |index| try appendDictionaryI64DataPage(&bytes, a, 8, 1, &.{ 16, @intCast(index % 2) });
+    const tenant_end = bytes.items.len;
+    try appendPlainI64DictionaryPage(&bytes, a, &.{ 10, 20 });
+    const optional_start = bytes.items.len;
+    for (0..8) |_| try appendOptionalDictionaryI64DataPageV2(&bytes, a, &.{ 0, null, 1 }, 1, &.{ 3, 0b00000010 });
+    const optional_page_len = (bytes.items.len - optional_start) / 8;
+    const storage = @import("../../storage/object_storage.zig");
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", bytes.items, .{});
+    defer put.deinit(a);
+    var chunks = [_]external_source.ColumnChunk{
+        .{ .column_id = @constCast("amount"), .file_offset = 0, .compressed_len = amount_end, .uncompressed_len = amount_end, .physical_type = @constCast("int64"), .encoding = @constCast("rle_dictionary") },
+        .{ .column_id = @constCast("tenant"), .file_offset = amount_end, .compressed_len = tenant_end - amount_end, .uncompressed_len = tenant_end - amount_end, .physical_type = @constCast("byte_array"), .encoding = @constCast("rle_dictionary") },
+        .{ .column_id = @constCast("optional"), .file_offset = tenant_end, .compressed_len = bytes.items.len - tenant_end, .uncompressed_len = bytes.items.len - tenant_end, .physical_type = @constCast("int64"), .encoding = @constCast("rle_dictionary"), .nullable = true },
+    };
+    var groups = [_]external_source.RowGroup{.{ .ordinal = 0, .row_count = 24, .file_offset = 0, .total_byte_len = bytes.items.len, .column_chunks = &chunks }};
+    var files = [_]external_source.FileEntry{.{ .file_id = @constCast("data"), .object_uri = @constCast("s3://bucket/data"), .etag = put.etag.?, .byte_len = bytes.items.len, .row_count = 24, .row_groups = &groups }};
+    const inventory: external_source.Inventory = .{ .format = .parquet, .source_id = @constCast("events"), .source_uri = @constCast("s3://bucket"), .snapshot_id = @constCast("v1"), .schema_fingerprint = @constCast("v1"), .files = &files };
+    const shared = @import("lake_serving_cache.zig");
+    var cache = shared.Cache.init(a);
+    defer cache.deinit();
+    var reader: shared.Reader = .{ .cache = &cache, .base = @import("lake_object_reader.zig").ObjectStorageRangeReader.init(client), .scope = @splat(0), .context = .{ .io = std.testing.io } };
+    var cursor = try @import("lake_parquet_cursor.zig").Cursor.init(a, reader.reader(), inventory, "data", 0, &.{ "amount", "tenant", "optional" }, .{});
+    defer cursor.deinit();
+    defer reader.drain(true);
+    cursor.shared_reader = &reader;
+    var position: usize = 0;
+    while (true) {
+        reader.drain(false);
+        const batch = (try cursor.next()) orelse break;
+        if (position == 0) try std.testing.expectEqual(amount_page_len + optional_page_len, reader.prefetch_bytes);
+        for (0..batch.rowCount()) |index| {
+            try std.testing.expectEqual(@as(u64, position), batch.row_refs[index].external.row_ordinal);
+            try std.testing.expectEqual(@as(i64, if (position % 3 == 0) 10 else 20), batch.columns[0].values.i64[index]);
+            try std.testing.expectEqualStrings(if ((position / 8) % 2 == 0) "alpha" else "beta", batch.columns[1].values.bytes[index]);
+            try std.testing.expectEqual(position % 3 == 1, batch.columns[2].nulls.bytes[index] != 0);
+            if (position % 3 != 1) try std.testing.expectEqual(@as(i64, if (position % 3 == 0) 10 else 20), batch.columns[2].values.i64[index]);
+            position += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 24), position);
+    try std.testing.expectEqual(@as(usize, 3), cursor.dictionary_decodes);
+    try std.testing.expectEqual(@as(usize, 19), cursor.pages_decoded);
+    try std.testing.expect(cache.snapshot().hits >= 19);
+}
+
+/// Benchmark fixture helpers are excluded from production builds.
+pub const RefinementBenchmark = if (@import("builtin").is_test) struct {
+    pub fn dictionary(io: std.Io, count: usize, cached: bool) !struct { ns: i96, peak: usize, checksum: i64 } {
+        const a = std.testing.allocator;
+        var values: [4096]i64 = undefined;
+        for (&values, 0..) |*value, index| value.* = @intCast(index + 1);
+        var encoded_dictionary: std.ArrayList(u8) = .empty;
+        defer encoded_dictionary.deinit(a);
+        try appendPlainI64DictionaryPage(&encoded_dictionary, a, &values);
+        var data: std.ArrayList(u8) = .empty;
+        defer data.deinit(a);
+        try appendDictionaryI64DataPage(&data, a, 512, 12, &.{ 128, 8, 0, 0 });
+        const combined = try std.mem.concat(a, u8, &.{ encoded_dictionary.items, data.items });
+        defer a.free(combined);
+        var budget: @import("../../sql/memory_budget.zig") = .{ .backing = a, .limit = 1024 * 1024 };
+        var decoded: ?[]i64 = null;
+        defer if (decoded) |owned| budget.allocator().free(owned);
+        const start = std.Io.Clock.now(.awake, io).nanoseconds;
+        if (cached) {
+            const header = try parquet_page.parsePageHeader(encoded_dictionary.items);
+            decoded = try parquet_page.decodePlainI64DictionaryPageAlloc(budget.allocator(), header.header, encoded_dictionary.items[header.header_len..]);
+        }
+        var checksum: i64 = 0;
+        for (0..count / 512) |_| {
+            const output = if (decoded) |borrowed| try parquet_page.scanDictionaryI64ColumnChunkAllocCached(budget.allocator(), data.items, .uncompressed, borrowed) else try parquet_page.scanDictionaryI64ColumnChunkAlloc(budget.allocator(), combined, .uncompressed);
+            defer budget.allocator().free(output);
+            for (output) |value| checksum += value;
+        }
+        return .{ .ns = std.Io.Clock.now(.awake, io).nanoseconds - start, .peak = budget.peak, .checksum = checksum };
+    }
+} else void;

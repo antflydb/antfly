@@ -785,6 +785,59 @@ pub const Grouped = struct {
         };
     }
 
+    /// Global COUNT, integer SUM and boolean reductions do not need a hash
+    /// probe per row. Validate the batch before changing state; unsupported
+    /// kinds, DISTINCT, mixed values and disk groups retain ordered updates.
+    pub fn addGlobalBatch(self: *Grouped, inputs: []const []const Datum) !void {
+        if (self.failed or self.finished or (self.key_count != null and self.key_count.? != 0)) return error.InvalidSqlBackendResponse;
+        var supported = self.external == null;
+        for (self.specs) |spec| supported = supported and !spec.distinct and (spec.kind == .count or spec.kind == .bool_and or spec.kind == .bool_or or (spec.kind == .sum and spec.input_type == .integer));
+        for (inputs) |row| {
+            if (row.len != self.specs.len) return error.InvalidSqlBackendResponse;
+            for (row, self.specs) |value, spec| {
+                if (value.sql_null or spec.kind == .count) continue;
+                if ((spec.kind == .sum and value.value != .integer) or ((spec.kind == .bool_and or spec.kind == .bool_or) and value.value != .bool)) supported = false;
+            }
+        }
+        if (!supported) {
+            for (inputs) |row| try self.add(&.{}, row);
+            return;
+        }
+        if (inputs.len == 0) return;
+        // First-row admission retains the usual spill/budget decision.
+        try self.add(&.{}, inputs[0]);
+        if (self.external != null) {
+            for (inputs[1..]) |row| try self.add(&.{}, row);
+            return;
+        }
+        errdefer self.failed = true;
+        const remaining = inputs[1..];
+        for (self.groups.items[0].states, 0..) |*state, column| {
+            var index: usize = 0;
+            while (index < remaining.len) {
+                var counts: [4]u64 = @splat(0);
+                var integers: [4]i128 = @splat(0);
+                var booleans: [4]bool = @splat(state.kind == .bool_and);
+                const count = @min(@as(usize, 4), remaining.len - index);
+                for (0..count) |lane| {
+                    const value = remaining[index + lane][column];
+                    if (value.sql_null) continue;
+                    counts[lane] = 1;
+                    if (state.kind == .sum) integers[lane] = value.value.integer;
+                    if (state.kind == .bool_and or state.kind == .bool_or) booleans[lane] = value.value.bool;
+                }
+                const added = @reduce(.Add, @as(@Vector(4, u64), counts));
+                if (added > @as(u64, std.math.maxInt(i64)) - state.count) return error.SqlNumericOutOfRange;
+                state.count += added;
+                if (state.kind == .sum) state.integer_sum = std.math.add(i128, state.integer_sum, @reduce(.Add, @as(@Vector(4, i128), integers))) catch return error.SqlNumericOutOfRange;
+                if (state.kind == .bool_and) state.boolean = state.boolean and @reduce(.And, @as(@Vector(4, bool), booleans));
+                if (state.kind == .bool_or) state.boolean = state.boolean or @reduce(.Or, @as(@Vector(4, bool), booleans));
+                index += count;
+            }
+        }
+        self.rows_seen = std.math.add(u64, self.rows_seen, remaining.len) catch return error.SqlNumericOutOfRange;
+    }
+
     pub fn ensureGlobalGroup(self: *Grouped) !void {
         if (self.rows_seen != 0 or self.groups.items.len != 0) return;
         self.key_count = 0;
@@ -1326,4 +1379,30 @@ test "SQL pattern sets spill distinct state and preserve reusable quantified nul
         try std.testing.expect(!nonnullable.sql_null and !nonnullable.value.bool);
     }
     try std.testing.expect(manager.written_bytes > 128 * 1024);
+}
+
+test "SQL global batch reductions preserve scalar null counts booleans and exact sums" {
+    const a = std.testing.allocator;
+    const specs = [_]AggregateSpec{ .{ .kind = .count }, .{ .kind = .sum, .input_type = .integer }, .{ .kind = .bool_and }, .{ .kind = .bool_or } };
+    var batched = try Grouped.create(a, &specs, .{});
+    defer batched.deinit();
+    var baseline = try Grouped.create(a, &specs, .{});
+    defer baseline.deinit();
+    const rows = [_][]const Datum{
+        &.{ Datum.json(.null), Datum.json(.{ .integer = std.math.maxInt(i64) }), Datum.json(.{ .bool = true }), .{} },
+        &.{ .{}, Datum.json(.{ .integer = 1 }), .{}, Datum.json(.{ .bool = false }) },
+        &.{ Datum.json(.{ .integer = 2 }), Datum.json(.{ .integer = -1 }), Datum.json(.{ .bool = false }), Datum.json(.{ .bool = true }) },
+        &.{ .{}, .{}, .{}, .{} },
+        &.{ .{}, .{}, Datum.json(.{ .bool = true }), .{} },
+        &.{ .{}, .{}, .{}, .{} },
+    };
+    try batched.addGlobalBatch(&rows);
+    for (rows) |row_value| try baseline.add(&.{}, row_value);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const actual = try batched.resultAt(arena.allocator(), 0);
+    const expected = try baseline.resultAt(arena.allocator(), 0);
+    try std.testing.expectEqualDeep(expected.aggregates, actual.aggregates);
+    try std.testing.expectEqual(@as(u64, 0), batched.hash_probes);
+    try std.testing.expectEqual(@as(u64, rows.len), batched.rows_seen);
 }

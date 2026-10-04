@@ -85,17 +85,17 @@ API SQL reads share a server-owned 64 MiB range cache (at most 4,096 entries).
 Keys bind the credential reference/scope, source endpoint, object version and
 byte range. Unversioned reads bypass it; cache hits still check cancellation and
 deadlines. Shared cached bytes are separate from each statement's memory budget.
-The cursor prefetches the next eligible row group's projected ranges (or the
-next file's footer) through the existing I/O runtime: at most four concurrent
-reads and 32 MiB of requested ranges per lookahead batch. Worker buffers use
+The cursor prefetches exact upcoming data-page ranges, next-group header probes
+(or the next file's footer) through the existing I/O runtime: at most four
+concurrent reads and 32 MiB of requested ranges per lookahead batch. Worker buffers use
 independent allocations outside the SQL arena; provider response copies can add
 temporary memory. Closing or canceling a cursor cancels and joins every worker
 before releasing source metadata. Prefetch failures stay speculative: required
 reads still enforce pinned versions, deadlines and cancellation.
 
 Each stream admits at most 100,000,000 examined rows. Parquet decoding aligns
-independent column pages and retains their dictionaries; 32 MiB input/decoded
-budgets apply to the active page set, rather than the entire row group. Large
+independent column pages and decodes each column dictionary once. The 32 MiB
+input/decoded budgets apply to the active page set, rather than the entire row group. Large
 individual pages and dictionaries can still fail admission. SQL defaults admit
 10,000,000 scanned rows, 65,536 scan pages and 64 MiB retained bytes per statement.
 Nested pipelines reduce internal page sizes under smaller budgets.
@@ -105,8 +105,9 @@ rows and window partitions spill through a shared statement owner. Sorts merge
 bounded runs and stream past OFFSET; groups merge partial states one key at a
 time; joins persist outer-join match markers. Window passes retain partition
 rows, peer/group directories and aggregate frame trees on disk, with small
-tracked caches. Ranking, navigation, ROWS/RANGE/GROUPS and frame exclusions keep
-their existing semantics. Quantified pattern sets use external DISTINCT and a
+tracked caches. Separate cell records store window outputs without rewriting
+the original row payload for each function. Ranking, navigation,
+ROWS/RANGE/GROUPS and frame exclusions keep their existing semantics. Quantified pattern sets use external DISTINCT and a
 reusable statement-owned file; matching retains one pattern at a time.
 
 API SQL statements default to a shared 1 GiB live spill quota and at most 64
@@ -126,13 +127,27 @@ preserved. HTTP JSON response limits remain; blocking projections involving
 external decision providers retain the existing bounded materialization path.
 
 Numeric and boolean expression batches use bounded instruction-major kernels,
-including four-lane exact integer arithmetic and comparisons. Mixed numeric
-values retain scalar conversion semantics. Lazy expressions (CASE, AND/OR) and
+including four-lane exact integer and floating-point arithmetic/comparisons.
+String comparisons and boolean unary operations also run by batch. Live
+intermediate vectors reuse workspace slots; global COUNT, integer SUM and
+boolean reductions avoid per-row grouping probes. Mixed numeric values retain
+scalar conversion semantics. Lazy expressions (CASE, AND/OR) and
 unsupported types/functions use the scalar evaluator.
+
+Repeatable native microbenchmarks run with
+`zig build sql-native-refinement-bench lake-native-refinement-bench -Doptimize=ReleaseFast`
+from `zig/`. The measured baseline and refined paths validate equivalent outputs
+and alternate execution order across three samples at each size. Raw samples,
+fixture details and median timings are in
+[`native-sql-refinements.json`](../zig/bench/baselines/native-sql-refinements.json).
+These measure CPU kernels and local temporary-file writes; remote lake latency
+and end-to-end query throughput need separate measurement. Vector batching
+uses more bounded workspace than row-at-a-time scalar evaluation, while reuse
+lets long expressions run without retaining one vector per instruction.
 
 The regression fixture scans 131,072 and 1,048,576 integer rows in 65,536-row
 Parquet groups under a 32 MiB tracking allocator. Peak tracked allocations are
-7,605,878 and 7,605,992 bytes respectively: input growth adds file metadata rather
+7,081,607 and 7,081,721 bytes respectively: input growth adds file metadata rather
 than retaining all rows. This measures cursor memory for that fixture, not
 process memory or query latency. Tests also verify lazy first-page I/O, warm
 range reuse, pruning without decoded pages, changed-object rejection, exact

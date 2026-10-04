@@ -70,6 +70,8 @@ pub const Rows = struct {
     width: usize,
     cache: [4]Entry,
     tick: u64 = 0,
+    updates: ?Updates = null,
+    const Updates = struct { file: spill.File, offsets: Integers, first_column: usize };
     const Entry = struct { arena: std.heap.ArenaAllocator, index: ?usize = null, row: operators.Row = undefined, touched: u64 = 0 };
     pub fn init(a: A, manager: *spill.Manager, width: usize) !Rows {
         var file = try manager.create();
@@ -81,10 +83,28 @@ pub const Rows = struct {
     }
     pub fn deinit(self: *Rows) void {
         for (&self.cache) |*entry| entry.arena.deinit();
+        if (self.updates) |*updates| {
+            updates.offsets.deinit();
+            updates.file.close();
+        }
         self.offsets.deinit();
         self.file.close();
     }
+    /// Window outputs use cell records instead of rewriting the input payload
+    /// for every function. The fixed offset directory shares the spill quota.
+    pub fn enableColumnUpdates(self: *Rows, first_column: usize) !void {
+        if (first_column > self.width or self.updates != null) return error.InvalidSqlSpill;
+        var file = try self.file.manager.create();
+        errdefer file.close();
+        var offsets = try Integers.init(self.file.manager);
+        errdefer offsets.deinit();
+        const count = std.math.mul(usize, self.len, self.width - first_column) catch return error.SqlProgramLimitExceeded;
+        if (@as(u128, count) * 8 > self.file.manager.max_bytes -| self.file.manager.live_bytes) return error.SqlProgramLimitExceeded;
+        for (0..count) |_| try offsets.append(std.math.maxInt(usize));
+        self.updates = .{ .file = file, .offsets = offsets, .first_column = first_column };
+    }
     pub fn append(self: *Rows, input: operators.Row) !void {
+        if (self.updates != null) return error.InvalidSqlSpill;
         if (input.values.len != self.width) return error.InvalidSqlSpill;
         const offset = try self.file.append(.{ .values = input.values, .keys = &.{}, .ordinal = input.ordinal }, spill.none);
         try self.offsets.append(@intCast(offset));
@@ -106,6 +126,17 @@ pub const Rows = struct {
         const decoded = try self.file.read(oldest.arena.allocator(), try self.offsets.at(index));
         if (decoded.row.values.len != self.width) return error.InvalidSqlSpill;
         oldest.row = decoded.row;
+        if (self.updates) |*updates| {
+            const values = try oldest.arena.allocator().dupe(Datum, decoded.row.values);
+            for (updates.first_column..self.width) |column| {
+                const offset = try updates.offsets.at(index * (self.width - updates.first_column) + column - updates.first_column);
+                if (offset == std.math.maxInt(usize)) continue;
+                const cell_record = try updates.file.read(oldest.arena.allocator(), offset);
+                if (cell_record.row.values.len != 1 or cell_record.row.ordinal != index) return error.InvalidSqlSpill;
+                values[column] = cell_record.row.values[0];
+            }
+            oldest.row.values = values;
+        }
         oldest.index = index;
         oldest.touched = self.tick;
         return oldest.row;
@@ -116,12 +147,23 @@ pub const Rows = struct {
     }
     pub fn setCell(self: *Rows, index: usize, column: usize, value: Datum) !void {
         if (column >= self.width) return error.InvalidSqlSpill;
+        if (index >= self.len) return error.InvalidSqlSpill;
+        if (self.updates) |*updates| {
+            if (column < updates.first_column) return error.InvalidSqlSpill;
+            const offset = try updates.file.append(.{ .values = &.{value}, .keys = &.{}, .ordinal = index }, spill.none);
+            try updates.offsets.set(index * (self.width - updates.first_column) + column - updates.first_column, @intCast(offset));
+            self.invalidate(index);
+            return;
+        }
         const before = try self.row(index);
         const values = try self.a.dupe(Datum, before.values);
         defer self.a.free(values);
         values[column] = value;
         const offset = try self.file.append(.{ .values = values, .keys = &.{}, .ordinal = before.ordinal }, spill.none);
         try self.offsets.set(index, @intCast(offset));
+        self.invalidate(index);
+    }
+    fn invalidate(self: *Rows, index: usize) void {
         for (&self.cache) |*entry| if (entry.index == index) {
             entry.index = null;
             _ = entry.arena.reset(.free_all);
@@ -200,3 +242,32 @@ pub const RawCache = struct {
         }
     }
 };
+
+test "SQL window cell updates preserve wide rows without rewriting input payloads" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows = try Rows.init(a, &manager, 3);
+    defer rows.deinit();
+    const text = [_]u8{'x'} ** 8192;
+    for (0..64) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .string = &text }), .{}, .{} }, .keys = &.{}, .ordinal = index + 100 });
+    const original_bytes = rows.file.size;
+    try rows.enableColumnUpdates(1);
+    for (0..64) |index| {
+        try rows.setCell(index, 1, Datum.json(.{ .integer = @intCast(index) }));
+        try rows.setCell(index, 2, if (index % 2 == 0) Datum.json(.null) else .{});
+    }
+    try std.testing.expectEqual(original_bytes, rows.file.size);
+    try std.testing.expect(rows.updates.?.file.size < original_bytes / 16);
+    for (0..64) |index| {
+        const row_value = try rows.row(index);
+        try std.testing.expectEqual(@as(u64, index + 100), row_value.ordinal);
+        try std.testing.expectEqualStrings(&text, row_value.values[0].value.string);
+        try std.testing.expectEqual(@as(i64, @intCast(index)), row_value.values[1].value.integer);
+        try std.testing.expectEqual(index % 2 != 0, row_value.values[2].sql_null);
+    }
+}
