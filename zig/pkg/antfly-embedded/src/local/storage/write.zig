@@ -19,8 +19,8 @@ const std = @import("std");
 const scraping = if (builtin.os.tag == .freestanding) @import("db/scraping_stub.zig") else @import("antfly_scraping");
 const common_secrets = @import("../common/secrets.zig");
 const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const backups_api = @import("../api/local_backups.zig");
-const metadata_table_provisioner = @import("../metadata/local_index_reconcile.zig");
+const backups_api = @import("../api/backups.zig");
+const metadata_table_provisioner = @import("../metadata/index_reconcile.zig");
 const backup_restore = @import("backup_restore.zig");
 const doc_identity = @import("db/doc_identity.zig");
 const hbc_mod = @import("hbc_adapter.zig");
@@ -28,7 +28,7 @@ const lsm_backend = @import("lsm_backend/mod.zig");
 const portable_backup = @import("portable_backup.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const storage_schema = @import("schema.zig");
-const tables_api = @import("../api/local_tables.zig");
+const tables_api = @import("../api/tables.zig");
 const stored_destination_authorization = @import("../api/stored_destination_authorization.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const remote_capabilities = @import("antfly_inference_remote_capabilities");
@@ -39,7 +39,7 @@ const document_extraction_mod = @import("db/enrichment/document_extraction.zig")
 const platform_time = @import("antfly_platform").time;
 const db_mod = @import("antfly_source_root").antfly_sources.selected_db;
 const control_only_storage_sources = false;
-const contract = @import("../api/local_write_contract.zig");
+const contract = @import("../api/write_contract.zig");
 pub const ManagedDbOpenMode = contract.ManagedDbOpenMode;
 pub const StartupCatchUpMetadata = contract.StartupCatchUpMetadata;
 pub const StorageKernelArtifactChildRangeBatchRequest = contract.StorageKernelArtifactChildRangeBatchRequest;
@@ -1971,11 +1971,11 @@ pub fn validateProvisionedDbIdentityNamespaceWithPolicy(
 }
 
 fn runTestBeforeBatchExecutionHook() void {
-    if (comptime builtin.is_test) @import("../api/local_write_test_hooks.zig").runTestBeforeBatchExecutionHook();
+    if (comptime builtin.is_test) @import("../api/write_test_hooks.zig").runTestBeforeBatchExecutionHook();
 }
 
 fn runTestBeforeNativeBackupCopyHook() void {
-    if (comptime builtin.is_test) @import("../api/local_write_test_hooks.zig").runTestBeforeNativeBackupCopyHook();
+    if (comptime builtin.is_test) @import("../api/write_test_hooks.zig").runTestBeforeNativeBackupCopyHook();
 }
 
 test "native backup local attempt tokens are retry unique" {

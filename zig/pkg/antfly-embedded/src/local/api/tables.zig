@@ -13,7 +13,7 @@
 // limitations.
 
 pub const std = @import("std");
-pub const metadata_table_manager = @import("../metadata/local_catalog.zig");
+pub const metadata_table_manager = @import("../metadata/catalog.zig");
 pub const schema_mod = @import("../schema/mod.zig");
 pub const full_text_indexes = @import("full_text_indexes.zig");
 pub const table_create_contract = @import("table_create_contract.zig");

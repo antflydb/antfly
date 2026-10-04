@@ -135924,7 +135924,7 @@ test "db storage kernel graph edges retain typed filters and physical scan budge
         .max_scanned_rows = 4,
     };
     defer request.deinit(alloc);
-    const local = @import("../local_query.zig");
+    const local = @import("../query.zig");
     {
         var result = try local.executeStorageKernelGraphEdges(alloc, &db, request);
         defer result.deinit(alloc);

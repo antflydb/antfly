@@ -35,6 +35,11 @@ the product entry points. Server adapters can use the local implementation, but
 production local code cannot import the server tree. Test-only fixture capabilities
 are supplied explicitly through a named module and share the consumer's types.
 
+Files under `src/local/` omit the redundant `local_` prefix. The query execution
+contracts live in `api/query_execution_contract.zig`, separate from the public
+query contracts in `api/query_contract.zig`. Import aliases can retain `local_`
+when they distinguish these implementations from server coordination at a call site.
+
 ## Independent products
 
 From `zig/`, build the local products with:

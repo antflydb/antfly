@@ -181,7 +181,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
             "storage.db.db.test.",
             "storage.db.db.DB.test.",
             "storage.db.generation_lifecycle.test.",
-            "storage.local_write.test.",
+            "storage.write.test.",
         },
     },
     .{

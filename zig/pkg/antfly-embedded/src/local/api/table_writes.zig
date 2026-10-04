@@ -16,7 +16,7 @@ pub const physical_local_write = if (@import("storage_source_options").control_o
 pub const std = @import("std");
 pub const storage_source_options = @import("storage_source_options");
 pub const control_only_storage_sources = storage_source_options.control_only;
-pub const backups_api = @import("local_backups.zig");
+pub const backups_api = @import("backups.zig");
 pub const db_mod = if (control_only_storage_sources)
     @import("../storage/db/control_root.zig")
 else
@@ -27,7 +27,7 @@ pub const portable_backup = @import("../storage/portable_backup.zig");
 pub const table_catalog = @import("routing_budget.zig");
 pub const table_write_source = @import("table_write_source.zig");
 pub const table_index_config = @import("table_index_config.zig");
-pub const tables_api = @import("local_tables.zig");
+pub const tables_api = @import("tables.zig");
 pub const runtime_status = @import("runtime_status.zig");
 pub const nativeSnapshotAttemptTokenAlloc = physical_local_write.nativeSnapshotAttemptTokenAlloc;
 
@@ -38,7 +38,7 @@ pub const reclaimStaleNativeSnapshotAttempts = physical_local_write.reclaimStale
 pub const applyGraphMetricActionToDb = physical_local_write.applyGraphMetricActionToDb;
 pub const runGraphMetricMaintenanceOrActionJsonAlloc = physical_local_write.runGraphMetricMaintenanceOrActionJsonAlloc;
 
-pub const distributed_txn = @import("local_transaction_contract.zig");
+pub const distributed_txn = @import("transaction_contract.zig");
 pub const platform_time = @import("antfly_platform").time;
 pub const Io = std.Io;
 

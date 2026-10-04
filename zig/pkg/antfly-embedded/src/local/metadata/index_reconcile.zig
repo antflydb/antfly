@@ -19,7 +19,7 @@ pub const internal_keys = @import("../storage/internal_keys.zig");
 pub const managed_embedder = @import("../inference/managed_embedder.zig");
 pub const coverage_policy = @import("../api/coverage_policy.zig");
 pub const table_index_config = @import("../api/table_index_config.zig");
-pub const indexes_api = @import("../api/local_indexes.zig");
+pub const indexes_api = @import("../api/indexes.zig");
 pub const enrichment_config_validation = @import("../storage/db/enrichment/config_validation.zig");
 /// Results of reconciling indexes and producers in one local DB.
 pub const IndexReconcileSummary = struct {

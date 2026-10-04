@@ -21,7 +21,7 @@ const Allocator = std.mem.Allocator;
 const backup_codec = @import("../backup_codec.zig");
 const backup_bundle = @import("../backup_bundle.zig");
 const backup_bundle_io = @import("../backup_bundle_io.zig");
-const backups_api = @import("../../api/local_backups.zig");
+const backups_api = @import("../../api/backups.zig");
 const connection = @import("portable_restore.zig").connection;
 
 const db_mod = @import("portable_restore.zig").db_mod;
@@ -31,8 +31,8 @@ const group_ids = @import("../../common/group_ids.zig");
 const internal_keys = @import("../internal_keys.zig");
 const portable_backup = @import("../portable_backup.zig");
 const query_api = @import("../../api/query.zig");
-const tables_api = @import("../../api/local_tables.zig");
-const table_writes = @import("../../api/local_table_writes.zig");
+const tables_api = @import("../../api/tables.zig");
+const table_writes = @import("../../api/table_writes.zig");
 const fs_paths = @import("portable_restore.zig").fs_paths;
 
 const full_text_index_defaults = @import("../../common/full_text_index_defaults.zig");

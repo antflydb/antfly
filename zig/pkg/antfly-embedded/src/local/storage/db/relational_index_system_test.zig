@@ -2104,7 +2104,7 @@ test "relational index system public typed bounds cursor auth and cross-owner or
             try std.testing.expectEqualStrings("{\"id\":9007199254740993}", result.documents[0].json);
             after = try alloc.dupe(u8, result.hashes[0].relational_cursor.?);
         }
-        const encoded = try @import("../../api/local_query_contract.zig").encodeStorageKernelScanNdjson(alloc, result, true);
+        const encoded = try @import("../../api/query_execution_contract.zig").encodeStorageKernelScanNdjson(alloc, result, true);
         defer alloc.free(encoded);
         merge.beginGroup();
         try merge.write(encoded);

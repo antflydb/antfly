@@ -217,7 +217,7 @@ def own(root: Path, relative: str) -> Path:
 def source_owner_path(relative: str) -> str:
     embedded = {
         "storage/db/db.zig",
-        "storage/local_query.zig",
+        "storage/query.zig",
         "storage/kernel_owner_abi.zig",
     }
     owner = "antfly-embedded/src/local" if relative in embedded else "antfly/src"
@@ -276,7 +276,7 @@ def main() -> None:
             ),
             (
                 "physical local query",
-                "storage/local_query.zig",
+                "storage/query.zig",
                 {"antfly-storage-kernel"},
                 (ARCHIVES - {"antfly-storage-kernel"})
                 | {

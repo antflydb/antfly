@@ -2848,7 +2848,7 @@ test "distributed txn MATCH PARTIAL nullable witnesses survive alternate deletio
                 self.scans += 1;
                 var result = try self.db.scan(allocator, from, to, opts);
                 defer result.deinit(allocator);
-                return .{ .ndjson = try @import("local_query_contract.zig").encodeStorageKernelScanNdjson(allocator, result, opts.include_documents) };
+                return .{ .ndjson = try @import("query_execution_contract.zig").encodeStorageKernelScanNdjson(allocator, result, opts.include_documents) };
             }
             fn query(_: *anyopaque, _: Allocator, _: []const u8, _: types.SearchRequest, _: gate.ReadConsistency) !?@import("query_response.zig").QueryResponse {
                 return error.UnexpectedCall;

@@ -6181,7 +6181,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.kernel_owner_client.",
             "storage.kernel_wal_wire.",
             "storage.lmdb.",
-            "storage.local_write.",
+            "storage.write.",
             "storage.lmdb_backend.",
             "storage.lmdb_vopr.",
             "storage.maintenance.",

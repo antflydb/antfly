@@ -2855,7 +2855,7 @@ test "api query contract hierarchy worker wire preserves explicit deferred proje
         var original = try parsePublicQueryRequest(alloc, null, "docs", body);
         defer original.deinit(alloc);
         try std.testing.expect(original.req.defer_stored_projection);
-        const wire = try @import("local_query_contract.zig").encodeQueryRequest(alloc, original.req);
+        const wire = try @import("query_execution_contract.zig").encodeQueryRequest(alloc, original.req);
         defer alloc.free(wire);
         var worker = try parseQueryRequest(alloc, null, "docs", wire);
         defer worker.deinit(alloc);

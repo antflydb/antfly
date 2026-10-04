@@ -114,7 +114,7 @@ pub fn artifactEnrichmentKindRank(kind: db_mod.types.EnrichmentKind) u8 {
     };
 }
 
-pub const tables_api = @import("local_tables.zig");
+pub const tables_api = @import("tables.zig");
 pub fn collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,

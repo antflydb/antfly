@@ -25,5 +25,5 @@ pub const portable_backup = @import("storage/portable_backup.zig");
 pub const public_api = struct {
     pub const batch = @import("api/batch.zig");
     pub const query = @import("api/query.zig");
-    pub const backups = @import("api/local_backups.zig");
+    pub const backups = @import("api/backups.zig");
 };

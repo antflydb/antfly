@@ -1238,7 +1238,7 @@ pub fn resolveLocalBaseDir(alloc: std.mem.Allocator, cfg: ?*const Config) ![]u8 
     return try defaultLocalBaseDir(alloc);
 }
 
-pub const defaultLocalBaseDir = @import("local_paths.zig").defaultLocalBaseDir;
+pub const defaultLocalBaseDir = @import("paths.zig").defaultLocalBaseDir;
 
 fn parseMetadataConfig(
     alloc: std.mem.Allocator,

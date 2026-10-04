@@ -63,7 +63,7 @@ pub fn create(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
     const enrichment = b.createModule(.{ .root_source_file = local_path.path(b, "storage/enrichment_compute_abi.zig"), .target = target, .optimize = optimize });
     enrichment.addImport("runtime_failure_abi", failure);
     enrichment.addImport("runtime_memory_abi", memory);
-    const query_client = b.createModule(.{ .root_source_file = local_path.path(b, "storage/local_query_client.zig"), .target = target, .optimize = optimize });
+    const query_client = b.createModule(.{ .root_source_file = local_path.path(b, "storage/query_client.zig"), .target = target, .optimize = optimize });
     query_client.addImport("kernel_owner_abi", owner);
     query_client.addImport("kernel_error_identity", identity);
     const physical_sources = b.addOptions();

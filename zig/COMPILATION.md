@@ -128,10 +128,10 @@ snapshot publication execute through the storage owner.
 
 ### Compilation and source ownership
 
-The storage archive owns `storage/db/db.zig`, `storage/local_query.zig`, and
-`storage/local_write.zig`. Serving coordination in `api/table_reads.zig` and
+The storage archive owns `storage/db/db.zig`, `storage/query.zig`, and
+`storage/write.zig`. Serving coordination in `api/table_reads.zig` and
 `api/table_writes.zig` uses opaque owners. Shared request and result helpers
-live in `api/local_query_contract.zig` and `api/local_write_contract.zig`;
+live in `api/query_execution_contract.zig` and `api/write_contract.zig`;
 physical resource setup lives under `storage/`.
 
 The executable dispatches Lite administration to storage and `lite serve` to
