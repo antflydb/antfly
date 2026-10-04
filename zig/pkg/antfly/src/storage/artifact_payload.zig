@@ -386,12 +386,15 @@ pub const Session = struct {
         if (header.kind != .dense_embedding) return value;
         const reference = try Reference.forArtifact(key, value);
         const alloc = self.arena.allocator();
-        if (self.findPrepared(reference) == null) {
-            // Admit metadata before retaining a new payload. Growing the index
-            // frees its previous allocation instead of retaining arena copies.
-            try self.prepared.ensureTotalCapacity(self.alloc, self.prepared.count() + 1);
-            const artifact = try alloc.dupe(u8, value);
-            self.prepared.putAssumeCapacityNoClobber(.{ .reference = reference, .artifact = artifact }, {});
+        const borrowed: Prepared = .{ .reference = reference, .artifact = &.{} };
+        // ArrayHashMap attempts growth before probing. At capacity, preserve
+        // allocation-free duplicates; otherwise insertion needs one probe.
+        if (self.prepared.count() >= self.prepared.capacity() and self.findPrepared(reference) != null)
+            return try alloc.dupe(u8, &reference.encode());
+        const entry = try self.prepared.getOrPut(self.alloc, borrowed);
+        if (!entry.found_existing) {
+            errdefer _ = self.prepared.swapRemove(borrowed);
+            entry.key_ptr.artifact = try alloc.dupe(u8, value);
             self.durable = false;
         }
         return try alloc.dupe(u8, &reference.encode());
