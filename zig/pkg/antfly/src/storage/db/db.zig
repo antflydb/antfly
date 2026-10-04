@@ -57516,16 +57516,18 @@ fn appendJsonFieldString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), fir
 
 fn appendJsonFieldU64(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: u64) !void {
     try appendJsonFieldName(alloc, out, first, name);
-    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
-    defer alloc.free(rendered);
-    try out.appendSlice(alloc, rendered);
+    try appendJsonUnsigned(alloc, out, value);
 }
 
 fn appendJsonFieldUsize(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: usize) !void {
     try appendJsonFieldName(alloc, out, first, name);
-    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
-    defer alloc.free(rendered);
-    try out.appendSlice(alloc, rendered);
+    try appendJsonUnsigned(alloc, out, value);
+}
+
+fn appendJsonUnsigned(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: u64) !void {
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, out);
+    defer out.* = writer.toArrayList();
+    writer.writer.print("{d}", .{value}) catch return error.OutOfMemory;
 }
 
 fn appendJsonFieldBool(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8, value: bool) !void {
@@ -57835,9 +57837,7 @@ fn documentExtractionManifestPayloadAlloc(
     try out.append(alloc, '[');
     for (failed_pages[0..failed_pages_len], 0..) |page, i| {
         if (i > 0) try out.append(alloc, ',');
-        const rendered_page = try std.fmt.allocPrint(alloc, "{d}", .{page});
-        defer alloc.free(rendered_page);
-        try out.appendSlice(alloc, rendered_page);
+        try appendJsonUnsigned(alloc, &out, page);
     }
     try out.append(alloc, ']');
     try appendJsonFieldBool(alloc, &out, &first, "ocr_failed_pages_truncated", ocr_failed_count > failed_pages_len);
@@ -62391,14 +62391,19 @@ fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template_mod.ContentPa
                 try out.append(alloc, '}');
             },
             .binary => |binary| {
-                const encoded_len = std.base64.standard.Encoder.calcSize(binary.data.len);
-                const encoded = try alloc.alloc(u8, encoded_len);
-                defer alloc.free(encoded);
-                _ = std.base64.standard.Encoder.encode(encoded, binary.data);
                 try out.appendSlice(alloc, "{\"type\":\"media\",\"mime_type\":");
                 try appendJsonString(alloc, &out, binary.mime_type);
                 try out.appendSlice(alloc, ",\"data\":");
-                try appendJsonString(alloc, &out, encoded);
+                // Standard base64 has no JSON escape characters. Encode into
+                // the final owned buffer after reserving the complete suffix.
+                const encoded_len = try std.math.mul(usize, (try std.math.add(usize, binary.data.len, 2)) / 3, 4);
+                const suffix_len = try std.math.add(usize, encoded_len, 2);
+                try out.ensureUnusedCapacity(alloc, suffix_len);
+                out.appendAssumeCapacity('"');
+                const offset = out.items.len;
+                out.items.len += encoded_len;
+                _ = std.base64.standard.Encoder.encode(out.items[offset..], binary.data);
+                out.appendAssumeCapacity('"');
                 try out.append(alloc, '}');
             },
         }
@@ -62408,9 +62413,11 @@ fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template_mod.ContentPa
 }
 
 fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
+    // Transfer the existing output buffer to the writer and restore ownership
+    // on every exit, including a partially written string after allocation failure.
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, out);
+    defer out.* = writer.toArrayList();
+    writer.writer.print("{f}", .{std.json.fmt(value, .{})}) catch return error.OutOfMemory;
 }
 
 fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
@@ -71891,7 +71898,11 @@ fn applyDerivedBatchToIndexContextProfiled(
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
-            var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
+            // Artifact-only replay has no documents to filter with this set.
+            var dense_embedding_doc_keys = if (batch.documents.len == 0)
+                std.StringHashMapUnmanaged(void).empty
+            else
+                try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
             defer dense_embedding_doc_keys.deinit(ctx.alloc);
 
             var index_writes = try collectDocumentWritesProfiled(
@@ -72004,7 +72015,10 @@ fn applyDerivedBatchToIndexContextProfiled(
             }
             if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
-            var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
+            var sparse_embedding_doc_keys = if (batch.documents.len == 0)
+                std.StringHashMapUnmanaged(void).empty
+            else
+                try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
             defer sparse_embedding_doc_keys.deinit(ctx.alloc);
 
             const sparse_collect_doc_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
@@ -72609,14 +72623,8 @@ fn decodeEmbeddingArtifactWriteIdentityAlloc(
         defer identity.deinit(alloc);
         if (!std.mem.eql(u8, identity.embedding_name, expected_embedding_name)) return null;
 
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        const parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
-        return .{
-            .doc_key = doc_key,
-            .parent_doc_key = parent_doc_key,
-        };
+        const keys = identity.takeDocumentKeys();
+        return .{ .doc_key = keys.doc_key, .parent_doc_key = keys.parent_doc_key };
     } else |err| switch (err) {
         error.InvalidInternalUserKey => {},
         else => return err,
@@ -72643,11 +72651,8 @@ fn decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(
         defer identity.deinit(alloc);
         if (!managedIndexConsumesEmbeddingName(index_manager, index_ref, identity.embedding_name)) return null;
 
-        const doc_key = try alloc.dupe(u8, identity.doc_key);
-        errdefer alloc.free(doc_key);
-        const parent_doc_key = if (identity.parent_doc_key) |parent_key| try alloc.dupe(u8, parent_key) else null;
-        errdefer if (parent_doc_key) |owned_parent| alloc.free(owned_parent);
-        return .{ .doc_key = doc_key, .parent_doc_key = parent_doc_key };
+        const keys = identity.takeDocumentKeys();
+        return .{ .doc_key = keys.doc_key, .parent_doc_key = keys.parent_doc_key };
     } else |err| switch (err) {
         error.InvalidInternalUserKey => {},
         else => return err,
@@ -72744,9 +72749,19 @@ fn collectSparseFieldWritesProfiled(
 
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
+    // Temporary descriptors cannot escape the synchronous read/apply below.
+    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
+    const descriptor_alloc = descriptor_buffer.get();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        pending.deinit(alloc);
+        pending.deinit(descriptor_alloc);
+    }
+    // A bounded small batch fits entirely on the stack. Reserve once so
+    // append does not repeatedly enter the capacity-growth path. Larger
+    // batches keep lazy growth proportional to the selected documents.
+    if (documents.len <= 64) {
+        comptime std.debug.assert(64 * @sizeOf(PendingDocumentWrite) <= 4096);
+        try pending.ensureTotalCapacityPrecise(descriptor_alloc, documents.len);
     }
 
     var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
@@ -72799,7 +72814,7 @@ fn collectSparseFieldWritesProfiled(
             }
             continue;
         }
-        try pending.append(alloc, .{
+        try pending.append(descriptor_alloc, .{
             .doc_key = doc.key,
             .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
@@ -72827,7 +72842,7 @@ fn collectSparseFieldWritesProfiled(
     }.lessThan);
     if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
-    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    var read_scratch = try document_read_scratch.Scratch.init(descriptor_alloc, pending.items.len);
     defer read_scratch.deinit();
     const read_keys = read_scratch.keys;
     const read_values = read_scratch.values;
@@ -72844,6 +72859,9 @@ fn collectSparseFieldWritesProfiled(
         defer if (owned_logical_value) |owned| alloc.free(owned);
         const value = if (read_values[i]) |store_value| blk: {
             if (profile) |p| p.store_hits += 1;
+            // Numeric outputs own their storage. Ordinary JSON only needs to
+            // remain borrowed until extraction completes inside this txn.
+            if (!internal_keys.isRelationalRowKey(item.store_key)) break :blk store_value;
             const logical = if (index_manager) |manager|
                 try manager.materializeStoredValueAlloc(alloc, item.store_key, store_value)
             else
@@ -72928,9 +72946,19 @@ fn collectDocumentWritesProfiled(
 
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
+    // Temporary descriptors cannot escape the synchronous read/apply below.
+    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
+    const descriptor_alloc = descriptor_buffer.get();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        pending.deinit(alloc);
+        pending.deinit(descriptor_alloc);
+    }
+    // A bounded small batch fits entirely on the stack. Reserve once so
+    // append does not repeatedly enter the capacity-growth path. Larger
+    // batches keep lazy growth proportional to the selected documents.
+    if (documents.len <= 64) {
+        comptime std.debug.assert(64 * @sizeOf(PendingDocumentWrite) <= 4096);
+        try pending.ensureTotalCapacityPrecise(descriptor_alloc, documents.len);
     }
 
     var has_pending_inline = false;
@@ -72969,7 +72997,7 @@ fn collectDocumentWritesProfiled(
             if (profile) |p| p.inline_hits += 1;
             continue;
         }
-        try pending.append(alloc, .{
+        try pending.append(descriptor_alloc, .{
             .doc_key = doc.key,
             .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
@@ -72998,7 +73026,7 @@ fn collectDocumentWritesProfiled(
     }.lessThan);
     if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
-    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    var read_scratch = try document_read_scratch.Scratch.init(descriptor_alloc, pending.items.len);
     defer read_scratch.deinit();
     const read_keys = read_scratch.keys;
     const read_values = read_scratch.values;
@@ -73061,8 +73089,15 @@ fn appendUniqueBorrowedKeyWithSet(
     key: []const u8,
 ) !void {
     if (key.len == 0) return;
-    const entry = try seen.getOrPut(alloc, key);
+    // Preserve the normal insertion/probing path. At capacity, getOrPut can
+    // fail while trying to grow even for an existing key; a duplicate still
+    // needs no additional storage and may succeed under that pressure.
+    const entry = seen.getOrPut(alloc, key) catch |err| {
+        if (seen.contains(key)) return;
+        return err;
+    };
     if (entry.found_existing) return;
+    errdefer _ = seen.remove(key);
     try out.append(alloc, key);
 }
 
@@ -73166,6 +73201,9 @@ const CollectedTextDocumentWrites = struct {
     alloc: Allocator,
     docs: std.ArrayListUnmanaged(mapper.MapperDoc) = .empty,
     owned_values: std.ArrayListUnmanaged([]u8) = .empty,
+    // Exact-size batch ownership for ordinary store-backed JSON. Slices in
+    // docs remain stable after the read transaction and this result move.
+    document_bytes: []u8 = &.{},
     materialized_documents: std.ArrayListUnmanaged(index_manager_mod.IndexManager.MaterializedStoredDocument) = .empty,
     missing_required: usize = 0,
 
@@ -73174,10 +73212,15 @@ const CollectedTextDocumentWrites = struct {
         self.materialized_documents.deinit(self.alloc);
         for (self.owned_values.items) |value| self.alloc.free(value);
         self.owned_values.deinit(self.alloc);
+        self.alloc.free(self.document_bytes);
         self.docs.deinit(self.alloc);
         self.* = undefined;
     }
 };
+
+fn ordinaryTextDocument(doc_key: []const u8, store_key: []const u8) bool {
+    return !internal_keys.isInternalUserKey(doc_key) and !internal_keys.isRelationalRowKey(store_key);
+}
 
 fn collectTextDocumentWritesForIndex(
     alloc: Allocator,
@@ -73197,9 +73240,19 @@ fn collectTextDocumentWritesForIndex(
 
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
+    // Temporary descriptors cannot escape the synchronous read/apply below.
+    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
+    const descriptor_alloc = descriptor_buffer.get();
     var pending = std.ArrayListUnmanaged(PendingTextWrite).empty;
     defer {
-        pending.deinit(alloc);
+        pending.deinit(descriptor_alloc);
+    }
+    // A bounded small batch fits entirely on the stack. Reserve once so
+    // append does not repeatedly enter the capacity-growth path. Larger
+    // batches keep lazy growth proportional to the selected documents.
+    if (documents.len <= 64) {
+        comptime std.debug.assert(64 * @sizeOf(PendingTextWrite) <= 4096);
+        try pending.ensureTotalCapacityPrecise(descriptor_alloc, documents.len);
     }
 
     var has_pending_inline = false;
@@ -73249,7 +73302,7 @@ fn collectTextDocumentWritesForIndex(
             });
             continue;
         }
-        try pending.append(alloc, .{
+        try pending.append(descriptor_alloc, .{
             .doc_key = doc.key,
             .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
@@ -73268,7 +73321,7 @@ fn collectTextDocumentWritesForIndex(
         }
     }.lessThan);
 
-    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    var read_scratch = try document_read_scratch.Scratch.init(descriptor_alloc, pending.items.len);
     defer read_scratch.deinit();
     const read_keys = read_scratch.keys;
     const read_values = read_scratch.values;
@@ -73280,6 +73333,35 @@ fn collectTextDocumentWritesForIndex(
 
     const available_values = availableDocumentValueCount(pending.items, read_values, has_pending_inline);
     try result.docs.ensureTotalCapacityPrecise(alloc, try std.math.add(usize, result.docs.items.len, available_values));
+
+    // Read-transaction bytes cannot escape. Homogeneous ordinary batches
+    // share one exact-size slab. Mixed/internal batches keep lazy per-value
+    // ownership: the slab saved allocations there but regressed smp timings.
+    const document_bytes_len: ?usize = sizing: {
+        var bytes: usize = 0;
+        for (pending.items, read_values) |item, visible| {
+            if (!ordinaryTextDocument(item.doc_key, item.store_key)) break :sizing null;
+            if (visible) |value| bytes = try std.math.add(usize, bytes, value.len);
+        }
+        break :sizing bytes;
+    };
+    if (document_bytes_len) |bytes| {
+        if (bytes != 0) result.document_bytes = try alloc.alloc(u8, bytes);
+    } else if (pending.items.len >= 16 and pending.items.len <= 256) {
+        // Preserve the existing bounded reservation for public relational
+        // rows. Sorted mixed/internal batches normally exit on the first key.
+        const ordinary_rows = count: {
+            var rows: usize = 0;
+            for (pending.items, read_values) |candidate, visible| {
+                if (internal_keys.isInternalUserKey(candidate.doc_key)) break :count 0;
+                if (visible != null) rows += 1;
+            }
+            break :count rows;
+        };
+        if (ordinary_rows >= 16)
+            try result.materialized_documents.ensureTotalCapacityPrecise(alloc, ordinary_rows);
+    }
+    var document_bytes_offset: usize = 0;
 
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse item.inline_value orelse {
@@ -73315,6 +73397,14 @@ fn collectTextDocumentWritesForIndex(
         // native materialization through the pinned schema-view set.
         if (read_values[i] == null) {
             try result.docs.append(alloc, .{ .key = item.doc_key, .value = value });
+            continue;
+        }
+
+        if (document_bytes_len != null) {
+            const owned = result.document_bytes[document_bytes_offset..][0..value.len];
+            @memcpy(owned, value);
+            document_bytes_offset += value.len;
+            try result.docs.append(alloc, .{ .key = item.doc_key, .value = owned, .source_bytes = owned.len });
             continue;
         }
 
@@ -73356,12 +73446,21 @@ fn textualAssetFullTextProjectionAlloc(
     key: []const u8,
     raw: []const u8,
 ) !?[]u8 {
-    const parsed = (try internal_keys.parseAssetArtifactKeyAlloc(alloc, key)) orelse return null;
-    defer {
-        alloc.free(parsed.doc_key);
-        alloc.free(parsed.artifact_name);
-    }
-    const enrichment = index_manager.getEnrichment(.asset, parsed.artifact_name) orelse return null;
+    const name_body = internal_keys.assetArtifactNameBody(key) orelse return null;
+    var name_buffer = std.heap.stackFallback(256, alloc);
+    const name_alloc = name_buffer.get();
+    var name_scratch = std.ArrayListUnmanaged(u8).empty;
+    defer name_scratch.deinit(name_alloc);
+    const name = (try internal_keys.decodeBodyView(name_body)) orelse blk: {
+        // Reserve once so short escaped names fit the bounded stack buffer.
+        // Longer names fall back to the caller's accounted allocator.
+        try name_scratch.ensureTotalCapacityPrecise(name_alloc, name_body.len);
+        break :blk try internal_keys.decodeBodyIntoList(&name_scratch, name_alloc, name_body);
+    };
+    const enrichment = index_manager.getEnrichment(.asset, name) orelse return null;
+    // The lookup borrows its name only for the call; release spill storage
+    // before allocating the projected value.
+    name_scratch.clearAndFree(name_alloc);
     if (assetContentTypeIsJson(enrichment.content_type)) return null;
 
     const field = if (enrichment.source_field.len > 0) enrichment.source_field else "text";
@@ -157895,21 +157994,44 @@ test "db generated write read fences detect artifact mutations and ABA independe
 
 test "db document lookup allocation benchmark" {
     const Counter = @import("../../allocation_bench_support.zig").Counter;
-    const Case = enum { short, long, missing, sparse, text, relational };
+    const Case = enum { short, long, missing, sparse, sparse_large, text_large, embedding_identity, embedding_identity_chunk, text, text_asset, text_asset_large, text_asset_escaped, text_mixed, text_missing, delete_set, relational, json_numbers, json_media };
     const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
     const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
-    const alloc = std.testing.allocator;
-    const count: usize = 50_000;
-    const batch_size = 256;
+    // Setup is outside measurement. Use the C allocator here to avoid
+    // debug-allocator bookkeeping dominating large fixture construction;
+    // measured collectors use the counter or production smp allocator.
+    const alloc = std.heap.c_allocator;
+    const count = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_DOCUMENTS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 50_000;
+    if (count == 0) return error.InvalidBenchmarkDocuments;
+    const batch_size = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_BATCH")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 256;
+    if (batch_size == 0) return error.InvalidBenchmarkBatch;
+    if (fixture == .json_numbers or fixture == .json_media)
+        return jsonOutputAllocationBenchmark(case_name, count, batch_size);
+    if (fixture == .embedding_identity or fixture == .embedding_identity_chunk)
+        return embeddingIdentityAllocationBenchmark(case_name, count, batch_size);
     var backend = mem_backend_mod.Backend.init(alloc, .{});
     defer backend.close();
     var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
     defer store.close();
     var directory = try TestDirectory.init("collector-benchmark");
     defer directory.cleanup();
-    var db: ?DB = if (fixture == .text or fixture == .relational) try DB.open(alloc, directory.path(), .{ .start_index_workers = false }) else null;
+    const text_fixture = fixture == .text_large or fixture == .text or fixture == .text_asset or fixture == .text_asset_large or fixture == .text_asset_escaped or fixture == .text_mixed or fixture == .text_missing;
+    var db: ?DB = if (text_fixture or fixture == .relational) try DB.open(alloc, directory.path(), .{ .start_index_workers = false }) else null;
     defer if (db) |*database| database.close();
-    const value = if (fixture == .sparse) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}" else "{\"title\":\"document value\"}";
+    const sparse_fixture = fixture == .sparse or fixture == .sparse_large;
+    const value_bytes = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_VALUE_BYTES")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 4096;
+    var large_value: ?[]u8 = null;
+    defer if (large_value) |bytes| alloc.free(bytes);
+    if (fixture == .text_large or fixture == .sparse_large) {
+        const prefix = if (sparse_fixture) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]},\"padding\":\"" else "{\"title\":\"";
+        const len = try std.math.add(usize, prefix.len + 2, value_bytes);
+        const bytes = try alloc.alloc(u8, len);
+        @memcpy(bytes[0..prefix.len], prefix);
+        @memset(bytes[prefix.len..][0..value_bytes], 'x');
+        @memcpy(bytes[len - 2 ..], "\"}");
+        large_value = bytes;
+    }
+    const value = large_value orelse if (sparse_fixture) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}" else "{\"title\":\"document value\"}";
     const relational_schema = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":false}}}}";
     var packed_value: ?[]u8 = null;
     defer if (packed_value) |packed_bytes| alloc.free(packed_bytes);
@@ -157923,7 +158045,12 @@ test "db document lookup allocation benchmark" {
         defer parsed_value.deinit();
         packed_value = try mapper.buildRelationalRowValueForSchemaFromParsedAlloc(alloc, parsed_value.value, runtime_schema);
     }
-    if (fixture == .text) try db.?.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    if (text_fixture) try db.?.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const asset_name = if (fixture == .text_asset_escaped) "cap\x00tion" else "caption";
+    const asset_raw: []const u8 = if (fixture == .text_asset_large) "quote\" newline\n null\x00 café 🚀" ** 128 else "projected value";
+    const asset_projected = try std.fmt.allocPrint(alloc, "{{\"caption\":{f}}}", .{std.json.fmt(asset_raw, .{})});
+    defer alloc.free(asset_projected);
+    if (text_fixture) try db.?.addEnrichment(.{ .name = asset_name, .kind = .asset, .field = "caption", .content_type = "text/plain" });
     const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
     const names = try alloc.alloc([544]u8, count);
     defer alloc.free(names);
@@ -157941,11 +158068,13 @@ test "db document lookup allocation benchmark" {
             name[100] = 0;
             break :blk name[0..512];
         } else prefix;
-        doc.* = .{ .key = key, .action = .upsert, .targets = &targets };
-        write.* = .{ .key = try replayDocumentStoreKeyAlloc(alloc, key, fixture == .relational), .value = packed_value orelse value };
+        const is_asset = fixture == .text_asset or fixture == .text_asset_large or fixture == .text_asset_escaped or (fixture == .text_mixed and i % 8 == 0);
+        const stored_key = if (is_asset) try internal_keys.artifactNamedPrefixAlloc(alloc, key, "asset", asset_name) else try replayDocumentStoreKeyAlloc(alloc, key, fixture == .relational);
+        doc.* = .{ .key = if (is_asset) stored_key else key, .action = .upsert, .targets = &targets };
+        write.* = .{ .key = stored_key, .value = if (is_asset) asset_raw else packed_value orelse value };
         initialized += 1;
     }
-    const expected_count = if (fixture == .missing) count / 5 else count;
+    const expected_count = if (fixture == .missing or fixture == .text_missing) count / 5 else count;
     try store.putBatch(stored[0..expected_count], &.{});
     for (0..2) |measurement| {
         for (0..2) |sample| {
@@ -157957,7 +158086,21 @@ test "db document lookup allocation benchmark" {
             var offset: usize = 0;
             while (offset < count) {
                 const end = @min(count, offset + batch_size);
-                if (fixture == .sparse) {
+                if (fixture == .delete_set) {
+                    var keys = std.ArrayListUnmanaged([]const u8).empty;
+                    defer keys.deinit(run_alloc);
+                    var seen = std.StringHashMapUnmanaged(void).empty;
+                    defer seen.deinit(run_alloc);
+                    // Exactly six keys fill the default map's first load limit.
+                    const unique = @min(@as(usize, 6), end - offset);
+                    for (docs[offset..][0..unique]) |doc| try appendUniqueBorrowedKeyWithSet(run_alloc, &keys, &seen, doc.key);
+                    for (0..128) |_| for (docs[offset..][0..unique]) |doc| try appendUniqueBorrowedKeyWithSet(run_alloc, &keys, &seen, doc.key);
+                    try std.testing.expectEqual(unique, keys.items.len);
+                    for (keys.items) |key| for (key) |byte| {
+                        checksum +%= byte;
+                    };
+                    output_count += end - offset;
+                } else if (sparse_fixture) {
                     var writes = try collectSparseFieldWritesProfiled(run_alloc, &store, null, docs[offset..end], .{ .start = "", .end = "" }, "vec", .{}, null);
                     defer writes.deinit();
                     try std.testing.expectEqual(end - offset, writes.items.len);
@@ -157968,13 +158111,14 @@ test "db document lookup allocation benchmark" {
                         for (write.doc_id) |byte| checksum +%= byte;
                     }
                     output_count += writes.items.len;
-                } else if (fixture == .text) {
+                } else if (text_fixture) {
                     var writes = try collectTextDocumentWritesForIndex(run_alloc, &store, db.?.core.index_manager, docs[offset..end], "text", false, .{ .start = "", .end = "" }, .{});
                     defer writes.deinit();
-                    try std.testing.expectEqual(end - offset, writes.docs.items.len);
-                    for (writes.docs.items, docs[offset..end]) |write, doc| {
+                    const available = @min(end, expected_count) -| offset;
+                    try std.testing.expectEqual(available, writes.docs.items.len);
+                    for (writes.docs.items, docs[offset..][0..available]) |write, doc| {
                         try std.testing.expectEqualStrings(doc.key, write.key);
-                        try std.testing.expectEqualStrings(value, write.value);
+                        try std.testing.expectEqualStrings(if (internal_keys.isAssetArtifactKey(doc.key)) asset_projected else value, write.value);
                         for (write.key) |byte| checksum +%= byte;
                     }
                     output_count += writes.docs.items.len;
@@ -157985,7 +158129,7 @@ test "db document lookup allocation benchmark" {
                     try std.testing.expectEqual(available, writes.items.len);
                     for (writes.items, docs[offset .. offset + available]) |write, doc| {
                         try std.testing.expectEqualStrings(doc.key, write.key);
-                        try std.testing.expectEqualStrings(value, write.value);
+                        try std.testing.expectEqualStrings(if (internal_keys.isAssetArtifactKey(doc.key)) asset_projected else value, write.value);
                         for (write.key) |byte| checksum +%= byte;
                     }
                     output_count += writes.items.len;
@@ -157995,9 +158139,94 @@ test "db document lookup allocation benchmark" {
             const elapsed = monotonicTimeNs() - started;
             try std.testing.expectEqual(expected_count, output_count);
             try std.testing.expectEqual(@as(usize, 0), counter.live);
-            if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ @tagName(fixture), count, batch_size, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+            if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ @tagName(fixture), count, batch_size, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
         }
     }
+}
+
+fn embeddingIdentityAllocationBenchmark(case_name: []const u8, count: usize, batch: usize) !void {
+    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const setup = std.heap.c_allocator;
+    const chunk = std.mem.eql(u8, case_name, "embedding_identity_chunk");
+    const doc_key = if (chunk) try internal_keys.documentUnitChunkArtifactKeyAlloc(setup, "doc\x00id", "chunks", "page:1", 3) else try setup.dupe(u8, "doc\x00id");
+    defer setup.free(doc_key);
+    const key = if (chunk) try internal_keys.derivedEmbeddingArtifactKeyAlloc(setup, doc_key, "dense") else try internal_keys.embeddingArtifactKeyForDocumentAlloc(setup, doc_key, "dense");
+    defer setup.free(key);
+    for (0..2) |measurement| for (0..2) |sample| {
+        var counter: Counter = .{};
+        const alloc = if (measurement == 0) counter.allocator() else std.heap.smp_allocator;
+        var checksum: usize = 0;
+        const started = monotonicTimeNs();
+        for (0..count) |_| {
+            var identity = (try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, key, "dense")).?;
+            defer identity.deinit(alloc);
+            try std.testing.expectEqualStrings(doc_key, identity.doc_key);
+            if (chunk) try std.testing.expectEqualStrings("doc\x00id", identity.parent_doc_key.?) else try std.testing.expect(identity.parent_doc_key == null);
+            for (identity.doc_key) |byte| checksum +%= byte;
+        }
+        const elapsed = monotonicTimeNs() - started;
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+        if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ case_name, count, batch, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
+    };
+}
+
+fn renderJsonOutputBenchmark(alloc: Allocator, media: bool, batch: usize, data: []const u8) ![]u8 {
+    if (media) return contentPartsJsonAlloc(alloc, &.{.{ .binary = .{ .mime_type = "application/octet-stream", .data = data } }});
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '{');
+    var first = true;
+    for (0..batch) |_| try appendJsonFieldU64(alloc, &out, &first, "number", std.math.maxInt(u64));
+    try out.append(alloc, '}');
+    return out.toOwnedSlice(alloc);
+}
+
+fn jsonOutputAllocationBenchmark(case_name: []const u8, count: usize, batch: usize) !void {
+    const Counter = @import("../../allocation_bench_support.zig").Counter;
+    const media = std.mem.eql(u8, case_name, "json_media");
+    // Setup is outside measurement. Use the C allocator here to avoid
+    // debug-allocator bookkeeping dominating large fixture construction;
+    // measured collectors use the counter or production smp allocator.
+    const alloc = std.heap.c_allocator;
+    const data = try alloc.alloc(u8, batch);
+    defer alloc.free(data);
+    for (data, 0..) |*byte, i| byte.* = @truncate(i);
+    // Build the reference outside measurement using the independent stdlib
+    // formatter/encoder; benchmark verification covers the complete output.
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(alloc);
+    if (media) {
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(data.len));
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, data);
+        try expected.appendSlice(alloc, "[{\"type\":\"media\",\"mime_type\":\"application/octet-stream\",\"data\":\"");
+        try expected.appendSlice(alloc, encoded);
+        try expected.appendSlice(alloc, "\"}]");
+    } else {
+        try expected.append(alloc, '{');
+        for (0..batch) |i| {
+            if (i != 0) try expected.append(alloc, ',');
+            const number = try std.fmt.allocPrint(alloc, "\"number\":{d}", .{std.math.maxInt(u64)});
+            defer alloc.free(number);
+            try expected.appendSlice(alloc, number);
+        }
+        try expected.append(alloc, '}');
+    }
+    for (0..2) |measurement| for (0..2) |sample| {
+        var counter: Counter = .{};
+        const run_alloc = if (measurement == 0) counter.allocator() else std.heap.smp_allocator;
+        var checksum: u64 = 0;
+        const started = monotonicTimeNs();
+        for (0..count) |_| {
+            const output = try renderJsonOutputBenchmark(run_alloc, media, batch, data);
+            defer run_alloc.free(output);
+            try std.testing.expectEqualStrings(expected.items, output);
+            checksum +%= std.hash.Wyhash.hash(0, output);
+        }
+        const elapsed = monotonicTimeNs() - started;
+        try std.testing.expectEqual(@as(usize, 0), counter.live);
+        if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ case_name, count, batch, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
+    };
 }
 
 fn documentCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
@@ -158031,7 +158260,11 @@ fn textCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, ma
     var result = try collectTextDocumentWritesForIndex(alloc, store, manager, documents, "text", false, .{ .start = "", .end = "" }, .{ .prefer_inline_when_store_tip_matches_sequence = if (inline_values) 0 else null });
     defer result.deinit();
     try std.testing.expectEqual(documents.len, result.docs.items.len);
-    try std.testing.expect(std.mem.indexOf(u8, result.docs.items[0].value, "projected") != null);
+    for (result.docs.items) |doc| {
+        if (internal_keys.isAssetArtifactKey(doc.key)) {
+            try std.testing.expect(std.mem.indexOf(u8, doc.value, "projected") != null);
+        } else try std.testing.expectEqualStrings("{\"title\":\"normal\"}", doc.value);
+    }
 }
 
 test "document collectors release text projections and materialized values on allocation failures" {
@@ -158052,8 +158285,285 @@ test "document collectors release text projections and materialized values on al
         .{ .key = asset_key, .action = .upsert, .targets = &targets, .cleaned_value = "projected value" },
         .{ .key = "normal", .action = .upsert, .targets = &targets, .cleaned_value = "{\"title\":\"normal\"}" },
     };
-    for ([_]bool{ false, true }) |inline_values|
+    for ([_]bool{ false, true }) |inline_values| {
+        // Mixed batches exercise per-value ownership; ordinary batches also
+        // exhaust failures before and after the exact-size slab allocation.
         try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
+        try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, docs[1..]), inline_values });
+    }
+}
+
+test "document collectors duplicate delete keys survive growth failure at map capacity" {
+    const alloc = std.testing.allocator;
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    defer keys.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void).empty;
+    defer seen.deinit(alloc);
+    for ([_][]const u8{ "a", "b", "c", "d", "e", "f" }) |key|
+        try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, key);
+    try std.testing.expectEqual(@as(u32, 8), seen.capacity());
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    for (0..128) |_| try appendUniqueBorrowedKeyWithSet(failing.allocator(), &keys, &seen, "a");
+    try std.testing.expectEqual(@as(usize, 6), keys.items.len);
+    try std.testing.expectEqual(@as(u32, 8), seen.capacity());
+    try std.testing.expectError(error.OutOfMemory, appendUniqueBorrowedKeyWithSet(failing.allocator(), &keys, &seen, "g"));
+    try std.testing.expectEqual(@as(usize, 6), keys.items.len);
+    try std.testing.expect(failing.has_induced_failure);
+    // The normal allocator still permits pre-probe map growth. This test
+    // promises recovery under pressure, not allocation-free normal insertion.
+    try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, "a");
+    try std.testing.expect(seen.capacity() > 8);
+    try std.testing.expectEqual(@as(usize, 6), keys.items.len);
+}
+
+test "document collectors asset projection borrows ordinary names and preserves escaped names" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("asset-name-projection");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addEnrichment(.{ .name = "json", .kind = .asset, .field = "caption", .content_type = "application/json" });
+    try db.addEnrichment(.{ .name = "cap\x00tion", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    const ordinary = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc\x00id", "asset", "json");
+    defer alloc.free(ordinary);
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(?[]u8, null), try textualAssetFullTextProjectionAlloc(failing.allocator(), db.core.index_manager, ordinary, "{}"));
+    const escaped = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc\x00id", "asset", "cap\x00tion");
+    defer alloc.free(escaped);
+    var long_name = [_]u8{'x'} ** 512;
+    long_name[1] = 0;
+    const long_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", &long_name);
+    defer alloc.free(long_key);
+    try std.testing.expectError(error.OutOfMemory, textualAssetFullTextProjectionAlloc(failing.allocator(), db.core.index_manager, long_key, "value"));
+    try std.testing.expectEqual(@as(?[]u8, null), try textualAssetFullTextProjectionAlloc(alloc, db.core.index_manager, long_key, "value"));
+    const Check = struct {
+        fn run(a: Allocator, manager: *index_manager_mod.IndexManager, key: []const u8) !void {
+            const result = (try textualAssetFullTextProjectionAlloc(a, manager, key, "projected value")).?;
+            defer a.free(result);
+            try std.testing.expectEqualStrings("{\"caption\":\"projected value\"}", result);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ db.core.index_manager, @as([]const u8, escaped) });
+}
+
+test "document collectors ordinary slab excludes projected assets" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("text-materialization-hint");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    try db.addEnrichment(.{ .name = "caption", .kind = .asset, .field = "caption", .content_type = "text/plain" });
+    const asset = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", "caption");
+    defer alloc.free(asset);
+    const normal = try replayDocumentStoreKeyAlloc(alloc, "normal", false);
+    defer alloc.free(normal);
+    try db.core.store.putBatch(&.{ .{ .key = asset, .value = "projected value" }, .{ .key = normal, .value = "{\"title\":\"normal\"}" } }, &.{});
+    const empty = try replayDocumentStoreKeyAlloc(alloc, "empty", false);
+    defer alloc.free(empty);
+    const second = try replayDocumentStoreKeyAlloc(alloc, "second", false);
+    defer alloc.free(second);
+    try db.core.store.putBatch(&.{ .{ .key = empty, .value = "" }, .{ .key = second, .value = "{\"title\":\"second document\"}" } }, &.{});
+    const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
+    var docs = [_]derived_types.DerivedDocument{.{ .key = asset, .action = .upsert, .targets = &targets }} ** 32;
+    docs[29].key = "normal";
+    docs[30].key = "empty";
+    docs[31].key = "second";
+    var result = try collectTextDocumentWritesForIndex(alloc, db.core.store, db.core.index_manager, docs[29..], "text", false, .{ .start = "", .end = "" }, .{});
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.docs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), result.materialized_documents.items.len);
+    try std.testing.expectEqualStrings("{\"title\":\"normal\"}{\"title\":\"second document\"}", result.document_bytes);
+    // The collector has already closed its read transaction. Replacing the
+    // source document must not change the returned owned slice.
+    try db.core.store.putBatch(&.{.{ .key = normal, .value = "{}" }}, &.{});
+    try std.testing.expectEqualStrings("{\"title\":\"normal\"}", result.docs.items[1].value);
+    try std.testing.expectEqualStrings("", result.docs.items[0].value);
+    try std.testing.expectEqualStrings("{\"title\":\"second document\"}", result.docs.items[2].value);
+    try std.testing.expectEqual(result.document_bytes.ptr, result.docs.items[1].value.ptr);
+    try std.testing.expectEqual(result.document_bytes.ptr + result.docs.items[1].value.len, result.docs.items[2].value.ptr);
+    var mixed = try collectTextDocumentWritesForIndex(alloc, db.core.store, db.core.index_manager, &docs, "text", false, .{ .start = "", .end = "" }, .{});
+    defer mixed.deinit();
+    try std.testing.expectEqual(@as(usize, 32), mixed.docs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), mixed.document_bytes.len);
+    try std.testing.expectEqual(@as(usize, 3), mixed.materialized_documents.items.len);
+    try std.testing.expectEqualStrings("{}", mixed.docs.items[30].value);
+    try std.testing.expectEqualStrings("{\"caption\":\"projected value\"}", mixed.docs.items[0].value);
+}
+
+test "document collectors JSON string writing preserves escaping and output ownership on failure" {
+    const Check = struct {
+        fn run(a: Allocator, input: []const u8, expected: []const u8) !void {
+            var output = std.ArrayListUnmanaged(u8).empty;
+            defer output.deinit(a);
+            try output.appendSlice(a, "prefix:");
+            try appendJsonString(a, &output, input);
+            try std.testing.expectEqualStrings("prefix:", output.items[0..7]);
+            try std.testing.expectEqualStrings(expected, output.items[7..]);
+        }
+    };
+    const inputs = [_][]const u8{ "", "ordinary", "quote\" slash\\ newline\n null\x00", "café 🚀", &([_]u8{0} ** 512) };
+    for (inputs) |input| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(input, .{})});
+        defer std.testing.allocator.free(expected);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ input, expected });
+    }
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(std.testing.allocator);
+    try output.ensureTotalCapacityPrecise(std.testing.allocator, 128);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try appendJsonString(failing.allocator(), &output, "quote\" newline\n");
+    try std.testing.expectEqualStrings("\"quote\\\" newline\\n\"", output.items);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "document collectors JSON numeric fields preserve boundaries and ownership on failure" {
+    const Check = struct {
+        fn run(a: Allocator) !void {
+            var out: std.ArrayListUnmanaged(u8) = .empty;
+            defer out.deinit(a);
+            try out.append(a, '{');
+            var first = true;
+            try appendJsonFieldU64(a, &out, &first, "zero", 0);
+            try appendJsonFieldU64(a, &out, &first, "max", std.math.maxInt(u64));
+            try appendJsonFieldUsize(a, &out, &first, "size", 42);
+            try out.append(a, '}');
+            try std.testing.expectEqualStrings("{\"zero\":0,\"max\":18446744073709551615,\"size\":42}", out.items);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+    try out.ensureTotalCapacityPrecise(std.testing.allocator, 128);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var first = true;
+    try appendJsonFieldU64(failing.allocator(), &out, &first, "number", std.math.maxInt(u64));
+    try std.testing.expectEqualStrings("\"number\":18446744073709551615", out.items);
+    try std.testing.expect(!failing.has_induced_failure);
+}
+
+test "document collectors JSON media encoding preserves padding escaping and failure ownership" {
+    const Check = struct {
+        fn run(a: Allocator, data: []const u8, expected: []const u8) !void {
+            const result = try contentPartsJsonAlloc(a, &.{ .{ .text = "prefix\n" }, .{ .binary = .{ .mime_type = "quoted\"type", .data = data } }, .{ .media_url = "suffix" } });
+            defer a.free(result);
+            try std.testing.expectEqualStrings(expected, result);
+        }
+    };
+    const alloc = std.testing.allocator;
+    var bytes: [16384]u8 = undefined;
+    for (&bytes, 0..) |*byte, i| byte.* = @truncate(i);
+    for ([_]usize{ 0, 1, 2, 3, 4, 5, 6, 256, 16384 }) |len| {
+        const encoded = try alloc.alloc(u8, std.base64.standard.Encoder.calcSize(len));
+        defer alloc.free(encoded);
+        _ = std.base64.standard.Encoder.encode(encoded, bytes[0..len]);
+        const expected = try std.fmt.allocPrint(alloc, "[{{\"type\":\"text\",\"text\":\"prefix\\n\"}},{{\"type\":\"media\",\"mime_type\":\"quoted\\\"type\",\"data\":\"{s}\"}},{{\"type\":\"media\",\"url\":\"suffix\"}}]", .{encoded});
+        defer alloc.free(expected);
+        try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ @as([]const u8, bytes[0..len]), @as([]const u8, expected) });
+    }
+}
+
+fn sparseCollectorOwnershipSweep(alloc: Allocator, store: *docstore_mod.DocStore, manager: ?*index_manager_mod.IndexManager, docs: []const derived_types.DerivedDocument, relational: bool) !void {
+    var result = try collectSparseFieldWritesProfiled(alloc, store, manager, docs, .{ .start = "", .end = "" }, "vec", .{ .relational_base_rows = relational }, null);
+    defer result.deinit();
+    try std.testing.expectEqual(docs.len, result.items.len);
+    for (result.items) |write| {
+        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, write.vec.indices);
+        try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25 }, write.vec.values);
+    }
+}
+
+test "document collectors sparse borrowed JSON owns numeric outputs and cleans every failure" {
+    const alloc = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    const values = [_][]const u8{
+        "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}",
+        "{\"v\\u0065c\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}",
+        "{\"vec\":{\"metadata\":{},\"indices\":[1,3],\"values\":[0.5,0.25]}}",
+    };
+    const ids = [_][]const u8{ "raw", "escaped", "metadata" };
+    var docs: [3]derived_types.DerivedDocument = undefined;
+    for (ids, values, &docs) |id, value, *doc| {
+        const key = try internal_keys.documentKeyAlloc(alloc, id);
+        defer alloc.free(key);
+        try store.put(key, value);
+        doc.* = .{ .key = id, .action = .upsert };
+    }
+    try std.testing.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ &store, @as(?*index_manager_mod.IndexManager, null), @as([]const derived_types.DerivedDocument, &docs), false });
+    var result = try collectSparseFieldWritesProfiled(alloc, &store, null, &docs, .{ .start = "", .end = "" }, "vec", .{}, null);
+    defer result.deinit();
+    // Returned numeric arrays outlive the collector's read transaction.
+    for (ids) |id| {
+        const key = try internal_keys.documentKeyAlloc(alloc, id);
+        defer alloc.free(key);
+        try store.put(key, "{}");
+    }
+    for (result.items) |write| {
+        try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, write.vec.indices);
+        try std.testing.expectEqualSlices(f32, &.{ 0.5, 0.25 }, write.vec.values);
+    }
+    var absent = try collectSparseFieldWritesProfiled(alloc, &store, null, &docs, .{ .start = "", .end = "" }, "vec", .{}, null);
+    defer absent.deinit();
+    try std.testing.expectEqual(@as(usize, 0), absent.items.len);
+    const key = try internal_keys.documentKeyAlloc(alloc, ids[0]);
+    defer alloc.free(key);
+    try store.put(key, "{\"vec\":{\"indices\":[1,3],\"values\":[0.5]}}");
+    try std.testing.expectError(error.InvalidSparseVector, collectSparseFieldWritesProfiled(alloc, &store, null, docs[0..1], .{ .start = "", .end = "" }, "vec", .{}, null));
+}
+
+test "document collectors sparse relational rows still decode under allocation failures" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("sparse-relational-ownership");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    const schema_json = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"vec\":{\"type\":\"json\"}},\"additionalProperties\":false}}}}";
+    try db.setSchemaJson(alloc, schema_json);
+    var parsed_schema = try public_table_schema.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const schema = try public_table_schema.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, schema);
+    var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}", .{});
+    defer parsed_value.deinit();
+    const packed_row = try mapper.buildRelationalRowValueForSchemaFromParsedAlloc(alloc, parsed_value.value, schema);
+    defer alloc.free(packed_row);
+    const key = try relational_store.keyAlloc(alloc, "row");
+    defer alloc.free(key);
+    try db.core.store.put(key, packed_row);
+    const docs = [_]derived_types.DerivedDocument{.{ .key = "row", .action = .upsert }};
+    try std.testing.checkAllAllocationFailures(alloc, sparseCollectorOwnershipSweep, .{ db.core.store, @as(?*index_manager_mod.IndexManager, db.core.index_manager), @as([]const derived_types.DerivedDocument, &docs), true });
+}
+
+fn embeddingWriteIdentitySweep(alloc: Allocator, key: []const u8, expected: []const u8, manager: ?*index_manager_mod.IndexManager) !void {
+    var identity = (if (manager) |m| try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, m, .{ .name = "dense", .kind = .dense_vector }, key) else try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, key, expected)) orelse return;
+    defer identity.deinit(alloc);
+    try std.testing.expect(identity.doc_key.len > 0);
+}
+
+test "document collectors embedding identity accepted and rejected keys clean every failure" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("embedding-write-identity");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "dense", .kind = .dense_vector, .config_json = "{\"field\":\"embedding\",\"dims\":2}" });
+    const chunk = try internal_keys.documentUnitChunkArtifactKeyAlloc(alloc, "doc\x00id", "chunks", "unit", 3);
+    defer alloc.free(chunk);
+    const doc = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc\x00id", "dense");
+    defer alloc.free(doc);
+    const derived = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, chunk, "dense");
+    defer alloc.free(derived);
+    const rejected = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "other");
+    defer alloc.free(rejected);
+    for ([_][]const u8{ doc, derived, rejected }) |key| {
+        for ([_]?*index_manager_mod.IndexManager{ null, db.core.index_manager }) |manager|
+            try std.testing.checkAllAllocationFailures(alloc, embeddingWriteIdentitySweep, .{ key, @as([]const u8, "dense"), manager });
+    }
+    try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityAlloc(alloc, rejected, "dense"));
+    try std.testing.expectEqual(@as(?OwnedEmbeddingArtifactWriteIdentity, null), try decodeEmbeddingArtifactWriteIdentityForManagedIndexAlloc(alloc, db.core.index_manager, .{ .name = "dense", .kind = .dense_vector }, rejected));
 }
 test "db external lake rejects native mutations before and after cold reopen" {
     const alloc = std.testing.allocator;
