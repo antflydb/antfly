@@ -5589,6 +5589,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("document-lookup-bench", "Build validated real document collector allocation/timing benchmark")
         .dependOn(&b.addInstallArtifact(document_lookup_bench, .{ .dest_sub_path = "document-lookup-bench" }).step);
 
+    const document_collector_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{
+            "document collectors release",
+            "collectDocumentWrites batches sorted document reads",
+            "collectDocumentWrites skips missing out-of-range",
+        },
+        .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("document-collector-test", "Verify synchronous document collector ownership and allocation failures")
+        .dependOn(&b.addRunArtifact(document_collector_tests).step);
+
     const replay_document_integration_filters = [_][]const u8{
         "document collectors release",
         "collectDocumentWrites batches sorted document reads",

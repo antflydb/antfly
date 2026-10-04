@@ -72695,9 +72695,19 @@ fn collectSparseFieldWritesProfiled(
 
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
+    // Temporary descriptors cannot escape the synchronous read/apply below.
+    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
+    const descriptor_alloc = descriptor_buffer.get();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        pending.deinit(alloc);
+        pending.deinit(descriptor_alloc);
+    }
+    // A bounded small batch fits entirely on the stack. Reserve once so
+    // append does not repeatedly enter the capacity-growth path. Larger
+    // batches keep lazy growth proportional to the selected documents.
+    if (documents.len <= 64) {
+        comptime std.debug.assert(64 * @sizeOf(PendingDocumentWrite) <= 4096);
+        try pending.ensureTotalCapacityPrecise(descriptor_alloc, documents.len);
     }
 
     var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
@@ -72750,7 +72760,7 @@ fn collectSparseFieldWritesProfiled(
             }
             continue;
         }
-        try pending.append(alloc, .{
+        try pending.append(descriptor_alloc, .{
             .doc_key = doc.key,
             .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
@@ -72778,7 +72788,7 @@ fn collectSparseFieldWritesProfiled(
     }.lessThan);
     if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
-    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    var read_scratch = try document_read_scratch.Scratch.init(descriptor_alloc, pending.items.len);
     defer read_scratch.deinit();
     const read_keys = read_scratch.keys;
     const read_values = read_scratch.values;
@@ -72879,9 +72889,19 @@ fn collectDocumentWritesProfiled(
 
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
+    // Temporary descriptors cannot escape the synchronous read/apply below.
+    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
+    const descriptor_alloc = descriptor_buffer.get();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
-        pending.deinit(alloc);
+        pending.deinit(descriptor_alloc);
+    }
+    // A bounded small batch fits entirely on the stack. Reserve once so
+    // append does not repeatedly enter the capacity-growth path. Larger
+    // batches keep lazy growth proportional to the selected documents.
+    if (documents.len <= 64) {
+        comptime std.debug.assert(64 * @sizeOf(PendingDocumentWrite) <= 4096);
+        try pending.ensureTotalCapacityPrecise(descriptor_alloc, documents.len);
     }
 
     var has_pending_inline = false;
@@ -72920,7 +72940,7 @@ fn collectDocumentWritesProfiled(
             if (profile) |p| p.inline_hits += 1;
             continue;
         }
-        try pending.append(alloc, .{
+        try pending.append(descriptor_alloc, .{
             .doc_key = doc.key,
             .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
@@ -72949,7 +72969,7 @@ fn collectDocumentWritesProfiled(
     }.lessThan);
     if (profile) |p| p.sort_ns = monotonicTimeNs() - sort_start_ns;
 
-    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    var read_scratch = try document_read_scratch.Scratch.init(descriptor_alloc, pending.items.len);
     defer read_scratch.deinit();
     const read_keys = read_scratch.keys;
     const read_values = read_scratch.values;
@@ -73148,9 +73168,19 @@ fn collectTextDocumentWritesForIndex(
 
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
+    // Temporary descriptors cannot escape the synchronous read/apply below.
+    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
+    const descriptor_alloc = descriptor_buffer.get();
     var pending = std.ArrayListUnmanaged(PendingTextWrite).empty;
     defer {
-        pending.deinit(alloc);
+        pending.deinit(descriptor_alloc);
+    }
+    // A bounded small batch fits entirely on the stack. Reserve once so
+    // append does not repeatedly enter the capacity-growth path. Larger
+    // batches keep lazy growth proportional to the selected documents.
+    if (documents.len <= 64) {
+        comptime std.debug.assert(64 * @sizeOf(PendingTextWrite) <= 4096);
+        try pending.ensureTotalCapacityPrecise(descriptor_alloc, documents.len);
     }
 
     var has_pending_inline = false;
@@ -73200,7 +73230,7 @@ fn collectTextDocumentWritesForIndex(
             });
             continue;
         }
-        try pending.append(alloc, .{
+        try pending.append(descriptor_alloc, .{
             .doc_key = doc.key,
             .store_key = try lookup_keys.key(doc.key, opts.relational_base_rows),
             .inline_value = doc.cleaned_value,
@@ -73219,7 +73249,7 @@ fn collectTextDocumentWritesForIndex(
         }
     }.lessThan);
 
-    var read_scratch = try document_read_scratch.Scratch.init(alloc, pending.items.len);
+    var read_scratch = try document_read_scratch.Scratch.init(descriptor_alloc, pending.items.len);
     defer read_scratch.deinit();
     const read_keys = read_scratch.keys;
     const read_values = read_scratch.values;
@@ -157817,8 +157847,10 @@ test "db document lookup allocation benchmark" {
     const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
     const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
     const alloc = std.testing.allocator;
-    const count: usize = 50_000;
-    const batch_size = 256;
+    const count = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_DOCUMENTS")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 50_000;
+    if (count == 0) return error.InvalidBenchmarkDocuments;
+    const batch_size = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_BATCH")) |raw| try std.fmt.parseInt(usize, std.mem.span(raw), 10) else 256;
+    if (batch_size == 0) return error.InvalidBenchmarkBatch;
     var backend = mem_backend_mod.Backend.init(alloc, .{});
     defer backend.close();
     var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));

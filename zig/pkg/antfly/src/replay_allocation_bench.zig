@@ -13,7 +13,7 @@ const indexes = @import("storage/db/catalog/index_manager.zig");
 const resources = @import("storage/resource_manager.zig");
 const time = @import("antfly_platform").time;
 
-const Operation = enum { replay, enrichment, latest, ordinal, scalar_ordinal };
+const Operation = enum { replay, enrichment, latest, ordinal, scalar_ordinal, scratch_trim };
 
 const Counter = @import("allocation_bench_support.zig").Counter;
 
@@ -54,6 +54,7 @@ pub fn main(init: std.process.Init) !void {
         if (!primary or kind != .full_text or documents_per_record != 1 or repetitions != 1 or requested_budgeted) return error.InvalidOrdinalParameters;
         return benchmarkOrdinals(count, batch, samples, counting, if (args.len > 11) args[11] else "short", operation == .scalar_ordinal);
     }
+    if (operation == .scratch_trim) return benchmarkScratchTrim(count, samples, counting);
     const setup = std.heap.smp_allocator;
     var log = try journal.Journal.open("allocation-benchmark-memory", .{
         .backend = .lsm_memory,
@@ -97,7 +98,7 @@ pub fn main(init: std.process.Init) !void {
         const started = time.monotonicNs();
         var windows: usize = 0;
         switch (operation) {
-            .ordinal, .scalar_ordinal => unreachable,
+            .ordinal, .scalar_ordinal, .scratch_trim => unreachable,
             .replay => {
                 const stats = try worker.catchUpIndexWithOptions(run_alloc, replay_source, index, 0, &consumer, Consumer.apply, .{
                     .resource_manager = if (budgeted) &manager else null,
@@ -127,7 +128,7 @@ pub fn main(init: std.process.Init) !void {
         const elapsed = time.monotonicNs() - started;
         if (manager.snapshot().memory.used_bytes != 0) return error.LeakedReservation;
         const expected_count = switch (operation) {
-            .ordinal, .scalar_ordinal => unreachable,
+            .ordinal, .scalar_ordinal, .scratch_trim => unreachable,
             .replay => count,
             .enrichment => try std.math.divCeil(usize, count, repetitions),
             .latest => 0,
@@ -218,5 +219,42 @@ fn benchmarkOrdinals(count: usize, batch: usize, samples: usize, counting: bool,
         const elapsed = time.monotonicNs() - started;
         if (counter.live != 0 or checksum != expected_checksum) return error.InvalidOrdinalsOrLeakedMemory;
         if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":false,\"documents_per_record\":1,\"index_kind\":\"full_text\",\"source\":\"primary\",\"operation\":\"{s}\",\"repetitions\":1,\"case\":\"{s}\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, count, batch, if (scalar) "scalar_ordinal" else "ordinal", fixture, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+    }
+}
+
+// Alternates exceptional records with ordinary records. Encoding and input
+// ownership are outside the measured region; returned borrowed fields are
+// validated before trimming invalidates them.
+fn benchmarkScratchTrim(count: usize, samples: usize, counting: bool) !void {
+    const setup = std.heap.smp_allocator;
+    const large_keys = try setup.alloc([]const u8, 8192);
+    defer setup.free(large_keys);
+    @memset(large_keys, "document");
+    const large = try journal.encodeRecord(setup, .{ .sequence = 1, .changed_doc_keys = large_keys, .deleted_doc_keys = &.{"deleted"}, .target_hints = &.{.full_text} });
+    defer setup.free(large);
+    const small = try journal.encodeRecord(setup, .{ .sequence = 2, .changed_doc_keys = large_keys[0..64], .deleted_doc_keys = &.{"deleted"}, .target_hints = &.{.full_text} });
+    defer setup.free(small);
+    const expected = ((count + 15) / 16) * (8192 + 2) + (count - (count + 15) / 16) * (64 + 2);
+    for (0..samples + 1) |sample| {
+        var counter: Counter = .{};
+        const alloc = if (counting) counter.allocator() else std.heap.smp_allocator;
+        var scratch: journal.BorrowedBinaryRecordScratch = .{};
+        var checksum: usize = 0;
+        const started = time.monotonicNs();
+        for (0..count) |i| {
+            const record = try journal.decodeBinaryRecordBorrowedScratch(alloc, if (i % 16 == 0) large else small, &scratch);
+            if (record.changed_doc_keys.len != (if (i % 16 == 0) @as(usize, 8192) else 64) or
+                record.deleted_doc_keys.len != 1 or record.target_hints.len != 1 or
+                !std.mem.eql(u8, record.changed_doc_keys[0], "document") or
+                !std.mem.eql(u8, record.deleted_doc_keys[0], "deleted") or record.target_hints[0] != .full_text)
+                return error.InvalidScratchRecord;
+            checksum += record.changed_doc_keys.len + record.deleted_doc_keys.len + record.target_hints.len;
+            scratch.trimRetainedCapacity(alloc, 64 * 1024);
+            if (scratch.retainedCapacityBytes() > 64 * 1024) return error.UnboundedScratch;
+        }
+        scratch.deinit(alloc);
+        const elapsed = time.monotonicNs() - started;
+        if (checksum != expected or counter.live != 0) return error.InvalidScratchResult;
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"operation\":\"scratch_trim\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
     }
 }

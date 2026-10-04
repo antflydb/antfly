@@ -30,21 +30,23 @@ def main():
     parser.add_argument('--dimensions', type=int, default=1536)
     parser.add_argument('--samples', type=int, default=7)
     parser.add_argument('--vector-samples', type=int, default=3)
+    parser.add_argument('--vector-measurements', nargs='+', choices=['counted', 'timing'], default=['counted', 'timing'])
     parser.add_argument('--index-kinds', nargs='+', choices=['full_text', 'algebraic'], default=['full_text', 'algebraic'])
     parser.add_argument('--replay-sources', nargs='+', choices=['journal', 'primary'], default=['journal'])
     parser.add_argument('--documents-per-record', nargs='+', type=int, default=[1, 128])
     parser.add_argument('--batches', nargs='+', type=int, default=[256, 1024])
-    parser.add_argument('--replay-operation', choices=['replay', 'enrichment', 'latest', 'ordinal', 'scalar_ordinal'], default='replay')
+    parser.add_argument('--replay-operation', choices=['replay', 'enrichment', 'latest', 'ordinal', 'scalar_ordinal', 'scratch_trim'], default='replay')
     parser.add_argument('--repetitions', type=int, default=1)
     parser.add_argument('--replay-measurements', nargs='+', choices=['counted', 'timing'], default=['counted'])
     parser.add_argument('--replay-only', action='store_true')
     parser.add_argument('--vector-only', action='store_true')
     parser.add_argument('--vector-modes', nargs='+', choices=['ingest', 'retry', 'retry-mixed', 'session-only'], default=['ingest'])
     parser.add_argument('--document-lookup-only', action='store_true')
+    parser.add_argument('--document-batches', nargs='+', type=int, default=[256])
     parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'relational'], default=['short'])
     parser.add_argument('--ordinal-case', choices=['short', 'long', 'missing'], default='short')
     args = parser.parse_args()
-    if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches, args.repetitions) <= 0:
+    if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches, *args.document_batches, args.repetitions) <= 0:
         parser.error('counts and sample sizes must be positive')
     args.output.mkdir(parents=True, exist_ok=False)
     binaries = {'baseline': args.baseline_bin.resolve(), 'changed': args.candidate_bin.resolve()}
@@ -79,7 +81,7 @@ def main():
                 results.append(dict(workload='replay', variant=variant, pair=pair, **data))
                 print(label, data['elapsed_ns'], flush=True)
                 save()
-    for fixture, mode in itertools.product(args.vector_modes, ([] if args.replay_only or args.document_lookup_only else ['counted', 'timing'])):
+    for fixture, mode in itertools.product(args.vector_modes, ([] if args.replay_only or args.document_lookup_only else args.vector_measurements)):
         child_env = env.copy()
         if mode == 'counted':
             child_env['ANTFLY_COUNT_BENCH_ALLOCATIONS'] = '1'
@@ -115,18 +117,20 @@ def main():
                     print(label, data['run_ns'], flush=True)
                     save()
     if args.document_lookup_only:
-        for fixture, pair in itertools.product(args.document_cases, range(args.samples)):
+        for fixture, batch, pair in itertools.product(args.document_cases, args.document_batches, range(args.samples)):
             for variant in (['baseline', 'changed'] if pair % 2 == 0 else ['changed', 'baseline']):
-                label = f'document-{fixture}-{pair}-{variant}'
+                label = f'document-{fixture}-{batch}-{pair}-{variant}'
                 child_env = env.copy()
                 child_env['ANTFLY_DOCUMENT_BENCH_CASE'] = fixture
+                child_env['ANTFLY_DOCUMENT_BENCH_BATCH'] = str(batch)
+                child_env['ANTFLY_DOCUMENT_BENCH_DOCUMENTS'] = str(args.documents)
                 lines = run(label, [binaries[variant] / 'document-lookup-bench'], child_env)
                 measurements = [json.loads(line.split('document_lookup_bench ', 1)[1])
                                 for line in lines if 'document_lookup_bench {' in line]
                 if {x['measurement'] for x in measurements} != {'counted', 'timing'} or len(measurements) != 2:
                     raise ValueError('both document collector binaries must emit counted and timing results')
                 for data in measurements:
-                    if data.get('case', 'short') != fixture:
+                    if data.get('case', 'short') != fixture or data['batch'] != batch or data['documents'] != args.documents:
                         raise ValueError('both document collector binaries must support the requested fixture')
                     results.append(dict(workload='document', source='primary', variant=variant, pair=pair, **data))
                 print(label, [(x['measurement'], x['elapsed_ns']) for x in measurements], flush=True)

@@ -639,8 +639,10 @@ pub fn lookupOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, doc_ids: []const [
 
     var keys = @import("lookup_key_scratch.zig").Scratch.init(alloc, doc_ids.len);
     defer keys.deinit();
-    var pending = try alloc.alloc(PendingOrdinalLookup, doc_ids.len);
-    defer alloc.free(pending);
+    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
+    const descriptor_alloc = descriptor_buffer.get();
+    var pending = try descriptor_alloc.alloc(PendingOrdinalLookup, doc_ids.len);
+    defer descriptor_alloc.free(pending);
     for (doc_ids, 0..) |doc_id, i| {
         pending[i] = .{
             .source_index = i,
@@ -649,7 +651,7 @@ pub fn lookupOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, doc_ids: []const [
     }
     std.sort.pdq(PendingOrdinalLookup, pending, {}, PendingOrdinalLookup.lessThan);
 
-    var reads = try @import("document_read_scratch.zig").Scratch.init(alloc, pending.len);
+    var reads = try @import("document_read_scratch.zig").Scratch.init(descriptor_alloc, pending.len);
     defer reads.deinit();
     const read_keys = reads.keys;
     const read_values = reads.values;

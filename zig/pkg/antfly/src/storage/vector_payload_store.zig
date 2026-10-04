@@ -1653,12 +1653,17 @@ pub const Store = struct {
         return true;
     }
 
-    fn reservePreparationLocked(self: *Store, records: []const native.BatchRecord) !?resources.BudgetedAllocator.ScratchReservation {
+    fn reservePreparationLocked(self: *Store, record_count: usize, payload_bytes: u64) !?resources.BudgetedAllocator.ScratchReservation {
         const budget = self.budget orelse return null;
-        // Decode/encode, immutable WAL successor and metadata coexist until
-        // append succeeds. Maintenance needs a page plus directory scratch.
-        var bytes: usize = 2 * 1024 * 1024;
-        for (records) |record| bytes = try std.math.add(usize, bytes, try std.math.add(usize, try std.math.mul(usize, record.vector.len, 12), 2048));
+        // Eligibility already totals float32 payload bytes. Reuse that total
+        // instead of scanning every record again. This is the same admission
+        // bound: three payload copies, per-record metadata, and maintenance.
+        const payload_size = std.math.cast(usize, payload_bytes) orelse return error.Overflow;
+        const bytes = try std.math.add(usize, 2 * 1024 * 1024, try std.math.add(
+            usize,
+            try std.math.mul(usize, payload_size, 3),
+            try std.math.mul(usize, record_count, 2048),
+        ));
         return budget.reserveScratch(bytes) catch |err| {
             if (err != error.ResourceBudgetExceeded or !self.discardCollectionForPressureLocked()) return err;
             if (self.checkpoint_running) self.waitCheckpointLocked();
@@ -1728,7 +1733,7 @@ pub const Store = struct {
                 .revision = 1,
                 .vector = vector,
             });
-            bytes.* += vector.len * 4;
+            bytes.* = try std.math.add(u64, bytes.*, try std.math.mul(u64, vector.len, 4));
             if (found != .vector) {
                 added_payloads.* += 1;
                 added_bytes.* += vector.len * 4;
@@ -1842,7 +1847,7 @@ pub const Store = struct {
             const prior_sequence = self.opened.store.covered_source_sequence;
             const prior_generation = self.opened.store.manifest.?.latest_generation;
             const prior_epoch = self.checkpoint_epoch.load(.acquire);
-            scratch_reservation = try self.reservePreparationLocked(records.items);
+            scratch_reservation = try self.reservePreparationLocked(records.items.len, bytes);
             if (self.walNeedsAdmissionCheckpoint()) try self.checkpointLocked();
             if (self.opened.store.covered_source_sequence != prior_sequence or
                 self.opened.store.manifest.?.latest_generation != prior_generation or
