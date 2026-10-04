@@ -1975,7 +1975,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_lite_benchmark = b.addRunArtifact(lite_benchmark);
-    run_lite_benchmark.addArgs(&.{ "--test-filter", "lite throughput benchmark" });
+    run_lite_benchmark.addArgs(&.{ "--suite-filter", "lite throughput benchmark" });
     run_lite_benchmark.setEnvironmentVariable("ANTFLY_LITE_BENCH", "1");
     b.step("lite-native-benchmark", "Benchmark native Lite transaction, commit, and sorted read scaling").dependOn(&run_lite_benchmark.step);
 
@@ -4736,7 +4736,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 11 else 7) * 1024 * 1024 * 1024,
     });
     const run_standalone_restore_tests = b.addRunArtifact(standalone_restore_tests);
-    run_standalone_restore_tests.addArgs(&.{ "--test-filter", "standalone shared" });
+    run_standalone_restore_tests.addArgs(&.{ "--suite-filter", "standalone shared" });
     b.step("antfly-standalone-staged-restore-test", "Run shared standalone restore authority and mixed import regressions").dependOn(&run_standalone_restore_tests.step);
 
     const raft_test_step = b.step("antfly-raft-test", "Run raft integration unit tests");

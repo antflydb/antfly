@@ -53032,10 +53032,17 @@ fn implementationTests() type {
             defer alloc.free(path);
 
             {
-                var db = try openManagedDbWithIndexesJson(
+                var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndIdentity(
                     alloc,
                     path,
                     "{\"semantic_idx\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":2}}",
+                    null,
+                    null,
+                    table_reads.backend_current_root_generation,
+                    null,
+                    .default,
+                    null,
+                    .{ .table_id = 7, .shard_id = 7001, .range_id = 7001 },
                 );
                 defer db.close();
                 // Special-field-only writes have no primary document for a dense hit.

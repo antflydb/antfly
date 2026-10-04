@@ -33435,7 +33435,7 @@ fn testOrderedAssetLifecycle(generated: bool, graph: bool, delete_live: bool) !v
                     defer value.deinit();
                 }
             };
-            if (pass == 0 and !delete_live and !graph and !generated) try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, selected, plan.plan() });
+            if (pass == 0 and !delete_live and !graph and !generated) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, selected, plan.plan() });
         }
         if (previous_closure) |*value| value.deinit();
         previous_closure = null;

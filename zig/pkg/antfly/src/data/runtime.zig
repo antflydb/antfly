@@ -24203,7 +24203,8 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .digest = @splat(1),
             .artifact_effects = &.{.{ .key = "untrusted", .value = null }},
         } };
-        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_page));
+        const merge_page_protocol = @import("../common/data_raft_protocol.zig").batch_graph_cleanup_generation_protocol_version;
+        try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_page));
         var unbound_vector_chunk = unbound_vector_page;
         unbound_vector_chunk.merge_page.?.artifact_effects = &.{};
         unbound_vector_chunk.merge_page.?.chunk = .{
@@ -24216,7 +24217,7 @@ const activation_admission_tests = if (@import("builtin").is_test and implementa
             .data = "x",
             .chunk_digest = @splat(2),
         };
-        try std.testing.expectEqual(data_raft_batch.artifact_catalog_protocol_version, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_chunk));
+        try std.testing.expectEqual(merge_page_protocol, DataServer.requiredRaftBatchProtocolVersion(unbound_vector_chunk));
         admitted.artifact_catalog.?.binding.epoch += 1;
         try std.testing.expect(!onlineMergeRaftBatchHasArtifactBarrier(admitted));
         var accepted = rollback_accept;

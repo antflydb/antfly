@@ -930,7 +930,7 @@ test "ordered artifact inventory unit chunk replacement binds its exact parent a
                 _ = (try unitSession(a, txn, parent_request, "chunks", snapshot)).?;
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ session, unit_key });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ session, unit_key });
         try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.authorize, .{ &current, request, plan.plan() });
     }
     {

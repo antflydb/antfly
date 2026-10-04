@@ -451,6 +451,7 @@ pub const rules: []const @import("unit_test_ownership.zig").Rule = &.{
         .artifact = "test",
         .selection = "dedupeSearchHitsById uses ordinals when hit page is complete",
         .skip = &.{
+            "storage.document_mutation_revision.test.document mutation revision capture owns allocation failures and coalesces owners",
             "storage.db.db.test.",
             "storage.db.query.graph_exec.test.",
             "storage.db.query.result_shape.test.",

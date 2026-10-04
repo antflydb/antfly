@@ -13092,7 +13092,7 @@ pub const DB = struct {
         }
 
         const cleanup_contract = @import("../graph_cleanup_contract.zig");
-        const graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
+        var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
             (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
             try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
         else
@@ -13383,6 +13383,14 @@ pub const DB = struct {
             &owned_delete_keys,
         );
         defer self.alloc.free(deleted_artifact_keys);
+        // Merge-page artifact deletes can retire a graph fact without a
+        // primary document mutation to allocate the cleanup generation above.
+        if (graph_lifecycle_generation == 0) for (deleted_artifact_keys) |key| {
+            if (internal_keys.graphInlineTargetComponent(key) != null) {
+                graph_lifecycle_generation = try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
+                break;
+            }
+        };
         try appendGraphEndpointRetirements(self.alloc, self.core.store, graph_lifecycle_generation, effective_req.deletes, self.core.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
@@ -128441,7 +128449,7 @@ test "db full text repair page replay is idempotent without compaction" {
     }
     try std.testing.expect(complete);
     try std.testing.expectEqual(@as(u32, 3), reopened.core.index_manager.textIndex(cfg.name).?.snapshot().liveDocCount());
-    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} }, .limit = 1 });
+    var all = try reopened.search(alloc, .{ .index_name = cfg.name, .full_text = .{ .match_all = {} }, .limit = 3 });
     defer all.deinit();
     try std.testing.expectEqual(@as(u32, 3), all.total_hits);
 }
@@ -154640,7 +154648,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectError(error.InvalidBatchRequest, binary.seekAfter(tail));
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, ProjectionCheck.run, .{ &db, expected_nums });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ProjectionCheck.run, .{ &db, expected_nums });
     // A selected empty unit and a shadowed root tail still have vector bytes
     // to retire. Reconciliation must enumerate them without exposing their
     // obsolete chunk payloads or confusing another embedding's outputs.
@@ -154681,7 +154689,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expect((try cursor.next()) == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, CandidateCheck.run, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, CandidateCheck.run, .{&db});
     const PollCheck = struct {
         fn run(a: Allocator, owner: *DB, minimum_yields: usize, extra_outputs: usize) !void {
             const candidates = @import("artifact_chunk_vector_cursor.zig");
@@ -154758,7 +154766,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expect(yields >= minimum_yields);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, PollCheck.run, .{ &db, 1, 0 });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PollCheck.run, .{ &db, 1, 0 });
     // Long obsolete tails are opaque here: malformed payloads and another
     // embedding's keys consume bounded scan work, never provider invocations.
     for (2..66) |ordinal| {

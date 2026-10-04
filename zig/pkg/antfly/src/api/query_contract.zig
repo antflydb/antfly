@@ -8638,17 +8638,19 @@ const ParsedFuzziness = struct {
 
 fn parseBleveFuzziness(value: ?query_openapi.Fuzziness, default_edits: u8) !ParsedFuzziness {
     if (value == null) return .{ .max_edits = default_edits, .auto_fuzzy = false };
-    return switch (value.?) {
-        .integer => |int_value| {
-            if (int_value < 0 or int_value > 2) return error.InvalidQueryRequest;
-            return .{ .max_edits = @intCast(int_value), .auto_fuzzy = false };
-        },
+    const int_value = switch (value.?) {
+        .integer => |number| number,
+        // Public admission preserves JSON numbers as text for exact values.
+        .number_string => |number| std.fmt.parseInt(i64, number, 10) catch
+            return error.InvalidQueryRequest,
         .string => |str_value| {
             if (!std.mem.eql(u8, str_value, "auto")) return error.UnsupportedQueryRequest;
             return .{ .max_edits = default_edits, .auto_fuzzy = true };
         },
-        else => error.UnsupportedQueryRequest,
+        else => return error.UnsupportedQueryRequest,
     };
+    if (int_value < 0 or int_value > 2) return error.InvalidQueryRequest;
+    return .{ .max_edits = @intCast(int_value), .auto_fuzzy = false };
 }
 
 fn parseBlevePrefixLength(value: ?i32) !u8 {
@@ -14378,6 +14380,16 @@ fn consumerTests() type {
                 const normalized = owned.req.graph_queries[0].query.params.node_filter.filter_query_json orelse
                     return error.TestUnexpectedResult;
                 try std.testing.expect(normalized.len > 0);
+            }
+
+            for ([_][]const u8{ "-1", "3", "1.5", "9223372036854775808" }) |fuzziness| {
+                const request = try std.mem.concat(alloc, u8, &.{
+                    "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"filter\":{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":",
+                    fuzziness,
+                    "}}}}}",
+                });
+                defer alloc.free(request);
+                try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", request));
             }
 
             // Closed empty-object predicates reject misspelled or future fields at

@@ -1641,7 +1641,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-table-read-test", "Run table-read routing and internal group contracts").dependOn(&run_api_table_reads_docid_tests.step);
     const statement_capture_retry_run = b.addRunArtifact(api_table_reads_linked_tests.executable);
     @import("test_support.zig").configureTestRun(statement_capture_retry_run);
-    statement_capture_retry_run.addArgs(&.{ "--test-filter", "relational statement retries unavailable capture and releases fences before pages or deadline" });
+    statement_capture_retry_run.addArgs(&.{ "--suite-filter", "relational statement retries unavailable capture and releases fences before pages or deadline" });
     b.step("antfly-api-statement-capture-retry-test", "Run bounded SQL statement capture retry regression")
         .dependOn(&statement_capture_retry_run.step);
     const api_aggregation_tests = @import("linked_tests.zig").addPair(b, .{

@@ -24,11 +24,11 @@ def build_commands(
 
     partition = [str(executable)]
     for test_filter in partition_filters:
-        partition.extend(("--test-filter", test_filter))
+        partition.extend(("--suite-filter", test_filter))
     partition.extend(common[1:])
     partition.extend(runtime_args)
 
-    complement = [str(executable), "--test-filter", "storage."]
+    complement = [str(executable), "--suite-filter", "storage."]
     complement.extend(common[1:])
     for test_filter in partition_filters:
         complement.extend(("--skip-test-filter", test_filter))
