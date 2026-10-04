@@ -112518,7 +112518,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     try db.addIndex(.{
         .name = "sp_v1",
         .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"sparse_body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
     });
 
     try db.batch(.{
@@ -112582,6 +112582,28 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     try std.testing.expectEqual(@as(usize, 1), sparse_grouped.hits.len);
     try std.testing.expectEqualStrings("doc:a", sparse_grouped.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), sparse_grouped.hits[0].chunk_hits.len);
+
+    // Singleton selection must not borrow the other vector family's
+    // embedding identity. These indexes deliberately own different chunks.
+    for ([_]types.ReturnMode{ .parent, .chunk }) |mode| {
+        var unnamed_sparse = try db.search(alloc, .{
+            .query = .{ .sparse_knn = .{
+                .indices = sparse_query.indices,
+                .values = sparse_query.values,
+                .k = 3,
+            } },
+            .return_mode = mode,
+            .limit = 1,
+            .include_stored = false,
+        });
+        defer unnamed_sparse.deinit();
+        try std.testing.expectEqual(@as(usize, 1), unnamed_sparse.hits.len);
+        if (mode == .parent) {
+            try std.testing.expectEqualStrings("doc:a", unnamed_sparse.hits[0].id);
+        } else {
+            try std.testing.expectEqualStrings("sparse_body_chunks_v1", unnamed_sparse.hits[0].artifact_ref.?.name);
+        }
+    }
 
     const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(doc_a_store_key);

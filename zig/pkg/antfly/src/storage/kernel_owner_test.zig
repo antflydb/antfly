@@ -1659,8 +1659,11 @@ test "opaque storage owner preserves dense profiles and captured identity" {
         .indexes_json = .fromSlice("{\"vec\":{\"type\":\"embeddings\",\"external\":true,\"dimension\":3}}"),
     });
     defer owner.deinit();
+    // _embeddings-only writes are artifact patches and preserve an existing
+    // source row; they do not create one. Seed source documents so presence
+    // filtering can return the members whose profiling we are exercising.
     var batch = try owner.batchJson("docs",
-        \\{"inserts":{"doc:a":{"_embeddings":{"vec":[1,0,0]}},"doc:b":{"_embeddings":{"vec":[0,1,0]}}},"sync_level":"full_index"}
+        \\{"inserts":{"doc:a":{"title":"alpha","_embeddings":{"vec":[1,0,0]}},"doc:b":{"title":"beta","_embeddings":{"vec":[0,1,0]}}},"sync_level":"full_index"}
     );
     defer batch.deinit();
     var identity: ?u64 = null;
@@ -1679,6 +1682,8 @@ test "opaque storage owner preserves dense profiles and captured identity" {
         try std.testing.expectEqual(@as(usize, 2), hits.len);
         try std.testing.expectEqualStrings("doc:a", hits[0].object.get("_id").?.string);
         try std.testing.expectEqualStrings("doc:b", hits[1].object.get("_id").?.string);
+        for (hits) |hit| if (hit.object.get("_source")) |source|
+            try std.testing.expect(source == .null);
         if (profile) {
             const profile_value = body.get("profile") orelse return error.MissingQueryProfile;
             const dense = (profile_value.object.get("dense_search") orelse return error.MissingDenseProfile).object;
@@ -3279,7 +3284,7 @@ test "opaque metadata HA callback preserves lost ack replay and full checkpoint 
         try std.testing.expectError(error.TableLifecycleConflict, source.replaceStandaloneCatalog(group, revision - 1, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision, try source.standaloneRevision());
         try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .transition_mutex = &transition, .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &wait_ctx, .sync_wait_fn = Failure.wait }));
-        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
+        try std.testing.expectError(error.MetadataReplicationPending, source.replaceStandaloneCatalog(group, revision, &.{}, &.{}, "{}"));
         try std.testing.expectEqual(revision + 1, try source.standaloneRevision());
         const catalog = (try source.loadStandaloneCatalog(alloc)).?;
         defer alloc.free(catalog);

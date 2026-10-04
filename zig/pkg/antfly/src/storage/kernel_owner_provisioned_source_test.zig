@@ -1085,14 +1085,15 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         "articles",
         replicated_descriptor.view(),
         .{
-            .deletes = &.{"doc:missing"},
             .timestamp_ns = 4243,
             .sync_level = .full_index,
         },
     );
     {
         // Prepared replay must remain usable while the catalog is unavailable,
-        // and must fail closed if no resident generation was prepared.
+        // and must fail closed if no resident generation was prepared. Use an
+        // empty command: replicated deletes require separately ordered graph
+        // cleanup, which this owner-sharing fixture does not drive.
         const saved_catalog = owner_source.catalog;
         owner_source.catalog = table_catalog.emptyCatalogSource();
         defer owner_source.catalog = saved_catalog;
@@ -1100,7 +1101,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             alloc,
             7001,
             "articles",
-            .{ .deletes = &.{"doc:missing"} },
+            .{},
             true,
             null,
         )) != null);

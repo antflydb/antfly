@@ -1648,6 +1648,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const api_http_runtime_default_filters = [_][]const u8{
         "storage-kernel query request preserves final projection while raw retrieval defers it",
+        "api http server executes direct foreign table aggregations through registry",
         "unconfigured remote catalog authority skips background work without borrowing internal credentials",
         "usermgr openapi module generates extractor surface for routed endpoints",
         "generated extractors: path param structs exist",

@@ -13455,6 +13455,9 @@ fn searchDenseInternal(
 
         const postprocess_start = platform_time.monotonicNs();
         var candidate_postprocess_req = postprocess_req;
+        // Postprocessing must retain the selected physical index even when
+        // the caller relied on the singleton-index default.
+        candidate_postprocess_req.index_name = entry.config.name;
         if (full_candidate_window) {
             candidate_postprocess_req.offset = 0;
             candidate_postprocess_req.limit = candidate_window;
@@ -15279,6 +15282,9 @@ pub fn searchSparse(
 
         owns_hits = false;
         var candidate_postprocess_req = postprocess_req;
+        // A singleton sparse index and a singleton dense index may both
+        // resolve a null name. Carry this executor's actual selection.
+        candidate_postprocess_req.index_name = entry.config.name;
         if (full_candidate_window) {
             candidate_postprocess_req.offset = 0;
             candidate_postprocess_req.limit = candidate_window;
