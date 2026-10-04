@@ -14869,37 +14869,46 @@ pub const DB = struct {
         fn stageWrite(self: *@This(), alloc: Allocator, key: []const u8, value: []const u8) !void {
             const gop = try self.positions.getOrPut(alloc, key);
             if (!gop.found_existing) {
+                // Keep the borrowed map key until both owned storage and the
+                // entry are ready. Roll back the reservation on every failure.
+                errdefer _ = self.positions.remove(key);
                 const owned_key = try alloc.dupe(u8, key);
                 errdefer alloc.free(owned_key);
                 const owned_value = try alloc.dupe(u8, value);
                 errdefer alloc.free(owned_value);
-                gop.key_ptr.* = owned_key;
-                gop.value_ptr.* = self.entries.items.len;
+                const entry_index = self.entries.items.len;
                 try self.entries.append(alloc, .{
                     .key = owned_key,
                     .value = owned_value,
                     .kind = .write,
                 });
+                gop.key_ptr.* = owned_key;
+                gop.value_ptr.* = entry_index;
                 return;
             }
 
             const entry = &self.entries.items[gop.value_ptr.*];
+            const replacement = try alloc.dupe(u8, value);
             if (entry.value) |existing| alloc.free(existing);
-            entry.value = try alloc.dupe(u8, value);
+            entry.value = replacement;
             entry.kind = .write;
         }
 
         fn stageDelete(self: *@This(), alloc: Allocator, key: []const u8) !void {
             const gop = try self.positions.getOrPut(alloc, key);
             if (!gop.found_existing) {
+                // Keep the borrowed map key until both owned storage and the
+                // entry are ready. Roll back the reservation on every failure.
+                errdefer _ = self.positions.remove(key);
                 const owned_key = try alloc.dupe(u8, key);
                 errdefer alloc.free(owned_key);
-                gop.key_ptr.* = owned_key;
-                gop.value_ptr.* = self.entries.items.len;
+                const entry_index = self.entries.items.len;
                 try self.entries.append(alloc, .{
                     .key = owned_key,
                     .kind = .delete,
                 });
+                gop.key_ptr.* = owned_key;
+                gop.value_ptr.* = entry_index;
                 return;
             }
 
@@ -14931,15 +14940,19 @@ pub const DB = struct {
         fn stageWriteOwned(self: *@This(), alloc: Allocator, key: []const u8, owned_value: []u8) !void {
             const gop = try self.positions.getOrPut(alloc, key);
             if (!gop.found_existing) {
+                // Keep the borrowed map key until both owned storage and the
+                // entry are ready. Roll back the reservation on every failure.
+                errdefer _ = self.positions.remove(key);
                 const owned_key = try alloc.dupe(u8, key);
                 errdefer alloc.free(owned_key);
-                gop.key_ptr.* = owned_key;
-                gop.value_ptr.* = self.entries.items.len;
+                const entry_index = self.entries.items.len;
                 try self.entries.append(alloc, .{
                     .key = owned_key,
                     .value = owned_value,
                     .kind = .write,
                 });
+                gop.key_ptr.* = owned_key;
+                gop.value_ptr.* = entry_index;
                 return;
             }
 
@@ -65209,7 +65222,10 @@ fn shouldRunDenseCatchUpMaintenance(ctx: *AsyncContext, index_name: []const u8, 
 
 fn noteDenseCatchUpMaintenanceRun(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) !void {
     const gop = try ctx.dense_maintenance_last_ns.getOrPut(ctx.alloc, index_name);
-    if (!gop.found_existing) gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+    if (!gop.found_existing) {
+        errdefer _ = ctx.dense_maintenance_last_ns.remove(index_name);
+        gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+    }
     gop.value_ptr.* = now_ns;
 }
 
@@ -65222,7 +65238,10 @@ fn shouldLogTargetAdvanceDebt(ctx: *AsyncContext, index_name: []const u8, now_ns
 
 fn noteTargetAdvanceDebtLogged(ctx: *AsyncContext, index_name: []const u8, now_ns: u64) !void {
     const gop = try ctx.target_advance_warning_last_ns.getOrPut(ctx.alloc, index_name);
-    if (!gop.found_existing) gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+    if (!gop.found_existing) {
+        errdefer _ = ctx.target_advance_warning_last_ns.remove(index_name);
+        gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+    }
     gop.value_ptr.* = now_ns;
 }
 
@@ -65298,7 +65317,10 @@ fn recordTargetAdvanceMaintenanceDebt(
     lockAtomic(&ctx.target_advance_debt_mutex);
     defer ctx.target_advance_debt_mutex.unlock();
     const gop = try ctx.target_advance_maintenance_pending.getOrPut(ctx.alloc, index_name);
-    if (!gop.found_existing) gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+    if (!gop.found_existing) {
+        errdefer _ = ctx.target_advance_maintenance_pending.remove(index_name);
+        gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
+    }
     gop.value_ptr.* = debt;
 }
 
@@ -65332,6 +65354,7 @@ fn noteTargetAdvanceStuck(ctx: *AsyncContext, index_name: []const u8, now_ns: u6
     defer ctx.target_advance_debt_mutex.unlock();
     const gop = try ctx.target_advance_stuck.getOrPut(ctx.alloc, index_name);
     if (!gop.found_existing) {
+        errdefer _ = ctx.target_advance_stuck.remove(index_name);
         gop.key_ptr.* = try ctx.alloc.dupe(u8, index_name);
         gop.value_ptr.* = .{ .first_stuck_ns = now_ns, .indexed = indexed, .expected = expected };
         return;
@@ -65742,6 +65765,99 @@ test "target advance debt logging is rate limited without doing repair work" {
     try noteTargetAdvanceDebtLogged(&ctx, "idx", now_ns);
     try std.testing.expect(!shouldLogTargetAdvanceDebt(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs() - 1));
     try std.testing.expect(shouldLogTargetAdvanceDebt(&ctx, "idx", now_ns + denseCatchUpMaintenanceCooldownNs()));
+}
+
+test "db target advance tracking rolls back allocation failures" {
+    const Check = struct {
+        const Mode = enum { debt, stuck, maintenance, warning };
+        fn run(alloc: Allocator, mode: Mode) !void {
+            var apply_mutex: apply_rw_lock_mod.ApplyRwLock = .{};
+            var ctx = AsyncContext{
+                .alloc = alloc,
+                .store = undefined,
+                .index_manager = undefined,
+                .apply_mutex = &apply_mutex,
+            };
+            defer ctx.deinit(alloc);
+            const result = switch (mode) {
+                .stuck => noteTargetAdvanceStuck(&ctx, "idx", 10, 3, 9),
+                .debt => recordTargetAdvanceMaintenanceDebt(&ctx, "idx", .{ .config_hash = 11, .generation = 7 }),
+                .maintenance => noteDenseCatchUpMaintenanceRun(&ctx, "idx", 10),
+                .warning => noteTargetAdvanceDebtLogged(&ctx, "idx", 10),
+            };
+            result catch |err| {
+                try std.testing.expectEqual(@as(u32, 0), ctx.target_advance_maintenance_pending.count());
+                try std.testing.expectEqual(@as(u32, 0), ctx.target_advance_stuck.count());
+                try std.testing.expectEqual(@as(u32, 0), ctx.dense_maintenance_last_ns.count());
+                try std.testing.expectEqual(@as(u32, 0), ctx.target_advance_warning_last_ns.count());
+                return err;
+            };
+            if (mode == .stuck) {
+                try noteTargetAdvanceStuck(&ctx, "idx", 20, 5, 9);
+                const record = ctx.target_advance_stuck.get("idx").?;
+                try std.testing.expectEqual(@as(u64, 10), record.first_stuck_ns);
+                try std.testing.expectEqual(@as(u64, 5), record.indexed);
+            } else if (mode == .debt) {
+                try recordTargetAdvanceMaintenanceDebt(&ctx, "idx", .{ .config_hash = 12, .generation = 8 });
+                try std.testing.expect(targetAdvanceMaintenanceDebtPending(&ctx, "idx", .{ .config_hash = 12, .generation = 8 }));
+            }
+        }
+    };
+    inline for (.{ Check.Mode.debt, Check.Mode.stuck, Check.Mode.maintenance, Check.Mode.warning }) |mode| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{mode});
+    }
+}
+
+test "db bulk coalescer rolls back every insertion allocation failure" {
+    const Check = struct {
+        const Mode = enum { write, delete, owned };
+        fn stage(alloc: Allocator, coalescer: *DB.BulkIngestCoalescer, mode: Mode) !void {
+            switch (mode) {
+                .write => try coalescer.stageWrite(alloc, "key", "body"),
+                .delete => try coalescer.stageDelete(alloc, "key"),
+                .owned => {
+                    const owned = try alloc.dupe(u8, "body");
+                    // Ownership transfers only after successful staging.
+                    errdefer alloc.free(owned);
+                    try coalescer.stageWriteOwned(alloc, "key", owned);
+                },
+            }
+        }
+        fn run(alloc: Allocator, mode: Mode) !void {
+            var coalescer: DB.BulkIngestCoalescer = .{};
+            defer coalescer.deinit(alloc);
+            stage(alloc, &coalescer, mode) catch |err| {
+                try std.testing.expectEqual(@as(u32, 0), coalescer.positions.count());
+                try std.testing.expectEqual(@as(usize, 0), coalescer.entries.items.len);
+                return err;
+            };
+            try std.testing.expectEqual(@as(usize, 0), coalescer.positions.get("key").?);
+            try std.testing.expectEqualStrings("key", coalescer.entries.items[0].key);
+        }
+    };
+    inline for (.{ Check.Mode.write, Check.Mode.delete, Check.Mode.owned }) |mode| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{mode});
+    }
+}
+
+test "db bulk coalescer preserves replacements on allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var coalescer: DB.BulkIngestCoalescer = .{};
+    defer coalescer.deinit(alloc);
+    try coalescer.stageWrite(alloc, "key", "old");
+    const freed_before = failing.freed_bytes;
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, coalescer.stageWrite(alloc, "key", "replacement"));
+    try std.testing.expectEqual(freed_before, failing.freed_bytes);
+    try std.testing.expectEqualStrings("old", coalescer.entries.items[0].value.?);
+    failing.fail_index = std.math.maxInt(usize);
+    try coalescer.stageWrite(alloc, "key", "replacement");
+    try std.testing.expectEqualStrings("replacement", coalescer.entries.items[0].value.?);
+    try coalescer.stageDelete(alloc, "key");
+    try std.testing.expect(coalescer.entries.items[0].value == null);
+    try coalescer.stageWrite(alloc, "key", "after-delete");
+    try std.testing.expectEqualStrings("after-delete", coalescer.entries.items[0].value.?);
 }
 
 test "target advance maintenance handoff is exact-incarnation scoped" {

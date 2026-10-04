@@ -22,8 +22,14 @@ pub const Scheduler = struct {
     };
     pub fn advance(self: *Scheduler, port: Port) !bool {
         if (port.now(port.ptr) < self.retry_after_ns.load(.acquire)) return false;
+        return self.advanceAfterCadenceCheck(port);
+    }
+    fn advanceAfterCadenceCheck(self: *Scheduler, port: Port) !bool {
         if (self.running.swap(true, .acq_rel)) return false;
         defer self.running.store(false, .release);
+        // A prior flight may have installed backoff after the optimistic check
+        // but before this caller acquired admission.
+        if (port.now(port.ptr) < self.retry_after_ns.load(.acquire)) return false;
         errdefer {
             self.pending.store(false, .release);
             self.retry_after_ns.store(port.now(port.ptr) +| poll_interval_ns, .release);
@@ -162,4 +168,39 @@ test "producer scheduler resumes partial retry sweeps and invalidates obsolete a
     scheduler.observeAuthority(next_authority);
     try std.testing.expect(scheduler.retry_round == null);
     try std.testing.expect(scheduler.producer_retry_after_ns == null);
+}
+
+test "producer scheduler rechecks backoff after admission handoff" {
+    const Fixture = struct {
+        now_ns: u64 = 1,
+        calls: usize = 0,
+        fn now(ptr: *anyopaque) u64 {
+            return (@as(*@This(), @ptrCast(@alignCast(ptr)))).now_ns;
+        }
+        fn page(ptr: *anyopaque) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.Refused;
+        }
+        fn port(self: *@This()) Scheduler.Port {
+            return .{ .ptr = self, .now = now, .page = page };
+        }
+    };
+    var fixture: Fixture = .{};
+    var scheduler: Scheduler = .{};
+    defer scheduler.deinit(std.testing.allocator);
+    // The waiting caller has passed the optimistic cadence check. A prior
+    // flight then fails and publishes backoff before releasing admission.
+    try std.testing.expect(fixture.now_ns >= scheduler.retry_after_ns.load(.acquire));
+    try std.testing.expectError(error.Refused, scheduler.advance(fixture.port()));
+    const deadline = scheduler.retry_after_ns.load(.acquire);
+    scheduler.pending.store(true, .release);
+    try std.testing.expect(!try scheduler.advanceAfterCadenceCheck(fixture.port()));
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(deadline, scheduler.retry_after_ns.load(.acquire));
+    try std.testing.expect(scheduler.pending.load(.acquire));
+    try std.testing.expect(!scheduler.running.load(.acquire));
+    fixture.now_ns = deadline;
+    try std.testing.expectError(error.Refused, scheduler.advance(fixture.port()));
+    try std.testing.expectEqual(@as(usize, 2), fixture.calls);
 }
