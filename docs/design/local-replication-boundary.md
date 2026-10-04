@@ -197,3 +197,34 @@ retry deadline before releasing its single-flight state. A successor admitted by
 a rearm callback cannot change the previous failure's report. Producer
 single-flight tests advance the clock while a page is active so cadence cannot
 hide missing admission protection.
+
+## Remaining local worker owners and server metadata
+
+`storage/server_group_metadata.zig` owns the server's group creation timestamp
+key and accessors. DB provides ordinary reads and writes without interpreting
+this server metadata. The existing key and decimal encoding remain unchanged;
+server status consumers attach their group identity in the adapter.
+
+`storage/db/graph_cleanup_owner.zig` owns scheduler registration, bounded polling
+cadence, and a permanent shutdown barrier. DB supplies write eligibility and one
+fenced graph cleanup page. A registration borrows the stable DB address until
+stop joins its callback outside the admission mutex.
+
+`storage/db/runtime_restart_owner.zig` owns restart admission, coalesced rerun
+requests, capped retry delay, and bounded durable-lane resubmission. Enrichment,
+text merge, and sparse compaction each have a separate owner. DB supplies desired
+state and a start attempt; enrichment runtime replacement remains protected by
+its lifecycle mutex, and structural mutations still govern paused runtimes.
+The durable owner lane drains before the borrowed context is destroyed.
+
+`storage/db/native_projection_owner.zig` owns wakeups, worker admission, retryable
+failure classification, and shutdown/join. Its stable AsyncContext supplies one
+publication round. Catalog pins, stable-tip/cardinality checks, snapshot admission,
+and durable checkpoint publication remain local storage operations. Shutdown
+joins outside the worker admission mutex; a stopped owner cannot be restarted.
+
+`storage/db/index_repair_scheduler.zig` owns the revision projection, exact runnable
+heap, fairness cursor, progress waits, and independent summary types. Durable
+repair checkpoints remain the authority. DB reconciles committed events under
+its scheduler mutex and executes selected fenced work. A revision gap still
+invalidates the projection; volatile progress hints cannot authorize publication.

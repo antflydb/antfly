@@ -272,6 +272,10 @@ def check_replication_contract(relative: str, source: str) -> None:
         "storage/db/portable_activation_recovery.zig",
         "storage/db/quarantine_recovery.zig",
         "storage/db/independent_maintenance.zig",
+        "storage/db/index_repair_scheduler.zig",
+        "storage/db/graph_cleanup_owner.zig",
+        "storage/db/native_projection_owner.zig",
+        "storage/db/runtime_restart_owner.zig",
     }:
         return
     source = mask_literals(production_source(source))
@@ -292,6 +296,9 @@ def check_replication_contract(relative: str, source: str) -> None:
         "raft_applied_entry_marker",
         "HAMirrorUnavailable",
         "primary_ha",
+        "getGroupCreatedAtMillis",
+        "ensureGroupCreatedAtMillis",
+        "groupCreatedAtMetadataKeyAlloc",
     }
     found = forbidden.intersection(re.findall(r"\b\w+\b", source))
     if found:

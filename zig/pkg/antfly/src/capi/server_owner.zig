@@ -13,6 +13,7 @@
 // limitations.
 
 //! Private server storage-provider operations, separate from public C exports.
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const server_document_child_range = @import("../storage/server_document_child_range.zig");
 pub const storage_root = @import("antfly_source_root");
 pub const antfly = @import("../capi_root.zig");
@@ -5662,7 +5663,8 @@ pub fn storageOwnerRuntimeStatusJson(
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = handle.storage_owner_group_id,
         .source_vectors = handle.db.sourceVectorStats() catch |err| return storageOwnerStatusFromError(err),
-        .created_at_millis = (handle.db.getGroupCreatedAtMillis(
+        .created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(
+            &handle.db,
             handle.alloc,
             handle.storage_owner_group_id,
         ) catch null) orelse 0,

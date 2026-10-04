@@ -9,4 +9,5 @@ test {
     _ = @import("storage/server_coordinated_ttl.zig");
     _ = @import("storage/server_query_visibility.zig");
     _ = @import("storage/server_document_child_range.zig");
+    _ = @import("storage/server_group_metadata.zig");
 }

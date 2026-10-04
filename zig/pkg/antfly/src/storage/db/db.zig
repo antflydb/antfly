@@ -942,434 +942,8 @@ fn managedIndexReplayHint(kind: types.IndexKind) change_journal_mod.TargetHint {
     };
 }
 
-fn retryableIndexRepairTerminalPhase(
-    last_error: ?[]const u8,
-    trigger: index_repair_state.Trigger,
-) ?index_repair_state.Phase {
-    const reason = last_error orelse return null;
-    if (!std.mem.eql(u8, reason, @errorName(error.RepairSourceCoverageIncomplete))) return null;
-    // A shadow can lag changing source artifacts during replacement or
-    // initial catalog admission. Resume its durable owner and discard only
-    // the inactive candidate; coverage lag is not structural corruption.
-    // Externally supplied and structurally invalid generations stay closed.
-    if (trigger != .operator_generation_rebuild and
-        trigger != .artifact_baseline_adoption and
-        trigger != .storage_format_migration and
-        trigger != .artifact_coverage_mismatch and
-        trigger != .replay_artifact_unavailable and
-        trigger != .catalog_admission)
-    {
-        return null;
-    }
-    return .detected;
-}
-
-const IndexRepairScheduleClass = enum {
-    runnable,
-    paused,
-    terminal,
-};
-
-const IndexRepairScheduleRecord = struct {
-    repair_id: u128,
-    revision: u64,
-    index_name: []u8,
-    work_class: index_repair_state.WorkClass,
-    config_hash: u64,
-    root_generation: u64,
-    class: IndexRepairScheduleClass,
-    phase_terminal: bool,
-    /// Durable retry deadline from the checkpoint. Progress waits are a
-    /// process-local acceleration layer and may temporarily replace the
-    /// effective deadline without changing durable repair authority.
-    durable_next_retry_at_ms: u64,
-    next_retry_at_ms: u64,
-    progress_wait_until_sequence: ?u64 = null,
-    // Process-local grace period for an already-queryable initial build.
-    // Once its deadline is selected, the repair owner receives one explicit
-    // audit authority instead of blindly rearming the same grace period.
-    audit_wait_armed: bool = false,
-    heap_position: ?usize = null,
-};
-
-/// Process-resident projection of the durable repair checkpoint. Durable
-/// intents remain the authority; this directory is rebuilt once per open and
-/// then revision-reconciled after every committed mutation. It makes the
-/// maintenance owner's steady-state inspection cost depend on its quantum,
-/// not on the total number of paused or future-dated intents.
-const IndexRepairSchedulerDirectory = struct {
-    const ControlMutationDisposition = enum { stale, next, gap };
-
-    initialized: bool = false,
-    identity: ?index_repair_state.ReplicaIdentity = null,
-    /// Exact durable checkpoint revision materialized by this projection.
-    /// Events must arrive consecutively; a gap invalidates the acceleration
-    /// layer and the next owner reconstructs it from the durable authority.
-    control_revision: u64 = 0,
-    records: std.ArrayListUnmanaged(IndexRepairScheduleRecord) = .empty,
-    by_id: std.AutoHashMapUnmanaged(u128, usize) = .empty,
-    by_name: std.StringHashMapUnmanaged(usize) = .empty,
-    /// Exact min-heap of runnable repair IDs. Record-owned positions make
-    /// update/removal O(log N) without tombstones, lazy pruning, or an
-    /// occasionally unbounded compaction pass under the owner mutex.
-    runnable_heap: std.ArrayListUnmanaged(u128) = .empty,
-    cursor: usize = 0,
-    runnable: usize = 0,
-    paused: usize = 0,
-    terminal: usize = 0,
-    progress_waiters: usize = 0,
-
-    fn classifyControlMutation(
-        self: *const @This(),
-        identity: index_repair_state.ReplicaIdentity,
-        control_revision: u64,
-    ) ControlMutationDisposition {
-        const current_identity = self.identity orelse return .gap;
-        if (!current_identity.eql(identity)) return .gap;
-        if (control_revision <= self.control_revision) return .stale;
-        if (control_revision != self.control_revision +| 1) return .gap;
-        return .next;
-    }
-
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        for (self.records.items) |record| alloc.free(record.index_name);
-        self.records.deinit(alloc);
-        self.by_id.deinit(alloc);
-        self.by_name.deinit(alloc);
-        self.runnable_heap.deinit(alloc);
-        self.* = .{};
-    }
-
-    fn heapLess(self: *const @This(), a: u128, b: u128) bool {
-        const a_record = self.records.items[self.by_id.get(a).?];
-        const b_record = self.records.items[self.by_id.get(b).?];
-        if (a_record.next_retry_at_ms != b_record.next_retry_at_ms) {
-            return a_record.next_retry_at_ms < b_record.next_retry_at_ms;
-        }
-        return a < b;
-    }
-
-    fn swapHeap(self: *@This(), a: usize, b: usize) void {
-        if (a == b) return;
-        std.mem.swap(u128, &self.runnable_heap.items[a], &self.runnable_heap.items[b]);
-        self.records.items[self.by_id.get(self.runnable_heap.items[a]).?].heap_position = a;
-        self.records.items[self.by_id.get(self.runnable_heap.items[b]).?].heap_position = b;
-    }
-
-    fn siftHeapUp(self: *@This(), start: usize) usize {
-        var child = start;
-        while (child != 0) {
-            const parent = (child - 1) / 2;
-            if (!self.heapLess(self.runnable_heap.items[child], self.runnable_heap.items[parent])) break;
-            self.swapHeap(child, parent);
-            child = parent;
-        }
-        return child;
-    }
-
-    fn siftHeapDown(self: *@This(), start: usize) void {
-        var parent = start;
-        while (true) {
-            const left = parent * 2 + 1;
-            if (left >= self.runnable_heap.items.len) break;
-            const right = left + 1;
-            const child = if (right < self.runnable_heap.items.len and
-                self.heapLess(self.runnable_heap.items[right], self.runnable_heap.items[left]))
-                right
-            else
-                left;
-            if (!self.heapLess(self.runnable_heap.items[child], self.runnable_heap.items[parent])) break;
-            self.swapHeap(parent, child);
-            parent = child;
-        }
-    }
-
-    fn addRunnableAssumeCapacity(self: *@This(), repair_id: u128) void {
-        const position = self.runnable_heap.items.len;
-        self.runnable_heap.appendAssumeCapacity(repair_id);
-        self.records.items[self.by_id.get(repair_id).?].heap_position = position;
-        _ = self.siftHeapUp(position);
-    }
-
-    fn removeRunnable(self: *@This(), repair_id: u128) void {
-        const record_index = self.by_id.get(repair_id) orelse return;
-        const position = self.records.items[record_index].heap_position orelse return;
-        const last = self.runnable_heap.pop().?;
-        self.records.items[record_index].heap_position = null;
-        if (position == self.runnable_heap.items.len) return;
-        self.runnable_heap.items[position] = last;
-        self.records.items[self.by_id.get(last).?].heap_position = position;
-        const new_position = self.siftHeapUp(position);
-        self.siftHeapDown(new_position);
-    }
-
-    fn rescheduleRunnable(self: *@This(), repair_id: u128) void {
-        const record = self.records.items[self.by_id.get(repair_id).?];
-        const position = record.heap_position orelse unreachable;
-        const new_position = self.siftHeapUp(position);
-        self.siftHeapDown(new_position);
-    }
-
-    /// Arm an event-driven wait for an exact durable repair revision. The
-    /// fallback deadline recovers missed callbacks and non-replay maintenance
-    /// completion without turning a queryable partial generation into a hot
-    /// owner loop.
-    fn deferForProgress(
-        self: *@This(),
-        repair_id: u128,
-        expected_revision: u64,
-        wake_at_sequence: u64,
-        fallback_at_ms: u64,
-    ) bool {
-        const record_index = self.by_id.get(repair_id) orelse return false;
-        const record = &self.records.items[record_index];
-        if (record.revision != expected_revision or record.class != .runnable) return false;
-        if (record.progress_wait_until_sequence == null) self.progress_waiters += 1;
-        record.progress_wait_until_sequence = wake_at_sequence;
-        record.audit_wait_armed = false;
-        record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
-        self.rescheduleRunnable(repair_id);
-        return true;
-    }
-
-    /// Defer a runnable lifecycle intent to its bounded audit deadline without
-    /// arming an applied-watermark waiter. Once replay has already reached its
-    /// durable target, later watermark increments are ordinary producer
-    /// progress and cannot prove corpus-wide coverage complete; waking the
-    /// lifecycle owner for every increment would turn a long initial build
-    /// into a maintenance hot loop.
-    fn deferForAudit(
-        self: *@This(),
-        repair_id: u128,
-        expected_revision: u64,
-        fallback_at_ms: u64,
-    ) bool {
-        const record_index = self.by_id.get(repair_id) orelse return false;
-        const record = &self.records.items[record_index];
-        if (record.revision != expected_revision or record.class != .runnable) return false;
-        if (record.progress_wait_until_sequence != null) {
-            record.progress_wait_until_sequence = null;
-            self.progress_waiters -= 1;
-        }
-        record.audit_wait_armed = true;
-        record.next_retry_at_ms = @max(fallback_at_ms, record.durable_next_retry_at_ms);
-        self.rescheduleRunnable(repair_id);
-        return true;
-    }
-
-    const ProgressWake = struct {
-        repair_id: u128,
-        revision: u64,
-        work_class: index_repair_state.WorkClass,
-        config_hash: u64,
-        root_generation: u64,
-    };
-
-    /// Wake only the waiting repair for the exact index whose durable applied
-    /// watermark advanced. Return the exact lifecycle identity so the outer
-    /// owner cannot mistake normal initial-build progress for corruption debt;
-    /// repeated notifications at the same sequence are coalesced.
-    fn wakeForIndexProgress(self: *@This(), index_name: []const u8, applied_sequence: u64) ?ProgressWake {
-        const record_index = self.by_name.get(index_name) orelse return null;
-        const record = &self.records.items[record_index];
-        const wake_at = record.progress_wait_until_sequence orelse return null;
-        if (applied_sequence < wake_at) return null;
-        record.progress_wait_until_sequence = null;
-        record.audit_wait_armed = false;
-        self.progress_waiters -= 1;
-        record.next_retry_at_ms = record.durable_next_retry_at_ms;
-        self.rescheduleRunnable(record.repair_id);
-        return .{
-            .repair_id = record.repair_id,
-            .revision = record.revision,
-            .work_class = record.work_class,
-            .config_hash = record.config_hash,
-            .root_generation = record.root_generation,
-        };
-    }
-
-    fn earliestRetryDeadline(self: *const @This()) u64 {
-        const repair_id = if (self.runnable_heap.items.len == 0)
-            return 0
-        else
-            self.runnable_heap.items[0];
-        return self.records.items[self.by_id.get(repair_id).?].next_retry_at_ms;
-    }
-
-    fn wake(self: *const @This()) DB.IndexRepairWake {
-        if (self.runnable != 0) {
-            const deadline = self.earliestRetryDeadline();
-            return if (deadline == 0) .immediate else .{ .at_realtime_ms = deadline };
-        }
-        if (self.paused != 0 or self.terminal != 0) return .parked;
-        return .empty;
-    }
-
-    fn incrementClass(self: *@This(), class: IndexRepairScheduleClass) void {
-        switch (class) {
-            .runnable => self.runnable += 1,
-            .paused => self.paused += 1,
-            .terminal => self.terminal += 1,
-        }
-    }
-
-    fn decrementClass(self: *@This(), class: IndexRepairScheduleClass) void {
-        switch (class) {
-            .runnable => self.runnable -= 1,
-            .paused => self.paused -= 1,
-            .terminal => self.terminal -= 1,
-        }
-    }
-
-    fn classForIntent(intent: index_repair_state.IndexRepairIntent) IndexRepairScheduleClass {
-        if (intent.phase == .terminal and retryableIndexRepairTerminalPhase(
-            intent.last_error,
-            intent.trigger,
-        ) == null) return .terminal;
-        if (intent.automation == .paused) return .paused;
-        return .runnable;
-    }
-
-    fn upsert(
-        self: *@This(),
-        alloc: Allocator,
-        intent: index_repair_state.IndexRepairIntent,
-        persisted_revision: u64,
-    ) !void {
-        const class = classForIntent(intent);
-        if (self.by_id.get(intent.repair_id)) |record_index| {
-            const record = &self.records.items[record_index];
-            if (!std.mem.eql(u8, record.index_name, intent.index_name)) return error.InvalidIndexRepairState;
-            if (persisted_revision < record.revision) return;
-            if (persisted_revision == record.revision) {
-                if (record.class != class or
-                    record.work_class != intent.work_class or
-                    record.config_hash != intent.config_hash or
-                    record.root_generation != intent.root_generation or
-                    record.phase_terminal != (intent.phase == .terminal) or
-                    record.durable_next_retry_at_ms != intent.next_retry_at_ms)
-                {
-                    return error.InvalidIndexRepairState;
-                }
-                return;
-            }
-            const schedule_changed = record.class != class or
-                record.next_retry_at_ms != intent.next_retry_at_ms or
-                record.progress_wait_until_sequence != null;
-            if (schedule_changed and record.class != .runnable and class == .runnable)
-                try self.runnable_heap.ensureUnusedCapacity(alloc, 1);
-            if (schedule_changed and record.class == .runnable and class != .runnable)
-                self.removeRunnable(intent.repair_id);
-            if (record.class != class) {
-                self.decrementClass(record.class);
-                self.incrementClass(class);
-                record.class = class;
-            }
-            record.next_retry_at_ms = intent.next_retry_at_ms;
-            record.durable_next_retry_at_ms = intent.next_retry_at_ms;
-            record.work_class = intent.work_class;
-            record.config_hash = intent.config_hash;
-            record.root_generation = intent.root_generation;
-            if (record.progress_wait_until_sequence != null) self.progress_waiters -= 1;
-            record.progress_wait_until_sequence = null;
-            record.audit_wait_armed = false;
-            record.phase_terminal = intent.phase == .terminal;
-            record.revision = persisted_revision;
-            if (schedule_changed and class == .runnable) {
-                if (record.heap_position == null)
-                    self.addRunnableAssumeCapacity(intent.repair_id)
-                else
-                    self.rescheduleRunnable(intent.repair_id);
-            }
-            return;
-        }
-        if (self.by_name.contains(intent.index_name)) return error.InvalidIndexRepairState;
-        const owned_name = try alloc.dupe(u8, intent.index_name);
-        errdefer alloc.free(owned_name);
-        try self.records.ensureUnusedCapacity(alloc, 1);
-        try self.by_id.ensureUnusedCapacity(alloc, 1);
-        try self.by_name.ensureUnusedCapacity(alloc, 1);
-        if (class == .runnable) try self.runnable_heap.ensureUnusedCapacity(alloc, 1);
-        const record_index = self.records.items.len;
-        self.records.appendAssumeCapacity(.{
-            .repair_id = intent.repair_id,
-            .revision = persisted_revision,
-            .index_name = owned_name,
-            .work_class = intent.work_class,
-            .config_hash = intent.config_hash,
-            .root_generation = intent.root_generation,
-            .class = class,
-            .phase_terminal = intent.phase == .terminal,
-            .durable_next_retry_at_ms = intent.next_retry_at_ms,
-            .next_retry_at_ms = intent.next_retry_at_ms,
-        });
-        self.by_id.putAssumeCapacity(intent.repair_id, record_index);
-        self.by_name.putAssumeCapacity(owned_name, record_index);
-        self.incrementClass(class);
-        if (class == .runnable) self.addRunnableAssumeCapacity(intent.repair_id);
-    }
-
-    fn remove(self: *@This(), alloc: Allocator, repair_id: u128) void {
-        const record_index = self.by_id.get(repair_id) orelse return;
-        const removed = self.records.items[record_index];
-        if (removed.progress_wait_until_sequence != null) self.progress_waiters -= 1;
-        if (removed.class == .runnable) self.removeRunnable(removed.repair_id);
-        self.decrementClass(removed.class);
-        _ = self.by_id.remove(removed.repair_id);
-        _ = self.by_name.remove(removed.index_name);
-        alloc.free(removed.index_name);
-        _ = self.records.swapRemove(record_index);
-        if (record_index < self.records.items.len) {
-            const moved = self.records.items[record_index];
-            self.by_id.getPtr(moved.repair_id).?.* = record_index;
-            self.by_name.getPtr(moved.index_name).?.* = record_index;
-        }
-        if (self.records.items.len == 0) {
-            self.cursor = 0;
-        } else if (self.cursor >= self.records.items.len) {
-            self.cursor %= self.records.items.len;
-        }
-    }
-
-    fn buildFromState(alloc: Allocator, state: index_repair_state.State) !@This() {
-        var directory: @This() = .{
-            .initialized = true,
-            .identity = state.identity,
-            .control_revision = state.control_revision,
-        };
-        errdefer directory.deinit(alloc);
-        try directory.records.ensureTotalCapacity(alloc, state.entries.items.len);
-        const map_capacity: u32 = @intCast(state.entries.items.len);
-        try directory.by_id.ensureTotalCapacity(alloc, map_capacity);
-        try directory.by_name.ensureTotalCapacity(alloc, map_capacity);
-        try directory.runnable_heap.ensureTotalCapacity(alloc, state.entries.items.len);
-        for (state.entries.items) |entry| try directory.upsert(alloc, entry.intent, entry.intent.revision);
-        return directory;
-    }
-
-    fn summary(self: *@This()) DB.IndexRepairIntentSummary {
-        return .{
-            .runnable = self.runnable,
-            .paused = self.paused,
-            .terminal = self.terminal,
-            .earliest_retry_at_ms = self.earliestRetryDeadline(),
-            .wake = self.wake(),
-        };
-    }
-
-    fn summaryForIndex(self: *@This(), target_index_name: ?[]const u8) DB.IndexRepairIntentSummary {
-        const name = target_index_name orelse return self.summary();
-        const index = self.by_name.get(name) orelse return .{};
-        const record = self.records.items[index];
-        return .{
-            .runnable = @intFromBool(record.class == .runnable),
-            .paused = @intFromBool(record.class == .paused),
-            .terminal = @intFromBool(record.class == .terminal),
-            .earliest_retry_at_ms = if (record.class == .runnable) record.next_retry_at_ms else 0,
-            .wake = if (record.class != .runnable) .empty else if (record.next_retry_at_ms == 0) .immediate else .{ .at_realtime_ms = record.next_retry_at_ms },
-        };
-    }
-};
+const IndexRepairSchedulerDirectory = @import("index_repair_scheduler.zig").Directory;
+const retryableIndexRepairTerminalPhase = @import("index_repair_scheduler.zig").retryableTerminalPhase;
 
 const AsyncDenseCatchUpSession = struct {
     index_name: []u8,
@@ -1440,10 +1014,7 @@ const AsyncContext = struct {
     // clean marker from racing a newly admitted derived session.
     dense_projection_committing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     dense_projection_finalization_requested: bool = false,
-    native_publication_enabled: bool = false,
-    native_publication_mutex: std.atomic.Mutex = .unlocked,
-    native_publication_wake: std.Io.Event = .unset,
-    native_publication_future: ?std.Io.Future(void) = null,
+    native_projection_owner: @import("native_projection_owner.zig").Owner = .{},
     pending_dense_projection_finalizations: std.StringHashMapUnmanaged(u64) = .empty,
     deferred_external_bulk_notify_sequence: AtomicU64 = AtomicU64.init(0),
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
@@ -1459,7 +1030,7 @@ const AsyncContext = struct {
     enrichment_lifecycle_mutex: std.atomic.Mutex = .unlocked,
     enrichment_runtime: ?*enrichment_runtime_mod.EnrichmentRuntime = null,
     enrichment_desired_running: std.atomic.Value(bool) = .init(false),
-    enrichment_restart_state: std.atomic.Value(u8) = .init(0),
+    enrichment_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     dense_maintenance_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     target_advance_warning_last_ns: std.StringHashMapUnmanaged(u64) = .empty,
     /// Exact indexes whose replay watermark could not advance because the
@@ -1484,9 +1055,9 @@ const AsyncContext = struct {
     /// looping on the same deferred check indefinitely.
     target_advance_stuck: std.StringHashMapUnmanaged(TargetAdvanceStuckRecord) = .empty,
     text_merge_runtime: ?*text_merge_runtime_mod.TextMergeRuntime = null,
-    text_merge_restart_state: std.atomic.Value(u8) = .init(0),
+    text_merge_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime = null,
-    sparse_compaction_restart_state: std.atomic.Value(u8) = .init(0),
+    sparse_compaction_restart_owner: @import("runtime_restart_owner.zig").Owner = .{},
     resolution_runtime: ?*resolution_runtime_mod.ResolutionRuntime = null,
     promotion_runtime: ?*promotion_runtime_mod.PromotionRuntime = null,
     repair_options: types.ArtifactRepairRunOptions = .{},
@@ -5030,10 +4601,6 @@ fn sleepNs(duration_ns: u64) void {
     };
 }
 
-fn groupCreatedAtMetadataKeyAlloc(alloc: Allocator, group_id: u64) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "\x00\x00__metadata__:data_group_created_at:{d}", .{group_id});
-}
-
 fn sleepPollInterval() void {
     platform_clock.Clock.real().sleepMs(10);
 }
@@ -5312,8 +4879,7 @@ pub const DB = struct {
     source_vector_storage: ?*lsm_backend_mod.NativeStorage = null,
     closed: bool = false,
     stable_address: bool = false,
-    graph_cleanup_worker: ?background_runtime_mod.MaintenanceScheduler.Handle = null,
-    graph_cleanup_stop: std.atomic.Value(bool) = .init(false),
+    graph_cleanup_owner: @import("graph_cleanup_owner.zig").Owner = .{},
     alloc: Allocator,
     runtime_alloc: Allocator,
     generation_read_lease: ?generation_lifecycle.ReadLease,
@@ -7559,7 +7125,7 @@ pub const DB = struct {
             .snapshot_replay_admission = async_resources.snapshot_replay_admission,
             .repair_replay_mutex = async_resources.repair_replay_mutex,
             .io = self.backend_runtime.io(),
-            .native_publication_enabled = self.start_index_workers,
+            .native_projection_owner = .{ .enabled = self.start_index_workers },
             .require_graph_resolution_contract = true,
             .query_visibility_hook = null,
             .text_merge_runtime = null,
@@ -8385,7 +7951,7 @@ pub const DB = struct {
     /// deterministic scheduler drains them. Destruction still happens through
     /// the ordinary close path after the drain completes.
     pub fn beginTeardown(self: *DB) void {
-        self.graph_cleanup_stop.store(true, .release);
+        self.graph_cleanup_owner.stopping.store(true, .release);
         if (self.enrichment_runtime) |runtime| runtime.beginTeardown();
         if (self.transaction_runtime) |runtime| runtime.beginTeardown();
     }
@@ -9602,34 +9168,22 @@ pub const DB = struct {
 
     fn startGraphEndpointCleanupWorker(self: *DB) void {
         if (comptime builtin.os.tag == .freestanding) return;
-        if (!self.stable_address or !self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer or self.graph_cleanup_worker != null) return;
+        if (!self.stable_address or !self.local_execution.optional_runtime_workers_enabled or self.open_mode != .writer) return;
         if (!(self.canRunLocalGraphEndpointCleanup() catch false)) return;
-        const scheduler = self.backend_runtime.maintenanceScheduler() catch |err| {
-            std.log.warn("graph cleanup scheduler unavailable: {}", .{err});
-            return;
-        };
-        self.graph_cleanup_stop.store(false, .release);
-        self.graph_cleanup_worker = scheduler.register(self, graphEndpointCleanupWorkerStep) catch |err| {
-            std.log.warn("graph cleanup worker unavailable: {}", .{err});
-            return;
-        };
+        self.graph_cleanup_owner.start(self.graphCleanupPort());
     }
-
+    fn graphCleanupPort(self: *DB) @import("graph_cleanup_owner.zig").Owner.Port {
+        return .{ .ptr = self, .runtime = self.backend_runtime, .run = graphCleanupPage };
+    }
+    fn graphCleanupPage(ptr: *anyopaque) !bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.runStandaloneGraphEndpointCleanupStep();
+    }
     fn stopGraphEndpointCleanupWorker(self: *DB) void {
-        self.graph_cleanup_stop.store(true, .release);
-        if (self.graph_cleanup_worker) |*worker| {
-            worker.await(self.backend_runtime.io().?);
-            self.graph_cleanup_worker = null;
-        }
+        self.graph_cleanup_owner.stop(self.backend_runtime.io());
     }
-
     fn graphEndpointCleanupWorkerStep(self: *DB) ?u64 {
-        if (self.graph_cleanup_stop.load(.acquire)) return null;
-        const progressed = self.runStandaloneGraphEndpointCleanupStep() catch |err| {
-            std.log.warn("graph endpoint cleanup deferred: {}", .{err});
-            return 250;
-        };
-        return if (progressed) 1 else 100;
+        return self.graph_cleanup_owner.step(self.graphCleanupPort());
     }
 
     /// Every enqueue path is serviced independently of subsequent foreground
@@ -14454,86 +14008,6 @@ pub const DB = struct {
         }
     };
 
-    const EnrichmentRestartWork = struct {
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-
-        const retry_initial_ms: i64 = 25;
-        const retry_max_ms: i64 = 1000;
-        const retries_per_job: usize = 8;
-
-        fn run(ptr: *anyopaque) anyerror!void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            var retries: usize = 0;
-            while (true) {
-                if (work.ctx.background_closing.load(.acquire)) {
-                    work.ctx.enrichment_restart_state.store(0, .release);
-                    return;
-                }
-                if (!work.ctx.enrichment_desired_running.load(.acquire)) {
-                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                        retries = 0;
-                        continue;
-                    }
-                    return;
-                }
-
-                lockAtomicWithBackoff(&work.ctx.enrichment_lifecycle_mutex);
-                const runtime = work.ctx.enrichment_runtime;
-                const should_start = runtime != null and
-                    work.ctx.enrichment_desired_running.load(.acquire) and
-                    !work.ctx.background_closing.load(.acquire) and
-                    !runtime.?.isStarted();
-                const start_result: ?anyerror = if (should_start) blk: {
-                    startEnrichmentRuntimeForLifecycle(runtime.?) catch |err| break :blk err;
-                    break :blk null;
-                } else null;
-                const started = runtime == null or runtime.?.isStarted();
-                work.ctx.enrichment_lifecycle_mutex.unlock();
-
-                if (started) {
-                    notifyQueryVisibilityHook(work.ctx, .status);
-                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                    if (work.ctx.enrichment_restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                        retries = 0;
-                        continue;
-                    }
-                    return;
-                }
-
-                retries += 1;
-                if (retries == 1 or std.math.isPowerOfTwo(retries)) {
-                    std.log.warn("enrichment runtime restart retry attempt={} err={s}", .{
-                        retries,
-                        if (start_result) |err| @errorName(err) else "RuntimeNotStarted",
-                    });
-                }
-                if (work.ctx.io) |io| {
-                    const shift: u6 = @intCast(@min(retries - 1, 5));
-                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
-                    io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
-                } else {
-                    work.ctx.enrichment_restart_state.store(0, .release);
-                    return start_result orelse error.EnrichmentRuntimeUnavailable;
-                }
-                if (retries >= retries_per_job) {
-                    // Preserve autonomous recovery while allowing unrelated
-                    // durable work to run on a persistently failing runtime.
-                    work.ctx.enrichment_restart_state.store(0, .release);
-                    scheduleEnrichmentRestartContext(work.ctx, work.lane, work.owner_id);
-                    return;
-                }
-            }
-        }
-
-        fn deinit(ptr: *anyopaque) void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            std.heap.page_allocator.destroy(work);
-        }
-    };
-
     var test_enrichment_restart_failures_remaining: std.atomic.Value(u32) = .init(0);
     var test_enrichment_reconfigure_after_detached_hook: ?*const fn (*DB) anyerror!void = null;
 
@@ -14556,152 +14030,52 @@ pub const DB = struct {
         try runtime.start();
     }
 
-    fn scheduleEnrichmentRestartContext(
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-    ) void {
-        if (ctx.background_closing.load(.acquire) or
-            !ctx.enrichment_desired_running.load(.acquire)) return;
-        if (ctx.enrichment_restart_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = ctx.enrichment_restart_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
-            return;
-        }
-        const work = std.heap.page_allocator.create(EnrichmentRestartWork) catch {
-            ctx.enrichment_restart_state.store(0, .release);
-            return;
-        };
-        work.* = .{ .ctx = ctx, .lane = lane, .owner_id = owner_id };
-        lane.submit(.{
-            .owner_id = owner_id,
-            .class = .maintenance,
-            .ptr = work,
-            .run = EnrichmentRestartWork.run,
-            .deinit = EnrichmentRestartWork.deinit,
-        }) catch |err| {
-            std.heap.page_allocator.destroy(work);
-            ctx.enrichment_restart_state.store(0, .release);
-            std.log.warn("enrichment runtime restart was not scheduled err={s}", .{@errorName(err)});
-        };
+    fn scheduleEnrichmentRestartContext(ctx: *AsyncContext, lane: background_runtime_mod.DurableJobLane, owner_id: u64) void {
+        ctx.enrichment_restart_owner.schedule(.{ .ptr = ctx, .lane = lane, .owner_id = owner_id, .io = ctx.io, .closing = &ctx.background_closing, .wanted = enrichmentRestartWanted, .attempt = attemptEnrichmentRestart, .name = "enrichment", .unavailable = error.EnrichmentRuntimeUnavailable });
     }
-
-    const MaintenanceRuntimeKind = enum {
-        text_merge,
-        sparse_compaction,
-    };
-
-    fn maintenanceRestartState(ctx: *AsyncContext, kind: MaintenanceRuntimeKind) *std.atomic.Value(u8) {
-        return switch (kind) {
-            .text_merge => &ctx.text_merge_restart_state,
-            .sparse_compaction => &ctx.sparse_compaction_restart_state,
-        };
+    fn enrichmentRestartWanted(ptr: *anyopaque) bool {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        return ctx.enrichment_desired_running.load(.acquire);
     }
-
-    fn ensureMaintenanceRuntimeRunning(ctx: *AsyncContext, kind: MaintenanceRuntimeKind) !bool {
-        return switch (kind) {
-            .text_merge => if (ctx.text_merge_runtime) |runtime| try runtime.ensureRunning() else true,
-            .sparse_compaction => if (ctx.sparse_compaction_runtime) |runtime| try runtime.ensureRunning() else true,
-        };
+    fn attemptEnrichmentRestart(ptr: *anyopaque) !bool {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        lockAtomicWithBackoff(&ctx.enrichment_lifecycle_mutex);
+        const runtime = ctx.enrichment_runtime;
+        const should_start = runtime != null and ctx.enrichment_desired_running.load(.acquire) and !ctx.background_closing.load(.acquire) and !runtime.?.isStarted();
+        const start_error: ?anyerror = if (should_start) blk: {
+            startEnrichmentRuntimeForLifecycle(runtime.?) catch |err| break :blk err;
+            break :blk null;
+        } else null;
+        const started = runtime == null or runtime.?.isStarted();
+        ctx.enrichment_lifecycle_mutex.unlock();
+        if (started) {
+            notifyQueryVisibilityHook(ctx, .status);
+            return true;
+        }
+        if (start_error) |err| return err;
+        return false;
     }
-
-    const MaintenanceRestartWork = struct {
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-        kind: MaintenanceRuntimeKind,
-
-        const retry_initial_ms: i64 = 25;
-        const retry_max_ms: i64 = 1000;
-        const retries_per_job: usize = 8;
-
-        fn run(ptr: *anyopaque) anyerror!void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            const restart_state = maintenanceRestartState(work.ctx, work.kind);
-            var retries: usize = 0;
-            while (true) {
-                if (work.ctx.background_closing.load(.acquire)) {
-                    restart_state.store(0, .release);
-                    return;
-                }
-
-                var start_error: ?anyerror = null;
-                const running = ensureMaintenanceRuntimeRunning(work.ctx, work.kind) catch |err| blk: {
-                    start_error = err;
-                    break :blk false;
-                };
-                if (running) {
-                    if (restart_state.cmpxchgStrong(1, 0, .acq_rel, .acquire) == null) return;
-                    if (restart_state.cmpxchgStrong(2, 1, .acq_rel, .acquire) == null) {
-                        retries = 0;
-                        continue;
-                    }
-                    return;
-                }
-
-                retries += 1;
-                if (start_error) |err| {
-                    if (retries == 1 or std.math.isPowerOfTwo(retries)) {
-                        std.log.warn("{s} runtime restart retry attempt={} err={s}", .{
-                            @tagName(work.kind),
-                            retries,
-                            @errorName(err),
-                        });
-                    }
-                }
-                // A paused runtime is owned by a subsequent structural
-                // mutation. Wait without starting it behind that mutation.
-                if (work.ctx.io) |io| {
-                    const shift: u6 = @intCast(@min(retries - 1, 5));
-                    const delay_ms = if (builtin.is_test) 1 else @min(retry_initial_ms << shift, retry_max_ms);
-                    io.sleep(std.Io.Duration.fromMilliseconds(delay_ms), .awake) catch {};
-                } else {
-                    restart_state.store(0, .release);
-                    return error.MaintenanceRuntimeUnavailable;
-                }
-                if (retries >= retries_per_job) {
-                    // Yield the shared durable lane during persistent failure;
-                    // the desired-running bit makes resubmission idempotent.
-                    restart_state.store(0, .release);
-                    scheduleMaintenanceRestartContext(work.ctx, work.lane, work.owner_id, work.kind);
-                    return;
-                }
-            }
-        }
-
-        fn deinit(ptr: *anyopaque) void {
-            const work: *@This() = @ptrCast(@alignCast(ptr));
-            std.heap.page_allocator.destroy(work);
-        }
-    };
-
-    fn scheduleMaintenanceRestartContext(
-        ctx: *AsyncContext,
-        lane: background_runtime_mod.DurableJobLane,
-        owner_id: u64,
-        kind: MaintenanceRuntimeKind,
-    ) void {
-        if (ctx.background_closing.load(.acquire)) return;
-        const restart_state = maintenanceRestartState(ctx, kind);
-        if (restart_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
-            _ = restart_state.cmpxchgStrong(1, 2, .acq_rel, .acquire);
-            return;
-        }
-        const work = std.heap.page_allocator.create(MaintenanceRestartWork) catch {
-            restart_state.store(0, .release);
-            return;
+    const MaintenanceRuntimeKind = enum { text_merge, sparse_compaction };
+    fn restartWanted(_: *anyopaque) bool {
+        return true;
+    }
+    fn attemptTextMergeRestart(ptr: *anyopaque) !bool {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        return if (ctx.text_merge_runtime) |runtime| try runtime.ensureRunning() else true;
+    }
+    fn attemptSparseCompactionRestart(ptr: *anyopaque) !bool {
+        const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+        return if (ctx.sparse_compaction_runtime) |runtime| try runtime.ensureRunning() else true;
+    }
+    fn scheduleMaintenanceRestartContext(ctx: *AsyncContext, lane: background_runtime_mod.DurableJobLane, owner_id: u64, kind: MaintenanceRuntimeKind) void {
+        const owner = switch (kind) {
+            .text_merge => &ctx.text_merge_restart_owner,
+            .sparse_compaction => &ctx.sparse_compaction_restart_owner,
         };
-        work.* = .{ .ctx = ctx, .lane = lane, .owner_id = owner_id, .kind = kind };
-        lane.submit(.{
-            .owner_id = owner_id,
-            .class = .maintenance,
-            .ptr = work,
-            .run = MaintenanceRestartWork.run,
-            .deinit = MaintenanceRestartWork.deinit,
-        }) catch |err| {
-            std.heap.page_allocator.destroy(work);
-            restart_state.store(0, .release);
-            std.log.warn("{s} runtime restart was not scheduled err={s}", .{ @tagName(kind), @errorName(err) });
-        };
+        owner.schedule(.{ .ptr = ctx, .lane = lane, .owner_id = owner_id, .io = ctx.io, .closing = &ctx.background_closing, .wanted = restartWanted, .attempt = switch (kind) {
+            .text_merge => attemptTextMergeRestart,
+            .sparse_compaction => attemptSparseCompactionRestart,
+        }, .name = @tagName(kind) });
     }
 
     fn quiesceEnrichmentForStructuralMutation(self: *DB) bool {
@@ -16261,33 +15635,6 @@ pub const DB = struct {
         errdefer alloc.free(result);
         try row_policy_lease.checkAt(@intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)));
         return result;
-    }
-
-    pub fn getGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64) !?u64 {
-        const key = try groupCreatedAtMetadataKeyAlloc(alloc, group_id);
-        defer alloc.free(key);
-        const raw = try self.get(alloc, key) orelse return null;
-        defer alloc.free(raw);
-        return try std.fmt.parseInt(u64, raw, 10);
-    }
-
-    pub fn ensureGroupCreatedAtMillis(self: *DB, alloc: Allocator, group_id: u64, now_ms: u64) !u64 {
-        if (try self.getGroupCreatedAtMillis(alloc, group_id)) |created_at_millis| return created_at_millis;
-
-        const key = try groupCreatedAtMetadataKeyAlloc(alloc, group_id);
-        defer alloc.free(key);
-        const encoded = try std.fmt.allocPrint(alloc, "{d}", .{now_ms});
-        defer alloc.free(encoded);
-
-        try self.batch(.{
-            .writes = &.{
-                .{
-                    .key = key,
-                    .value = encoded,
-                },
-            },
-        });
-        return now_ms;
     }
 
     pub fn getArtifact(self: *DB, alloc: Allocator, artifact_id: []const u8) !?types.ArtifactRecord {
@@ -18286,13 +17633,7 @@ pub const DB = struct {
     /// boundaries.
     pub const IndexRepairWake = types.IndexRepairWake;
 
-    pub const IndexRepairIntentSummary = struct {
-        runnable: usize = 0,
-        paused: usize = 0,
-        terminal: usize = 0,
-        earliest_retry_at_ms: u64 = 0,
-        wake: IndexRepairWake = .empty,
-    };
+    pub const IndexRepairIntentSummary = @import("index_repair_scheduler.zig").Summary;
 
     /// Requires index_repair_scheduler_mutex.
     fn publishIndexRepairProgressWaitHint(ctx: *AsyncContext) void {
@@ -42134,7 +41475,7 @@ pub const DB = struct {
         if (desired and !started) {
             // While lifecycle owns the runtime pointer, expose the persisted
             // snapshot as a supervised transition rather than a fatal worker.
-            const supervised = !lifecycle_locked or self.async_context.enrichment_restart_state.load(.acquire) != 0;
+            const supervised = !lifecycle_locked or self.async_context.enrichment_restart_owner.state.load(.acquire) != 0;
             enrichment_status.retrying = supervised;
             enrichment_status.worker_failed = !supervised;
             enrichment_status.projection_checkpoint_status = if (supervised) "retrying" else "failed";
@@ -66523,12 +65864,12 @@ test "native publication finalization forwards raced source completion" {
         .index_manager = undefined,
         .apply_mutex = &apply_mutex,
         .io = io,
-        .native_publication_enabled = true,
+        .native_projection_owner = .{ .enabled = true },
     };
     defer ctx.deinit(alloc);
     // Keep an owned task installed without a consumer racing the observation.
     // Its only purpose is to exercise the real scheduler's wakeup path.
-    ctx.native_publication_future = try io.concurrent(struct {
+    ctx.native_projection_owner.future = try io.concurrent(struct {
         fn run() void {}
     }.run, .{});
     var guard = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
@@ -66536,15 +65877,15 @@ test "native publication finalization forwards raced source completion" {
     try std.testing.expect(!tryClaimOrRequestDenseProjectionFinalizationLocked(&ctx));
     guard.unlock();
     finishDenseProjectionFinalization(&ctx);
-    try std.testing.expect(ctx.native_publication_wake.isSet());
+    try std.testing.expect(ctx.native_projection_owner.wake.isSet());
     try std.testing.expect(!ctx.dense_projection_finalization_requested);
     try std.testing.expect(!ctx.dense_projection_finalizing.load(.acquire));
-    ctx.native_publication_wake.reset();
+    ctx.native_projection_owner.wake.reset();
     guard = lockAtomicWithBackoffProfiled(&ctx.dense_finish_mutex, &ctx.stats.dense_finish_mutex);
     try std.testing.expect(tryClaimOrRequestDenseProjectionFinalizationLocked(&ctx));
     guard.unlock();
     finishDenseProjectionFinalization(&ctx);
-    try std.testing.expect(!ctx.native_publication_wake.isSet());
+    try std.testing.expect(!ctx.native_projection_owner.wake.isSet());
 }
 
 test "external dense bulk waiter owns admission across catch-up handoff" {
@@ -80232,61 +79573,15 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
 /// by-value wrapper moves. The catalog read pin protects lifetime, not primary
 /// write admission; no apply or mutation lock is held across file staging.
 fn scheduleNativeProjectionMaintenance(ctx: *AsyncContext) void {
-    if (!ctx.native_publication_enabled or ctx.background_closing.load(.acquire)) return;
     const io = ctx.io orelse return;
-    if (!ctx.native_publication_mutex.tryLock()) return;
-    defer ctx.native_publication_mutex.unlock();
-    if (ctx.background_closing.load(.acquire)) return;
-    if (ctx.native_publication_future == null) {
-        ctx.native_publication_future = io.concurrent(nativeProjectionMaintenanceMain, .{ctx}) catch |err| {
-            std.log.warn("native projection maintenance admission deferred err={s}", .{@errorName(err)});
-            return;
-        };
-    }
-    ctx.native_publication_wake.set(io);
+    ctx.native_projection_owner.schedule(.{ .ptr = ctx, .io = io, .closing = &ctx.background_closing, .round = nativeProjectionRound });
 }
-
+fn nativeProjectionRound(ptr: *anyopaque) !bool {
+    return nativeProjectionMaintenanceRound(@ptrCast(@alignCast(ptr)));
+}
 fn stopNativeProjectionMaintenance(ctx: *AsyncContext) void {
-    const io = ctx.io orelse return;
     ctx.background_closing.store(true, .release);
-    lockAtomic(&ctx.native_publication_mutex);
-    const future = ctx.native_publication_future;
-    ctx.native_publication_future = null;
-    ctx.native_publication_mutex.unlock();
-    ctx.native_publication_wake.set(io);
-    if (future) |owned| {
-        var join = owned;
-        join.await(io);
-    }
-}
-
-fn nativeProjectionMaintenanceMain(ctx: *AsyncContext) void {
-    const io = ctx.io.?;
-    while (!ctx.background_closing.load(.acquire)) {
-        ctx.native_publication_wake.waitUncancelable(io);
-        ctx.native_publication_wake.reset();
-        while (!ctx.background_closing.load(.acquire)) {
-            const pending = nativeProjectionMaintenanceRound(ctx) catch |err| blk: {
-                std.log.warn("native projection maintenance deferred err={s}", .{@errorName(err)});
-                // Durable WAL/source coverage remains the recovery authority.
-                // Capacity can return without another source write, so retain
-                // the retry wakeup on this bounded background timer.
-                break :blk switch (err) {
-                    error.ResourceBudgetExceeded,
-                    error.OutOfMemory,
-                    error.WriterLocked,
-                    error.PostingCheckpointCaptureActive,
-                    error.PostingCheckpointSequenceMismatch,
-                    error.VectorBlockSnapshotAdvancedWithoutWal,
-                    error.VectorBlockGenerationReservationLost,
-                    => true,
-                    else => false,
-                };
-            };
-            if (!pending) break;
-            io.sleep(std.Io.Duration.fromMilliseconds(50), .awake) catch return;
-        }
-    }
+    ctx.native_projection_owner.stop(ctx.io orelse return);
 }
 
 fn nativeProjectionMaintenanceRound(ctx: *AsyncContext) !bool {
@@ -88810,8 +88105,8 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         const stored_public_v1 = try db.core.store.get(alloc, public_v1_key);
         defer alloc.free(stored_public_v1);
         try std.testing.expectEqualStrings(schema_json, stored_public_v1);
-        try std.testing.expectEqual(@as(u64, 1234), try db.ensureGroupCreatedAtMillis(alloc, 7, 1234));
-        try std.testing.expectEqual(@as(?u64, 1234), try db.getGroupCreatedAtMillis(alloc, 7));
+        try std.testing.expectEqual(@as(u64, 1234), try @import("../server_group_metadata.zig").ensureGroupCreatedAtMillis(&db, alloc, 7, 1234));
+        try std.testing.expectEqual(@as(?u64, 1234), try @import("../server_group_metadata.zig").getGroupCreatedAtMillis(&db, alloc, 7));
         try db.addIndex(.{ .name = "ft_rows", .kind = .full_text, .config_json = "{}" });
 
         try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .writes = &.{.{
@@ -88875,7 +88170,7 @@ test "db relational mode stores authoritative packed rows across reopen scan and
         try std.testing.expectEqual(@as(u64, 1), db.core.table_catalog.row_count);
         const raw = (try db.get(alloc, "row:a")) orelse return error.TestExpectedEqual;
         defer alloc.free(raw);
-        try std.testing.expectEqual(@as(?u64, 1234), try db.getGroupCreatedAtMillis(alloc, 7));
+        try std.testing.expectEqual(@as(?u64, 1234), try @import("../server_group_metadata.zig").getGroupCreatedAtMillis(&db, alloc, 7));
         try std.testing.expectEqualStrings(
             "{\"id\":\"a\",\"count\":9007199254740993,\"status\":\"active\",\"title\":\"replayed relational row\",\"payload\":{\"n\":0.10000000000000001}}",
             raw,
@@ -125317,172 +124612,6 @@ test "resident index repair scheduler skips deferred prefixes with bounded fair 
     try std.testing.expect(!third.repairs.items[0].audit_due);
 }
 
-test "resident index repair scheduler maintains exact aggregate wake precedence" {
-    const alloc = std.testing.allocator;
-    var directory = IndexRepairSchedulerDirectory{
-        .initialized = true,
-        .identity = .{ .db_identity = 1, .replica_id = 1, .root_generation = 1 },
-    };
-    defer directory.deinit(alloc);
-
-    const Intent = struct {
-        fn make(
-            allocator: Allocator,
-            id: u128,
-            deadline: u64,
-            automation: index_repair_state.Automation,
-        ) !index_repair_state.IndexRepairIntent {
-            return .{
-                .repair_id = id,
-                .revision = 1,
-                .db_identity = 1,
-                .group_id = 1,
-                .replica_id = 1,
-                .root_generation = 1,
-                .index_name = try std.fmt.allocPrint(allocator, "repair-{d}", .{id}),
-                .kind = .full_text,
-                .config_hash = 1,
-                .detected_sequence = 1,
-                .target_sequence = 1,
-                .started_at_ms = 1,
-                .updated_at_ms = 1,
-                .owner_epoch = 0,
-                .next_retry_at_ms = deadline,
-                .automation = automation,
-            };
-        }
-    };
-
-    var future = try Intent.make(alloc, 1, 900, .enabled);
-    defer future.deinit(alloc);
-    try directory.upsert(alloc, future, future.revision);
-    var immediate = try Intent.make(alloc, 2, 0, .enabled);
-    defer immediate.deinit(alloc);
-    try directory.upsert(alloc, immediate, immediate.revision);
-    var earlier = try Intent.make(alloc, 3, 400, .enabled);
-    defer earlier.deinit(alloc);
-    try directory.upsert(alloc, earlier, earlier.revision);
-    try std.testing.expectEqual(@as(usize, 3), directory.runnable_heap.items.len);
-    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
-
-    // Deadline churn updates one indexed heap position; it never accumulates
-    // lazy tombstones that later require an unbounded owner-side compaction.
-    for (0..4096) |i| {
-        immediate.revision += 1;
-        immediate.next_retry_at_ms = if (i % 2 == 0) 0 else 800;
-        try directory.upsert(alloc, immediate, immediate.revision);
-        try std.testing.expectEqual(@as(usize, 3), directory.runnable_heap.items.len);
-    }
-    immediate.next_retry_at_ms = 0;
-    immediate.revision += 1;
-    try directory.upsert(alloc, immediate, immediate.revision);
-
-    // Model the first selected intent deferring itself. A different immediate
-    // intent must continue to dominate the aggregate wake until it too moves.
-    future.next_retry_at_ms = 1_200;
-    future.revision += 1;
-    try directory.upsert(alloc, future, future.revision);
-    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
-    immediate.next_retry_at_ms = 700;
-    immediate.revision += 1;
-    try directory.upsert(alloc, immediate, immediate.revision);
-    try std.testing.expectEqual(@as(u64, 400), directory.wake().at_realtime_ms);
-
-    earlier.automation = .paused;
-    earlier.revision += 1;
-    try directory.upsert(alloc, earlier, earlier.revision);
-    try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
-    try std.testing.expectEqual(directory.runnable, directory.runnable_heap.items.len);
-    directory.remove(alloc, 2);
-    directory.remove(alloc, 1);
-    try std.testing.expectEqual(DB.IndexRepairWake.parked, directory.wake());
-    try std.testing.expectEqual(@as(usize, 0), directory.runnable_heap.items.len);
-
-    // A durable clear advances the materialized-view revision even though it
-    // removes the record. A delayed pre-clear upsert is then stale and cannot
-    // resurrect debt which is absent from the checkpoint. A missed event is a
-    // gap, forcing reconstruction rather than accepting a partial view.
-    directory.control_revision = 41;
-    const identity = directory.identity.?;
-    try std.testing.expectEqual(
-        IndexRepairSchedulerDirectory.ControlMutationDisposition.next,
-        directory.classifyControlMutation(identity, 42),
-    );
-    directory.control_revision = 42;
-    try std.testing.expectEqual(
-        IndexRepairSchedulerDirectory.ControlMutationDisposition.stale,
-        directory.classifyControlMutation(identity, 41),
-    );
-    try std.testing.expectEqual(
-        IndexRepairSchedulerDirectory.ControlMutationDisposition.gap,
-        directory.classifyControlMutation(identity, 44),
-    );
-}
-
-test "resident index repair progress waits are revision scoped and event driven" {
-    const alloc = std.testing.allocator;
-    var directory = IndexRepairSchedulerDirectory{
-        .initialized = true,
-        .identity = .{ .db_identity = 1, .replica_id = 1, .root_generation = 1 },
-    };
-    defer directory.deinit(alloc);
-
-    var intent = index_repair_state.IndexRepairIntent{
-        .repair_id = 17,
-        .revision = 1,
-        .db_identity = 1,
-        .group_id = 1,
-        .replica_id = 1,
-        .root_generation = 1,
-        .index_name = try alloc.dupe(u8, "semantic_idx"),
-        .kind = .dense_vector,
-        .config_hash = 9,
-        .detected_sequence = 1,
-        .target_sequence = 20,
-        .started_at_ms = 1,
-        .updated_at_ms = 1,
-        .owner_epoch = 0,
-    };
-    defer intent.deinit(alloc);
-    try directory.upsert(alloc, intent, intent.revision);
-
-    try std.testing.expect(directory.deferForProgress(17, 1, 20, 500));
-    try std.testing.expectEqual(@as(usize, 1), directory.progress_waiters);
-    try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
-    // An idempotent durable projection must not erase a resident wait.
-    try directory.upsert(alloc, intent, intent.revision);
-    try std.testing.expectEqual(@as(u64, 500), directory.wake().at_realtime_ms);
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 10) == null);
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 19) == null);
-    const progress_wake = directory.wakeForIndexProgress("semantic_idx", 20) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u128, 17), progress_wake.repair_id);
-    try std.testing.expectEqual(@as(u64, 1), progress_wake.revision);
-    try std.testing.expectEqual(index_repair_state.WorkClass.repair, progress_wake.work_class);
-    try std.testing.expectEqual(@as(u64, 9), progress_wake.config_hash);
-    try std.testing.expectEqual(@as(u64, 1), progress_wake.root_generation);
-    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
-    try std.testing.expectEqual(DB.IndexRepairWake.immediate, directory.wake());
-    try std.testing.expect(directory.wakeForIndexProgress("unrelated", 99) == null);
-
-    try std.testing.expect(directory.deferForProgress(17, 1, 30, 600));
-    intent.revision += 1;
-    intent.next_retry_at_ms = 700;
-    try directory.upsert(alloc, intent, intent.revision);
-    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
-    try std.testing.expectEqual(@as(u64, 700), directory.wake().at_realtime_ms);
-    // A delayed event from the prior revision cannot wake the new schedule.
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", 12) == null);
-
-    // Once replay is at its durable target, corpus coverage—not another
-    // watermark increment—is the remaining completion proof. The bounded
-    // audit must therefore ignore arbitrarily high progress notifications.
-    try std.testing.expect(directory.deferForAudit(17, 2, 800));
-    try std.testing.expectEqual(@as(usize, 0), directory.progress_waiters);
-    try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
-    try std.testing.expect(directory.wakeForIndexProgress("semantic_idx", std.math.maxInt(u64)) == null);
-    try std.testing.expectEqual(@as(u64, 800), directory.wake().at_realtime_ms);
-}
-
 test "index repair intent string replacement is allocation failure safe" {
     const alloc = std.testing.allocator;
     var path_tmp = try TestDirectory.init("db");
@@ -136028,8 +135157,8 @@ test "db structural mutation autonomously retries transient maintenance restart 
     for (0..500) |_| {
         if (text_runtime.isStarted() and
             sparse_runtime.isStarted() and
-            db.async_context.text_merge_restart_state.load(.acquire) == 0 and
-            db.async_context.sparse_compaction_restart_state.load(.acquire) == 0)
+            db.async_context.text_merge_restart_owner.state.load(.acquire) == 0 and
+            db.async_context.sparse_compaction_restart_owner.state.load(.acquire) == 0)
         {
             recovered = true;
             break;
@@ -154762,7 +153891,7 @@ test "db graph endpoint cleanup pages progress after standalone ttl without anot
     defer directory.cleanup();
     const db = try DB.openOwned(alloc, directory.path(), .{ .start_index_workers = false });
     defer db.closeOwned();
-    try std.testing.expect(db.graph_cleanup_worker != null);
+    try std.testing.expect(db.graph_cleanup_owner.registration != null);
     try db.setSchema(.{ .version = 1, .default_type = "_default", .ttl_duration_ns = std.time.ns_per_s });
     try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
     try db.batch(.{ .writes = &.{.{ .key = "hub", .value = "{}" }}, .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R" }}, .timestamp_ns = currentTimeNs() - 2 * std.time.ns_per_s, .sync_level = .full_index });

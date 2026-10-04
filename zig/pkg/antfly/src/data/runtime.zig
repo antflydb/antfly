@@ -12,6 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const replication_ingress = @import("../storage/db/replication_ingress.zig");
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
@@ -20499,7 +20500,7 @@ pub const DataServer = struct {
         if (status.created_at_millis == 0) {
             if (comptime control_only_storage_sources) return;
             if (db) |ptr| {
-                status.created_at_millis = (ptr.getGroupCreatedAtMillis(self.alloc, group_id) catch null) orelse 0;
+                status.created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(ptr, self.alloc, group_id) catch null) orelse 0;
             }
         }
     }
@@ -29305,7 +29306,7 @@ fn collectLocalGroupStatusFromDb(
     const source_doc_count = controlPlaneDocumentCount(stats);
 
     const now_realtime_ms = platform_clock.Clock.real().nowRealtimeMs();
-    const created_at_millis = (try db.getGroupCreatedAtMillis(alloc, group_id)) orelse now_realtime_ms;
+    const created_at_millis = (try server_group_metadata.getGroupCreatedAtMillis(db, alloc, group_id)) orelse now_realtime_ms;
     const readiness = derivePublishedGroupReadiness(
         group_id,
         snapshot_stores,

@@ -75,11 +75,17 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             "raft_applied_entry_marker",
             "HAMirrorUnavailable",
             "primary_ha",
+            "getGroupCreatedAtMillis",
+            "ensureGroupCreatedAtMillis",
         ):
             for path in (
                 "storage/db/replication_contract.zig",
                 "storage/db/commit_integration.zig",
                 "storage/db/db.zig",
+                "storage/db/index_repair_scheduler.zig",
+                "storage/db/graph_cleanup_owner.zig",
+                "storage/db/native_projection_owner.zig",
+                "storage/db/runtime_restart_owner.zig",
             ):
                 with (
                     self.subTest(token=token, path=path),

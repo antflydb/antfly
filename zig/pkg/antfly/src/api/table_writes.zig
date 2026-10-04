@@ -12,6 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
 const server_document_child_range = @import("../storage/server_document_child_range.zig");
 const server_query_visibility = @import("../storage/server_query_visibility.zig");
 const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
@@ -15852,14 +15853,14 @@ pub const ProvisionedTableWriteSource = struct {
                         status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                         status.source_vectors = owned.db.sourceVectorStats() catch status.source_vectors;
                         if (status.created_at_millis == 0) {
-                            status.created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0;
+                            status.created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(owned.db, alloc, group_id) catch null) orelse 0;
                         }
                         break :blk status;
                     }
                 }
                 var status = runtime_status.LocalTableRuntimeStatus{
                     .group_id = group_id,
-                    .created_at_millis = (owned.db.getGroupCreatedAtMillis(alloc, group_id) catch null) orelse 0,
+                    .created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(owned.db, alloc, group_id) catch null) orelse 0,
                     .source_vectors = owned.db.sourceVectorStats() catch return error.WriterLocked,
                     .stats = try owned.db.runtimeStatusStatsConsistent(alloc),
                     .lsm_storage_stats = lsmStorageStatsFromDb(owned.db),
@@ -15890,7 +15891,7 @@ pub const ProvisionedTableWriteSource = struct {
                 status.lsm_storage_stats = lsmStorageStatsFromDb(owned.db);
                 status.source_vectors = owned.db.sourceVectorStats() catch status.source_vectors;
                 if (status.created_at_millis == 0) {
-                    status.created_at_millis = (owned.db.getGroupCreatedAtMillis(std.heap.page_allocator, group_id) catch null) orelse 0;
+                    status.created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(owned.db, std.heap.page_allocator, group_id) catch null) orelse 0;
                 }
             },
         }
