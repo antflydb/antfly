@@ -168,6 +168,10 @@ test {
     }
     if (build_options.enable_metal) {
         _ = metal_executor;
+        // compiled_registry uses lazy backend declarations; import the Metal
+        // implementation directly so its file-local dispatch tests belong to
+        // the inference test binary.
+        _ = @import("compiled_metal.zig");
     }
     _ = execution;
     _ = onnx_kv_cache;

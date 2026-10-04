@@ -43,7 +43,10 @@ pub fn addCommands(ctx: Context, install_default: bool) *std.Build.Step.Compile 
 
     const bench_server = b.addExecutable(.{
         .name = "antfly-inference-bench-server",
-        .max_rss = @as(usize, if (ctx.hasAccelerator()) 7 else 6) * 1024 * 1024 * 1024,
+        // The Metal HTTP server's compiler peak exceeds 7 GiB on macOS.
+        // Match the macOS inference-test allowance so a successful compile
+        // is not rejected by the build scheduler's declared resource bound.
+        .max_rss = @as(usize, if (ctx.target.result.os.tag == .macos and ctx.backend.enable_metal) 14 else if (ctx.hasAccelerator()) 7 else 6) * 1024 * 1024 * 1024,
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/benchmark_server.zig"),
             .target = ctx.target,

@@ -815,6 +815,35 @@ pub fn graphForwardCompiledModelGreedyToken(
     );
 }
 
+/// Executes a capability-qualified sampled decode through the compiled
+/// whole-model runtime. A null result means the request was rejected before
+/// any model frame was submitted. Errors after submission propagate to the
+/// caller; this function never replays the forward through another path.
+pub fn graphForwardCompiledModelSampledToken(
+    pipeline: anytype,
+    cache: *cache_mod.GraphCache,
+    request: model_runtime.SampledDecodeRequest,
+) !?i64 {
+    const backend = pipeline.compiled_partition_backend orelse return null;
+    if (pipeline.compiled_attachment_target != .whole_model) return null;
+    const backend_def = compiledBackendDefinition(backend) orelse return null;
+    if (backend_def.model_runtime_strategy == .none) return null;
+    const execute_direct = backend_def.execute_model_sample_direct orelse return null;
+
+    const attach_context = compiledBackendAttachContext(
+        pipeline,
+        backend,
+        request.decode.attention_mode,
+    );
+    return try execute_direct(
+        pipeline.allocator,
+        cache,
+        attach_context,
+        .single_device,
+        request,
+    );
+}
+
 test "shouldUsePartitionedGraphExecution requires explicit sharding config" {
     const allocator = std.testing.allocator;
     const fake_cb_a = @as(*const ops.ComputeBackend, @ptrFromInt(0x1000));

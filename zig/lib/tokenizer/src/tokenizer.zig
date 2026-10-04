@@ -74,6 +74,9 @@ pub const Tokenizer = struct {
         encodeIntoParallelStable: ?*const fn (ptr: *anyopaque, io: std.Io, allocator: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32), max_tasks: usize, stable_input_id: u64) anyerror!void = null,
         /// Encode text with model wrapping such as [CLS]/[SEP], optionally including offsets.
         encodeForModel: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult,
+        /// Optional dynamic-length encoding with the same model wrap. Keeps
+        /// one inactive slot when possible for a caller-supplied trailing EOS.
+        encodeForModelUnpadded: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!EncodeResult = null,
         /// Encode text for causal generation, optionally with BOS-aware start-of-sequence semantics.
         encodeGeneration: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!EncodeResult,
         /// Decode token IDs back to text.
@@ -195,6 +198,12 @@ pub const Tokenizer = struct {
     /// Returns token IDs and attention mask.
     pub fn encodeForModel(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, max_length: usize) !EncodeResult {
         return self.vtable.encodeForModel(self.ptr, allocator, text, max_length);
+    }
+
+    pub fn encodeForModelUnpadded(self: Tokenizer, allocator: std.mem.Allocator, text: []const u8, max_length: usize) !EncodeResult {
+        if (self.vtable.encodeForModelUnpadded) |encode_unpadded|
+            return encode_unpadded(self.ptr, allocator, text, max_length);
+        return self.encodeForModel(allocator, text, max_length);
     }
 
     /// Encode text for causal generation without implicitly appending an EOS/SEP token.

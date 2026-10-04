@@ -209,6 +209,20 @@ pub const ModelManifestDeclarations = struct {
     embedding_style: bool = false,
 };
 
+fn cloneManifestStrings(allocator: std.mem.Allocator, strings: []const []const u8) ![][]const u8 {
+    const copy = try allocator.alloc([]const u8, strings.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (copy[0..initialized]) |bytes| allocator.free(bytes);
+        allocator.free(copy);
+    }
+    for (strings, copy) |bytes, *owned| {
+        owned.* = try allocator.dupe(u8, bytes);
+        initialized += 1;
+    }
+    return copy;
+}
+
 pub const Sparse3DOutputLayout = enum {
     batch_seq,
     seq_batch,
@@ -399,6 +413,54 @@ pub const ModelManifest = struct {
             .position_id_mode = position_id_mode,
         };
         return config.maxSequenceLength();
+    }
+
+    /// Copy resolved metadata without reopening artifacts or retaining the
+    /// runtime publication. The copy owns every string, list, and receipt.
+    pub fn clone(self: *const ModelManifest, allocator: std.mem.Allocator) !ModelManifest {
+        var copy = self.*;
+        copy.allocator = allocator;
+        // Clear owned fields before installing any fallible copies, so an
+        // allocation failure cannot free storage belonging to the source.
+        inline for (@typeInfo(ModelManifest).@"struct".fields) |field| {
+            if (field.type == []const u8) {
+                @field(copy, field.name) = "";
+            } else if (field.type == ?[]const u8 or field.type == ?[][]const u8) {
+                @field(copy, field.name) = null;
+            } else if (field.type == [][]const u8) {
+                @field(copy, field.name) = &.{};
+            }
+        }
+        copy.embedding_profile = .{ .task_contract = self.embedding_profile.task_contract };
+        copy.gliner_boundary_bundle = null;
+        errdefer copy.deinit();
+        inline for (@typeInfo(ModelManifest).@"struct".fields) |field| {
+            const value = @field(self, field.name);
+            if (field.type == []const u8) {
+                if (value.len > 0) @field(copy, field.name) = try allocator.dupe(u8, value);
+            } else if (field.type == ?[]const u8) {
+                if (value) |bytes| @field(copy, field.name) = try allocator.dupe(u8, bytes);
+            } else if (field.type == [][]const u8) {
+                if (value.len > 0) @field(copy, field.name) = try cloneManifestStrings(allocator, value);
+            } else if (field.type == ?[][]const u8) {
+                if (value) |strings| @field(copy, field.name) = try cloneManifestStrings(allocator, strings);
+            }
+        }
+        copy.embedding_profile.query = .{
+            .declared = self.embedding_profile.query.declared,
+            .prefix = try allocator.dupe(u8, self.embedding_profile.query.prefix),
+        };
+        copy.embedding_profile.document = .{
+            .declared = self.embedding_profile.document.declared,
+            .prefix = try allocator.dupe(u8, self.embedding_profile.document.prefix),
+        };
+        copy.embedding_profile.instruction_template = try allocator.dupe(u8, self.embedding_profile.instruction_template);
+        if (self.gliner_boundary_bundle) |receipt| {
+            const bytes = try std.json.Stringify.valueAlloc(allocator, receipt.value, .{});
+            defer allocator.free(bytes);
+            copy.gliner_boundary_bundle = try boundary_bundle.parse(allocator, bytes);
+        }
+        return copy;
     }
 
     pub fn deinit(self: *ModelManifest) void {
@@ -1930,6 +1992,21 @@ fn applyGgufTokenizerMetadata(
             }
             if (std.mem.eql(u8, arch, "qwen3")) {
                 var key_buf: [64]u8 = undefined;
+                // Decoder GGUFs are not parsed by the BERT metadata reader.
+                // Use the selected artifact's geometry for output dimensions
+                // and run admission rather than retaining BERT-era defaults.
+                inline for (.{
+                    .{ "embedding_length", "hidden_size" },
+                    .{ "feed_forward_length", "intermediate_size" },
+                    .{ "block_count", "num_hidden_layers" },
+                    .{ "attention.head_count", "num_attention_heads" },
+                }) |field| {
+                    const geometry_key = std.fmt.bufPrint(&key_buf, "{s}.{s}", .{ arch, field[0] }) catch unreachable;
+                    if (view.getU64(geometry_key)) |value| {
+                        if (value > 0 and value <= std.math.maxInt(u32))
+                            @field(manifest.*, field[1]) = @intCast(value);
+                    }
+                }
                 // Without this the manifest keeps its BERT-era default of 512
                 // and maxTextSequenceLength() silently truncates long
                 // embedding inputs to 512 tokens.
@@ -6883,6 +6960,10 @@ test "qwen3 embedding GGUF metadata configures last pooling and full context" {
     try std.testing.expectEqualStrings("qwen3", manifest.config_model_arch);
     try std.testing.expectEqual(ModelType.embedder, manifest.model_type);
     try std.testing.expectEqual(EmbeddingStyle.qwen3_embedding, manifest.embedding_style);
+    try std.testing.expectEqual(@as(u32, 1024), manifest.hidden_size);
+    try std.testing.expectEqual(@as(u32, 3072), manifest.intermediate_size);
+    try std.testing.expectEqual(@as(u32, 28), manifest.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 16), manifest.num_attention_heads);
     try std.testing.expect(manifest.normalize);
     // qwen3.context_length must reach maxTextSequenceLength(); the BERT-era
     // 512 default would silently truncate long embedding inputs.
@@ -7082,9 +7163,13 @@ fn buildTestGgufWithQwen3Pooling(allocator: std.mem.Allocator, pooling_type: u32
     try data.appendSlice(allocator, gguf_format.magic);
     try appendTestLe(u32, allocator, &data, 3);
     try appendTestLe(u64, allocator, &data, 0);
-    try appendTestLe(u64, allocator, &data, 9);
+    try appendTestLe(u64, allocator, &data, 13);
 
     try appendTestMetadataString(allocator, &data, "general.architecture", "qwen3");
+    try appendTestMetadataU32(allocator, &data, "qwen3.embedding_length", 1024);
+    try appendTestMetadataU32(allocator, &data, "qwen3.feed_forward_length", 3072);
+    try appendTestMetadataU32(allocator, &data, "qwen3.block_count", 28);
+    try appendTestMetadataU32(allocator, &data, "qwen3.attention.head_count", 16);
     try appendTestMetadataU32(allocator, &data, "qwen3.context_length", 32768);
     try appendTestMetadataU32(allocator, &data, "qwen3.pooling_type", pooling_type);
     try appendTestMetadataString(allocator, &data, "tokenizer.ggml.model", "gpt2");
@@ -7391,4 +7476,96 @@ test "span wrapper manifest takes encoder geometry from encoder_config" {
     try std.testing.expectEqual(@as(u32, 24), manifest.num_hidden_layers);
     try std.testing.expectEqual(@as(u32, 16), manifest.num_attention_heads);
     try std.testing.expectEqual(@as(u32, 4096), manifest.intermediate_size);
+}
+
+test "manifest clone owns metadata and unwinds every allocation failure" {
+    const allocator = std.testing.allocator;
+    var strings = [_][]const u8{ "text", "" };
+    const zero = "0" ** 64;
+    const pins = [_]boundary_bundle.FilePin{
+        .{ .path = "model.safetensors", .size_bytes = 32, .sha256 = zero },
+        .{ .path = "config.json", .size_bytes = 1, .sha256 = zero },
+        .{ .path = "encoder_config/config.json", .size_bytes = 1, .sha256 = zero },
+        .{ .path = "tokenizer.json", .size_bytes = 1, .sha256 = zero },
+        .{ .path = "tokenizer_config.json", .size_bytes = 1, .sha256 = zero },
+    };
+    var output_pins = pins;
+    output_pins[0].path = boundary_bundle.model_name;
+    const receipt = boundary_bundle.Receipt{
+        .family = boundary_bundle.family,
+        .version = 1,
+        .architecture_version = 1,
+        .config_version = 3,
+        .tensor_policy_version = 1,
+        .backbone = .small,
+        .precision = .q4_0,
+        .source_files = &pins,
+        .files = &output_pins,
+    };
+    const bytes = try std.json.Stringify.valueAlloc(allocator, receipt, .{});
+    defer allocator.free(bytes);
+    var parsed = try boundary_bundle.parse(allocator, bytes);
+    defer parsed.deinit();
+    const source = ModelManifest{
+        .allocator = allocator,
+        .gguf_path = "model.gguf",
+        .config_model_arch = "qwen3",
+        .embedding_style = .qwen3_embedding,
+        .hidden_size = 1024,
+        .max_position_embeddings = 32768,
+        .normalize = false,
+        .embedding_profile = .{
+            .task_contract = .profiled,
+            .query = .{ .prefix = "Instruct: retrieve\nQuery: ", .declared = true },
+            .document = .{ .prefix = "Document: ", .declared = true },
+            .instruction_template = "Instruct: {instruction}\nQuery: ",
+        },
+        .inputs = &strings,
+        .capabilities = &strings,
+        .tasks = &strings,
+        .id2label = &strings,
+        .gliner_default_labels = &strings,
+        .gliner_relation_labels = &strings,
+        .chat_template = "{{ message }}",
+        .eos_token = "<eos>",
+        .gliner_boundary_bundle = parsed,
+    };
+    const Check = struct {
+        fn run(a: std.mem.Allocator, original: *const ModelManifest) !void {
+            var copy = try original.clone(a);
+            defer copy.deinit();
+            inline for (@typeInfo(ModelManifest).@"struct".fields) |field| {
+                const expected = @field(original, field.name);
+                const actual = @field(copy, field.name);
+                if (field.type == []const u8) {
+                    try std.testing.expectEqualStrings(expected, actual);
+                    if (expected.len > 0) try std.testing.expect(expected.ptr != actual.ptr);
+                } else if (field.type == ?[]const u8) {
+                    try std.testing.expectEqual(expected != null, actual != null);
+                    if (expected) |value| {
+                        try std.testing.expectEqualStrings(value, actual.?);
+                        if (value.len > 0) try std.testing.expect(value.ptr != actual.?.ptr);
+                    }
+                } else if (field.type == [][]const u8 or field.type == ?[][]const u8) {
+                    const expected_list = if (field.type == ?[][]const u8) expected orelse &.{} else expected;
+                    const actual_list = if (field.type == ?[][]const u8) actual orelse &.{} else actual;
+                    try std.testing.expectEqual(expected_list.len, actual_list.len);
+                    for (expected_list, actual_list) |value, owned| {
+                        try std.testing.expectEqualStrings(value, owned);
+                        if (value.len > 0) try std.testing.expect(value.ptr != owned.ptr);
+                    }
+                }
+            }
+            try std.testing.expectEqual(original.hidden_size, copy.hidden_size);
+            try std.testing.expectEqual(original.max_position_embeddings, copy.max_position_embeddings);
+            try std.testing.expectEqual(original.normalize, copy.normalize);
+            try std.testing.expectEqualDeep(original.embedding_profile, copy.embedding_profile);
+            try std.testing.expect(original.queryPrefix().ptr != copy.queryPrefix().ptr);
+            try std.testing.expectEqualDeep(original.gliner_boundary_bundle.?.value, copy.gliner_boundary_bundle.?.value);
+            try std.testing.expect(original.gliner_boundary_bundle.?.value.files.ptr != copy.gliner_boundary_bundle.?.value.files.ptr);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{&source});
+    try std.testing.expectEqualStrings("text", source.inputs[0]);
+    try std.testing.expectEqualStrings("Instruct: retrieve\nQuery: ", source.queryPrefix());
 }

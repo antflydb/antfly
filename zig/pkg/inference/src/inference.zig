@@ -207,6 +207,7 @@ test {
     _ = @import("architectures/gemma4_runtime.zig");
     _ = @import("architectures/gemma4_projector.zig");
     _ = @import("embedding_trace.zig");
+    _ = @import("pipelines/qwen_embedding_batch.zig");
     _ = @import("server/model_manager.zig");
     _ = @import("server/transcription_sessions.zig");
     _ = finetune;

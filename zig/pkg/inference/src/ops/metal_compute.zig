@@ -615,6 +615,22 @@ fn enableActiveDecodeFrame() bool {
     return !getenvBool("TERMITE_METAL_DISABLE_ACTIVE_DECODE_FRAME");
 }
 
+fn sampledNucleusFramePhaseSupported(phase: backend_contracts.DecoderRuntimeDecodePhase) bool {
+    return switch (phase) {
+        .full, .submit_only, .step => true,
+        .submit_pending, .cancel_pending, .await_only => false,
+    };
+}
+
+test "sampled nucleus frame carries its contract only while encoding" {
+    try std.testing.expect(sampledNucleusFramePhaseSupported(.full));
+    try std.testing.expect(sampledNucleusFramePhaseSupported(.submit_only));
+    try std.testing.expect(sampledNucleusFramePhaseSupported(.step));
+    try std.testing.expect(!sampledNucleusFramePhaseSupported(.submit_pending));
+    try std.testing.expect(!sampledNucleusFramePhaseSupported(.cancel_pending));
+    try std.testing.expect(!sampledNucleusFramePhaseSupported(.await_only));
+}
+
 fn enableActiveCompressedQuantBlock() bool {
     return !getenvBool("TERMITE_METAL_DISABLE_ACTIVE_COMPRESSED_QUANT_BLOCK") and
         !getenvBool("TERMITE_METAL_DISABLE_ACTIVE_COMPRESSED_Q80_BLOCK");
@@ -20717,6 +20733,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const attention_input_size = request.num_heads * request.head_dim;
         const block_scope = self.beginActivePlannedComputeScopeIfPossible(.layer, .layer);
         defer self.endActivePlannedComputeScope(block_scope);
+        var attention_region = if (request.attention.mode == .dense_causal)
+            metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention)
+        else
+            metal_runtime.ComputeRegionScope{ .runtime = null, .previous = 0, .active = false };
+        defer attention_region.deinit();
+        var ffn_region = metal_runtime.ComputeRegionScope{ .runtime = null, .previous = 0, .active = false };
+        defer ffn_region.deinit();
         var attention_linear_input = attn_out;
         var attention_linear_input_owned: ?MetalTensor = null;
         defer if (attention_linear_input_owned) |*tensor| tensor.deinit();
@@ -20794,6 +20817,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             errdefer attn_res.deinit();
             try self.maybeDumpDecodeStageTensor("attn-residual", attention_layer_index, attn_res, request.hidden_size);
             self.activePlannedComputeBarrier(residual_scope or block_scope);
+            if (request.attention.mode == .dense_causal)
+                ffn_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ffn);
             ffn_normed = (try metal_runtime.decoderRuntimeApplyFfnNormInternal(
                 self.provider_impl,
                 attn_res,
@@ -21957,6 +21982,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) anyerror!?CT {
         const trace = metalPrefillTraceRequested();
         const shape = self.denseCausalBatchShape(request) orelse return null;
+        var attention_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
+        defer attention_region.deinit();
         if (request.ple != null) {
             if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=ple\n", .{request.attention.layer_index});
             return null;
@@ -25910,6 +25937,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self: *MetalCompute,
         request: *const ops.DecoderRuntimeDecodeRequest,
         batch_inputs: *const DecodeBatchHostInputs,
+        resident_sampling_request: ?ops.DecoderRuntimeSampleResidentLogitsRequest,
         queued_token_id: *bool,
         immediate_token_id: *u32,
         queued_final_input: *?MetalTensor,
@@ -26421,7 +26449,46 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     queued_output_hidden.* = try final_hidden_mt.retainedCopy();
                 }
             }
-            if (!try metal_runtime.decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self.provider_impl, .{
+            if (resident_sampling_request) |sample_request| {
+                // Sampling replaces the greedy plan's terminal argmax. Keep
+                // final norm and LM-head in the planned encoder, then let the
+                // resident nucleus tail own the remaining encoder sequence.
+                var logits_tail_contract = planned_tail_contract;
+                const terminal_argmax: u16 = @intFromEnum(metal_command_planner.OpKind.tail_argmax);
+                if (logits_tail_contract.ops.len == 0 or
+                    logits_tail_contract.ops.len != logits_tail_contract.barriers.len or
+                    logits_tail_contract.ops.len != logits_tail_contract.quant_dispatches.len or
+                    logits_tail_contract.ops.len != logits_tail_contract.command_ops.len or
+                    logits_tail_contract.ops[logits_tail_contract.ops.len - 1] != terminal_argmax or
+                    logits_tail_contract.command_ops[logits_tail_contract.command_ops.len - 1].kind != terminal_argmax)
+                {
+                    if (trace) std.debug.print("decoder-runtime-decode: sampled-tail failure=planned-contract-no-terminal-argmax\n", .{});
+                    break :final_tail_blk;
+                }
+                const logits_op_count = logits_tail_contract.ops.len - 1;
+                logits_tail_contract.ops = logits_tail_contract.ops[0..logits_op_count];
+                logits_tail_contract.barriers = logits_tail_contract.barriers[0..logits_op_count];
+                logits_tail_contract.quant_dispatches = logits_tail_contract.quant_dispatches[0..logits_op_count];
+                logits_tail_contract.command_ops = logits_tail_contract.command_ops[0..logits_op_count];
+                var resident_logits = (try metal_runtime.decoderRuntimeEncodeRmsNormLinearLogitsDevice(self.provider_impl, .{
+                    .input = final_input,
+                    .norm_slot = request.final_norm_slot,
+                    .linear_slot = request.final_lm_head_slot,
+                    .hidden_size = request.hidden_size,
+                    .eps = request.norm_eps,
+                    .out_dim = request.vocab_size,
+                    .use_transformed_lm_head = false,
+                    .planned_layer_contract = logits_tail_contract,
+                })) orelse {
+                    if (trace) std.debug.print("decoder-runtime-decode: sampled-tail failure=lm-head-logits\n", .{});
+                    break :final_tail_blk;
+                };
+                defer resident_logits.deinit();
+                if (!metal_runtime.decoderRuntimeEncodeSampleResidentLogits(self.provider_impl, sample_request)) {
+                    if (trace) std.debug.print("decoder-runtime-decode: sampled-tail failure=nucleus-encode\n", .{});
+                    break :final_tail_blk;
+                }
+            } else if (!try metal_runtime.decoderRuntimeEncodeRmsNormLinearArgmaxDevice(self.provider_impl, .{
                 .input = final_input,
                 .norm_slot = request.final_norm_slot,
                 .linear_slot = request.final_lm_head_slot,
@@ -26610,7 +26677,38 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.timing_stats.active_decode_frame_attempts += 1;
         const runtime = self.provider_impl.raw_decode_runtime orelse return false;
         if (metal_runtime.termite_metal_decode_runtime_ready(runtime) == 0) return false;
-        if (request.mode != .greedy_argmax) return false;
+        var resident_sampling_request: ?ops.DecoderRuntimeSampleResidentLogitsRequest = null;
+        switch (request.mode) {
+            .greedy_argmax => if (request.sampling != null) return false,
+            .sampled_nucleus => {
+                if (!sampledNucleusFramePhaseSupported(request.phase)) return false;
+                if (request.suppress_token_ids.len != 0) return false;
+                const sampling = request.sampling orelse return false;
+                // This mode is deliberately narrower than the generic sampler:
+                // it promises exact full-vocabulary nucleus semantics in one
+                // committed frame, with no post-submit fallback or replay.
+                if (sampling.temperature <= 0.0 or sampling.top_k != 0 or
+                    !(sampling.top_p > 0.0 and sampling.top_p < 1.0) or
+                    sampling.min_p > 0.0 or sampling.repetition_penalty != 1.0 or
+                    sampling.frequency_penalty != 0.0 or sampling.presence_penalty != 0.0) return false;
+                const sample_request: ops.DecoderRuntimeSampleResidentLogitsRequest = .{
+                    .linear_slot = request.final_lm_head_slot,
+                    .hidden_size = request.hidden_size,
+                    .out_dim = request.vocab_size,
+                    .final_logit_softcap = sampling.final_logit_softcap,
+                    .temperature = sampling.temperature,
+                    .top_k = sampling.top_k,
+                    .top_p = sampling.top_p,
+                    .min_p = sampling.min_p,
+                    .repetition_penalty = sampling.repetition_penalty,
+                    .frequency_penalty = sampling.frequency_penalty,
+                    .presence_penalty = sampling.presence_penalty,
+                    .token_history = sampling.token_history,
+                };
+                if (!metal_runtime.decoderRuntimeResidentLogitsSamplingSupported(self.provider_impl, sample_request)) return false;
+                resident_sampling_request = sample_request;
+            },
+        }
         switch (request.phase) {
             .full, .submit_only, .step => {},
             .submit_pending => {
@@ -26698,11 +26796,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .qwen3_dense_text_prefill => return false,
         }
         const active_decode_frame_requested = enableActiveDecodeFrame();
+        if (resident_sampling_request != null and !active_decode_frame_requested) return false;
         if (active_decode_frame_requested and !self.activeDecodeFrameDirectBlocksSupported(request)) {
             self.timing_stats.active_decode_frame_disabled += 1;
             return false;
         }
         if (!metal_runtime.decoderRuntimeReserveGreedyTailScratch(self.provider_impl, request.vocab_size)) {
+            self.timing_stats.active_decode_frame_scratch_failures += 1;
+            return false;
+        }
+        if (resident_sampling_request != null and
+            !metal_runtime.decoderRuntimeReserveSampleTailScratch(self.provider_impl, request.vocab_size, 0))
+        {
             self.timing_stats.active_decode_frame_scratch_failures += 1;
             return false;
         }
@@ -26731,6 +26836,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (active_decode_frame_enabled and !metal_runtime.hasActiveFrame(runtime)) {
             active_frame = try self.beginPreparedDecoderRuntimeFrame(runtime);
         }
+        if (resident_sampling_request != null and !active_frame) return false;
         errdefer self.cancelDecoderRuntimeFrame(runtime, &active_frame);
         if (request.phase != .full and !active_frame) {
             self.cancelDecoderRuntimeFrame(runtime, &active_frame);
@@ -26748,7 +26854,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer if (queued_final_input) |*tensor| tensor.deinit();
         var queued_output_hidden: ?MetalTensor = null;
         defer if (queued_output_hidden) |*tensor| tensor.deinit();
-        if (try runActiveDecoderRuntimeDecode(ctx, self, request, &batch_inputs, &queued_token_id, &immediate_token_id, &queued_final_input, &queued_output_hidden)) {
+        if (try runActiveDecoderRuntimeDecode(ctx, self, request, &batch_inputs, resident_sampling_request, &queued_token_id, &immediate_token_id, &queued_final_input, &queued_output_hidden)) {
             switch (request.phase) {
                 .submit_only => {
                     if (!active_frame or !queued_token_id) {
@@ -26772,6 +26878,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         self.cancelDecoderRuntimeFrame(runtime, &active_frame);
                         return false;
                     };
+                    if (resident_sampling_request != null and token_id >= request.vocab_size) {
+                        self.cancelDecoderRuntimeFrame(runtime, &active_frame);
+                        return error.InvalidModelOutput;
+                    }
                     request.output_token_ids[0] = @intCast(token_id);
                     active_frame = false;
                     self.timing_stats.active_decode_frame_successes += 1;
@@ -26785,6 +26895,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 (try metal_runtime.decoderRuntimeReadTokenId(self.provider_impl)) orelse return false
             else
                 @as(usize, immediate_token_id);
+            if (resident_sampling_request != null and token_id >= request.vocab_size) return false;
             request.output_token_ids[0] = @intCast(token_id);
             if (request.output_hidden) |output_hidden| {
                 var hidden_tensor = queued_output_hidden orelse return false;
@@ -28143,6 +28254,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.output_hidden.* != null) return self.declinePrefillFrameExecute(.output_hidden_set);
         const frame_plan = &(self.active_prefill_frame_plan orelse return self.declinePrefillFrameExecute(.missing_plan));
 
+        // Short rows are dominated by command/encoder overhead. Use the
+        // existing serial planned scope through attention and FFN, retaining
+        // the established barriers when concurrent dispatch is requested.
+        const short_scope = request.rows >= 9 and request.rows <= 64 and
+            metal_runtime_mod.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_Q8_0_SMALL_ROWS", true) and
+            !getenvBool("TERMITE_METAL_DISABLE_QWEN3_SMALL_ENCODER");
+        const owns_short_scope = if (short_scope) try decoderRuntimeBeginPlannedComputeScopeOp(ctx) else false;
+        defer if (owns_short_scope) decoderRuntimeEndPlannedComputeScopeOp(ctx);
+
         var hidden = request.hidden;
         var owns_hidden = false;
         defer if (owns_hidden) freeOp(ctx, hidden);
@@ -28153,6 +28273,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
         for (request.layers, 0..) |layer, layer_index| {
+            var attention_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
+            defer attention_region.deinit();
             if (request.execution_control) |control| try control.check();
             if (layer.shares_kv or layer.sliding_window != 0) return self.declinePrefillFrameExecute(.invalid_shape);
             const head_dim = layer.head_dim;
@@ -28251,6 +28373,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (metalPrefillTraceRequested()) std.debug.print("prefill-trace: qwen3-prefill-frame decline=incomplete next={d} ops={d}\n", .{ frame_cursor.next_index, frame_plan.view().ops.len });
             return self.declinePrefillFrameExecute(.plan_mismatch);
         }
+        var tail_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
+        defer tail_region.deinit();
         const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
             .slot = request.final_norm_slot,
             .input = hidden,
@@ -28858,6 +28982,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         stats.metal_runtime_generated_rms_norm_calls = runtime_stats.generated_rms_norm_calls;
         stats.metal_runtime_prepared_frame_fast_path_calls = runtime_stats.prepared_frame_fast_path_calls;
         stats.metal_runtime_prepared_frame_fallback_calls = runtime_stats.prepared_frame_fallback_calls;
+        stats.metal_runtime_full_vocab_nucleus_sample_calls =
+            metal_runtime.termite_metal_decode_runtime_full_vocab_nucleus_sample_calls(self.provider_impl.raw_decode_runtime);
         stats.metal_runtime_compute_encoder_count = runtime_stats.compute_encoder_count;
         stats.metal_runtime_blit_encoder_count = runtime_stats.blit_encoder_count;
         stats.metal_runtime_last_frame_compute_encoder_count = runtime_stats.last_frame_compute_encoder_count;
@@ -30121,6 +30247,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         });
     }
 
+    fn decoderRuntimeResidentLogitsSamplingSupportedOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeSampleResidentLogitsRequest) bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return metal_runtime.decoderRuntimeResidentLogitsSamplingSupported(self.provider_impl, request.*);
+    }
+
     fn decoderRuntimeApplyLinearPairOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearPairRequest) anyerror!?ops.LinearNoBiasPairResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
@@ -30646,6 +30777,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.reserveGraphPlanSlots = reserveGraphPlanSlotsOp;
         vt.freeTensor = freeOp;
         vt.getWeight = getWeightOp;
+        // NativeCompute's embedding hook expects a NativeCompute context;
+        // inheriting it would reinterpret MetalCompute and crash PLE lookup.
+        vt.getEmbeddingWeight = getWeightOp;
         vt.acquireWeight = acquireWeightOp;
         vt.prefetchWeightHint = prefetchWeightHintOp;
         vt.drainPrefetchBudget = drainPrefetchBudgetOp;
@@ -30902,6 +31036,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         vt.decoderRuntimeApplyRmsNormLinear = decoderRuntimeApplyRmsNormLinearOp;
         vt.decoderRuntimeApplyRmsNormLinearSample = decoderRuntimeApplyRmsNormLinearSampleOp;
         vt.decoderRuntimeSampleResidentLogits = decoderRuntimeSampleResidentLogitsOp;
+        vt.decoderRuntimeResidentLogitsSamplingSupported = decoderRuntimeResidentLogitsSamplingSupportedOp;
         vt.decoderRuntimeApplyLinearArgmax = decoderRuntimeApplyLinearArgmaxOp;
         vt.decoderRuntimeApplyLinearPair = decoderRuntimeApplyLinearPairOp;
         vt.decoderRuntimeApplyLinearQkv = decoderRuntimeApplyLinearQkvOp;
@@ -31110,6 +31245,24 @@ fn testMetalWeightStoreInit(allocator: std.mem.Allocator) WeightStore {
         .prefix = "",
         .lazy_weights = .empty,
     };
+}
+
+test "metal_compute: embedding weight lookup keeps the Metal context" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(allocator);
+    }
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    // Both handle kinds must dispatch with a MetalCompute context. Inheriting
+    // NativeCompute's embedding hook crashes before it can report MissingWeight.
+    for ([_]ops.ComputeBackend{ compute.computeBackend(), compute.ownedComputeBackend() }) |cb| {
+        try std.testing.expectError(error.MissingWeight, cb.getEmbeddingWeight("model.per_layer_input.per_layer_token_embd.weight"));
+        try std.testing.expectEqual(@as(usize, 0), compute.weight_handles.count());
+    }
 }
 
 test "metal_compute: owned backend handle destroys its request context" {
@@ -34808,6 +34961,54 @@ test "metal_compute: non-last-axis reduce sum and mean stay resident" {
         5,  6,  7,  8,
         17, 18, 19, 20,
     }, mean_data);
+}
+
+test "metal_compute: short Qwen RMS rows match host across SIMD boundaries" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var store = testMetalWeightStoreInit(allocator);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(allocator);
+    }
+    var compute = try MetalCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    var cb = compute.computeBackend();
+    const hidden: usize = 1024;
+    const eps: f32 = 1e-6;
+    var weights: [hidden]f32 = undefined;
+    for (&weights, 0..) |*value, i| value.* = 0.8 + @as(f32, @floatFromInt(i % 17)) * 0.025;
+    const weight = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&weights, &.{hidden}));
+    defer cb.free(weight);
+    for ([_]usize{ 1, 8, 9, 16, 20, 31, 32, 33, 64, 65 }) |rows| {
+        const data = try allocator.alloc(f32, rows * hidden);
+        defer allocator.free(data);
+        for (data, 0..) |*value, i| {
+            const row = i / hidden;
+            // Include zero rows and low-amplitude rows where epsilon matters.
+            const scale: f32 = if (row % 7 == 0) 0 else if (row % 7 == 1) 0.0001 else 0.015;
+            value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 127)) - 63)) * scale;
+        }
+        const input = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(data, &.{ @intCast(rows), hidden }));
+        defer cb.free(input);
+        var output: ?CT = null;
+        defer if (output) |value| cb.free(value);
+        try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+        var active = true;
+        defer if (active) cb.decoderRuntimeCancelFrame() catch {};
+        output = try cb.rmsNorm(input, weight, hidden, eps);
+        try std.testing.expect(MetalCompute.debugHasDeviceTensor(&cb, output.?));
+        try cb.decoderRuntimeSubmitAndWaitFrame();
+        active = false;
+        const actual = try cb.toFloat32(output.?, allocator);
+        defer allocator.free(actual);
+        const expected = try allocator.dupe(f32, data);
+        defer allocator.free(expected);
+        activations_mod.rmsNorm(expected, &weights, hidden, eps);
+        try std.testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try std.testing.expectApproxEqAbs(want, got, 3e-5);
+    }
 }
 
 test "metal_compute: lazy multiply reduce last dim stays resident" {

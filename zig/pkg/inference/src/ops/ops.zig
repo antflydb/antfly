@@ -1049,6 +1049,7 @@ pub const NativeQuantTimingStats = struct {
     metal_runtime_generated_rms_norm_calls: u64 = 0,
     metal_runtime_prepared_frame_fast_path_calls: u64 = 0,
     metal_runtime_prepared_frame_fallback_calls: u64 = 0,
+    metal_runtime_full_vocab_nucleus_sample_calls: u64 = 0,
     metal_runtime_compute_encoder_count: u64 = 0,
     metal_runtime_blit_encoder_count: u64 = 0,
     metal_runtime_last_frame_compute_encoder_count: u64 = 0,
@@ -2826,6 +2827,11 @@ pub const ComputeBackend = struct {
         /// sample-logits buffer by the most recent decode frame's fused
         /// lm-head tail.
         decoderRuntimeSampleResidentLogits: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) anyerror!?usize = null,
+
+        /// Preflight the exact resident-logits sampling contract. Backends
+        /// must return false before a decode frame is submitted when any
+        /// requested transform cannot be honored exactly.
+        decoderRuntimeResidentLogitsSamplingSupported: ?*const fn (ctx: *anyopaque, request: *const DecoderRuntimeSampleResidentLogitsRequest) bool = null,
 
         /// Upload dense linear parameters into a backend-owned whole-token
         /// runtime slot. Weight shape is [out_dim, in_dim], bias shape is
@@ -5164,6 +5170,13 @@ pub const ComputeBackend = struct {
             return op(self.ptr, request);
         }
         return null;
+    }
+
+    pub fn decoderRuntimeResidentLogitsSamplingSupported(self: *const ComputeBackend, request: *const DecoderRuntimeSampleResidentLogitsRequest) bool {
+        if (self.vtable.decoderRuntimeResidentLogitsSamplingSupported) |op| {
+            return op(self.ptr, request);
+        }
+        return false;
     }
 
     pub fn decoderRuntimePrepareLinear(self: *const ComputeBackend, request: *const DecoderRuntimePrepareLinearRequest) !bool {

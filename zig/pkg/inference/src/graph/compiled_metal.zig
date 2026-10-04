@@ -321,6 +321,20 @@ fn executeRuntimeGreedy(
     };
 }
 
+fn executeRuntimeSample(
+    allocator: std.mem.Allocator,
+    runtime: *model_runtime.ModelRuntime,
+    request: model_runtime.SampledDecodeRequest,
+) !?i64 {
+    // This is the commit boundary. Returning null is allowed only before the
+    // runtime submits a decode frame. Once decodeSample starts, every error is
+    // propagated and the caller must not replay the token through another
+    // forward path.
+    if (!runtime.supportsSampleDecodeRequest(request)) return null;
+    const sampled = try runtime.decodeSample(allocator, request);
+    return sampled.token_id;
+}
+
 fn directSessionRuntime(
     allocator: std.mem.Allocator,
     cache: *cache_mod.GraphCache,
@@ -391,6 +405,17 @@ fn executeModelGreedyDirect(
     return executeRuntimeGreedy(allocator, runtime, request, vocab_size);
 }
 
+fn executeModelSampleDirect(
+    allocator: std.mem.Allocator,
+    cache: *cache_mod.GraphCache,
+    context: compiled_backend.AttachContext,
+    mode: compiled_backend.CompileMode,
+    request: model_runtime.SampledDecodeRequest,
+) !?i64 {
+    const runtime = try directSessionRuntime(allocator, cache, context, mode) orelse return null;
+    return executeRuntimeSample(allocator, runtime, request);
+}
+
 fn prepareModelRuntimeDirect(
     allocator: std.mem.Allocator,
     cache: *cache_mod.GraphCache,
@@ -415,5 +440,83 @@ pub const backend = compiled_backend.Definition{
     .execute_model_forward_direct = &executeModelForwardDirect,
     .execute_model_forward_output_direct = &executeModelForwardOutputDirect,
     .execute_model_greedy_direct = &executeModelGreedyDirect,
+    .execute_model_sample_direct = &executeModelSampleDirect,
     .prepare_model_runtime_direct = &prepareModelRuntimeDirect,
 };
+
+test "sampled runtime declines before submission when capability rejects request" {
+    const Probe = struct {
+        decode_calls: usize = 0,
+
+        fn supports(_: *anyopaque, _: model_runtime.SampledDecodeRequest) bool {
+            return false;
+        }
+
+        fn decode(ctx: *anyopaque, _: std.mem.Allocator, _: model_runtime.SampledDecodeRequest) !model_runtime.SampledDecodeOutput {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.decode_calls += 1;
+            return .{ .token_id = 7 };
+        }
+
+        fn prefill(_: *anyopaque, _: std.mem.Allocator, _: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
+            return error.UnexpectedPrefill;
+        }
+
+        fn deinit(_: *anyopaque) void {}
+
+        const vtable = model_runtime.ModelRuntime.VTable{
+            .prefill = prefill,
+            .decode_sample = decode,
+            .supports_sample_decode_request = supports,
+            .deinit = deinit,
+        };
+    };
+
+    var probe = Probe{};
+    var runtime = model_runtime.ModelRuntime{ .ptr = &probe, .vtable = &Probe.vtable };
+    const result = try executeRuntimeSample(std.testing.allocator, &runtime, .{
+        .decode = .{ .token_id = 1, .position = 1 },
+        .sampling = .{ .temperature = 0.8, .top_p = 0.95 },
+        .token_history = &.{1},
+    });
+    try std.testing.expectEqual(@as(?i64, null), result);
+    try std.testing.expectEqual(@as(usize, 0), probe.decode_calls);
+}
+
+test "sampled runtime propagates post-commit error without replay" {
+    const Probe = struct {
+        decode_calls: usize = 0,
+
+        fn supports(_: *anyopaque, _: model_runtime.SampledDecodeRequest) bool {
+            return true;
+        }
+
+        fn decode(ctx: *anyopaque, _: std.mem.Allocator, _: model_runtime.SampledDecodeRequest) !model_runtime.SampledDecodeOutput {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.decode_calls += 1;
+            return error.InjectedPostCommitFailure;
+        }
+
+        fn prefill(_: *anyopaque, _: std.mem.Allocator, _: model_runtime.PrefillRequest) !model_runtime.ModelOutput {
+            return error.UnexpectedPrefill;
+        }
+
+        fn deinit(_: *anyopaque) void {}
+
+        const vtable = model_runtime.ModelRuntime.VTable{
+            .prefill = prefill,
+            .decode_sample = decode,
+            .supports_sample_decode_request = supports,
+            .deinit = deinit,
+        };
+    };
+
+    var probe = Probe{};
+    var runtime = model_runtime.ModelRuntime{ .ptr = &probe, .vtable = &Probe.vtable };
+    try std.testing.expectError(error.InjectedPostCommitFailure, executeRuntimeSample(std.testing.allocator, &runtime, .{
+        .decode = .{ .token_id = 1, .position = 1 },
+        .sampling = .{ .temperature = 0.8, .top_p = 0.95 },
+        .token_history = &.{1},
+    }));
+    try std.testing.expectEqual(@as(usize, 1), probe.decode_calls);
+}

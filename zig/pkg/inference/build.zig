@@ -1269,6 +1269,46 @@ pub fn build(b: *std.Build) void {
         quant_kernel_metal_local_check_step.dependOn(q4_pair_route_tail);
     }
 
+    // Focused E2B prefill qualification suite. It remains a separate local
+    // check because it allocates production-sized Q4_0 weights. Verify the
+    // qualified routes against their independently disabled baselines.
+    const e2b_q4_mm_cases = [_]struct { rows: []const u8, in_dim: []const u8, out_dim: []const u8, route: []const u8 }{
+        .{ .rows = "32", .in_dim = "1536", .out_dim = "6144", .route = "aligned" },
+        .{ .rows = "31", .in_dim = "1536", .out_dim = "12288", .route = "aligned-tail" },
+        .{ .rows = "32", .in_dim = "12288", .out_dim = "1536", .route = "aligned" },
+        .{ .rows = "31", .in_dim = "6144", .out_dim = "1536", .route = "aligned-tail" },
+    };
+    var e2b_prefill_route_tail: ?*std.Build.Step = null;
+    for (e2b_q4_mm_cases) |case| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_E2B_Q4_0_MM_SG_ALIGNED", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_E2B_Q4_0_MM_SG_ALIGNED", "0");
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "linear", "--rows", case.rows, "--in", case.in_dim, "--out", case.out_dim, "--warmup", "1", "--iters", "3", "--compare-q4-e2b-disabled-baseline", "--expect-q4-route", case.route });
+        if (e2b_prefill_route_tail) |tail| check.step.dependOn(tail);
+        e2b_prefill_route_tail = &check.step;
+    }
+    const e2b_q4_pair_cases = [_]struct { rows: []const u8, out_dim: []const u8, route: []const u8 }{
+        .{ .rows = "32", .out_dim = "6144", .route = "m32-n64-aligned" },
+        .{ .rows = "31", .out_dim = "6144", .route = "m32-n64-tail" },
+        .{ .rows = "32", .out_dim = "12288", .route = "m32-n64-aligned" },
+        .{ .rows = "31", .out_dim = "12288", .route = "m32-n64-tail" },
+    };
+    for (e2b_q4_pair_cases) |case| {
+        const check = b.addRunArtifact(metal_bench_exe);
+        check.setEnvironmentVariable("TERMITE_METAL_ENABLE_E2B_Q4_0_PAIR_ACTIVATION_MM", "1");
+        check.setEnvironmentVariable("TERMITE_METAL_DISABLE_E2B_Q4_0_PAIR_ACTIVATION_MM", "0");
+        check.addArg("--skip-unless-apple-m4");
+        check.addArgs(&.{ "--mode", "ffn", "--rows", case.rows, "--in", "1536", "--out", case.out_dim, "--warmup", "1", "--iters", "3", "--compare-q4-e2b-disabled-baseline", "--expect-q4-pair-mm-route", case.route });
+        if (e2b_prefill_route_tail) |tail| check.step.dependOn(tail);
+        e2b_prefill_route_tail = &check.step;
+    }
+    const e2b_prefill_route_check_step = b.step(
+        "bench-metal-gemma4-e2b-prefill-routes",
+        "Run E2B Q4_0 aligned linear and fused FFN prefill route qualification on Apple M4",
+    );
+    e2b_prefill_route_check_step.dependOn(e2b_prefill_route_tail.?);
+
     workflows_benches.addPagedAttention(workflow_ctx);
 
     const turboquant_distortion_bench_exe = b.addExecutable(.{

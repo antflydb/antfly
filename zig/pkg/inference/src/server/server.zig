@@ -49,6 +49,7 @@ const gpt_model_mod = @import("../models/gpt.zig");
 const model_compatibility = @import("../models/compatibility.zig");
 const chunking_mod = @import("../pipelines/chunking.zig");
 const embedding_mod = @import("../pipelines/embedding.zig");
+const metal_runtime = @import("../backends/metal_runtime.zig");
 const extraction_mod = @import("../pipelines/extraction.zig");
 const extraction_v2 = @import("../extractors/extraction_v2.zig");
 const boundary_executor = @import("../extractors/gliner_boundary_executor.zig");
@@ -2289,6 +2290,27 @@ fn countParsedDenseEmbedTextTokens(
     return total;
 }
 
+fn maxParsedDenseEmbedTextTokens(
+    allocator: std.mem.Allocator,
+    io: ?std.Io,
+    tokenizer: anytype,
+    inputs: *const ParsedDenseEmbedInputs,
+    text_prefix: []const u8,
+) !usize {
+    var maximum: usize = 0;
+    for (inputs.texts.items) |item| {
+        // Tokenize the complete rendered input: BPE can merge across the
+        // prefix/body boundary, so counting the two independently is unsafe.
+        const rendered = if (text_prefix.len > 0)
+            try std.fmt.allocPrint(allocator, "{s}{s}", .{ text_prefix, item.text })
+        else
+            item.text;
+        defer if (text_prefix.len > 0) allocator.free(rendered);
+        maximum = @max(maximum, try countTokenizerTokens(allocator, io, tokenizer, rendered));
+    }
+    return maximum;
+}
+
 test "token counting uses the attached std.Io tokenizer path" {
     const ProbeTokenizer = struct {
         serial_calls: *usize,
@@ -2384,6 +2406,37 @@ test "dense embedding token usage includes the applied text prefix" {
             "query: ",
         ),
     );
+    try std.testing.expectEqual(@as(usize, 4), try maxParsedDenseEmbedTextTokens(std.testing.allocator, null, ByteTokenizer{}, &inputs, ""));
+    try std.testing.expectEqual(@as(usize, 11), try maxParsedDenseEmbedTextTokens(std.testing.allocator, null, ByteTokenizer{}, &inputs, "query: "));
+
+    const manifest = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
+    var contract = ResolvedInferenceExecutorContract{
+        .task = "embed",
+        .batch = .{
+            .mode = .native,
+            .preferred_items = 1,
+            .max_items = 2,
+            .max_encoded_media_bytes = 0,
+            .max_decoded_pixels = null,
+            .max_media_parts_per_item = 0,
+            .per_item_failures = true,
+            .max_input_tokens_per_item = 4,
+        },
+        .accepts_text = true,
+        .accepts_image = false,
+        .accepts_audio = false,
+        .accepts_document = false,
+    };
+    try validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 4, 0);
+    try std.testing.expectError(error.InferenceInputTokensExceeded, validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 11, 7));
+    contract.batch.max_input_tokens_per_item = null;
+    contract.batch.max_text_bytes_per_item = 4;
+    try validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 4, 0);
+    try std.testing.expectError(error.InferenceTextBytesExceeded, validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 11, 7));
+    // The prefix is not a text input when a request contains only media.
+    inputs.texts.clearRetainingCapacity();
+    try std.testing.expectEqual(@as(usize, 0), try maxParsedDenseEmbedTextTokens(std.testing.allocator, null, ByteTokenizer{}, &inputs, "query: "));
+    try validateDenseEmbedExecutorInvocation(contract, &manifest, &inputs, 0, 7);
 }
 
 fn estimateParsedDenseEmbedPromptTokens(inputs: *const ParsedDenseEmbedInputs) usize {
@@ -5560,6 +5613,14 @@ pub const Node = struct {
         };
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
+        // SSE returns through streamGenerate before the ordinary response
+        // path. Keep diagnostics at this common exit so streaming benchmarks
+        // observe the same completed-frame counters as non-streaming calls.
+        defer if (debug_metal_timing) {
+            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
+                runtime_model.printDebugTiming();
+            }
+        };
         const setup_at_ns = embedTimingNowNs();
         if (timing != null) {
             std.log.info("direct generator starting generation model={s} backend={s}", .{ model_name, @tagName(model.session.backend()) });
@@ -5603,11 +5664,6 @@ pub const Node = struct {
                     std.log.info("{s}", .{session_factory.formatCudaDecodeProfileLine(&cuda_profile_line_buf, profile_delta)});
                     std.log.info("{s}", .{session_factory.formatCudaPrefillProfileLine(&cuda_profile_line_buf, profile_delta)});
                 }
-            }
-        }
-        if (debug_metal_timing) {
-            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
-                runtime_model.printDebugTiming();
             }
         }
         if (timing) |t| {
@@ -5845,11 +5901,13 @@ pub const Node = struct {
         const io = self.inferenceIo(allocator, null, &owned_io);
         const model_path = try self.resolveModelPath(io, model_name, "embedders");
         defer self.allocator.free(model_path);
+        const control = self.bindExecutionControl(io, .{});
         const Attempt = struct {
             allocator: std.mem.Allocator,
             texts: []const []const u8,
             materialize_optional_sessions: bool,
             fail_closed: bool,
+            control: InferenceExecutionControl,
 
             fn run(ctx: *anyopaque, loaded: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
@@ -5860,6 +5918,7 @@ pub const Node = struct {
                         .tok = loaded.getTokenizer(),
                         .config = sparse_embedding_mod.SparseEmbeddingConfig.fromManifest(&loaded.manifest),
                         .execution_lock = loaded.embeddingExecutionLock(),
+                        .execution_control = attempt.control,
                     };
                     const sparse = try pipeline.embed(attempt.texts);
                     defer {
@@ -5871,6 +5930,7 @@ pub const Node = struct {
                     defer asset_lease.release();
                     try loaded.ensureEmbeddingAssets(true, false, false);
                     var pipeline = loaded.embeddingPipeline(attempt.allocator);
+                    pipeline.execution_control = attempt.control;
                     const embeddings = try pipeline.embed(attempt.texts);
                     defer {
                         for (embeddings) |embedding| attempt.allocator.free(embedding);
@@ -5890,11 +5950,13 @@ pub const Node = struct {
             .texts = &texts,
             .materialize_optional_sessions = materialize_optional_sessions,
             .fail_closed = self.config.kernel_jit.mode.failClosed(),
+            .control = control,
         };
         try runLoadedEmbeddingRuntimeWithRecovery(self, model_path, .{
             .preferred_backends = if (backend) |value| singleBackendPreference(value) else null,
             .cache_default_alias = false,
             .pin_on_success = true,
+            .execution_control = control,
         }, &attempt, Attempt.run);
         std.log.info("warmed inference embedder model={s} elapsed_ms={d}", .{ model_name, elapsedMs(started_at_ns, embedTimingNowNs()) });
     }
@@ -6907,7 +6969,7 @@ pub const Node = struct {
 
         // Preserve the generic request-security errors above, then apply any
         // narrower model-specific media and item ceilings before acquisition.
-        try validateDenseEmbedExecutorInvocation(executor_contract, admission_manifest, parsed, 0);
+        try validateDenseEmbedExecutorInvocation(executor_contract, admission_manifest, parsed, 0, 0);
 
         const Attempt = struct {
             allocator: std.mem.Allocator,
@@ -6924,23 +6986,15 @@ pub const Node = struct {
             fn run(ctx: *anyopaque, model: *model_manager_mod.LoadedModel) !void {
                 const attempt: *@This() = @ptrCast(@alignCast(ctx));
                 if (model.manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
-                var max_input_tokens: usize = 0;
-                for (attempt.parsed.texts.items) |item| {
-                    max_input_tokens = @max(
-                        max_input_tokens,
-                        try countTokenizerTokens(
-                            attempt.allocator,
-                            attempt.io,
-                            model.getTokenizer(),
-                            item.text,
-                        ),
-                    );
-                }
+                const request_prefix = try denseEmbeddingTextPrefix(attempt.allocator, model, attempt.task_type, attempt.instruction);
+                defer if (request_prefix.owned) |owned| attempt.allocator.free(owned);
+                const max_input_tokens = try maxParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.parsed, request_prefix.prefix);
                 try validateDenseEmbedExecutorInvocation(
                     attempt.executor_contract,
                     &model.manifest,
                     attempt.parsed,
                     max_input_tokens,
+                    request_prefix.prefix.len,
                 );
                 if (attempt.parsed.parse_errors.items.len == 0) {
                     if (try attempt.node.tryEmbedParsedViaBroker(attempt.allocator, attempt.io, model, attempt.parsed, attempt.control, attempt.task_type, attempt.instruction, attempt.audio_decode_working_bytes)) |vectors| {
@@ -10483,9 +10537,24 @@ pub const Node = struct {
             return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(model_path);
 
-        var admission_manifest = manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
+        // Copy the warm publication's small metadata while briefly pinning it.
+        // Request validation never scans its GGUF tokenizer arrays, and the
+        // failed runtime can be reclaimed before a recovery replacement loads.
+        const cached_manifest = if (metal_runtime.qualifiedM4FeatureEnabled("TERMITE_METAL_ENABLE_QWEN3_EMBED_BATCHING", true))
+            self.model_manager.copyCachedQwenEmbeddingManifest(ctx.allocator, model_path) catch |err|
+                return modelLoadFailureResponse(ctx, err)
+        else
+            null;
+        var admission_manifest = cached_manifest orelse
+            manifest_mod.loadFromDir(ctx.allocator, model_path) catch |err|
             return modelLoadFailureResponse(ctx, err);
         defer admission_manifest.deinit();
+        validateQwen3EmbeddingDimensions(&admission_manifest, requested_dimensions) catch |err| {
+            return ctx.status(400).json(.{
+                .@"error" = "INVALID_REQUEST",
+                .message = embedRequestOptionErrorMessage(err),
+            });
+        };
         const executor_contract = resolvedInferenceExecutorContract(self, "embed", &admission_manifest) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
         const trace_resolve_finished = if (tracing) embedding_trace.now() else 0;
@@ -10642,7 +10711,7 @@ pub const Node = struct {
             audio_decode_working_bytes = audio_admission.max_decode_working_bytes;
         }
 
-        validateDenseEmbedExecutorInvocation(executor_contract, &admission_manifest, &inputs, 0) catch |err|
+        validateDenseEmbedExecutorInvocation(executor_contract, &admission_manifest, &inputs, 0, 0) catch |err|
             return inferenceExecutorContractFailureResponse(ctx, err);
 
         if (try rejectDisallowedModel(self, ctx, model_path)) |response| return response;
@@ -10713,11 +10782,8 @@ pub const Node = struct {
                     )
                 else
                     estimateParsedDenseEmbedPromptTokens(attempt.inputs);
-                var max_input_tokens: usize = 0;
-                for (attempt.inputs.texts.items) |item| {
-                    max_input_tokens = @max(max_input_tokens, try countTokenizerTokens(attempt.allocator, attempt.io, model.getTokenizer(), item.text));
-                }
-                try validateDenseEmbedExecutorInvocation(attempt.executor_contract, attempt.admission_manifest, attempt.inputs, max_input_tokens);
+                const max_input_tokens = try maxParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs, pipeline.config.text_prefix);
+                try validateDenseEmbedExecutorInvocation(attempt.executor_contract, attempt.admission_manifest, attempt.inputs, max_input_tokens, pipeline.config.text_prefix.len);
 
                 attempt.result = switch (attempt.request.error_policy) {
                     .fail_fast => .{ .fail_fast = try embedDenseInputs(
@@ -12864,6 +12930,14 @@ pub const Node = struct {
             use_model_graph_cache and
             platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
+        // Streaming returns through streamGenerate below, before the ordinary
+        // response path. Emit diagnostics from this common scope so both
+        // streaming and buffered OpenAI requests report completed counters.
+        defer if (debug_metal_timing) {
+            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
+                runtime_model.printDebugTiming();
+            }
+        };
 
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = execution_allocator,
@@ -12927,12 +13001,6 @@ pub const Node = struct {
             return generationErrorResponse(ctx, err);
         };
         defer result.deinit();
-        if (debug_metal_timing) {
-            if (model.native_generation_graph_cache.getSessionCompiledModelRuntime(.metal, .whole_model)) |runtime_model| {
-                runtime_model.printDebugTiming();
-            }
-        }
-
         var response_text = result.text;
         var tool_response_text: ?[]u8 = null;
         defer if (tool_response_text) |text| ctx.allocator.free(text);
@@ -29731,6 +29799,13 @@ fn parseRequestedEmbeddingDimensions(dimensions: ?i64) !?usize {
     return @intCast(value);
 }
 
+fn validateQwen3EmbeddingDimensions(manifest: *const manifest_mod.ModelManifest, dimensions: ?usize) !void {
+    if (manifest.embedding_style != .qwen3_embedding) return;
+    const requested = dimensions orelse return;
+    if (requested < 32 or requested > manifest.hidden_size)
+        return error.InvalidQwen3EmbeddingDimensions;
+}
+
 const ParsedEmbedRequest = struct {
     model: []const u8,
     input: std.json.Value,
@@ -29838,11 +29913,16 @@ fn validateDenseEmbedExecutorInvocation(
     manifest: *const manifest_mod.ModelManifest,
     inputs: *const ParsedDenseEmbedInputs,
     max_input_tokens: usize,
+    text_prefix_bytes: usize,
 ) !void {
     var encoded_media_bytes: usize = 0;
     var decoded_pixels: u64 = 0;
     var max_text_bytes: usize = 0;
     for (inputs.texts.items) |item| max_text_bytes = @max(max_text_bytes, item.text.len);
+    if (inputs.texts.items.len > 0) {
+        max_text_bytes = std.math.add(usize, max_text_bytes, text_prefix_bytes) catch
+            return error.InferenceTextBytesExceeded;
+    }
     for (inputs.images.items) |item| {
         encoded_media_bytes = std.math.add(usize, encoded_media_bytes, item.bytes.len) catch
             return error.InferenceEncodedBytesExceeded;
@@ -30277,6 +30357,7 @@ fn embedRequestOptionErrorMessage(err: anyerror) []const u8 {
         error.InstructionNotSupportedForModel => "instruction is only supported for instruction-aware embedding models",
         error.InstructionRequiredForEmbeddingTask => "instruction is required for this embedding task_type because the model has no task-specific default",
         error.InstructionRequiresQueryTask => "instruction requires a query-side task_type (documents are embedded without instructions)",
+        error.InvalidQwen3EmbeddingDimensions => "Qwen3-Embedding dimensions must be between 32 and the model embedding size",
         else => "invalid embedding options",
     };
 }
@@ -31527,6 +31608,26 @@ test "Antfly inference embeddings validates encoding format and dimensions" {
     try std.testing.expectEqual(@as(?usize, 128), try parseRequestedEmbeddingDimensions(128));
     try std.testing.expectError(error.InvalidEmbeddingDimensions, parseRequestedEmbeddingDimensions(0));
     try std.testing.expectError(error.InvalidEmbeddingDimensions, parseRequestedEmbeddingDimensions(-1));
+}
+
+test "qwen3 embedding dimensions enforce the published model range before execution" {
+    var manifest = manifest_mod.ModelManifest{
+        .allocator = std.testing.allocator,
+        .embedding_style = .qwen3_embedding,
+        .hidden_size = 1024,
+    };
+    try validateQwen3EmbeddingDimensions(&manifest, null);
+    for ([_]usize{ 32, 256, 1024 }) |dimensions|
+        try validateQwen3EmbeddingDimensions(&manifest, dimensions);
+    for ([_]usize{ 1, 31, 1025 }) |dimensions|
+        try std.testing.expectError(error.InvalidQwen3EmbeddingDimensions, validateQwen3EmbeddingDimensions(&manifest, dimensions));
+    // Larger Qwen models use their own output width; other embedding families
+    // retain their existing dimension contracts.
+    manifest.hidden_size = 2560;
+    try validateQwen3EmbeddingDimensions(&manifest, 2560);
+    try std.testing.expectError(error.InvalidQwen3EmbeddingDimensions, validateQwen3EmbeddingDimensions(&manifest, 2561));
+    manifest.embedding_style = .none;
+    try validateQwen3EmbeddingDimensions(&manifest, 1);
 }
 
 /// Test shim: applies request options and asserts no owned prefix escaped

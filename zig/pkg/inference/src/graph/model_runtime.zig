@@ -54,6 +54,13 @@ pub const ModelRuntime = struct {
             allocator: std.mem.Allocator,
             request: SampledDecodeRequest,
         ) anyerror!SampledDecodeOutput = null,
+        /// Returns true only when `decode_sample` can execute this exact
+        /// request without falling back to a second model forward. Callers
+        /// must check this before submitting a decode frame.
+        supports_sample_decode_request: ?*const fn (
+            ctx: *anyopaque,
+            request: SampledDecodeRequest,
+        ) bool = null,
         decode_greedy: ?*const fn (
             ctx: *anyopaque,
             allocator: std.mem.Allocator,
@@ -187,6 +194,15 @@ pub const ModelRuntime = struct {
         const output = try decode_sample_fn(self.ptr, allocator, request);
         try request.decode.check();
         return output;
+    }
+
+    pub fn supportsSampleDecodeRequest(
+        self: *const ModelRuntime,
+        request: SampledDecodeRequest,
+    ) bool {
+        if (self.vtable.decode_sample == null) return false;
+        const supports_fn = self.vtable.supports_sample_decode_request orelse return false;
+        return supports_fn(self.ptr, request);
     }
 
     pub fn deinit(self: *ModelRuntime) void {
