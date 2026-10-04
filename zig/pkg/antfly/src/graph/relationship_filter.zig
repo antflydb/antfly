@@ -684,6 +684,7 @@ test "relationship predicates escaped oversized keys are controlled by graph bud
 
 fn z17RepeatString(comptime bytes: []const u8, comptime count: usize) *const [bytes.len * count:0]u8 {
     const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (count *| 16))));
         var repeated: [bytes.len * count:0]u8 = undefined;
         for (0..count) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
         repeated[bytes.len * count] = 0;
