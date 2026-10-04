@@ -486,7 +486,7 @@ pub const StorageOwnerRuntimeHooks = struct {
         }
         const wire = kernel_owner_abi.CoordinatedTtlRequest{
             .table_id = request.table_id,
-            .group_id = request.group_id,
+            .group_id = self.group_id,
             .schema_version = request.schema_version,
             .ttl_duration_ns = request.ttl_duration_ns,
             .ttl_field = .fromSlice(request.ttl_field),
@@ -517,7 +517,7 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     pub fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
         if (self.config.artifact_publication_enqueue_fn == null) return null;
-        return .{ .ptr = self, .enqueue = enqueueArtifactPublication, .recover_uploads = recoverArtifactUploads, .should_recover_uploads = shouldRecoverArtifactUploads };
+        return .{ .ptr = self, .enqueue = enqueueArtifactPublication, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
     }
 
     fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("../storage/db/artifact_publication.zig").UploadRecoveryTick) bool {
@@ -3315,7 +3315,7 @@ pub fn storageOwnerOpen(
     handle.db.local_execution.row_policy_authority_secret = owned_policy_secret;
     handle.db.local_execution.row_policy_authority_issuer = owned_policy_issuer;
     handle.db.local_execution.row_policy_table_name = owned_table_name;
-    if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort(), request.group_id);
+    if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort());
     if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,
         .table_name = owned_table_name,

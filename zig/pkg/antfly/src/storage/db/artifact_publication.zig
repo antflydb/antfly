@@ -892,14 +892,16 @@ pub const UploadRecoveryInvocation = struct {
     trigger: @FieldType(UploadRecoveryTick, "trigger"),
 };
 
+pub const UploadRecovery = struct {
+    should_poll: *const fn (*anyopaque, UploadRecoveryTick) bool,
+    recover: *const fn (*anyopaque, UploadRecoveryInvocation) anyerror!bool,
+};
+
 pub const Dispatcher = struct {
     ptr: *anyopaque,
-    /// Cheap owner cadence check before storage discovers bounded facts.
-    should_recover_uploads: ?*const fn (*anyopaque, UploadRecoveryTick) bool = null,
-    /// Borrowed synchronous owner hook. The snapshot has been released before
-    /// invocation. Queue scheduling, fairness and retry state belong to the
-    /// external owner; absence leaves local storage recovery inert.
-    recover_uploads: ?*const fn (*anyopaque, UploadRecoveryInvocation) anyerror!bool = null,
+    /// Borrowed synchronous owner capability. Storage releases its snapshot
+    /// before recovery; absence leaves external publication recovery inert.
+    upload_recovery: ?UploadRecovery = null,
     /// No storage/apply lock may be held here. Success means bounded queue
     /// admission only; output remains pending until the local durable receipt.
     enqueue: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,

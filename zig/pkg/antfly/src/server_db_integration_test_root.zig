@@ -6,4 +6,5 @@ test {
     _ = @import("storage/server_db_integration_test.zig");
     _ = @import("storage/server_transaction_recovery.zig");
     _ = @import("storage/artifact_upload_recovery.zig");
+    _ = @import("storage/server_coordinated_ttl.zig");
 }

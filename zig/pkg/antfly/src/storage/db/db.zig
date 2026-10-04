@@ -644,7 +644,6 @@ pub const OpenOptions = struct {
     enrichment: ?enrichment_runtime_mod.Config = null,
     ttl_cleanup: ttl_runtime_mod.Config = .{},
     coordinated_ttl: ?coordinated_ttl.Port = null,
-    coordinated_ttl_group_id: u64 = 0,
     transaction_recovery: transaction_runtime_mod.Config = .{},
     text_merge: text_merge_runtime_mod.Config = .{},
     sparse_compaction: sparse_compaction_runtime_mod.Config = .{},
@@ -2234,7 +2233,6 @@ const TtlCleanupContext = struct {
     schema_registry: ?*schema_registry_mod.Registry = null,
     hook_mutex: Io.Mutex = .init,
     coordinated_port: ?coordinated_ttl.Port = null,
-    coordinated_group_id: u64 = 0,
 };
 
 /// Synchronous local mutation receiver. It borrows resources and owns only
@@ -5287,9 +5285,7 @@ const LocalExecutionState = struct {
     /// Owner-scoped recovery keeps remote acknowledgement off the open/read
     /// path. The startup barrier orders crash-left obligations before new WAL
     /// records; steady-state mutations then wait on independent LSN watermarks.
-    durable_replication_recovery_state: std.atomic.Value(u8) = .init(0),
-    durable_replication_recovery_failure_streak: u32 = 0,
-    durable_replication_recovery_next_attempt_ns: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    publication_outbox_recovery: @import("publication_outbox_recovery.zig").Driver = .{},
     /// 0 = idle, 1 = queued/running, 2 = rerun requested. The owner-scoped
     /// durable lane is drained before DB teardown, so jobs may safely borrow
     /// this DB while keeping schema publication latency independent of index
@@ -5431,12 +5427,7 @@ pub const DB = struct {
     artifact_repair_metadata_pending: bool = true,
     artifact_footprint_pending: std.atomic.Value(bool) = .init(true),
     artifact_producer_baseline_pending: std.atomic.Value(bool) = .init(true),
-    artifact_producer_work_running: std.atomic.Value(bool) = .init(false),
-    artifact_producer_work_pending: std.atomic.Value(bool) = .init(false),
-    artifact_producer_work_retry_after_ns: std.atomic.Value(u64) = .init(0),
-    artifact_producer_work_cursor: ?@import("artifact_producer_obligations.zig").WorkCursor = null,
-    artifact_producer_retry_after_ns: ?u64 = null,
-    artifact_producer_retry_round: ?struct { authority: @import("artifact_publication.zig").Authority, number: u64, more: bool = false } = null,
+    artifact_producer_scheduler: @import("artifact_producer_scheduler.zig").Scheduler = .{},
     /// Bounded no-progress guard for `runUntilIdle` (see `OpenOptions.
     /// run_until_idle_no_progress_timeout_ms` and `ReplayDrainOptions.
     /// no_progress_timeout_ns`); 0 disables it. Copied into `ReplayDrainOptions`
@@ -6136,73 +6127,61 @@ pub const DB = struct {
     /// Queue remote acknowledgement without coupling it to DB open or reads.
     /// The dedicated owner gives this retry state an independent maintenance
     /// probe and makes close a lifetime barrier for every borrowed callback.
-    fn scheduleDurableReplicationOutboxRecovery(self: *DB) void {
-        if (!self.stable_address or self.replication_recovery_owner_id == 0) return;
-        if (self.async_context.background_closing.load(.acquire)) return;
-        if (openModeRequiresReadOnlyBackends(self.open_mode)) return;
-        if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
-        if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) {
-            if (self.local_execution.replication_async_effect_mirror == null) self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
-            return;
-        }
-        if (self.backend_runtime.durable_jobs.executesInline()) return;
-        if (monotonicTimeNs() < self.local_execution.durable_replication_recovery_next_attempt_ns.load(.acquire)) {
-            self.armDurableReplicationRecoveryProbe();
-            return;
-        }
-        if (self.local_execution.durable_replication_recovery_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
-        self.backend_runtime.durable_jobs.submit(.{
-            .owner_id = self.replication_recovery_owner_id,
-            .class = .maintenance,
-            .ptr = self,
-            .run = DurableReplicationRecoveryWork.run,
-            .deinit = DurableReplicationRecoveryWork.deinit,
-        }) catch |err| {
-            self.local_execution.durable_replication_recovery_state.store(0, .release);
-            self.local_execution.durable_replication_recovery_next_attempt_ns.store(
-                monotonicTimeNs() +| portable_activation_retry_base_ns,
-                .release,
-            );
-            self.armDurableReplicationRecoveryProbe();
-            std.log.warn("durable HA recovery queue unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
-        };
+    fn publicationOutboxRecoveryPort(self: *DB) @import("publication_outbox_recovery.zig").Driver.Port {
+        return .{ .ptr = self, .eligible = outboxRecoveryEligible, .closing = outboxRecoveryClosing, .pending = outboxRecoveryPending, .may_disarm = outboxRecoveryMayDisarm, .now = outboxRecoveryNow, .drain = outboxRecoveryDrain, .submit = outboxRecoverySubmit, .arm = outboxRecoveryArm, .disarm = outboxRecoveryDisarm, .retry_delay = outboxRecoveryDelay, .report = outboxRecoveryReport };
     }
 
+    fn scheduleDurableReplicationOutboxRecovery(self: *DB) void {
+        self.local_execution.publication_outbox_recovery.schedule(self.publicationOutboxRecoveryPort());
+    }
     fn runDurableReplicationOutboxRecovery(self: *DB) void {
-        // A successful delivery leaves the conservative maybe-bit set until a
-        // fenced empty scan. A second pass supplies that proof without making
-        // every individual clear perform another prefix scan.
-        for (0..2) |_| {
-            self.flushDurableReplicationOutboxes() catch |err| {
-                if (self.async_context.background_closing.load(.acquire)) {
-                    self.local_execution.durable_replication_recovery_state.store(0, .release);
-                    return;
-                }
-                self.local_execution.durable_replication_recovery_failure_streak +|= 1;
-                const delay_ns = portableActivationRetryDelayNs(
-                    self.core.path,
-                    @as(u64, @truncate(self.root_incarnation)) ^ self.replication_recovery_owner_id,
-                    self.local_execution.durable_replication_recovery_failure_streak - 1,
-                );
-                self.local_execution.durable_replication_recovery_next_attempt_ns.store(monotonicTimeNs() +| delay_ns, .release);
-                self.local_execution.durable_replication_recovery_state.store(0, .release);
-                self.armDurableReplicationRecoveryProbe();
-                std.log.warn(
-                    "durable HA acknowledgement pending path={s} err={s} failures={d} next_retry_ms={d}",
-                    .{ self.core.path, @errorName(err), self.local_execution.durable_replication_recovery_failure_streak, delay_ns / std.time.ns_per_ms },
-                );
-                return;
-            };
-            if (!self.local_execution.durable_replication_outbox_maybe.load(.acquire)) break;
-        }
-        self.local_execution.durable_replication_recovery_failure_streak = 0;
-        self.local_execution.durable_replication_recovery_next_attempt_ns.store(0, .release);
-        self.local_execution.durable_replication_recovery_state.store(0, .release);
-        if (self.local_execution.durable_replication_outbox_maybe.load(.acquire)) {
-            self.scheduleDurableReplicationOutboxRecovery();
-        } else {
-            if (self.local_execution.replication_async_effect_mirror == null) self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
-        }
+        self.local_execution.publication_outbox_recovery.run(self.publicationOutboxRecoveryPort());
+    }
+    fn outboxRecoveryEligible(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.stable_address and self.replication_recovery_owner_id != 0 and
+            !self.async_context.background_closing.load(.acquire) and
+            !openModeRequiresReadOnlyBackends(self.open_mode) and !self.backend_runtime.durable_jobs.executesInline();
+    }
+    fn outboxRecoveryClosing(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.async_context.background_closing.load(.acquire);
+    }
+    fn outboxRecoveryPending(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        if (self.async_context.primary_replication_outbox_pending.load(.acquire)) self.local_execution.durable_replication_outbox_maybe.store(true, .release);
+        return self.local_execution.durable_replication_outbox_maybe.load(.acquire);
+    }
+    fn outboxRecoveryMayDisarm(ptr: *anyopaque) bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.local_execution.replication_async_effect_mirror == null;
+    }
+    fn outboxRecoveryNow(_: *anyopaque) u64 {
+        return monotonicTimeNs();
+    }
+    fn outboxRecoveryDrain(ptr: *anyopaque) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        try self.flushDurableReplicationOutboxes();
+    }
+    fn outboxRecoverySubmit(ptr: *anyopaque) !void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        try self.backend_runtime.durable_jobs.submit(.{ .owner_id = self.replication_recovery_owner_id, .class = .maintenance, .ptr = self, .run = DurableReplicationRecoveryWork.run, .deinit = DurableReplicationRecoveryWork.deinit });
+    }
+    fn outboxRecoveryArm(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.armDurableReplicationRecoveryProbe();
+    }
+    fn outboxRecoveryDisarm(ptr: *anyopaque) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        self.backend_runtime.disarmOwnerMaintenanceProbe(self.replication_recovery_owner_id);
+    }
+    fn outboxRecoveryDelay(ptr: *anyopaque, failure_streak: u32) u64 {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return portableActivationRetryDelayNs(self.core.path, @as(u64, @truncate(self.root_incarnation)) ^ self.replication_recovery_owner_id, failure_streak);
+    }
+    fn outboxRecoveryReport(ptr: *anyopaque, failure: @import("publication_outbox_recovery.zig").Driver.Failure, err: anyerror, failures: u32, delay_ns: u64) void {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        std.log.warn("hot_standby publication recovery {s} failed path={s} err={s} failures={d} next_retry_ms={d}", .{ @tagName(failure), self.core.path, @errorName(err), failures, delay_ns / std.time.ns_per_ms });
     }
 
     fn armDurableReplicationRecoveryProbe(self: *DB) void {
@@ -6210,7 +6189,7 @@ pub const DB = struct {
             .ptr = self,
             .run = durableReplicationRecoveryMaintenanceProbeMain,
         }) catch |err| {
-            std.log.warn("durable HA recovery supervisor unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
+            std.log.warn("hot_standby recovery supervisor unavailable path={s} err={s}", .{ self.core.path, @errorName(err) });
         };
     }
 
@@ -8294,13 +8273,12 @@ pub const DB = struct {
 
     /// The context must outlive the managed DB. This only swaps the callback;
     /// teardown drains TTL workers before releasing the owning service.
-    pub fn setCoordinatedTtl(self: *DB, port: ?coordinated_ttl.Port, group_id: u64) void {
+    pub fn setCoordinatedTtl(self: *DB, port: ?coordinated_ttl.Port) void {
         const context = self.ttl_cleanup_context orelse return;
         const io = self.backend_runtime.io() orelse std.Options.debug_io;
         context.hook_mutex.lockUncancelable(io);
         defer context.hook_mutex.unlock(io);
         context.coordinated_port = port;
-        context.coordinated_group_id = group_id;
     }
 
     fn initOptionalTransactionRuntime(self: *DB, cfg: transaction_runtime_mod.Config) !void {
@@ -8411,7 +8389,7 @@ pub const DB = struct {
         }
         if (opts.ttl_cleanup.enabled) {
             try self.initOptionalTtlRuntime(opts.ttl_cleanup);
-            self.setCoordinatedTtl(opts.coordinated_ttl, opts.coordinated_ttl_group_id);
+            self.setCoordinatedTtl(opts.coordinated_ttl);
         }
         if (opts.transaction_recovery.enabled) {
             try self.initOptionalTransactionRuntime(opts.transaction_recovery);
@@ -8546,8 +8524,7 @@ pub const DB = struct {
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
         self.stopArtifactRepairMetadataWorker();
-        if (self.artifact_producer_work_cursor) |cursor| self.alloc.free(cursor.document);
-        self.artifact_producer_work_cursor = null;
+        self.artifact_producer_scheduler.deinit(self.alloc);
         self.stopPortableActivationRetryWorker();
         self.stopQuarantineRetryWorker();
         self.stopGraphEndpointCleanupWorker();
@@ -37242,7 +37219,7 @@ pub const DB = struct {
         const artifact_active = self.artifact_repair_metadata_pending or self.artifact_footprint_pending.load(.acquire) or self.artifact_producer_baseline_pending.load(.acquire) or
             (if (self.local_execution.source_vectors.load(.acquire)) |source| source.collectionPending() else false);
         const active = (self.independentMaintenanceNowNs() >= self.artifact_metadata_retry_after_ns and artifact_active) or
-            (self.artifact_producer_work_pending.load(.acquire) and self.independentMaintenanceNowNs() >= self.artifact_producer_work_retry_after_ns.load(.acquire)) or
+            self.artifact_producer_scheduler.active(self.independentMaintenanceNowNs()) or
             (self.local_execution.relational_index_maintenance_sweep.isPending() and platform_time.monotonicNs() >= self.local_execution.relational_index_retry_after_ns.load(.acquire)) or
             (self.relational_column_maintenance.pending.load(.acquire) and !self.relational_column_maintenance.backing_off.load(.acquire));
         const scan_pause = if (self.local_execution.source_vectors.load(.acquire)) |source| source.activeScanPauseNs() else null;
@@ -37327,18 +37304,16 @@ pub const DB = struct {
     fn advanceArtifactUploadRecoveryWithTrigger(self: *DB, trigger: @FieldType(@import("artifact_publication.zig").UploadRecoveryInvocation, "trigger")) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
         const dispatcher = self.local_execution.artifact_publication_dispatcher orelse return false;
-        const recover = dispatcher.recover_uploads orelse return false;
+        const recovery = dispatcher.upload_recovery orelse return false;
         const now_ns = self.independentMaintenanceNowNs();
-        if (dispatcher.should_recover_uploads) |should_poll| {
-            if (!should_poll(dispatcher.ptr, .{ .now_ns = now_ns, .trigger = trigger })) return false;
-        }
+        if (!recovery.should_poll(dispatcher.ptr, .{ .now_ns = now_ns, .trigger = trigger })) return false;
         const inventory = blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             const namespace = (try @import("../source_authority.zig").externalPublicationNamespace(&read)) orelse return false;
             break :blk try @import("artifact_publication_transport.zig").recoveryInventory(&read, namespace);
         };
-        return recover(dispatcher.ptr, .{
+        return recovery.recover(dispatcher.ptr, .{
             .io = self.core.index_manager.checkpointIo(),
             .now_ns = now_ns,
             .inventory = inventory,
@@ -37351,17 +37326,16 @@ pub const DB = struct {
     /// operations, and restart can safely rediscover every unscheduled row.
     pub fn advanceArtifactProducerWorkPage(self: *DB) !bool {
         if (openModeRequiresReadOnlyBackends(self.open_mode)) return false;
-        if (self.independentMaintenanceNowNs() < self.artifact_producer_work_retry_after_ns.load(.acquire)) return false;
-        if (self.artifact_producer_work_running.swap(true, .acq_rel)) return false;
-        defer self.artifact_producer_work_running.store(false, .release);
-        errdefer {
-            self.artifact_producer_work_pending.store(false, .release);
-            self.artifact_producer_work_retry_after_ns.store(self.independentMaintenanceNowNs() +| artifact_repair_metadata_poll_ns, .release);
-        }
-        self.artifact_producer_work_pending.store(false, .release);
-        // Other maintenance jobs may stay on the active cadence. A completed
-        // sweep must still back off instead of rescanning scheduled rows then.
-        self.artifact_producer_work_retry_after_ns.store(self.independentMaintenanceNowNs() +| artifact_repair_metadata_poll_ns, .release);
+        return self.artifact_producer_scheduler.advance(.{ .ptr = self, .now = producerMaintenanceNow, .page = advanceArtifactProducerBudgetedPage });
+    }
+
+    fn producerMaintenanceNow(ptr: *anyopaque) u64 {
+        const self: *DB = @ptrCast(@alignCast(ptr));
+        return self.independentMaintenanceNowNs();
+    }
+
+    fn advanceArtifactProducerBudgetedPage(ptr: *anyopaque) !bool {
+        const self: *DB = @ptrCast(@alignCast(ptr));
         var budget = if (self.core.index_manager.resource_manager) |manager|
             resource_manager_mod.BudgetedAllocator.init(manager, .relational_preparation_working_set, self.alloc, 1)
         else
@@ -37518,40 +37492,34 @@ pub const DB = struct {
             if (state.sealed_attempt != null) return false;
             const catalogs = try @import("artifact_inventory.zig").catalogs(&read);
             if (!plan.plan().matchesArtifactInventory(catalogs) or !std.mem.eql(u8, &catalogs.digest(), &authority.catalog_digest)) return error.ArtifactCatalogDrift;
-            if (self.artifact_producer_work_cursor) |cursor| if (!std.meta.eql(cursor.authority, authority)) {
-                self.alloc.free(cursor.document);
-                self.artifact_producer_work_cursor = null;
-            };
-            break :blk try obligations.scanWork(scratch, &read, authority, self.artifact_producer_work_cursor);
+            const cursor = self.artifact_producer_scheduler.cursorForAuthority(self.alloc, authority);
+            break :blk try obligations.scanWork(scratch, &read, authority, cursor);
         };
         defer page.deinit();
         const dispatch = @import("artifact_producer_dispatch.zig");
         const retry = @import("artifact_producer_retry.zig");
         const retry_now = self.independentMaintenanceNowNs();
-        if (self.artifact_producer_retry_round) |round| if (!std.meta.eql(round.authority, page.authority)) {
-            self.artifact_producer_retry_round = null;
-            self.artifact_producer_retry_after_ns = null;
-        };
+        self.artifact_producer_scheduler.observeAuthority(page.authority);
         const retry_real_now: u64 = @intCast(@max(0, std.Io.Timestamp.now(self.core.index_manager.checkpointIo(), .real).toNanoseconds()));
         // Persisted wall time selects retries only. It prevents cold-owner
         // churn from restarting the grace period forever; runtime deadlines
         // still use the owner's awake clock and cannot discharge any work.
-        if (self.artifact_producer_retry_after_ns == null) {
+        if (self.artifact_producer_scheduler.needsRetryDelay()) {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
-            self.artifact_producer_retry_after_ns = retry_now +| try obligations.retryDelay(&read, page.authority, retry_real_now, retry.interval_ns);
+            self.artifact_producer_scheduler.setRetryDelay(retry_now, try obligations.retryDelay(&read, page.authority, retry_real_now, retry.interval_ns));
         }
-        if (self.artifact_producer_retry_round == null and page.items.len != 0 and plan.plan().generated_templates.len != 0 and retry_now >= self.artifact_producer_retry_after_ns.?) {
+        if (self.artifact_producer_scheduler.needsRetryRound(retry_now, page.items.len != 0, plan.plan().generated_templates.len != 0)) {
             try self.lockApplyForPortableRuntime();
             defer self.core.unlockApply();
             var txn = try self.core.store.beginWriteTxn();
             errdefer txn.abort();
             const round = try obligations.beginRetryRoundAt(&txn, page.authority, retry_real_now);
             try txn.commit();
-            self.artifact_producer_retry_round = .{ .authority = page.authority, .number = round };
+            self.artifact_producer_scheduler.startRound(page.authority, round);
         }
         var refs: dispatch.Buffer = undefined;
-        const deadline = platform_time.monotonicNs() +| 2 * std.time.ns_per_ms;
+        const deadline = platform_time.monotonicNs() +| @import("artifact_producer_scheduler.zig").Scheduler.quantum_ns;
         var processed: usize = 0;
         var more_dispatch = false;
         for (page.items) |item| {
@@ -37579,53 +37547,33 @@ pub const DB = struct {
                 });
                 more_dispatch = more_dispatch or !requests.progress.complete;
             }
-            if (self.artifact_producer_retry_round) |*round| {
-                if (item.dispatch_complete and plan.plan().generated_templates.len != 0 and
-                    (item.retry_round != round.number or item.retry_next_template != 0))
-                {
-                    const first = if (item.retry_round == round.number) item.retry_next_template else 0;
-                    const requests = blk: {
-                        var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
-                        defer read.abort();
-                        break :blk try retry.prepare(scratch, &read, self.root_incarnation, plan.plan(), first, item.document, &refs);
-                    };
-                    const required: RequiredProducerDispatch = .{ .authority = page.authority, .item = item, .plan_generation = plan.generation(), .page = requests.progress, .retry_round = round.number };
-                    if (requests.items.len != 0) {
-                        var ctx = self.batchContext();
-                        _ = try appendDerivedBatchRecordContextWithWork(&ctx, .{ .generated_enrichment_refs = requests.items }, false, required);
-                    } else {
-                        // No empty replay record for an already accepted page.
-                        // This advances scheduling only, not completion credit.
-                        try self.lockApplyForPortableRuntime();
-                        defer self.core.unlockApply();
-                        if (self.core.index_manager.writePlanGeneration() != required.plan_generation) return error.EnrichmentSourceChanged;
-                        var txn = try self.core.store.beginWriteTxn();
-                        errdefer txn.abort();
-                        if (!try obligations.stageRetry(scratch, &txn, page.authority, item, round.number, null, requests.progress)) return error.EnrichmentSourceChanged;
-                        try txn.commit();
-                    }
-                    round.more = round.more or !requests.progress.complete;
+            if (self.artifact_producer_scheduler.retryPage(item, plan.plan().generated_templates.len != 0)) |round| {
+                const requests = blk: {
+                    var read = try self.core.store.beginReadTxnWithBlockCacheAdmission(.transient);
+                    defer read.abort();
+                    break :blk try retry.prepare(scratch, &read, self.root_incarnation, plan.plan(), round.first_template, item.document, &refs);
+                };
+                const required: RequiredProducerDispatch = .{ .authority = page.authority, .item = item, .plan_generation = plan.generation(), .page = requests.progress, .retry_round = round.number };
+                if (requests.items.len != 0) {
+                    var ctx = self.batchContext();
+                    _ = try appendDerivedBatchRecordContextWithWork(&ctx, .{ .generated_enrichment_refs = requests.items }, false, required);
+                } else {
+                    // No empty replay record for an already accepted page.
+                    // This advances scheduling only, not completion credit.
+                    try self.lockApplyForPortableRuntime();
+                    defer self.core.unlockApply();
+                    if (self.core.index_manager.writePlanGeneration() != required.plan_generation) return error.EnrichmentSourceChanged;
+                    var txn = try self.core.store.beginWriteTxn();
+                    errdefer txn.abort();
+                    if (!try obligations.stageRetry(scratch, &txn, page.authority, item, round.number, null, requests.progress)) return error.EnrichmentSourceChanged;
+                    try txn.commit();
                 }
+                self.artifact_producer_scheduler.noteRetryProgress(requests.progress.complete);
             }
-            if (self.artifact_producer_work_cursor) |cursor| self.alloc.free(cursor.document);
-            self.artifact_producer_work_cursor = .{ .authority = page.authority, .document = next };
+            self.artifact_producer_scheduler.commitCursor(self.alloc, page.authority, next);
             processed += 1;
         }
-        if (processed == page.items.len and page.at_end) {
-            if (self.artifact_producer_work_cursor) |cursor| self.alloc.free(cursor.document);
-            self.artifact_producer_work_cursor = null;
-            if (self.artifact_producer_retry_round) |*round| {
-                if (round.more) {
-                    round.more = false;
-                } else {
-                    self.artifact_producer_retry_round = null;
-                    self.artifact_producer_retry_after_ns = self.independentMaintenanceNowNs() +| retry.interval_ns;
-                }
-            }
-        }
-        more_dispatch = more_dispatch or self.artifact_producer_retry_round != null;
-        self.artifact_producer_work_pending.store(self.artifact_producer_work_cursor != null or more_dispatch, .release);
-        if (self.artifact_producer_work_cursor != null or more_dispatch) self.artifact_producer_work_retry_after_ns.store(0, .release);
+        self.artifact_producer_scheduler.completePage(self.alloc, processed == page.items.len and page.at_end, more_dispatch, self.independentMaintenanceNowNs());
         return processed != 0;
     }
 
@@ -65328,10 +65276,9 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
         const io = ctx.batch.io orelse std.Options.debug_io;
         ctx.hook_mutex.lockUncancelable(io);
         const port = ctx.coordinated_port;
-        const group_id = ctx.coordinated_group_id;
         ctx.hook_mutex.unlock(io);
         const callback = port orelse return error.ForeignKeyCoordinationRequired;
-        if (group_id == 0 or ctx.batch.identity_namespace.table_id == 0)
+        if (ctx.batch.identity_namespace.table_id == 0)
             return error.ForeignKeyCoordinationRequired;
         const schema = pinned.tableSchema();
         if (schema.ttl_duration_ns == 0) return 0;
@@ -65376,7 +65323,6 @@ fn deleteExpiredDocumentsFromCandidates(ctx_ptr: *anyopaque, candidates: []const
         // No native transaction, apply lock, or hook lock spans distributed IO.
         return callback.expire(.{
             .table_id = ctx.batch.identity_namespace.table_id,
-            .group_id = group_id,
             .schema_version = pinned.version(),
             .ttl_duration_ns = schema.ttl_duration_ns,
             .ttl_field = schema.ttl_field,
@@ -142072,8 +142018,7 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
         fn expire(ptr: *anyopaque, request: coordinated_ttl.Request) !u32 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try std.testing.expectEqual(@as(u64, 100), request.table_id);
-            // Group routing is explicit, never guessed from inherited namespace.
-            try std.testing.expectEqual(@as(u64, 999), request.group_id);
+            // The local observation carries table identity; routing is bound by its owner.
             try std.testing.expectEqual(@as(usize, 1), request.candidates.len);
             try std.testing.expectEqual(@as(u64, 1), request.candidates[0].row_version);
             try std.testing.expectEqual(@as(u64, 1), request.candidates[0].ttl_timestamp_ns);
@@ -142096,7 +142041,6 @@ test "db coordinated ttl retains visible rows and emits snapshot bound observati
         .schema_registry = db.core.schema_registry,
         .grace_period_ns = 0,
         .coordinated_port = .{ .ptr = &capture, .expire_fn = Capture.expire },
-        .coordinated_group_id = 999,
     };
     const candidates = [_]ttl_runtime_mod.DeleteCandidate{.{ .key = @constCast("parent"), .timestamp_ns = 1 }};
     try std.testing.expectEqual(@as(u32, 0), try deleteExpiredDocumentsFromCandidates(&context, &candidates));
@@ -155017,8 +154961,8 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             // Lose the producer's queue/upload entirely: the durable original
             // dispatch is complete, but no accepted output exists. A bounded
             // retry sweep must append work without reopening that dispatch.
-            db.artifact_producer_retry_after_ns = 0;
-            db.artifact_producer_work_retry_after_ns.store(0, .release);
+            db.artifact_producer_scheduler.producer_retry_after_ns = 0;
+            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
             try std.testing.expect(try db.advanceArtifactProducerWorkPage());
             const retried_sequence = db.core.store.lastReplaySequence(0);
             try std.testing.expect(retried_sequence > expected_sequence);
@@ -155046,8 +154990,8 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
                 try std.testing.expectEqual(@as(u64, 3), round);
                 try std.testing.expect(try obligations.stageRetry(alloc, &txn, authority, current, round, expected_sequence + 1, .{ .next_template = 1, .complete = true }));
             }
-            db.artifact_producer_retry_after_ns = 0;
-            db.artifact_producer_work_retry_after_ns.store(0, .release);
+            db.artifact_producer_scheduler.producer_retry_after_ns = 0;
+            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
             try std.testing.expect(try db.advanceArtifactProducerWorkPage());
             expected_sequence = db.core.store.lastReplaySequence(0);
             {
@@ -155061,7 +155005,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             }
             // A completed local retry round cannot spin while other work
             // keeps the maintenance scheduler on its active cadence.
-            db.artifact_producer_work_retry_after_ns.store(0, .release);
+            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
             _ = try db.advanceArtifactProducerWorkPage();
             try std.testing.expectEqual(expected_sequence, db.core.store.lastReplaySequence(0));
             // A dependency repair can retain the primary position. It must
@@ -155071,7 +155015,7 @@ test "db ordered artifact inventory producer dispatch is durable and never compl
             const authority = (try publication.authority(&txn)).?;
             _ = try obligations.mark(alloc, &txn, authority, "doc", null);
             try txn.commit();
-            db.artifact_producer_work_retry_after_ns.store(0, .release);
+            db.artifact_producer_scheduler.retry_after_ns.store(0, .release);
             try std.testing.expect(try db.advanceArtifactProducerWorkPage());
             try std.testing.expect(db.core.store.lastReplaySequence(0) > expected_sequence);
         }
@@ -155822,6 +155766,10 @@ test "db graph endpoint cleanup pages cancellation stops between commits" {
 // White-box hooks for server integration fixtures; absent from production builds.
 const fixture_owner = @This();
 pub const test_support = if (builtin.is_test) struct {
+    pub fn advanceArtifactUploadRecoveryMaintenance(db: *fixture_owner.DB) !bool {
+        return db.advanceArtifactUploadRecoveryWithTrigger(.maintenance);
+    }
+
     pub const drainStandaloneGraphEndpointCleanup = fixture_owner.DB.drainStandaloneGraphEndpointCleanup;
     pub const runStandaloneGraphEndpointCleanupStep = fixture_owner.DB.runStandaloneGraphEndpointCleanupStep;
     pub const enrichmentReconfigureHook = &fixture_owner.DB.test_enrichment_reconfigure_after_detached_hook;

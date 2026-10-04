@@ -2980,30 +2980,45 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
             try txn.put(counter_key, &saved_counter);
             try txn.commit();
         }
+        const owner = @import("../capi/server_owner.zig");
         const Capture = struct {
-            scheduler: @import("artifact_upload_recovery.zig").Scheduler = .{},
             refused: bool = true,
+            calls: usize = 0,
             hint: ?transport.RecoveryHint = null,
-            fn recover(ptr: *anyopaque, invocation: publication.UploadRecoveryInvocation) !bool {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                return self.scheduler.advance(.{ .ptr = self, .enqueue = enqueue }, invocation);
-            }
-            fn enqueue(ptr: *anyopaque, namespace: [24]u8, bytes: []const u8) !void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                if (self.refused) return error.ResourceLimitExceeded;
-                self.hint = (try transport.RecoveryHint.decode(bytes)) orelse return error.InvalidBatchRequest;
-                try std.testing.expectEqualDeep(namespace, self.hint.?.namespace);
+            fn enqueue(ptr: ?*anyopaque, group_id: u64, namespace: *const [24]u8, bytes: owner.kernel_owner_abi.BorrowedBytes) callconv(.c) owner.kernel_owner_abi.Status {
+                const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+                if (group_id != 77) return .invalid_argument;
+                self.calls += 1;
+                if (self.refused) return .resource_limit_exceeded;
+                self.hint = (transport.RecoveryHint.decode(bytes.slice()) catch return .invalid_argument) orelse return .invalid_argument;
+                if (!std.mem.eql(u8, namespace, &self.hint.?.namespace)) return .invalid_argument;
+                return .ok;
             }
         };
         var capture: Capture = .{};
-        db.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue, .recover_uploads = Capture.recover };
+        var hooks: owner.StorageOwnerRuntimeHooks = .{
+            .group_id = 77,
+            .config = .{ .artifact_publication_ctx = &capture, .artifact_publication_enqueue_fn = Capture.enqueue },
+        };
+        db.local_execution.artifact_publication_dispatcher = hooks.artifactPublicationDispatcher();
         defer db.local_execution.artifact_publication_dispatcher = null;
-        try std.testing.expectError(error.ResourceLimitExceeded, db.advanceArtifactUploadRecovery());
-        try std.testing.expectEqual(@as(u64, 0), capture.scheduler.cursor.load(.acquire));
+        try std.testing.expectError(error.ResourceLimitExceeded, engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(u64, 0), hooks.artifact_upload_recovery.cursor.load(.acquire));
+        try std.testing.expect(hooks.artifact_upload_recovery.retry_after_ns.load(.acquire) != 0);
+        // Pin the deadline ahead of every possible runtime tick. Suppression
+        // must happen before the recovery/admission callback, even after refusal.
+        hooks.artifact_upload_recovery.retry_after_ns.store(std.math.maxInt(u64), .release);
         capture.refused = false;
+        try std.testing.expect(!try engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(usize, 1), capture.calls);
         try std.testing.expect(try db.advanceArtifactUploadRecovery());
         recovered = capture.hint.?;
         try std.testing.expectEqual(@as(u64, 4), recovered.?.created_index);
+        try std.testing.expectEqual(@as(usize, 2), capture.calls);
+        // The next maintenance opportunity uses the same production binding.
+        hooks.artifact_upload_recovery.retry_after_ns.store(0, .release);
+        try std.testing.expect(try engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(usize, 3), capture.calls);
         // A delayed hint for a retired incarnation advances only the Raft
         // watermark. It cannot consume this upload or credit a receipt.
         var stale = recovered.?.request();

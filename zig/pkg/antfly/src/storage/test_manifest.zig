@@ -77,7 +77,6 @@ comptime {
     _ = @import("db/relational_row_cursor.zig");
     _ = @import("db/relational_predicate.zig");
     _ = @import("admission_waiter.zig");
-    _ = @import("coordinated_ttl.zig");
     _ = @import("restore_owner.zig");
     _ = @import("restore_decoder_cache.zig");
     _ = @import("artifact_payload.zig");
@@ -415,6 +414,8 @@ comptime {
     _ = @import("db/artifact_publication_owner.zig");
     _ = @import("db/artifact_publication_resolution.zig");
     _ = @import("db/artifact_publication_transport.zig");
+    _ = @import("db/artifact_producer_scheduler.zig");
+    _ = @import("db/publication_outbox_recovery.zig");
     _ = @import("db/artifact_publication_transport_codec.zig");
     _ = @import("db/artifact_publication_wire.zig");
     _ = @import("db/artifact_reconcile.zig");

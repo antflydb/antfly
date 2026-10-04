@@ -119,3 +119,30 @@ snapshot before handing those facts to the owner; the owner releases its own
 mutex before queue admission. A refused proposal never advances its cursor.
 Explicit retries bypass periodic cadence. Durable exact-incarnation and progress
 checks remain in storage and are the only authority to retire upload bytes.
+
+## Producer scheduling, publication recovery, and TTL routing
+
+`storage/db/artifact_producer_scheduler.zig` owns volatile producer polling,
+single-flight admission, fairness cursors, and retry rounds. It is shared local
+maintenance, including native inference. DB supplies budgeted transactional work;
+it retains durable obligations, exact-generation checks, replay-journal append,
+and completion receipts. A scheduler cursor advances only after accepted work,
+and a restart rediscovers obligations from storage.
+
+`storage/db/publication_outbox_recovery.zig` owns the publication retry driver.
+Its borrowed port provides queue submission, probes, clocks, and fenced draining.
+The DB owner still drains queued work before destruction. Durable outboxes,
+startup publication barriers, and local append/acknowledgement ordering remain in
+storage. Retry deadlines never prove delivery or discharge an obligation.
+
+`storage/coordinated_ttl.zig` contains only local expiration observations and their
+borrowed callback. `storage/server_coordinated_ttl.zig` binds group routing and owns
+the bounded server queue. Stable cache-entry bindings synchronize route refreshes
+with callbacks without holding a routing lock across distributed work. C ABI
+adapters attach their existing group identity; the wire layout is unchanged.
+Storage retains timestamps, content digests, schema guards, and local deletion.
+
+Upload recovery is one optional dispatcher capability containing both cadence and
+recovery callbacks. Its integration regression uses the actual server runtime-hook
+factory and verifies refused periodic admission, cadence suppression, explicit
+retry, and the following maintenance opportunity against reopened upload state.
