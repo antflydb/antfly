@@ -50494,15 +50494,17 @@ pub const DB = struct {
         // Only explicitly ephemeral chunk streams use the embedding row as
         // their presence authority. Keep the public chunk identity unchanged
         // so full-text/dense fusion still deduplicates the same member.
-        if (self.core.index_manager.denseIndex(req.index_name)) |entry| {
-            if (entry.embedding_names.len == 0) {
-                if (entry.chunk_name) |chunk_name| {
-                    if (self.core.index_manager.getEnrichment(.chunk, chunk_name)) |cfg| {
-                        if (cfg.source_artifact_name.len == 0 and !cfg.full_text_index and cfg.chunker_json.len > 0 and
-                            !(try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, cfg.chunker_json)) and
-                            !(try chunking_types_mod.parseStoreChunksFromSlice(alloc, cfg.chunker_json)))
-                        {
-                            presence.ephemeral_embedding_name = entry.embedding_name orelse entry.config.name;
+        inline for (.{ self.core.index_manager.denseIndex(req.index_name), self.core.index_manager.sparseIndex(req.index_name) }) |selected| {
+            if (selected) |entry| {
+                if (chunk_backed and entry.embedding_names.len == 0) {
+                    if (entry.chunk_name) |chunk_name| {
+                        if (self.core.index_manager.getEnrichment(.chunk, chunk_name)) |cfg| {
+                            if (cfg.source_artifact_name.len == 0 and !cfg.full_text_index and cfg.chunker_json.len > 0 and
+                                !(try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, cfg.chunker_json)) and
+                                !(try chunking_types_mod.parseStoreChunksFromSlice(alloc, cfg.chunker_json)))
+                            {
+                                presence.ephemeral_embedding_name = entry.embedding_name orelse entry.config.name;
+                            }
                         }
                     }
                 }
@@ -63710,7 +63712,8 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     for (pending.items, 0..) |item, i| keys[i] = item.key;
     var txn = try self.core.store.beginProbeTxn();
     defer txn.abort();
-    try txn.getManySorted(keys, values);
+    // Presence only needs the primary reference, not its decoded vector.
+    try txn.getManySortedPhysical(keys, values);
     for (pending.items, values) |item, value| if (value == null) {
         keep[item.hit_index] = false;
     };
@@ -107889,7 +107892,7 @@ test "db query drops full text hits whose stored document row was deleted direct
     defer remote_embedding_ref.deinit(alloc);
 
     const PresenceAllocationCheck = struct {
-        fn run(test_alloc: Allocator, active_db: *DB, remote_key: []u8, embedding_ref: types.ArtifactRef) !void {
+        fn run(test_alloc: Allocator, active_db: *DB, remote_key: []u8, source_key: []u8, embedding_ref: types.ArtifactRef) !void {
             const keep = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
                 .{ .id = @constCast("doc:a") },
                 .{ .id = @constCast("doc:b") },
@@ -107899,9 +107902,17 @@ test "db query drops full text hits whose stored document row was deleted direct
             }, null);
             defer test_alloc.free(keep);
             try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, keep);
+            // A single managed vector source uses chunk metadata even when
+            // store_chunks is false. Its embedding is the persisted member.
+            const single = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
+                .{ .id = remote_key },
+                .{ .id = source_key },
+            }, "remote_dense");
+            defer test_alloc.free(single);
+            try std.testing.expectEqualSlices(bool, &.{ false, true }, single);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_embedding_ref });
+    try std.testing.checkAllAllocationFailures(alloc, PresenceAllocationCheck.run, .{ &db, remote_member_key, remote_source_key, remote_embedding_ref });
 
     // Presence is a candidate visibility rule, including IDs-only and count
     // requests. Apply it before offset/limit, and refill an orphaned top hit.
@@ -112637,7 +112648,7 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     try db.addIndex(.{
         .name = "sp_v1",
         .kind = .sparse_vector,
-        .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
+        .config_json = "{\"field\":\"sparse_embedding\",\"generator\":{\"kind\":\"sparse_embedding\",\"source_field\":\"body\",\"artifact_name\":\"sparse_body_chunks_v1\",\"chunk_size\":8,\"chunk_overlap\":2}}",
     });
 
     try db.batch(.{
@@ -112701,6 +112712,28 @@ test "db chunked generated dense and sparse embeddings search as parent results"
     try std.testing.expectEqual(@as(usize, 1), sparse_grouped.hits.len);
     try std.testing.expectEqualStrings("doc:a", sparse_grouped.hits[0].id);
     try std.testing.expectEqual(@as(usize, 1), sparse_grouped.hits[0].chunk_hits.len);
+
+    // Singleton selection must not borrow the other vector family's
+    // embedding identity. These indexes deliberately own different chunks.
+    for ([_]types.ReturnMode{ .parent, .chunk }) |mode| {
+        var unnamed_sparse = try db.search(alloc, .{
+            .query = .{ .sparse_knn = .{
+                .indices = sparse_query.indices,
+                .values = sparse_query.values,
+                .k = 3,
+            } },
+            .return_mode = mode,
+            .limit = 1,
+            .include_stored = false,
+        });
+        defer unnamed_sparse.deinit();
+        try std.testing.expectEqual(@as(usize, 1), unnamed_sparse.hits.len);
+        if (mode == .parent) {
+            try std.testing.expectEqualStrings("doc:a", unnamed_sparse.hits[0].id);
+        } else {
+            try std.testing.expectEqualStrings("sparse_body_chunks_v1", unnamed_sparse.hits[0].artifact_ref.?.name);
+        }
+    }
 
     const doc_a_store_key = try internal_keys.documentKeyAlloc(alloc, "doc:a");
     defer alloc.free(doc_a_store_key);

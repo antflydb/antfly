@@ -60,6 +60,21 @@ pub fn awaitMetadataRead(io: std.Io, server: *metadata_runtime.Server) !void {
     return error.MetadataReadinessTimeout;
 }
 
+pub fn awaitStoreRegistration(io: std.Io, server: *data_runtime.DataServer) !void {
+    const deadline = platform.time.monotonicNs() +| 20 * std.time.ns_per_s;
+    while (true) {
+        server.registerNodeIfConfigured() catch |err| switch (err) {
+            error.StoreRegistrationNotVisible => {
+                if (platform.time.monotonicNs() >= deadline) return err;
+                try io.sleep(.fromMilliseconds(10), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+}
+
 pub const DataRestart = struct {
     alloc: std.mem.Allocator,
     io: std.Io,

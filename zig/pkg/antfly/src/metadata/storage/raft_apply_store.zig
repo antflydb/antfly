@@ -5914,7 +5914,7 @@ test "standalone metadata chunked HA resumes large effects through checkpoint wi
         };
         var context: u8 = 0;
         try source.bindHotStandby(.{ .borrowed = hot_standby_write_gate_adapter.bindPrimary(&primary) }, hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .remote_apply }, .sync_wait_ctx = &context, .sync_wait_fn = Failure.wait }));
-        try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
+        try std.testing.expectError(error.MetadataReplicationPending, source.replaceStandaloneCatalog(group, 0, &.{}, &.{}, value));
     }
     const final_lsn = primary.lastLsn();
     try std.testing.expect(final_lsn > 8);
@@ -6996,7 +6996,10 @@ pub const RaftApplyStore = struct {
         };
         self.unlockHotStandbyTransition();
         transition_locked = false;
-        self.flushHotStandbyOutboxLocked() catch return error.MetadataMutationOutcomeUnknown;
+        // Local commit and sync succeeded. Failure to publish/acknowledge its
+        // outbox must preserve the committed catalog without poisoning local
+        // durability or admitting a subsequent mutation past that outbox.
+        self.flushHotStandbyOutboxLocked() catch return error.MetadataReplicationPending;
     }
 
     fn commitStandaloneTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, outcome: *CommittedApplyOutcome, committed: *bool) !void {

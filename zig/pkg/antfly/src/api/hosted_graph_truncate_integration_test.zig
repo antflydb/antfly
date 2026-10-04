@@ -501,16 +501,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     var data_live = true;
     defer if (data_live) data.deinit();
     try data.start();
-    for (0..32) |_| {
-        data.registerNodeIfConfigured() catch |err| switch (err) {
-            error.StoreRegistrationNotVisible => {
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    } else return error.StoreRegistrationNotVisible;
+    try recovery_fixture.awaitStoreRegistration(io, &data);
     var data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
     var data_raft_live = true;
     defer if (data_raft_live) data_raft.deinit();
@@ -618,7 +609,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     }, metadata_uri);
     data_live = true;
     try data.start();
-    try data.registerNodeIfConfigured();
+    try recovery_fixture.awaitStoreRegistration(io, &data);
     data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
     data_raft_live = true;
     try data_raft.start();
@@ -700,7 +691,7 @@ fn mountedGraphTruncate(faults: bool) !void {
     }, metadata_uri);
     data_live = true;
     try data.start();
-    try data.registerNodeIfConfigured();
+    try recovery_fixture.awaitStoreRegistration(io, &data);
     data_raft = raft.ManagedProgressDriver.init(io, .{ .ptr = &data, .run_once = dataRaft }, std.time.ns_per_ms);
     data_raft_live = true;
     try data_raft.start();

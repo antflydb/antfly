@@ -23231,6 +23231,28 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(i64, 1), parsed_fuzzy.value.object.get("full_text_search").?.object.get("fuzziness").?.integer);
         }
 
+        test "storage-kernel query request preserves final projection while raw retrieval defers it" {
+            const alloc = std.testing.allocator;
+            var original = try query_api.parseQueryRequest(alloc, null, "docs",
+                \\{"full_text_search":{"match_all":{}},"fields":["title"]}
+            );
+            defer original.deinit(alloc);
+            try std.testing.expect(original.req.defer_stored_projection);
+            for ([_]bool{ false, true }) |raw| {
+                const encoded = try local_query_contract.encodeStorageKernelQueryRequestForExecution(alloc, original.req, raw);
+                defer alloc.free(encoded);
+                var parsed = try query_api.parseQueryRequest(alloc, null, "docs", encoded);
+                defer parsed.deinit(alloc);
+                if (raw) {
+                    try std.testing.expectEqual(@as(usize, 0), parsed.req.fields.len);
+                } else {
+                    try std.testing.expectEqual(@as(usize, 1), parsed.req.fields.len);
+                    try std.testing.expectEqualStrings("title", parsed.req.fields[0]);
+                    try std.testing.expect(parsed.req.defer_stored_projection);
+                }
+            }
+        }
+
         test "storage-kernel query request encodes singleton vector index identity" {
             const alloc = std.testing.allocator;
             const encoded = try encodeStorageKernelQueryRequest(alloc, .{
