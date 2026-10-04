@@ -757,7 +757,8 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
         break :blk value.*;
     } else null;
     const receiver = if (services.io) |io| try io.receive() else null;
-    const bootstrap_alloc = if (bridge) |*value| value.asStd() else std.heap.c_allocator;
+    const process_alloc = @import("antfly_platform").allocator.processAllocator(std.heap.c_allocator);
+    const bootstrap_alloc = if (bridge) |*value| value.asStd() else process_alloc;
     const context = try bootstrap_alloc.create(StorageOwnerContext);
     errdefer bootstrap_alloc.destroy(context);
     context.* = .{
@@ -767,7 +768,7 @@ pub fn createStorageOwnerContext(services: kernel_runtime_services.Request) !*St
         .resources = undefined,
         .backend_runtime = undefined,
     };
-    const alloc = if (context.allocator_bridge) |*value| value.asStd() else std.heap.c_allocator;
+    const alloc = if (context.allocator_bridge) |*value| value.asStd() else process_alloc;
     context.alloc = alloc;
     const memory_budget = antfly.memory_budget;
     const memory_limit = std.math.cast(usize, services.memory_limit_bytes) orelse return error.InvalidArgument;
@@ -884,8 +885,11 @@ pub fn storageOwnerContextMetrics(
     context: ?*anyopaque,
     out_result: *kernel_owner_abi.ContextMetricsResult,
 ) callconv(.c) kernel_owner_abi.Status {
-    out_result.* = .{};
     const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    // The result has grown across ABI versions. Read only the leading version
+    // word, which every revision shares, and reject a caller built against
+    // another layout before writing: it may have reserved a smaller struct.
+    if (out_result.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const stats = owner_context.resources.lsm_cache.snapshotStats();
     out_result.* = .{
         .lsm_cache_used_bytes = @intCast(stats.used_bytes),
@@ -896,6 +900,19 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
     };
+    const heap = @import("antfly_platform").allocator.heapAccountingStats();
+    out_result.heap_accounting_enabled = @intFromBool(heap.enabled);
+    out_result.heap_live_bytes = heap.live_bytes;
+    out_result.heap_peak_live_bytes = heap.peak_live_bytes;
+    out_result.heap_allocated_bytes_total = heap.allocated_bytes_total;
+    out_result.heap_allocations_total = heap.allocations_total;
+    const resources = owner_context.resources.resource_manager.snapshot();
+    out_result.resource_memory = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(resources.memory);
+    const slice_count = @min(resources.slices.len, kernel_owner_abi.context_resource_slice_capacity);
+    out_result.resource_slice_count = @intCast(slice_count);
+    for (resources.slices[0..slice_count], out_result.resource_slices[0..slice_count]) |slice, *out| {
+        out.* = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(slice);
+    }
     return .ok;
 }
 

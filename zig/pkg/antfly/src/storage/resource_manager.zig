@@ -4158,7 +4158,7 @@ fn sliceIndex(slice: Slice) usize {
     return @intFromEnum(slice);
 }
 
-fn pressureFor(budget: Budget, used_bytes: u64) Pressure {
+pub fn pressureFor(budget: Budget, used_bytes: u64) Pressure {
     if (budget.hard_limit_bytes > 0 and used_bytes > budget.hard_limit_bytes) return .hard;
     if (budget.soft_limit_bytes > 0 and used_bytes > budget.soft_limit_bytes) return .soft;
     return .normal;

@@ -4512,14 +4512,28 @@ pub fn runFromIterator(
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    // The storage kernel sizes its ResourceManager when its context is
+    // created, so the operator's process envelope must be resolved first.
+    const process_memory_resolution = resolveProcessMemoryBudget(
+        cli,
+        init.environ_map,
+    ) catch |err| {
+        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
+        return err;
+    };
+    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
+    platform.allocator.configureForProcessEnvelope(process_memory_limit_bytes);
     var storage_kernel_context = kernel_owner_client.Context{};
     defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
-        try storage_kernel_context.ensureWith(.{
-            .storage_kind = if (lite_path != null) .lite else .directory,
-            .no_sync = @intFromBool(!lite_fsync),
-            .storage_path = .fromSlice(lite_path orelse ""),
-            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        try storage_kernel_context.ensureWithRuntime(.{
+            .context = .{
+                .storage_kind = if (lite_path != null) .lite else .directory,
+                .no_sync = @intFromBool(!lite_fsync),
+                .storage_path = .fromSlice(lite_path orelse ""),
+                .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+            },
+            .memory_limit_bytes = process_memory_limit_bytes,
         });
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
@@ -4632,14 +4646,6 @@ pub fn runFromIterator(
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
     const loaded_cfg = if (loaded_config) |*cfg| cfg else null;
-    const process_memory_resolution = resolveProcessMemoryBudget(
-        cli,
-        init.environ_map,
-    ) catch |err| {
-        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
-        return err;
-    };
-    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
     const configured_preload = if (loaded_cfg) |cfg| cfg.inference.preload else &.{};
     const loaded_preload = if (cli.inference_preload_models.items.len == 0 and configured_preload.len != 0) blk: {
         const out = try alloc.alloc(inference_bridge.WarmModel, configured_preload.len);

@@ -215,6 +215,12 @@ fn tryCaptureRaftAfterDeadline(
 const runtime_status_refresh_max_db_opens_per_run: usize = 16;
 const runtime_status_disk_usage_refresh_interval_ns: u64 = 30 * std.time.ns_per_s;
 const auto_bulk_finish_poll_interval_ms: u64 = 250;
+const process_memory_reclaim_check_interval_ns: u64 = 2 * std.time.ns_per_s;
+const process_memory_reclaim_backoff_ns: u64 = 10 * std.time.ns_per_s;
+const process_memory_reclaim_min_useful_bytes: u64 = 16 * 1024 * 1024;
+// Reclaim once the pressure working set passes 1/2 of the process envelope.
+const process_memory_reclaim_threshold_numerator: u64 = 1;
+const process_memory_reclaim_threshold_divisor: u64 = 2;
 const provisioned_startup_catch_up_interval_ms: u64 = std.time.ms_per_s;
 const provisioned_index_repair_interval_ms: u64 = 5 * std.time.ms_per_s;
 const default_provisioned_index_repair_discovery_interval_ms: u64 = 30 * std.time.ms_per_s;
@@ -2710,7 +2716,12 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_retry_scheduled", "gauge", "Whether dropped-table recovery is waiting in its bounded retry backoff", if (dropped_table_recovery.retry_scheduled) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_consecutive_enqueue_failures", "gauge", "Consecutive dropped-table recovery worker allocations or durable queue submissions that failed", dropped_table_recovery.consecutive_enqueue_failures);
         try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_enqueue_failures_total", "counter", "Dropped-table recovery worker allocations or durable queue submissions that failed and were retained for watchdog retry", dropped_table_recovery.enqueue_failures);
-        try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
+        try health_metrics.appendPromMetric(writer, "antfly_process_memory_reclaim_attempts_total", "counter", "Allocator purge requests issued because the pressure working set passed the reclaim threshold", self.data_server.process_memory_reclaim_attempts.load(.monotonic));
+        try health_metrics.appendPromMetric(writer, "antfly_process_memory_reclaimed_bytes_total", "counter", "Pressure working-set bytes released by allocator purge requests", self.data_server.process_memory_reclaimed_bytes.load(.monotonic));
+        if (comptime linked_storage) try self.data_server.writeHeapAccountingMetricsBestEffort(writer);
+        var resource_snapshot = self.data_server.provisioned_storage.resource_manager.snapshot();
+        if (comptime linked_storage) self.data_server.mergeStorageOwnerResourceStatsBestEffort(&resource_snapshot);
+        try writeResourceMetricsSnapshot(writer, resource_snapshot);
         try writeLsmCacheMetrics(writer, if (comptime linked_storage)
             self.data_server.storageOwnerLsmCacheStatsBestEffort()
         else
@@ -3437,7 +3448,10 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
 }
 
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
-    const snapshot = manager.snapshot();
+    try writeResourceMetricsSnapshot(writer, manager.snapshot());
+}
+
+fn writeResourceMetricsSnapshot(writer: *std.Io.Writer, snapshot: resource_manager_mod.Stats) !void {
     try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_active", "gauge", "Bounded vector read helpers active", snapshot.dense_read_tasks.active);
     try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_peak_active", "gauge", "Bounded vector read helpers peak_active", snapshot.dense_read_tasks.peak_active);
     try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_limit", "gauge", "Bounded vector read helpers limit", snapshot.dense_read_tasks.limit);
@@ -5589,6 +5603,9 @@ pub const DataServer = struct {
     local_split_key_generation: std.atomic.Value(u64) = .init(1),
     local_split_key_cache_mutex: std.atomic.Mutex = .unlocked,
     local_split_key_cache: LocalSplitKeyCache = .{},
+    process_memory_reclaim_next_check_ns: std.atomic.Value(u64) = .init(0),
+    process_memory_reclaim_attempts: std.atomic.Value(u64) = .init(0),
+    process_memory_reclaimed_bytes: std.atomic.Value(u64) = .init(0),
     auto_bulk_finish_mutex: std.atomic.Mutex = .unlocked,
     auto_bulk_finish_active: std.atomic.Value(bool) = .init(false),
     auto_bulk_finish_started: std.atomic.Value(u64) = .init(0),
@@ -6550,6 +6567,77 @@ pub const DataServer = struct {
     fn storageKernelContextHandle(self: *const DataServer) ?*anyopaque {
         return self.borrowed_storage_kernel_context orelse
             if (self.storage_kernel_context) |context| context.handle else null;
+    }
+
+    /// Safety fuse for allocator-retained memory. The ResourceManager only
+    /// governs what owners charge; freed heap the allocator keeps dirty still
+    /// counts against the process envelope. When the pressure working set
+    /// passes the threshold, ask the allocator to return unused pages. It is
+    /// armed only in small envelopes: on a large node half the envelope is an
+    /// ordinary working set, and a purge walks every arena and re-faults the
+    /// pages it returns, which shows up as tail latency.
+    fn maintainProcessMemoryReclaim(self: *DataServer, now_ns: u64) void {
+        if (comptime !platform.allocator.processMemoryReclaimSupported()) return;
+        const limit = self.provisioned_storage.effective_memory_limit_bytes;
+        if (limit == 0 or limit > platform.allocator.small_process_envelope_bytes) return;
+        if (now_ns < self.process_memory_reclaim_next_check_ns.load(.monotonic)) return;
+        self.process_memory_reclaim_next_check_ns.store(now_ns +| process_memory_reclaim_check_interval_ns, .monotonic);
+        const working_set = platform.process_memory.pressureWorkingSetBytes(platform.process_memory.pressureSnapshot());
+        if (working_set < limit / process_memory_reclaim_threshold_divisor * process_memory_reclaim_threshold_numerator) return;
+        _ = self.process_memory_reclaim_attempts.fetchAdd(1, .monotonic);
+        _ = platform.allocator.reclaimUnusedProcessMemory();
+        const after = platform.process_memory.pressureWorkingSetBytes(platform.process_memory.pressureSnapshot());
+        const reclaimed = working_set -| after;
+        _ = self.process_memory_reclaimed_bytes.fetchAdd(reclaimed, .monotonic);
+        // Live memory legitimately above the threshold has nothing to give
+        // back; do not keep paying for purge walks that return nothing.
+        if (reclaimed < process_memory_reclaim_min_useful_bytes) {
+            self.process_memory_reclaim_next_check_ns.store(now_ns +| process_memory_reclaim_backoff_ns, .monotonic);
+        }
+    }
+
+    /// Storage owners charge the kernel context's ResourceManager, not the
+    /// node-level one that still carries inference leases. Report one ledger:
+    /// usage is summed, and a slice or aggregate limit comes from the kernel
+    /// whenever the kernel has one.
+    fn mergeStorageOwnerResourceStatsBestEffort(self: *DataServer, stats: *resource_manager_mod.Stats) void {
+        const owner_source = self.kernel_owner_source orelse return;
+        const metrics = owner_source.contextMetrics() catch return;
+        mergeStorageOwnerBudgetStats(&stats.memory, metrics.resource_memory);
+        const count = @min(stats.slices.len, @as(usize, metrics.resource_slice_count));
+        for (stats.slices[0..count], metrics.resource_slices[0..count]) |*slice, kernel| mergeStorageOwnerBudgetStats(slice, kernel);
+    }
+
+    /// Live heap for the node allocator plus the storage kernel's, exported only
+    /// when `ANTFLY_HEAP_ACCOUNTING=1` so resident memory can be compared with it.
+    fn writeHeapAccountingMetricsBestEffort(self: *DataServer, writer: *std.Io.Writer) !void {
+        const node = platform.allocator.heapAccountingStats();
+        const owner_source = self.kernel_owner_source orelse return;
+        const kernel = owner_source.contextMetrics() catch return;
+        if (!node.enabled and kernel.heap_accounting_enabled == 0) return;
+        const live: u64 = @intCast(@max(node.live_bytes +| kernel.heap_live_bytes, 0));
+        try health_metrics.appendPromMetric(writer, "antfly_process_heap_live_bytes", "gauge", "Bytes currently allocated through the accounted node and storage-kernel allocators", live);
+        try health_metrics.appendPromMetric(writer, "antfly_process_heap_kernel_peak_live_bytes", "gauge", "Peak bytes allocated through the storage kernel allocator", kernel.heap_peak_live_bytes);
+        try health_metrics.appendPromMetric(writer, "antfly_process_heap_allocated_bytes_total", "counter", "Cumulative bytes allocated through the accounted process allocators", node.allocated_bytes_total +| kernel.heap_allocated_bytes_total);
+        try health_metrics.appendPromMetric(writer, "antfly_process_heap_allocations_total", "counter", "Cumulative allocations through the accounted process allocators", node.allocations_total +| kernel.heap_allocations_total);
+    }
+
+    fn mergeStorageOwnerBudgetStats(stats: anytype, kernel: kernel_owner_client.ContextResourceBudgetStats) void {
+        stats.used_bytes +|= kernel.used_bytes;
+        stats.peak_bytes +|= kernel.peak_bytes;
+        if (kernel.soft_limit_bytes != 0) stats.soft_limit_bytes = kernel.soft_limit_bytes;
+        if (kernel.hard_limit_bytes != 0) stats.hard_limit_bytes = kernel.hard_limit_bytes;
+        stats.soft_limit_events +|= kernel.soft_limit_events;
+        stats.hard_limit_rejections +|= kernel.hard_limit_rejections;
+        if (comptime @hasField(@TypeOf(stats.*), "oversized_single_grants")) stats.oversized_single_grants +|= kernel.oversized_single_grants;
+        if (comptime @hasField(@TypeOf(stats.*), "accounting_errors")) stats.accounting_errors +|= kernel.accounting_errors;
+        // Pressure follows the merged ledger: the combined usage against the
+        // limits now reported, never lower than either manager's own state.
+        const merged = resource_manager_mod.pressureFor(.{
+            .soft_limit_bytes = stats.soft_limit_bytes,
+            .hard_limit_bytes = stats.hard_limit_bytes,
+        }, stats.used_bytes);
+        if (@intFromEnum(merged) > @intFromEnum(stats.pressure)) stats.pressure = merged;
     }
 
     fn storageOwnerLsmCacheStatsBestEffort(self: *DataServer) lsm_backend_mod.CacheStats {
@@ -9176,6 +9264,7 @@ pub const DataServer = struct {
             std.log.warn("initial FK retirement maintenance deferred err={s}", .{@errorName(err)});
         };
         self.maintainHotStandbyTerminalReclamation(now_ns);
+        self.maintainProcessMemoryReclaim(now_ns);
         if (self.hotStandbyStandbyReplicationRetryDue(now_ns)) {
             if (self.runHotStandbyStandbyReplicationRound()) |_| {
                 self.clearHotStandbyStandbyReplicationRetry();
@@ -23822,7 +23911,7 @@ pub const DataServer = struct {
                     const io = backend_runtime.?.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
                     var borrow = services.executor.Borrow.init(&io);
                     try context.ensureWithRuntime(.{ .io = &borrow, .memory_limit_bytes = cfg.process_memory_limit_bytes });
-                } else try context.ensure();
+                } else try context.ensureWithRuntime(.{ .memory_limit_bytes = cfg.process_memory_limit_bytes });
                 storage_kernel_context = context;
                 const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(
                     alloc,
@@ -30579,6 +30668,7 @@ pub fn runFromIterator(
         return err;
     };
     const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
+    platform.allocator.configureForProcessEnvelope(process_memory_limit_bytes);
 
     var secret_store: antfly.common.secrets.FileStore = undefined;
     var secret_store_initialized = false;
@@ -30728,8 +30818,11 @@ pub fn runFromIterator(
     defer if (process_storage_kernel_context) |*context| context.deinit();
     if (comptime linked_storage) {
         var context = kernel_owner_client.Context{};
-        try context.ensureWith(.{
-            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        try context.ensureWithRuntime(.{
+            .context = .{
+                .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+            },
+            .memory_limit_bytes = process_memory_limit_bytes,
         });
         process_storage_kernel_context = context;
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
@@ -55896,4 +55989,63 @@ comptime {
         _ = consumer_tests;
         _ = implementation_tests;
     }
+}
+
+test "merged storage-owner budget stats report pressure from the combined ledger" {
+    var memory: resource_manager_mod.MemoryStats = .{};
+    DataServer.mergeStorageOwnerBudgetStats(&memory, .{ .used_bytes = 90, .soft_limit_bytes = 75, .hard_limit_bytes = 100 });
+    try std.testing.expectEqual(resource_manager_mod.Pressure.soft, memory.pressure);
+
+    // Node usage and kernel usage together cross the kernel's hard limit.
+    var slice: resource_manager_mod.SliceStats = .{ .name = "slice", .used_bytes = 10 };
+    DataServer.mergeStorageOwnerBudgetStats(&slice, .{ .used_bytes = 95, .soft_limit_bytes = 50, .hard_limit_bytes = 100 });
+    try std.testing.expectEqual(resource_manager_mod.Pressure.hard, slice.pressure);
+
+    // A node-level state above what the merged numbers imply is kept.
+    var node_hard: resource_manager_mod.MemoryStats = .{ .pressure = .hard };
+    DataServer.mergeStorageOwnerBudgetStats(&node_hard, .{});
+    try std.testing.expectEqual(resource_manager_mod.Pressure.hard, node_hard.pressure);
+}
+
+test "merged storage-owner metrics preserve accounting counters in Prometheus output" {
+    var budgets = resource_manager_mod.Options.defaultBudgets();
+    const slice_index = @intFromEnum(resource_manager_mod.Slice.text_merge_buffers);
+    budgets[slice_index] = .{ .soft_limit_bytes = 8, .hard_limit_bytes = 10 };
+    var node = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer node.deinit(std.testing.allocator);
+    var kernel = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+    defer kernel.deinit(std.testing.allocator);
+    // Generate actual slice grants and fail-closed stale-release events in
+    // each ledger, then exercise the same projection, merge, and renderer.
+    for (0..7) |i| {
+        if (i < 3) {
+            var grant = try node.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2);
+            var stale = grant;
+            grant.release();
+            if (i < 2) stale.release();
+        }
+        var grant = try kernel.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2);
+        var stale = grant;
+        grant.release();
+        if (i < 5) stale.release();
+    }
+    var snapshot = node.snapshot();
+    const kernel_snapshot = kernel.snapshot();
+    DataServer.mergeStorageOwnerBudgetStats(&snapshot.memory, kernel_owner_client.ContextResourceBudgetStats.fromResourceStats(kernel_snapshot.memory));
+    DataServer.mergeStorageOwnerBudgetStats(&snapshot.slices[slice_index], kernel_owner_client.ContextResourceBudgetStats.fromResourceStats(kernel_snapshot.slices[slice_index]));
+
+    var buffer: [262144]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    try writeResourceMetricsSnapshot(&writer, snapshot);
+    const output = writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "\nantfly_resource_host_memory_accounting_errors_total 7\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\nantfly_resource_oversized_single_grants_total{slice=\"text_merge.buffers\"} 10\n") != null);
+
+    // Long-lived cumulative counters must retain their saturating semantics.
+    var memory: resource_manager_mod.MemoryStats = .{ .accounting_errors = std.math.maxInt(u64) - 1 };
+    DataServer.mergeStorageOwnerBudgetStats(&memory, .{ .accounting_errors = 2 });
+    try std.testing.expectEqual(std.math.maxInt(u64), memory.accounting_errors);
+    var slice: resource_manager_mod.SliceStats = .{ .name = "slice", .oversized_single_grants = std.math.maxInt(u64) - 1 };
+    DataServer.mergeStorageOwnerBudgetStats(&slice, .{ .oversized_single_grants = 2 });
+    try std.testing.expectEqual(std.math.maxInt(u64), slice.oversized_single_grants);
 }
