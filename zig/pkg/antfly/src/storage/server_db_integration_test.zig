@@ -138,7 +138,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             try std.testing.expectError(error.RaftApplyWriterUnavailable, server_test_adapter.applyOrdered(&database, merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(u64, 1), (try database.orderedApplyReceipt()).?.index);
             database.startResidentBackgroundWorkersIfNeeded();
-            if (database.artifact_repair_metadata_future == null) return error.GraphMaintenanceWorkerMissing;
+            if (database.independent_maintenance.future == null) return error.GraphMaintenanceWorkerMissing;
             const graph = &database.core.index_manager.graphIndex("g").?.index;
             for (0..100) |_| {
                 if (!graph.ownershipTransitionPending()) break;

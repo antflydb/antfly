@@ -4753,7 +4753,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-local-transaction-recovery-test", "Run local transaction recovery regressions").dependOn(&addFilteredTestRunArtifact(b, local_recovery_tests).step);
-    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl." };
+    const server_db_filters = [_][]const u8{ "storage.server_db_integration_test.", "storage.server_transaction_recovery.", "storage.artifact_upload_recovery.", "storage.server_coordinated_ttl.", "storage.server_query_visibility.", "storage.server_document_child_range." };
     const server_db_tests = b.addTest(.{
         .root_module = server_db_test_mod,
         .filters = &server_db_filters,
@@ -5690,7 +5690,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const local_maintenance_tests = b.addTest(.{
         .name = "local-maintenance-contract-tests",
         .root_module = antfly_test_mod,
-        .filters = &.{ "storage.source_authority.", "storage.db.promotion_runtime.", "storage.db.artifact_publication_transport.", "storage.db.artifact_producer_scheduler.", "storage.db.publication_outbox_recovery." },
+        .filters = &.{ "storage.source_authority.", "storage.db.promotion_runtime.", "storage.db.artifact_publication_transport.", "storage.db.artifact_producer_scheduler.", "storage.db.publication_outbox_recovery.", "storage.db.document_child_range_manifest.", "storage.db.document_child_range_effects.", "storage.db.document_child_range_outbox.", "storage.db.quarantine_recovery.", "storage.db.independent_maintenance." },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     const run_local_maintenance_tests = addCuratedTestRunArtifact(b, local_maintenance_tests, local_maintenance_tests.filters);
@@ -5699,7 +5699,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const producer_maintenance_tests = b.addTest(.{
         .name = "producer-maintenance-tests",
         .root_module = db_test_mod,
-        .filters = &.{ "db ordered artifact inventory producer", "storage.db.artifact_completion_progress.", "storage.hot_standby durable outbox recovery", "db coordinated ttl", "db ttl cleanup rechecks", "db ttl cleanup defers" },
+        .filters = &.{ "db ordered artifact inventory producer", "storage.db.artifact_completion_progress.", "storage.hot_standby durable outbox recovery", "db coordinated ttl", "db ttl cleanup rechecks", "db ttl cleanup defers", "portable activation retry", "db portable activation gate", "db quarantined index self-heals", "db targeted quarantine retry", "db dispatches generated document child range", "document child range partition preserves", "db retries remote document child range", "db managed visibility hook rehydrates", "db dense auto bulk finish wakes weak-sync", "db searches fail fast without joining portable", "db enrichment status changes notify", "relational columnar maintenance survives", "relational columnar artifact backoff", "owned DB open starts self-retaining workers" },
         .test_runner = .{ .path = b.path("pkg/antfly/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-producer-maintenance-test", "Run durable producer, publication recovery, and TTL observation regressions").dependOn(&addCuratedTestRunArtifact(b, producer_maintenance_tests, producer_maintenance_tests.filters).step);
@@ -5985,6 +5985,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.db.artifact_publication_transport.",
             "storage.db.artifact_producer_scheduler.",
             "storage.db.publication_outbox_recovery.",
+            "storage.db.document_child_range_manifest.",
+            "storage.db.document_child_range_effects.",
+            "storage.db.document_child_range_outbox.",
+            "storage.db.quarantine_recovery.",
+            "storage.db.independent_maintenance.",
             "storage.db.artifact_publication_transport_codec.",
             "storage.db.artifact_publication_wire.",
             "storage.db.artifact_reconcile.",
@@ -6255,7 +6260,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }
-    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig", "artifact_upload_recovery.zig", "server_coordinated_ttl.zig" }) |source| {
+    for ([_][]const u8{ "server_db_integration_test.zig", "server_transaction_recovery.zig", "artifact_upload_recovery.zig", "server_coordinated_ttl.zig", "server_query_visibility.zig", "server_document_child_range.zig" }) |source| {
         unit_storage_shard_audit.addArg("--dedicated");
         unit_storage_shard_audit.addFileArg(b.path(b.fmt("pkg/antfly/src/storage/{s}", .{source})));
     }

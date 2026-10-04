@@ -100,12 +100,19 @@ test "producer scheduler backs off failures and empty sweeps and prevents reentr
         now_ns: u64 = 10,
         fail: bool = true,
         calls: usize = 0,
+        in_page: bool = false,
         fn now(ptr: *anyopaque) u64 {
             return (@as(*@This(), @ptrCast(@alignCast(ptr)))).now_ns;
         }
         fn page(ptr: *anyopaque) !bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(!self.in_page);
+            self.in_page = true;
+            defer self.in_page = false;
             self.calls += 1;
+            // Expire cadence while the outer page remains active. Only the
+            // single-flight guard can now exclude a nested page.
+            self.now_ns += Scheduler.poll_interval_ns;
             try std.testing.expect(!try self.scheduler.advance(self.port()));
             if (self.fail) return error.Refused;
             return false;

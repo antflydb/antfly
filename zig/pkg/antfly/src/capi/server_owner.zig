@@ -13,6 +13,7 @@
 // limitations.
 
 //! Private server storage-provider operations, separate from public C exports.
+const server_document_child_range = @import("../storage/server_document_child_range.zig");
 pub const storage_root = @import("antfly_source_root");
 pub const antfly = @import("../capi_root.zig");
 const handles = @import("handles.zig");
@@ -3068,13 +3069,12 @@ pub fn storageOwnerLocalTransition(
 
 pub fn storageOwnerTargetAdvanced(
     ptr: *anyopaque,
-    table_name: []const u8,
-    group_id: u64,
-    _: ?*db_mod.DB,
     event: db_mod.QueryVisibilityEvent,
 ) void {
     if (event.change != .target_advanced) return;
     const handle: *Handle = @ptrCast(@alignCast(ptr));
+    const table_name = handle.storage_owner_table_name orelse "";
+    const group_id = handle.storage_owner_group_id;
     const observer = handle.storage_owner_target_observer;
     const notify = observer.notify orelse return;
     const identities_json = if (event.target_scope_known)
@@ -3318,8 +3318,6 @@ pub fn storageOwnerOpen(
     if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort());
     if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,
-        .table_name = owned_table_name,
-        .group_id = request.group_id,
         .on_change = storageOwnerTargetAdvanced,
     });
     // Configuration can start DB-owned workers. Publish their pointers only
@@ -3718,7 +3716,7 @@ pub const StorageOwnerDocumentChildRangeDispatch = struct {
     callback_fn: kernel_owner_abi.DocumentChildRangeDispatchFn,
 
     pub fn dispatcher(self: *@This()) db_mod.DocumentArtifactChildRangeDispatcher {
-        return .{ .ptr = self, .apply = apply };
+        return .{ .ptr = self, .select_destination = server_document_child_range.selectPersistedDestination, .apply = apply };
     }
 
     pub fn apply(

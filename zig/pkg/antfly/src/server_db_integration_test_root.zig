@@ -7,4 +7,6 @@ test {
     _ = @import("storage/server_transaction_recovery.zig");
     _ = @import("storage/artifact_upload_recovery.zig");
     _ = @import("storage/server_coordinated_ttl.zig");
+    _ = @import("storage/server_query_visibility.zig");
+    _ = @import("storage/server_document_child_range.zig");
 }

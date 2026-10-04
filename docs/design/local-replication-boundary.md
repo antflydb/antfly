@@ -146,3 +146,54 @@ Upload recovery is one optional dispatcher capability containing both cadence an
 recovery callbacks. Its integration regression uses the actual server runtime-hook
 factory and verifies refused periodic admission, cadence suppression, explicit
 retry, and the following maintenance opportunity against reopened upload state.
+
+## Visibility observations and child-range effects
+
+The DB emits `QueryVisibilityEvent` through a borrowed context and callback.
+`storage/server_query_visibility.zig` binds table, group, cache, and owner identity
+outside storage. The private C owner attaches its handle's existing routing
+identity when encoding the unchanged notification ABI. Detachment still waits
+for in-flight observations, and installing a hook still rehydrates durable repair
+state. An observer that needs local DB access borrows it through its own context.
+
+`storage/db/document_child_range_effects.zig` partitions prepared generated effects
+against local manifest snapshots and physical key bounds. A pure, bounded
+selection callback supplies a destination; planning does not inspect server role
+or placement status. `storage/server_document_child_range.zig` interprets committed
+server placement. Delivery adapters retain live routing and transport admission
+checks after the local apply fence is released.
+
+`document_child_range_manifest.zig` owns child-range decoding and allocation
+cleanup. `document_child_range_outbox.zig` owns intent encoding, staging, and
+delivery iteration. DB supplies fenced manifest reads, snapshot scans, and intent
+deletion. Local effects and staged intents still commit in the same batch; an
+intent is deleted only after successful delivery. The version-one record and
+persisted destination remain compatible. Allocation failure cannot transfer only
+part of a record's key/value ownership.
+
+## Local recovery and maintenance owners
+
+`storage/db/portable_activation_recovery.zig` owns activation queue admission,
+retry jitter, supervisor probes, the running flag, and permanent close state.
+Its stable borrowed port invokes DB's fenced catalog activation. The completion
+handshake and runtime owner drain protect the DB and callback context through
+shutdown, including a supervisor probe claimed before close.
+
+`storage/db/quarantine_recovery.zig` owns index-load retry registration and joining.
+DB supplies load-failure observation and its fenced retry operation. A completed
+cohort is joined before another cohort can be scheduled; close permanently
+rejects new registration. These are embedded self-healing mechanisms and have
+no server coordination dependency.
+
+`storage/db/independent_maintenance.zig` owns bounded operation order, retry
+suppression, active/idle and source-scan cadence, scheduler registration, and
+shutdown. DB supplies local activity and the budgeted, fenced operations. Runtime
+awake time controls repair retry deadlines; relational-index activity retains its
+existing clock. Activation contention yields the turn without increasing repair
+backoff. Other repair errors leave relational maintenance able to progress.
+
+Publication recovery snapshots its diagnostic counter and publishes the next
+retry deadline before releasing its single-flight state. A successor admitted by
+a rearm callback cannot change the previous failure's report. Producer
+single-flight tests advance the clock while a page is active so cadence cannot
+hide missing admission protection.

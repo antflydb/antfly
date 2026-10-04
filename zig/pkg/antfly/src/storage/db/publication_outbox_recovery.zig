@@ -32,12 +32,20 @@ pub const Driver = struct {
             return;
         }
         if (self.state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) return;
-        port.submit(port.ptr) catch |err| {
+        // A previous flight can publish backoff between the optimistic clock
+        // check and admission. Recheck while owning the flight before enqueueing.
+        if (port.now(port.ptr) < self.next_attempt_ns.load(.acquire)) {
             self.state.store(0, .release);
-            const delay = 250 * std.time.ns_per_ms;
-            self.next_attempt_ns.store(port.now(port.ptr) +| delay, .release);
             port.arm(port.ptr);
-            port.report(port.ptr, .admission, err, self.failure_streak, delay);
+            return;
+        }
+        port.submit(port.ptr) catch |err| {
+            const delay = 250 * std.time.ns_per_ms;
+            const failures = self.failure_streak;
+            self.next_attempt_ns.store(port.now(port.ptr) +| delay, .release);
+            self.state.store(0, .release);
+            port.arm(port.ptr);
+            port.report(port.ptr, .admission, err, failures, delay);
         };
     }
     pub fn run(self: *Driver, port: Port) void {
@@ -50,11 +58,12 @@ pub const Driver = struct {
                     return;
                 }
                 self.failure_streak +|= 1;
-                const delay = port.retry_delay(port.ptr, self.failure_streak - 1);
+                const failures = self.failure_streak;
+                const delay = port.retry_delay(port.ptr, failures - 1);
                 self.next_attempt_ns.store(port.now(port.ptr) +| delay, .release);
                 self.state.store(0, .release);
                 port.arm(port.ptr);
-                port.report(port.ptr, .delivery, err, self.failure_streak, delay);
+                port.report(port.ptr, .delivery, err, failures, delay);
                 return;
             };
             if (!port.pending(port.ptr)) break;
@@ -152,4 +161,61 @@ test "publication outbox recovery retries admission and delivery until fenced em
     try std.testing.expectEqual(@as(u8, 0), fixture.driver.state.load(.acquire));
     try std.testing.expectEqual(arms, fixture.arms);
     try std.testing.expectEqual(@as(u32, 0), fixture.driver.failure_streak);
+}
+
+test "a previous recovery failure must retain its own diagnostic counter after rearming" {
+    const F = struct {
+        driver: Driver = .{},
+        now_ns: u64 = 1,
+        pending_work: bool = true,
+        refuse_delivery: bool = true,
+        reenter: bool = true,
+        reported: ?u32 = null,
+        fn f(ptr: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(ptr));
+        }
+        fn yes(_: *anyopaque) bool {
+            return true;
+        }
+        fn no(_: *anyopaque) bool {
+            return false;
+        }
+        fn pending(ptr: *anyopaque) bool {
+            return f(ptr).pending_work;
+        }
+        fn now(ptr: *anyopaque) u64 {
+            return f(ptr).now_ns;
+        }
+        fn drain(ptr: *anyopaque) !void {
+            const fixture = f(ptr);
+            if (fixture.refuse_delivery) return error.PublisherUnavailable;
+            fixture.pending_work = false;
+        }
+        fn submit(_: *anyopaque) !void {}
+        fn arm(ptr: *anyopaque) void {
+            const fixture = f(ptr);
+            if (!fixture.reenter) return;
+            fixture.reenter = false;
+            fixture.refuse_delivery = false;
+            fixture.now_ns = fixture.driver.next_attempt_ns.load(.acquire);
+            // Model a due maintenance probe and queued successor running
+            // before the previous worker reaches its logging callback.
+            fixture.driver.schedule(fixture.port());
+            fixture.driver.run(fixture.port());
+        }
+        fn disarm(_: *anyopaque) void {}
+        fn delay(_: *anyopaque, _: u32) u64 {
+            return 10;
+        }
+        fn report(ptr: *anyopaque, _: Driver.Failure, _: anyerror, failures: u32, _: u64) void {
+            f(ptr).reported = failures;
+        }
+        fn port(fixture: *@This()) Driver.Port {
+            return .{ .ptr = fixture, .eligible = yes, .closing = no, .pending = pending, .may_disarm = yes, .now = now, .drain = drain, .submit = submit, .arm = arm, .disarm = disarm, .retry_delay = delay, .report = report };
+        }
+    };
+    var fixture: F = .{};
+    fixture.driver.schedule(fixture.port());
+    fixture.driver.run(fixture.port());
+    try std.testing.expectEqual(@as(?u32, 1), fixture.reported);
 }

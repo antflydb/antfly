@@ -12,6 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const server_document_child_range = @import("../storage/server_document_child_range.zig");
+const server_query_visibility = @import("../storage/server_query_visibility.zig");
 const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const hot_standby_publisher_adapter = @import("../storage/hot_standby/db_commit.zig");
 const hot_standby_write_gate_adapter = @import("../storage/hot_standby/write_gate.zig");
@@ -2487,6 +2489,7 @@ pub const ProvisionedTableWriteCache = struct {
         group_id: u64 = 0,
         leadership_source: ?PromotionLeadershipSourceContract = null,
         ttl_binding: server_coordinated_ttl.Binding = .{},
+        visibility_binding: server_query_visibility.Binding = .{},
 
         fn owner(self: *RuntimeHookState) ?db_mod.PromotionOwner {
             if (self.leadership_source == null) return null;
@@ -6153,6 +6156,7 @@ const DocumentChildRangeDispatchContext = struct {
     fn dispatcher(self: *DocumentChildRangeDispatchContext) db_mod.DocumentArtifactChildRangeDispatcher {
         return .{
             .ptr = self,
+            .select_destination = server_document_child_range.selectPersistedDestination,
             .apply = apply,
         };
     }
@@ -7670,15 +7674,13 @@ pub const ProvisionedTableWriteSource = struct {
     ) void {
         db.setResolutionCandidateSource(self.resolution_candidate_source);
         db.setEntitySink(self.entity_sink);
-        owner_state.* = .{
-            .group_id = group_id,
-            .leadership_source = self.promotion_leadership_source,
-        };
+        owner_state.group_id = group_id;
+        owner_state.leadership_source = self.promotion_leadership_source;
         db.setPromotionOwner(owner_state.owner());
         // Cold repair owners must report the same durable pending/clear edges
         // as resident writers. DB.close() clears this hook with a callback
         // barrier before table_name leaves the caller's scope.
-        db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(table_name, group_id, db));
+        db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&owner_state.visibility_binding, table_name, group_id, db));
     }
 
     pub fn withRaftBatcher(self: *ProvisionedTableWriteSource, batcher: ?RaftBatcher) *ProvisionedTableWriteSource {
@@ -12352,7 +12354,7 @@ pub const ProvisionedTableWriteSource = struct {
                         cached.db,
                     );
                     if (mode == .default or mode == .default_async) {
-                        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+                        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
                     }
                     return cached;
                 },
@@ -12406,7 +12408,7 @@ pub const ProvisionedTableWriteSource = struct {
                         prepared_open.?.deinit(cache.alloc);
                         prepared_open = null;
                         if (mode == .default or mode == .default_async) {
-                            cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+                            cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
                         }
                         return cached;
                     },
@@ -12618,7 +12620,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try cache.reserveRetiredEntriesCapacityLocked(1);
                 const adopted = try cache.adoptPreparedOpenLocked(&opened, group_id, lsm_root_generation, table_name, mode, &prepared_open.?);
                 if (mode == .default or mode == .default_async) {
-                    adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(adopted.entry.?.table_name, group_id, adopted.db));
+                    adopted.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&adopted.entry.?.runtime_hook_state.visibility_binding, adopted.entry.?.table_name, group_id, adopted.db));
                 }
                 if (ensure_auto_bulk_now_ns) |now_ns| try cache.ensureAutoBulkIngestLocked(group_id, table_name, now_ns);
                 break :blk adopted;
@@ -12864,17 +12866,12 @@ pub const ProvisionedTableWriteSource = struct {
 
     fn managedDerivedVisibilityHook(
         self: *ProvisionedTableWriteSource,
+        binding: *server_query_visibility.Binding,
         table_name: []const u8,
         group_id: u64,
         db: *db_mod.DB,
     ) db_mod.QueryVisibilityHook {
-        return .{
-            .ptr = self,
-            .table_name = table_name,
-            .group_id = group_id,
-            .db = db,
-            .on_change = onManagedDerivedVisibilityEvent,
-        };
+        return binding.bind(.{ .ptr = self, .table_name = table_name, .group_id = group_id, .owner = db, .notify = onManagedDerivedVisibilityEvent });
     }
 
     fn publishManagedRuntimeStatusBestEffort(
@@ -28187,7 +28184,7 @@ fn reconcileCachedLocalTableIndexCreate(
         var cached = try self.getOrOpenCachedDbForLocalMutationAlreadyLocked(cache, path, group_id, target_generation, table_name, false);
         var cached_active = true;
         defer if (cached_active) cached.deinit(alloc);
-        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
         applyIndexCreateToCachedDb(alloc, cached.db, metadata.indexes_json, index_name, self.backend_runtime, self.antfly_provider, self.remote_capability_cache, self.inference_api_url, table_name, self.secret_store, self.remote_content) catch |err| {
             cache.retireCachedLeaseAfterMutationFailureLocked(&cached);
@@ -28239,7 +28236,7 @@ fn reconcileCachedLocalTableIndexDrop(
         var cached = try self.getOrOpenCachedDbForLocalMutationAlreadyLocked(cache, path, group_id, target_generation, table_name, false);
         var cached_active = true;
         defer if (cached_active) cached.deinit(alloc);
-        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
         reconfigureManagedDbEnrichmentRuntime(
             alloc,
@@ -28340,7 +28337,7 @@ fn putCachedLocalArtifactEnrichment(
         var cached = try self.getOrOpenCachedDbForLocalMutation(alloc, cache, path, group_id, target_generation, table_name, false);
         var cached_active = true;
         defer if (cached_active) cached.deinit(alloc);
-        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
         const mutation_err: ?anyerror = blk: {
             putArtifactEnrichmentInDb(alloc, cached.db, artifact_name, enrichment_json) catch |err| break :blk err;
@@ -28410,7 +28407,7 @@ fn dropCachedLocalArtifactEnrichment(
         var cached = try self.getOrOpenCachedDbForLocalMutation(alloc, cache, path, group_id, target_generation, table_name, false);
         var cached_active = true;
         defer if (cached_active) cached.deinit(alloc);
-        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(cached.entry.?.table_name, group_id, cached.db));
+        cached.db.setQueryVisibilityHook(self.managedDerivedVisibilityHook(&cached.entry.?.runtime_hook_state.visibility_binding, cached.entry.?.table_name, group_id, cached.db));
 
         const mutation_err: ?anyerror = blk: {
             _ = deleteArtifactEnrichmentFromDbByName(alloc, cached.db, artifact_name) catch |err| break :blk err;
@@ -41224,7 +41221,8 @@ fn implementationTests() type {
                 .sync_level = .full_index,
             });
 
-            const hook = source.managedDerivedVisibilityHook("docs", 7001, &db);
+            var visibility_binding: server_query_visibility.Binding = .{};
+            const hook = source.managedDerivedVisibilityHook(&visibility_binding, "docs", 7001, &db);
             hook.notify(.{ .change = .publish });
 
             var statuses = (try snapshot_cache.snapshot(alloc, "docs")).?;
@@ -41838,7 +41836,8 @@ fn implementationTests() type {
 
             var source = ProvisionedTableWriteSource.init(replica_root_dir, table_catalog.emptyCatalogSource());
             source.runtime_status_cache = &snapshot_cache;
-            const hook = source.managedDerivedVisibilityHook("docs", 7001, &db);
+            var visibility_binding: server_query_visibility.Binding = .{};
+            const hook = source.managedDerivedVisibilityHook(&visibility_binding, "docs", 7001, &db);
 
             try db.batch(.{
                 .writes = &.{.{ .key = "doc:a", .value = "{\"_embeddings\":{\"dense_idx\":[1,0]}}" }},

@@ -416,6 +416,11 @@ comptime {
     _ = @import("db/artifact_publication_transport.zig");
     _ = @import("db/artifact_producer_scheduler.zig");
     _ = @import("db/publication_outbox_recovery.zig");
+    _ = @import("db/document_child_range_manifest.zig");
+    _ = @import("db/document_child_range_effects.zig");
+    _ = @import("db/document_child_range_outbox.zig");
+    _ = @import("db/quarantine_recovery.zig");
+    _ = @import("db/independent_maintenance.zig");
     _ = @import("db/artifact_publication_transport_codec.zig");
     _ = @import("db/artifact_publication_wire.zig");
     _ = @import("db/artifact_reconcile.zig");
