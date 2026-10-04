@@ -134,8 +134,8 @@ pub fn main(init: std.process.Init) !void {
             .latest => 0,
         };
         if (consumer.count != expected_count or consumer.checksum != (if (operation == .latest) @as(usize, 0) else expected_checksum) or counter.live != 0) return error.InvalidReplayOrLeakedMemory;
-        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"index_kind\":\"{s}\",\"source\":\"{s}\",\"operation\":\"{s}\",\"repetitions\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
-            sample, count, batch, budgeted, documents_per_record, @tagName(kind), if (primary) "primary" else "journal", @tagName(operation), repetitions, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, consumer.checksum, windows,
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":{},\"documents_per_record\":{d},\"index_kind\":\"{s}\",\"source\":\"{s}\",\"operation\":\"{s}\",\"repetitions\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d},\"windows\":{d}}}\n", .{
+            sample, count, batch, budgeted, documents_per_record, @tagName(kind), if (primary) "primary" else "journal", @tagName(operation), repetitions, if (counting) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, consumer.checksum, windows,
         });
     }
 }
@@ -218,7 +218,7 @@ fn benchmarkOrdinals(count: usize, batch: usize, samples: usize, counting: bool,
         }
         const elapsed = time.monotonicNs() - started;
         if (counter.live != 0 or checksum != expected_checksum) return error.InvalidOrdinalsOrLeakedMemory;
-        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":false,\"documents_per_record\":1,\"index_kind\":\"full_text\",\"source\":\"primary\",\"operation\":\"{s}\",\"repetitions\":1,\"case\":\"{s}\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, count, batch, if (scalar) "scalar_ordinal" else "ordinal", fixture, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"documents\":{d},\"batch\":{d},\"budgeted\":false,\"documents_per_record\":1,\"index_kind\":\"full_text\",\"source\":\"primary\",\"operation\":\"{s}\",\"repetitions\":1,\"case\":\"{s}\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, count, batch, if (scalar) "scalar_ordinal" else "ordinal", fixture, if (counting) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
     }
 }
 
@@ -255,6 +255,6 @@ fn benchmarkScratchTrim(count: usize, samples: usize, counting: bool) !void {
         scratch.deinit(alloc);
         const elapsed = time.monotonicNs() - started;
         if (checksum != expected or counter.live != 0) return error.InvalidScratchResult;
-        if (sample != 0) std.debug.print("{{\"sample\":{d},\"operation\":\"scratch_trim\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, if (counting) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+        if (sample != 0) std.debug.print("{{\"sample\":{d},\"operation\":\"scratch_trim\",\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ sample, if (counting) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
     }
 }

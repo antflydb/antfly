@@ -10,6 +10,10 @@ Replay counted timings include diagnostic counter overhead. Replay timing runs
 use the production smp allocator without counting. Vector timing runs disable
 counting and retain the benchmark's normal allocator. Heap counts are requested
 bytes through the benchmark allocator, not RSS or complete process allocation.
+allocations counts successful raw allocs. resize_calls/remap_calls count attempts;
+moving_remaps/moved_bytes count successful pointer changes and their new sizes.
+allocated_bytes counts successful logical storage growth, excluding transient
+backend realloc overlap.
 """
 import argparse
 import json
@@ -43,7 +47,7 @@ def main():
     parser.add_argument('--vector-modes', nargs='+', choices=['ingest', 'retry', 'retry-mixed', 'session-only'], default=['ingest'])
     parser.add_argument('--document-lookup-only', action='store_true')
     parser.add_argument('--document-batches', nargs='+', type=int, default=[256])
-    parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'text_asset', 'text_asset_escaped', 'text_mixed', 'text_missing', 'delete_set', 'relational'], default=['short'])
+    parser.add_argument('--document-cases', nargs='+', choices=['short', 'long', 'missing', 'sparse', 'text', 'text_asset', 'text_asset_large', 'text_asset_escaped', 'text_mixed', 'text_missing', 'delete_set', 'relational'], default=['short'])
     parser.add_argument('--ordinal-case', choices=['short', 'long', 'missing'], default='short')
     args = parser.parse_args()
     if min(args.documents, args.dimensions, args.samples, args.vector_samples, *args.documents_per_record, *args.batches, *args.document_batches, args.repetitions) <= 0:
@@ -161,6 +165,7 @@ def main():
                      for v in binaries}
             fields = ['elapsed_ns', 'allocations', 'allocated_bytes', 'peak_live_bytes'] if workload in ('replay', 'document') else [
                 'run_ns', 'final_checkpoint_ns', 'max_batch_ns', 'allocations', 'allocated_bytes', 'peak_additional_live_bytes']
+            fields += ['resize_calls', 'remap_calls', 'moving_remaps', 'moved_bytes']
             if workload in ('replay', 'document') and mode.startswith('timing'):
                 fields = ['elapsed_ns']
             stats = {f: {v: statistics.median(x[f] for x in xs) for v, xs in group.items()}

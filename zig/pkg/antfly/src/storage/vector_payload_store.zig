@@ -835,7 +835,11 @@ pub const Store = struct {
     fn verifyLiveLocation(source: *const native.Opened, digest: payload.Digest, dims: u32) !void {
         const found = try source.locateHashed(&digest, vector_block.keyHash(&digest), std.math.maxInt(u64), 1);
         if (found != .vector) return error.MissingCommittedVectorPayload;
-        switch (found.vector) {
+        try verifyLiveLocatedValue(found.vector, dims);
+    }
+
+    fn verifyLiveLocatedValue(found: native.LocatedValue, dims: u32) !void {
+        switch (found) {
             .wal => |value| {
                 if (value.dims != dims) return error.MissingCommittedVectorPayload;
                 if (value.encoding != .float32 or value.bytes.len != try vector_block.encodedVectorBytesLen(.float32, dims))
@@ -1702,9 +1706,16 @@ pub const Store = struct {
     ) !void {
         const records = &metadata.records;
         for (prepared, 0..) |*item, item_index| {
-            // A retry can reuse an already durable immutable payload.
-            const found = try self.opened.get(&item.reference.digest, std.math.maxInt(u64), null);
+            // Eligibility proves identity and exact-payload availability under
+            // this Opened lease; it is not an integrity scrub. Avoid touching
+            // immutable payload bytes just to reuse a durable identity. Reads
+            // and GC copies still verify payload/residual CRCs before use.
+            const found = try self.opened.locateHashed(&item.reference.digest, vector_block.keyHash(&item.reference.digest), std.math.maxInt(u64), null);
             if (found == .vector) {
+                verifyLiveLocatedValue(found.vector, item.reference.dims) catch |err| {
+                    if (err == error.MissingCommittedVectorPayload) return error.VectorReferenceIdentityMismatch;
+                    return err;
+                };
                 // A retry can select an orphan omitted from the initial mark.
                 // Re-append it once after the cut so base+WAL retains it.
                 if (self.collection) |collection| {
@@ -1713,7 +1724,6 @@ pub const Store = struct {
                     if (marking.tail.contains(item.reference.digest) or (!marking.running and marking.live.contains(item.reference.digest))) continue;
                     if (self.rescue_reappends) {
                         if (marking.rescued.contains(item.reference.digest)) continue;
-                        if (found.vector.dims != item.reference.dims) return error.VectorReferenceIdentityMismatch;
                         // Rescue receipts are rebuildable state. Grow only for
                         // a unique rescue, before any durable append.
                         try marking.rescued.put(eligibility_alloc, item.reference.digest, item.reference.dims);
@@ -6541,7 +6551,7 @@ test "source vector payloads GC scan preserves snapshots without admitting prima
     try std.testing.expectEqual(@as(u64, 0), source.stats.retained_payloads);
 }
 
-test "source vector payloads GC liveness defers payload checksums but reads and copies reject corruption" {
+test "source vector payloads durable retries and GC liveness defer checksums but reads and copies reject corruption" {
     const a = std.testing.allocator;
     const mem = @import("mem_backend.zig");
     const docs = @import("docstore.zig");
@@ -6573,6 +6583,19 @@ test "source vector payloads GC liveness defers payload checksums but reads and 
         bytes[offset] ^= 1;
         defer bytes[offset] ^= 1;
         const generation = source.currentGeneration();
+        const before_wal = source.opened.store.wal_committed_bytes;
+        const before_prepared = source.stats.prepared_payloads;
+        for ([_]bool{ false, true }) |group_commit| {
+            source.group_commit = group_commit;
+            // A durable retry does not consume/republish the damaged bytes.
+            // Keep integrity validation on reads and copy plans below.
+            try Store.prepare(&source, &.{.{ .reference = ref, .artifact = artifact }});
+            var wrong = ref;
+            wrong.dims += 1;
+            try std.testing.expectError(error.VectorReferenceIdentityMismatch, Store.prepare(&source, &.{.{ .reference = wrong, .artifact = artifact }}));
+        }
+        try std.testing.expectEqual(before_wal, source.opened.store.wal_committed_bytes);
+        try std.testing.expectEqual(before_prepared, source.stats.prepared_payloads);
         try std.testing.expect(try source.collectStep(&raw, std.math.maxInt(u64)));
         try std.testing.expectEqual(generation, source.currentGeneration());
         try std.testing.expectEqual(@as(u64, 1), source.stats.retained_payloads);

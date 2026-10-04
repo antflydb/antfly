@@ -62366,9 +62366,11 @@ fn contentPartsJsonAlloc(alloc: Allocator, parts: []const template_mod.ContentPa
 }
 
 fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
-    const encoded = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
-    defer alloc.free(encoded);
-    try out.appendSlice(alloc, encoded);
+    // Transfer the existing output buffer to the writer and restore ownership
+    // on every exit, including a partially written string after allocation failure.
+    var writer = std.Io.Writer.Allocating.fromArrayList(alloc, out);
+    defer out.* = writer.toArrayList();
+    writer.writer.print("{f}", .{std.json.fmt(value, .{})}) catch return error.OutOfMemory;
 }
 
 fn castOwnedKeysToConst(alloc: Allocator, keys: [][]u8) ![]const []const u8 {
@@ -71842,7 +71844,11 @@ fn applyDerivedBatchToIndexContextProfiled(
             }
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.dense_delete_ns, dense_delete_start_ns);
 
-            var dense_embedding_doc_keys = try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
+            // Artifact-only replay has no documents to filter with this set.
+            var dense_embedding_doc_keys = if (batch.documents.len == 0)
+                std.StringHashMapUnmanaged(void).empty
+            else
+                try denseEmbeddingDocKeySet(ctx.alloc, dense_embeddings.writes);
             defer dense_embedding_doc_keys.deinit(ctx.alloc);
 
             var index_writes = try collectDocumentWritesProfiled(
@@ -71955,7 +71961,10 @@ fn applyDerivedBatchToIndexContextProfiled(
             }
             if (emit_sparse_write_profile) sparse_delete_ns = monotonicTimeNs() - sparse_delete_start_ns;
 
-            var sparse_embedding_doc_keys = try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
+            var sparse_embedding_doc_keys = if (batch.documents.len == 0)
+                std.StringHashMapUnmanaged(void).empty
+            else
+                try sparseEmbeddingDocKeySet(ctx.alloc, sparse_embeddings.writes);
             defer sparse_embedding_doc_keys.deinit(ctx.alloc);
 
             const sparse_collect_doc_start_ns = if (emit_sparse_write_profile) monotonicTimeNs() else 0;
@@ -157875,7 +157884,7 @@ test "db generated write read fences detect artifact mutations and ABA independe
 
 test "db document lookup allocation benchmark" {
     const Counter = @import("../../allocation_bench_support.zig").Counter;
-    const Case = enum { short, long, missing, sparse, text, text_asset, text_asset_escaped, text_mixed, text_missing, delete_set, relational };
+    const Case = enum { short, long, missing, sparse, text, text_asset, text_asset_large, text_asset_escaped, text_mixed, text_missing, delete_set, relational };
     const case_name = if (std.c.getenv("ANTFLY_DOCUMENT_BENCH_CASE")) |raw| std.mem.span(raw) else "short";
     const fixture = std.meta.stringToEnum(Case, case_name) orelse return error.InvalidBenchmarkCase;
     const alloc = std.testing.allocator;
@@ -157889,7 +157898,7 @@ test "db document lookup allocation benchmark" {
     defer store.close();
     var directory = try TestDirectory.init("collector-benchmark");
     defer directory.cleanup();
-    const text_fixture = fixture == .text or fixture == .text_asset or fixture == .text_asset_escaped or fixture == .text_mixed or fixture == .text_missing;
+    const text_fixture = fixture == .text or fixture == .text_asset or fixture == .text_asset_large or fixture == .text_asset_escaped or fixture == .text_mixed or fixture == .text_missing;
     var db: ?DB = if (text_fixture or fixture == .relational) try DB.open(alloc, directory.path(), .{ .start_index_workers = false }) else null;
     defer if (db) |*database| database.close();
     const value = if (fixture == .sparse) "{\"vec\":{\"indices\":[1,3],\"values\":[0.5,0.25]}}" else "{\"title\":\"document value\"}";
@@ -157908,6 +157917,9 @@ test "db document lookup allocation benchmark" {
     }
     if (text_fixture) try db.?.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     const asset_name = if (fixture == .text_asset_escaped) "cap\x00tion" else "caption";
+    const asset_raw: []const u8 = if (fixture == .text_asset_large) "quote\" newline\n null\x00 café 🚀" ** 128 else "projected value";
+    const asset_projected = try std.fmt.allocPrint(alloc, "{{\"caption\":{f}}}", .{std.json.fmt(asset_raw, .{})});
+    defer alloc.free(asset_projected);
     if (text_fixture) try db.?.addEnrichment(.{ .name = asset_name, .kind = .asset, .field = "caption", .content_type = "text/plain" });
     const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
     const names = try alloc.alloc([544]u8, count);
@@ -157926,10 +157938,10 @@ test "db document lookup allocation benchmark" {
             name[100] = 0;
             break :blk name[0..512];
         } else prefix;
-        const is_asset = fixture == .text_asset or fixture == .text_asset_escaped or (fixture == .text_mixed and i % 8 == 0);
+        const is_asset = fixture == .text_asset or fixture == .text_asset_large or fixture == .text_asset_escaped or (fixture == .text_mixed and i % 8 == 0);
         const stored_key = if (is_asset) try internal_keys.artifactNamedPrefixAlloc(alloc, key, "asset", asset_name) else try replayDocumentStoreKeyAlloc(alloc, key, fixture == .relational);
         doc.* = .{ .key = if (is_asset) stored_key else key, .action = .upsert, .targets = &targets };
-        write.* = .{ .key = stored_key, .value = if (is_asset) "projected value" else packed_value orelse value };
+        write.* = .{ .key = stored_key, .value = if (is_asset) asset_raw else packed_value orelse value };
         initialized += 1;
     }
     const expected_count = if (fixture == .missing or fixture == .text_missing) count / 5 else count;
@@ -157976,7 +157988,7 @@ test "db document lookup allocation benchmark" {
                     try std.testing.expectEqual(available, writes.docs.items.len);
                     for (writes.docs.items, docs[offset..][0..available]) |write, doc| {
                         try std.testing.expectEqualStrings(doc.key, write.key);
-                        try std.testing.expectEqualStrings(if (internal_keys.isAssetArtifactKey(doc.key)) "{\"caption\":\"projected value\"}" else value, write.value);
+                        try std.testing.expectEqualStrings(if (internal_keys.isAssetArtifactKey(doc.key)) asset_projected else value, write.value);
                         for (write.key) |byte| checksum +%= byte;
                     }
                     output_count += writes.docs.items.len;
@@ -157987,7 +157999,7 @@ test "db document lookup allocation benchmark" {
                     try std.testing.expectEqual(available, writes.items.len);
                     for (writes.items, docs[offset .. offset + available]) |write, doc| {
                         try std.testing.expectEqualStrings(doc.key, write.key);
-                        try std.testing.expectEqualStrings(if (internal_keys.isAssetArtifactKey(doc.key)) "{\"caption\":\"projected value\"}" else value, write.value);
+                        try std.testing.expectEqualStrings(if (internal_keys.isAssetArtifactKey(doc.key)) asset_projected else value, write.value);
                         for (write.key) |byte| checksum +%= byte;
                     }
                     output_count += writes.items.len;
@@ -157997,7 +158009,7 @@ test "db document lookup allocation benchmark" {
             const elapsed = monotonicTimeNs() - started;
             try std.testing.expectEqual(expected_count, output_count);
             try std.testing.expectEqual(@as(usize, 0), counter.live);
-            if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ @tagName(fixture), count, batch_size, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.bytes, counter.peak, checksum });
+            if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ @tagName(fixture), count, batch_size, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
         }
     }
 }
@@ -158058,7 +158070,7 @@ test "document collectors release text projections and materialized values on al
         try std.testing.checkAllAllocationFailures(alloc, textCollectorFailureSweep, .{ db.core.store, db.core.index_manager, @as([]const derived_types.DerivedDocument, &docs), inline_values });
 }
 
-test "document collectors duplicate delete keys at map capacity do not allocate" {
+test "document collectors duplicate delete keys survive growth failure at map capacity" {
     const alloc = std.testing.allocator;
     var keys = std.ArrayListUnmanaged([]const u8).empty;
     defer keys.deinit(alloc);
@@ -158072,6 +158084,12 @@ test "document collectors duplicate delete keys at map capacity do not allocate"
     try std.testing.expectEqual(@as(usize, 6), keys.items.len);
     try std.testing.expectEqual(@as(u32, 8), seen.capacity());
     try std.testing.expectError(error.OutOfMemory, appendUniqueBorrowedKeyWithSet(failing.allocator(), &keys, &seen, "g"));
+    try std.testing.expectEqual(@as(usize, 6), keys.items.len);
+    try std.testing.expect(failing.has_induced_failure);
+    // The normal allocator still permits pre-probe map growth. This test
+    // promises recovery under pressure, not allocation-free normal insertion.
+    try appendUniqueBorrowedKeyWithSet(alloc, &keys, &seen, "a");
+    try std.testing.expect(seen.capacity() > 8);
     try std.testing.expectEqual(@as(usize, 6), keys.items.len);
 }
 
@@ -158126,4 +158144,30 @@ test "document collectors materialization hints exclude projected assets" {
     try std.testing.expectEqual(@as(usize, 32), result.docs.items.len);
     try std.testing.expectEqual(@as(usize, 1), result.materialized_documents.items.len);
     try std.testing.expect(result.materialized_documents.capacity <= 8);
+}
+
+test "document collectors JSON string writing preserves escaping and output ownership on failure" {
+    const Check = struct {
+        fn run(a: Allocator, input: []const u8, expected: []const u8) !void {
+            var output = std.ArrayListUnmanaged(u8).empty;
+            defer output.deinit(a);
+            try output.appendSlice(a, "prefix:");
+            try appendJsonString(a, &output, input);
+            try std.testing.expectEqualStrings("prefix:", output.items[0..7]);
+            try std.testing.expectEqualStrings(expected, output.items[7..]);
+        }
+    };
+    const inputs = [_][]const u8{ "", "ordinary", "quote\" slash\\ newline\n null\x00", "café 🚀", &([_]u8{0} ** 512) };
+    for (inputs) |input| {
+        const expected = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(input, .{})});
+        defer std.testing.allocator.free(expected);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{ input, expected });
+    }
+    var output = std.ArrayListUnmanaged(u8).empty;
+    defer output.deinit(std.testing.allocator);
+    try output.ensureTotalCapacityPrecise(std.testing.allocator, 128);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try appendJsonString(failing.allocator(), &output, "quote\" newline\n");
+    try std.testing.expectEqualStrings("\"quote\\\" newline\\n\"", output.items);
+    try std.testing.expect(!failing.has_induced_failure);
 }
