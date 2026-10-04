@@ -572,14 +572,23 @@ def create_consumer(deployment, provider):
         return True
 
     eventually(create)
-    eventually(
-        lambda: (
-            deployment.request(
-                deployment.consumer, "GET", "/tables/secret_consumer"
-            ).status_code
-            == 200
+
+    def visible():
+        # The serverless catalog exposes table records through its list route;
+        # GET /tables/{name} is a stateful API route.
+        path = (
+            "/tables" if deployment.mode == "serverless" else "/tables/secret_consumer"
         )
-    )
+        response = deployment.request(deployment.consumer, "GET", path)
+        if response.status_code != 200:
+            return False
+        if deployment.mode == "serverless":
+            return any(
+                table["table_name"] == "secret_consumer" for table in response.json()
+            )
+        return True
+
+    eventually(visible)
     response = deployment.request(
         deployment.consumer,
         "POST",
