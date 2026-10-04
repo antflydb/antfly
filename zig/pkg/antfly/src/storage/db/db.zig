@@ -50485,10 +50485,35 @@ pub const DB = struct {
         chunk_backed: bool,
     ) anyerror!types.SearchResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+        var presence = VectorSearchPresenceContext{ .db = self };
+        var preparing = true;
+        errdefer if (preparing) {
+            var owned = raw;
+            owned.deinit();
+        };
+        // Only explicitly ephemeral chunk streams use the embedding row as
+        // their presence authority. Keep the public chunk identity unchanged
+        // so full-text/dense fusion still deduplicates the same member.
+        if (self.core.index_manager.denseIndex(req.index_name)) |entry| {
+            if (entry.embedding_names.len == 0) {
+                if (entry.chunk_name) |chunk_name| {
+                    if (self.core.index_manager.getEnrichment(.chunk, chunk_name)) |cfg| {
+                        if (cfg.source_artifact_name.len == 0 and !cfg.full_text_index and cfg.chunker_json.len > 0 and
+                            !(try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, cfg.chunker_json)) and
+                            !(try chunking_types_mod.parseStoreChunksFromSlice(alloc, cfg.chunker_json)))
+                        {
+                            presence.ephemeral_embedding_name = entry.embedding_name orelse entry.config.name;
+                        }
+                    }
+                }
+            }
+        }
+        preparing = false;
         return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, chunk_backed, .{
             .ctx = self,
             .is_visible = if (chunk_backed) isVisibleSearchHitCallback else isVisibleNonChunkSearchHitCallback,
-            .filter_visible_many = filterStoredSearchCandidatesManyCallback,
+            .filter_visible_many = filterVectorSearchCandidatesManyCallback,
+            .filter_visible_many_ctx = &presence,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -63649,7 +63674,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     return timestamps;
 }
 
-fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
+fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit, ephemeral_embedding_name: ?[]const u8) ![]bool {
     const keep = try alloc.alloc(bool, hits.len);
     errdefer alloc.free(keep);
     @memset(keep, true);
@@ -63666,7 +63691,9 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
         // Named vector members resolve their public hit id to the source
         // document/chunk, which may be shared by several embeddings. The
         // artifact reference retains the member's authoritative stored key.
-        const key = if (hit.artifact_ref) |artifact_ref|
+        const key = if (ephemeral_embedding_name != null and internal_keys.isChunkArtifactRecordKey(hit.id))
+            try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, ephemeral_embedding_name.?)
+        else if (hit.artifact_ref) |artifact_ref|
             try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
         else
             try encodeStoreLookupKeyAlloc(self, scratch, hit.id);
@@ -63802,10 +63829,30 @@ fn filterStoredSearchCandidatesManyCallback(
     hits: []const types.SearchHit,
 ) anyerror![]bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    const present = try filterPresentSearchHitsMany(self, alloc, hits);
+    const present = try filterPresentSearchHitsMany(self, alloc, hits, null);
     errdefer alloc.free(present);
     if (ttlDurationNs(self) == 0) return present;
     const visible = try filterVisibleSearchHitsMany(self, alloc, hits);
+    defer alloc.free(visible);
+    for (present, visible) |*keep, live| keep.* = keep.* and live;
+    return present;
+}
+
+const VectorSearchPresenceContext = struct {
+    db: *DB,
+    ephemeral_embedding_name: ?[]const u8 = null,
+};
+
+fn filterVectorSearchCandidatesManyCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+) anyerror![]bool {
+    const presence: *const VectorSearchPresenceContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const present = try filterPresentSearchHitsMany(presence.db, alloc, hits, presence.ephemeral_embedding_name);
+    errdefer alloc.free(present);
+    if (ttlDurationNs(presence.db) == 0) return present;
+    const visible = try filterVisibleSearchHitsMany(presence.db, alloc, hits);
     defer alloc.free(visible);
     for (present, visible) |*keep, live| keep.* = keep.* and live;
     return present;
@@ -95494,8 +95541,10 @@ test "db generated downstream indexes are exact convergence targets at source co
     try std.testing.expectEqual(@as(usize, 0), replay_targets.all_indexes.len);
     try std.testing.expect(replay_targets.target_scope_known);
     try std.testing.expectEqual(@as(usize, 2), replay_targets.target_identities.len);
+    // Producer reruns can retire generated members, even when the source
+    // commit itself adds a document.
     for (replay_targets.target_identities) |target|
-        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, target.serving_set_effect);
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, target.serving_set_effect);
 
     var materialized_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
         .documents = &.{.{ .key = "doc:a", .cleaned_value = "{}" }},
@@ -95509,7 +95558,7 @@ test "db generated downstream indexes are exact convergence targets at source co
     try std.testing.expect(materialized_targets.target_scope_known);
     try std.testing.expectEqual(@as(usize, 2), materialized_targets.target_identities.len);
     for (materialized_targets.target_identities) |target|
-        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.additive_only, target.serving_set_effect);
+        try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, target.serving_set_effect);
 
     var deletion_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
         .deleted_keys = &.{"doc:a"},
@@ -107847,7 +107896,7 @@ test "db query drops full text hits whose stored document row was deleted direct
                 .{ .id = remote_key },
                 .{ .id = @constCast("doc:off-shard"), .artifact_ref = embedding_ref },
                 .{ .id = @constCast("doc:b"), .artifact_ref = .{ .document_id = @constCast("doc:b"), .name = @constCast("absent_embedding"), .kind = .embedding } },
-            });
+            }, null);
             defer test_alloc.free(keep);
             try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, keep);
         }

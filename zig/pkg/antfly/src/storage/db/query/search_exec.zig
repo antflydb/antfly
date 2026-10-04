@@ -13396,15 +13396,10 @@ fn searchDenseInternal(
             };
             var doc_key_owned = true;
             errdefer if (doc_key_owned) alloc.free(doc_key);
-            var source_artifact_ref = if (entry.embedding_names.len > 0)
+            var source_artifact_ref = if (entry.embedding_names.len > 0 or entry.chunk_name != null)
                 try artifact_ids.decodeArtifactRefAlloc(alloc, doc_key)
-            else if (entry.chunk_name != null) blk: {
-                // Ephemeral chunks retain their embedding, not a stored chunk
-                // row. Presence checks must probe that authoritative member.
-                const embedding_key = try internal_keys.derivedEmbeddingArtifactKeyAlloc(alloc, doc_key, entry.embedding_name orelse entry.config.name);
-                defer alloc.free(embedding_key);
-                break :blk try artifact_ids.decodeArtifactRefAlloc(alloc, embedding_key);
-            } else null;
+            else
+                null;
             var source_artifact_ref_owned = source_artifact_ref != null;
             errdefer if (source_artifact_ref_owned) {
                 if (source_artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);

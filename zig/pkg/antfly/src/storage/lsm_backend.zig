@@ -11692,6 +11692,9 @@ fn implementationTests() type {
                 .storage = storage.storage(),
                 .wal_checkpoint_dirty_bytes_multiplier = 2,
                 .wal_checkpoint_dirty_bytes_floor = 256,
+                // Bulk sessions defer soft-pressure memtable flushes. A hard
+                // admission bound still checkpoints during sustained writes.
+                .wal_hard_limit_bytes = 2048,
                 .foreground_soft_wal_checkpoint = true,
                 .compact_threshold_runs = 100,
             });
@@ -11714,12 +11717,14 @@ fn implementationTests() type {
             try std.testing.expect(backend.bulkIngestActive());
             try std.testing.expect(writes < 16);
             try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_pressure_flushes);
+            try std.testing.expectEqual(@as(u64, 1), backend.write_stats.wal_pressure_admission_checkpoints);
             try std.testing.expect(backend.write_stats.manifest_writes > 0);
-            try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
+            try std.testing.expect(backend.snapshotMaintenanceStats().wal_retained_bytes <= backend.options.wal_hard_limit_bytes);
             try std.testing.expectEqualSlices(u8, &value, try backend.getMergedWithMutable(&backend.mutable, .{ .name = "docs" }, "doc:a"));
 
-            try backend.finishBulkIngestSessionWithOptions(.{ .compact = false });
+            try backend.finishBulkIngestSessionWithOptions(.{ .compact = false, .flush = true });
             try std.testing.expect(!backend.bulkIngestActive());
+            try std.testing.expectEqual(@as(u64, 0), backend.snapshotMaintenanceStats().wal_retained_bytes);
         }
 
         test "lsm backend deferred direct bulk commits publish bounded wal checkpoints" {
