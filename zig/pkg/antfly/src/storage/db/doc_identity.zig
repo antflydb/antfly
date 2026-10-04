@@ -625,33 +625,31 @@ pub fn lookupOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, doc_ids: []const [
 
     const PendingOrdinalLookup = struct {
         source_index: usize,
-        key: []u8,
+        key: []const u8,
 
         fn lessThan(_: void, lhs: @This(), rhs: @This()) bool {
             return std.mem.lessThan(u8, lhs.key, rhs.key);
         }
     };
 
+    var keys = @import("lookup_key_scratch.zig").Scratch.init(alloc, doc_ids.len);
+    defer keys.deinit();
     var pending = try alloc.alloc(PendingOrdinalLookup, doc_ids.len);
-    defer {
-        for (pending) |item| alloc.free(item.key);
-        alloc.free(pending);
-    }
+    defer alloc.free(pending);
     for (doc_ids, 0..) |doc_id, i| {
         pending[i] = .{
             .source_index = i,
-            .key = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, doc_id),
+            .key = try keys.identityKey(doc_id),
         };
     }
     std.sort.pdq(PendingOrdinalLookup, pending, {}, PendingOrdinalLookup.lessThan);
 
-    var read_keys = try alloc.alloc([]const u8, pending.len);
-    defer alloc.free(read_keys);
-    var read_values = try alloc.alloc(?[]const u8, pending.len);
-    defer alloc.free(read_values);
+    var reads = try @import("document_read_scratch.zig").Scratch.init(alloc, pending.len);
+    defer reads.deinit();
+    const read_keys = reads.keys;
+    const read_values = reads.values;
     for (pending, 0..) |item, i| {
         read_keys[i] = item.key;
-        read_values[i] = null;
     }
 
     try mutable_txn.getManySorted(read_keys, read_values);
@@ -3999,4 +3997,72 @@ fn freeIdentityWrites(alloc: Allocator, writes: *std.ArrayListUnmanaged(docstore
         alloc.free(@constCast(item.value));
     }
     writes.deinit(alloc);
+}
+
+const OrdinalBatchFixtureTxn = struct {
+    keys: []const []const u8,
+    values: []const [4]u8,
+    pub fn getManySorted(self: *@This(), read_keys: []const []const u8, outputs: []?[]const u8) !void {
+        for (read_keys, outputs, 0..) |key, *output, i| {
+            if (i > 0) try std.testing.expect(std.mem.order(u8, read_keys[i - 1], key) != .gt);
+            var found = false;
+            for (self.keys, self.values) |expected, *value| {
+                if (std.mem.eql(u8, expected, key)) {
+                    output.* = if (std.mem.readInt(u32, value, .big) == 8) null else value;
+                    found = true;
+                    break;
+                }
+            }
+            try std.testing.expect(found);
+        }
+    }
+};
+
+fn ordinalBatchLookupFailureSweep(alloc: Allocator, txn: *OrdinalBatchFixtureTxn, ids: []const []const u8) !void {
+    const ordinals = try lookupOrdinalsTxnAlloc(alloc, txn, ids);
+    defer alloc.free(ordinals);
+    for (ordinals, 0..) |ordinal, i| {
+        const id = (ids.len - 1 - i) % 31;
+        try std.testing.expectEqual(if (id == 7) @as(?DocOrdinal, null) else @as(?DocOrdinal, @intCast(id + 1)), ordinal);
+    }
+}
+
+test "ordinal batch lookup pools escaped keys and releases partial construction on every failure" {
+    const alloc = std.testing.allocator;
+    const count = 160;
+    var names: [count][512]u8 = undefined;
+    var ids: [count][]const u8 = undefined;
+    var keys: [count][]const u8 = undefined;
+    var values: [count][4]u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(key);
+    for (&names, &ids, &keys, &values, 0..) |*name, *id, *key, *value, i| {
+        @memset(name, 'x');
+        const number = (count - 1 - i) % 31;
+        _ = try std.fmt.bufPrint(name[0..8], "{d:0>8}", .{number});
+        name[20] = 0;
+        id.* = name;
+        key.* = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, id.*);
+        initialized += 1;
+        std.mem.writeInt(u32, value, @intCast(number + 1), .big);
+    }
+    var txn: OrdinalBatchFixtureTxn = .{ .keys = &keys, .values = &values };
+    try std.testing.checkAllAllocationFailures(alloc, ordinalBatchLookupFailureSweep, .{ &txn, @as([]const []const u8, &ids) });
+}
+
+test "ordinal batch lookup rejects malformed values and propagates read failure without leaks" {
+    const Txn = struct {
+        fail: bool = false,
+        pub fn getManySorted(self: *@This(), _: []const []const u8, values: []?[]const u8) !void {
+            if (self.fail) return error.InjectedReadFailure;
+            @memset(values, "bad");
+        }
+    };
+    var txn: Txn = .{};
+    try std.testing.expectError(error.InvalidDocIdentity, lookupOrdinalsTxnAlloc(std.testing.allocator, &txn, &.{"a"}));
+    txn.fail = true;
+    try std.testing.expectError(error.InjectedReadFailure, lookupOrdinalsTxnAlloc(std.testing.allocator, &txn, &.{"a"}));
+    const empty = try lookupOrdinalsTxnAlloc(std.testing.allocator, &txn, &.{});
+    defer std.testing.allocator.free(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
 }

@@ -40,7 +40,7 @@ pub const MatchingRecordStats = struct {
     scan_batches: usize = 0,
     last_sequence: u64 = 0,
 
-    fn add(self: *MatchingRecordStats, other: MatchingRecordStats) void {
+    pub fn add(self: *MatchingRecordStats, other: MatchingRecordStats) void {
         self.matched_entries += other.matched_entries;
         self.scanned_entries += other.scanned_entries;
         self.hint_filter_skips += other.hint_filter_skips;
@@ -50,6 +50,9 @@ pub const MatchingRecordStats = struct {
 };
 
 pub const MatchingCursor = struct {
+    /// Statistics from the latest collection attempt, including accepted
+    /// entries before a consumer error. Rejected lookahead is not counted.
+    last_scan_stats: MatchingRecordStats = .{},
     state: union(enum) {
         journal: JournalMatchingCursor,
         primary_store: PrimaryStoreMatchingCursor,
@@ -77,15 +80,18 @@ pub const MatchingCursor = struct {
         ctx: *anyopaque,
         consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
     ) !MatchingRecordStats {
+        self.last_scan_stats = .{};
         return switch (self.state) {
             .journal => |*cursor| journalMatchingCursorForEachNext(
                 cursor,
+                &self.last_scan_stats,
                 max_matched_entries,
                 ctx,
                 consume,
             ),
             .primary_store => |*cursor| primaryStoreMatchingCursorForEachNext(
                 cursor,
+                &self.last_scan_stats,
                 max_matched_entries,
                 ctx,
                 consume,
@@ -255,46 +261,55 @@ fn primaryStoreFallbackScanBudget(max_matched_entries: usize) usize {
 
 fn journalMatchingCursorForEachNext(
     cursor: *JournalMatchingCursor,
+    stats_out: *MatchingRecordStats,
     max_matched_entries: usize,
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
 ) !MatchingRecordStats {
-    const entries = try cursor.journal.iterateOpaqueFrom(cursor.alloc, cursor.next_sequence + 1);
-    defer {
-        for (entries) |*entry| entry.deinit(cursor.alloc);
-        cursor.alloc.free(entries);
-    }
+    const log_mod = @import("derived_log.zig");
+    const Scan = struct {
+        cursor: *JournalMatchingCursor,
+        max_matched: usize,
+        consumer_ctx: *anyopaque,
+        consume: *const fn (*anyopaque, u64, []const u8) anyerror!void,
+        stats: MatchingRecordStats = .{ .scan_batches = 1 },
 
-    var stats = MatchingRecordStats{};
-    stats.scan_batches = 1;
-    for (entries) |entry| {
-        if (!try change_journal_mod.encodedRecordHasHint(entry.payload, cursor.hint)) {
-            stats.scanned_entries += 1;
-            stats.hint_filter_skips += 1;
-            cursor.next_sequence = entry.sequence;
-            continue;
+        fn visit(self: *@This(), entry: log_mod.EntryView) !log_mod.ScanAction {
+            if (!try change_journal_mod.encodedRecordHasHint(entry.payload, self.cursor.hint)) {
+                self.stats.scanned_entries += 1;
+                self.stats.hint_filter_skips += 1;
+                self.cursor.next_sequence = entry.sequence;
+                return .@"continue";
+            }
+            self.consume(self.consumer_ctx, entry.sequence, entry.payload) catch |err| switch (err) {
+                StopReplayChunk.StopReplayChunk => return .stop,
+                else => return err,
+            };
+            self.stats.scanned_entries += 1;
+            self.stats.matched_entries += 1;
+            self.stats.last_sequence = entry.sequence;
+            self.cursor.next_sequence = entry.sequence;
+            return if (self.max_matched != 0 and self.stats.matched_entries >= self.max_matched) .stop else .@"continue";
         }
-        consume(ctx, entry.sequence, entry.payload) catch |err| switch (err) {
-            StopReplayChunk.StopReplayChunk => return stats,
-            else => return err,
-        };
-        stats.scanned_entries += 1;
-        cursor.next_sequence = entry.sequence;
-        stats.matched_entries += 1;
-        stats.last_sequence = entry.sequence;
-        if (max_matched_entries != 0 and stats.matched_entries >= max_matched_entries) break;
-    }
-    return stats;
+    };
+    var scan = Scan{ .cursor = cursor, .max_matched = max_matched_entries, .consumer_ctx = ctx, .consume = consume };
+    defer stats_out.* = scan.stats;
+    // Payloads are borrowed only while collecting. The stream closes its read
+    // transaction before apply, and rejected lookahead remains at the cursor.
+    try cursor.journal.iterateOpaqueFromStreamingWithContext(cursor.next_sequence + 1, &scan, Scan.visit);
+    return scan.stats;
 }
 
 fn primaryStoreMatchingCursorForEachNext(
     cursor: *PrimaryStoreMatchingCursor,
+    stats_out: *MatchingRecordStats,
     max_matched_entries: usize,
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
 ) !MatchingRecordStats {
     if (cursor.hint_exhausted) return .{};
     var stats = MatchingRecordStats{ .scan_batches = 1 };
+    defer stats_out.* = stats;
     const max_scanned_entries = if (cursor.fallback_all)
         primaryStoreFallbackScanBudget(max_matched_entries)
     else
@@ -472,28 +487,23 @@ fn journalLatestMatchingSequence(
     hint: TargetHint,
 ) !u64 {
     const journal: *change_journal_mod.Journal = @ptrCast(@alignCast(ptr));
-    const entries = try journal.iterateOpaqueFrom(alloc, from_sequence + 1);
-    defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
-    }
-
-    var latest = from_sequence;
-    for (entries) |entry| {
-        if (!try change_journal_mod.encodedRecordHasHint(entry.payload, hint)) continue;
-        latest = entry.sequence;
-    }
-    return latest;
+    const log_mod = @import("derived_log.zig");
+    const Context = struct {
+        hint: TargetHint,
+        latest: u64,
+        fn visit(self: *@This(), entry: log_mod.EntryView) !log_mod.ScanAction {
+            if (try change_journal_mod.encodedRecordHasHint(entry.payload, self.hint)) self.latest = entry.sequence;
+            return .@"continue";
+        }
+    };
+    _ = alloc;
+    var ctx: Context = .{ .hint = hint, .latest = from_sequence };
+    try journal.iterateOpaqueFromStreamingWithContext(from_sequence + 1, &ctx, Context.visit);
+    return ctx.latest;
 }
 
 fn journalCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
-    const journal: *change_journal_mod.Journal = @ptrCast(@alignCast(ptr));
-    const entries = try journal.iterateOpaqueFrom(alloc, from_sequence + 1);
-    defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
-    }
-    return try collectEnrichmentDocumentGroupsFromEntries(alloc, entries);
+    return collectEnrichmentDocumentGroups(Source.fromJournal(@ptrCast(@alignCast(ptr))), alloc, from_sequence);
 }
 
 fn journalIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
@@ -584,31 +594,43 @@ fn primaryStoreLatestMatchingSequence(
 }
 
 fn primaryStoreCollectEnrichmentDocumentGroups(ptr: *anyopaque, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
+    return collectEnrichmentDocumentGroups(Source.fromPrimaryStore(@ptrCast(@alignCast(ptr)), null, null), alloc, from_sequence);
+}
+
+fn collectEnrichmentDocumentGroups(replay_source: Source, alloc: Allocator, from_sequence: u64) ![]PendingDocumentGroup {
     var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
     errdefer cleanupPendingDocumentGroupMap(alloc, &pending);
-
+    var scratch: change_journal_mod.BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
     const Context = struct {
         alloc: Allocator,
         pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
+        scratch: *change_journal_mod.BorrowedBinaryRecordScratch,
 
         fn consume(ctx_ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
             const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
-            var record = try change_journal_mod.decodeRecord(ctx.alloc, payload);
-            defer record.deinit();
-            if (!recordHasEnrichmentHint(record.record)) return;
-
-            for (record.record.changed_doc_keys) |doc_key| {
-                try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, doc_key);
+            if (change_journal_mod.looksLikeBinaryRecord(payload)) {
+                const record = try change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(ctx.alloc, payload, ctx.scratch, .{
+                    .deleted_doc_keys = false,
+                    .overwritten_doc_keys = false,
+                    .changed_artifact_keys = false,
+                });
+                if (!recordHasEnrichmentHint(record)) return;
+                // Retain only the returned group's unique keys; input payloads
+                // and scratch descriptors are borrowed through this callback.
+                for (record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+                ctx.scratch.trimRetainedCapacity(ctx.alloc, 64 * 1024);
+            } else {
+                var record = try change_journal_mod.decodeRecord(ctx.alloc, payload);
+                defer record.deinit();
+                if (!recordHasEnrichmentHint(record.record)) return;
+                for (record.record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
             }
         }
     };
-
-    var ctx = Context{
-        .alloc = alloc,
-        .pending = &pending,
-    };
-    _ = try primaryStoreForEachMatchingRecord(ptr, alloc, from_sequence, .enrichment, 0, &ctx, Context.consume);
-    return try pendingDocumentGroupsToOwnedSlice(alloc, &pending);
+    var ctx: Context = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch };
+    _ = try replay_source.forEachMatchingRecord(alloc, from_sequence, .enrichment, 0, &ctx, Context.consume);
+    return pendingDocumentGroupsToOwnedSlice(alloc, &pending);
 }
 
 fn primaryStoreIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
@@ -624,23 +646,6 @@ fn primaryStoreIsSequenceVisible(ptr: *anyopaque, sequence: u64) !bool {
     return true;
 }
 
-fn collectEnrichmentDocumentGroupsFromEntries(alloc: Allocator, entries: anytype) ![]PendingDocumentGroup {
-    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
-    errdefer cleanupPendingDocumentGroupMap(alloc, &pending);
-
-    for (entries) |entry| {
-        var record = try change_journal_mod.decodeRecord(alloc, entry.payload);
-        defer record.deinit();
-        if (!recordHasEnrichmentHint(record.record)) continue;
-
-        for (record.record.changed_doc_keys) |doc_key| {
-            try appendPendingDocumentGroup(alloc, &pending, entry.sequence, doc_key);
-        }
-    }
-
-    return try pendingDocumentGroupsToOwnedSlice(alloc, &pending);
-}
-
 fn cleanupPendingDocumentGroupMap(alloc: Allocator, pending: *std.StringHashMapUnmanaged(PendingDocumentGroup)) void {
     var it = pending.iterator();
     while (it.next()) |entry| alloc.free(entry.key_ptr.*);
@@ -653,13 +658,15 @@ fn appendPendingDocumentGroup(
     sequence: u64,
     doc_key: []const u8,
 ) !void {
-    const owned_key = try alloc.dupe(u8, doc_key);
-    errdefer alloc.free(owned_key);
-    const gop = try pending.getOrPut(alloc, owned_key);
-    if (gop.found_existing) {
-        alloc.free(owned_key);
-    } else {
-        gop.key_ptr.* = owned_key;
+    if (pending.getPtr(doc_key)) |existing| {
+        existing.sequence = sequence;
+        return;
+    }
+    const gop = try pending.getOrPut(alloc, doc_key);
+    if (!gop.found_existing) {
+        // A failed ownership transfer must remove the borrowed map key.
+        errdefer _ = pending.remove(doc_key);
+        gop.key_ptr.* = try alloc.dupe(u8, doc_key);
     }
     gop.value_ptr.* = .{
         .sequence = sequence,
@@ -1394,4 +1401,159 @@ test "replay source primary visibility checks the exact replay sequence" {
     try std.testing.expect(!(try source.isSequenceVisible(2)));
     try std.testing.expect(try source.isSequenceVisible(3));
     try std.testing.expect(!(try source.isSequenceVisible(4)));
+}
+
+test "replay source journal cursor streams borrowed entries and resumes rejected records" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("streaming-cursor-regression", .{ .backend = .lsm_memory });
+    defer journal.close();
+    for (1..5) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(alloc, .{
+            .sequence = sequence,
+            .changed_doc_keys = &.{"document"},
+            .target_hints = if (sequence == 1) &.{.graph} else &.{.full_text},
+        });
+        defer alloc.free(payload);
+        _ = try journal.appendOpaque(payload);
+    }
+    // Only cursor construction may allocate through the replay allocator.
+    // The old suffix materialization would fail on its first payload copy.
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 1 });
+    var cursor = try Source.fromJournal(&journal).openMatchingCursor(failing.allocator(), 0, .full_text);
+    defer cursor.deinit(failing.allocator());
+    const Context = struct {
+        calls: usize = 0,
+        last: u64 = 0,
+        reject: bool = false,
+        fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.reject) return error.StopReplayChunk;
+            if (!try change_journal_mod.encodedRecordHasHint(payload, .full_text)) return error.InvalidPayload;
+            self.calls += 1;
+            self.last = sequence;
+        }
+    };
+    var context: Context = .{};
+    const first = try cursor.forEachNext(1, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 1), first.hint_filter_skips);
+    try std.testing.expectEqual(@as(u64, 2), first.last_sequence);
+    context.reject = true;
+    const rejected = try cursor.forEachNext(1, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 0), rejected.matched_entries);
+    // A write between windows must not overlap a live journal scan transaction.
+    const appended = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 5, .changed_doc_keys = &.{"new"}, .target_hints = &.{.full_text} });
+    defer alloc.free(appended);
+    _ = try journal.appendOpaque(appended);
+    context.reject = false;
+    const rest = try cursor.forEachNext(0, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 3), rest.matched_entries);
+    try std.testing.expectEqual(@as(u64, 5), context.last);
+    try std.testing.expectEqual(@as(usize, 4), context.calls);
+}
+
+fn enrichmentOwnershipAllocationFailure(alloc: Allocator) !void {
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    defer cleanupPendingDocumentGroupMap(alloc, &pending);
+    try appendPendingDocumentGroup(alloc, &pending, 1, "document");
+    try appendPendingDocumentGroup(alloc, &pending, 2, "document");
+    try appendPendingDocumentGroup(alloc, &pending, 3, "another");
+}
+
+test "replay source enrichment key ownership rolls back every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, enrichmentOwnershipAllocationFailure, .{});
+}
+
+test "replay source enrichment repeated document needs no new allocation" {
+    const alloc = std.testing.allocator;
+    var pending = std.StringHashMapUnmanaged(PendingDocumentGroup).empty;
+    defer cleanupPendingDocumentGroupMap(alloc, &pending);
+    try appendPendingDocumentGroup(alloc, &pending, 1, "document");
+    const owned = pending.get("document").?.doc_key.ptr;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try appendPendingDocumentGroup(failing.allocator(), &pending, 2, "document");
+    try std.testing.expectEqual(@as(u64, 2), pending.get("document").?.sequence);
+    try std.testing.expectEqual(owned, pending.get("document").?.doc_key.ptr);
+}
+
+test "replay source enrichment shares selective decode for binary and legacy sources" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("selected-enrichment", .{ .backend = .lsm_memory });
+    defer journal.close();
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+    const first = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .deleted_doc_keys = &.{"unused-delete"},
+        .overwritten_doc_keys = &.{"unused-overwrite"},
+        .changed_artifact_keys = &.{"unused-artifact"},
+        .target_hints = &.{.enrichment},
+    });
+    defer alloc.free(first);
+    const legacy = "{\"version\":1,\"sequence\":2,\"changed_doc_keys\":[\"doc:b\",\"doc:a\"],\"target_hints\":[\"enrichment\"]}";
+    _ = try journal.appendOpaque(first);
+    _ = try journal.appendOpaque(legacy);
+    try store.appendReplayOpaque(alloc, 1, first);
+    try store.appendReplayOpaque(alloc, 2, legacy);
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null) }) |replay_source| {
+        const groups = try replay_source.collectEnrichmentDocumentGroups(alloc, 0);
+        defer freePendingDocumentGroups(alloc, groups);
+        try std.testing.expectEqual(@as(usize, 2), groups.len);
+        try std.testing.expectEqualStrings("doc:a", groups[0].doc_key);
+        try std.testing.expectEqualStrings("doc:b", groups[1].doc_key);
+        for (groups) |group| try std.testing.expectEqual(@as(u64, 2), group.sequence);
+    }
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    try std.testing.expectEqual(@as(u64, 2), try Source.fromJournal(&journal).latestMatchingSequence(failing.allocator(), 0, .enrichment));
+    try std.testing.expectEqual(@as(u64, 1), try Source.fromJournal(&journal).latestMatchingSequence(failing.allocator(), 1, .graph));
+}
+
+test "replay source enrichment validates corruption in skipped binary fields" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("enrichment-corrupt-skipped", .{ .backend = .lsm_memory });
+    defer journal.close();
+    const encoded = try change_journal_mod.encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = &.{"doc"}, .changed_artifact_keys = &.{"artifact"}, .target_hints = &.{.enrichment} });
+    defer alloc.free(encoded);
+    _ = try journal.appendOpaque(encoded[0 .. encoded.len - 1]);
+    try std.testing.expectError(error.UnexpectedEndOfInput, Source.fromJournal(&journal).collectEnrichmentDocumentGroups(alloc, 0));
+}
+
+test "replay cursor exposes partial scan statistics on consumer failure for both sources" {
+    const alloc = std.testing.allocator;
+    var journal = try change_journal_mod.Journal.open("partial-scan-stats", .{ .backend = .lsm_memory });
+    defer journal.close();
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    for (1..4) |sequence| {
+        const encoded = try change_journal_mod.encodeRecord(alloc, .{ .sequence = sequence, .target_hints = if (sequence == 1) &.{.graph} else &.{.full_text} });
+        defer alloc.free(encoded);
+        _ = try journal.appendOpaque(encoded);
+        try store.appendReplayOpaque(alloc, sequence, encoded);
+    }
+    const Context = struct {
+        reject: bool = true,
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (sequence == 3 and self.reject) return error.ResourceBudgetExceeded;
+        }
+    };
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null) }, 0..) |source, i| {
+        var cursor = try source.openMatchingCursor(alloc, 0, .full_text);
+        defer cursor.deinit(alloc);
+        var ctx: Context = .{};
+        try std.testing.expectError(error.ResourceBudgetExceeded, cursor.forEachNext(0, &ctx, Context.consume));
+        try std.testing.expectEqual(@as(usize, 1), cursor.last_scan_stats.matched_entries);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 2 else 1), cursor.last_scan_stats.scanned_entries);
+        try std.testing.expectEqual(@as(usize, if (i == 0) 1 else 0), cursor.last_scan_stats.hint_filter_skips);
+        try std.testing.expectEqual(@as(usize, 1), cursor.last_scan_stats.scan_batches);
+        ctx.reject = false;
+        const resumed = try cursor.forEachNext(0, &ctx, Context.consume);
+        try std.testing.expectEqual(@as(usize, 1), resumed.matched_entries);
+        try std.testing.expectEqual(@as(u64, 3), resumed.last_sequence);
+    }
 }
