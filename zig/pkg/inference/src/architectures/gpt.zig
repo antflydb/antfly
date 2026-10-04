@@ -31,6 +31,7 @@ const platform = @import("antfly_platform");
 const a4b_feature_flags = @import("../util/a4b_feature_flags.zig");
 const ops = @import("../ops/ops.zig");
 const backend_contracts = @import("../graph/backend_contracts.zig");
+const resident_ops = @import("../graph/resident_ops.zig");
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
 const gpt_config = @import("../models/gpt.zig");
@@ -3180,6 +3181,9 @@ pub const DenseQwen3PrefillOptions = struct {
     /// Borrowed [1, hidden_size] yes-minus-no head, prepared before the frame.
     /// The caller retains it until this synchronous operation returns.
     score_weight: ?CT = null,
+    /// Embedding-only L2 tail, encoded before the decoder frame is submitted.
+    /// Requires selected rows and cannot be combined with a score head.
+    normalize_selected_rows: bool = false,
     profile: bool = false,
 };
 
@@ -3221,6 +3225,7 @@ pub fn tryDenseQwen3Prefill(
         getenvBool("TERMITE_METAL_DISABLE_QWEN3_PREPARED_PREFILL")) return null;
     const total = std.math.mul(usize, batch, seq_len) catch return error.ShapeMismatch;
     if (input_ids.len != total) return error.ShapeMismatch;
+    if (options.normalize_selected_rows and (options.output_rows == null or options.score_weight != null)) return error.ShapeMismatch;
     if (total <= 1 or !denseQwen3RightPaddingValid(attention_mask, batch, seq_len)) return null;
     if (options.output_rows) |rows| {
         if (rows.len != batch) return error.ShapeMismatch;
@@ -3288,6 +3293,8 @@ pub fn tryDenseQwen3Prefill(
     defer if (selected) |value| cb.free(value);
     var scores: ?CT = null;
     defer if (scores) |value| cb.free(value);
+    var normalized: ?CT = null;
+    defer if (normalized) |value| cb.free(value);
     var active = try cb.decoderRuntimeBeginFrame();
     if (!active) return null;
     // Runs before any tensor defer, including when execution returned false.
@@ -3329,6 +3336,9 @@ pub fn tryDenseQwen3Prefill(
         if (options.score_weight) |weight| {
             scores = try cb.linearNoBias(selected.?, weight, rows.len, config.hidden_size, 1);
         }
+        if (options.normalize_selected_rows) {
+            normalized = try resident_ops.l2NormalizeLastDim(allocator, cb, selected.?, &.{ @intCast(rows.len), @intCast(config.hidden_size) });
+        }
     }
     try cb.checkExecutionControl();
     try cb.decoderRuntimeSubmitAndWaitFrame();
@@ -3336,6 +3346,10 @@ pub fn tryDenseQwen3Prefill(
     try cb.checkExecutionControl();
     if (scores) |value| {
         scores = null;
+        return value;
+    }
+    if (normalized) |value| {
+        normalized = null;
         return value;
     }
     if (selected) |value| {
@@ -12369,6 +12383,8 @@ test "Qwen3 prepared prefill rejects incompatible semantics masks and selected r
     try std.testing.expectEqual(@as(?CT, null), try tryDenseQwen3Prefill(&cb, std.testing.allocator, base, &DenseQwen3PrefillProbe.ids, &invalid, 2, 3, .{}));
     try std.testing.expectError(error.ShapeMismatch, tryDenseQwen3Prefill(&cb, std.testing.allocator, base, &DenseQwen3PrefillProbe.ids, &DenseQwen3PrefillProbe.mask, 2, 3, .{ .output_rows = &.{ 0, 3 } }));
     try std.testing.expectError(error.ShapeMismatch, tryDenseQwen3Prefill(&cb, std.testing.allocator, base, &DenseQwen3PrefillProbe.ids, &DenseQwen3PrefillProbe.mask, 2, 3, .{ .output_rows = &.{ 2, 3 } }));
+    try std.testing.expectError(error.ShapeMismatch, tryDenseQwen3Prefill(&cb, std.testing.allocator, base, &DenseQwen3PrefillProbe.ids, &DenseQwen3PrefillProbe.mask, 2, 3, .{ .normalize_selected_rows = true }));
+    try std.testing.expectError(error.ShapeMismatch, tryDenseQwen3Prefill(&cb, std.testing.allocator, base, &DenseQwen3PrefillProbe.ids, &DenseQwen3PrefillProbe.mask, 2, 3, .{ .output_rows = &.{ 1, 3 }, .score_weight = &probe.tokens[0], .normalize_selected_rows = true }));
     try std.testing.expectEqual(@as(usize, 0), probe.prepares);
 }
 

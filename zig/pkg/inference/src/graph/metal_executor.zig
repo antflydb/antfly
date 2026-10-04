@@ -420,7 +420,7 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
         },
     );
     std.debug.print(
-        "metal_active_decode_ops: layer_input_direct={d}/{d} attn_norm={d} q_linear={d} qkv={d} head_norm={d} rope={d} head_norm_rope_fused={d} ple={d} fused_argmax={d} split_argmax={d} frame={d}/{d} disabled={d} scratch_failures={d} fallbacks={d} batch_fallbacks={d} initial_tensor_fallbacks={d} layer_fallbacks={d} tail_fallbacks={d}\n",
+        "metal_active_decode_ops: layer_input_direct={d}/{d} attn_norm={d} q_linear={d} qkv={d} head_norm={d} rope={d} head_norm_rope_fused={d} ple={d} fused_argmax={d} split_argmax={d} nucleus_samples={d} frame={d}/{d} disabled={d} scratch_failures={d} fallbacks={d} batch_fallbacks={d} initial_tensor_fallbacks={d} layer_fallbacks={d} tail_fallbacks={d}\n",
         .{
             provider_stats.active_decode_layer_input_direct_hits,
             provider_stats.active_decode_layer_input_direct_attempts,
@@ -433,6 +433,7 @@ fn printRuntimeDebugTimingStats(metal_stats: model_runtime.RuntimeDebugTimingSta
             provider_stats.active_decode_ple_ops,
             provider_stats.active_decode_final_fused_argmax_ops,
             provider_stats.active_decode_final_split_argmax_ops,
+            provider_stats.metal_runtime_full_vocab_nucleus_sample_calls,
             provider_stats.active_decode_frame_successes,
             provider_stats.active_decode_frame_attempts,
             provider_stats.active_decode_frame_disabled,
@@ -1311,6 +1312,40 @@ const ExecutorKvMetadataLayer = struct {
     }
 };
 
+const PipelinedDecodeMode = enum {
+    greedy,
+    sampled_nucleus,
+};
+
+fn validateSampledPipelineContinuation(
+    armed: bool,
+    active_mode: ?PipelinedDecodeMode,
+    next_position: usize,
+    requested_position: usize,
+) !void {
+    if (!armed) return;
+    if (active_mode != .sampled_nucleus) return error.PipelinedDecodeModeChanged;
+    if (next_position != requested_position) return error.PipelinedDecodePositionChanged;
+}
+
+fn sampledPipelineConfigMatches(
+    active: ?model_runtime.SamplingConfig,
+    requested: model_runtime.SamplingConfig,
+) bool {
+    return active != null and std.meta.eql(active.?, requested);
+}
+
+fn submitSampledPipelineToken(cb: *const ops.ComputeBackend, token: i64, vocab_size: usize) !void {
+    // Frame A has completed, but B still depends on its device token. An
+    // invalid draw (including the nucleus UINT32_MAX sentinel) must cancel B
+    // rather than submit it with an invalid embedding index.
+    errdefer decoder_gated_runtime.pipelinedCancelPending(cb);
+    if (token < 0 or @as(u64, @intCast(token)) >= vocab_size) return error.InvalidModelOutput;
+    if ((try decoder_gated_runtime.decoderRuntimePipelinedControl(cb, .submit_pending)) == null) {
+        return error.ResidentSamplingFrameFailed;
+    }
+}
+
 const RuntimeContext = struct {
     allocator: std.mem.Allocator,
     cb: ops.ComputeBackend,
@@ -1325,6 +1360,8 @@ const RuntimeContext = struct {
     mirrored_kv_view: ?generation.KvView,
     mirrored_kv_compacted: bool,
     pipelined_decode_armed: bool = false,
+    pipelined_decode_mode: ?PipelinedDecodeMode = null,
+    pipelined_sampling: ?model_runtime.SamplingConfig = null,
     pipelined_next_position: usize = 0,
     pipelined_kv_advanced_for: ?usize = null,
     raw_span_state: ?DecoderRuntimeSpanState,
@@ -1405,6 +1442,12 @@ const RuntimeContext = struct {
     }
 
     fn deinit(self: *RuntimeContext) void {
+        // Sampled and greedy pipelining intentionally leave the next frame
+        // submitted after returning a token. The runtime borrows the shared
+        // Metal provider, so its ComputeBackend teardown does not own or drain
+        // that frame. Complete it before releasing KV storage and ending the
+        // borrowed request that the in-flight command buffer depends on.
+        self.drainPipelinedDecode();
         self.clearGreedyDeviceToken();
         self.moe_runtime.deinit();
         self.kv_metadata.deinit(&self.kv_storage);
@@ -1856,6 +1899,8 @@ const RuntimeContext = struct {
         if (!self.pipelined_decode_armed) return;
         _ = metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb) catch null;
         self.pipelined_decode_armed = false;
+        self.pipelined_decode_mode = null;
+        self.pipelined_sampling = null;
         self.pipelined_kv_advanced_for = null;
     }
 
@@ -1867,6 +1912,9 @@ const RuntimeContext = struct {
         if (request.attention_mode != .paged_decode) return null;
         if (self.gpt_config.family != .gemma) return null;
         const configured_layer_count = self.decoderRuntimeConfiguredLayerCount();
+        if (self.pipelined_decode_armed and self.pipelined_decode_mode != .greedy) {
+            return error.PipelinedDecodeModeChanged;
+        }
         if (self.pipelined_decode_armed and self.pipelined_next_position != request.position) {
             self.drainPipelinedDecode();
         }
@@ -1916,6 +1964,8 @@ const RuntimeContext = struct {
                 );
             }
             self.pipelined_decode_armed = true;
+            self.pipelined_decode_mode = .greedy;
+            self.pipelined_sampling = null;
             self.pipelined_next_position = request.position;
         }
         // Pending frame produces the token at position request.position + 1.
@@ -1926,6 +1976,8 @@ const RuntimeContext = struct {
             self.pipelined_kv_advanced_for = request.position + 1;
             const token = (try metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb)) orelse return error.InvalidModelOutput;
             self.pipelined_decode_armed = false;
+            self.pipelined_decode_mode = null;
+            self.pipelined_sampling = null;
             if (token < 0) return error.InvalidModelOutput;
             self.noteDecoderRuntimeStateFromCurrentView();
             return token;
@@ -1941,10 +1993,14 @@ const RuntimeContext = struct {
             if (token < 0) return error.InvalidModelOutput;
             if (metal_runtime.decoderRuntimePipelinedSubmitPending(&self.cb)) {
                 self.pipelined_decode_armed = true;
+                self.pipelined_decode_mode = .greedy;
+                self.pipelined_sampling = null;
                 self.pipelined_next_position = request.position + 1;
             } else {
                 metal_runtime.decoderRuntimePipelinedCancelPending(&self.cb);
                 self.pipelined_decode_armed = false;
+                self.pipelined_decode_mode = null;
+                self.pipelined_sampling = null;
                 self.pipelined_kv_advanced_for = request.position + 1;
             }
             self.noteDecoderRuntimeStateFromCurrentView();
@@ -1954,7 +2010,90 @@ const RuntimeContext = struct {
         self.pipelined_kv_advanced_for = request.position + 1;
         const token = (try metal_runtime.decoderRuntimePipelinedAwaitToken(&self.cb)) orelse return error.InvalidModelOutput;
         self.pipelined_decode_armed = false;
+        self.pipelined_decode_mode = null;
+        self.pipelined_sampling = null;
         if (token < 0) return error.InvalidModelOutput;
+        self.noteDecoderRuntimeStateFromCurrentView();
+        return token;
+    }
+
+    fn decodeSamplePipelined(
+        self: *RuntimeContext,
+        allocator: std.mem.Allocator,
+        request: model_runtime.SampledDecodeRequest,
+    ) !?i64 {
+        if (request.decode.attention_mode != .paged_decode) {
+            if (self.pipelined_decode_armed) return error.PipelinedSamplingContractChanged;
+            return null;
+        }
+        if (self.gpt_config.family != .gemma) {
+            if (self.pipelined_decode_armed) return error.PipelinedSamplingContractChanged;
+            return null;
+        }
+        const configured_layer_count = self.decoderRuntimeConfiguredLayerCount();
+
+        try validateSampledPipelineContinuation(
+            self.pipelined_decode_armed,
+            self.pipelined_decode_mode,
+            self.pipelined_next_position,
+            request.decode.position,
+        );
+        if (self.pipelined_decode_armed) {
+            if (!sampledPipelineConfigMatches(self.pipelined_sampling, request.sampling)) {
+                return error.PipelinedSamplingContractChanged;
+            }
+            if (!decoder_gated_runtime.residentSampledTokenPipelineContinuationSupported(
+                self.gpt_config,
+                configured_layer_count,
+                request.sampling,
+            )) return error.PipelinedSamplingContractChanged;
+        } else {
+            // runtimeSupportsSampleDecodeRequest completed the backend
+            // capability check and fixed-capacity scratch reservation before
+            // decodeSample entered this method.
+            if (!(try self.ensureDecoderRuntimePrepared())) return null;
+        }
+        if (!self.pipelined_decode_armed) {
+            if (self.pipelined_kv_advanced_for != null) return error.InvalidPagedKvState;
+            const arm_step = try self.beginDecodeStep(request.decode.position, request.decode.attention_mode);
+            const armed = try decoder_gated_runtime.forwardSampledTokenPipelinedArm(
+                &self.cb,
+                allocator,
+                self.gpt_config,
+                configured_layer_count,
+                request.decode.token_id,
+                arm_step.seq_len,
+                &arm_step.decode_context,
+                request.sampling,
+                request.token_history,
+            );
+            if (!armed) return error.ResidentSamplingPreflightChanged;
+            self.pipelined_decode_armed = true;
+            self.pipelined_decode_mode = .sampled_nucleus;
+            self.pipelined_sampling = request.sampling;
+            self.pipelined_next_position = request.decode.position;
+        }
+        errdefer self.drainPipelinedDecode();
+
+        // Encode B while submitted A executes, then wait/read A before B is
+        // submitted. The single sampler scratch set is therefore never used
+        // by two executing command buffers at once.
+        const next_step = try self.beginDecodeStep(request.decode.position + 1, request.decode.attention_mode);
+        const token = (try decoder_gated_runtime.forwardSampledTokenPipelinedStep(
+            &self.cb,
+            allocator,
+            self.gpt_config,
+            configured_layer_count,
+            next_step.seq_len,
+            &next_step.decode_context,
+            request.sampling,
+            request.token_history,
+        )) orelse return error.ResidentSamplingFrameFailed;
+        try submitSampledPipelineToken(&self.cb, token, self.gpt_config.vocab_size);
+        self.pipelined_decode_armed = true;
+        self.pipelined_decode_mode = .sampled_nucleus;
+        self.pipelined_sampling = request.sampling;
+        self.pipelined_next_position = request.decode.position + 1;
         self.noteDecoderRuntimeStateFromCurrentView();
         return token;
     }
@@ -2022,6 +2161,7 @@ const runtime_vtable = model_runtime.ModelRuntime.VTable{
     .prefill = runtimePrefill,
     .decode = runtimeDecode,
     .decode_sample = runtimeDecodeSample,
+    .supports_sample_decode_request = runtimeSupportsSampleDecodeRequest,
     .decode_greedy = runtimeDecodeGreedy,
     .deinit = runtimeDeinit,
     .reset = runtimeReset,
@@ -2485,14 +2625,42 @@ fn runtimeDecodeSample(
         const greedy = try runtimeDecodeGreedy(ctx, allocator, request.decode);
         return .{ .token_id = greedy.token_id };
     }
-    runtime_ctx.drainPipelinedDecode();
+    const committed_direct = runtimeSupportsSampleDecodeRequest(ctx, request);
 
     timing_stats.decode_sample_calls += 1;
     runtime_ctx.clearGreedyDeviceToken();
+    if (committed_direct and
+        (runtime_ctx.pipelined_decode_armed or pipelinedDecodeFrameEnabled(runtime_ctx.gpt_config)))
+    {
+        const pipelined_started_at = monotonicNowNs();
+        if (try runtime_ctx.decodeSamplePipelined(allocator, request)) |token_id| {
+            timing_stats.decode_sample_direct_nanos += @intCast(monotonicNowNs() - pipelined_started_at);
+            return .{ .token_id = token_id };
+        }
+    }
+    runtime_ctx.drainPipelinedDecode();
     const begin_started_at = monotonicNowNs();
     const step = try runtime_ctx.beginDecodeStep(request.decode.position, request.decode.attention_mode);
     try request.decode.check();
     timing_stats.decode_begin_step_nanos += @intCast(monotonicNowNs() - begin_started_at);
+    if (committed_direct) {
+        const direct_started_at = monotonicNowNs();
+        const configured_layer_count = runtime_ctx.decoderRuntimeConfiguredLayerCount();
+        const token_id = (try decoder_gated_runtime.forwardResidentSampledToken(
+            &runtime_ctx.cb,
+            allocator,
+            runtime_ctx.gpt_config,
+            configured_layer_count,
+            request.decode.token_id,
+            step.seq_len,
+            &step.decode_context,
+            request.sampling,
+            request.token_history,
+        )) orelse return error.ResidentSamplingPreflightChanged;
+        runtime_ctx.noteDecoderRuntimeStateFromCurrentView();
+        timing_stats.decode_sample_direct_nanos += @intCast(monotonicNowNs() - direct_started_at);
+        return .{ .token_id = token_id };
+    }
     if (runtime_ctx.decoderRuntimeExecutorEnabled()) {
         const direct_started_at = monotonicNowNs();
         if (try runtime_ctx.forwardDecoderRuntimeSampledToken(
@@ -2555,6 +2723,29 @@ fn runtimeDecodeSample(
             request.sampling,
             request.token_history,
         )),
+    };
+}
+
+fn runtimeSupportsSampleDecodeRequest(
+    ctx: *anyopaque,
+    request: model_runtime.SampledDecodeRequest,
+) bool {
+    const runtime_ctx: *RuntimeContext = @ptrCast(@alignCast(ctx));
+    // Once a sampled frame is submitted, the caller must enter decodeSample
+    // so continuation mismatches become fatal errors. Returning false here
+    // would let the graph dispatcher replay the same KV position elsewhere.
+    if (runtime_ctx.pipelined_decode_armed) return true;
+    if (request.decode.attention_mode != .paged_decode) return false;
+    if (!runtime_ctx.decoderRuntimeExecutorEnabled()) return false;
+    return switch (runtime_ctx.gpt_config.family) {
+        .llama, .mistral, .qwen2, .gemma => decoder_gated_runtime.residentSampledTokenSupported(
+            &runtime_ctx.cb,
+            runtime_ctx.gpt_config,
+            runtime_ctx.decoderRuntimeConfiguredLayerCount(),
+            request.sampling,
+            request.token_history,
+        ),
+        else => false,
     };
 }
 
@@ -2773,4 +2964,70 @@ test "metal executor keeps speculative decode frames opt in" {
     try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, false, true, false, false));
     try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(false, true, true, true, true));
     try std.testing.expect(!pipelinedDecodeFrameEnabledForFlags(true, true, false, false, false));
+}
+
+test "sampled pipeline rejects mode and position changes after arm" {
+    try validateSampledPipelineContinuation(false, null, 0, 99);
+    try validateSampledPipelineContinuation(true, .sampled_nucleus, 42, 42);
+    try std.testing.expectError(
+        error.PipelinedDecodeModeChanged,
+        validateSampledPipelineContinuation(true, .greedy, 42, 42),
+    );
+    try std.testing.expectError(
+        error.PipelinedDecodePositionChanged,
+        validateSampledPipelineContinuation(true, .sampled_nucleus, 42, 43),
+    );
+
+    const matched = model_runtime.SamplingConfig{ .temperature = 0.8, .top_p = 0.95 };
+    try std.testing.expect(sampledPipelineConfigMatches(matched, matched));
+    try std.testing.expect(!sampledPipelineConfigMatches(null, matched));
+    var changed = matched;
+    changed.top_p = 0.9;
+    try std.testing.expect(!sampledPipelineConfigMatches(matched, changed));
+}
+
+test "sampled pipeline cancels invalid draws before submitting the next frame" {
+    const Probe = struct {
+        submits: usize = 0,
+        cancels: usize = 0,
+        reject_submit: bool = false,
+        fail_submit: bool = false,
+
+        fn decode(ctx: *anyopaque, request: *const ops.DecoderRuntimeDecodeRequest) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (request.phase) {
+                .submit_pending => {
+                    self.submits += 1;
+                    if (self.fail_submit) return error.InjectedSubmitFailure;
+                    return !self.reject_submit;
+                },
+                .cancel_pending => {
+                    self.cancels += 1;
+                    return true;
+                },
+                else => return error.UnexpectedDecodePhase,
+            }
+        }
+    };
+    var probe = Probe{};
+    // The control path touches only this callback, never a tensor operation.
+    var vtable: ops.ComputeBackend.VTable = undefined;
+    vtable.decoderRuntimeDecode = Probe.decode;
+    const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &vtable };
+    const vocab_size: usize = 262144;
+    for ([_]i64{ -1, vocab_size, std.math.maxInt(u32) }) |invalid| {
+        try std.testing.expectError(error.InvalidModelOutput, submitSampledPipelineToken(&cb, invalid, vocab_size));
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.submits);
+    try std.testing.expectEqual(@as(usize, 3), probe.cancels);
+
+    try submitSampledPipelineToken(&cb, vocab_size - 1, vocab_size);
+    try std.testing.expectEqual(@as(usize, 1), probe.submits);
+    try std.testing.expectEqual(@as(usize, 3), probe.cancels);
+    probe.reject_submit = true;
+    try std.testing.expectError(error.ResidentSamplingFrameFailed, submitSampledPipelineToken(&cb, 7, vocab_size));
+    probe.fail_submit = true;
+    try std.testing.expectError(error.InjectedSubmitFailure, submitSampledPipelineToken(&cb, 7, vocab_size));
+    try std.testing.expectEqual(@as(usize, 3), probe.submits);
+    try std.testing.expectEqual(@as(usize, 5), probe.cancels);
 }
