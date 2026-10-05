@@ -171,6 +171,29 @@ pub const Rows = struct {
     }
 };
 
+/// A permutation over one immutable payload and its shared output sidecars.
+/// Views own only ordinal directories; window updates address original rows.
+pub const View = struct {
+    source: *Rows,
+    indices: *Integers,
+    begin: usize = 0,
+    len: usize,
+    pub fn row(self: *View, index: usize) !operators.Row {
+        if (index >= self.len) return error.InvalidSqlSpill;
+        return self.source.row(try self.indices.at(self.begin + index));
+    }
+    pub fn cell(self: *View, index: usize, column: usize) !Datum {
+        return (try self.row(index)).values[column];
+    }
+    pub fn setCell(self: *View, index: usize, column: usize, value: Datum) !void {
+        if (index >= self.len) return error.InvalidSqlSpill;
+        try self.source.setCell(try self.indices.at(self.begin + index), column, value);
+    }
+};
+pub fn isDisk(comptime T: type) bool {
+    return T == *Rows or T == *View;
+}
+
 /// Small write-back cache for fixed window state. The underlying file is
 /// already sized and charged to the statement quota before cache admission.
 pub const RawCache = struct {
@@ -270,4 +293,37 @@ test "SQL window cell updates preserve wide rows without rewriting input payload
         try std.testing.expectEqual(@as(i64, @intCast(index)), row_value.values[1].value.integer);
         try std.testing.expectEqual(index % 2 != 0, row_value.values[2].sql_null);
     }
+}
+
+test "SQL window permutations share wide payloads and original-row sidecars" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    defer manager.deinit();
+    const text = try a.alloc(u8, 64 * 1024);
+    defer a.free(text);
+    @memset(text, 'x');
+    var source = try Rows.init(a, &manager, 2);
+    defer source.deinit();
+    for (0..3) |index| try source.append(.{ .values = &.{ Datum.json(.{ .string = text }), .{} }, .keys = &.{}, .ordinal = index });
+    const payload_bytes = source.file.size;
+    try source.enableColumnUpdates(1);
+    var first = try Integers.init(&manager);
+    defer first.deinit();
+    var second = try Integers.init(&manager);
+    defer second.deinit();
+    for ([_]usize{ 2, 0, 1 }) |i| try first.append(i);
+    for ([_]usize{ 1, 2, 0 }) |i| try second.append(i);
+    var left: View = .{ .source = &source, .indices = &first, .len = 3 };
+    var right: View = .{ .source = &source, .indices = &second, .len = 3 };
+    try left.setCell(0, 1, Datum.json(.{ .integer = 42 }));
+    try std.testing.expectEqual(@as(i64, 42), (try right.cell(1, 1)).value.integer);
+    try right.setCell(2, 1, Datum.json(.{ .integer = 7 }));
+    try std.testing.expectEqual(@as(i64, 7), (try left.cell(1, 1)).value.integer);
+    try std.testing.expectEqual(@as(u64, 2), (try right.row(1)).ordinal);
+    try std.testing.expectEqualStrings(text, (try right.cell(1, 0)).value.string);
+    try std.testing.expectEqual(payload_bytes, source.file.size);
 }

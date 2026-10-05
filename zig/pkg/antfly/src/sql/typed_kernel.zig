@@ -247,7 +247,10 @@ fn evaluateImpl(a: A, programs: []const *const scalar.Program, input: anytype, p
         // Materialize roots when ready, so delivery vectors do not pin live
         // kernel slots while later expressions reuse the shared DAG.
         for (roots[0..programs.len], outputs) |root, output| if (root == i) {
-            for (@constCast(output), 0..) |*value, row| value.* = target.get(row);
+            for (@constCast(output), 0..) |*value, row| {
+                value.* = target.get(row);
+                try scalar.validateResult(value.*, .{});
+            }
             uses[i] -= 1;
         };
         var buf: [2]u32 = undefined;

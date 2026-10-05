@@ -118,6 +118,81 @@ pub const Prepared = struct {
         }
         return false;
     }
+    /// Build one deletion mask per physical batch. Bind field sets once and
+    /// cache dictionary key parts; reuse the canonical key buffer for lanes.
+    pub fn mask(self: *Prepared, a: A, file: @import("../external_source/types.zig").FileEntry, batch: types.ColumnBatch, selected: []bool) !void {
+        if (selected.len != batch.rowCount()) return error.InvalidParquetRowGroupBatch;
+        try batch.validate();
+        const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
+        if (self.positions.count() != 0) {
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            const prefixes = self.positionPrefixes(info, file) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            self.mutex.unlock();
+            for (batch.row_refs, selected) |ref, *keep| {
+                if (!keep.*) continue;
+                const ordinal = try std.math.add(u64, ref.external.row_ordinal, prefixes[ref.external.row_group_ordinal]);
+                if (self.positions.contains(.{ .file = info.index, .ordinal = ordinal })) keep.* = false;
+            }
+        }
+        var key: std.ArrayListUnmanaged(u8) = .empty;
+        defer key.deinit(a);
+        for (info.equality, 0..) |equality_index, set_index| {
+            const equality = self.equality[equality_index];
+            const names = self.request.delete_plan.files[equality.file].equality_columns;
+            const repeated = for (info.equality[0..set_index]) |earlier| {
+                if (sameFields(names, self.request.delete_plan.files[self.equality[earlier].file].equality_columns)) break true;
+            } else false;
+            if (repeated) continue;
+            const columns = try a.alloc(?types.ColumnVector, names.len);
+            defer a.free(columns);
+            const parts = try a.alloc(std.AutoHashMapUnmanaged(u32, []const u8), names.len);
+            defer a.free(parts);
+            @memset(parts, .empty);
+            defer for (parts) |*dictionary| {
+                var iterator = dictionary.valueIterator();
+                while (iterator.next()) |part| a.free(part.*);
+                dictionary.deinit(a);
+            };
+            for (names, columns) |name, *column| column.* = batch.findColumn(name);
+            for (selected, 0..) |*keep, row| {
+                if (!keep.*) continue;
+                key.clearRetainingCapacity();
+                for (columns, parts) |column, *dictionary| {
+                    if (column == null or column.?.nulls.isNull(row)) {
+                        try key.append(a, 0);
+                    } else if (column.?.values == .dictionary_bytes) {
+                        const id = column.?.values.dictionary_bytes.indices[row];
+                        if (dictionary.get(id)) |part| {
+                            try key.appendSlice(a, part);
+                        } else {
+                            const begin = key.items.len;
+                            try deletes.appendEqualityColumnPart(a, &key, column.?, row);
+                            const part = try a.dupe(u8, key.items[begin..]);
+                            dictionary.put(a, id, part) catch |err| {
+                                a.free(part);
+                                return err;
+                            };
+                        }
+                    } else try deletes.appendEqualityColumnPart(a, &key, column.?, row);
+                }
+                for (info.equality[set_index..]) |candidate| {
+                    const entry = self.equality[candidate];
+                    if (sameFields(names, self.request.delete_plan.files[entry.file].equality_columns) and entry.keys.contains(key.items)) {
+                        keep.* = false;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    fn sameFields(left: []const []const u8, right: []const []const u8) bool {
+        if (left.len != right.len) return false;
+        for (left, right) |a, b| if (!std.mem.eql(u8, a, b)) return false;
+        return true;
+    }
     pub fn bindFile(self: *Prepared, file: @import("../external_source/types.zig").FileEntry) !void {
         if (self.positions.count() == 0) return;
         const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;

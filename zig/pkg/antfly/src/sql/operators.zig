@@ -618,10 +618,43 @@ pub const HashJoin = struct {
         self.addInner(values, keys) catch |err| return if (err == error.OutOfMemory and self.budget.exhausted) error.SqlProgramLimitExceeded else err;
         self.row_count += 1;
     }
+    fn admitBatch(self: *HashJoin, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum) !bool {
+        if (self.disk != null) return false;
+        if (self.sealed or batch.len() != keys.len) return error.InvalidSqlBackendResponse;
+        if (keys.len > self.limits.rows -| self.row_count) return error.SqlProgramLimitExceeded;
+        var needed: usize = 4096 +| batch.len() *| (128 +| batch.width() *| 64);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        for (0..batch.width()) |column| for (0..batch.len()) |index| {
+            _ = scratch.reset(.retain_capacity);
+            needed +|= (try datumBytes(try batch.cell(scratch.allocator(), index, column))) *| 4;
+        };
+        for (keys) |row| {
+            if (row.len > 256 or (self.key_count != null and row.len != self.key_count.?)) return error.InvalidSqlBackendResponse;
+            for (row) |value| needed +|= (try datumBytes(value)) *| 4;
+        }
+        if (needed > self.budget.limit / 2 -| self.budget.live) return false;
+        const hashes = try @import("batch_hash.zig").rows(a, keys, false);
+        defer a.free(hashes);
+        const retained = self.budget.allocator();
+        try self.entries.ensureUnusedCapacity(retained, keys.len);
+        try self.heads.ensureUnusedCapacity(retained, @intCast(keys.len));
+        try self.value_columns.appendBatch(batch);
+        for (keys, hashes) |row, hash| {
+            const index = self.entries.items.len;
+            _ = try self.key_columns.append(row);
+            self.entries.appendAssumeCapacity(.{ .width = batch.width(), .next = if (hash) |h| self.heads.get(h) else null });
+            if (hash) |h| self.heads.putAssumeCapacity(h, index);
+            self.key_count = row.len;
+        }
+        self.row_count += keys.len;
+        return true;
+    }
     /// Gather each build row into reusable scratch and admit it directly into
     /// retained typed state. Native payloads are copied exactly once.
     pub fn addBatch(self: *HashJoin, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum) !void {
         if (batch.len() != keys.len) return error.InvalidSqlBackendResponse;
+        if (try self.admitBatch(a, batch, keys)) return;
         const values = try a.alloc(Datum, batch.width());
         defer a.free(values);
         var scratch = std.heap.ArenaAllocator.init(a);
@@ -631,6 +664,24 @@ pub const HashJoin = struct {
             for (values, 0..) |*value, column| value.* = try batch.cell(scratch.allocator(), index, column);
             try self.add(values, key);
         }
+    }
+    /// Retain a bounded prefix without creating an intermediate disk chain.
+    /// The caller transfers this prefix once to its Grace partition sink.
+    pub fn addBatchUntilFull(self: *HashJoin, a: Allocator, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum) !usize {
+        if (batch.len() != keys.len or self.disk != null) return error.InvalidSqlBackendResponse;
+        if (try self.admitBatch(a, batch, keys)) return keys.len;
+        const values = try a.alloc(Datum, batch.width());
+        defer a.free(values);
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        for (keys, 0..) |key, index| {
+            _ = scratch.reset(.retain_capacity);
+            for (values, 0..) |*value, column| value.* = try batch.cell(scratch.allocator(), index, column);
+            const estimate = 4096 +| (try self.value_columns.appendBytes(values)) *| 4 +| (try self.key_columns.appendBytes(key)) *| 4;
+            if (self.budget.live > self.budget.limit / 2 or estimate > self.budget.limit -| self.budget.live) return index;
+            try self.add(values, key);
+        }
+        return keys.len;
     }
     fn addInner(self: *HashJoin, values: []const Datum, keys: []const Datum) !void {
         if (self.sealed or keys.len > 256 or (self.key_count != null and self.key_count.? != keys.len)) return error.InvalidSqlBackendResponse;
@@ -662,33 +713,17 @@ pub const HashJoin = struct {
         self.sealed = true;
         const probes = try a.alloc(Probe, keys.len);
         errdefer a.free(probes);
-        const hashes = try a.alloc(std.hash.Wyhash, keys.len);
+        const hashes = try @import("batch_hash.zig").rows(a, keys, false);
         defer a.free(hashes);
-        for (hashes, probes, keys) |*hash, *probe_, row| {
+        for (keys, probes, hashes) |row, *probe_, hash| {
             if (self.key_count != null and row.len != self.key_count.?) return error.InvalidSqlBackendResponse;
-            hash.* = .init(0);
             probe_.* = .{ .owner = self, .keys = row, .cursor = null };
-        }
-        const valid = try a.alloc(bool, keys.len);
-        defer a.free(valid);
-        for (keys, valid) |row, *accepted| accepted.* = for (row) |cell| {
-            if (cell.sql_null) break false;
-        } else true;
-        const width = if (keys.len == 0) 0 else keys[0].len;
-        for (0..width) |column| for (keys, hashes, valid) |row, *hash, accepted| {
-            if (row.len != width) return error.InvalidSqlBackendResponse;
-            if (!accepted) continue;
-            var bytes: [8]u8 = undefined;
-            std.mem.writeInt(u64, &bytes, try scalar.semanticHash(row[column].value), .little);
-            hash.update(&bytes);
-        };
-        for (hashes, probes, valid) |*hash, *probe_, accepted| {
-            if (!accepted) continue;
-            const value = hash.final();
-            if (self.disk != null) {
-                const head = self.disk_heads[value & (self.disk_heads.len - 1)];
-                probe_.cursor = if (head == @import("spill.zig").none) null else @intCast(head);
-            } else probe_.cursor = self.heads.get(value);
+            if (hash) |value| {
+                if (self.disk != null) {
+                    const head = self.disk_heads[value & (self.disk_heads.len - 1)];
+                    probe_.cursor = if (head == @import("spill.zig").none) null else @intCast(head);
+                } else probe_.cursor = self.heads.get(value);
+            }
         }
         return probes;
     }
@@ -883,9 +918,11 @@ pub const Grouped = struct {
         defer a.free(ids);
         self.key_count = keys.len;
         errdefer self.failed = true;
+        const hashes = try @import("batch_hash.zig").columns(a, keys, count, true);
+        defer a.free(hashes);
         for (ids, 0..) |*id, index| {
             for (keys, row_keys) |column, *cell| cell.* = column[index];
-            id.* = try self.resolveGroup(row_keys);
+            id.* = try self.resolveGroupHashed(row_keys, hashes[index].?);
             self.rows_seen = std.math.add(u64, self.rows_seen, 1) catch return error.SqlNumericOutOfRange;
         }
         for (self.state_columns, inputs) |*column, values| try column.updateBatch(self.budget.allocator(), ids, values);
@@ -1135,7 +1172,9 @@ pub const Grouped = struct {
             std.mem.writeInt(u64, bytes[1..9], if (key.sql_null) 0 else try scalar.semanticHash(key.value), .little);
             hasher.update(&bytes);
         }
-        const hash = hasher.final();
+        return self.resolveGroupHashed(keys, hasher.final());
+    }
+    fn resolveGroupHashed(self: *Grouped, keys: []const Datum, hash: u64) !usize {
         var slot = self.heads.get(hash);
         while (slot) |index| {
             self.hash_probes += 1;
@@ -1683,4 +1722,49 @@ test "SQL spilled worker partials preserve wide sums until final merge" {
         try std.testing.expectEqual(@as(i64, 0), row.aggregates[0].value.integer);
     }
     for (seen) |found| try std.testing.expect(found);
+}
+
+test "SQL bounded native join admission transfers a prefix without a chain spool" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var manager: @import("spill.zig").Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const count = 256;
+    var integers: [count]Datum = undefined;
+    var rows: [count][]const Datum = undefined;
+    var keys: [count][]const Datum = undefined;
+    for (&integers, &rows, &keys, 0..) |*value, *row, *key, index| {
+        value.* = Datum.json(.{ .integer = @intCast(index) });
+        row.* = integers[index..][0..1];
+        key.* = row.*;
+    }
+    const hash = try HashJoin.create(a, .{ .bytes = 32 * 1024, .rows = count, .spill = &manager });
+    defer hash.deinit();
+    const consumed = try hash.addBatchUntilFull(a, .{ .rows = &rows }, &keys);
+    try std.testing.expect(consumed > 0 and consumed < count);
+    try std.testing.expectEqual(consumed, hash.row_count);
+    try std.testing.expect(hash.disk == null);
+    try std.testing.expectEqual(@as(u64, 0), manager.written_bytes);
+    const grace = try @import("partition_join.zig").Join.create(a, &manager, 32 * 1024, count, 0, false, false);
+    defer grace.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var index: usize = 0;
+    while (try hash.unmatched(&index)) |match| {
+        _ = arena.reset(.retain_capacity);
+        try grace.add(true, try match.materializeValues(arena.allocator()), try match.materializeKeys(arena.allocator()), match.index);
+    }
+    try grace.addBatch(true, .{ .rows = &rows }, &keys, consumed);
+    try grace.addBatch(false, .{ .rows = &rows }, &keys, 0);
+    try std.testing.expectEqual(@as(usize, count), grace.rows[1]);
+    var matches: usize = 0;
+    while (try grace.next()) |pair| {
+        try std.testing.expectEqual(pair.left.?[0].value.integer, pair.right.?[0].value.integer);
+        if (pair.match) |matched| try grace.accept(matched);
+        matches += 1;
+    }
+    try std.testing.expectEqual(@as(usize, count), matches);
 }

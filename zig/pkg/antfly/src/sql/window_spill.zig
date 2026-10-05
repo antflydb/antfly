@@ -54,8 +54,7 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
         return try window.evaluateCells(context, statement, cells);
     }
     var rows = try disk.Rows.init(context.alloc, manager, width);
-    var rows_owned = true;
-    defer if (rows_owned) rows.deinit();
+    defer rows.deinit();
     try appendPage(context, &rows, first.output, bound.input.columns);
     first.deinit();
     first_owned = false;
@@ -68,6 +67,9 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
     input.close();
     input_owned = false;
     const roots = try @import("ordering_reuse.zig").plan(context.arena, bound);
+    try rows.enableColumnUpdates(bound.input.columns.len);
+    var final_indices = try disk.Integers.init(manager);
+    defer final_indices.deinit();
     var physical_order: ?@import("window_binding.zig").Sort = null;
     for (bound.sorts, 0..) |specification, root| {
         if (roots[root] != root) continue;
@@ -92,8 +94,8 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
             // existing row store instead of being copied into every run.
             try sort.add(.{ .values = &.{Datum.json(.{ .integer = @intCast(index) })}, .keys = keys, .ordinal = row.ordinal });
         }
-        var next = try disk.Rows.init(context.alloc, manager, width);
-        errdefer next.deinit();
+        var layout = try disk.Integers.init(manager);
+        defer layout.deinit();
         var carry: ?operators.Row = null;
         while (true) {
             const first_row = carry orelse (try sort.next(scratch.allocator())) orelse break;
@@ -102,9 +104,8 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
             defer keys_arena.deinit();
             const keys = try keys_arena.allocator().alloc(Datum, specification.partition.len);
             for (first_row.keys[0..keys.len], keys) |value, *key| key.* = try operators.cloneDatum(keys_arena.allocator(), value);
-            var partition = try disk.Rows.init(context.alloc, manager, width);
-            defer partition.deinit();
-            try partition.append(try rows.row(std.math.cast(usize, first_row.values[0].value.integer) orelse return error.InvalidSqlSpill));
+            const begin = layout.len;
+            try layout.append(std.math.cast(usize, first_row.values[0].value.integer) orelse return error.InvalidSqlSpill);
             while (true) {
                 _ = scratch.reset(.free_all);
                 const candidate = (try sort.next(scratch.allocator())) orelse break;
@@ -112,9 +113,9 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
                     carry = candidate;
                     break;
                 }
-                try partition.append(try rows.row(std.math.cast(usize, candidate.values[0].value.integer) orelse return error.InvalidSqlSpill));
+                try layout.append(std.math.cast(usize, candidate.values[0].value.integer) orelse return error.InvalidSqlSpill);
             }
-            try partition.enableColumnUpdates(bound.input.columns.len);
+            var partition: disk.View = .{ .source = &rows, .indices = &layout, .begin = begin, .len = layout.len - begin };
             for (bound.sorts, 0..) |requirement, sort_index| {
                 if (roots[sort_index] != root) continue;
                 var starts = try disk.Integers.init(manager);
@@ -138,12 +139,10 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
                 const indices = disk.Identity{ .len = partition.len };
                 for (bound.specs, 0..) |spec, column| if (spec.sort == sort_index) try window.evaluate(context, &partition, indices, requirement, spec, bound.input.columns.len + column, &starts, &ends, &groups);
             }
-            for (0..partition.len) |index| try next.append(try partition.row(index));
         }
-        rows.deinit();
-        rows = next;
-        rows_owned = true;
+        std.mem.swap(disk.Integers, &final_indices, &layout);
         physical_order = specification;
     }
-    return try window.finishOrderedCells(context, statement, &rows, physical_order);
+    var result: disk.View = .{ .source = &rows, .indices = &final_indices, .len = rows.len };
+    return try window.finishOrderedCells(context, statement, &result, physical_order);
 }

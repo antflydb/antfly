@@ -205,6 +205,7 @@ const PendingColumns = struct {
     arena: std.heap.ArenaAllocator,
     values: @import("typed_store.zig").Store,
     exhausted: bool = false,
+    terminal_error: ?anyerror = null,
     fn create(a: std.mem.Allocator) !*PendingColumns {
         const self = try a.create(PendingColumns);
         self.* = .{ .backing = a, .arena = .init(a), .values = undefined };
@@ -445,6 +446,18 @@ pub const Stream = struct {
     fn executeColumns(self: *Stream, max_rows: u32) !*PendingColumns {
         const pending = try PendingColumns.create(self.budget.allocator());
         errdefer pending.deinit();
+        self.fillColumns(pending, max_rows) catch |err| {
+            if (pending.values.failed or pending.values.len == 0) return err;
+            pending.terminal_error = err;
+        };
+        if (self.exhausted or pending.terminal_error != null) {
+            if (self.cursor) |cursor| cursor.close(cursor.ptr);
+            self.cursor = null;
+        }
+        pending.exhausted = self.exhausted and pending.terminal_error == null;
+        return pending;
+    }
+    fn fillColumns(self: *Stream, pending: *PendingColumns, max_rows: u32) !void {
         var output_bytes: usize = 0;
         while (!self.exhausted and pending.values.len < max_rows) {
             try self.context.checkpoint();
@@ -458,55 +471,103 @@ pub const Stream = struct {
             const page = try cursor.next_columns.?(cursor.ptr, a, wanted);
             if (page.selection.len > wanted or page.selection.len > self.context.limits.scan_rows -| self.visited) return error.SqlProgramLimitExceeded;
             self.visited += page.selection.len;
-            const predicates = if (self.context.binding.scalars.predicate) |*program| try self.columnProgram(a, program, page) else null;
-            var selection: std.ArrayList(usize) = .empty;
-            for (page.selection, 0..) |physical, index| {
-                if (predicates) |values| {
-                    if (values[index].sql_null) continue;
-                    if (values[index].value != .bool) return error.SqlTypeMismatch;
-                    if (!values[index].value.bool) continue;
-                }
-                if (self.skip != 0) {
-                    self.skip -= 1;
-                    continue;
-                }
-                try selection.append(a, physical);
-            }
-            const selected: catalog.ColumnPage = .{ .batch = page.batch, .selection = selection.items };
-            const projections = try a.alloc(?[]const @import("scalar.zig").Datum, self.fields.len);
-            @memset(projections, null);
-            var programs: std.ArrayList(*const @import("scalar.zig").Program) = .empty;
-            var slots: std.ArrayList(usize) = .empty;
-            for (self.context.binding.scalars.projections, 0..) |*optional, index| if (optional.*) |*program| {
-                try programs.append(a, program);
-                try slots.append(a, index);
+            const before = pending.values.len;
+            const bytes = self.appendColumnPage(pending, a, page) catch |err| switch (err) {
+                error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlProgramLimitExceeded, error.InvalidSqlDateTime, error.SqlCardinalityViolation => if (pending.values.len == before) try self.appendScalarColumnPage(pending, a, page) else return err,
+                else => return err,
             };
-            const evaluated = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io);
-            for (evaluated, programs.items, slots.items) |values, program, index| projections[index] = values orelse try self.columnProgram(a, program, selected);
-            for (0..selection.items.len) |index| {
-                const row = try a.alloc(@import("scalar.zig").Datum, self.fields.len);
-                for (self.fields, self.context.binding.columns, row, 0..) |field, column, *value, ordinal| {
-                    const cell = if (projections[ordinal]) |values| values[index] else blk: {
-                        const raw = try selected.cell(a, index, field);
-                        break :blk @import("scalar.zig").Datum{ .value = raw.value, .sql_null = raw.sql_null };
-                    };
-                    value.* = .{ .value = try describe.coerceAlloc(a, cell.value, column.type), .sql_null = cell.sql_null };
-                    output_bytes +|= try @import("operators.zig").datumBytes(value.*);
-                }
-                _ = try pending.values.append(row);
-                self.remaining -= 1;
-                self.emitted += 1;
-            }
+            output_bytes +|= bytes;
             self.exhausted = self.remaining == 0 or page.after == null;
 
             if (output_bytes >= @min(self.context.limits.page_bytes, @max(@as(usize, 1024), self.context.limits.retained_bytes / 16))) break;
         }
-        if (self.exhausted) {
-            if (self.cursor) |cursor| cursor.close(cursor.ptr);
-            self.cursor = null;
+    }
+    fn appendColumnPage(self: *Stream, pending: *PendingColumns, backing: std.mem.Allocator, page: catalog.ColumnPage) !usize {
+        var attempt = std.heap.ArenaAllocator.init(backing);
+        defer attempt.deinit();
+        const a = attempt.allocator();
+        var skip = self.skip;
+        var output_bytes: usize = 0;
+        const predicates = if (self.context.binding.scalars.predicate) |*program| try self.columnProgram(a, program, page) else null;
+        var selection: std.ArrayList(usize) = .empty;
+        for (page.selection, 0..) |physical, index| {
+            if (predicates) |values| {
+                if (values[index].sql_null) continue;
+                if (values[index].value != .bool) return error.SqlTypeMismatch;
+                if (!values[index].value.bool) continue;
+            }
+            if (skip != 0) {
+                skip -= 1;
+                continue;
+            }
+            try selection.append(a, physical);
         }
-        pending.exhausted = self.exhausted;
-        return pending;
+        const selected: catalog.ColumnPage = .{ .batch = page.batch, .selection = selection.items };
+        const projections = try a.alloc(?[]const @import("scalar.zig").Datum, self.fields.len);
+        @memset(projections, null);
+        var programs: std.ArrayList(*const @import("scalar.zig").Program) = .empty;
+        var slots: std.ArrayList(usize) = .empty;
+        for (self.context.binding.scalars.projections, 0..) |*optional, index| if (optional.*) |*program| {
+            try programs.append(a, program);
+            try slots.append(a, index);
+        };
+        const evaluated = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io);
+        for (evaluated, programs.items, slots.items) |values, program, index| projections[index] = values orelse try self.columnProgram(a, program, selected);
+        for (0..selection.items.len) |index| {
+            const row = try a.alloc(@import("scalar.zig").Datum, self.fields.len);
+            for (self.fields, self.context.binding.columns, row, 0..) |field, column, *value, ordinal| {
+                const cell = if (projections[ordinal]) |values| values[index] else blk: {
+                    const raw = try selected.cell(a, index, field);
+                    break :blk @import("scalar.zig").Datum{ .value = raw.value, .sql_null = raw.sql_null };
+                };
+                value.* = .{ .value = try describe.coerceAlloc(a, cell.value, column.type), .sql_null = cell.sql_null };
+                output_bytes +|= try @import("operators.zig").datumBytes(value.*);
+            }
+            _ = try pending.values.append(row);
+            self.remaining -= 1;
+            self.emitted += 1;
+        }
+        self.skip = skip;
+        return output_bytes;
+    }
+    /// Recover row order only on a semantic vector failure. Ordinary batches
+    /// keep their fused kernels; a failure retains the exact successful prefix.
+    fn appendScalarColumnPage(self: *Stream, pending: *PendingColumns, backing: std.mem.Allocator, page: catalog.ColumnPage) !usize {
+        var scratch = std.heap.ArenaAllocator.init(backing);
+        defer scratch.deinit();
+        var output_bytes: usize = 0;
+        for (page.selection, 0..) |physical, index| {
+            _ = scratch.reset(.retain_capacity);
+            const a = scratch.allocator();
+            const cells = try self.context.binding.scalars.columnCells(a, page, index);
+            if (self.context.binding.scalars.predicate) |program| {
+                const accepted = try self.context.evaluate(a, program, cells);
+                if (accepted.sql_null) continue;
+                if (accepted.value != .bool) return error.SqlTypeMismatch;
+                if (!accepted.value.bool) continue;
+            }
+            if (self.skip != 0) {
+                self.skip -= 1;
+                continue;
+            }
+            if (self.remaining == 0) break;
+            const one: catalog.ColumnPage = .{ .batch = page.batch, .selection = &.{physical} };
+            const row = try a.alloc(@import("scalar.zig").Datum, self.fields.len);
+            for (self.fields, self.context.binding.columns, row, 0..) |field, column, *value, ordinal| {
+                const cell = if (self.context.binding.scalars.projections[ordinal]) |program|
+                    try self.context.evaluate(a, program, cells)
+                else blk: {
+                    const raw = try one.cell(a, 0, field);
+                    break :blk @import("scalar.zig").Datum{ .value = raw.value, .sql_null = raw.sql_null };
+                };
+                value.* = .{ .value = try describe.coerceAlloc(a, cell.value, column.type), .sql_null = cell.sql_null };
+                output_bytes +|= try @import("operators.zig").datumBytes(value.*);
+            }
+            _ = try pending.values.append(row);
+            self.remaining -= 1;
+            self.emitted += 1;
+        }
+        return output_bytes;
     }
     /// Evaluate native batches independently of HTTP/pgwire delivery sizes.
     /// The pending page owns projected values, so the scan can advance without
@@ -526,6 +587,10 @@ pub const Stream = struct {
                 self.exhausted = false;
             }
             const pending = self.pending_columns.?;
+            if (self.pending_index == pending.values.len) if (pending.terminal_error) |err| {
+                if (rows.items.len != 0) break;
+                return err;
+            };
             while (self.pending_index < pending.values.len and rows.items.len < max_rows) {
                 const index = self.pending_index;
                 const row = try a.alloc(Json, self.context.binding.columns.len);
@@ -541,7 +606,7 @@ pub const Stream = struct {
                 self.pending_index += 1;
                 if (bytes >= self.context.limits.page_bytes) break;
             }
-            if (self.pending_index == pending.values.len) {
+            if (self.pending_index == pending.values.len and pending.terminal_error == null) {
                 self.exhausted = pending.exhausted;
                 pending.deinit();
                 self.pending_columns = null;
@@ -872,4 +937,53 @@ test "SQL native execution batches drain small delivery pages without rescan" {
     try std.testing.expectEqual(@as(usize, 1200), count);
     try std.testing.expectEqual(@as(usize, 2), fixture.calls);
     try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+}
+
+test "SQL native execution batches retain successful prefixes before semantic errors" {
+    const a = std.testing.allocator;
+    const Columns = struct {
+        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+            const fixture: *Fixture = @ptrCast(@alignCast(raw));
+            fixture.opened += 1;
+            return .{ .ptr = raw, .next = Fixture.next, .next_columns = nextColumns, .close = Fixture.close };
+        }
+        fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, wanted: u32) !catalog.ColumnPage {
+            const fixture: *Fixture = @ptrCast(@alignCast(raw));
+            fixture.calls += 1;
+            const count = @min(wanted, fixture.count - fixture.offset);
+            const values = try alloc.alloc(i64, count);
+            const refs = try alloc.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
+            const selected = try alloc.alloc(usize, count);
+            for (values, refs, selected, 0..) |*value, *ref, *index, i| {
+                value.* = @intCast(fixture.offset + i);
+                ref.* = .{ .relational_key = "r" };
+                index.* = i;
+            }
+            const columns = try alloc.alloc(@import("../storage/rowsource/types.zig").ColumnVector, 1);
+            columns[0] = .{ .name = "n", .values = .{ .i64 = values } };
+            fixture.offset += count;
+            return .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = refs, .columns = columns }, .selection = selected, .after = if (fixture.offset < fixture.count) "more" else null };
+        }
+    };
+    for ([_][]const u8{
+        "SELECT 1 / (1 - n) FROM docs",
+        "SELECT n FROM docs WHERE 1 / (1 - n) > 0",
+        "SELECT n, 1 / (1 - n) FROM docs",
+    }) |sql| for ([_]bool{ false, true }) |native| {
+        var fixture: Fixture = .{ .count = 2 };
+        var backend = fixture.backend();
+        var vtable = backend.vtable.*;
+        if (native) vtable.open_scan = Columns.open;
+        backend.vtable = &vtable;
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 1024, .page_rows = 256 })).?;
+        defer stream.close();
+        var first = try stream.next(1);
+        defer first.deinit();
+        try std.testing.expectEqual(@as(usize, 1), first.output.rows.len);
+        try std.testing.expect(!first.exhausted);
+        try std.testing.expectError(error.SqlDivisionByZero, stream.next(1));
+        try std.testing.expectEqual(@as(usize, 1), fixture.closed);
+    };
 }

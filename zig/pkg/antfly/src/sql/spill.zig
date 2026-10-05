@@ -1078,7 +1078,8 @@ pub const Sort = struct {
     }
     fn readRun(self: *Sort, file: *Sequential, a: Allocator, offset: u64) !Decoded {
         if (offset == 0) try file.seal();
-        var decoded = try file.read(a, offset);
+        _ = a;
+        var decoded = try file.readBorrowed(offset);
         decoded.row.normalized = @import("sort_key.zig").encode(decoded.row.keys, self.orders);
         return decoded;
     }

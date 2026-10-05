@@ -503,3 +503,61 @@ test "native pipeline refinements benchmark" {
         }
     }
 }
+
+fn windowLayouts(shared: bool, count: usize, bytes: usize) !struct { ns: i96, written: u64, checksum: i64 } {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check, .compression = .none };
+    defer manager.deinit();
+    const payload = try a.alloc(u8, bytes);
+    defer a.free(payload);
+    @memset(payload, 'x');
+    var rows = try disk.Rows.init(a, &manager, 2);
+    defer rows.deinit();
+    for (0..count) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .string = payload }), .{} }, .keys = &.{}, .ordinal = index });
+    const started = now();
+    if (shared) try rows.enableColumnUpdates(1);
+    for (0..3) |pass| {
+        if (shared) {
+            var order = try disk.Integers.init(&manager);
+            defer order.deinit();
+            for (0..count) |index| try order.append((index + pass) % count);
+            var view: disk.View = .{ .source = &rows, .indices = &order, .len = count };
+            for (0..count) |index| {
+                const ordinal = (try view.row(index)).ordinal;
+                try view.setCell(index, 1, Datum.json(.{ .integer = @intCast(ordinal + pass) }));
+            }
+        } else {
+            var partition = try disk.Rows.init(a, &manager, 2);
+            defer partition.deinit();
+            var next = try disk.Rows.init(a, &manager, 2);
+            errdefer next.deinit();
+            for (0..count) |index| try partition.append(try rows.row((index + pass) % count));
+            try partition.enableColumnUpdates(1);
+            for (0..count) |index| {
+                const ordinal = (try partition.row(index)).ordinal;
+                try partition.setCell(index, 1, Datum.json(.{ .integer = @intCast(ordinal + pass) }));
+                try next.append(try partition.row(index));
+            }
+            rows.deinit();
+            rows = next;
+        }
+    }
+    const elapsed = now() - started;
+    var checksum: i64 = 0;
+    for (0..count) |index| checksum += (try rows.cell(index, 1)).value.integer;
+    return .{ .ns = elapsed, .written = manager.written_bytes, .checksum = checksum };
+}
+test "native refinements benchmark shared window permutations" {
+    for ([_]usize{ 1024, 16384 }) |width| for (0..3) |sample| {
+        const first = try windowLayouts(sample % 2 != 0, 256, width);
+        const second = try windowLayouts(sample % 2 == 0, 256, width);
+        const baseline = if (sample % 2 == 0) first else second;
+        const refined = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(baseline.checksum, refined.checksum);
+        std.debug.print("native_refinement {{\"case\":\"shared_window_permutations\",\"rows\":256,\"payload_bytes\":{d},\"sample\":{d},\"copy_ns\":{d},\"shared_ns\":{d},\"copy_written_bytes\":{d},\"shared_written_bytes\":{d}}}\n", .{ width, sample, baseline.ns, refined.ns, baseline.written, refined.written });
+    };
+}

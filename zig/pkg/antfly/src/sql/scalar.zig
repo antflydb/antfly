@@ -91,6 +91,13 @@ pub const Program = struct {
     }
 };
 
+/// Shared result-boundary validation. Intermediates are deliberately not
+/// validated: a large or invalid input can be discarded by a lazy expression.
+pub fn validateResult(result: Datum, limits: EvalLimits) !void {
+    var context: Evaluator = .{ .program = undefined, .alloc = undefined, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    _ = try context.validateJson(result.value, 0);
+}
+
 pub fn bind(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const ?ast.ColumnType, limits: BindLimits) !Program {
     return bindExpected(alloc, expression, columns, parameter_hints, null, limits);
 }

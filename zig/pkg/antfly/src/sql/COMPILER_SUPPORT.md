@@ -229,20 +229,31 @@ only competitive rows, and preserves stable tie ordering. Primary-key ascending
 order and simple COUNT retain their native fast paths.
 
 Lake execution requests up to 1,024 typed rows independently of delivery page
-size. Projected batches remain pending across bounded delivery pages. Joins
+size. Projected batches remain pending across bounded delivery pages. Semantic
+vector failures recover the successful row prefix and defer the terminal error
+until that prefix drains; failed vector workspaces are released before recovery. Joins
 batch key expression evaluation and probe admission, while preserving input
 order and delaying later-lane errors until consumed. Grouped reductions resolve
 group IDs once per batch and update state by aggregate column; global COUNT,
-integer SUM and boolean reductions consume contiguous vectors.
+integer SUM and boolean reductions consume contiguous vectors. Join payload
+admission is column-major, and join/group hash vectors memoize repeated text
+without relying on dictionary IDs across batches.
 Retained join/group strings and exact decimals use adaptive dictionaries,
 switching to flat owned references for high-cardinality inputs.
 
 Parquet scans evaluate predicate and delete evidence before projected payloads.
+A bounded selection mask is shared with delivery when its physical row range
+matches, including narrower payload-page slices. Dictionary predicate results
+and delete key parts are memoized only for entries referenced by that page;
+applicable equality-delete files with identical field sets share key encoding.
 Standard offset/column indexes can skip page reads, while Iceberg manifest
 bounds resolve through field IDs. Unknown encodings remain conservative.
 Identity-only scans generate row references without decoding data pages.
 Parsed footers and decoded vectors use immutable, version/credential-scoped
-cache leases with bounded eviction. Duplicate range reads share one in-flight
+cache leases with bounded eviction. Compressed range bytes also use immutable
+leases: native page/header/index decoding borrows pinned bytes, while legacy
+owned reads copy outside the cache mutex. Pinned entries cannot be evicted, and
+admission declines when pinning leaves insufficient space. Duplicate range reads share one in-flight
 request; next-group evidence and next-file metadata use shared bounded
 scheduling and join before cursor teardown. Iceberg delete indexes are prepared
 once per pinned source and applied directly to column batches. Missing evolved
@@ -256,7 +267,8 @@ Common subexpressions and column normalization are shared across projections,
 group keys and aggregate inputs with the same FILTER selection. Lazy programs
 keep scalar evaluation, and FILTER inputs evaluate only accepted rows. Declared
 SQL types, mixed numeric comparisons and exceptional arithmetic lanes retain
-the scalar coercion and error contracts.
+the scalar coercion and error contracts, including UTF-8 and expression output
+size validation at result roots rather than discarded intermediates.
 
 Eligible COUNT, integer SUM and boolean reductions split pinned lake scans into
 up to four workers claiming compressed-size-ordered row-group tasks. File
@@ -270,7 +282,11 @@ warming reserves 4 MiB and releases admission at completion, independently of
 its cursor-owned join handle.
 
 Join dynamic filters are sealed and installed on eligible probe scans before
-probing or collecting spill partitions. Complete spill partition jobs evaluate
+probing or collecting spill partitions. At memory pressure, a non-shared join
+transfers its retained build prefix directly to Grace partition sinks and sends
+remaining build/probe batches there, without an intermediate chain spool.
+Oversized partitions test remaining hash bits before creating a chain fallback;
+indistinguishable keys keep bounded chain probing. Complete spill partition jobs evaluate
 ordinary ON residuals and matched markers inside the worker. Join and exact
 aggregate workers deliver bounded typed blocks through queues with backpressure;
 output does not add spill writes. Consumer close stops and joins producers, and
@@ -279,6 +295,8 @@ external decision evaluation or pattern-set cursor state retain the coordinated
 residual path.
 
 Sort spill uses bounded eight-way merging and releases sealed write buffers.
+Each run pins its borrowed merge head until that run advances; output encoding
+finishes before advancement, avoiding per-head cloning.
 Independent merge compactions share parallel scheduling admission. Complete
 homogeneous normalized keys use stable radix passes with original ordinals as
 tie breakers; mixed, nullable-layout and truncated keys retain exact comparison.
@@ -294,7 +312,10 @@ Exact COUNT, integer SUM and boolean aggregates partition updates into bounded
 typed reducers; oversized partitions use sorted partial merging. Floating-point,
 distinct and pattern aggregates preserve their ordered merge paths. A final
 ORDER BY reuses a window sort when its complete physical key and null ordering
-match, preserving original-row tie order and expression errors.
+match, preserving original-row tie order and expression errors. External window
+layouts share one immutable input payload, ordinal permutations, and output
+sidecars indexed by original row. Partitions are slices of a permutation rather
+than rewritten payload stores.
 
 The deterministic spill tests compare identical inputs and memory budgets:
 eight-way sorting and partitioned aggregation both write fewer bytes than their
@@ -329,3 +350,11 @@ explicit parameter types, not SQL execution or storage throughput:
 ```sh
 zig run -O ReleaseSafe --dep sql_parser -Mroot=pkg/antfly/src/sql_bench.zig -Msql_parser=lib/sql/root.zig
 ```
+
+Additional ownership/admission samples are recorded in
+`bench/baselines/native-lake-ownership-refinements.json`. In the local fixture,
+column batch join admission takes about 43% of the row-materializing baseline
+elapsed time. Three window layouts over 256 rows with 16 KiB payloads write
+4,255,232 bytes through shared payloads versus 29,524,992 through payload
+rewrites, with compression disabled. These fixtures validate equal results and
+alternate execution order; they do not measure total production query latency.

@@ -113,7 +113,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     const after = if (request.after) |v| try owned.dupe(u8, v) else null;
     const before = if (request.before) |v| try owned.dupe(u8, v) else null;
     const primary_key = if (request.primary_key) |v| try owned.dupe(u8, v) else null;
-    owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key };
+    owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key, .mask_arena = .init(alloc) };
     var filter_columns: std.ArrayList([]const u8) = .empty;
     for (conditions) |condition| try appendColumn(owned, &filter_columns, table, condition.column);
     if (source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |name| try filter_columns.append(owned, name);
@@ -206,43 +206,76 @@ const Owner = struct {
     position: usize = 0,
     exhausted: bool = false,
 
-    fn matchesAt(self: *Owner, a: Allocator, batch: @import("../storage/rowsource/types.zig").ColumnBatch, index: usize, physical: @import("../storage/rowsource/types.zig").ColumnBatch) !bool {
-        try self.context.ensureActive();
-        if (try self.stream.isDeletedBatch(a, physical, index)) return false;
-        const one: catalog.ColumnPage = .{ .batch = batch, .selection = &.{index} };
-        if (self.after != null or self.before != null or self.primary_key != null) {
-            const id = (try one.cell(a, 0, "_id")).value.string;
-            if (self.after) |after| if (std.mem.order(u8, id, after) != .gt) return false;
-            if (self.before) |before| if (std.mem.order(u8, id, before) != .lt) return false;
-            if (self.primary_key) |key| if (!std.mem.eql(u8, id, key)) return false;
+    mask_arena: std.heap.ArenaAllocator,
+    selection_mask: []bool = &.{},
+    mask_file: []const u8 = &.{},
+    mask_group: u32 = 0,
+    mask_first: u64 = 0,
+    fn selectionMask(self: *Owner, batch: @import("../storage/rowsource/types.zig").ColumnBatch) ![]const bool {
+        const count = batch.rowCount();
+        if (count == 0) return &.{};
+        const ref = batch.row_refs[0].external;
+        if (std.mem.eql(u8, self.mask_file, ref.file_id) and self.mask_group == ref.row_group_ordinal and ref.row_ordinal >= self.mask_first) {
+            const start = std.math.cast(usize, ref.row_ordinal - self.mask_first) orelse return error.InvalidSqlBackendResponse;
+            if (start <= self.selection_mask.len and count <= self.selection_mask.len - start) return self.selection_mask[start..][0..count];
         }
-        if (self.dynamic) |filter| {
-            const keys = try a.alloc(scalar.Datum, filter.columns.len);
-            for (filter.columns, keys) |key, *value| {
-                const cell = try one.cell(a, 0, key.name);
-                value.* = .{ .value = if (cell.sql_null) .null else try @import("../sql/describe.zig").coerceAlloc(a, cell.value, key.type), .sql_null = cell.sql_null };
-            }
-            if (!try filter.contains(keys)) return false;
-        }
-        return matchesColumns(one, a, self.table, self.conditions);
-    }
-    fn anyMatch(raw: *anyopaque, batch: @import("../storage/rowsource/types.zig").ColumnBatch) !bool {
-        const self: *Owner = @ptrCast(@alignCast(raw));
-        var scratch = std.heap.ArenaAllocator.init(self.alloc);
-        defer scratch.deinit();
-        const vectors = try scratch.allocator().dupe(@import("../storage/rowsource/types.zig").ColumnVector, batch.columns);
+        _ = self.mask_arena.reset(.retain_capacity);
+        self.selection_mask = &.{};
+        self.mask_file = &.{};
+        const a = self.mask_arena.allocator();
+        const selected = try a.alloc(bool, count);
+        @memset(selected, true);
+        try self.stream.deleteMask(a, batch, selected);
+        const vectors = try a.dupe(@import("../storage/rowsource/types.zig").ColumnVector, batch.columns);
         for (vectors) |*vector| for (self.table.columns) |definition| if (std.mem.eql(u8, definition.path, vector.name)) {
             vector.name = definition.name;
             break;
         };
         var view = batch;
         view.columns = vectors;
-        var row_scratch = std.heap.ArenaAllocator.init(self.alloc);
-        defer row_scratch.deinit();
-        for (0..batch.rowCount()) |index| {
-            _ = row_scratch.reset(.retain_capacity);
-            if (try self.matchesAt(row_scratch.allocator(), view, index, batch)) return true;
+        // Column-major predicates, with dictionary entries evaluated once.
+        for (self.conditions) |condition| {
+            const physical = view.findColumn(condition.column);
+            var dictionary: std.AutoHashMapUnmanaged(u32, bool) = .empty;
+            defer dictionary.deinit(a);
+            for (selected, 0..) |*keep, index| {
+                if (!keep.*) continue;
+                const one: catalog.ColumnPage = .{ .batch = view, .selection = &.{index} };
+                if (physical != null and physical.?.values == .dictionary_bytes and !physical.?.nulls.isNull(index)) {
+                    const id = physical.?.values.dictionary_bytes.indices[index];
+                    if (id >= physical.?.values.dictionary_bytes.values.len) return error.InvalidSqlBackendResponse;
+                    if (dictionary.get(id)) |cached| {
+                        keep.* = cached;
+                    } else {
+                        keep.* = try matchesColumns(one, a, self.table, &.{condition});
+                        try dictionary.put(a, id, keep.*);
+                    }
+                } else keep.* = try matchesColumns(one, a, self.table, &.{condition});
+            }
         }
+        if (self.dynamic) |filter| try filter.applyBatch(a, view, selected);
+        if (self.after != null or self.before != null or self.primary_key != null) for (selected, 0..) |*keep, index| {
+            if (!keep.*) continue;
+            const id = try @import("../storage/rowsource/identity.zig").allocId(a, batch.row_refs[index]);
+            if (self.after) |after| if (std.mem.order(u8, id, after) != .gt) {
+                keep.* = false;
+            };
+            if (self.before) |before| if (std.mem.order(u8, id, before) != .lt) {
+                keep.* = false;
+            };
+            if (self.primary_key) |key| if (!std.mem.eql(u8, id, key)) {
+                keep.* = false;
+            };
+        };
+        self.mask_file = try a.dupe(u8, ref.file_id);
+        self.mask_group = ref.row_group_ordinal;
+        self.mask_first = ref.row_ordinal;
+        self.selection_mask = selected;
+        return selected;
+    }
+    fn anyMatch(raw: *anyopaque, batch: @import("../storage/rowsource/types.zig").ColumnBatch) !bool {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        for (try self.selectionMask(batch)) |selected| if (selected) return true;
         return false;
     }
     fn countRows(raw: *anyopaque) !?u64 {
@@ -325,15 +358,14 @@ const Owner = struct {
             var view = batch;
             view.columns = vectors;
             const selected = try alloc.alloc(usize, @min(@as(usize, limit), batch.rowCount() - self.position));
+            const mask = try self.selectionMask(batch);
             var count: usize = 0;
             var last_id: ?[]const u8 = null;
             while (self.position < batch.rowCount() and count < limit) {
                 try self.context.ensureActive();
                 const index = self.position;
                 self.position += 1;
-                var temporary = std.heap.ArenaAllocator.init(self.alloc);
-                defer temporary.deinit();
-                if (!try self.matchesAt(temporary.allocator(), view, index, batch)) continue;
+                if (!mask[index]) continue;
                 selected[count] = index;
                 count += 1;
             }
@@ -401,6 +433,7 @@ const Owner = struct {
     }
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
+        self.mask_arena.deinit();
         self.stream.deinit();
         if (self.partition_source) |source| {
             self.alloc.destroy(source.scanner.shared_reader.?);

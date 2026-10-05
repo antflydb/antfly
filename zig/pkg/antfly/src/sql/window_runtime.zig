@@ -17,13 +17,15 @@ const disk = @import("disk_rows.zig");
 const Cells = union(enum) {
     memory: []const []Datum,
     disk: *disk.Rows,
+    view: *disk.View,
     fn from(value: anytype) Cells {
-        return if (@TypeOf(value) == *disk.Rows) .{ .disk = value } else .{ .memory = value };
+        return if (@TypeOf(value) == *disk.Rows) .{ .disk = value } else if (@TypeOf(value) == *disk.View) .{ .view = value } else .{ .memory = value };
     }
     fn get(self: Cells, row: usize, column: usize) !Datum {
         return switch (self) {
             .memory => |rows| rows[row][column],
             .disk => |rows| rows.cell(row, column),
+            .view => |rows| rows.cell(row, column),
         };
     }
 };
@@ -34,7 +36,7 @@ fn at(values: anytype, index: usize) !usize {
     return if (@TypeOf(values) == disk.Identity or @TypeOf(values) == *disk.Integers) values.at(index) else (@as([]const usize, values))[index];
 }
 fn setCell(rows: anytype, row: usize, column: usize, value: Datum) !void {
-    if (@TypeOf(rows) == *disk.Rows) try rows.setCell(row, column, value) else rows[row][column] = value;
+    if (comptime disk.isDisk(@TypeOf(rows))) try rows.setCell(row, column, value) else rows[row][column] = value;
 }
 
 fn compare(a: Datum, b: Datum, direction: operators.Order) !std.math.Order {
@@ -246,11 +248,11 @@ const Tree = struct {
     fn create(context: anytype, alloc: Allocator, cells: anytype, indices: anytype, spec: binding.Spec) !Tree {
         const base = try std.math.ceilPowerOfTwo(usize, @max(1, indices.len));
         const count = try std.math.mul(usize, base, 2);
-        const nodes: []Node = if (@TypeOf(cells) == *disk.Rows) &.{} else try alloc.alloc(Node, count);
+        const nodes: []Node = if (comptime disk.isDisk(@TypeOf(cells))) &.{} else try alloc.alloc(Node, count);
         errdefer alloc.free(nodes);
         @memset(nodes, .{});
         var result = Tree{ .nodes = nodes, .base = base, .cells = Cells.from(cells), .spec = spec };
-        if (@TypeOf(cells) == *disk.Rows) {
+        if (comptime disk.isDisk(@TypeOf(cells))) {
             var file = try context.spill.?.create();
             errdefer file.close();
             const zeros: [4096]u8 = @splat(0);
@@ -610,7 +612,7 @@ pub fn evaluate(context: anytype, cells: anytype, indices: anytype, sort: bindin
             else => if (sliding) try running.query(context, cells, indices, spec, bounds) else try tree.?.querySet(selected),
         };
         try setCell(cells, row, column, if (result.sql_null) result else .{
-            .value = try describe.coerceAlloc(if (@TypeOf(cells) == *disk.Rows) result_arena.allocator() else context.arena, result.value, spec.type),
+            .value = try describe.coerceAlloc(if (comptime disk.isDisk(@TypeOf(cells))) result_arena.allocator() else context.arena, result.value, spec.type),
             .sql_null = false,
         });
     }
@@ -695,7 +697,7 @@ pub fn evaluateCells(context: anytype, statement: ast.Select, cells: [][]Datum) 
     return finishCells(context, statement, cells);
 }
 fn rowCells(cells: anytype, alloc: Allocator, index: usize) ![]const Datum {
-    if (@TypeOf(cells) == *disk.Rows) {
+    if (comptime disk.isDisk(@TypeOf(cells))) {
         const row = try cells.row(index);
         const values = try alloc.alloc(Datum, row.values.len);
         for (row.values, values) |value, *out| out.* = try operators.cloneDatum(alloc, value);
@@ -704,7 +706,7 @@ fn rowCells(cells: anytype, alloc: Allocator, index: usize) ![]const Datum {
     return cells[index];
 }
 fn rowOrdinal(cells: anytype, index: usize) !u64 {
-    return if (@TypeOf(cells) == *disk.Rows) (try cells.row(index)).ordinal else index;
+    return if (comptime disk.isDisk(@TypeOf(cells))) (try cells.row(index)).ordinal else index;
 }
 pub fn finishCells(context: anytype, statement: ast.Select, cells: anytype) !@import("runtime.zig").Output {
     return finishOrderedCells(context, statement, cells, null);

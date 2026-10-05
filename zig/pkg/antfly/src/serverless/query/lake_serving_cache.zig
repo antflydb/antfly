@@ -24,7 +24,7 @@ pub const Cache = struct {
     alloc: Allocator,
     decoded: @import("lake_decoded_cache.zig").Cache,
     mutex: std.atomic.Mutex = .unlocked,
-    entries: std.StringHashMapUnmanaged(Entry) = .empty,
+    entries: std.StringHashMapUnmanaged(*Entry) = .empty,
     flights: std.StringHashMapUnmanaged(*Flight) = .empty,
     max_bytes: usize = 64 * 1024 * 1024,
     max_entries: usize = 4096,
@@ -64,7 +64,7 @@ pub const Cache = struct {
         }
         self.releaseFlight(claim.flight);
     }
-    const Entry = struct { bytes: []u8, touched: u64 };
+    const Entry = struct { cache: *Cache, bytes: []u8, touched: u64, refs: usize = 0 };
     pub const Stats = struct { hits: u64 = 0, misses: u64 = 0, stored_bytes: usize = 0, evictions: u64 = 0 };
     pub fn init(alloc: Allocator) Cache {
         return .{ .alloc = alloc, .decoded = .{ .a = alloc } };
@@ -76,7 +76,9 @@ pub const Cache = struct {
         var iter = self.entries.iterator();
         while (iter.next()) |entry| {
             self.alloc.free(entry.key_ptr.*);
-            self.alloc.free(entry.value_ptr.bytes);
+            std.debug.assert(entry.value_ptr.*.refs == 0);
+            self.alloc.free(entry.value_ptr.*.bytes);
+            self.alloc.destroy(entry.value_ptr.*);
         }
         self.entries.deinit(self.alloc);
         self.* = undefined;
@@ -86,20 +88,40 @@ pub const Cache = struct {
         defer self.mutex.unlock();
         return self.stats;
     }
-    fn lookup(self: *Cache, alloc: Allocator, key: []const u8) !?[]u8 {
+    fn pin(self: *Cache, key: []const u8) ?ranges.RangeLease {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
-        if (self.entries.getPtr(key)) |entry| {
+        if (self.entries.get(key)) |entry| {
             self.tick +%= 1;
             entry.touched = self.tick;
+            entry.refs += 1;
             self.stats.hits += 1;
-            return try alloc.dupe(u8, entry.bytes);
+            return .{ .bytes = entry.bytes, .owner = .{ .shared = .{ .ptr = entry, .release_fn = releaseRange } } };
         }
         self.stats.misses += 1;
         return null;
     }
+    fn releaseRange(raw: *anyopaque) void {
+        const entry: *Entry = @ptrCast(@alignCast(raw));
+        while (!entry.cache.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer entry.cache.mutex.unlock();
+        std.debug.assert(entry.refs != 0);
+        entry.refs -= 1;
+    }
+    fn lookup(self: *Cache, alloc: Allocator, key: []const u8) !?[]u8 {
+        const lease = self.pin(key) orelse return null;
+        defer lease.release();
+        return try alloc.dupe(u8, lease.bytes);
+    }
     fn store(self: *Cache, key: []const u8, bytes: []const u8) !void {
         if (bytes.len > self.max_bytes or self.max_entries == 0) return;
+        const owned_key = try self.alloc.dupe(u8, key);
+        defer self.alloc.free(owned_key);
+        const owned_bytes = try self.alloc.dupe(u8, bytes);
+        var admitted = false;
+        defer if (!admitted) self.alloc.free(owned_bytes);
+        const item = try self.alloc.create(Entry);
+        defer if (!admitted) self.alloc.destroy(item);
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         // Concurrent misses may fetch the same immutable object range.
@@ -108,22 +130,23 @@ pub const Cache = struct {
             var oldest: ?[]const u8 = null;
             var touched: u64 = std.math.maxInt(u64);
             var iter = self.entries.iterator();
-            while (iter.next()) |entry| if (oldest == null or entry.value_ptr.touched < touched) {
+            while (iter.next()) |entry| if (entry.value_ptr.*.refs == 0 and (oldest == null or entry.value_ptr.*.touched < touched)) {
                 oldest = entry.key_ptr.*;
-                touched = entry.value_ptr.touched;
+                touched = entry.value_ptr.*.touched;
             };
-            const removed = self.entries.fetchRemove(oldest.?).?;
+            const removed = self.entries.fetchRemove(oldest orelse return).?;
             self.stats.stored_bytes -= removed.value.bytes.len;
             self.stats.evictions += 1;
             self.alloc.free(removed.key);
             self.alloc.free(removed.value.bytes);
+            self.alloc.destroy(removed.value);
         }
-        const owned_key = try self.alloc.dupe(u8, key);
-        errdefer self.alloc.free(owned_key);
-        const owned_bytes = try self.alloc.dupe(u8, bytes);
-        errdefer self.alloc.free(owned_bytes);
+        const map_key = try self.alloc.dupe(u8, owned_key);
+        errdefer self.alloc.free(map_key);
         self.tick +%= 1;
-        try self.entries.put(self.alloc, owned_key, .{ .bytes = owned_bytes, .touched = self.tick });
+        item.* = .{ .cache = self, .bytes = owned_bytes, .touched = self.tick };
+        try self.entries.put(self.alloc, map_key, item);
+        admitted = true;
         self.stats.stored_bytes += bytes.len;
     }
 };
@@ -158,8 +181,8 @@ pub const Reader = struct {
             const lease = try worker.footerRead(read);
             defer lease.release();
         } else {
-            const bytes = try readPlanned(&worker, std.heap.page_allocator, read);
-            defer std.heap.page_allocator.free(bytes);
+            const bytes = try readLease(&worker, std.heap.page_allocator, read);
+            defer bytes.release();
         }
     }
     fn prefetchCanceled(raw: *const anyopaque) bool {
@@ -184,7 +207,7 @@ pub const Reader = struct {
         self.prefetch_bytes = 0;
     }
     pub fn reader(self: *Reader) parquet.ObjectRangeReader {
-        return .{ .ctx = self, .read_range_alloc = readRange, .read_planned_range_alloc = readPlanned };
+        return .{ .ctx = self, .read_range_alloc = readRange, .read_planned_range_alloc = readPlanned, .read_planned_range_lease = readLease };
     }
     pub fn objectKey(self: *Reader, a: Allocator, read: ranges.RangeRead, interpretation: []const u8) ![32]u8 {
         const key = try read.cacheKeyAlloc(a);
@@ -207,15 +230,17 @@ pub const Reader = struct {
         const lease = try self.cache.decoded.create(32 * 1024 * 1024);
         errdefer lease.release();
         const a = lease.item.arena.allocator();
-        const tail = try self.reader().readPlannedAlloc(a, read);
-        defer a.free(tail);
+        const tail_lease = try self.reader().readPlannedLease(a, read);
+        defer tail_lease.release();
+        const tail = tail_lease.bytes;
         const footer_api = @import("lake_parquet_footer.zig");
         const preflight = try footer_api.parseFooterPreflight(read.object.byte_len, read.range.offset, tail);
         if (preflight.metadataSlice(tail)) |bytes| {
             lease.item.payload = .{ .footer = try @import("lake_parquet_metadata.zig").parseFooterMetadataAlloc(a, bytes, read.object.byte_len) };
         } else {
-            const bytes = try self.reader().readPlannedAlloc(a, try footer_api.planFooterMetadataRead(read.object, read.range.offset, tail));
-            defer a.free(bytes);
+            const bytes_lease = try self.reader().readPlannedLease(a, try footer_api.planFooterMetadataRead(read.object, read.range.offset, tail));
+            defer bytes_lease.release();
+            const bytes = bytes_lease.bytes;
             lease.item.payload = .{ .footer = try @import("lake_parquet_metadata.zig").parseFooterMetadataAlloc(a, bytes, read.object.byte_len) };
         }
         try self.context.ensureActive();
@@ -228,17 +253,27 @@ pub const Reader = struct {
         return self.base.parquetReader().readAlloc(alloc, bucket, key, offset, len);
     }
     fn readPlanned(raw: *anyopaque, alloc: Allocator, read: ranges.RangeRead) ![]u8 {
+        const lease = try readLease(raw, alloc, read);
+        switch (lease.owner) {
+            .allocation => return @constCast(lease.bytes),
+            .shared => {
+                defer lease.release();
+                return try alloc.dupe(u8, lease.bytes);
+            },
+        }
+    }
+    fn readLease(raw: *anyopaque, alloc: Allocator, read: ranges.RangeRead) !ranges.RangeLease {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try self.context.ensureActive();
         try read.validate();
         // Unversioned reads must always reach the provider.
-        if (read.object.version.etag.len == 0 and read.object.version.version_id.len == 0) return self.base.parquetReader().readPlannedAlloc(alloc, read);
+        if (read.object.version.etag.len == 0 and read.object.version.version_id.len == 0) return self.base.parquetReader().readPlannedLease(alloc, read);
         const range_key = try read.cacheKeyAlloc(alloc);
         defer alloc.free(range_key);
         const key = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ std.fmt.bytesToHex(self.scope, .lower), range_key });
         defer alloc.free(key);
-        if (try self.cache.lookup(alloc, key)) |bytes| {
-            errdefer alloc.free(bytes);
+        if (self.cache.pin(key)) |bytes| {
+            errdefer bytes.release();
             try self.context.ensureActive();
             return bytes;
         }
@@ -260,21 +295,25 @@ pub const Reader = struct {
                     }
                 }
                 try self.context.ensureActive();
-                if (try self.cache.lookup(alloc, key)) |bytes| return bytes;
+                if (self.cache.pin(key)) |bytes| return bytes;
                 // A failed/canceled speculative leader does not poison other
                 // requests. Retry under this reader's own cancellation token.
             }
         }
         defer if (claim) |active| self.cache.finish(active, self.context.io.?);
         // Close the lookup/claim race without issuing a duplicate read.
-        if (claim != null) if (try self.cache.lookup(alloc, key)) |bytes| return bytes;
+        if (claim != null) if (self.cache.pin(key)) |bytes| return bytes;
         const bytes = try self.base.parquetReader().readPlannedAlloc(alloc, read);
         errdefer alloc.free(bytes);
         try self.context.ensureActive();
         // Cache admission is optional and never turns a successful read into
         // an allocation failure in a long-lived shared owner.
         self.cache.store(key, bytes) catch {};
-        return bytes;
+        if (self.cache.pin(key)) |lease| {
+            alloc.free(bytes);
+            return lease;
+        }
+        return .{ .bytes = bytes, .owner = .{ .allocation = alloc } };
     }
 };
 test "external lake shared cache bounds memory and segregates versions and credential scopes" {
@@ -380,4 +419,34 @@ test "external lake prefetch overlaps bounded ranges warms versions and joins on
     reader.drain(true);
     try std.testing.expect(slow.canceled.load(.acquire) > 0);
     for (reader.pending) |future| try std.testing.expect(future == null);
+}
+
+test "external lake range leases pin cache bytes across bounded eviction" {
+    const a = std.testing.allocator;
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    cache.max_bytes = 6;
+    try cache.store("first", "abc");
+    const lease = cache.pin("first").?;
+    try cache.store("second", "def");
+    try cache.store("third", "ghi");
+    try std.testing.expectEqualStrings("abc", lease.bytes);
+    const again = cache.pin("first").?;
+    try std.testing.expectEqual(lease.bytes.ptr, again.bytes.ptr);
+    again.release();
+    lease.release();
+    try cache.store("fourth", "jkl");
+    try std.testing.expect(cache.snapshot().stored_bytes <= cache.max_bytes);
+}
+
+fn rangeAdmissionAllocationScenario(a: Allocator) !void {
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    try cache.store("versioned-range", "immutable payload");
+    const lease = cache.pin("versioned-range").?;
+    defer lease.release();
+    try std.testing.expectEqualStrings("immutable payload", lease.bytes);
+}
+test "external lake range admission unwinds every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, rangeAdmissionAllocationScenario, .{});
 }

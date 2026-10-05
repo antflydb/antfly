@@ -69,8 +69,8 @@ pub const Cursor = struct {
         self.a.free(self.columns);
         self.output.deinit();
     }
-    fn read(self: *Cursor, offset: u64, len: usize) ![]u8 {
-        return self.reader.readPlannedAlloc(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_column_chunk });
+    fn read(self: *Cursor, offset: u64, len: usize) !ranges.RangeLease {
+        return self.reader.readPlannedLease(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_column_chunk });
     }
     fn loadIndex(self: *Cursor, column: *Column) !void {
         if (column.index_loaded) return;
@@ -79,11 +79,11 @@ pub const Cursor = struct {
         const len = column.chunk.offset_index_length.?;
         const budget = self.limits.max_input_bytes / @max(@as(usize, 1), self.columns.len);
         if (len > budget or (column.chunk.column_index_length orelse 0) > budget - len) return error.ParquetPageTooLarge;
-        const offsets = try self.reader.readPlannedAlloc(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_page_index });
-        defer self.a.free(offsets);
-        const bounds = if (column.chunk.column_index_offset) |start| try self.reader.readPlannedAlloc(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = start, .len = column.chunk.column_index_length.? }, .purpose = .parquet_page_index }) else null;
-        defer if (bounds) |bytes| self.a.free(bytes);
-        column.directory = try @import("lake_parquet_metadata.zig").parsePageDirectory(self.a, offsets, bounds, column.chunk, self.group.row_count, self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len));
+        const offsets = try self.reader.readPlannedLease(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = offset, .len = len }, .purpose = .parquet_page_index });
+        defer offsets.release();
+        const bounds = if (column.chunk.column_index_offset) |start| try self.reader.readPlannedLease(self.a, .{ .object = try ranges.objectRefForExternalFileUri(self.file), .range = .{ .offset = start, .len = column.chunk.column_index_length.? }, .purpose = .parquet_page_index }) else null;
+        defer if (bounds) |bytes| bytes.release();
+        column.directory = try @import("lake_parquet_metadata.zig").parsePageDirectory(self.a, offsets.bytes, if (bounds) |v| v.bytes else null, column.chunk, self.group.row_count, self.limits.max_struct_allocation_bytes / @max(@as(usize, 1), self.columns.len));
     }
     fn advance(self: *Cursor, column: *Column) !void {
         if (column.decoded) |*decoded| decoded.deinit(self.a);
@@ -155,8 +155,9 @@ pub const Cursor = struct {
                     return;
                 }
             };
-            const encoded = try self.read(column.offset, len);
-            defer self.a.free(encoded);
+            const encoded_lease = try self.read(column.offset, len);
+            defer encoded_lease.release();
+            const encoded = encoded_lease.bytes;
             column.offset += len;
             switch (parsed.header.page_type) {
                 .dictionary_page => {
@@ -227,8 +228,9 @@ pub const Cursor = struct {
         if (column.offset >= end) return error.InvalidParquetPage;
         var probe_size: usize = @intCast(@min(end - column.offset, 512));
         while (true) {
-            const probe = try self.read(column.offset, probe_size);
-            defer self.a.free(probe);
+            const probe_lease = try self.read(column.offset, probe_size);
+            defer probe_lease.release();
+            const probe = probe_lease.bytes;
             const parsed = page.parsePageHeader(probe) catch |err| {
                 const next_size = @min(end - column.offset, @min(probe_size * 2, 64 * 1024));
                 if (next_size == probe_size) return err;

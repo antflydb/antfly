@@ -70,6 +70,55 @@ pub const Filter = struct {
         self.bits[second.index] |= second.bit;
         self.rows += 1;
     }
+    pub fn applyBatch(self: *const Filter, a: A, batch: @import("../storage/rowsource/types.zig").ColumnBatch, selected: []bool) !void {
+        if (self.failed or !self.sealed or selected.len != batch.rowCount()) return error.InvalidSqlBackendResponse;
+        if (self.rows == 0) {
+            @memset(selected, false);
+            return;
+        }
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const columns = try a.alloc([]const Datum, self.columns.len);
+        defer a.free(columns);
+        @memset(columns, &.{});
+        defer for (columns) |column| a.free(column);
+        for (self.columns, columns, self.domains) |definition, *column, domain| {
+            const values = try a.alloc(Datum, batch.rowCount());
+            column.* = values;
+            @memset(values, .{});
+            const physical = batch.findColumn(definition.name);
+            var dictionary: std.AutoHashMapUnmanaged(u32, Datum) = .empty;
+            defer dictionary.deinit(a);
+            for (selected, values, 0..) |*keep, *value, index| {
+                if (!keep.*) continue;
+                const one: @import("catalog.zig").ColumnPage = .{ .batch = batch, .selection = &.{index} };
+                value.* = if (physical != null and physical.?.values == .dictionary_bytes and !physical.?.nulls.isNull(index)) blk: {
+                    const id = physical.?.values.dictionary_bytes.indices[index];
+                    if (id >= physical.?.values.dictionary_bytes.values.len) return error.InvalidSqlBackendResponse;
+                    if (dictionary.get(id)) |cached| break :blk cached;
+                    const cell = Datum.json(try @import("describe.zig").coerceAlloc(scratch.allocator(), .{ .string = physical.?.values.dictionary_bytes.values[id] }, definition.type));
+                    try dictionary.put(a, id, cell);
+                    break :blk cell;
+                } else blk: {
+                    const cell = try one.cell(scratch.allocator(), 0, definition.name);
+                    break :blk Datum{ .value = if (cell.sql_null) .null else try @import("describe.zig").coerceAlloc(scratch.allocator(), cell.value, definition.type), .sql_null = cell.sql_null };
+                };
+                if (value.sql_null or (try scalar.compare(value.value, domain.minimum.?.value)) == .lt or (try scalar.compare(value.value, domain.maximum.?.value)) == .gt) keep.* = false;
+            }
+        }
+        const hashes = try @import("batch_hash.zig").columns(a, columns, batch.rowCount(), false);
+        defer a.free(hashes);
+        for (selected, hashes) |*keep, optional| {
+            if (!keep.*) continue;
+            const hash = optional orelse {
+                keep.* = false;
+                continue;
+            };
+            const first = self.mask(hash);
+            const second = self.mask(std.math.rotr(u64, hash, 23));
+            keep.* = self.bits[first.index] & first.bit != 0 and self.bits[second.index] & second.bit != 0;
+        }
+    }
     pub fn contains(self: *const Filter, values: []const Datum) !bool {
         if (self.failed or !self.sealed or values.len != self.columns.len) return error.InvalidSqlBackendResponse;
         if (self.rows == 0) return false;
@@ -94,4 +143,23 @@ test "SQL scan dynamic filters preserve composite numeric equality and SQL nulls
     try std.testing.expect(!try filter.contains(&.{ .{}, Datum.json(.{ .string = "x" }) }));
     try std.testing.expect(!try filter.contains(&.{ Datum.json(.{ .integer = 4000 }), Datum.json(.{ .string = "x" }) }));
     try std.testing.expectError(error.InvalidSqlBackendResponse, filter.add(&.{ .{}, .{} }));
+}
+
+test "SQL batch dynamic masks match scalar membership for dictionaries nulls and selections" {
+    const a = std.testing.allocator;
+    const filter = try Filter.create(a, &.{ .{ .name = "s", .type = .string }, .{ .name = "n", .type = .integer } }, 256);
+    defer filter.close();
+    try filter.add(&.{ Datum.json(.{ .string = "yes" }), Datum.json(.{ .integer = 9007199254740993 }) });
+    filter.sealed = true;
+    const batch: @import("../storage/rowsource/types.zig").ColumnBatch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &.{ .{ .relational_key = "1" }, .{ .relational_key = "2" }, .{ .relational_key = "3" }, .{ .relational_key = "4" } },
+        .columns = &.{
+            .{ .name = "s", .values = .{ .dictionary_bytes = .{ .values = &.{ "no", "yes" }, .indices = &.{ 1, 0, 99, 1 } } }, .nulls = .{ .bytes = &.{ 0, 0, 1, 0 } } },
+            .{ .name = "n", .values = .{ .i64 = &.{ 9007199254740993, 9007199254740993, 0, 9007199254740993 } } },
+        },
+    };
+    var selected = [_]bool{ true, true, true, false };
+    try filter.applyBatch(a, batch, &selected);
+    try std.testing.expectEqualSlices(bool, &.{ true, false, false, false }, &selected);
 }

@@ -236,28 +236,34 @@ fn equalityKeyFromBatchRow(alloc: Allocator, batch: rowsource.ColumnBatch, row_i
             try out.append(alloc, 0);
             continue;
         };
-        if (column.nulls.isNull(row_idx)) {
-            try out.append(alloc, 0);
-            continue;
-        }
-        switch (column.values) {
-            .bytes => |values| try appendBytesEqualityKeyPart(alloc, &out, values[row_idx]),
-            .dictionary_bytes => |values| try appendBytesEqualityKeyPart(alloc, &out, values.at(row_idx)),
-            .json, .vector_f32 => return error.UnsupportedIcebergEqualityDeleteColumn,
-            .i64 => |values| {
-                try out.append(alloc, 2);
-                var bytes: [8]u8 = undefined;
-                std.mem.writeInt(i64, &bytes, values[row_idx], .little);
-                try out.appendSlice(alloc, &bytes);
-            },
-            .f64 => |values| try appendF64EqualityKeyPart(alloc, &out, values[row_idx]),
-            .bool => |values| {
-                try out.append(alloc, 4);
-                try out.append(alloc, @intFromBool(values[row_idx]));
-            },
-        }
+        try appendEqualityColumnPart(alloc, &out, column, row_idx);
     }
     return try out.toOwnedSlice(alloc);
+}
+
+/// Reusable column-part encoder used by batch delete masks. The caller binds
+/// columns and validates the batch once, rather than once per membership test.
+pub fn appendEqualityColumnPart(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), column: rowsource.ColumnVector, row: usize) !void {
+    if (column.nulls.isNull(row)) {
+        try out.append(alloc, 0);
+        return;
+    }
+    switch (column.values) {
+        .bytes => |values| try appendBytesEqualityKeyPart(alloc, out, values[row]),
+        .dictionary_bytes => |values| try appendBytesEqualityKeyPart(alloc, out, values.at(row)),
+        .json, .vector_f32 => return error.UnsupportedIcebergEqualityDeleteColumn,
+        .i64 => |values| {
+            try out.append(alloc, 2);
+            var bytes: [8]u8 = undefined;
+            std.mem.writeInt(i64, &bytes, values[row], .little);
+            try out.appendSlice(alloc, &bytes);
+        },
+        .f64 => |values| try appendF64EqualityKeyPart(alloc, out, values[row]),
+        .bool => |values| {
+            try out.append(alloc, 4);
+            try out.append(alloc, @intFromBool(values[row]));
+        },
+    }
 }
 
 fn appendBytesEqualityKeyPart(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {

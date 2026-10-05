@@ -50,6 +50,7 @@ pub const Join = struct {
     matched: bool = false,
     unmatched: usize = 0,
     rows: [2]usize = @splat(0),
+    next_ordinals: [2]usize = @splat(0),
     finished: bool = false,
     probing_started: bool = false,
     probe_arena: std.heap.ArenaAllocator,
@@ -195,6 +196,16 @@ pub const Join = struct {
         self.* = .{ .a = a, .manager = manager, .limits = .{ .bytes = @max(8192, bytes / 2), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 };
         return self;
     }
+    pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {
+        if (keys.len != batch.len() or begin > keys.len) return error.InvalidSqlBackendResponse;
+        var arena = std.heap.ArenaAllocator.init(self.a);
+        defer arena.deinit();
+        for (begin..keys.len) |index| {
+            _ = arena.reset(.retain_capacity);
+            const ordinal = self.next_ordinals[@intFromBool(build_side)];
+            try self.add(build_side, try batch.row(arena.allocator(), index), keys[index], ordinal);
+        }
+    }
     pub fn close(self: *Join) void {
         if (self.output) |pipe| pipe.stop();
         if (self.output_task) |*task| {
@@ -242,6 +253,8 @@ pub const Join = struct {
     pub fn add(self: *Join, build: bool, values: []const Datum, keys: []const Datum, ordinal: usize) !void {
         if (self.finished or (build and self.probing_started)) return error.InvalidSqlBackendResponse;
         if (!build) self.probing_started = true;
+        const input_side = @intFromBool(build);
+        self.next_ordinals[input_side] = @max(self.next_ordinals[input_side], try std.math.add(usize, ordinal, 1));
         const hash = try operators.HashJoin.keyHash(keys);
         if (hash) |value| {
             const bit = value % (self.filter.len * 64);
@@ -332,23 +345,44 @@ pub const Join = struct {
             self.hash = try operators.HashJoin.create(self.a, self.limits);
             var hash_union: u64 = 0;
             var hash_intersection: u64 = std.math.maxInt(u64);
+            var repartitioned = false;
             if (self.active.?.build) |*file| {
                 var offset: u64 = 0;
+                var skew_fallback = false;
                 while (offset < file.size) {
-                    _ = self.scratch.reset(.free_all);
-                    const row = try file.read(self.scratch.allocator(), offset);
+                    const row = try file.readBorrowed(offset);
                     const hash = (try operators.HashJoin.keyHash(row.row.keys)) orelse 0;
                     hash_union |= hash;
                     hash_intersection &= hash;
-                    try self.hash.?.add(row.row.values, row.row.keys);
+                    if (!skew_fallback) {
+                        const consumed = try self.hash.?.addBatchUntilFull(self.a, .{ .rows = &.{row.row.values} }, &.{row.row.keys});
+                        if (consumed == 0) {
+                            // Determine useful remaining bits before writing any
+                            // temporary hash-chain file. Skew alone needs chains.
+                            var remaining = row.following;
+                            while (remaining < file.size) {
+                                const scanned = try file.readBorrowed(remaining);
+                                const h = (try operators.HashJoin.keyHash(scanned.row.keys)) orelse 0;
+                                hash_union |= h;
+                                hash_intersection &= h;
+                                remaining = scanned.following;
+                            }
+                            if (try self.split(hash_union ^ hash_intersection)) {
+                                self.hash.?.deinit();
+                                self.hash = null;
+                                repartitioned = true;
+                                break;
+                            }
+                            skew_fallback = true;
+                            // The range scan advanced the borrowed decode head.
+                            const current = try file.readBorrowed(offset);
+                            try self.hash.?.add(current.row.values, current.row.keys);
+                        }
+                    } else try self.hash.?.add(row.row.values, row.row.keys);
                     offset = row.following;
                 }
             }
-            if (self.hash.?.disk != null and try self.split(hash_union ^ hash_intersection)) {
-                self.hash.?.deinit();
-                self.hash = null;
-                continue;
-            }
+            if (repartitioned) continue;
             if (self.active.?.build) |*file| file.close();
             self.active.?.build = null;
             self.partitions_loaded += 1;

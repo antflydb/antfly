@@ -962,7 +962,27 @@ fn Engine(comptime Context: type) type {
                         const batch = try self.right.?.nextBatch(a, count, null);
                         if (batch.len() == 0) break;
                         const keys_ = try self.keyBatch(a, if (self.flipped_join) join.left_keys else join.right_keys, batch, null);
-                        try self.hash_join.?.addBatch(a, batch, keys_);
+                        if (!shared and self.engine.context.spill != null) {
+                            if (self.partition_join) |owner| {
+                                try owner.addBatch(true, batch, keys_, 0);
+                            } else {
+                                const consumed = try self.hash_join.?.addBatchUntilFull(a, batch, keys_);
+                                if (consumed != batch.len()) {
+                                    const owner = try @import("partition_join.zig").Join.create(self.engine.context.alloc, self.engine.context.spill.?, self.engine.context.limits.retained_bytes, self.engine.context.limits.scan_rows, self.engine.context.limits.retained_bytes / 8, kind == .left or kind == .full, kind == .right or kind == .full);
+                                    self.partition_join = owner;
+                                    var transfer = std.heap.ArenaAllocator.init(self.engine.context.alloc);
+                                    defer transfer.deinit();
+                                    var index: usize = 0;
+                                    while (try self.hash_join.?.unmatched(&index)) |match| {
+                                        _ = transfer.reset(.retain_capacity);
+                                        try owner.add(true, try match.materializeValues(transfer.allocator()), try match.materializeKeys(transfer.allocator()), @intCast(match.index));
+                                    }
+                                    self.hash_join.?.deinit();
+                                    self.hash_join = null;
+                                    try owner.addBatch(true, batch, keys_, consumed);
+                                }
+                            }
+                        } else try self.hash_join.?.addBatch(a, batch, keys_);
                         if (self.scan_filter) |filter| for (keys_) |key_values| try filter.add(key_values);
                     }
                     if (self.scan_filter) |filter| {
@@ -971,8 +991,7 @@ fn Engine(comptime Context: type) type {
                         const cursor = self.engine.cursors[scan.index];
                         _ = try cursor.set_dynamic_filter.?(cursor.ptr, filter);
                     }
-                    if (!shared and self.hash_join.?.disk != null and self.engine.context.spill != null) {
-                        const owner = try @import("partition_join.zig").Join.create(self.engine.context.alloc, self.engine.context.spill.?, self.engine.context.limits.retained_bytes, self.engine.context.limits.scan_rows, self.hash_join.?.disk.?.size, kind == .left or kind == .full, kind == .right or kind == .full);
+                    if (self.partition_join) |owner| {
                         if (!Adapter.hasPatterns(self.node, 0) and (join.condition == null or !@import("decision_eval.zig").hasExternal(&join.condition.?))) owner.evaluation = .{
                             .condition = if (self.node.operation.join.condition) |*program| program else null,
                             .parameters = self.engine.context.parameters,
@@ -980,24 +999,18 @@ fn Engine(comptime Context: type) type {
                             .right_width = self.right.?.node.columns.len,
                             .flipped = self.flipped_join,
                         };
-                        var transferred = false;
-                        errdefer if (!transferred) owner.close();
-                        var index: usize = 0;
-                        while (try self.hash_join.?.unmatched(&index)) |match| {
-                            _ = scratch.reset(.free_all);
-                            try owner.add(true, try match.materializeValues(scratch.allocator()), try match.materializeKeys(scratch.allocator()), @intCast(match.index));
+                        while (true) {
+                            _ = scratch.reset(.retain_capacity);
+                            const a = scratch.allocator();
+                            const count = @min(self.engine.context.limits.execution_batch_rows, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.left.?.node.columns.len * @sizeOf(Datum) * 16)));
+                            const batch = try self.left.?.nextBatch(a, count, null);
+                            if (batch.len() == 0) break;
+                            const keys_ = try self.keyBatch(a, if (self.flipped_join) join.right_keys else join.left_keys, batch, null);
+                            try owner.addBatch(false, batch, keys_, 0);
                         }
-                        var ordinal: usize = 0;
-                        while (try self.left.?.next(scratch.allocator())) |values| {
-                            const keys_ = try self.keys(scratch.allocator(), if (self.flipped_join) join.right_keys else join.left_keys, values);
-                            try owner.add(false, values, keys_, ordinal);
-                            ordinal += 1;
-                            _ = scratch.reset(.free_all);
-                        }
-                        self.hash_join.?.deinit();
+                        if (self.hash_join) |hash| hash.deinit();
                         self.hash_join = null;
                         self.partition_join = owner;
-                        transferred = true;
                         return self.nextPartitionJoin(alloc, join);
                     }
                     if (shared) {

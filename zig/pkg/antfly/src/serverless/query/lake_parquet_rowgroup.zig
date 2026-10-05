@@ -105,6 +105,15 @@ pub const ObjectRangeReader = struct {
         read: range_io.RangeRead,
     ) anyerror![]u8 = null,
 
+    read_planned_range_lease: ?*const fn (*anyopaque, Allocator, range_io.RangeRead) anyerror!range_io.RangeLease = null,
+    pub fn readPlannedLease(self: ObjectRangeReader, alloc: Allocator, read: range_io.RangeRead) !range_io.RangeLease {
+        try read.validate();
+        const lease = if (self.read_planned_range_lease) |read_fn| try read_fn(self.ctx, alloc, read) else range_io.RangeLease{ .bytes = try self.readPlannedAlloc(alloc, read), .owner = .{ .allocation = alloc } };
+        errdefer lease.release();
+        if (lease.bytes.len != read.range.len) return error.InvalidLakeRangeRead;
+        return lease;
+    }
+
     pub fn readAlloc(
         self: ObjectRangeReader,
         alloc: Allocator,

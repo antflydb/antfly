@@ -1,0 +1,174 @@
+{
+  "environment": {
+    "architecture": "arm64",
+    "zig": "0.16.0",
+    "optimize": "ReleaseFast"
+  },
+  "method": "Alternating local microbenchmark paths with equal-output checks; row materialization versus column batch admission, and payload rewriting versus shared ordinal views. Timings are not query-wide guarantees. The window spill comparison disables compression and includes base payload writes.",
+  "samples": [
+    {
+      "case": "partitioned_join",
+      "rows_per_side": 1024,
+      "chained_ns": 55968917,
+      "partitioned_ns": 66187208,
+      "chained_first_row_ns": 13042542,
+      "partitioned_first_row_ns": 12863875,
+      "chained_peak_bytes": 54644,
+      "partitioned_peak_bytes": 100684,
+      "chained_written_bytes": 70656,
+      "partitioned_written_bytes": 54687,
+      "chained_reads": 2118,
+      "partitioned_reads": 69,
+      "chained_writes": 18,
+      "partitioned_writes": 69,
+      "chained_allocations": 5693,
+      "partitioned_allocations": 8054,
+      "filtered_probes": 510
+    },
+    {
+      "case": "partitioned_join",
+      "rows_per_side": 4096,
+      "chained_ns": 409724542,
+      "partitioned_ns": 235148083,
+      "chained_first_row_ns": 37424250,
+      "partitioned_first_row_ns": 41821667,
+      "chained_peak_bytes": 54644,
+      "partitioned_peak_bytes": 100332,
+      "chained_written_bytes": 282624,
+      "partitioned_written_bytes": 218529,
+      "chained_reads": 21082,
+      "partitioned_reads": 237,
+      "chained_writes": 70,
+      "partitioned_writes": 237,
+      "chained_allocations": 46693,
+      "partitioned_allocations": 30928,
+      "filtered_probes": 2006
+    },
+    {
+      "case": "borrowed_join_batch",
+      "rows": 8192,
+      "sample": 0,
+      "rows_ns": 4217208,
+      "batch_ns": 1825917,
+      "rows_allocations": 116,
+      "batch_allocations": 74,
+      "rows_peak_bytes": 1637194,
+      "batch_peak_bytes": 1313734
+    },
+    {
+      "case": "borrowed_join_batch",
+      "rows": 8192,
+      "sample": 1,
+      "rows_ns": 4192333,
+      "batch_ns": 1795125,
+      "rows_allocations": 116,
+      "batch_allocations": 74,
+      "rows_peak_bytes": 1637194,
+      "batch_peak_bytes": 1313734
+    },
+    {
+      "case": "borrowed_join_batch",
+      "rows": 8192,
+      "sample": 2,
+      "rows_ns": 4170833,
+      "batch_ns": 1789291,
+      "rows_allocations": 116,
+      "batch_allocations": 74,
+      "rows_peak_bytes": 1637194,
+      "batch_peak_bytes": 1313734
+    },
+    {
+      "case": "borrowed_join_batch",
+      "rows": 32768,
+      "sample": 0,
+      "rows_ns": 17332625,
+      "batch_ns": 7183917,
+      "rows_allocations": 257,
+      "batch_allocations": 137,
+      "rows_peak_bytes": 4071894,
+      "batch_peak_bytes": 4028362
+    },
+    {
+      "case": "borrowed_join_batch",
+      "rows": 32768,
+      "sample": 1,
+      "rows_ns": 16175709,
+      "batch_ns": 6829083,
+      "rows_allocations": 257,
+      "batch_allocations": 137,
+      "rows_peak_bytes": 4071894,
+      "batch_peak_bytes": 4028362
+    },
+    {
+      "case": "borrowed_join_batch",
+      "rows": 32768,
+      "sample": 2,
+      "rows_ns": 16083958,
+      "batch_ns": 6804542,
+      "rows_allocations": 257,
+      "batch_allocations": 137,
+      "rows_peak_bytes": 4071894,
+      "batch_peak_bytes": 4028362
+    },
+    {
+      "case": "shared_window_permutations",
+      "rows": 256,
+      "payload_bytes": 1024,
+      "sample": 0,
+      "copy_ns": 69032792,
+      "shared_ns": 22929083,
+      "copy_written_bytes": 1999872,
+      "shared_written_bytes": 323072
+    },
+    {
+      "case": "shared_window_permutations",
+      "rows": 256,
+      "payload_bytes": 1024,
+      "sample": 1,
+      "copy_ns": 68656375,
+      "shared_ns": 22261208,
+      "copy_written_bytes": 1999872,
+      "shared_written_bytes": 323072
+    },
+    {
+      "case": "shared_window_permutations",
+      "rows": 256,
+      "payload_bytes": 1024,
+      "sample": 2,
+      "copy_ns": 69174417,
+      "shared_ns": 22831208,
+      "copy_written_bytes": 1999872,
+      "shared_written_bytes": 323072
+    },
+    {
+      "case": "shared_window_permutations",
+      "rows": 256,
+      "payload_bytes": 16384,
+      "sample": 0,
+      "copy_ns": 91636000,
+      "shared_ns": 21434750,
+      "copy_written_bytes": 29524992,
+      "shared_written_bytes": 4255232
+    },
+    {
+      "case": "shared_window_permutations",
+      "rows": 256,
+      "payload_bytes": 16384,
+      "sample": 1,
+      "copy_ns": 87976584,
+      "shared_ns": 21548375,
+      "copy_written_bytes": 29524992,
+      "shared_written_bytes": 4255232
+    },
+    {
+      "case": "shared_window_permutations",
+      "rows": 256,
+      "payload_bytes": 16384,
+      "sample": 2,
+      "copy_ns": 84960750,
+      "shared_ns": 20941417,
+      "copy_written_bytes": 29524992,
+      "shared_written_bytes": 4255232
+    }
+  ]
+}

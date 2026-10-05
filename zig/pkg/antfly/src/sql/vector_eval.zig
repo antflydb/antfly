@@ -594,3 +594,32 @@ test "SQL native typed columns preserve finite-number coercion and selected null
         try std.testing.expectError(error.SqlTypeMismatch, evaluateColumns(a, &program, invalid, &definitions, &.{}));
     }
 }
+
+test "SQL vector root text validation matches scalar and ignores discarded intermediates" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const wide = try alloc.alloc(u8, 1024 * 1024 + 1);
+    @memset(wide, 'x');
+    for ([_][]const u8{ "s", "s = s" }) |sql| {
+        var compiled = try @import("compiler.zig").compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var program = try scalar.bind(a, compiled.expression, &.{.{ .name = "s", .type = .string }}, &.{}, .{});
+        defer program.deinit();
+        for ([_][]const u8{ "\xff", wide }) |text| {
+            const rows = [_][]const Datum{&.{Datum.json(.{ .string = text })}};
+            if (std.mem.eql(u8, sql, "s")) {
+                const err = if (text.len == 1) error.SqlTypeMismatch else error.SqlProgramLimitExceeded;
+                try std.testing.expectError(err, program.evaluate(alloc, rows[0], &.{}, .{}));
+                try std.testing.expectError(err, evaluate(alloc, &program, &rows, &.{}));
+                const types = @import("../storage/rowsource/types.zig");
+                const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = &.{.{ .relational_key = "r" }}, .columns = &.{types.ColumnVector{ .name = "s", .values = .{ .dictionary_bytes = .{ .values = &.{text}, .indices = &.{0} } } }} }, .selection = &.{0} };
+                try std.testing.expectError(err, evaluateColumns(alloc, &program, page, &.{.{ .name = "s", .type = .string }}, &.{}));
+            } else {
+                try std.testing.expect((try program.evaluate(alloc, rows[0], &.{}, .{})).value.bool);
+                try std.testing.expect((try evaluate(alloc, &program, &rows, &.{})).?[0].value.bool);
+            }
+        }
+    }
+}

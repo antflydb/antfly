@@ -193,6 +193,25 @@ pub const Store = struct {
         }
         return bytes;
     }
+    /// Column-major payload admission. No per-row Datum slices or arenas;
+    /// primitive and dictionary state is retained directly in each column.
+    pub fn appendBatch(self: *Store, batch: @import("execution_batch.zig").Batch) !void {
+        if (self.failed or (self.initialized and self.columns.len != batch.width())) return error.InvalidSqlBackendResponse;
+        errdefer self.failed = true;
+        if (!self.initialized) {
+            self.columns = try self.a.alloc(Column, batch.width());
+            @memset(self.columns, .{});
+            self.initialized = true;
+        }
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        for (self.columns, 0..) |*column, ordinal| for (0..batch.len()) |index| {
+            _ = scratch.reset(.retain_capacity);
+            const value = try batch.cell(scratch.allocator(), index, ordinal);
+            try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, value);
+        };
+        self.len += batch.len();
+    }
     pub fn append(self: *Store, values: []const Datum) !usize {
         if (self.failed or (self.initialized and values.len != self.columns.len)) return error.InvalidSqlBackendResponse;
         errdefer self.failed = true;
@@ -305,4 +324,23 @@ test "SQL typed dictionaries retain repeated payloads once and preserve promotio
         try std.testing.expect((try store.cell(a, 0, 0)).sql_null);
     }
     try std.testing.expectEqual(@as(usize, 0), budget.live);
+}
+
+fn batchAllocationScenario(a: A) !void {
+    var store = Store.init(a);
+    defer store.deinit();
+    const rows = [_][]const Datum{
+        &.{ Datum.json(.{ .integer = 1 }), Datum.json(.{ .string = "shared" }) },
+        &.{ .{}, Datum.json(.{ .string = "shared" }) },
+        &.{ Datum.json(.{ .float = 2.5 }), Datum.json(.{ .string = "unique" }) },
+    };
+    try store.appendBatch(.{ .rows = &rows });
+    for (rows, 0..) |row, index| for (row, 0..) |expected, column| {
+        const actual = try store.cell(a, index, column);
+        try std.testing.expectEqualDeep(expected.value, actual.value);
+        try std.testing.expectEqual(expected.sql_null, actual.sql_null);
+    };
+}
+test "SQL retained column batch promotion unwinds every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, batchAllocationScenario, .{});
 }

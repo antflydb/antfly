@@ -593,6 +593,13 @@ pub const Stream = struct {
         self.file_index = self.files.len;
         return total;
     }
+    pub fn deleteMask(self: Stream, a: Allocator, batch: types.ColumnBatch, selected: []bool) !void {
+        for (batch.row_refs, selected) |ref, *keep| if (keep.* and self.isDeleted(ref)) {
+            keep.* = false;
+        };
+        if (self.source.prepared_deletes) |prepared|
+            try prepared.mask(a, self.discovered.?.inventory.files[0], batch, selected);
+    }
     pub fn isDeletedBatch(self: Stream, a: Allocator, batch: types.ColumnBatch, index: usize) !bool {
         if (self.isDeleted(batch.row_refs[index])) return true;
         if (self.source.prepared_deletes) |prepared|
