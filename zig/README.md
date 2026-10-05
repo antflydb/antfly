@@ -5,6 +5,26 @@ runtime. The repository contains product packages, shared libraries, benchmark
 harnesses, compatibility suites, and Python end-to-end tests that exercise the
 same checked-in source tree.
 
+## Evented enrichment executor
+
+Linux enrichment can use `EventedExecutor.io()` for fiber concurrency, timers,
+cancellation, and positional file I/O. The backend must be initialized and used
+on the same OS thread. Its allocation stays at a stable address until `deinit`;
+complete or cancel tasks before teardown. Production transports and LSM I/O
+continue to use Threaded because upstream Evented networking is incomplete.
+
+Run `zig build evented-enrichment-test` on native Linux to validate scheduling,
+cancellation, file I/O, and teardown. This gate requires working io_uring,
+including `SINGLE_ISSUER` (Linux 6.0+) and a seccomp policy allowing its syscalls;
+backend initialization reports unsupported kernels or denied syscalls as errors.
+On other operating systems the test checks the unsupported-backend result.
+
+`lib/platform/src/io_uring_compat.zig` is the MIT-licensed Zig 0.17.0
+`std/Io/Uring.zig` with the release vtable repaired: remove obsolete process-path
+entries, add inherited directory/file descriptor hooks, and import `std` by
+module name. The upstream source checksum is recorded in the file. Recheck and
+remove this compatibility copy when upgrading to a release with a working backend.
+
 ## Repository Layout
 
 ```text

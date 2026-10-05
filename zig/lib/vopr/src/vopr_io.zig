@@ -1717,7 +1717,7 @@ test "VoprIo unsupported operations latch a deterministic harness violation" {
     try std.testing.expectError(error.VoprIoCapabilityViolation, sim.ensureNoCapabilityViolation());
 
     sim.clearCapabilityViolation();
-    io.vtable.netClose(io.userdata, &.{0});
+    io.vtable.netClose(io.userdata, &.{.{ .handle = 0, .address = undefined }});
     try std.testing.expectEqual(ViolationOperation.network_close, sim.firstCapabilityViolation().?.operation);
 }
 

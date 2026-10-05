@@ -438,7 +438,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "--features",
         "libantfly",
     });
-    run_lite_rs_tests.argv.insert(b.allocator, 2, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
+    run_lite_rs_tests.argv.insert(b.allocator, 1, .{ .decorated_directory = .{ .lazy_path = b.graph.path(.install_lib, ""), .prefix = "ANTFLY_LIB_DIR=", .suffix = "", .make_absolute = true } }) catch @panic("OOM");
     run_lite_rs_tests.setCwd(b.path("."));
     run_lite_rs_tests.step.dependOn(&install_libantfly.step);
     const lite_rs_test_step = b.step("lite-rs-test", "Run Rust Antfly Lite binding tests against libantfly");

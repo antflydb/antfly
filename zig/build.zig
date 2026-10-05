@@ -402,6 +402,16 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .link_libc = link_libc,
     });
+    const evented_enrichment_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft/enrichment_executor_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    evented_enrichment_test_mod.addImport("antfly_platform", platform_mod);
+    const evented_enrichment_tests = b.addTest(.{ .root_module = evented_enrichment_test_mod });
+    b.step("evented-enrichment-test", "Test enrichment io_uring lifetime, concurrent tasks, cancellation, and file I/O")
+        .dependOn(&b.addRunArtifact(evented_enrichment_tests).step);
+
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
         .target = target,
