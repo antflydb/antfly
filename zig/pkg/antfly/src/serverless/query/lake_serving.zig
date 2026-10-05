@@ -475,8 +475,8 @@ pub const ServingSource = struct {
                 .bearer_token => |token| @as(?[]const u8, token),
                 else => null,
             } else null,
-            .gcs_token_source = if (store.gcs_client) |gcs| switch (gcs.cfg.auth) {
-                .google_token_source => |source| @as(?usize, @intFromPtr(source)),
+            .gcs_credentials = if (store.gcs_client) |gcs| switch (gcs.cfg.auth) {
+                .google_token_source => |source| @as(?@TypeOf(source.cfg), source.cfg),
                 else => null,
             } else null,
             .gcs_endpoint = if (store.gcs_client) |gcs| @as(?[]const u8, gcs.cfg.endpoint) else null,
