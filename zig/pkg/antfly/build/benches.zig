@@ -96,7 +96,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
     b.step("antfly-system-catalog-routing-bench", "Benchmark rebuilt and retained indexed routing generations").dependOn(&b.addRunArtifact(system_catalog_routing_bench).step);
     const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
     const lmdb_bench_build_options_c = lmdb_bench_engine_options_c;
-    const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_c);
+    const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_c, platform_mod);
     const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "lib/lmdb/src/lmdb.zig", target, optimize, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod, hash_mod);
     const lmstorage_bench_mod_c = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
@@ -113,7 +113,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
     const lmdb_bench_build_options_zig = lmdb_bench_engine_options_zig;
-    const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_zig);
+    const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, optimize, true, lmdb_bench_engine_options_zig, platform_mod);
     const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "lib/lmdb/src/lmdb.zig", target, optimize, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod, hash_mod);
     const lmstorage_bench_mod_zig = b.createModule(.{
         .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
@@ -134,7 +134,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const split_bench_build_options = makeRootBuildOptions(b, false, false, true, false, false);
-    const split_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, split_bench_engine_options);
+    const split_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, split_bench_engine_options, platform_mod);
     const split_bench_root_mod = makeLmdbModule(b, split_bench_root, target, optimize, split_bench_build_options, split_bench_engine_mod, platform_mod, hash_mod);
     const split_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/split_bench.zig"),
@@ -292,7 +292,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const wal_bench_build_options = makeRootBuildOptions(b, false, false, true, false, false);
-    const wal_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_bench_engine_options);
+    const wal_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_bench_engine_options, platform_mod);
     const wal_bench_wal_mod = makeLmdbModule(b, wal_bench_root, target, optimize, wal_bench_build_options, wal_bench_engine_mod, platform_mod, hash_mod);
     const wal_bench_mod = b.createModule(.{
         .root_source_file = b.path("bench/storage/wal_bench.zig"),
@@ -319,7 +319,7 @@ pub fn addBenchmarks(b: *std.Build, options: AddBenchmarksOptions) AddBenchmarks
 
     const derived_log_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const derived_log_bench_build_options = makeRootBuildOptions(b, false, false, true, false, false);
-    const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, derived_log_bench_engine_options);
+    const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, optimize, true, derived_log_bench_engine_options, platform_mod);
     const derived_log_bench_root_mod = b.createModule(.{
         .root_source_file = b.path(derived_log_bench_root),
         .target = target,

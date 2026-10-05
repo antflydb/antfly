@@ -4,9 +4,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-// Linux io_uring supports fibers, timers, cancellation, and positional file I/O.
+// The platform io_uring/Dispatch backends support fibers, timers, cancellation, and file I/O.
 // Network operations remain incomplete upstream; production transports use Threaded.
-const supports_evented_executor = builtin.os.tag == .linux and std.Io.fiber.supported;
+const supports_evented_executor = (builtin.os.tag == .linux or builtin.os.tag == .macos) and std.Io.fiber.supported;
 const Evented = @import("antfly_platform").Evented;
 
 pub const ExecutorBackend = enum {
@@ -113,7 +113,7 @@ pub fn testEventedExecutor(require_available: bool) !void {
         return;
     }
 
-    var executor = EventedExecutor.init(std.testing.allocator) catch |err| switch (err) {
+    var executor = EventedExecutor.init(std.testing.allocator) catch |err| switch (@as(anyerror, err)) {
         // Evented is optional in ordinary Raft tests. The dedicated gate must
         // still fail if the kernel or sandbox cannot provide io_uring.
         error.PermissionDenied, error.SystemOutdated => if (require_available) return err else return error.SkipZigTest,
@@ -135,17 +135,47 @@ pub fn testEventedExecutor(require_available: bool) !void {
         fn wait(task_io: std.Io) !void {
             try std.Io.sleep(task_io, .fromSeconds(3600), .awake);
         }
+        fn immediate(value: u64) u64 {
+            return value;
+        }
     };
     var completed = try io.concurrent(Work.run, .{io});
     try completed.await(io);
     var canceled = try io.concurrent(Work.wait, .{io});
     try std.testing.expectError(error.Canceled, canceled.cancel(io));
+    // Also cancel after the timer has had an opportunity to enter its wait.
+    for (0..4) |_| {
+        var sleeping = try io.concurrent(Work.wait, .{io});
+        try io.sleep(.fromMilliseconds(1), .awake);
+        try std.testing.expectError(error.Canceled, sleeping.cancel(io));
+    }
+
+    // Immediate completion must not release a fiber while its stack is active.
+    // Repeat concurrent completion to exercise Dispatch's optimized handoff.
+    for (0..16) |_| {
+        var futures: [8]std.Io.Future(u64) = undefined;
+        var launched: usize = 0;
+        var joined: usize = 0;
+        defer for (futures[joined..launched]) |*future| {
+            _ = future.cancel(io);
+        };
+        for (&futures, 0..) |*future, value| {
+            future.* = try io.concurrent(Work.immediate, .{@as(u64, value)});
+            launched += 1;
+        }
+        while (joined < launched) {
+            const value = futures[joined].await(io);
+            joined += 1;
+            try std.testing.expectEqual(@as(u64, joined - 1), value);
+        }
+    }
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const file = try tmp.dir.createFile(io, "evented-replay", .{ .read = true });
     defer file.close(io);
     try file.writePositionalAll(io, "evented enrichment", 0);
+    try file.sync(io);
     var bytes: [32]u8 = undefined;
     const n = try file.readPositionalAll(io, &bytes, 0);
     try std.testing.expectEqualStrings("evented enrichment", bytes[0..n]);

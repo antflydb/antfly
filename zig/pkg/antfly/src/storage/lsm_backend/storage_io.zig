@@ -30,11 +30,9 @@ const supports_posix_fd_cache = supports_native_storage and
     builtin.os.tag != .wasi and
     (builtin.os.tag == .linux or builtin.link_libc) and
     @hasDecl(std.posix.system, "pread");
-// TODO: Re-enable Linux evented storage once std.Io.Evented/std.Io.Uring is
-// stable enough for this code path. In Zig 0.16, instantiating std.Io.Uring
-// trips stdlib error-set mismatches: std/Io/Uring.zig's dirOpenDir and
-// dirRealPathFile propagate openat's error.ReadOnlyFileSystem into std/Io/Dir.zig
-// error sets that do not include it.
+// Keep the production storage runtime Threaded while Evented is qualified
+// with workload and recovery tests. Native positional reads also use the fd
+// cache directly, so switching std.Io alone would not convert every read path.
 const supports_evented_runtime = false;
 // Standalone NativeStorage values used by focused tools/tests have no
 // BackendRuntime handle, so keep their local cache conservative. Production

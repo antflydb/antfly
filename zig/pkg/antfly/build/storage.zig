@@ -41,6 +41,9 @@ pub fn makeLmdbBuildOptions(
 pub fn configureLmdb(b: *std.Build, module: *std.Build.Module, engine: *std.Build.Module, include_c: bool) void {
     module.addImport("lmdb_engine", engine);
     module.addIncludePath(b.path("lib/lmdb"));
+    // Share one translation module across consumers of this engine; Zig rejects
+    // the same generated source owned by multiple module instances.
+    module.addImport("lmdb_c_bindings", engine.import_table.get("lmdb_c_bindings").?);
     if (include_c) {
         module.addCSourceFiles(.{
             .files = &.{ "lib/lmdb/mdb.c", "lib/lmdb/midl.c" },
@@ -92,6 +95,7 @@ pub fn makeLmdbEngineModule(
     optimize: std.lang.Optimize,
     link_libc: bool,
     build_options: *std.Build.Step.Options,
+    platform_mod: *std.Build.Module,
 ) *std.Build.Module {
     const mod = b.createModule(.{
         .root_source_file = b.path("lib/lmdb/src/root.zig"),
@@ -99,6 +103,14 @@ pub fn makeLmdbEngineModule(
         .optimize = optimize,
     });
     mod.addOptions("build_options", build_options);
+    mod.addImport("antfly_platform", platform_mod);
+    const bindings = b.addTranslateC(.{
+        .root_source_file = b.path("lib/lmdb/lmdb.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = target.result.os.tag != .freestanding,
+    });
+    mod.addImport("lmdb_c_bindings", bindings.createModule());
     if (link_libc and target.result.os.tag != .freestanding) {
         mod.link_libc = true;
         addMacosSdkPaths(b, mod, target);
@@ -129,7 +141,7 @@ pub fn makeLmdbModule(
     } else {
         mod.addOptions("build_options", build_options);
     }
-    mod.addImport("lmdb_engine", lmdb_engine_mod);
+    configureLmdb(b, mod, lmdb_engine_mod, true);
     mod.addImport("storage_sim_fixture", b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage/sim_fixture.zig"),
         .target = target,
@@ -137,11 +149,6 @@ pub fn makeLmdbModule(
     }));
     mod.addImport("antfly_platform", platform_mod);
     mod.addImport("antfly_hash", hash_mod);
-    mod.addCSourceFiles(.{
-        .files = &.{ "lib/lmdb/mdb.c", "lib/lmdb/midl.c" },
-        .flags = &lmdb_c_flags,
-    });
-    mod.addIncludePath(b.path("lib/lmdb"));
     mod.link_libc = true;
     addMacosSdkPaths(b, mod, target);
     return mod;
