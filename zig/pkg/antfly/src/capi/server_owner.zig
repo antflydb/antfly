@@ -897,8 +897,11 @@ pub fn storageOwnerContextMetrics(
     context: ?*anyopaque,
     out_result: *kernel_owner_abi.ContextMetricsResult,
 ) callconv(.c) kernel_owner_abi.Status {
-    out_result.* = .{};
     const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    // The result has grown across ABI versions. Read only the leading version
+    // word, which every revision shares, and reject a caller built against
+    // another layout before writing: it may have reserved a smaller struct.
+    if (out_result.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const stats = owner_context.resources.lsm_cache.snapshotStats();
     out_result.* = .{
         .lsm_cache_used_bytes = @intCast(stats.used_bytes),
@@ -909,6 +912,14 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
     };
+    const resources = owner_context.resources.resource_manager.snapshot();
+    out_result.resource_memory = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(resources.memory);
+    comptime std.debug.assert(@import("../storage/resource_manager.zig").slice_count <= kernel_owner_abi.context_resource_slice_capacity);
+    const slice_count = resources.slices.len;
+    out_result.resource_slice_count = @intCast(slice_count);
+    for (resources.slices[0..slice_count], out_result.resource_slices[0..slice_count]) |slice, *out| {
+        out.* = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(slice);
+    }
     return .ok;
 }
 

@@ -155,7 +155,7 @@ test "laya forward preprocessing and batching match the PyTorch reference" {
             try std.testing.expectEqualStrings(expected.label, actual.label);
             for (expected.probabilities, actual.probabilities) |want, got| try std.testing.expectApproxEqAbs(want, got, 2e-4);
             try std.testing.expectApproxEqAbs(expected.confidence, actual.confidence, 2e-4);
-            try std.testing.expectApproxEqAbs(expected.act_probability, actual.act_probability, 2e-4);
+            try std.testing.expectApproxEqAbs(expected.act_probability.?, actual.act_probability.?, 2e-4);
         }
     }
     const Cancel = struct {
@@ -306,7 +306,7 @@ test "laya released checkpoint accuracy parity batching and performance" {
             totals[kind] += 1;
             if (decision.expected_value) |value| ordinal_error += @abs(value - @as(f64, @floatFromInt(row.target)));
             for (row.probabilities, decision.probabilities) |want, got| max_probability_error = @max(max_probability_error, @abs(want - got));
-            max_action_error = @max(max_action_error, @abs(row.act_probability - decision.act_probability));
+            max_action_error = @max(max_action_error, @abs(row.act_probability - decision.act_probability.?));
         }
         std.debug.print("Laya evaluated {d}/{d}, max_probability_error={d:.7}\n", .{ start + chunk.len, rows.len, max_probability_error });
     }
@@ -325,7 +325,7 @@ test "laya released checkpoint accuracy parity batching and performance" {
             const expected = rows[(511 - i) % rows.len];
             try std.testing.expectEqual(argmax(expected.probabilities), argmax(actual.probabilities));
             for (expected.probabilities, actual.probabilities) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-5);
-            try std.testing.expectApproxEqAbs(expected.act_probability, actual.act_probability, 5e-5);
+            try std.testing.expectApproxEqAbs(expected.act_probability, actual.act_probability.?, 5e-5);
         }
         std.debug.print("Laya released stress tasks=512 parity=passed\n", .{});
     }
@@ -377,7 +377,7 @@ test "laya released checkpoint accuracy parity batching and performance" {
                 const expected = rows[(batch_size - i - 1) % rows.len];
                 try std.testing.expectEqual(argmax(expected.probabilities), argmax(actual.probabilities));
                 for (expected.probabilities, actual.probabilities) |want, got| batch_error = @max(batch_error, @abs(want - got));
-                try std.testing.expectApproxEqAbs(expected.act_probability, actual.act_probability, 5e-5);
+                try std.testing.expectApproxEqAbs(expected.act_probability, actual.act_probability.?, 5e-5);
             }
         }
         std.mem.sort(u64, &timings, {}, std.sort.asc(u64));
@@ -473,7 +473,7 @@ fn benchmarkMatched(a: std.mem.Allocator, session: @import("../backends/session.
                         const expected = rows[if (mixed) batch - 1 - i else 0];
                         try std.testing.expectEqual(argmax(expected.probabilities), argmax(decision.probabilities));
                         for (expected.probabilities, decision.probabilities) |want, got| try std.testing.expectApproxEqAbs(want, got, 5e-5);
-                        try std.testing.expectApproxEqAbs(expected.act_probability, decision.act_probability, 5e-5);
+                        try std.testing.expectApproxEqAbs(expected.act_probability, decision.act_probability.?, 5e-5);
                     }
                 }
                 std.mem.sort(u64, timings, {}, std.sort.asc(u64));

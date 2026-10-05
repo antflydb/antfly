@@ -125,6 +125,8 @@ pub const CatchUpOptions = struct {
     max_call_ns: u64 = 0,
     max_call_bytes: u64 = 0,
     estimated_dense_vector_bytes: u64 = 0,
+    max_work_chunk_bytes: u64 = 0,
+    dense_replay_working_set_factor: u64 = 1,
     target_sequence: u64 = 0,
     /// Optional absolute monotonic deadline. Collection stops before opening a
     /// new apply window once this deadline is reached. Callers must still size
@@ -281,6 +283,8 @@ pub fn catchUpIndexFromMatchingCursor(
             builder.max_chunk_bytes = @min(builder.max_chunk_bytes, options.max_call_bytes -| call_bytes);
         builder.max_items = options.max_items_per_window;
         builder.estimated_dense_vector_bytes = options.estimated_dense_vector_bytes;
+        builder.max_work_chunk_bytes = options.max_work_chunk_bytes;
+        builder.dense_replay_working_set_factor = @max(@as(u64, 1), options.dense_replay_working_set_factor);
         builder.target_sequence = options.target_sequence;
         builder.decode_scratch = &decode_scratch;
         builder.scratch_alloc = scratch_alloc;
@@ -497,9 +501,12 @@ const ReplayChunkBuilder = struct {
     seen_overwritten_docs: std.StringHashMapUnmanaged(void) = .empty,
     seen_changed_artifacts: std.StringHashMapUnmanaged(void) = .empty,
     tracked_bytes: u64 = 0,
+    tracked_dense_vector_bytes: u64 = 0,
     item_count: usize = 0,
     max_items: usize = 0,
     estimated_dense_vector_bytes: u64 = 0,
+    max_work_chunk_bytes: u64 = 0,
+    dense_replay_working_set_factor: u64 = 1,
     target_sequence: u64 = 0,
 
     fn init(
@@ -544,6 +551,8 @@ const ReplayChunkBuilder = struct {
         fresh.scratch_budget = self.scratch_budget;
         fresh.max_items = self.max_items;
         fresh.estimated_dense_vector_bytes = self.estimated_dense_vector_bytes;
+        fresh.max_work_chunk_bytes = self.max_work_chunk_bytes;
+        fresh.dense_replay_working_set_factor = self.dense_replay_working_set_factor;
         fresh.target_sequence = self.target_sequence;
         self.deinit();
         self.* = fresh;
@@ -726,12 +735,26 @@ const ReplayChunkBuilder = struct {
         if (self.index_ref.kind == .dense_vector) {
             const vector_bytes = @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) * self.estimatedDenseVectorBytes();
             try self.observeTrackedBytes(self.tracked_bytes +| vector_bytes);
+            if (self.max_work_chunk_bytes != 0) self.tracked_dense_vector_bytes +|= vector_bytes;
         }
     }
 
     fn wouldOverflowWithRecord(self: *@This(), record: change_journal_mod.Record) bool {
         if (self.tracked_bytes == 0 and self.item_count == 0) return false;
-        if (self.max_chunk_bytes > 0 and self.tracked_bytes + recordEstimatedBytesForIndex(record, self.index_ref.kind, self.estimatedDenseVectorBytes()) > self.max_chunk_bytes) return true;
+        if (self.max_chunk_bytes > 0 or self.max_work_chunk_bytes != 0) {
+            const incoming_bytes = recordEstimatedBytesForIndex(record, self.index_ref.kind, self.estimatedDenseVectorBytes());
+            if (self.max_chunk_bytes > 0 and self.tracked_bytes +| incoming_bytes > self.max_chunk_bytes) return true;
+            if (self.max_work_chunk_bytes != 0) {
+                const vector_bytes = if (self.index_ref.kind == .dense_vector)
+                    @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) *| self.estimatedDenseVectorBytes()
+                else
+                    0;
+                const factor = @max(@as(u64, 1), self.dense_replay_working_set_factor);
+                const work_bytes = (self.tracked_bytes -| self.tracked_dense_vector_bytes) +| (self.tracked_dense_vector_bytes / factor);
+                const incoming_work = (incoming_bytes -| vector_bytes) +| (vector_bytes / factor);
+                if (work_bytes +| incoming_work > self.max_work_chunk_bytes) return true;
+            }
+        }
         if (self.max_items > 0 and self.item_count + recordItemCountForIndex(record, self.index_ref.kind) > self.max_items) return true;
         if (self.resource_manager) |manager| {
             // The hard limit also covers shared decode scratch and other replay
@@ -2356,4 +2379,89 @@ test "replay batcher duplicate metadata at its load limit does not grow" {
     for (0..256) |_| try builder.appendRecord(.{ .changed_doc_keys = &.{"key-0"} });
     try std.testing.expectEqual(capacity, builder.seen_changed_docs.capacity());
     try std.testing.expectEqual(allocations, failing.alloc_index);
+}
+
+test "dense replay work ceiling bounds delete and mixed records independently of vector estimates" {
+    const alloc = std.testing.allocator;
+    const key = try alloc.alloc(u8, 8192);
+    defer alloc.free(key);
+    @memset(key, 'x');
+    const artifact = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dense");
+    defer alloc.free(artifact);
+    var builder = ReplayChunkBuilder.init(alloc, .{ .name = "dense", .kind = .dense_vector }, null, 8 * 16384);
+    defer builder.deinit();
+    builder.max_work_chunk_bytes = 16384;
+    builder.dense_replay_working_set_factor = 8;
+    builder.estimated_dense_vector_bytes = 8 * 1024;
+    // No embeddings: the larger memory ceiling must not enlarge delete work.
+    try builder.appendRecord(.{ .deleted_doc_keys = &.{key} });
+    try std.testing.expect(builder.wouldOverflowWithRecord(.{ .deleted_doc_keys = &.{key} }));
+    builder.resetEmptyWindow();
+    try std.testing.expectEqual(@as(u64, 0), builder.tracked_dense_vector_bytes);
+    try std.testing.expectEqual(@as(u64, 16384), builder.max_work_chunk_bytes);
+    try builder.appendRecord(.{ .changed_artifact_keys = &.{artifact} });
+    try std.testing.expectEqual(@as(u64, 8192), builder.tracked_dense_vector_bytes);
+    const work_bytes = builder.tracked_bytes - builder.tracked_dense_vector_bytes + builder.tracked_dense_vector_bytes / 8;
+    const deletion: change_journal_mod.Record = .{ .deleted_doc_keys = &.{key} };
+    const deletion_bytes = recordEstimatedBytesForIndex(deletion, .dense_vector, builder.estimated_dense_vector_bytes);
+    builder.max_work_chunk_bytes = work_bytes + deletion_bytes;
+    try std.testing.expect(!builder.wouldOverflowWithRecord(deletion));
+    builder.max_work_chunk_bytes -= 1;
+    try std.testing.expect(builder.wouldOverflowWithRecord(deletion));
+}
+
+test "catchUpIndex enforces the unscaled work ceiling across Lite windows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/derived-dense-vector-work-chunked-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    const artifact_a = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "dv_v1");
+    defer alloc.free(artifact_a);
+    const artifact_b = try internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:b", "dv_v1");
+    defer alloc.free(artifact_b);
+
+    try appendChangeJournalRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:a"},
+        .changed_artifact_keys = &.{artifact_a},
+        .target_hints = &.{.dense_vector},
+    });
+    try appendChangeJournalRecord(&journal, alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:b"},
+        .changed_artifact_keys = &.{artifact_b},
+        .target_hints = &.{.dense_vector},
+    });
+
+    var capture = TestApplyCapture{ .alloc = alloc };
+    defer capture.deinit();
+
+    const estimated_vector_bytes = 8 * 1024 * 1024;
+    const stats = try catchUpIndexWithOptions(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        .{ .name = "dv_v1", .kind = .dense_vector },
+        0,
+        &capture,
+        testApplyCapture,
+        .{
+            .max_chunk_bytes = 64 * 1024 * 1024,
+            .max_work_chunk_bytes = 1024 * 1024 + 4096,
+            .dense_replay_working_set_factor = 8,
+            .estimated_dense_vector_bytes = estimated_vector_bytes,
+        },
+    );
+
+    try std.testing.expectEqual(@as(usize, 2), stats.scanned_entries);
+    try std.testing.expectEqual(@as(usize, 2), stats.applied_entries);
+    try std.testing.expectEqual(@as(usize, 2), capture.call_count);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, capture.sequences.items);
 }

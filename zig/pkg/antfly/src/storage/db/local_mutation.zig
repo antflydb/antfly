@@ -9897,11 +9897,13 @@ pub fn ImplementationFor(comptime D: type) type {
                 ) or
                     (!entry.external and entry.embedding_name != null and
                         generated_names.embeddings.contains(entry.embedding_name.?));
+                const working_set_factor = index_manager.denseReplayWorkingSetFactor();
                 candidates.appendAssumeCapacity(.{
                     .ref = .{
                         .name = entry.config.name,
                         .kind = .dense_vector,
-                        .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32),
+                        .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32) *| working_set_factor,
+                        .dense_replay_working_set_factor = working_set_factor,
                     },
                     .config = &entry.config,
                     .consumes_generated_enrichment = generated,

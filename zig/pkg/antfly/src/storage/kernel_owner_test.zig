@@ -2663,6 +2663,25 @@ test "opaque storage owner transaction recovery crosses callback ABI" {
     try std.testing.expect(cleaned);
 }
 
+test "opaque storage context reports the configured process budget" {
+    const services = @import("kernel_runtime_services.zig");
+    // Borrowed I/O makes budget resolution deterministic instead of clamping
+    // the explicit limit to whichever host/container runs this regression.
+    var executor = services.executor.Borrow.init(&std.testing.io);
+    var small = client.Context{};
+    try small.ensureWithRuntime(.{ .memory_limit_bytes = 64 * 1024 * 1024, .io = &executor });
+    defer small.deinit();
+    var large = client.Context{};
+    try large.ensureWithRuntime(.{ .memory_limit_bytes = 128 * 1024 * 1024, .io = &executor });
+    defer large.deinit();
+    const small_metrics = try small.metrics();
+    const large_metrics = try large.metrics();
+    try std.testing.expect(small_metrics.resource_memory.hard_limit_bytes > 0);
+    try std.testing.expect(large_metrics.resource_memory.hard_limit_bytes > small_metrics.resource_memory.hard_limit_bytes);
+    try std.testing.expect(small_metrics.resource_slice_count > 0);
+    try std.testing.expect(small_metrics.resource_slice_count <= small_metrics.resource_slices.len);
+}
+
 test "opaque storage context enforces owner lifetime and shares process storage state" {
     const first_path = "/tmp/antfly-storage-kernel-context-first";
     const second_path = "/tmp/antfly-storage-kernel-context-second";
@@ -2674,11 +2693,22 @@ test "opaque storage context enforces owner lifetime and shares process storage 
     var context: ?*anyopaque = null;
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_create(&.{}, &context));
     try std.testing.expect(context != null);
-    var metrics: abi.ContextMetricsResult = undefined;
+    var metrics: abi.ContextMetricsResult = .{};
     try std.testing.expectEqual(abi.Status.invalid_argument, abi.antfly_storage_context_metrics(null, &metrics));
     try std.testing.expectEqual(abi.Status.ok, abi.antfly_storage_context_metrics(context, &metrics));
     try std.testing.expectEqual(abi.abi_version, metrics.version);
     try std.testing.expectEqual(@as(u64, 0), metrics.lsm_cache_entry_count);
+    for (71..abi.abi_version) |version| {
+        const old_version: u32 = @intCast(version);
+        // Reject every earlier layout, including main's independent ABI
+        // changes, without writing past the version word.
+        var old_caller: [@sizeOf(abi.ContextMetricsResult)]u8 align(@alignOf(abi.ContextMetricsResult)) = @splat(0xaa);
+        std.mem.writeInt(u32, old_caller[0..4], old_version, .native);
+        const as_result: *abi.ContextMetricsResult = @ptrCast(&old_caller);
+        try std.testing.expectEqual(abi.Status.invalid_abi, abi.antfly_storage_context_metrics(context, as_result));
+        try std.testing.expectEqual(old_version, std.mem.readInt(u32, old_caller[0..4], .native));
+        for (old_caller[4..]) |byte| try std.testing.expectEqual(@as(u8, 0xaa), byte);
+    }
     try std.testing.expectEqual(
         abi.Status.invalid_argument,
         abi.antfly_storage_context_attach_inference_provider(context, null),
