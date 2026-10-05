@@ -39526,7 +39526,6 @@ components:
         - probabilities
         - confidence
         - confidence_method
-        - act_probability
       properties:
         name:
           type: string
@@ -39572,7 +39571,9 @@ components:
           format: float
           minimum: 0
           maximum: 1
-          description: Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+          description: Auxiliary model estimate for acting, from models with an action head (Laya). Does
+            not authorize or execute a tool call.
+          x-go-type-skip-optional-pointer: false
     ExtractionAttributeLabel:
       type: object
       required:

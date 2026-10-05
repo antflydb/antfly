@@ -11847,8 +11847,8 @@ pub const ExtractionDecision = struct {
     expected_value: ?f32 = null,
     /// Boolean decisions only; probability of the true label.
     true_probability: ?f32 = null,
-    /// Auxiliary model estimate for acting. Does not authorize or execute a tool call.
-    act_probability: f32,
+    /// Auxiliary model estimate for acting, from models with an action head (Laya). Does not authorize or execute a tool call.
+    act_probability: ?f32 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -11860,7 +11860,7 @@ pub const ExtractionDecision = struct {
         .{ "confidence_method", "confidence_method", false },
         .{ "expected_value", "expected_value", true },
         .{ "true_probability", "true_probability", true },
-        .{ "act_probability", "act_probability", false },
+        .{ "act_probability", "act_probability", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -11893,8 +11893,10 @@ pub const ExtractionDecision = struct {
             try jw.objectField("true_probability");
             try jw.write(value);
         }
-        try jw.objectField("act_probability");
-        try jw.write(self.act_probability);
+        if (self.act_probability) |value| {
+            try jw.objectField("act_probability");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

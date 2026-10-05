@@ -20323,9 +20323,9 @@ export interface components {
             true_probability?: number;
             /**
              * Format: float
-             * @description Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+             * @description Auxiliary model estimate for acting, from models with an action head (Laya). Does not authorize or execute a tool call.
              */
-            act_probability: number;
+            act_probability?: number;
         };
         ExtractionAttributeLabel: {
             label: string;
