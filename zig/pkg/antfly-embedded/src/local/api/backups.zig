@@ -22,7 +22,7 @@ pub const remote_uri = @import("../serverless/remote_uri.zig");
 pub const tables_api = @import("tables.zig");
 pub const common_secrets = @import("../common/secrets.zig");
 pub const common_config = @import("../common/config.zig");
-pub const bedrock = @import("antfly_inference_bedrock");
+pub const aws = @import("antfly_credentials").aws;
 pub const httpx = @import("httpx");
 pub const google_auth = @import("antfly_google").auth;
 pub const backup_contract = @import("backup_contract.zig");
@@ -113,15 +113,15 @@ pub const AwsCredentialContext = struct {
     alloc: std.mem.Allocator,
     io_impl: ?*std.Io.Threaded,
     http: httpx.Client,
-    cache: bedrock.CredentialCache = .{},
+    cache: aws.CredentialCache = .{},
     region: []u8,
-    source: bedrock.CredentialSource,
+    source: aws.CredentialSource,
     filesystem_io: ?std.Io,
 
     pub fn init(
         alloc: std.mem.Allocator,
         region: []const u8,
-        source: bedrock.CredentialSource,
+        source: aws.CredentialSource,
         network_io: ?std.Io,
         filesystem_io: ?std.Io,
     ) !AwsCredentialContext {
@@ -176,7 +176,7 @@ pub const AwsCredentialContext = struct {
             .session_token = if (credentials.session_token) |value| @constCast(value) else null,
             .ownership = .{ .borrowed = .{
                 .ctx = lease.releaseContext(),
-                .release = bedrock.CredentialCache.Lease.releaseOpaque,
+                .release = aws.CredentialCache.Lease.releaseOpaque,
             } },
         };
     }
@@ -260,7 +260,7 @@ pub fn s3ConfigForConnection(
     errdefer cfg.deinit(alloc);
     if (static) return cfg;
 
-    const source: bedrock.CredentialSource = switch (external.credentials.source) {
+    const source: aws.CredentialSource = switch (external.credentials.source) {
         .default => .default,
         .static => unreachable,
         .profile => .{ .profile = .{

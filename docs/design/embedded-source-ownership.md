@@ -12,6 +12,7 @@ release changes belong to the separate licensing PR.
 | `pkg/antfly-embedded/src/local` | DB, WAL, LSM, indexes, search, graph execution, local transactions, local backups/restore, SQL and decision-function evaluation, portable lake readers, Lite, public C API and file CLI |
 | `pkg/antfly-embedded/src/inference` | Antfly inference providers and embedding integration |
 | `pkg/inference` | Model execution, inference host and native provider exports |
+| `lib/credentials` | Credential-source identities and native AWS discovery/cache shared by lake, backups and Bedrock |
 | `pkg/antfly/src` | HTTP handlers, distributed transactions, Raft coordination, cluster metadata, hot standby, server storage-owner adapters and private C API |
 | `pkg/antfly-embedded/build` | Local storage profiles, public C API, native provider archives and browser build |
 | `build_support/antfly` | Shared module composition, dependency configuration, runtime contracts and test collection |
@@ -49,6 +50,10 @@ cursors live in the local source owner. Sidecar and row-fragment codecs required
 by those readers are portable data operations, not cluster coordination.
 
 The native Zig package exposes these capabilities through `antfly_embedded.lake`.
+The public package, C API, file CLI and native reader tests use the same embedded
+dependency composer. Consumer regressions import the public package and open a
+host-resolved source, scan its SQL cursor and compile SQL. Native boundary checks
+include both the public package and C API owners.
 Its `sql_cursor` implements the shared SQL catalog cursor contract; callers can
 use it from their SQL backend without an HTTP server, Raft group or replica.
 `lake.host.OpenOptions` accepts a borrowed resolver for managed credential
@@ -58,6 +63,26 @@ releases that owner. With no resolver, ordinary file/cloud URIs use the portable
 object-store implementation. The server resolves node connections and secrets
 in `configured_object_store_support.zig`, then supplies that port. It uses a thin
 `api/lake_sql_cursor.zig` adapter over the same cursor implementation.
+
+AWS discovery and ref-counted immutable credential snapshots live in
+`lib/credentials/src/aws.zig`, independent of any inference provider. Bedrock,
+lake readers, backups and server connection validation consume that owner.
+Bedrock retains type aliases for compatibility. Cache leases keep credentials
+alive across refresh and cache shutdown; absolute deadline/cancellation context
+continues across credential discovery and provider dispatch. Browser identity
+contracts do not expose native AWS discovery. The extracted implementation keeps
+its ELv2 license in this structural PR and is part of the Apache transition in
+#893, explicitly tracked by the license-header classifier.
+
+Google authentication already follows this split: `lib/google/src/auth.zig`
+owns ADC/service-account discovery, token minting, refresh and caching. Vertex
+and GCS choose their scopes and consume that shared owner. API-key adapters
+receive resolved keys and format service authorization headers. Antfly secret
+references, connection configuration and provider resource lifetimes remain in
+their host/integration owners; credential-source identities remain shared in
+`lib/credentials`. Extract generic authentication mechanics when another service
+needs them, while keeping service scopes, request signing and header conventions
+with the appropriate protocol adapter.
 
 Cluster placement, distributed query orchestration, catalog publication,
 sidecar build coordination, managed credential policy and HTTP serving remain
@@ -95,7 +120,7 @@ From `zig/`, build the local products with:
 ```sh
 zig build --build-file embedded.build.zig lite capi-smoke embedded-capi-check -Dmetal=false
 zig build --build-file embedded.build.zig wasm-test -Dmetal=false
-zig build --build-file embedded.build.zig embedded-lake-test -Dmetal=false
+zig build --build-file embedded.build.zig embedded-lake-test embedded-package-test aws-credentials-test -Dmetal=false
 ```
 
 The public library compiles its local C API directly and links native inference
@@ -110,7 +135,7 @@ entry point for process isolation. Public executable names and release packaging
 by this refactor.
 
 The staged-build check removes the entire server package before compiling the
-CLI, public C API, native boundary and WASM products:
+CLI, public C API, public Zig package, AWS credentials, native lake and WASM products:
 
 ```sh
 python3 tools/check_embedded_isolated_build.py -- -j1

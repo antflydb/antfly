@@ -131,6 +131,8 @@ def main() -> None:
                 "capi-smoke",
                 "embedded-capi-check",
                 "embedded-lake-test",
+                "embedded-package-test",
+                "aws-credentials-test",
                 "embedded-native-module-boundary-check",
                 "embedded-wasm-module-boundary-check",
                 "wasm-test",

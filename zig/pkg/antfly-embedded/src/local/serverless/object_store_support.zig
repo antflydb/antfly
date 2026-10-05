@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const object_storage = @import("../storage/object_storage.zig");
-const bedrock = @import("antfly_inference_bedrock");
+const aws = @import("antfly_credentials").aws;
 const google_auth = @import("antfly_google").auth;
 const remote_uri = @import("remote_uri.zig");
 
@@ -27,7 +27,7 @@ pub const S3Options = struct {
     access_key_id: ?[]const u8 = null,
     secret_access_key: ?[]const u8 = null,
     session_token: ?[]const u8 = null,
-    credential_source: bedrock.CredentialSource = .default,
+    credential_source: aws.CredentialSource = .default,
     use_ssl: bool = true,
     addressing_style: object_storage.S3.AddressingStyle = .path,
     create_bucket: bool = false,

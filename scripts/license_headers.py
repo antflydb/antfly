@@ -36,6 +36,7 @@ ELV2_ROOTS = (
 
 # Source moves preserve the original license until the licensing PR lands.
 ELV2_FILES = {
+    "zig/lib/credentials/src/aws.zig",
     "zig/build_support/antfly/test_partitions.zig",
     "zig/build_support/antfly/runtime_roles.zig",
     "zig/pkg/inference/src/host/native_exports.zig",

@@ -3,16 +3,16 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objectstore = @import("objectstore");
-const bedrock = @import("antfly_inference_bedrock");
+const aws = @import("antfly_credentials").aws;
 
 pub const AwsCredentialContext = struct {
     alloc: Allocator,
     http: @import("httpx").Client,
-    cache: bedrock.CredentialCache = .{},
+    cache: aws.CredentialCache = .{},
     region: []u8,
-    source: bedrock.CredentialSource,
+    source: aws.CredentialSource,
 
-    pub fn init(alloc: Allocator, region: []const u8, source: bedrock.CredentialSource, io: std.Io) !AwsCredentialContext {
+    pub fn init(alloc: Allocator, region: []const u8, source: aws.CredentialSource, io: std.Io) !AwsCredentialContext {
         const owned_region = try alloc.dupe(u8, region);
         return .{
             .alloc = alloc,
@@ -44,7 +44,7 @@ pub const AwsCredentialContext = struct {
             .session_token = if (credentials.session_token) |value| @constCast(value) else null,
             .ownership = .{ .borrowed = .{
                 .ctx = lease.releaseContext(),
-                .release = bedrock.CredentialCache.Lease.releaseOpaque,
+                .release = aws.CredentialCache.Lease.releaseOpaque,
             } },
         };
     }

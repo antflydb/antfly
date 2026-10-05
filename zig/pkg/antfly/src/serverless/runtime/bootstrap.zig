@@ -35,7 +35,7 @@ const enrichment_mod = @import("../enrichment/mod.zig");
 const search_sources = @import("../search_sources.zig");
 const runtime_manager = @import("manager.zig");
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
-const bedrock = @import("antfly_inference_bedrock");
+const aws = @import("antfly_credentials").aws;
 const foreign_mod = @import("../../foreign/mod.zig");
 const scraping = @import("antfly_scraping");
 const object_store_support = @import("antfly_local_sources").serverless_object_store_support;
@@ -281,7 +281,7 @@ fn gcsOptionsEql(a: object_store_support.GcsOptions, b: object_store_support.Gcs
         optionalStringEql(a.scope, b.scope);
 }
 
-fn credentialSourceEql(a: bedrock.CredentialSource, b: bedrock.CredentialSource) bool {
+fn credentialSourceEql(a: aws.CredentialSource, b: aws.CredentialSource) bool {
     if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
     return switch (a) {
         .default => true,

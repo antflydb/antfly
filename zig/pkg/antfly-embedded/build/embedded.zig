@@ -15,7 +15,8 @@
 const std = @import("std");
 const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
 
-pub fn configureModule(
+/// Freestanding composition has no native cloud authentication or lake I/O.
+pub fn configureBrowserModule(
     b: *std.Build,
     storage_boundary: @import("storage_boundary.zig").Modules,
     mod: *std.Build.Module,
@@ -77,7 +78,6 @@ pub fn configureModule(
 const addMacosSdkPaths = @import("../../../lib/platform/build_support.zig").addMacosSdkPaths;
 const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
-const configureEmbeddedModule = @import("embedded.zig").configureModule;
 const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
 
 pub const AddEmbeddedOptions = struct {
@@ -122,85 +122,21 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
     const optimize = options.optimize;
     const strip = options.strip;
     const link_libc = options.antfly_imports.platform_link_libc;
-    const build_options = options.antfly_imports.build_options;
     const httpx_mod = options.antfly_imports.httpx;
     const structlog_mod = options.antfly_imports.structlog;
-    const public_openapi_mod = options.antfly_imports.public_openapi;
     const client_openapi_mod = options.antfly_imports.client_openapi;
-    const indexes_openapi_mod = options.antfly_imports.indexes_openapi;
-    const sort_openapi_mod = options.antfly_imports.sort_openapi;
-    const query_openapi_mod = options.antfly_imports.query_openapi;
-    const metadata_openapi_mod = options.antfly_imports.metadata_openapi;
-    const schema_openapi_mod = options.antfly_imports.schema_openapi;
-    const handlebars_mod = options.antfly_imports.handlebars;
     const platform_mod = options.antfly_imports.platform;
-    const objectstore_mod = options.antfly_imports.objectstore;
-    const bloom_mod = options.antfly_imports.bloom;
     const vector_mod = options.antfly_imports.vector;
-    const hash_mod = options.antfly_imports.hash;
-    const vectorindex_mod = options.antfly_imports.vectorindex;
-    const fst_mod = options.antfly_imports.fst;
-    const regex_mod = options.antfly_imports.regex;
-    const json_mod = options.antfly_imports.json;
-    const matcher_mod = options.antfly_imports.matcher;
-    const resolver_mod = options.antfly_imports.resolver;
-    const chunking_mod = options.antfly_imports.chunking;
-    const scraping_mod = options.antfly_imports.scraping;
-    const reranking_mod = options.antfly_imports.reranking;
-    const image_mod = options.antfly_imports.image;
-    const pdf_mod = options.antfly_imports.pdf;
-    const font_mod = options.antfly_imports.font;
-    const transcribing_mod = options.antfly_imports.transcribing;
-    const reader_config_mod = options.antfly_imports.reader_config;
     const antfly_imports = options.antfly_imports;
     const antfly_mod = options.antfly_mod;
-    const embedded_deps = .{
-        build_options,
-        antfly_imports.lite_options,
-        json_mod,
-        public_openapi_mod,
-        query_openapi_mod,
-        indexes_openapi_mod,
-        sort_openapi_mod,
-        metadata_openapi_mod,
-        schema_openapi_mod,
-        reranking_mod,
-        objectstore_mod,
-        httpx_mod,
-        platform_mod,
-        chunking_mod,
-        bloom_mod,
-        vector_mod,
-        vectorindex_mod,
-        hash_mod,
-        fst_mod,
-        regex_mod,
-        image_mod,
-        font_mod,
-        pdf_mod,
-        handlebars_mod,
-    };
-
     const embedded_support_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/local/embedded_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    @call(.auto, configureEmbeddedModule, .{ b, antfly_imports.storage_boundary, embedded_support_mod } ++ embedded_deps ++ .{addSnowballModule});
-    embedded_support_mod.addImport("antfly_cancellation", antfly_imports.cancellation);
-    embedded_support_mod.addImport("antfly_runtime_fs", antfly_imports.runtime_fs);
-    embedded_support_mod.addImport("antfly_inference_execution_context", antfly_imports.inference_execution_context);
-    embedded_support_mod.addImport("antfly_inference_work", antfly_imports.inference_work);
-    embedded_support_mod.addImport("antfly_cache_budget", antfly_imports.cache_budget);
-    embedded_support_mod.addImport("antfly_runtime_abi", antfly_imports.runtime_abi);
-    embedded_support_mod.addImport("antfly_public_limits", antfly_imports.public_limits);
-    embedded_support_mod.addImport("antfly_template_content", antfly_imports.template_content);
-    embedded_support_mod.addImport("antfly_sparse_embedding", antfly_imports.sparse_embedding);
-    embedded_support_mod.addImport("antfly_scraping", scraping_mod);
-    embedded_support_mod.addImport("antfly_resolver", resolver_mod);
-    embedded_support_mod.addImport("antfly_matcher", matcher_mod);
-    embedded_support_mod.addImport("antfly_reader_config", reader_config_mod);
-    embedded_support_mod.addImport("antfly_transcribing", transcribing_mod);
+    // The public package and independent products use one native dependency
+    // composer. Browser composition remains a separate freestanding profile.
+    antfly_imports.configureEmbedded(b, embedded_support_mod, link_libc);
 
     const embedded_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/engine/root.zig"),
@@ -367,6 +303,18 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .header,
         "antfly.h",
     );
+
+    const public_consumer_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly-embedded/tests/lake.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    public_consumer_mod.addImport("antfly-embedded", antfly_embedded_pkg_mod);
+    const public_consumer_tests = b.addTest(.{ .root_module = public_consumer_mod });
+    b.step("embedded-package-test", "Exercise lake readers and SQL through the public Zig package")
+        .dependOn(&b.addRunArtifact(public_consumer_tests).step);
+    const package_boundary = @import("embedded_boundary.zig").add(b, antfly_embedded_pkg_mod);
+    b.top_level_steps.get("embedded-native-module-boundary-check").?.step.dependOn(&package_boundary.step);
 
     const capi_step = b.step("capi", "Build the public libantfly C ABI shared library");
     capi_step.dependOn(&install_libantfly.step);

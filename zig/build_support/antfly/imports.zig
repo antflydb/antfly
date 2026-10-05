@@ -341,6 +341,7 @@ pub const AntflyRootImports = struct {
             "scraping_openapi", "vectorindex",
         }) |field| self.addImport(mod, field);
         mod.addImport("antfly_lite_options", self.lite_options);
+        mod.addImport("antfly_font", self.font);
         addSnowballModule(b, mod);
     }
 

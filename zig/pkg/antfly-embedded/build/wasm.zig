@@ -20,7 +20,7 @@ const image_build = @import("../../../lib/image/build_support.zig");
 const pdf_build = @import("../../../lib/pdf/build_support.zig");
 const tokenizer_build = @import("../../../lib/tokenizer/build_support.zig");
 const codegen = @import("../../../build_support/openapi.zig");
-const configureEmbeddedModule = @import("embedded.zig").configureModule;
+const configureBrowserModule = @import("embedded.zig").configureBrowserModule;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 
 pub const Result = struct {
@@ -166,7 +166,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .optimize = optimize,
     });
     const wasm_storage_boundary = @import("storage_boundary.zig").create(b, wasm_target, optimize);
-    @call(.auto, configureEmbeddedModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
+    @call(.auto, configureBrowserModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
     embedded_support_wasm_mod.addImport("sql_parser", wasm_sql_parser_mod);
     const wasm_cancellation_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/cancellation.zig"),

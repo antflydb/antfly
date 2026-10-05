@@ -257,3 +257,17 @@ Provisioning DTOs stay server-owned. The independent `embedded-lake-test` target
 exercises this capability without the server source tree. Zig 0.17 migration
 changes must apply to the extracted build composition, source-owner partition
 collection, native C API, file CLI and browser build, not just server targets.
+
+### Public lake composition and shared AWS authentication
+
+Native package composition now uses the same dependency owner as C API and
+reader tests. The public-package consumer target opens a host-resolved source,
+scans through the SQL cursor and compiles SQL; it is part of isolated product
+validation and the ordinary unit aggregate. The public package is also audited
+by the native source-boundary check.
+
+Generic AWS credential sources, discovery, deadline propagation and cache leases
+live in `lib/credentials/src/aws.zig`. Lake, backups and Bedrock use that shared
+owner. Native credential regressions run in the unit aggregate. Existing source
+licenses remain preserved, including the explicit ELv2 exception for the extracted
+AWS implementation; #893 must include it in the Apache license audit.

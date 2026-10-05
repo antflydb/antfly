@@ -16,6 +16,9 @@
 const std = @import("std");
 const binding = @import("external_source/catalog_binding.zig");
 const stores = @import("object_store_support.zig");
+pub const Binding = binding.Binding;
+pub const OpenedObjectStore = stores.OpenedObjectStore;
+
 pub const OpenOptions = struct {
     file_bucket: []const u8 = "antfly",
     resolver: ?Resolver = null,

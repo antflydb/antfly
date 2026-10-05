@@ -844,6 +844,20 @@ pub fn create(b: *std.Build) ?Shared {
         .target = target,
         .optimize = optimize,
     });
+    credentials_mod.addImport("httpx", httpx_mod);
+    credentials_mod.addImport("antfly_cancellation", cancellation_mod);
+    credentials_mod.link_libc = link_libc;
+    const aws_tests_mod = b.createModule(.{
+        .root_source_file = b.path("lib/credentials/src/aws.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = link_libc,
+    });
+    aws_tests_mod.addImport("httpx", httpx_mod);
+    aws_tests_mod.addImport("antfly_cancellation", cancellation_mod);
+    const aws_tests = b.addTest(.{ .root_module = aws_tests_mod });
+    b.step("aws-credentials-test", "Test shared AWS discovery and credential cache ownership")
+        .dependOn(&b.addRunArtifact(aws_tests).step);
     const cache_budget_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/cache_budget.zig"),
         .target = target,
