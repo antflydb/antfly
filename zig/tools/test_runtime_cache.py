@@ -457,6 +457,12 @@ class RuntimeCacheTest(unittest.TestCase):
             audio.read_bytes()
             + b'\npub const cache_test_profile = @import("builtin").mode;\n'
         )
+        for name in ("prometheus", "structlog"):
+            source = self.own(f"zig/lib/{name}/src/root.zig")
+            source.write_bytes(
+                source.read_bytes()
+                + b"\npub const cache_test_observability_revision: u8 = 1;\n"
+            )
         for standalone in (False, True):
             with self.subTest(standalone=standalone):
                 if standalone:
@@ -486,14 +492,27 @@ class RuntimeCacheTest(unittest.TestCase):
                 for name in ("prometheus", "structlog"):
                     with self.subTest(module=name):
                         source = self.own(f"zig/lib/{name}/src/root.zig")
-                        contents = (
-                            source.read_bytes()
-                            + b"\n// actual observability dependency\n"
+                        # Change a value consumed by the tiny entry bodies;
+                        # comments and unused declarations need not recompile.
+                        before = 1 + int(standalone)
+                        contents = source.read_bytes().replace(
+                            f"cache_test_observability_revision: u8 = {before};".encode(),
+                            f"cache_test_observability_revision: u8 = {before + 1};".encode(),
                         )
+                        self.assertNotEqual(contents, source.read_bytes())
                         source.write_bytes(contents)
+                        changed = self.build(target)
                         self.assertRegex(
-                            self.build(target), rf"compile {artifact} debug \S+ success"
+                            changed, rf"compile {artifact} debug \S+ success"
                         )
+                        if standalone:
+                            structlog_revision = (
+                                before if name == "prometheus" else before + 1
+                            )
+                            self.assertIn(
+                                f"OBSERVABILITY_REVISION {before + 1} {structlog_revision}",
+                                changed,
+                            )
                         source.unlink()
                         self.build("--help")
                         self.assertIn(
@@ -1533,12 +1552,14 @@ class RuntimeCacheTest(unittest.TestCase):
     def test_enabled_backend_identities(self):
         for backend, source in (("metal", METAL), ("cuda", CUDA)):
             with self.subTest(backend=backend):
+                # Establish the owned input before warming the cache: replacing
+                # a symlink with a copy is itself an input change in Zig 0.17.
+                path = self.own(source)
                 first = self.build(
                     "cache-identity", "runtime-unit-cli", backend=backend
                 )
                 label = f"{backend.upper()}_IDENTITY"
                 before = self.probe(first, label).split()
-                path = self.own(source)
                 self.assertEqual(
                     before[0], hashlib.sha256(path.read_bytes()).hexdigest()
                 )

@@ -15,6 +15,23 @@
 //! Inspect production module profiles before fixtures substitute entry bodies.
 const std = @import("std");
 
+/// Tiny entry bodies still consume the production owner's observability inputs.
+pub fn addObservabilityProbe(root: *std.Build.Module, owner: *std.Build.Module) void {
+    root.addImport("cache_prometheus", owner.import_table.get("prometheus") orelse
+        @panic("inference owner is missing prometheus"));
+    root.addImport("cache_structlog", owner.import_table.get("structlog") orelse
+        @panic("inference owner is missing structlog"));
+}
+
+pub const observability_probe_source =
+    \\fn observabilityRevision(comptime module: type) u64 {
+    \\    return if (@hasDecl(module, "cache_test_observability_revision"))
+    \\        module.cache_test_observability_revision
+    \\    else 0;
+    \\}
+    \\
+;
+
 pub fn check(artifact: *std.Build.Step.Compile) void {
     var seen = std.AutoHashMap(*std.Build.Module, void).init(artifact.step.owner.allocator);
     inspect(artifact, artifact.root_module, &seen);

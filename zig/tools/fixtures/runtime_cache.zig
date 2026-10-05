@@ -182,6 +182,10 @@ pub fn build(b: *std.Build) void {
                 std.debug.panic("{s} archive depends on inference backend identity through {s}", .{ @tagName(unit), path });
         }
         inspect(artifact.root_module, unit, artifacts.inference.build_info_object, &seen);
+        if (unit == .inference) profiles.addObservabilityProbe(
+            artifact.root_module,
+            artifact.root_module.import_table.get("inference_server").?,
+        );
         if (unit == .distributed) artifact.root_module.addImport("cache_lite_capabilities", b.createModule(.{
             .root_source_file = b.path("pkg/antfly/src/storage/lite/capabilities.zig"),
             .target = artifact.root_module.resolved_target,
@@ -193,14 +197,15 @@ pub fn build(b: *std.Build) void {
                 "std.hash.Wyhash.hash(0, specs.metadata) ^ std.hash.Wyhash.hash(0, specs.extensions) ^ " ++
                 "std.hash.Wyhash.hash(0, specs.auth) ^ std.hash.Wyhash.hash(0, specs.inference_config)"
         else if (unit == .inference)
-            "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @sizeOf(@import(\"inference_server\").execution_control.Cancellation)"
+            "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @sizeOf(@import(\"inference_server\").execution_control.Cancellation) ^ " ++
+                "observabilityRevision(@import(\"cache_prometheus\")) ^ (observabilityRevision(@import(\"cache_structlog\")) << 8)"
         else if (unit == .distributed)
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\") ^ @intFromBool(@import(\"cache_lite_capabilities\").capabilitiesForProfile(.native).local_inference_runtime)"
         else
             "@import(\"antfly_hash\").Adler32.hash(\"cache probe\")";
         artifact.root_module.root_source_file = sources.add(b.fmt("{s}.zig", .{@tagName(unit)}), b.fmt(
             "const std = @import(\"std\");\n{s}export fn probe_{s}() u64 {{ return {s}; }}\n",
-            .{ if (unit == .api_kernel) "const specs = @import(\"antfly_openapi_specs\");\n" else "", @tagName(unit), expression },
+            .{ if (unit == .api_kernel) "const specs = @import(\"antfly_openapi_specs\");\n" else if (unit == .inference) profiles.observability_probe_source else "", @tagName(unit), expression },
         ));
         artifact.step.max_rss = 0;
     }
