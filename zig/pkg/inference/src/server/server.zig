@@ -4104,7 +4104,7 @@ pub const Node = struct {
     pub fn attachIo(self: *Node, io: std.Io) !void {
         if (self.hard_cancellation_watchdog) |watchdog| try watchdog.start(io);
         self.session_manager.io = io;
-        self.model_manager.attachIo(io);
+        try self.model_manager.attachIo(io);
     }
 
     /// Select the executor for direct model-family work. Production nodes
@@ -20794,6 +20794,25 @@ test "gliner boundary v2 direct cancellation and HTTP capacity use existing admi
     try std.testing.expectEqual(@as(u64, 3), node.metrics.errors_total.impl.count);
     try std.testing.expectEqual(@as(i64, 0), node.metrics.requests_active.impl.value);
     try std.testing.expectEqual(@as(i64, 0), node.metrics.extraction_v2.active.impl.value);
+}
+
+test "node attachment propagates model eviction scheduling failure" {
+    var unavailable_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer unavailable_io.deinit();
+    var available_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    });
+    defer available_io.deinit();
+    var node = try Node.init(std.testing.allocator, .{ .keep_alive_ms = 1 });
+    defer node.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, node.attachIo(unavailable_io.io()));
+    try std.testing.expect(!node.model_manager.eviction_loop_started);
+    try node.attachIo(available_io.io());
+    try std.testing.expect(node.model_manager.eviction_loop_started);
 }
 
 test "gliner boundary v2 direct control binds cold and cached Metal process guards" {
