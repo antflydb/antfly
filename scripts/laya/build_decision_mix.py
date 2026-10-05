@@ -148,7 +148,8 @@ class Mix:
         if not text or norm in self.exclude or norm in self.seen:
             return None
         self.seen.add(norm)
-        return f"{source}/{key}"
+        # Source row ids are not always unique; the case count always is.
+        return f"{source}/{len(self.seen)}-{key}"
 
     def smoothed(self, n: int, gold: int) -> list[float]:
         eps = self.smoothing
