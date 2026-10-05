@@ -270,10 +270,13 @@ pub fn executeWithScratch(a: std.mem.Allocator, scratch: std.mem.Allocator, sess
         if (max_input_tokens) |limit| if (prepared.ids.len > limit) return error.InferenceInputTokensExceeded;
         tokens += prepared.ids.len;
     }
-    const order = if (session.backend() == .cuda and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_BUCKETING", true))
-        try bucketOrder(a, sequences)
+    // Group similar lengths so a chunk pads to its own longest input rather
+    // than the request's.
+    const bucketing = if (session.backend() == .cuda)
+        platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_OPTIMIZATIONS", true) and platform.env.getenvBoolDefault("ANTFLY_CUDA_LAYA_BUCKETING", true)
     else
-        null;
+        platform.env.getenvBoolDefault("ANTFLY_LAYA_BUCKETING", true);
+    const order = if (bucketing) try bucketOrder(a, sequences) else null;
     defer if (order) |indices| a.free(indices);
     const ordered_tasks = if (order != null) try a.alloc(Task, tasks.len) else null;
     defer if (ordered_tasks) |value| a.free(value);

@@ -61,16 +61,58 @@ pub fn forward(cb: *const CB, a: std.mem.Allocator, cfg: Config, encoder: CT, ma
     const hidden = transformed orelse encoder;
     // The CUDA tail is scorer-only; a pointer head scores on the host path.
     if (cb.kind() == .cuda and cfg.decision_head == .scorer and cfg.format == .laya) return forwardCudaTail(cb, a, cfg, hidden, markers, batch, seq, count, dim);
-    const host = try cb.toFloat32(hidden, a);
-    defer a.free(host);
-    if (host.len != batch * seq * dim) return error.UnexpectedOutputShape;
     const tokens = try a.alloc(i64, markers.len);
     defer a.free(tokens);
     for (markers, tokens, 0..) |pos, *token, i| token.* = if (pos < 0) -1 else @intCast((i / count) * seq + @as(usize, @intCast(pos)));
+    // Metal keeps the hidden states on the device: reading back every row of
+    // a padded batch to score a few markers dominated the decision's time.
+    if (cb.kind() == .metal and cfg.decision_head == .scorer) {
+        const rows = try a.alloc(i64, batch);
+        defer a.free(rows);
+        for (rows, 0..) |*row, i| row.* = @intCast(i * seq);
+        return scoreDevice(cb, a, cfg, hidden, tokens, rows, count, dim);
+    }
+    const host = try cb.toFloat32(hidden, a);
+    defer a.free(host);
+    if (host.len != batch * seq * dim) return error.UnexpectedOutputShape;
     const anchors = try a.alloc(usize, batch);
     defer a.free(anchors);
     for (anchors, 0..) |*anchor, row| anchor.* = row * seq;
     return scoreHost(cb, a, cfg, host, tokens, anchors, count, dim);
+}
+
+/// The option scorer over gathered marker rows `[rows, dim]`, read back.
+/// Laya: LayerNorm `scorer.0`, linear `scorer.1`, GELU, linear `scorer.3`.
+/// OpenDecider: linear `scorer.0`, GELU, LayerNorm `scorer.2`, linear `scorer.3`.
+fn scorerLogits(cb: *const CB, a: std.mem.Allocator, cfg: Config, m: CT, rows: usize, dim: usize) ![]f32 {
+    if (cfg.format == .opendecider) {
+        const s0 = try linear(cb, m, "scorer.0", rows, dim, dim);
+        defer cb.free(s0);
+        const sg = try exactGelu(cb, s0);
+        defer cb.free(sg);
+        const n = try norm(cb, sg, "scorer.2", dim);
+        defer cb.free(n);
+        const s3 = try linear(cb, n, "scorer.3", rows, dim, 1);
+        defer cb.free(s3);
+        return cb.toFloat32(s3, a);
+    }
+    const n = try norm(cb, m, "scorer.0", dim);
+    defer cb.free(n);
+    const s1 = try linear(cb, n, "scorer.1", rows, dim, dim);
+    defer cb.free(s1);
+    const sg = try exactGelu(cb, s1);
+    defer cb.free(sg);
+    const s2 = try linear(cb, sg, "scorer.3", rows, dim, 1);
+    defer cb.free(s2);
+    return cb.toFloat32(s2, a);
+}
+
+/// The output of a checkpoint without an action head: logits only.
+fn logitsOnly(a: std.mem.Allocator, logits: []const f32, batch: usize, count: usize) ![]Tensor {
+    const result = try a.alloc(Tensor, 1);
+    errdefer a.free(result);
+    result[0] = try Tensor.initFloat32(a, "logits", &.{ @intCast(batch), @intCast(count) }, logits);
+    return result;
 }
 
 /// Score `anchors.len` decisions from host hidden states `[tokens, dim]`.
@@ -89,38 +131,14 @@ fn scoreHost(cb: *const CB, a: std.mem.Allocator, cfg: Config, host: []const f32
     defer cb.free(m);
     const logits = if (cfg.decision_head == .pointer)
         try pointerLogits(cb, a, cfg, host, m, anchors, count, dim)
-    else if (cfg.format == .opendecider) blk: {
-        const s0 = try linear(cb, m, "scorer.0", batch * count, dim, dim);
-        defer cb.free(s0);
-        const sg = try exactGelu(cb, s0);
-        defer cb.free(sg);
-        const n = try norm(cb, sg, "scorer.2", dim);
-        defer cb.free(n);
-        const s3 = try linear(cb, n, "scorer.3", batch * count, dim, 1);
-        defer cb.free(s3);
-        break :blk try cb.toFloat32(s3, a);
-    } else blk: {
-        const n = try norm(cb, m, "scorer.0", dim);
-        defer cb.free(n);
-        const s1 = try linear(cb, n, "scorer.1", batch * count, dim, dim);
-        defer cb.free(s1);
-        const sg = try exactGelu(cb, s1);
-        defer cb.free(sg);
-        const s2 = try linear(cb, sg, "scorer.3", batch * count, dim, 1);
-        defer cb.free(s2);
-        break :blk try cb.toFloat32(s2, a);
-    };
+    else
+        try scorerLogits(cb, a, cfg, m, batch * count, dim);
     defer a.free(logits);
     if (logits.len != batch * count) return error.UnexpectedOutputShape;
     for (markers, logits) |pos, *logit| if (pos < 0) {
         logit.* = -1e4;
     };
-    if (cfg.n_act == 0) {
-        const result = try a.alloc(Tensor, 1);
-        errdefer a.free(result);
-        result[0] = try Tensor.initFloat32(a, "logits", &.{ @intCast(batch), @intCast(count) }, logits);
-        return result;
-    }
+    if (cfg.n_act == 0) return logitsOnly(a, logits, batch, count);
     const features = try a.alloc(f32, batch * (dim + 4));
     defer a.free(features);
     for (0..batch) |row| {
@@ -145,20 +163,13 @@ fn scoreDevice(cb: *const CB, a: std.mem.Allocator, cfg: Config, hidden: CT, mar
     for (markers, rows) |marker, *row| row.* = @max(marker, 0);
     const gathered = try cb.embeddingLookup(hidden, rows, rows.len, dim);
     defer cb.free(gathered);
-    const n = try norm(cb, gathered, "scorer.0", dim);
-    defer cb.free(n);
-    const s1 = try linear(cb, n, "scorer.1", batch * count, dim, dim);
-    defer cb.free(s1);
-    const sg = try exactGelu(cb, s1);
-    defer cb.free(sg);
-    const s2 = try linear(cb, sg, "scorer.3", batch * count, dim, 1);
-    defer cb.free(s2);
-    const logits = try cb.toFloat32(s2, a);
+    const logits = try scorerLogits(cb, a, cfg, gathered, batch * count, dim);
     defer a.free(logits);
     if (logits.len != batch * count) return error.UnexpectedOutputShape;
     for (markers, logits) |pos, *logit| if (pos < 0) {
         logit.* = -1e4;
     };
+    if (cfg.n_act == 0) return logitsOnly(a, logits, batch, count);
     const stats = try a.alloc(f32, batch * 4);
     defer a.free(stats);
     for (0..batch) |row| actionStats(logits[row * count ..][0..count], markers[row * count ..][0..count], stats[row * 4 ..][0..4]);
