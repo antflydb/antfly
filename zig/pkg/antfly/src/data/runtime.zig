@@ -2710,9 +2710,13 @@ pub const HealthSource = struct {
         try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_retry_scheduled", "gauge", "Whether dropped-table recovery is waiting in its bounded retry backoff", if (dropped_table_recovery.retry_scheduled) 1 else 0);
         try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_consecutive_enqueue_failures", "gauge", "Consecutive dropped-table recovery worker allocations or durable queue submissions that failed", dropped_table_recovery.consecutive_enqueue_failures);
         try health_metrics.appendPromMetric(writer, "antfly_dropped_table_recovery_enqueue_failures_total", "counter", "Dropped-table recovery worker allocations or durable queue submissions that failed and were retained for watchdog retry", dropped_table_recovery.enqueue_failures);
-        try writeResourceMetrics(writer, &self.data_server.provisioned_storage.resource_manager);
+        // One kernel snapshot supplies both ledgers and the cache metrics.
+        const owner_metrics = if (comptime linked_storage) self.data_server.storageOwnerContextMetricsBestEffort() else null;
+        var resource_snapshot = self.data_server.provisioned_storage.resource_manager.snapshot();
+        if (owner_metrics) |*metrics| DataServer.mergeStorageOwnerResourceStats(&resource_snapshot, metrics);
+        try writeResourceMetricsSnapshot(writer, resource_snapshot);
         try writeLsmCacheMetrics(writer, if (comptime linked_storage)
-            self.data_server.storageOwnerLsmCacheStatsBestEffort()
+            if (owner_metrics) |*metrics| storageOwnerLsmCacheStats(metrics) else .{}
         else
             self.data_server.provisioned_storage.lsm_cache.snapshotStats());
         try writeLsmNativeStorageMetrics(writer, live_write_source.lsmNativeStorageStatsBestEffort());
@@ -3436,8 +3440,23 @@ fn asyncMutexMetricValue(stats: antfly.db.types.DBMutexStats, field: AsyncMutexM
     };
 }
 
+fn storageOwnerLsmCacheStats(metrics: *const kernel_owner_client.ContextMetricsResult) lsm_backend_mod.CacheStats {
+    return .{
+        .used_bytes = @intCast(metrics.lsm_cache_used_bytes),
+        .entry_count = @intCast(metrics.lsm_cache_entry_count),
+        .run_state = storageOwnerLsmCacheKindStats(metrics.lsm_run_state),
+        .run_table_raw = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_raw),
+        .run_table_index = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_index),
+        .run_table_block = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_block),
+        .run_table_physical_block = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_physical_block),
+    };
+}
+
 fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.ResourceManager) !void {
-    const snapshot = manager.snapshot();
+    try writeResourceMetricsSnapshot(writer, manager.snapshot());
+}
+
+fn writeResourceMetricsSnapshot(writer: *std.Io.Writer, snapshot: resource_manager_mod.Stats) !void {
     try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_active", "gauge", "Bounded vector read helpers active", snapshot.dense_read_tasks.active);
     try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_peak_active", "gauge", "Bounded vector read helpers peak_active", snapshot.dense_read_tasks.peak_active);
     try health_metrics.appendPromMetric(writer, "antfly_dense_read_helpers_limit", "gauge", "Bounded vector read helpers limit", snapshot.dense_read_tasks.limit);
@@ -3445,7 +3464,7 @@ fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.R
     try health_metrics.appendPromMetric(writer, "antfly_dense_physically_ordered_batches_total", "counter", "Rerank payload batches ordered by retained file and offset", snapshot.dense_read_tasks.physically_ordered_batches);
     try health_metrics.appendPromMetric(writer, "antfly_dense_physically_ordered_requests_total", "counter", "Rerank payload requests ordered by retained file and offset", snapshot.dense_read_tasks.physically_ordered_requests);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_used_bytes", "gauge", "Aggregate physical host memory currently charged to ResourceManager", snapshot.memory.used_bytes);
-    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_peak_bytes", "gauge", "Peak aggregate physical host memory charged to ResourceManager", snapshot.memory.peak_bytes);
+    try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_peak_bytes", "gauge", "Upper bound on aggregate charged memory, summing independently recorded ledger peaks", snapshot.memory.peak_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_bytes", "gauge", "Aggregate managed host-memory soft limit", snapshot.memory.soft_limit_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_hard_limit_bytes", "gauge", "Aggregate managed host-memory hard limit", snapshot.memory.hard_limit_bytes);
     try health_metrics.appendPromMetric(writer, "antfly_resource_host_memory_soft_limit_events_total", "counter", "Aggregate managed host-memory soft-limit events", snapshot.memory.soft_limit_events);
@@ -3464,7 +3483,7 @@ fn writeResourceMetrics(writer: *std.Io.Writer, manager: *resource_manager_mod.R
     try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_cancellations_total", "counter", "Queued dense searches cancelled before admission", snapshot.dense_search_admission.cancellations);
     try health_metrics.appendPromMetric(writer, "antfly_dense_search_admission_wait_ns_total", "counter", "Cumulative nanoseconds dense queries spent queued for candidate-scan permits", snapshot.dense_search_admission.wait_ns);
     try writeResourceMetricFamily(writer, snapshot, .used_bytes, "antfly_resource_used_bytes", "gauge", "Resource slice bytes currently accounted");
-    try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Resource slice peak bytes accounted");
+    try writeResourceMetricFamily(writer, snapshot, .peak_bytes, "antfly_resource_peak_bytes", "gauge", "Upper bound on resource slice charged bytes, summing independently recorded ledger peaks");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_bytes, "antfly_resource_soft_limit_bytes", "gauge", "Resource slice soft limit in bytes");
     try writeResourceMetricFamily(writer, snapshot, .hard_limit_bytes, "antfly_resource_hard_limit_bytes", "gauge", "Resource slice hard limit in bytes");
     try writeResourceMetricFamily(writer, snapshot, .soft_limit_events, "antfly_resource_soft_limit_events_total", "counter", "Resource slice soft-limit events");
@@ -6552,18 +6571,35 @@ pub const DataServer = struct {
             if (self.storage_kernel_context) |context| context.handle else null;
     }
 
-    fn storageOwnerLsmCacheStatsBestEffort(self: *DataServer) lsm_backend_mod.CacheStats {
-        const owner_source = self.kernel_owner_source orelse return .{};
-        const metrics = owner_source.contextMetrics() catch return .{};
-        return .{
-            .used_bytes = @intCast(metrics.lsm_cache_used_bytes),
-            .entry_count = @intCast(metrics.lsm_cache_entry_count),
-            .run_state = storageOwnerLsmCacheKindStats(metrics.lsm_run_state),
-            .run_table_raw = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_raw),
-            .run_table_index = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_index),
-            .run_table_block = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_block),
-            .run_table_physical_block = storageOwnerLsmCacheKindStats(metrics.lsm_run_table_physical_block),
-        };
+    fn storageOwnerContextMetricsBestEffort(self: *DataServer) ?kernel_owner_client.ContextMetricsResult {
+        const owner_source = self.kernel_owner_source orelse return null;
+        return owner_source.contextMetrics() catch null;
+    }
+
+    /// Sum the two ledgers using the kernel's limits. Peaks remain an upper
+    /// bound, since independently recorded peaks need not occur together.
+    fn mergeStorageOwnerResourceStats(stats: *resource_manager_mod.Stats, metrics: *const kernel_owner_client.ContextMetricsResult) void {
+        mergeStorageOwnerBudgetStats(&stats.memory, metrics.resource_memory);
+        const count = @min(@min(stats.slices.len, metrics.resource_slices.len), @as(usize, metrics.resource_slice_count));
+        for (stats.slices[0..count], metrics.resource_slices[0..count]) |*slice, kernel| mergeStorageOwnerBudgetStats(slice, kernel);
+    }
+
+    fn mergeStorageOwnerBudgetStats(stats: anytype, kernel: kernel_owner_client.ContextResourceBudgetStats) void {
+        stats.used_bytes +|= kernel.used_bytes;
+        stats.peak_bytes +|= kernel.peak_bytes;
+        if (kernel.soft_limit_bytes != 0) stats.soft_limit_bytes = kernel.soft_limit_bytes;
+        if (kernel.hard_limit_bytes != 0) stats.hard_limit_bytes = kernel.hard_limit_bytes;
+        stats.soft_limit_events +|= kernel.soft_limit_events;
+        stats.hard_limit_rejections +|= kernel.hard_limit_rejections;
+        if (comptime @hasField(@TypeOf(stats.*), "oversized_single_grants")) stats.oversized_single_grants +|= kernel.oversized_single_grants;
+        if (comptime @hasField(@TypeOf(stats.*), "accounting_errors")) stats.accounting_errors +|= kernel.accounting_errors;
+        // Pressure follows the merged ledger: the combined usage against the
+        // limits now reported, never lower than either manager's own state.
+        const merged = resource_manager_mod.pressureFor(.{
+            .soft_limit_bytes = stats.soft_limit_bytes,
+            .hard_limit_bytes = stats.hard_limit_bytes,
+        }, stats.used_bytes);
+        if (@intFromEnum(merged) > @intFromEnum(stats.pressure)) stats.pressure = merged;
     }
 
     pub fn initApiServer(self: *DataServer) !void {
@@ -30728,8 +30764,9 @@ pub fn runFromIterator(
     defer if (process_storage_kernel_context) |*context| context.deinit();
     if (comptime linked_storage) {
         var context = kernel_owner_client.Context{};
-        try context.ensureWith(.{
-            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        try context.ensureWithRuntime(.{
+            .context = .{ .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else "") },
+            .memory_limit_bytes = process_memory_limit_bytes,
         });
         process_storage_kernel_context = context;
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
@@ -40822,6 +40859,65 @@ fn consumerTests() type {
                 .metadata_raft_role = "future_role",
             });
             try std.testing.expectEqualStrings("unknown", future_topology.metadata_raft_role);
+        }
+
+        test "data runtime kernel resource metrics report combined pressure" {
+            var memory: resource_manager_mod.MemoryStats = .{};
+            DataServer.mergeStorageOwnerBudgetStats(&memory, .{ .used_bytes = 90, .soft_limit_bytes = 75, .hard_limit_bytes = 100 });
+            try std.testing.expectEqual(resource_manager_mod.Pressure.soft, memory.pressure);
+
+            // Node usage and kernel usage together cross the kernel's hard limit.
+            var slice: resource_manager_mod.SliceStats = .{ .name = "slice", .used_bytes = 10 };
+            DataServer.mergeStorageOwnerBudgetStats(&slice, .{ .used_bytes = 95, .soft_limit_bytes = 50, .hard_limit_bytes = 100 });
+            try std.testing.expectEqual(resource_manager_mod.Pressure.hard, slice.pressure);
+
+            // A node-level state above what the merged numbers imply is kept.
+            var node_hard: resource_manager_mod.MemoryStats = .{ .pressure = .hard };
+            DataServer.mergeStorageOwnerBudgetStats(&node_hard, .{});
+            try std.testing.expectEqual(resource_manager_mod.Pressure.hard, node_hard.pressure);
+        }
+
+        test "data runtime kernel resource metrics preserve accounting counters" {
+            var budgets = resource_manager_mod.Options.defaultBudgets();
+            const slice_index = @intFromEnum(resource_manager_mod.Slice.text_merge_buffers);
+            budgets[slice_index] = .{ .soft_limit_bytes = 8, .hard_limit_bytes = 10 };
+            var node = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+            defer node.deinit(std.testing.allocator);
+            var kernel = resource_manager_mod.ResourceManager.init(.{ .budgets = budgets });
+            defer kernel.deinit(std.testing.allocator);
+            // Generate actual slice grants and fail-closed stale-release events in
+            // each ledger, then exercise the same projection, merge, and renderer.
+            for (0..7) |i| {
+                if (i < 3) {
+                    var grant = try node.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2);
+                    var stale = grant;
+                    grant.release();
+                    if (i < 2) stale.release();
+                }
+                var grant = try kernel.reserveBoundedOversizedSingle(.text_merge_buffers, 18, 2);
+                var stale = grant;
+                grant.release();
+                if (i < 5) stale.release();
+            }
+            var snapshot = node.snapshot();
+            const kernel_snapshot = kernel.snapshot();
+            DataServer.mergeStorageOwnerBudgetStats(&snapshot.memory, kernel_owner_client.ContextResourceBudgetStats.fromResourceStats(kernel_snapshot.memory));
+            DataServer.mergeStorageOwnerBudgetStats(&snapshot.slices[slice_index], kernel_owner_client.ContextResourceBudgetStats.fromResourceStats(kernel_snapshot.slices[slice_index]));
+
+            var buffer: [262144]u8 = undefined;
+            var writer: std.Io.Writer = .fixed(&buffer);
+            try writeResourceMetricsSnapshot(&writer, snapshot);
+            const output = writer.buffered();
+            try std.testing.expect(std.mem.indexOf(u8, output, "\nantfly_resource_host_memory_accounting_errors_total 7\n") != null);
+            try std.testing.expect(std.mem.indexOf(u8, output, "\nantfly_resource_oversized_single_grants_total{slice=\"text_merge.buffers\"} 10\n") != null);
+
+            // Long-lived cumulative counters must retain their saturating semantics.
+            var memory: resource_manager_mod.MemoryStats = .{ .accounting_errors = std.math.maxInt(u64) - 1 };
+            DataServer.mergeStorageOwnerBudgetStats(&memory, .{ .accounting_errors = 2 });
+            try std.testing.expectEqual(std.math.maxInt(u64), memory.accounting_errors);
+            var slice: resource_manager_mod.SliceStats = .{ .name = "slice", .oversized_single_grants = std.math.maxInt(u64) - 1 };
+            DataServer.mergeStorageOwnerBudgetStats(&slice, .{ .oversized_single_grants = 2 });
+            try std.testing.expectEqual(std.math.maxInt(u64), slice.oversized_single_grants);
         }
 
         test "data runtime health metrics include replay debt and provisioned warmup counters" {

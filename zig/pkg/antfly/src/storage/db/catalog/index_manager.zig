@@ -298,6 +298,7 @@ pub var test_before_source_vector_checkpoint: ?struct {
 const sparse_backfill_batch_size: usize = 1024;
 const vector_backfill_page_items: usize = 1024;
 const vector_backfill_page_bytes: usize = 16 * 1024 * 1024;
+const dense_lsm_posting_apply_working_set_factor: u64 = 8;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 
@@ -308,6 +309,10 @@ pub const ManagedIndexRef = struct {
     /// Zero preserves the conservative fallback for callers that only know
     /// the projection kind (for example status-only catalog entries).
     estimated_dense_vector_bytes: u64 = 0,
+    /// How many times larger than the raw vector the estimate above is. The
+    /// memory ceiling scales with it, while an independent work ceiling
+    /// preserves unscaled vector and non-vector work per window.
+    dense_replay_working_set_factor: u64 = 1,
 };
 
 pub const LsmOwnerStats = struct {
@@ -13960,10 +13965,12 @@ pub const IndexManager = struct {
             initialized += 1;
         }
         for (self.dense_indexes.items) |entry| {
+            const working_set_factor = self.denseReplayWorkingSetFactor();
             refs[initialized] = .{
                 .name = try alloc.dupe(u8, entry.config.name),
                 .kind = .dense_vector,
-                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32),
+                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32) *| working_set_factor,
+                .dense_replay_working_set_factor = working_set_factor,
             };
             initialized += 1;
         }
@@ -15928,6 +15935,17 @@ pub const IndexManager = struct {
     fn densePostingSidecarEnabled() bool {
         return densePostingWalMutationStoreEnabled() or
             environmentFlag("ANTFLY_HBC_POSTING_SIDECAR", false);
+    }
+
+    /// Replay windows are sized from estimated bytes per vector. Storage that
+    /// cannot host the native posting store (Lite) applies through
+    /// HBC-over-LSM, where one write transaction owns a copy of every point
+    /// read until it commits: the measured working set is about 57 KiB per
+    /// 1536-dimension vector, not 6 KiB.
+    pub fn denseReplayWorkingSetFactor(self: *const IndexManager) u64 {
+        if (self.configuredDenseNativePostingStoreSupported() and
+            nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return 1;
+        return dense_lsm_posting_apply_working_set_factor;
     }
 
     fn configuredDenseNativePostingStoreSupported(self: *const IndexManager) bool {
@@ -29964,6 +29982,7 @@ pub const IndexManager = struct {
             for (legacy_keys) |key| self.alloc.free(@constCast(key));
         }
 
+        sortLegacyOrdinalProbes(legacy_keys, missing_ordinals);
         try mutable_txn.getManySorted(legacy_keys, legacy_values);
         for (legacy_values, missing_ordinals) |maybe_raw, ordinal| {
             if (maybe_raw) |raw| {
@@ -34195,6 +34214,81 @@ fn legacyDenseVectorIdMappingKey(alloc: Allocator, index_name: []const u8, vecto
 
 fn legacyDenseOrdinalMappingKey(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:ordinal:{d}", .{ index_name, ordinal });
+}
+
+/// Legacy ordinal keys spell the ordinal in decimal, so numeric order is not
+/// byte order ("...:999" sorts after "...:1000"). Sorted multi-gets require
+/// ascending keys; Lite rejects anything else with InvalidBatch. Reorder the
+/// keys byte-wise, keeping each ordinal paired with its key.
+fn sortLegacyOrdinalProbes(keys: [][]const u8, ordinals: []doc_identity.DocOrdinal) void {
+    std.debug.assert(keys.len == ordinals.len);
+    if (keys.len < 2) return;
+    var ordered = true;
+    for (keys[1..], keys[0 .. keys.len - 1]) |key, previous| {
+        if (std.mem.order(u8, previous, key) == .gt) {
+            ordered = false;
+            break;
+        }
+    }
+    if (ordered) return;
+    const Context = struct {
+        keys: [][]const u8,
+        ordinals: []doc_identity.DocOrdinal,
+
+        pub fn lessThan(ctx: @This(), lhs: usize, rhs: usize) bool {
+            return std.mem.lessThan(u8, ctx.keys[lhs], ctx.keys[rhs]);
+        }
+        pub fn swap(ctx: @This(), lhs: usize, rhs: usize) void {
+            std.mem.swap([]const u8, &ctx.keys[lhs], &ctx.keys[rhs]);
+            std.mem.swap(doc_identity.DocOrdinal, &ctx.ordinals[lhs], &ctx.ordinals[rhs]);
+        }
+    };
+    // Sort both arrays together, with no heap scratch or extra failure path.
+    std.sort.pdqContext(0, keys.len, Context{ .keys = keys, .ordinals = ordinals });
+}
+
+test "legacy dense ordinal probes are byte-ordered for sorted multi-gets" {
+    const alloc = std.testing.allocator;
+    var ordinals = [_]doc_identity.DocOrdinal{ 9, 999, 1000, 10000 };
+    var keys: [ordinals.len][]const u8 = undefined;
+    for (&keys, ordinals) |*key, ordinal| key.* = try legacyDenseOrdinalMappingKey(alloc, "vec", ordinal);
+    defer for (keys) |key| alloc.free(@constCast(key));
+    // Numeric order is not byte order once the decimal widths differ.
+    try std.testing.expect(std.mem.order(u8, keys[1], keys[2]) == .gt);
+
+    sortLegacyOrdinalProbes(&keys, &ordinals);
+    for (keys[1..], keys[0 .. keys.len - 1]) |key, previous| {
+        try std.testing.expect(std.mem.order(u8, previous, key) == .lt);
+    }
+    for (keys, ordinals) |key, ordinal| {
+        const expected = try legacyDenseOrdinalMappingKey(alloc, "vec", ordinal);
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, key);
+    }
+}
+
+test "legacy dense ordinal probes preserve pairs through partition sorting" {
+    const alloc = std.testing.allocator;
+    var ordinals: [257]doc_identity.DocOrdinal = undefined;
+    var keys: [ordinals.len][]const u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+    for (&keys, &ordinals, 0..) |*key, *ordinal, i| {
+        ordinal.* = @intCast((i * 73) % ordinals.len);
+        key.* = try legacyDenseOrdinalMappingKey(alloc, "vec:ordinal_member", ordinal.*);
+        initialized += 1;
+    }
+    sortLegacyOrdinalProbes(keys[0..0], ordinals[0..0]);
+    sortLegacyOrdinalProbes(keys[0..1], ordinals[0..1]);
+    sortLegacyOrdinalProbes(&keys, &ordinals);
+    // Repeat an already sorted batch to exercise the allocation-free fast path.
+    sortLegacyOrdinalProbes(&keys, &ordinals);
+    for (keys, ordinals, 0..) |key, ordinal, i| {
+        if (i > 0) try std.testing.expect(std.mem.lessThan(u8, keys[i - 1], key));
+        const expected = try legacyDenseOrdinalMappingKey(alloc, "vec:ordinal_member", ordinal);
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, key);
+    }
 }
 
 fn legacyDenseOrdinalMemberPrefix(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
