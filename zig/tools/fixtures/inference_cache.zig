@@ -44,14 +44,19 @@ pub fn build(b: *std.Build) void {
                 "    @import(\"std\").debug.print(\"PJRT_PRODUCT_REVISION {d}\\n\", .{@import(\"cache_pjrt\").cache_test_revision});\n"
             else
                 "";
-            artifact.root_module.root_source_file = b.addWriteFiles().add("inference_link.zig", profiles.observability_probe_source ++
-                \\pub fn main() void {
-                \\    @import("std").debug.print("INFERENCE_VERSION {s}\n", .{@import("build_info").version()});
-                \\    @import("std").debug.print("OBSERVABILITY_REVISION {d} {d}\n", .{
-                \\        observabilityRevision(@import("cache_prometheus")),
-                \\        observabilityRevision(@import("cache_structlog")),
-                \\    });
-            ++ pjrt_probe ++ "}\n");
+            artifact.root_module.root_source_file = b.addWriteFiles().add("inference_link.zig", std.mem.concat(b.allocator, u8, &.{
+                profiles.observability_probe_source ++
+                    \\pub fn main() void {
+                    \\    @import("std").debug.print("INFERENCE_VERSION {s}\n", .{@import("build_info").version()});
+                    \\    @import("std").debug.print("OBSERVABILITY_REVISION {d} {d}\n", .{
+                    \\        observabilityRevision(@import("cache_prometheus")),
+                    \\        observabilityRevision(@import("cache_structlog")),
+                    \\    });
+                ,
+                "\n",
+                pjrt_probe,
+                "}\n",
+            }) catch @panic("OOM"));
             b.step("cache-inference", "Link the actual inference dependency graph").dependOn(&b.addRunArtifact(artifact).step);
         }
         if (std.mem.eql(u8, artifact.name, "generate-gemma4-pilot-dataset")) {
