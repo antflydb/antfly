@@ -180,7 +180,7 @@ const ChatGPTBackend = struct {
         if (self.context) |context| {
             try context.check();
             self.provider.timeout_ms = try context.remainingTimeoutMs() orelse 120_000;
-            if (context.cancellation) |token| self.provider.cancellation = httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn);
+            self.provider.request_context = context;
         }
         return self.provider.generate(alloc, model, messages);
     }

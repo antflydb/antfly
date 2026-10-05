@@ -880,7 +880,7 @@ const AgentGenerationRunner = struct {
             const manager = runner.chatgpt orelse return error.ChatGPTInteractiveOnly;
             const owner = runner.personal_owner orelse return error.ChatGPTInteractiveOnly;
             const id = link.generator.connection_id orelse return error.InvalidGeneratorConfig;
-            if (runner.chatgpt_pin == null) runner.chatgpt_pin = try manager.pin(owner, id);
+            if (runner.chatgpt_pin == null) runner.chatgpt_pin = try manager.pinWithContext(owner, id, runner.request_context);
             try runner.chatgpt_pin.?.check(id);
         };
         // Each model round is a cancellation and deadline boundary.

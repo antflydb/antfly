@@ -17,6 +17,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const paths = @import("../common/fs_paths.zig");
 const protocol = @import("protocol.zig");
+const RequestContext = @import("../inference/execution_context.zig").RequestContext;
 
 pub const Summary = struct { connection_id: []const u8, email: []const u8, label: []const u8, connected: bool, plan_enabled: bool };
 pub const Begin = struct { attempt_id: []const u8, authorization_url: []const u8, expires_at: i64 };
@@ -400,7 +401,17 @@ pub const Manager = struct {
     }
     /// Request-long pin prevents disconnect/reconnect from reviving a tool loop.
     pub fn pin(self: *Manager, owner: []const u8, id: []const u8) !Pin {
-        self.mutex.lockUncancelable(self.io);
+        return self.pinWithContext(owner, id, .{ .io = self.io, .deadline_ns = null });
+    }
+    fn lockWithContext(self: *Manager, context: RequestContext) !void {
+        while (true) {
+            try context.check();
+            if (self.mutex.tryLock()) return;
+            try self.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+    pub fn pinWithContext(self: *Manager, owner: []const u8, id: []const u8, context: RequestContext) !Pin {
+        try self.lockWithContext(context);
         defer self.mutex.unlock(self.io);
         var state = try self.load(self.alloc);
         defer {
@@ -408,6 +419,7 @@ pub const Manager = struct {
             state.deinit();
         }
         _ = try find(&state.value, owner, id);
+        try context.check();
         const current = try self.session(id);
         return .{ .session = current, .epoch = current.epoch.load(.acquire) };
     }
@@ -415,7 +427,10 @@ pub const Manager = struct {
         return self.leaseBound(a, owner, id, null);
     }
     pub fn leaseBound(self: *Manager, a: std.mem.Allocator, owner: []const u8, id: []const u8, expected: ?Pin) !Lease {
-        self.mutex.lockUncancelable(self.io);
+        return self.leaseBoundWithContext(a, owner, id, expected, .{ .io = self.io, .deadline_ns = null });
+    }
+    pub fn leaseBoundWithContext(self: *Manager, a: std.mem.Allocator, owner: []const u8, id: []const u8, expected: ?Pin, context: RequestContext) !Lease {
+        try self.lockWithContext(context);
         defer self.mutex.unlock(self.io);
         if (expected) |binding| try binding.check(id);
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -435,7 +450,7 @@ pub const Manager = struct {
             defer http.deinit();
             const body = try protocol.form(local, &.{ .{ "grant_type", "refresh_token" }, .{ "client_id", rec.client_id }, .{ "refresh_token", rec.refresh_token }, .{ "resource", protocol.resource } });
             defer std.crypto.secureZero(u8, body);
-            var token = tokenRequest(local, &http, try self.authUrl(local, "/api/accounts/oauth/token"), body) catch |err| {
+            var token = tokenRequestWithContext(local, &http, try self.authUrl(local, "/api/accounts/oauth/token"), body, context) catch |err| {
                 if (err == error.ChatGPTReconnectRequired) {
                     scrubRecord(rec.*);
                     rec.access_token = "";
@@ -461,6 +476,7 @@ pub const Manager = struct {
             try self.save(saved.value);
             if (!protocol.hasScope(rec.scope, "chatgpt.tokens.use.direct")) return error.ChatGPTPlanDisabled;
         }
+        try context.check();
         const s = try self.session(id);
         return .{ .alloc = a, .access_token = try a.dupe(u8, rec.access_token), .session = s, .epoch = s.epoch.load(.acquire) };
     }
@@ -543,7 +559,17 @@ fn getJson(a: std.mem.Allocator, http: *httpx.Client, url: []const u8) ![]u8 {
     return a.dupe(u8, response.body orelse return error.InvalidResponse);
 }
 fn tokenRequest(a: std.mem.Allocator, http: *httpx.Client, url: []const u8, body: []const u8) !std.json.Parsed(Token) {
-    var response = try http.post(url, .{ .body = body, .headers = &.{.{ "Content-Type", "application/x-www-form-urlencoded" }}, .timeout_ms = 15_000, .follow_redirects = false, .max_retries = 0, .cookies_enabled = false });
+    return tokenRequestWithContext(a, http, url, body, .{ .io = http.io, .deadline_ns = null });
+}
+fn tokenRequestWithContext(a: std.mem.Allocator, http: *httpx.Client, url: []const u8, body: []const u8, context: RequestContext) !std.json.Parsed(Token) {
+    const Cancel = struct {
+        fn cancelled(raw: *const anyopaque) bool {
+            const request: *const RequestContext = @ptrCast(@alignCast(raw));
+            if (request.cancellation) |token| return token.isCancelled();
+            return false;
+        }
+    };
+    var response = try http.post(url, .{ .body = body, .headers = &.{.{ "Content-Type", "application/x-www-form-urlencoded" }}, .timeout_ms = @min(15_000, try context.remainingTimeoutMs() orelse 15_000), .cancellation = httpx.CancellationToken.fromCallback(&context, Cancel.cancelled), .follow_redirects = false, .max_retries = 0, .cookies_enabled = false });
     defer response.deinit();
     defer if (response.body) |bytes| std.crypto.secureZero(u8, @constCast(bytes));
     if (!response.ok()) {
@@ -577,6 +603,83 @@ fn scrubRecord(rec: Record) void {
 }
 fn scrub(state: State) void {
     for (state.accounts) |rec| scrubRecord(rec);
+}
+
+test "chatgpt generation bounds refresh and credential queueing by deadline and cancellation" {
+    const Mock = struct {
+        cancel: ?*std.atomic.Value(bool) = null,
+        requests: std.atomic.Value(u32) = .init(0),
+        fn token(self: *@This(), ctx: *httpx.Context) !httpx.Response {
+            _ = self.requests.fetchAdd(1, .acq_rel);
+            if (self.cancel) |signal| signal.store(true, .release);
+            try ctx.io.sleep(.fromSeconds(1), .awake);
+            return ctx.status(400).json(.{ .@"error" = "invalid_grant" });
+        }
+        fn serve(server: *httpx.Server) std.Io.Cancelable!void {
+            server.listen() catch {};
+        }
+    };
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var instance = try Manager.init(a, io, root);
+    defer instance.deinit();
+    var saved = try instance.load(a);
+    defer saved.deinit();
+    try instance.save(.{ .host_id = saved.value.host_id, .accounts = @constCast(&[_]Record{
+        .{ .connection_id = "one", .owner = "alice", .subject = "user-a", .email = "a@example.com", .client_id = "client-a", .access_token = "expired", .refresh_token = "refresh", .id_token = "", .scope = protocol.scopes, .expires_at = 1 },
+    }) });
+    var cancelled: std.atomic.Value(bool) = .init(false);
+    var mock: Mock = .{};
+    var server = httpx.Server.initWithConfig(a, io, .{ .host = "127.0.0.1", .port = 0 });
+    defer server.deinit();
+    try server.post("/api/accounts/oauth/token", httpx.Handler.bind(&mock, Mock.token));
+    try server.bind();
+    const origin = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}", .{server.boundAddress().?.getPort()});
+    defer a.free(origin);
+    instance.test_auth_origin = origin;
+    var group: std.Io.Group = .init;
+    try group.concurrent(io, Mock.serve, .{&server});
+    defer {
+        server.stop();
+        group.cancel(io);
+    }
+    var http = instance.client(a);
+    defer http.deinit();
+    var provider: @import("responses.zig").Provider = .{ .http = &http, .registrations = &instance, .owner = "alice", .connection_id = "one", .timeout_ms = 50 };
+    // A short provider timeout includes refresh, not only the Responses POST.
+    var started = @import("antfly_platform").time.monotonicNs();
+    try std.testing.expectError(error.Timeout, provider.generate(a, "model", &.{}));
+    try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 750 * std.time.ns_per_ms);
+    // Cancellation arriving during refresh interrupts it and preserves the grant.
+    mock.cancel = &cancelled;
+    provider.timeout_ms = 5_000;
+    provider.request_context = .{ .io = io, .deadline_ns = null, .cancellation = @import("../common/cancellation.zig").CancellationToken.fromAtomic(&cancelled) };
+    started = @import("antfly_platform").time.monotonicNs();
+    try std.testing.expectError(error.Cancelled, provider.generate(a, "model", &.{}));
+    try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < 750 * std.time.ns_per_ms);
+    try std.testing.expectEqual(@as(u32, 2), mock.requests.load(.acquire));
+    var retained = try instance.load(a);
+    defer {
+        scrub(retained.value);
+        retained.deinit();
+    }
+    try std.testing.expectEqualStrings("expired", retained.value.accounts[0].access_token);
+    try std.testing.expectEqualStrings("refresh", retained.value.accounts[0].refresh_token);
+    // Waiting behind another refresh must obey the same controls for both pins
+    // and leases, including cancellation before any network request.
+    instance.mutex.lockUncancelable(io);
+    defer instance.mutex.unlock(io);
+    const cancel_context = provider.request_context.?;
+    try std.testing.expectError(error.Cancelled, instance.pinWithContext("alice", "one", cancel_context));
+    try std.testing.expectError(error.Cancelled, instance.leaseBoundWithContext(a, "alice", "one", null, cancel_context));
+    const deadline_context: RequestContext = .{ .io = io, .deadline_ns = @import("antfly_platform").time.monotonicNs() + 10 * std.time.ns_per_ms };
+    try std.testing.expectError(error.Timeout, instance.pinWithContext("alice", "one", deadline_context));
+    try std.testing.expectError(error.Timeout, instance.leaseBoundWithContext(a, "alice", "one", null, deadline_context));
+    try std.testing.expectEqual(@as(u32, 2), mock.requests.load(.acquire));
 }
 
 test "chatgpt authorization return allocation failure leaves no running attempt" {

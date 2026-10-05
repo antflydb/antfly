@@ -18,6 +18,8 @@ const httpx = @import("httpx");
 const gen = @import("antfly_generating");
 const manager = @import("manager.zig");
 const protocol = @import("protocol.zig");
+const RequestContext = @import("../inference/execution_context.zig").RequestContext;
+const platform_time = @import("antfly_platform").time;
 
 /// Request-owned diagnostic buffers survive transport cleanup. Only bounded
 /// protocol identifiers are exposed; upstream messages and prompts stay private.
@@ -64,12 +66,28 @@ pub const Provider = struct {
     connection_id: []const u8,
     timeout_ms: u64 = 120_000,
     cancellation: ?httpx.CancellationToken = null,
+    request_context: ?RequestContext = null,
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     reasoning_effort: ?[]const u8 = null,
     max_response_bytes: usize = 16 * 1024 * 1024,
     pub fn generate(self: *Provider, a: std.mem.Allocator, model: []const u8, messages: []const gen.ChatMessage) !gen.GenerateResult {
-        var lease = try self.registrations.leaseBound(a, self.owner, self.connection_id, self.pin);
+        const ControlCancellation = struct {
+            external: ?httpx.CancellationToken,
+            context: ?RequestContext,
+            fn cancelled(raw: *const anyopaque) bool {
+                const c: *const @This() = @ptrCast(@alignCast(raw));
+                if (c.external) |token| if (token.isCancelled()) return true;
+                if (c.context) |context| if (context.cancellation) |token| return token.isCancelled();
+                return false;
+            }
+        };
+        const cancellation: ControlCancellation = .{ .external = self.cancellation, .context = self.request_context };
+        var control: RequestContext = .{ .io = self.http.io, .deadline_ns = platform_time.monotonicNs() +| (self.timeout_ms *| std.time.ns_per_ms), .cancellation = .{ .ptr = &cancellation, .is_cancelled_fn = ControlCancellation.cancelled } };
+        if (self.request_context) |context| if (context.deadline_ns) |deadline| {
+            control.deadline_ns = @min(control.deadline_ns.?, deadline);
+        };
+        var lease = try self.registrations.leaseBoundWithContext(a, self.owner, self.connection_id, self.pin, control);
         defer lease.deinit();
         const Cancel = struct {
             lease: *manager.Lease,
@@ -79,7 +97,7 @@ pub const Provider = struct {
                 return c.lease.cancelled() or if (c.external) |e| e.isCancelled() else false;
             }
         };
-        var cancel: Cancel = .{ .lease = &lease, .external = self.cancellation };
+        var cancel: Cancel = .{ .lease = &lease, .external = httpx.CancellationToken.fromCallback(&cancellation, ControlCancellation.cancelled) };
         const body = try request(a, model, messages, self.tools_json, self.tool_choice_json, self.reasoning_effort);
         defer a.free(body);
         const bearer = try std.fmt.allocPrint(a, "Bearer {s}", .{lease.access_token});
@@ -96,7 +114,7 @@ pub const Provider = struct {
             .follow_redirects = false,
             .cookies_enabled = false,
             .max_retries = 0,
-            .timeout_ms = self.timeout_ms,
+            .timeout_ms = try control.remainingTimeoutMs(),
             .max_response_size = self.max_response_bytes,
             .cancellation = httpx.CancellationToken.fromCallback(&cancel, Cancel.cancelled),
         }, &decoder, null, null) catch |err| {
