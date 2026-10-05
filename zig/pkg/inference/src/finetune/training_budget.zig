@@ -119,7 +119,7 @@ pub const TrainingBudget = struct {
         tier: Tier,
         bytes: u64,
     ) ReservationResult {
-        const idx = @intFromEnum(category);
+        const idx = @backingInt(category);
         switch (tier) {
             .host => {
                 const new_used = sumArr(self.host_by_category) +| bytes;
@@ -164,7 +164,7 @@ pub const TrainingBudget = struct {
         bytes: u64,
     ) void {
         if (bytes == 0) return;
-        const idx = @intFromEnum(category);
+        const idx = @backingInt(category);
         switch (tier) {
             .host => {
                 const cur = self.host_by_category[idx];
@@ -200,10 +200,10 @@ pub const TrainingBudget = struct {
     }
 
     pub fn format(self: *const TrainingBudget, out: []u8) ![]u8 {
-        const w = @intFromEnum(BudgetCategory.weights);
-        const g = @intFromEnum(BudgetCategory.gradients);
-        const a = @intFromEnum(BudgetCategory.activations);
-        const o = @intFromEnum(BudgetCategory.optimizer);
+        const w = @backingInt(BudgetCategory.weights);
+        const g = @backingInt(BudgetCategory.gradients);
+        const a = @backingInt(BudgetCategory.activations);
+        const o = @backingInt(BudgetCategory.optimizer);
         return std.fmt.bufPrint(
             out,
             "host: {d}/{d} bytes ({d} weights, {d} grads, {d} activ, {d} optim), " ++
@@ -238,20 +238,20 @@ test "fresh reserve weights on host" {
 test "reserve and release reverses state" {
     var b = TrainingBudget.init(.{ .host_bytes = 8 * 1024 * 1024, .scratch_headroom_bytes = 0 });
     _ = b.tryReserve(.gradients, .host, 2 * 1024 * 1024);
-    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), b.host_by_category[@intFromEnum(BudgetCategory.gradients)]);
+    try std.testing.expectEqual(@as(u64, 2 * 1024 * 1024), b.host_by_category[@backingInt(BudgetCategory.gradients)]);
     b.release(.gradients, .host, 2 * 1024 * 1024);
-    try std.testing.expectEqual(@as(u64, 0), b.host_by_category[@intFromEnum(BudgetCategory.gradients)]);
+    try std.testing.expectEqual(@as(u64, 0), b.host_by_category[@backingInt(BudgetCategory.gradients)]);
 }
 
 test "exceeding host_bytes denies and leaves state unchanged" {
     var b = TrainingBudget.init(.{ .host_bytes = 4 * 1024 * 1024, .scratch_headroom_bytes = 0 });
     _ = b.tryReserve(.weights, .host, 3 * 1024 * 1024);
-    const before_used = b.host_by_category[@intFromEnum(BudgetCategory.weights)];
+    const before_used = b.host_by_category[@backingInt(BudgetCategory.weights)];
     const r = b.tryReserve(.activations, .host, 2 * 1024 * 1024);
     try std.testing.expectEqual(BudgetEvent.denied_host_oom, r.event);
     try std.testing.expectEqual(@as(u64, 0), r.reserved);
-    try std.testing.expectEqual(before_used, b.host_by_category[@intFromEnum(BudgetCategory.weights)]);
-    try std.testing.expectEqual(@as(u64, 0), b.host_by_category[@intFromEnum(BudgetCategory.activations)]);
+    try std.testing.expectEqual(before_used, b.host_by_category[@backingInt(BudgetCategory.weights)]);
+    try std.testing.expectEqual(@as(u64, 0), b.host_by_category[@backingInt(BudgetCategory.activations)]);
     try std.testing.expectEqual(@as(u64, 1), b.deny_count);
 }
 

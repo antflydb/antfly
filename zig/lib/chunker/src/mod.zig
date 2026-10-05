@@ -27,6 +27,7 @@ pub const AudioChunkOptions = types.AudioChunkOptions;
 pub const max_chunk_results = types.max_chunk_results;
 pub const max_chunk_target_tokens = types.max_chunk_target_tokens;
 pub const max_chunk_audio_window_ms = types.max_chunk_audio_window_ms;
+pub const default_gif_max_frames = types.default_gif_max_frames;
 pub const default_max_chunk_owned_output_bytes = types.default_max_chunk_owned_output_bytes;
 
 test {

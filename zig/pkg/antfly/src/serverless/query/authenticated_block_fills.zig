@@ -320,7 +320,7 @@ test "serverless canonical block disk promotion bypasses pending fills and alloc
     const alloc = std.testing.allocator;
     var cache = Cache{};
     defer cache.deinit();
-    const key = [_]u8{7} ** 32;
+    const key = @as([32]u8, @splat(7));
     var pending = try cache.acquire(alloc, alloc, &.{.{ .key = key, .len = 4 }}, null, .none);
     defer pending.deinit();
     cache.retainVerified(alloc, key, "data");

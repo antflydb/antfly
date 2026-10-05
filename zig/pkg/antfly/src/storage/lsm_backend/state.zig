@@ -29,7 +29,7 @@ const EntryIndex = struct {
     collisions: std.AutoHashMapUnmanaged(u64, CollisionBucket) = .empty,
     collision_capacity_bytes: u64 = 0,
 
-    fn deinit(self: *EntryIndex, allocator: Allocator) void {
+    pub fn deinit(self: *EntryIndex, allocator: Allocator) void {
         var values = self.collisions.valueIterator();
         while (values.next()) |bucket| bucket.deinit(allocator);
         self.collisions.deinit(allocator);
@@ -77,7 +77,7 @@ const EntryIndex = struct {
         self.collision_capacity_bytes +|= (collision.value_ptr.capacity - old_capacity) * @sizeOf(usize);
     }
 
-    fn estimatedMemoryBytes(self: *const EntryIndex) u64 {
+    pub fn estimatedMemoryBytes(self: *const EntryIndex) u64 {
         var total = hashMapAllocationBytes(u64, usize, self.primary.capacity());
         total +|= hashMapAllocationBytes(u64, CollisionBucket, self.collisions.capacity());
         total +|= self.collision_capacity_bytes;
@@ -1232,7 +1232,7 @@ test "prepared mutable publication is atomic at every allocation failure" {
         defer pinned.deinit(alloc);
         var incoming: ActiveMemTable = .{ .ordered_enabled = false };
         defer incoming.deinit(alloc);
-        const a = [_]u8{0} ** 8;
+        const a = @as([8]u8, @splat(0));
         const b = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 1 };
         try incoming.upsert(alloc, .{}, &a, "new-a", false);
         try incoming.upsert(alloc, .{}, &b, "new-b", false);
@@ -1262,7 +1262,7 @@ test "ordered generations account shared allocations once and rotate without all
     const alloc = counter.allocator();
     var live: ActiveMemTable = .{};
     defer live.deinit(alloc);
-    const value = [_]u8{'x'} ** 4096;
+    const value = @as([4096]u8, @splat('x'));
     for (0..1024) |i| {
         var key: [8]u8 = undefined;
         std.mem.writeInt(u64, &key, i, .big);

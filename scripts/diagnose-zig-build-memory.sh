@@ -14,7 +14,7 @@ Options:
   --out-dir DIR          Directory for logs. Default: /tmp/antfly-zig-build-memory
   --prefix DIR           Zig install prefix. Default: /tmp/antfly-zig-build-memory-prefix
   --target TARGET        Zig target. Default: aarch64-linux-musl
-  --optimize MODE        Zig optimize mode. Default: ReleaseFast
+  --optimize MODE        Zig optimize mode. Default: fast
   --strip true|false     Omit debug information. Default: false
   --install-step STEP    Build step. Default: antfly
   --jobs N               Zig build jobs. Default: 1
@@ -30,7 +30,7 @@ Environment:
 
 Examples:
   scripts/diagnose-zig-build-memory.sh
-  scripts/diagnose-zig-build-memory.sh --optimize ReleaseSmall
+  scripts/diagnose-zig-build-memory.sh --optimize small
   scripts/diagnose-zig-build-memory.sh --target native -- --verbose
 EOF
 }
@@ -40,7 +40,7 @@ zig_dir="${repo_root}/zig"
 out_dir="/tmp/antfly-zig-build-memory"
 prefix="/tmp/antfly-zig-build-memory-prefix"
 target="aarch64-linux-musl"
-optimize="ReleaseFast"
+optimize="fast"
 strip="false"
 install_step="antfly"
 jobs="1"
@@ -183,10 +183,11 @@ rss_mb_from_kb() {
     awk -v kb="$1" 'BEGIN { printf "%.2f", kb / 1024 }'
 }
 
-echo "timestamp	elapsed_s	pid	rss_kb	rss_mb	command" > "${timeline}"
+printf 'timestamp\telapsed_s\tpid\trss_kb\trss_mb\tcommand\tsample_id\n' > "${timeline}"
 
 start_epoch="$(date +%s)"
 sample_taken="0"
+sample_id="0"
 sample_pid=""
 max_rss_kb="0"
 max_pid=""
@@ -194,7 +195,7 @@ max_cmd=""
 
 (
     cd "${zig_dir}"
-    "${zig_bin}" build "-j${jobs}" "-Dtarget=${target}" "-Doptimize=${optimize}" "-Dstrip=${strip}" "${install_step}" --prefix "${prefix}" "${extra_args[@]}"
+    "${zig_bin}" build "-j${jobs}" "-Dtarget=${target}" "-Doptimize=${optimize}" "-Dstrip=${strip}" "${install_step}" --prefix "${prefix}" ${extra_args[@]+"${extra_args[@]}"}
 ) >"${build_log}" 2>&1 &
 build_pid="$!"
 
@@ -203,6 +204,7 @@ echo "logs: ${build_log}" >&2
 echo "rss:  ${timeline}" >&2
 
 while kill -0 "${build_pid}" 2>/dev/null; do
+    sample_id="$((sample_id + 1))"
     now="$(date +%s)"
     elapsed="$((now - start_epoch))"
 
@@ -213,8 +215,8 @@ while kill -0 "${build_pid}" 2>/dev/null; do
         cmd="$(ps -o command= -p "${pid}" 2>/dev/null | tr '\t' ' ' || true)"
         rss_mb="$(rss_mb_from_kb "${rss_kb}")"
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${elapsed}" "${pid}" "${rss_kb}" "${rss_mb}" "${cmd}" \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${elapsed}" "${pid}" "${rss_kb}" "${rss_mb}" "${cmd}" "${sample_id}" \
             >> "${timeline}"
 
         if [ "${rss_kb}" -gt "${max_rss_kb}" ]; then

@@ -27,7 +27,7 @@ const requiresDurableLifecycleReplication = @import("db/replication_contract.zig
 pub fn applyOrdered(
     owner: anytype,
     req: types.BatchRequest,
-    identity: types.RaftAppliedEntryIdentity,
+    identity: types.OrderedApplyReceipt,
 ) anyerror!void {
     const db = physicalOwner(owner);
     const mirror_scoped_restore = requiresDurableLifecycleReplication(req) and db.local_execution.replication_async_batch_mirror != null;
@@ -96,7 +96,7 @@ pub fn applyStorageKernelReplicatedBatchAtRaftEntry(
     table_name: []const u8,
     group_id: u64,
     req: types.BatchRequest,
-    raft_entry: types.RaftAppliedEntryIdentity,
+    raft_entry: types.OrderedApplyReceipt,
 ) !void {
     // The leader admitted this immutable command under the descriptor pinned
     // in its Raft entry. A follower may already have a newer durable schema
@@ -117,8 +117,8 @@ pub fn restoreAuthenticatedReplicaToStagedGeneration(
     alloc: std.mem.Allocator,
     snapshot_root: []const u8,
     path: []const u8,
-    opts: @import("db/db.zig").OpenOptions,
+    opts: @import("antfly_source_root").antfly_sources.physical_db.OpenOptions,
     namespace: @import("db/doc_identity.zig").Namespace,
 ) !void {
-    try @import("db/db.zig").DB.restoreIdentityPreservingSnapshotToStagedGeneration(staged, alloc, snapshot_root, path, opts, namespace);
+    try @import("antfly_source_root").antfly_sources.physical_db.DB.restoreIdentityPreservingSnapshotToStagedGeneration(staged, alloc, snapshot_root, path, opts, namespace);
 }

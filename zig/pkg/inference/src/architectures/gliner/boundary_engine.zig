@@ -518,8 +518,8 @@ pub const TestBatch = struct {
 
     pub fn prepared(self: *TestBatch) processor.PreparedBatch {
         self.samples = .{
-            .{ .original_text = "a", .schema_fingerprint = .{0} ** 32, .input_ids = self.ids[0..12], .words = &self.words, .groups = &self.groups, .queries = &self.queries, .classification_labels = &self.classifications, .enum_choices = &.{}, .prefix_word_count = 1, .body_word_count = 1, .terminal_period_added = false, .is_joint_ie = false },
-            .{ .original_text = "b", .schema_fingerprint = .{0} ** 32, .input_ids = self.ids[12..19], .words = &self.other_words, .groups = &self.other_groups, .queries = self.queries[0..1], .classification_labels = &self.other_classifications, .enum_choices = &.{}, .prefix_word_count = 0, .body_word_count = 1, .terminal_period_added = false, .is_joint_ie = false },
+            .{ .original_text = "a", .schema_fingerprint = @splat(0), .input_ids = self.ids[0..12], .words = &self.words, .groups = &self.groups, .queries = &self.queries, .classification_labels = &self.classifications, .enum_choices = &.{}, .prefix_word_count = 1, .body_word_count = 1, .terminal_period_added = false, .is_joint_ie = false },
+            .{ .original_text = "b", .schema_fingerprint = @splat(0), .input_ids = self.ids[12..19], .words = &self.other_words, .groups = &self.other_groups, .queries = self.queries[0..1], .classification_labels = &self.other_classifications, .enum_choices = &.{}, .prefix_word_count = 0, .body_word_count = 1, .terminal_period_added = false, .is_joint_ie = false },
         };
         return .{
             .arena = std.heap.ArenaAllocator.init(std.testing.allocator),

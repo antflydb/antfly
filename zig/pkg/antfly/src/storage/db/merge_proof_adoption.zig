@@ -124,11 +124,11 @@ pub fn validateRequest(req: anytype) !void {
     const command = req.merge_proof_adoption orelse return;
     try command.validate();
     const empty: @TypeOf(req) = .{};
-    inline for (std.meta.fields(@TypeOf(req))) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "merge_proof_adoption") and !std.mem.eql(u8, field.name, "sync_level")) {
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
-                if (@field(req, field.name).len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(@field(req, field.name), @field(empty, field.name))) return error.InvalidBatchRequest;
+    inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !std.mem.eql(u8, reflected_name, "merge_proof_adoption") and !std.mem.eql(u8, reflected_name, "sync_level")) {
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (@field(req, reflected_name).len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(@field(req, reflected_name), @field(empty, reflected_name))) return error.InvalidBatchRequest;
         }
     }
 }

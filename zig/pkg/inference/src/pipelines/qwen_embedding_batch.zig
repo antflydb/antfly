@@ -38,7 +38,7 @@ pub fn chunkLength(lengths: []const usize, indices: []const usize, max_items: us
 }
 
 test "Qwen embedding planner bounds passage chunks and preserves identities" {
-    const lengths = [_]usize{256} ** 32;
+    const lengths: [32]usize = @splat(256);
     const indices = try order(std.testing.allocator, &lengths);
     defer std.testing.allocator.free(indices);
     for (indices, 0..) |index, i| try std.testing.expectEqual(i, index);
@@ -60,7 +60,7 @@ test "Qwen embedding planner reduces ragged padding and admits long singletons" 
     }
     try std.testing.expectEqual(@as(usize, 2416), padded);
     try std.testing.expectEqual(@as(usize, 1), chunkLength(&.{32768}, &.{0}, 32));
-    try std.testing.expectEqual(@as(usize, 32), chunkLength(&([_]usize{20} ** 32), indicesForShort(), 32));
+    try std.testing.expectEqual(@as(usize, 32), chunkLength(&@as([32]usize, @splat(20)), indicesForShort(), 32));
 }
 
 fn indicesForShort() []const usize {

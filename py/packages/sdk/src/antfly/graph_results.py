@@ -223,7 +223,7 @@ def _validate_path_edge(
         edge,
         path,
         required=frozenset({"from", "to", "direction", "type", "weight"}),
-        optional=frozenset({"metadata"}),
+        optional=frozenset({"metadata", "edge_id", "owner_document"}),
     )
     from_endpoint = _validate_endpoint(edge["from"], f"{path}.from")
     to_endpoint = _validate_endpoint(edge["to"], f"{path}.to")
@@ -233,6 +233,12 @@ def _validate_path_edge(
         _invalid(f"{path}.direction", "must be out or in")
     _nonempty_string(edge["type"], f"{path}.type", max_utf8_bytes=65_536)
     weight = _finite_nonnegative(edge["weight"], f"{path}.weight", at_most_one=max_weight_product)
+    if "edge_id" in edge:
+        _nonempty_string(edge["edge_id"], f"{path}.edge_id")
+    if "owner_document" in edge:
+        _nonempty_string(edge["owner_document"], f"{path}.owner_document")
+        if "edge_id" not in edge:
+            _invalid(path, "owner_document requires edge_id")
     if "metadata" in edge:
         _object(edge["metadata"], f"{path}.metadata")
     return weight

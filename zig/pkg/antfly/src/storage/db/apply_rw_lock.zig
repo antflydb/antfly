@@ -764,7 +764,7 @@ const LockVoprHarness = if (builtin.is_test) struct {
     enabled: vopr.transition.List = .{},
     events: vopr.event.Sink = .{},
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.enabled.deinit(std.testing.allocator);
         self.events.deinit(std.testing.allocator);
     }

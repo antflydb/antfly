@@ -46,7 +46,7 @@ const DurStats = struct {
         return @intCast(self.total / self.values.items.len);
     }
 
-    fn deinit(self: *DurStats, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DurStats, alloc: std.mem.Allocator) void {
         self.values.deinit(alloc);
         self.* = undefined;
     }
@@ -60,7 +60,7 @@ const Results = struct {
     old_store_finalize_ns: DurStats = .{},
     current_store_finalize_ns: DurStats = .{},
 
-    fn deinit(self: *Results, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Results, alloc: std.mem.Allocator) void {
         self.old_prepare_ns.deinit(alloc);
         self.current_prepare_ns.deinit(alloc);
         self.old_prune_ns.deinit(alloc);

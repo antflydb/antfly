@@ -347,7 +347,7 @@ pub fn freeTableStorageStatuses(alloc: std.mem.Allocator, statuses: []TableStora
 }
 
 fn readerPinCount(counts: [lsm_backend.reader_pin_kind_count]u64, kind: lsm_backend.ReaderPinKind) u64 {
-    return counts[@intFromEnum(kind)];
+    return counts[@backingInt(kind)];
 }
 
 pub fn lsmStorageStatusFromStats(stats: table_reads.LsmStorageStats) LsmStorageStatus {
@@ -726,7 +726,7 @@ fn cloneSchemaProjection(comptime T: type, alloc: std.mem.Allocator, value: T) s
                 break :blk out;
             }
             var out: T = undefined;
-            inline for (info.fields) |field| @field(out, field.name) = try cloneSchemaProjection(field.type, alloc, @field(value, field.name));
+            inline for (info.field_names, info.field_types) |reflected_name, field_type| @field(out, reflected_name) = try cloneSchemaProjection(field_type, alloc, @field(value, reflected_name));
             break :blk out;
         },
         .@"union" => switch (value) {
@@ -1188,7 +1188,7 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
         if (value != .null) {
             const encoded_schema = try stringifyJsonValue(alloc, value);
             defer alloc.free(encoded_schema);
-            const validated_schema = parseSchemaUpdateRequest(alloc, encoded_schema) catch |err| switch (err) {
+            const validated_schema = @import("../schema/table_schema_impl.zig").parseCreateSchemaRequest(alloc, encoded_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
             };
@@ -1200,7 +1200,13 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             };
             var normalized_schema_owned = true;
             errdefer if (normalized_schema_owned) alloc.free(normalized_schema);
-            validateRuntimeDerivableSchemaJson(alloc, normalized_schema) catch |err| switch (err) {
+            // Unpublished inference drafts are resolved at public creation
+            // ingress before strict metadata/catalog admission.
+            var draft = try std.json.parseFromSlice(std.json.Value, alloc, normalized_schema, .{});
+            defer draft.deinit();
+            const docs = draft.value.object.get("document_schemas");
+            const pending = draft.value.object.get("base_source") != null and (docs == null or docs.? == .null or (docs.? == .object and docs.?.object.count() == 0));
+            if (!pending) validateRuntimeDerivableSchemaJson(alloc, normalized_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
             };
@@ -1840,8 +1846,8 @@ fn validateNamedFullTextQueryIndexes(
 
 fn generatedSourceVectorStats(stats: @import("../storage/artifact_payload.zig").Stats) metadata_openapi.VectorSourceStorageStatus {
     var out: metadata_openapi.VectorSourceStorageStatus = .{};
-    inline for (@typeInfo(@TypeOf(stats)).@"struct".fields) |field| {
-        @field(out, field.name) = @intCast(@min(@field(stats, field.name), std.math.maxInt(i64)));
+    inline for (comptime std.meta.fieldNames(@TypeOf(stats))) |reflected_name| {
+        @field(out, reflected_name) = @intCast(@min(@field(stats, reflected_name), std.math.maxInt(i64)));
     }
     return out;
 }

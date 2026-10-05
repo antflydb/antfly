@@ -219,7 +219,7 @@ pub const MetadataControlLoop = struct {
     }
 };
 
-fn lockCatalogMutation(service: anytype) bool {
+pub fn lockCatalogMutation(service: anytype) bool {
     const Service = switch (@typeInfo(@TypeOf(service))) {
         .pointer => |pointer| pointer.child,
         else => @TypeOf(service),
@@ -229,7 +229,7 @@ fn lockCatalogMutation(service: anytype) bool {
     return true;
 }
 
-fn unlockCatalogMutation(service: anytype, locked: bool) void {
+pub fn unlockCatalogMutation(service: anytype, locked: bool) void {
     const Service = switch (@typeInfo(@TypeOf(service))) {
         .pointer => |pointer| pointer.child,
         else => @TypeOf(service),

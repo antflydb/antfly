@@ -46,7 +46,7 @@ pub const OpenedStore = struct {
     docstore: *docstore_mod.DocStore,
 
     pub fn open(alloc: std.mem.Allocator, path: []const u8) !OpenedStore {
-        const path_z = try alloc.dupeZ(u8, path);
+        const path_z = try alloc.dupeSentinel(u8, path, 0);
         errdefer alloc.free(path_z);
         const docstore = try alloc.create(docstore_mod.DocStore);
         errdefer alloc.destroy(docstore);
@@ -642,7 +642,7 @@ test "research job requests reject inline credentials and ids are well formed" {
     const referenced = try std.json.parseFromSliceLeaky(std.json.Value, arena, "{\"generator\":{\"provider\":\"openai\",\"api_key\":\"${secret:openai.key}\"}}", .{});
     try validateRequest(arena, referenced);
     var buf: [36]u8 = undefined;
-    const id = formatJobId(&buf, [_]u8{0xab} ** 16);
+    const id = formatJobId(&buf, @as([16]u8, @splat(0xab)));
     try std.testing.expect(validJobId(id));
     try std.testing.expect(!validJobId("rsj_../../etc"));
 }
@@ -685,7 +685,7 @@ test "research job queries are stored on a UTF-8 boundary and quotas use cached 
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
     // 4095 ASCII bytes then a multibyte code point across the 4096 limit.
-    const query = try std.mem.concat(arena, u8, &.{ "q" ** 4095, "\u{1f600}" });
+    const query = try std.mem.concat(arena, u8, &.{ z17RepeatString("q", 4095), "\u{1f600}" });
     alloc.free(try store.create(alloc, "rsj_u", "alice", query, "{}"));
     const record = (try store.load(arena, "rsj_u", "alice")).?;
     try std.testing.expect(std.unicode.utf8ValidateSlice(record.query));
@@ -722,4 +722,15 @@ test "research job cancellation wins over a terminal outcome of the running atte
     const final = try store.finish(arena, claimed, .{ .state = .succeeded, .phase = "done", .request = "{}", .result = "{}" });
     try std.testing.expectEqual(JobState.cancelled, final.state);
     try std.testing.expectEqualStrings("{}", final.result.?);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

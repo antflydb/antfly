@@ -1251,7 +1251,7 @@ Compaction releases the namespace registry lock after its initial sync barrier.
 Secret metadata enumeration also uses a scope-bounded catalog cursor. It does
 not materialize unrelated private metadata or encrypted values from other scopes.
 
-Run `zig build lite-native-benchmark -Doptimize=ReleaseSafe` for the reproducible
+Run `zig build lite-native-benchmark -Doptimize=safe` for the reproducible
 transaction-assembly, commit, and sorted-read workloads. Timings are observations;
 structural tests enforce page-read, write-call, memory, and correctness bounds.
 

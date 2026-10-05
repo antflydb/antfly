@@ -16,6 +16,7 @@
 //! Distributed sources retain routing, admission, consistency, aggregation,
 //! and lifecycle; this source owns only coarse physical operations.
 
+const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const std = @import("std");
 const request_operation = @import("operation.zig");
 const platform_sync = @import("antfly_platform").sync;
@@ -32,7 +33,7 @@ const replication_contract = @import("../storage/db/replication_contract.zig");
 const document_artifact_child_range = @import("../storage/db/document_artifact_child_range.zig");
 const text_memory = @import("../storage/db/text_memory_stats.zig");
 const replication_effects = @import("../storage/db/replication_effects.zig");
-const ha_replication_record = @import("../storage/db/replication_record.zig");
+const hot_standby_replication_record = @import("../storage/db/replication_record.zig");
 const runtime_preflight = @import("../storage/db/runtime_preflight.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_domain = @import("../metadata/domain.zig");
@@ -272,14 +273,14 @@ pub const ProvisionedKernelOwnerSource = struct {
     restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
-    coordinated_ttl: ?@import("../storage/coordinated_ttl.zig").Port = null,
+    coordinated_ttl: ?server_coordinated_ttl.Port = null,
     artifact_publications: ?@import("../storage/artifact_publication_dispatch.zig").Port = null,
     entity_sink: ?runtime_callbacks.EntitySink = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
     native_migration_policy: ?runtime_callbacks.DenseNativeMigrationPolicySource = null,
     promotion_leadership_source: ?table_writes.PromotionLeadershipSource = null,
     replication_write_gate: ?replication_contract.WriteGate = null,
-    ha_async_mirror: ?replication_contract.AsyncEffectMirror = null,
+    hot_standby_async_mirror: ?replication_contract.AsyncEffectMirror = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     remote_content_configured: bool = false,
     secret_store: ?*anyopaque = null,
@@ -369,7 +370,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             return pending;
         }
 
-        fn deinit(self: *ApplyOpen, alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *ApplyOpen, alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             alloc.free(self.path);
             alloc.free(self.descriptor.schema_json);
@@ -524,7 +525,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.entry.transient_retirement_pending = false;
         }
 
-        fn deinit(self: *Lease) void {
+        pub fn deinit(self: *Lease) void {
             if (!self.active) return;
             self.source.release(self.entry, self.exclusive, self.apply_only);
             self.active = false;
@@ -742,7 +743,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         mirror: ?replication_contract.AsyncEffectMirror,
     ) *ProvisionedKernelOwnerSource {
         self.replication_write_gate = gate;
-        self.ha_async_mirror = mirror;
+        self.hot_standby_async_mirror = mirror;
         return self;
     }
 
@@ -1496,7 +1497,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             self.request.cancellation_fn = cancelled;
         }
 
-        fn deinit(self: *EncodedRestoreRequest) void {
+        pub fn deinit(self: *EncodedRestoreRequest) void {
             self.alloc.free(self.manifest_json);
             self.* = undefined;
         }
@@ -1716,13 +1717,13 @@ pub const ProvisionedKernelOwnerSource = struct {
         self: *ProvisionedKernelOwnerSource,
         group_id: u64,
         table_name: []const u8,
-        record: ha_replication_record.RecordView,
+        record: hot_standby_replication_record.RecordView,
     ) !void {
         var lease = try self.acquire(group_id, table_name);
         defer lease.deinit();
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1875,7 +1876,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         defer abi.antfly_storage_owner_buffer_destroy(&output);
     }
 
-    pub fn applyHotStandbyHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: ha_replication_record.RecordView) !void {
+    pub fn applyHotStandbyHiddenOwnerRecord(self: *ProvisionedKernelOwnerSource, alloc: std.mem.Allocator, group_id: u64, table_name: []const u8, scope: [32]u8, record: hot_standby_replication_record.RecordView) !void {
         var descriptor = (try self.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
         defer descriptor.deinit(alloc);
         const path = try std.fmt.allocPrint(alloc, "{s}/group-{d}/table-db", .{ self.replica_root_dir, group_id });
@@ -1883,8 +1884,8 @@ pub const ProvisionedKernelOwnerSource = struct {
         var lease = try self.acquireDescriptor(group_id, table_name, path, descriptor.view());
         defer lease.deinit();
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1898,14 +1899,14 @@ pub const ProvisionedKernelOwnerSource = struct {
         });
     }
 
-    pub fn applyHotStandbyInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: ha_replication_record.RecordView) !void {
+    pub fn applyHotStandbyInitialChildOwnerRecord(self: *ProvisionedKernelOwnerSource, group_id: u64, table_name: []const u8, record: hot_standby_replication_record.RecordView) !void {
         var lease = try self.acquirePreparedOwner(group_id, table_name);
         defer lease.deinit();
         if (lease.entry.initial_child_bootstrap_json.len == 0 or lease.entry.identity.table_id != record.table_id or
             lease.entry.identity.shard_id != record.shard_id) return error.InitialChildPublicationChanged;
         try lease.owner().applyHotStandbyReplicationRecord(table_name, .{
-            .record_kind = @intFromEnum(record.kind),
-            .payload_codec = @intFromEnum(record.payload_codec),
+            .record_kind = @backingInt(record.kind),
+            .payload_codec = @backingInt(record.payload_codec),
             .flags = record.flags,
             .cluster_id = record.cluster_id,
             .shard_id = record.shard_id,
@@ -1957,7 +1958,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_name = .fromSlice(table_name),
             .backup_root = .fromSlice(plan.backup_root),
             .backup_id = .fromSlice(plan.backup_id),
-            .format = @intFromEnum(switch (plan.format) {
+            .format = @backingInt(switch (plan.format) {
                 .native => abi.BackupFormat.native,
                 .portable => abi.BackupFormat.portable,
             }),
@@ -3213,7 +3214,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
-    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: @import("../storage/coordinated_ttl.zig").Port) *ProvisionedKernelOwnerSource {
+    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: server_coordinated_ttl.Port) *ProvisionedKernelOwnerSource {
         std.debug.assert(self.entries.items.len == 0);
         self.coordinated_ttl = port;
         return self;
@@ -3238,7 +3239,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const port = self.coordinated_ttl orelse return 1;
         if (request.candidate_count > abi.coordinated_ttl_page_capacity or
             (request.candidate_count != 0 and request.candidates == null)) return 1;
-        var candidates: [abi.coordinated_ttl_page_capacity]@import("../storage/coordinated_ttl.zig").Candidate = undefined;
+        var candidates: [abi.coordinated_ttl_page_capacity]server_coordinated_ttl.Candidate = undefined;
         for (candidates[0..request.candidate_count], 0..) |*dest, index| {
             const source = request.candidates.?[index];
             if (source.key.len != 0 and source.key.ptr == null) return 1;
@@ -4072,7 +4073,7 @@ pub const ProvisionedKernelOwnerSource = struct {
             .initial_child_bootstrap_json = .fromSlice(descriptor.initial_child_bootstrap_json),
             .restore_cancel_recovery = @intFromBool(descriptor.restore_cancel_recovery),
             .restore_ha_replay = @intFromBool(descriptor.restore_ha_replay),
-            .online_source_authority = @intFromEnum(self.online_source_authority),
+            .online_source_authority = @backingInt(self.online_source_authority),
             .row_policy_authority_secret = .fromSlice(self.row_policy_authority_secret orelse ""),
             .row_policy_authority_issuer = .fromSlice(self.row_policy_authority_issuer orelse ""),
             .historical_raft_apply = @intFromBool(controls.historical_raft_apply),
@@ -4214,7 +4215,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !client.QueryResponse {
         try table_reads.checkQueryDeadline(req);
         try self.prepareQueryRead(group_id, req, consistency);
-        const request_json = try table_reads.encodeStorageKernelQueryRequest(alloc, req);
+        const request_json = try @import("local_query_contract.zig").encodeStorageKernelQueryRequestForExecution(alloc, req, raw_search_result);
         defer alloc.free(request_json);
         var lease = try self.acquireWithControls(group_id, table_name, .from(req));
         defer lease.deinit();
@@ -4378,7 +4379,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         frozen_proof: ?read_gate.ReadSafetyBarrier.FrozenProof = null,
 
-        fn validate(ptr: *anyopaque) !void {
+        pub fn validate(ptr: *anyopaque) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try validateLocal(self);
             if (self.frozen_proof) |proof| {
@@ -4993,7 +4994,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         table_name: []const u8,
         req: db_types.BatchRequest,
         metadata_prepared: bool,
-        entry: ?db_types.RaftAppliedEntryIdentity,
+        entry: ?db_types.OrderedApplyReceipt,
     ) !?void {
         const self: *ProvisionedKernelOwnerSource = @ptrCast(@alignCast(ptr));
         var lease = if (metadata_prepared)
@@ -5036,7 +5037,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         descriptor: ?descriptor_contract.Descriptor,
     ) !?void {
         if (self.replication_write_gate) |gate| try gate.check();
-        var replication_mutation = if (self.ha_async_mirror) |mirror|
+        var replication_mutation = if (self.hot_standby_async_mirror) |mirror|
             if (mirror.mutation_barrier) |barrier| barrier.acquireShared() else null
         else
             null;
@@ -5091,7 +5092,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn preflightHotStandbyMirrorSyncCommit(self: *ProvisionedKernelOwnerSource) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         try mirror.publisher.preflightRecordingDecision(mirror);
     }
 
@@ -5122,7 +5123,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         req: db_types.BatchRequest,
         identity: Identity,
     ) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         const transition_mutex = mirror.transition_mutex;
         if (transition_mutex) |mutex| lock(mutex);
         var transition_locked = transition_mutex != null;
@@ -5130,7 +5131,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 
         const payload = replication_effects.encodeBatchMutationRequestAlloc(self.alloc, req) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
         defer self.alloc.free(payload);
@@ -5139,10 +5140,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_id = identity.table_id,
         }) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
 
         if (transition_mutex) |mutex| {
             mutex.unlock();
@@ -5161,7 +5162,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         replay_payload: []const u8,
         identity: Identity,
     ) !void {
-        const mirror = self.ha_async_mirror orelse return;
+        const mirror = self.hot_standby_async_mirror orelse return;
         const transition_mutex = mirror.transition_mutex;
         if (transition_mutex) |mutex| lock(mutex);
         var transition_locked = transition_mutex != null;
@@ -5172,10 +5173,10 @@ pub const ProvisionedKernelOwnerSource = struct {
             .table_id = identity.table_id,
         }) catch |err| {
             noteReplicationMirrorFailure(mirror, err);
-            if (mirror.sync_policy.mode != .async) return err;
+            if (mirror.requirements.synchronous) return err;
             return;
         };
-        if (mirror.last_lsn) |last_lsn| last_lsn.store(lsn, .release);
+        mirror.notePublished(lsn);
 
         if (transition_mutex) |mutex| {
             mutex.unlock();
@@ -5194,7 +5195,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     }
 
     fn noteReplicationMirrorFailure(mirror: replication_contract.AsyncEffectMirror, err: anyerror) void {
-        if (mirror.failure_count) |counter| _ = counter.fetchAdd(1, .monotonic);
+        mirror.noteFailure();
         std.log.warn("failed to mirror compiled-owner commit into HA stream: {s}", .{@errorName(err)});
     }
 
@@ -5555,7 +5556,11 @@ pub const ProvisionedKernelOwnerSource = struct {
         return null;
     }
 
-    fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
+    pub fn restoreDescriptorUseForBatch(req: db_types.BatchRequest) RestoreDescriptorUse {
+        if (req.restore_staging) |control| switch (control) {
+            .finish => return .resolve,
+            else => {},
+        };
         // Empty-generation admission is installed after old-owner cutover,
         // while the target is still private. This is a bounded Plan-bound
         // recovery control, not a new import mutation; the storage apply
@@ -6244,7 +6249,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 };
 
 test "compiled owner coordinated ttl admission preserves exact observations and pressure" {
-    const ttl = @import("../storage/coordinated_ttl.zig");
+    const ttl = @import("../storage/server_coordinated_ttl.zig");
     const Fake = struct {
         calls: usize = 0,
         pressure: bool = false,
@@ -6259,7 +6264,7 @@ test "compiled owner coordinated ttl admission preserves exact observations and 
             try std.testing.expectEqualStrings("\x00\xffkey", request.candidates[0].key);
             try std.testing.expectEqual(@as(u64, 99), request.candidates[0].row_version);
             try std.testing.expectEqual(@as(u64, 44), request.candidates[0].ttl_timestamp_ns);
-            try std.testing.expectEqual([_]u8{0xa7} ** 32, request.candidates[0].expected_content_digest);
+            try std.testing.expectEqual(@as([32]u8, @splat(0xa7)), request.candidates[0].expected_content_digest);
             self.calls += 1;
             return 0;
         }
@@ -6478,6 +6483,21 @@ test "committed owner apply never opens or closes storage under the raft apply l
             platform_sync.lockYielding(&self.raft_mutex);
             self.raft_mutex.unlock();
         }
+
+        fn applyCommitted(self: *@This(), owner_source: *Source, descriptor: descriptor_contract.Descriptor, batch: db_types.BatchRequest, index: u64) !void {
+            const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+            while (true) {
+                owner_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(std.testing.allocator, 1, "docs", descriptor, batch, 1, index) catch |err| switch (err) {
+                    error.RaftApplyWriterUnavailable => {
+                        if (platform_time.monotonicNs() >= deadline) return error.TestOwnerDidNotAdmit;
+                        try self.io.sleep(.fromMilliseconds(1), .awake);
+                        continue;
+                    },
+                    else => return err,
+                };
+                return;
+            }
+        }
     };
     var gate = Gate{ .io = io };
     defer {
@@ -6501,28 +6521,39 @@ test "committed owner apply never opens or closes storage under the raft apply l
         .key = "doc:a",
         .operations = &.{.{ .op = .inc, .path = "count", .value_json = "1" }},
     }} };
-    try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
-    try gate.cold_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // A bounded admission rejection need not enqueue an open: the registry
+    // itself may be busy. Force that history, then retry the same committed
+    // entry just as the progress driver does until the control worker enters.
+    {
+        Source.lock(&source.mutex);
+        defer source.mutex.unlock();
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
+        try std.testing.expectEqual(@as(usize, 0), source.apply_control_pending.items.len);
+    }
+    const cold_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!gate.cold_entered.isSet()) {
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
+        if (platform_time.monotonicNs() >= cold_deadline) return error.TestColdOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     // The worker is held before physical open; a repeated committed apply
     // remains a bounded retry and cannot itself open the owner.
     try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1));
     gate.cold_release.set(io);
-    const deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
-    while (true) {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", first, first_batch, 1, 1) catch |err| switch (err) {
-            error.RaftApplyWriterUnavailable => {
-                if (platform_time.monotonicNs() >= deadline) return error.TestColdOwnerDidNotOpen;
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    }
+    try gate.applyCommitted(&source, first, first_batch, 1);
     // A different group's cold open can hold the owner registry while a
     // recovery callback awaits Raft progress. The already-admitted apply
     // lease must be releasable even in that exact lock order.
-    var warm_lease = try source.acquireApplyOnly(1, "docs", first);
+    const lease_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    var warm_lease = while (true) {
+        const lease = source.acquireApplyOnly(1, "docs", first) catch |err| {
+            try std.testing.expect(err == error.RaftApplyWriterUnavailable);
+            if (platform_time.monotonicNs() >= lease_deadline) return error.TestWarmOwnerDidNotAdmit;
+            try io.sleep(.fromMilliseconds(1), .awake);
+            continue;
+        };
+        break lease;
+    };
     const Release = struct {
         lease: *Source.Lease,
         io: std.Io,
@@ -6571,22 +6602,22 @@ test "committed owner apply never opens or closes storage under the raft apply l
     }
     try apply.done.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(2), .clock = .awake } });
     try std.testing.expectEqual(@as(?anyerror, error.RaftApplyWriterUnavailable), apply.failure);
-    try gate.close_entered.waitTimeout(io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+    // Retirement admission is also a retry, not proof that this attempt
+    // queued the descriptor. Keep Raft's mutex held while advancing the exact
+    // entry; physical close still belongs to the independent control worker.
+    const close_deadline = platform_time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (!gate.close_entered.isSet()) {
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2));
+        if (platform_time.monotonicNs() >= close_deadline) return error.TestRetiredOwnerDidNotQueue;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
     gate.raft_mutex.unlock();
     raft_mutex_held = false;
     gate.close_release.set(io);
-    while (true) {
-        source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2) catch |err| switch (err) {
-            error.RaftApplyWriterUnavailable => {
-                if (platform_time.monotonicNs() >= deadline +| 5 * std.time.ns_per_s) return error.TestRetiredOwnerDidNotReopen;
-                try io.sleep(.fromMilliseconds(1), .awake);
-                continue;
-            },
-            else => return err,
-        };
-        break;
-    }
-    try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(alloc, 1, "docs", second, second_batch, 1, 2);
+    try gate.applyCommitted(&source, second, second_batch, 2);
+    // Idempotency uses the same admission contract: the successful apply wakes
+    // release reconciliation, which can briefly contend with this retry.
+    try gate.applyCommitted(&source, second, second_batch, 2);
     var lease = try source.acquireDescriptorOnce(1, "docs", path, second, .shared, .resident, .{ .historical_raft_apply = true });
     defer lease.deinit();
     var value = try lease.owner().lookupJson("docs", "{\"key\":\"doc:a\",\"include_all_fields\":true}");
@@ -6817,13 +6848,13 @@ test "hidden initial child descriptor requires exact private bootstrap" {
     defer source.deinit();
     const Bootstrap = @import("../storage/db/relational_initial_child_publication.zig").Bootstrap;
     const expected: Bootstrap = .{
-        .plan_id = .{1} ** 16,
-        .plan_digest = .{2} ** 32,
+        .plan_id = @splat(1),
+        .plan_digest = @splat(2),
         .namespace = .{ .table_id = 7, .shard_id = 8, .range_id = 9 },
         .schema_version = 1,
-        .schema_digest = .{3} ** 32,
-        .public_schema_json_digest = .{4} ** 32,
-        .catalog_digest = .{5} ** 32,
+        .schema_digest = @splat(3),
+        .public_schema_json_digest = @splat(4),
+        .catalog_digest = @splat(5),
     };
     const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, expected, .{});
     defer alloc.free(bootstrap_json);
@@ -6839,7 +6870,7 @@ test "hidden initial child descriptor requires exact private bootstrap" {
     try std.testing.expectEqualStrings(bootstrap_json, loaded.view().initial_child_bootstrap_json);
     try std.testing.expect(loaded.view().identity.eql(.{ .table_id = 7, .shard_id = 8, .range_id = 9 }));
     var wrong = expected;
-    wrong.plan_id = .{6} ** 16;
+    wrong.plan_id = @splat(6);
     try std.testing.expectError(error.InitialChildPublicationChanged, source.loadInitialChildDescriptor(alloc, 1, "hidden", wrong));
 }
 
@@ -7538,7 +7569,7 @@ test "owner recovery bulk callback preserves bounded identities and uncertain st
         fn many(ptr: *anyopaque, txn: @import("../storage/db/types.zig").TxnId, owner: []const u8, participants: []const []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            try std.testing.expectEqual([_]u8{4} ** 16, txn);
+            try std.testing.expectEqual(@as([16]u8, @splat(4)), txn);
             try std.testing.expectEqualStrings("owner", owner);
             try std.testing.expectEqual(@as(usize, 2), participants.len);
             try std.testing.expectEqualStrings("first", participants[0]);

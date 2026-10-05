@@ -12,7 +12,7 @@ const processor = inference.pipelines.gliner_boundary_processor;
 const Allocator = std.mem.Allocator;
 const scope = "gliner25_cuda_training_comparison_v1";
 comptime {
-    if (!@import("build_options").enable_cuda or @import("builtin").mode != .ReleaseFast)
+    if (!@import("build_options").enable_cuda or @import("builtin").mode != .fast)
         @compileError("CUDA training benchmark requires CUDA and ReleaseFast");
 }
 const Command = struct { request_id: u32, op: enum { validate, run, stop }, case_id: []const u8 = "" };
@@ -29,7 +29,7 @@ fn emit(a: Allocator, out: *std.Io.Writer, value: anytype) !void {
     try out.writeByte('\n');
     try out.flush();
 }
-fn sync(owner: *native.Trainer) !void {
+pub fn sync(owner: *native.Trainer) !void {
     try inference.native_compute.cuda.gliner25_api.synchronizeAndDrainDeferredDeviceFrees(owner.backend.cuda_backend.?);
 }
 fn benchmarkName(name: []const u8) []const u8 {
@@ -78,7 +78,7 @@ const PhaseProfile = struct {
     last_ns: u64,
     calls: usize = 0,
     decision_ns: [4]?u64 = @splat(null),
-    phase_ns: [@typeInfo(native.MemoryPhase).@"enum".fields.len]u64 = @splat(0),
+    phase_ns: [@typeInfo(native.MemoryPhase).@"enum".field_names.len]u64 = @splat(0),
 
     fn sample(raw: ?*anyopaque) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw.?));
@@ -87,13 +87,13 @@ const PhaseProfile = struct {
         const phase = self.owner.memory_failures.phase;
         if (phase == self.phase and self.calls % 128 != 0) return;
         const timestamp = try now();
-        self.phase_ns[@intFromEnum(self.phase)] += timestamp - self.last_ns;
+        self.phase_ns[@backingInt(self.phase)] += timestamp - self.last_ns;
         self.last_ns = timestamp;
         self.phase = phase;
     }
     fn decision(raw: *anyopaque, event: native.DecisionEvents.Event) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        const index = @intFromEnum(std.meta.activeTag(event));
+        const index = @backingInt(std.meta.activeTag(event));
         if (self.decision_ns[index] == null) self.decision_ns[index] = (try now()) - self.start_ns;
     }
 };
@@ -116,7 +116,7 @@ const TraceCapture = struct {
     fn init(a: Allocator, json_bytes: usize) @This() {
         return .{ .budget = .{ .backing = a, .limit = json_bytes } };
     }
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         const a = self.budget.allocator();
         for (self.events.items) |event| a.free(event);
         self.events.deinit(a);
@@ -383,7 +383,7 @@ pub fn main(init: std.process.Init) !void {
             const finished = try now();
             const duration = finished - start;
             if (profiling) {
-                profile.phase_ns[@intFromEnum(profile.phase)] += finished - profile.last_ns;
+                profile.phase_ns[@backingInt(profile.phase)] += finished - profile.last_ns;
                 try emit(a, &output.interface, .{ .event = "phase_profile", .request_id = c.request_id, .phase_names = std.meta.fieldNames(native.MemoryPhase), .phase_ns = profile.phase_ns, .decision_names = .{ "pool", "relations", "boundary_loss", "record" }, .decision_ns = profile.decision_ns, .control_checks = profile.calls, .matmul_plans = if (owner.backend.cuda_backend.?.cublaslt) |*blas| blas.tensor_core_plans.count() else 0, .timing = "diagnostic_host_intervals" });
             }
             const after = owner.cb.trainingRuntimeStats();

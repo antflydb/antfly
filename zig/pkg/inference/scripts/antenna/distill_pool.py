@@ -143,7 +143,10 @@ SOURCE_TASKS = {
     "massive": "intent",
     "go_emotions": "emotion",
     "dbpedia": "topic",
+    "huffpost": "topic",
 }
+# Sources loaded through antenna_training_sets.py (pinned there).
+TRAINING_SET_SOURCES = ("huffpost",)
 
 
 def wikipedia_passages(path: Path, limit: int) -> list[str]:
@@ -249,6 +252,13 @@ def load_source(name: str) -> tuple[list[tuple[str, list[str]]], list[str]]:
 
     import pyarrow.parquet as pq
 
+    if name in TRAINING_SET_SOURCES:
+        import antenna_training_sets
+
+        records = antenna_training_sets.load_classification(name)
+        return [(record["text"], []) for record in records], (
+            antenna_training_sets.label_names(name)
+        )
     data = _fetch(name)
     if name == "nuner":
         csv.field_size_limit(1 << 24)
@@ -667,7 +677,7 @@ def main() -> int:
         action="append",
         default=[],
         metavar="NAME=ROWS",
-        help=f"sampled source mix instead of the default texts: {', '.join(TEXT_SETS + ('wikipedia',) + tuple(SOURCES))}",
+        help=f"sampled source mix instead of the default texts: {', '.join(TEXT_SETS + ('wikipedia',) + tuple(SOURCES) + TRAINING_SET_SOURCES)}",
     )
     parser.add_argument(
         "--label-sets",

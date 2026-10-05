@@ -22,6 +22,70 @@ measurement = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(measurement)
 
 
+class LiteralSourceOwnership(unittest.TestCase):
+    def test_control_roots_have_no_physical_implementation_import_path(self):
+        source = measurement.ZIG_ROOT / "pkg/antfly/src"
+        roots = [
+            *(
+                f"runtime_{unit}_root.zig"
+                for unit in (
+                    "cli",
+                    "distributed",
+                    "enrichment_compute",
+                    "serverless",
+                    "inference",
+                    "api_kernel",
+                )
+            ),
+            "storage_kernel_owner_test_root.zig",
+            "storage_kernel_provisioned_source_test_root.zig",
+            "enrichment_compute_test_root.zig",
+            "api_table_reads_test_root.zig",
+            "api_table_writes_test_root.zig",
+            "data_runtime_test_root.zig",
+        ]
+        for name in roots:
+            with self.subTest(root=name):
+                root = source / name
+                self.assertTrue(root.is_file(), name)
+                path = measurement.literal_import_path(
+                    root, source / "storage/db/db.zig"
+                )
+                self.assertIsNone(path, path)
+                if (
+                    name.startswith("runtime_")
+                    and name != "runtime_distributed_root.zig"
+                ):
+                    path = measurement.literal_import_path(
+                        root, source / "api/table_writes.zig"
+                    )
+                    self.assertIsNone(path, path)
+
+    def test_imports_in_inactive_test_bodies_are_cache_dependencies(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            (root / "owner.zig").write_text(
+                '// @import("comment.zig")\n'
+                """const quote = '"';\n"""
+                'const doc = "@import(\\"string.zig\\")";\n'
+                'test { if (false) { _ = @import("helper.zig"); } }\n'
+            )
+            (root / "helper.zig").write_text('const db = @import("db.zig");\n')
+            (root / "db.zig").write_text("")
+            self.assertEqual(
+                measurement.literal_import_path(root / "owner.zig", root / "db.zig"),
+                [root / "owner.zig", root / "helper.zig", root / "db.zig"],
+            )
+            self.assertIsNone(
+                measurement.literal_import_path(
+                    root / "owner.zig", root / "comment.zig"
+                )
+            )
+            self.assertIsNone(
+                measurement.literal_import_path(root / "owner.zig", root / "string.zig")
+            )
+
+
 class BuildMemoryAccounting(unittest.TestCase):
     def test_concurrent_descendants_exclude_unrelated_builds(self):
         snapshot = """
@@ -106,10 +170,10 @@ class BuildFailureEvidence(unittest.TestCase):
                     if label in {"cold", "storage contract cold"} or name in rebuilt
                     else "cached"
                 )
-                output.append(f"compile {kind} {name} Debug native {status}")
+                output.append(f"compile {kind} {name} debug native {status}")
             if label in {"physical DB", "physical local query"}:
                 output.extend(
-                    f"compile exe {name} Debug native success"
+                    f"compile exe {name} debug native success"
                     for name in measurement.CONSUMERS
                 )
             seen.append(label)
@@ -210,7 +274,7 @@ pub fn create(b: *std.Build) ?void {
     }) |name| {
         if (omit == null or !std.mem.eql(u8, omit.?, name)) {
             const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
-                .root_source_file = root, .target = target, .optimize = .Debug,
+                .root_source_file = root, .target = target, .optimize = .debug,
             }) });
             b.step(name, name).dependOn(&exe.step);
         }
@@ -220,7 +284,7 @@ pub fn create(b: *std.Build) ?void {
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = b.createModule(.{
             .root_source_file = files.add("unrelated.zig", "comptime { @compileError(\"unrelated owner fixture compiled\"); }"),
-            .target = target, .optimize = .Debug,
+            .target = target, .optimize = .debug,
         }),
     });
     b.step("unrelated", "unrelated").dependOn(&unrelated.step);

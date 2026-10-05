@@ -46,6 +46,7 @@ const Mock = struct {
     stream_offset: usize = 0,
     stream_closes: usize = 0,
     stream_pulls: usize = 0,
+    stream_live_pages: usize = 0,
     stream_detaches: usize = 0,
     stream_validations: usize = 0,
     revoke_after_commit: bool = false,
@@ -112,6 +113,7 @@ const Mock = struct {
     }
     fn detachStream(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.stream_live_pages == 0);
         self.stream_detaches += 1;
     }
     fn validateStream(raw: *anyopaque, _: std.mem.Allocator, request: backend.Request) !void {
@@ -130,11 +132,18 @@ const Mock = struct {
         const rows = try alloc.alloc([]const std.json.Value, count);
         for (rows, 0..) |*row, i| row.* = try alloc.dupe(std.json.Value, &.{.{ .integer = @intCast(self.stream_offset + i) }});
         self.stream_offset += count;
-        return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = rows, .command_tag = "SELECT" } };
+        self.stream_live_pages += 1;
+        return .{ .exhausted = self.stream_offset == self.stream_rows, .result = .{ .columns = &.{.{ .name = "n", .type = .integer }}, .rows = rows, .command_tag = "SELECT", .owner = .{ .context = self, .release = releaseStreamPage } } };
+    }
+    fn releaseStreamPage(raw: *anyopaque) void {
+        const self: *Mock = @ptrCast(@alignCast(raw));
+        std.debug.assert(self.stream_live_pages > 0);
+        self.stream_live_pages -= 1;
     }
     fn closeStream(raw: *anyopaque) void {
         const self: *Mock = @ptrCast(@alignCast(raw));
         std.debug.assert(self.releases == 0);
+        std.debug.assert(self.stream_live_pages == 0);
         self.stream_closes += 1;
     }
     fn authenticate(raw: *anyopaque, _: std.mem.Allocator, user: []const u8, password: []const u8) !backend.Identity {

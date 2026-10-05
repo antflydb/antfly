@@ -67,7 +67,7 @@ pub const FileSnapshotArtifact = struct {
         return data;
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *FileSnapshotArtifact = @ptrCast(@alignCast(ptr));
         std.Io.Dir.cwd().deleteFile(self.io, self.path) catch |err| switch (err) {
             error.FileNotFound => {},

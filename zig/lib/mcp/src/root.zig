@@ -892,7 +892,7 @@ test "mcp session store enforces capacity and reclaims expired sessions" {
     const Clock = struct {
         var now_ns: std.atomic.Value(u64) = .init(100);
 
-        fn read() u64 {
+        pub fn read() u64 {
             return now_ns.load(.acquire);
         }
     };

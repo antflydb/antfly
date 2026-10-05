@@ -142,7 +142,7 @@ uv run scripts/laya/laya_qualify.py \
 cd zig
 ANTFLY_LAYA_QUALIFICATION=/tmp/laya-qualification ANTFLY_LAYA_METAL=1 \
   python3 tools/run_bounded_zig_build.py --max-rss-cap 16000000000 \
-  build inference-test -Doptimize=ReleaseFast -Dmetal=true -Dcuda=false -Donnx=false \
+  build inference-test -Doptimize=fast -Dmetal=true -Dcuda=false -Donnx=false \
   -- --test-filter 'laya released' --test-filter 'laya extraction v2' \
   --test-filter 'HuggingFace ModernBERT' --test-filter 'metal native f16 host linear'
 ```

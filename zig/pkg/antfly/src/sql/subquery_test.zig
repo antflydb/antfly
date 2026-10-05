@@ -157,7 +157,7 @@ test "SQL EXISTS validates discarded expressions without evaluating them" {
             try std.testing.expect(result.output.rows[0][0].bool);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     for ([_]struct { query: []const u8, err: anyerror }{
         .{ .query = "SELECT EXISTS (SELECT missing + 1 FROM (SELECT 1 AS x) i)", .err = error.UndefinedColumn },
@@ -216,7 +216,7 @@ test "SQL membership unwinds allocations admits parameters and fails closed outs
             try std.testing.expect(result.output.rows[0][0].bool);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT 1 IN (SELECT x FROM (SELECT 1 AS x) i)", .{});
     defer compiled.deinit();
@@ -506,7 +506,7 @@ test "SQL composed correlated aggregates retain empty group defaults and compute
             try std.testing.expectEqualStrings("10", result.output.rows[1][1].string);
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT (SELECT i.y + SUM(i.y) FROM (SELECT 1 AS y) i)", .{});
     defer compiled.deinit();
@@ -574,7 +574,7 @@ test "SQL decorrelation unwinds every allocation and enforces shared memory admi
             defer result.deinit();
         }
     };
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
     var backend: Backend = .{};
     var compiled = try compiler.compile(std.testing.allocator, "SELECT EXISTS (SELECT 1)", .{});
     defer compiled.deinit();

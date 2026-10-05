@@ -399,7 +399,7 @@ fn saveGcCursor(txn: anytype, value: GcCursor) !void {
 
 fn descriptorView(raw: []const u8, sequence: u64) !retained_frame.View {
     const Dummy = struct {
-        fn read(_: *anyopaque, _: u64, _: u32, _: []u8) !usize {
+        pub fn read(_: *anyopaque, _: u64, _: u32, _: []u8) !usize {
             return error.RetainedEffectsCorrupt;
         }
     };
@@ -517,7 +517,7 @@ pub const Frame = union(enum) {
 pub fn chunkSource(txn: anytype) retained_frame.Source {
     const Txn = @TypeOf(txn.*);
     return .{ .context = txn, .read_chunk = struct {
-        fn read(ptr: *anyopaque, sequence: u64, ordinal: u32, out: []u8) !usize {
+        pub fn read(ptr: *anyopaque, sequence: u64, ordinal: u32, out: []u8) !usize {
             const owner: *Txn = @ptrCast(@alignCast(ptr));
             const key = chunkKey(sequence, ordinal);
             if (@hasDecl(Txn, "forkRead")) {
@@ -733,7 +733,7 @@ pub const Capture = struct {
     pub fn touch(self: *Capture, alloc: Allocator, txn: anytype, key: []const u8, primary: bool, cache: ?*std.atomic.Value(u8)) !void {
         if (self.staging) return;
         errdefer self.poisoned = true;
-        if (std.mem.eql(u8, key, &internal_keys.raft_document_applied_entry_key)) {
+        if (std.mem.eql(u8, key, &internal_keys.ordered_document_applied_entry_key)) {
             try @import("source_authority.zig").requireRaftMarkerAllowed(txn);
             self.raft_marker = true;
         }
@@ -1109,7 +1109,7 @@ test "retained effects capture allocation failures poison commit and release own
         const Self = @This();
         alloc: Allocator,
         records: std.StringHashMapUnmanaged([]u8) = .empty,
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var iter = self.records.iterator();
             while (iter.next()) |entry| {
                 self.alloc.free(entry.key_ptr.*);
@@ -1129,7 +1129,7 @@ test "retained effects capture allocation failures poison commit and release own
                 return null;
             }
         };
-        fn openCursor(self: *@This()) !Cursor {
+        pub fn openCursor(self: *@This()) !Cursor {
             return .{ .owner = self };
         }
         pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {

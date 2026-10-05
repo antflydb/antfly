@@ -841,7 +841,7 @@ pub const RerankingPipeline = struct {
         allocator: std.mem.Allocator,
         outputs: []Tensor,
 
-        fn deinit(self: *TextRun) void {
+        pub fn deinit(self: *TextRun) void {
             for (self.outputs) |*o| o.deinit();
             self.allocator.free(self.outputs);
         }
@@ -1098,7 +1098,7 @@ test "cross encoder stops a 30-document pass after its first bounded batch" {
         .{ .max_length = 8, .batch_size = 8 },
     );
     pipeline.execution_control = .{ .ptr = &control, .check_fn = Control.check };
-    const documents = [_][]const u8{"document"} ** 30;
+    const documents = @as([30][]const u8, @splat("document"));
     try std.testing.expectError(error.Cancelled, pipeline.rerank("query", &documents));
     try std.testing.expectEqual(@as(usize, 1), session_state.run_count.load(.acquire));
 }
@@ -1493,7 +1493,7 @@ const FakeRerankingTokenizer = struct {
         return 256;
     }
 
-    fn deinit(_: *anyopaque) void {}
+    pub fn deinit(_: *anyopaque) void {}
 };
 
 test "reranking text run reports missing model output instead of panicking" {

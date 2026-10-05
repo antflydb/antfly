@@ -26,6 +26,7 @@ const relational_native = @import("../storage/relational_index.zig");
 pub const TableSchema = struct {
     version: u32 = 0,
     storage_mode: StorageMode = .document,
+    external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     default_type: []const u8 = "",
     ttl_duration_ns: u64 = 0,
     ttl_field: []const u8 = "_timestamp",
@@ -41,6 +42,7 @@ pub const TableSchema = struct {
     generated_columns: ?std.json.Parsed(std.json.Value) = null,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
+        if (self.external_base_source) |*source| source.deinit(alloc);
         if (self.relational_indexes) |*indexes| indexes.deinit();
         if (self.checks) |*checks| checks.deinit();
         if (self.unique_constraints) |*constraints| constraints.deinit();
@@ -114,7 +116,7 @@ pub const TableSchema = struct {
     }
 
     fn nativeEnum(comptime T: type, wire: anytype) T {
-        inline for (@typeInfo(T).@"enum".fields) |field| if (std.mem.eql(u8, @tagName(wire), field.name)) return @field(T, field.name);
+        inline for (@typeInfo(T).@"enum".field_names) |reflected_name| if (std.mem.eql(u8, @tagName(wire), reflected_name)) return @field(T, reflected_name);
         unreachable;
     }
 
@@ -575,7 +577,7 @@ const RuntimeValidationContext = struct {
     root_property: ?*const DocumentProperty = null,
     require_physical_encoding: bool = false,
     physical_numeric_kind: ?RelationalNumericKind = null,
-    active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
+    active_root_ref_values: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0, .pointer_stability = .{} },
 
     fn findProperty(self: *const RuntimeValidationContext, properties: []const DocumentProperty, name: []const u8) ?DocumentProperty {
         if (self.compiled) |compiled| return compiled.findProperty(properties, name);
@@ -592,7 +594,7 @@ const RuntimeValidationContext = struct {
         };
     }
 
-    fn deinit(self: *RuntimeValidationContext) void {
+    pub fn deinit(self: *RuntimeValidationContext) void {
         self.active_root_ref_values.deinit(self.alloc);
         self.* = undefined;
     }
@@ -618,6 +620,15 @@ const RootRefGuard = struct {
 };
 
 pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return parseSchemaRequest(alloc, body, false);
+}
+
+/// Creation can carry an unpublished external schema-inference draft. Updates
+/// and stored schemas always require fully bound relational columns.
+pub fn parseCreateSchemaRequest(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    return parseSchemaRequest(alloc, body, true);
+}
+fn parseSchemaRequest(alloc: std.mem.Allocator, body: []const u8, allow_inference: bool) ![]u8 {
     if (body.len == 0) return error.InvalidSchemaUpdateRequest;
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .parse_numbers = false });
     defer parsed.deinit();
@@ -626,8 +637,13 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     defer schema.deinit(alloc);
     try validateParsedStorageModeSchema(schema);
     try validateParsedTtlSchema(schema);
-    try validateParsedRelationalSchema(schema);
-    try validateRelationalExpressions(alloc, schema);
+    const pending = allow_inference and schema.external_base_source != null and schema.document_schemas.len == 0;
+    if (pending) {
+        if (schema.dynamic_templates.len != 0 or schema.index_sort.len != 0) return error.InvalidSchemaUpdateRequest;
+    } else {
+        try validateParsedRelationalSchema(schema);
+        try validateRelationalExpressions(alloc, schema);
+    }
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -854,14 +870,14 @@ pub const RelationalRestorePlan = struct {
         const defaults = DocumentSchema{ .name = "" };
         // Explicitly account for each root keyword we can discharge through
         // the closed physical layout. New keywords default to full validation.
-        inline for (std.meta.fields(DocumentSchema)) |field| {
-            if (comptime !std.mem.eql(u8, field.name, "name") and
-                !std.mem.eql(u8, field.name, "properties") and
-                !std.mem.eql(u8, field.name, "required_fields") and
-                !std.mem.eql(u8, field.name, "include_in_all_fields") and
-                !std.mem.eql(u8, field.name, "additional_properties_allowed"))
+        inline for (comptime std.meta.fieldNames(DocumentSchema)) |reflected_name| {
+            if (comptime !std.mem.eql(u8, reflected_name, "name") and
+                !std.mem.eql(u8, reflected_name, "properties") and
+                !std.mem.eql(u8, reflected_name, "required_fields") and
+                !std.mem.eql(u8, reflected_name, "include_in_all_fields") and
+                !std.mem.eql(u8, reflected_name, "additional_properties_allowed"))
             {
-                if (!restoreFieldIsDefault(@field(document, field.name), @field(defaults, field.name))) return .{};
+                if (!restoreFieldIsDefault(@field(document, reflected_name), @field(defaults, reflected_name))) return .{};
             }
         }
         for (document.properties) |property| {
@@ -899,13 +915,13 @@ fn physicalLayoutDischargesProperty(property: DocumentProperty) bool {
     if (!physical_scalar) return false;
     if (property.integer_only and !std.mem.eql(u8, kind, "integer")) return false;
     const defaults = DocumentProperty{ .name = "" };
-    inline for (std.meta.fields(DocumentProperty)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "name") and
-            !std.mem.eql(u8, field.name, "field_type") and
-            !std.mem.eql(u8, field.name, "integer_only") and
-            !std.mem.eql(u8, field.name, "allows_null"))
+    inline for (comptime std.meta.fieldNames(DocumentProperty)) |reflected_name| {
+        if (comptime !std.mem.eql(u8, reflected_name, "name") and
+            !std.mem.eql(u8, reflected_name, "field_type") and
+            !std.mem.eql(u8, reflected_name, "integer_only") and
+            !std.mem.eql(u8, reflected_name, "allows_null"))
         {
-            if (!restoreFieldIsDefault(@field(property, field.name), @field(defaults, field.name))) return false;
+            if (!restoreFieldIsDefault(@field(property, reflected_name), @field(defaults, reflected_name))) return false;
         }
     }
     return true;
@@ -2347,6 +2363,17 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             parsed.storage_mode = std.meta.stringToEnum(StorageMode, storage_mode.string) orelse return error.InvalidSchemaUpdateRequest;
         }
     }
+    if (root.get("base_source")) |base_source| {
+        if (base_source != .null) {
+            if (base_source != .object) return error.InvalidSchemaUpdateRequest;
+            const kind = base_source.object.get("kind") orelse return error.InvalidSchemaUpdateRequest;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "external")) return error.InvalidSchemaUpdateRequest;
+        }
+        const bytes = try std.json.Stringify.valueAlloc(alloc, value, .{});
+        defer alloc.free(bytes);
+        parsed.external_base_source = try @import("../serverless/external_source/schema_binding.zig").externalBindingFromSchemaJsonAlloc(alloc, bytes);
+        if (parsed.external_base_source != null and parsed.storage_mode != .relational) return error.InvalidSchemaUpdateRequest;
+    }
     if (root.get("default_type")) |default_type| {
         if (default_type != .null) {
             alloc.free(parsed.default_type);
@@ -2480,6 +2507,9 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
             if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
         }
         parsed.enforce_types = true;
+    }
+    if (parsed.external_base_source) |source| {
+        if (source.binding.format == .lance or parsed.ttl_duration_ns != 0 or parsed.relational_indexes != null or parsed.checks != null or parsed.unique_constraints != null or parsed.foreign_keys != null or parsed.column_defaults != null or parsed.generated_columns != null) return error.InvalidSchemaUpdateRequest;
     }
     return parsed;
 }

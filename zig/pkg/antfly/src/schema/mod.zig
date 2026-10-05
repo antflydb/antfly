@@ -130,6 +130,7 @@ pub const CompiledTableValidator = struct {
     }
 
     pub fn validateWrites(self: CompiledTableValidator, alloc: std.mem.Allocator, writes: anytype) !void {
+        if (self.schema.external_base_source != null and writes.len != 0) return error.ExternalLakeReadOnly;
         try impl.validateWritesWithPlan(alloc, self.schema, writes, self.physical_fields, &self.execution);
     }
 
@@ -445,7 +446,7 @@ fn appendUniquePhysicalFieldValidation(
     source_field: []const u8,
     field_type: storage_schema.AntflyType,
 ) !void {
-    const type_mask = @as(u16, 1) << @intCast(@intFromEnum(field_type));
+    const type_mask = @as(u16, 1) << @intCast(@backingInt(field_type));
     if (seen_types.getPtr(source_field)) |mask| {
         if (mask.* & type_mask != 0) return;
         const owned_source = try alloc.dupe(u8, source_field);
@@ -477,7 +478,7 @@ fn appendUniquePhysicalFieldValidation(
 fn physicalFieldValidationLessThan(_: void, a: impl.PhysicalFieldValidation, b: impl.PhysicalFieldValidation) bool {
     const order = std.mem.order(u8, a.source_field, b.source_field);
     if (order != .eq) return order == .lt;
-    return @intFromEnum(a.field_type) < @intFromEnum(b.field_type);
+    return @backingInt(a.field_type) < @backingInt(b.field_type);
 }
 
 fn freePhysicalFieldValidations(alloc: std.mem.Allocator, fields: []impl.PhysicalFieldValidation) void {
@@ -573,9 +574,12 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     const default_type = try alloc.dupe(u8, if (schema.default_type.len > 0) schema.default_type else "_default");
     errdefer alloc.free(default_type);
     const ttl_field = try alloc.dupe(u8, schema.ttl_field);
+    errdefer alloc.free(ttl_field);
+    const external = if (schema.external_base_source) |source| try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, source) else null;
 
     return .{
         .version = schema.version,
+        .external_base_source = external,
         .default_type = default_type,
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = ttl_field,
@@ -993,14 +997,14 @@ fn declaredFieldLessThan(_: void, a: storage_schema.DeclaredField, b: storage_sc
     const field_order = std.mem.order(u8, a.field, b.field);
     if (field_order != .eq) return field_order == .lt;
     if (a.mapping.field_type != b.mapping.field_type) {
-        return @intFromEnum(a.mapping.field_type) < @intFromEnum(b.mapping.field_type);
+        return @backingInt(a.mapping.field_type) < @backingInt(b.mapping.field_type);
     }
     if (a.mapping.do_index != b.mapping.do_index) return !a.mapping.do_index;
     if (a.mapping.store != b.mapping.store) return !a.mapping.store;
     if (a.mapping.doc_values != b.mapping.doc_values) return !a.mapping.doc_values;
     if (a.mapping.sortable != b.mapping.sortable) return !a.mapping.sortable;
     if (a.mapping.missing_null_policy != b.mapping.missing_null_policy) {
-        return @intFromEnum(a.mapping.missing_null_policy) < @intFromEnum(b.mapping.missing_null_policy);
+        return @backingInt(a.mapping.missing_null_policy) < @backingInt(b.mapping.missing_null_policy);
     }
     if (a.mapping.include_in_all != b.mapping.include_in_all) return !a.mapping.include_in_all;
     return std.mem.order(u8, a.mapping.analyzer, b.mapping.analyzer) == .lt;
@@ -2682,4 +2686,27 @@ test "runtime schema derives and validates index sort metadata" {
     );
     defer id_not_final.deinit(alloc);
     try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, id_not_final));
+}
+
+test "external lake schema binding survives durable serialization and preserves ownership" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":7,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"orders","format":"iceberg","uri":"s3://bucket/orders","credentials":{"ref":"lake","scope":"orders"},"snapshot":{"mode":"snapshot_id","id":"123"},"schema_fingerprint":"schema-v7"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"amount":{"type":"integer"}},"additionalProperties":false}}}}
+    );
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    parsed.deinit(alloc);
+    defer storage_schema.freeSchema(alloc, runtime);
+    const bytes = try storage_schema.serializeSchema(alloc, runtime);
+    defer alloc.free(bytes);
+    const restored = try storage_schema.deserializeSchema(alloc, bytes);
+    defer storage_schema.freeSchema(alloc, restored);
+    try std.testing.expect(try storage_schema.schemasEqual(alloc, runtime, restored));
+    const source = restored.external_base_source.?.binding;
+    try std.testing.expectEqualStrings("123", source.snapshot_mode.snapshot_id);
+    try std.testing.expectEqualStrings("lake", source.credential_ref.?.ref_id);
+    const projection = try storage_schema.serializeTextProjectionSchema(alloc, runtime);
+    defer alloc.free(projection);
+    const text_schema = try storage_schema.deserializeSchema(alloc, projection);
+    defer storage_schema.freeSchema(alloc, text_schema);
+    try std.testing.expect(text_schema.external_base_source == null);
 }

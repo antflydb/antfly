@@ -364,7 +364,7 @@ fn isScalarDefault(comptime T: type, value: T) bool {
         .int => value == 0,
         .float => value == 0.0,
         .bool => !value,
-        .@"enum" => @intFromEnum(value) == 0,
+        .@"enum" => @backingInt(value) == 0,
         else => @compileError("isScalarDefault: unsupported type " ++ @typeName(T)),
     };
 }
@@ -378,7 +378,7 @@ fn varintWireValue(comptime T: type, value: T) u64 {
             @intCast(value),
         .bool => @intFromBool(value),
         .@"enum" => |enum_info| blk: {
-            const tag_val = @intFromEnum(value);
+            const tag_val = @backingInt(value);
             const tag_info = @typeInfo(enum_info.tag_type).int;
             break :blk if (tag_info.signedness == .signed)
                 @bitCast(@as(i64, @intCast(tag_val)))
@@ -803,7 +803,7 @@ fn RepeatedLists(comptime T: type) type {
     const map = T._pb_field_map;
     comptime var field_names: [map.len][]const u8 = undefined;
     comptime var field_types: [map.len]type = undefined;
-    comptime var field_attrs: [map.len]std.builtin.Type.StructField.Attributes = undefined;
+    comptime var field_attrs: [map.len]std.builtin.Type.Struct.FieldAttributes = undefined;
     inline for (map, 0..) |fd, i| {
         const FieldT = @FieldType(T, fd.name);
         const ListT: type = switch (fd.encoding) {
@@ -994,7 +994,7 @@ fn enumFromWireUnchecked(comptime T: type, tag_val: @typeInfo(T).@"enum".tag_typ
     // values that cannot fit the enum tag type and leaves semantic validation to
     // callers that own the concrete enum.
     @setRuntimeSafety(false);
-    return @enumFromInt(tag_val);
+    return @fromBackingInt(@intCast(tag_val));
 }
 
 fn fixed32FromWire(comptime T: type, raw: u32) T {
@@ -1412,7 +1412,7 @@ test "enum preserves unknown in-range wire value" {
     const bytes = [_]u8{ 0x08, 0x63 };
     var decoded = try decode(EnumMsg, testing.allocator, &bytes);
     defer deinit(EnumMsg, testing.allocator, &decoded);
-    try testing.expectEqual(@as(i32, 99), @intFromEnum(decoded.kind));
+    try testing.expectEqual(@as(i32, 99), @backingInt(decoded.kind));
 }
 
 const Inner = struct {

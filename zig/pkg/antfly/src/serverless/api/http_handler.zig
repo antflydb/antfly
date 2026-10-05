@@ -54,6 +54,7 @@ const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const graph_mod = @import("../../graph/graph.zig");
 const graph_metric_rerank = @import("../../graph/metric_rerank.zig");
 const graph_pattern_mod = @import("../../graph/pattern.zig");
+const relationship_filter = @import("../../graph/relationship_filter.zig");
 const graph_work_budget_mod = @import("../../graph/work_budget.zig");
 const graph_node_admission = @import("../../graph/node_admission.zig");
 const graph_node_identity = @import("../../graph/node_identity.zig");
@@ -125,7 +126,7 @@ const SearchExecution = struct {
     requested_limit: usize,
     profile_requested: bool,
 
-    fn deinit(self: *SearchExecution, alloc: Allocator) void {
+    pub fn deinit(self: *SearchExecution, alloc: Allocator) void {
         query_mod.freeSearchHits(alloc, self.hits);
         if (self.session) |*session| session.deinit();
         self.status.deinit(alloc);
@@ -145,7 +146,7 @@ const ServerlessAggregationComputation = struct {
     requests: []const db_mod.aggregations.SearchAggregationRequest = &.{},
     results: []db_mod.aggregations.SearchAggregationResult,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         query_api.freeAggregationRequests(alloc, self.requests);
         db_mod.aggregations.deinitResults(alloc, self.results);
         self.* = undefined;
@@ -155,7 +156,7 @@ const ServerlessAggregationComputation = struct {
 const ServerlessAggregationContextOwned = struct {
     ctx: db_mod.aggregations.Context = .{},
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         distributed_stats_mod.deinitTextFieldStats(alloc, self.ctx.distributed_text_stats);
         db_mod.aggregations.deinitDistributedBackgroundTextStats(alloc, self.ctx.distributed_background_text_stats);
         self.* = undefined;
@@ -166,7 +167,7 @@ const SignificantTermFieldSet = struct {
     field: []u8,
     terms: std.ArrayListUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.field);
         for (self.terms.items) |term| alloc.free(term);
         self.terms.deinit(alloc);
@@ -941,7 +942,7 @@ pub const HttpHandler = struct {
                             .ready => .ready,
                             .rejected => .rejected,
                         };
-                        status.rejection_reason = @enumFromInt(@intFromEnum(metric_ref.graph_metric_rejection_reason));
+                        status.rejection_reason = @fromBackingInt(@backingInt(metric_ref.graph_metric_rejection_reason));
                     }
                 }
                 statuses[initialized] = status;
@@ -3050,6 +3051,7 @@ pub const HttpHandler = struct {
         }
         var parsed_request = ant_json.parseFromSlice(metadata_openapi.QueryRequest, self.alloc, body, .{
             .allocate = .alloc_always,
+            .parse_numbers = false,
         }) catch return error.InvalidQueryRequest;
         defer parsed_request.deinit();
         const request = parsed_request.value;
@@ -3059,6 +3061,7 @@ pub const HttpHandler = struct {
             return err;
         };
         defer public_graph_query.freeNamedGraphQueries(self.alloc, graph_queries);
+        for (graph_queries) |named| try validatePublishedRelationshipFilters(named);
 
         var metric_requests = try query_api.parseGraphMetricRequestsAlloc(self.alloc, body);
         defer metric_requests.deinit(self.alloc);
@@ -3088,8 +3091,8 @@ pub const HttpHandler = struct {
             .offset = if (request.offset) |offset| std.math.cast(u32, offset) orelse 0 else 0,
             .cancellation = cancellation,
         };
-        if (graph_request) |canonical_operations| {
-            req.graph_query_transport = graph_wire_envelope.captureCanonicalOperationsAlloc(
+        if (request.graph_queries) |canonical_operations| {
+            req.graph_query_transport = graph_wire_envelope.captureTypedCanonicalOperationsAlloc(
                 self.alloc,
                 canonical_operations,
                 graph_queries,
@@ -3292,7 +3295,7 @@ pub const HttpHandler = struct {
     const PublicGraphMetricColumns = struct {
         columns: []query_mod.graph_metric_reader.ScoreColumn,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.columns) |*column| column.deinit(alloc);
             if (self.columns.len > 0) alloc.free(self.columns);
             self.* = undefined;
@@ -4496,6 +4499,7 @@ pub const HttpHandler = struct {
                 .direction = named_query.query.params.direction,
                 .edge_types = named_query.query.params.edge_types,
                 .max_depth = named_query.query.params.max_depth,
+                .edge_filter = named_query.query.params.edge_filter,
                 .min_weight = named_query.query.params.min_weight,
                 .max_weight = named_query.query.params.max_weight,
                 .max_results = traversal_limit,
@@ -4612,6 +4616,7 @@ pub const HttpHandler = struct {
             .edge_types = named_query.query.params.edge_types,
             .direction = named_query.query.params.direction,
             .max_depth = named_query.query.params.max_depth,
+            .edge_filter = named_query.query.params.edge_filter,
             .min_weight = named_query.query.params.min_weight,
             .max_weight = named_query.query.params.max_weight,
             .node_admission = admission,
@@ -6523,7 +6528,7 @@ const BudgetedMutationOverlay = struct {
     items: []query_materializer.Mutation,
     lease: graph_work_budget_mod.RetainedLease,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         freeMaterializerMutations(alloc, self.items);
         self.lease.deinit();
         self.* = undefined;
@@ -6547,7 +6552,7 @@ const PublicDocumentRef = struct {
     last_lsn: u64,
     last_timestamp_ns: u64,
 
-    fn deinit(self: *PublicDocumentRef, alloc: Allocator) void {
+    pub fn deinit(self: *PublicDocumentRef, alloc: Allocator) void {
         switch (self.body) {
             .owned => |body| {
                 alloc.free(self.doc_id);
@@ -6601,7 +6606,7 @@ const PublicGraphRequestCache = struct {
         };
     }
 
-    fn deinit(self: *PublicGraphRequestCache) void {
+    pub fn deinit(self: *PublicGraphRequestCache) void {
         if (self.facts_reader) |reader| {
             const alloc = self.facts_allocation.allocator();
             var bodies = self.facts_bodies.iterator();
@@ -6900,7 +6905,11 @@ const PublicGraphRequestCache = struct {
         var application_lease = try graph_work_budget_mod.RetainedLease.init(self.work_budget, application_peak_bytes);
         defer application_lease.deinit();
 
-        var slots = std.ArrayListUnmanaged(PublicDocumentRef){ .items = base, .capacity = base.len };
+        var slots = std.ArrayListUnmanaged(PublicDocumentRef){
+            .items = base,
+            .capacity = base.len,
+            .pointer_stability = .{},
+        };
         base = &.{};
         defer {
             for (slots.items) |*slot| slot.deinit(self.handler.alloc);
@@ -7455,6 +7464,50 @@ const PublicEdgeCursor = struct {
         return try out.toOwnedSlice(a);
     }
 };
+
+// Published lake sidecars contain only physical endpoints, type, and weight.
+// Validate once at admission rather than synthesizing absent fact data during
+// traversal, which would make null/temporal predicates silently succeed.
+fn validatePublishedRelationshipFilter(operation: []const u8, filter: relationship_filter.Filter) !void {
+    if (filter.valid_at_ns != null or filter.known_at_ns != null) {
+        graph_query_diagnostic.record(operation, "edge_filter", .request_control_not_supported);
+        return error.UnsupportedQueryRequest;
+    }
+    for (filter.properties) |predicate| {
+        const supported = std.mem.eql(u8, predicate.field, "/source") or
+            std.mem.eql(u8, predicate.field, "/target") or
+            std.mem.eql(u8, predicate.field, "/type") or
+            std.mem.eql(u8, predicate.field, "/weight");
+        if (!supported) {
+            graph_query_diagnostic.record(operation, "edge_filter", .request_control_not_supported);
+            return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validatePublishedMatchEdges(operation: []const u8, edges: []const graph_pattern_mod.MatchEdge) !void {
+    for (edges) |edge| try validatePublishedRelationshipFilter(operation, edge.step.edge_filter);
+}
+
+fn validatePublishedMatchPredicates(operation: []const u8, predicates: []const graph_pattern_mod.MatchPredicate) !void {
+    for (predicates) |predicate| switch (predicate) {
+        .not_equal => {},
+        .not_exists => |edges| try validatePublishedMatchEdges(operation, edges),
+    };
+}
+
+fn validatePublishedRelationshipFilters(named: db_types.NamedGraphQuery) !void {
+    try validatePublishedRelationshipFilter(named.name, named.query.params.edge_filter);
+    for (named.query.pattern) |step| try validatePublishedRelationshipFilter(named.name, step.edge.edge_filter);
+    if (named.query.match_pattern) |pattern| {
+        try validatePublishedMatchEdges(named.name, pattern.edges);
+        try validatePublishedMatchPredicates(named.name, pattern.predicates);
+        for (pattern.optional) |optional| {
+            try validatePublishedMatchEdges(named.name, optional.edges);
+            try validatePublishedMatchPredicates(named.name, optional.predicates);
+        }
+    }
+}
 
 const ServerlessTraversalEdgeReader = struct {
     cached: *const CachedPublicGraphSegment,
@@ -9056,7 +9109,7 @@ const ServerlessGraphMetricStatus = struct {
     materializer_fingerprint: u64 = 0,
     published_generation: u64 = 0,
 
-    fn deinit(self: *ServerlessGraphMetricStatus, alloc: Allocator) void {
+    pub fn deinit(self: *ServerlessGraphMetricStatus, alloc: Allocator) void {
         alloc.free(self.index_name);
         alloc.free(self.metric_name);
         self.* = undefined;
@@ -10081,7 +10134,7 @@ const OwnedJsonValueSlice = struct {
     alloc: Allocator,
     values: []std.json.Value,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.values) |*value| deinitJsonValue(self.alloc, value);
         self.alloc.free(self.values);
     }
@@ -13789,7 +13842,7 @@ test "serverless graph index status exposes disabled publication as terminal" {
     try std.testing.expect(!metric.get("retryable").?.bool);
 }
 
-test "http handler serves published graph query endpoints" {
+test "serverless http handler serves published graph query endpoints" {
     const alloc = std.testing.allocator;
 
     var artifact_root_buf: [256]u8 = undefined;
@@ -14069,6 +14122,95 @@ test "http handler serves published graph query endpoints" {
     try std.testing.expectEqual(@as(usize, 2), neighbors_from_search.nodes.len);
     try std.testing.expectEqualStrings("doc-b", neighbors_from_search.nodes[0].key);
     try std.testing.expectEqualStrings("doc-c", neighbors_from_search.nodes[1].key);
+
+    // Exercise actual public admission and execution: rejected edges must not
+    // enter traversal, path ranking, or MATCH, and literals remain lossless.
+    const filtered_cases = [_]struct { body: []const u8, count: usize, path_len: usize = 0 }{
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"max_depth":1,"edge_filter":{"properties":[{"field":"/weight","op":"gt","value":1}]}}}}}
+        , .count = 1, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"max_depth":1,"edge_filter":{"properties":[{"field":"/weight","op":"eq","value":1.5000000000000001}]}}}}}
+        , .count = 0, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","shortest_path":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/weight","op":"gte","value":1}]},"objective":"min_weight_sum"}}}}
+        , .count = 1, .path_len = 3 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","k_shortest_paths":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/weight","op":"gte","value":1}]},"k":2,"objective":"min_weight_sum"}}}}
+        , .count = 1, .path_len = 3 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","shortest_path":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/weight","op":"gt","value":10000}]},"objective":"min_weight_sum"}}}}
+        , .count = 0, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","k_shortest_paths":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/weight","op":"gt","value":10000}]},"k":2,"objective":"min_weight_sum"}}}}
+        , .count = 0, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"],"edge_filter":{"properties":[{"field":"/weight","op":"eq","value":1.5000000000000001}]}}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        , .count = 0, .path_len = 0 },
+        .{ .body =
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"],"edge_filter":{"properties":[{"field":"/weight","op":"eq","value":1.5}]}}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        , .count = 1, .path_len = 0 },
+    };
+    // The response sidecar is built from the same typed contract as execution,
+    // rather than the rounded raw tree used only for feature routing.
+    var precise_request = try ant_json.parseFromSlice(metadata_openapi.QueryRequest, alloc, filtered_cases[1].body, .{ .parse_numbers = false });
+    defer precise_request.deinit();
+    const expected_names = [_]struct { name: []const u8 }{.{ .name = "filtered" }};
+    var precise_transport = try graph_wire_envelope.captureTypedCanonicalOperationsAlloc(alloc, precise_request.value.graph_queries.?, &expected_names);
+    defer precise_transport.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, precise_transport.operations_json, "1.5000000000000001") != null);
+    const wrong_names = [_]struct { name: []const u8 }{.{ .name = "other" }};
+    try std.testing.expectError(error.InvalidGraphWireEnvelope, graph_wire_envelope.captureTypedCanonicalOperationsAlloc(alloc, precise_request.value.graph_queries.?, &wrong_names));
+
+    for (filtered_cases) |case| {
+        var response = try handler.handle(.{ .method = .post, .path = "/tables/docs/query", .body = case.body });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status);
+        var parsed = try parseJsonTestBody(metadata_openapi.QueryResponses, alloc, response.body);
+        defer parsed.deinit();
+        const result = parsed.value.responses.?[0].graph_results.?.map.get("filtered").?;
+        switch (result) {
+            .graph_nodes_result => |nodes| try std.testing.expectEqual(case.count, nodes.nodes.len),
+            .graph_paths_result => |paths| {
+                try std.testing.expectEqual(case.count, paths.paths.len);
+                if (case.path_len != 0) {
+                    try std.testing.expectEqual(case.path_len, paths.paths[0].path.nodes.len);
+                    try std.testing.expectEqual(@as(f64, 3.5), paths.paths[0].path.weight_sum);
+                }
+            },
+            .graph_bindings_result => |bindings| try std.testing.expectEqual(case.count, bindings.rows.len),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    // Unsupported fact data must fail before any graph reads, including when
+    // the predicate is buried in optional or negative pattern clauses.
+    const unsupported_filters = [_][]const u8{
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","traverse":{"start":{"keys":["doc-a"]},"max_depth":1,"edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","shortest_path":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"known_at":"2022-01-01T00:00:00Z"}}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","k_shortest_paths":{"from":{"key":"doc-a"},"to":{"key":"doc-c"},"edge_filter":{"properties":[{"field":"/edge_id","op":"is_null"}]},"k":2}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"],"edge_filter":{"properties":[{"field":"/metadata/score","op":"is_null"}]}}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"]}],"where":{"not_exists":{"edges":[{"from":"a","to":"b","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]}}},"return":{"bindings":["a","b"],"limit":10}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"]}],"optional":[{"nodes":{"c":{}},"edges":[{"from":"a","to":"c","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        ,
+        \\{"graph_queries":{"filtered":{"index":"graph_idx","match":{"anchor":"a","nodes":{"a":{"filter":{"ids":["doc-a"]}},"b":{}},"edges":[{"from":"a","to":"b","types":["cites"]}],"optional":[{"nodes":{"c":{}},"edges":[{"from":"b","to":"c"}],"where":{"not_exists":{"edges":[{"from":"a","to":"c","edge_filter":{"valid_at":"2022-01-01T00:00:00Z"}}]}}}]},"return":{"bindings":["a","b"],"limit":10}}}}
+        ,
+    };
+    for (unsupported_filters) |body| {
+        var response = try handler.handle(.{ .method = .post, .path = "/tables/docs/query", .body = body });
+        defer response.deinit(alloc);
+        try std.testing.expectEqual(@as(u16, 422), response.status);
+        var parsed = try parseJsonTestBody(metadata_openapi.GraphQueryUnsupportedError, alloc, response.body);
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("filtered", parsed.value.operation);
+        try std.testing.expectEqualStrings("edge_filter", parsed.value.feature);
+        try std.testing.expectEqualStrings("request_control_not_supported", parsed.value.reason);
+    }
 
     var from_fused = try handler.handle(.{
         .method = .post,

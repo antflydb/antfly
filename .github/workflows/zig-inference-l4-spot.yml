@@ -71,7 +71,7 @@ jobs:
     env:
       ZIG_LOCAL_CACHE_DIR: /mnt/cache/antfly/zig/${{ github.job }}/${{ github.run_id }}-${{ github.run_attempt }}/zig-local
       ZIG_GLOBAL_CACHE_DIR: /mnt/cache/antfly/zig/zig-global
-      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+      ANTFLY_CI_ZIG_OPTIMIZE: safe
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_CI_ZIG_CUDA: "true"
       ANTFLY_CI_ZIG_CUDA_ARTIFACTS: ${{ inputs.scope == 'laya-portable' && 'portable' || 'fatbin' }}
@@ -117,7 +117,7 @@ jobs:
         working-directory: zig
         run: |
           python3 tools/run_bounded_zig_build.py build inference-laya-cuda-test-build \
-            -Doptimize=ReleaseSafe -Dcpu=x86_64_v3 -Dcuda=true \
+            -Doptimize=safe -Dcpu=x86_64_v3 -Dcuda=true \
             -Dcuda-artifacts="$ANTFLY_CI_ZIG_CUDA_ARTIFACTS" -Dmetal=false -Donnx=false
 
       - name: Verify CUDA is compiled in

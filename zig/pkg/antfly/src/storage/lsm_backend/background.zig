@@ -90,7 +90,7 @@ test "lsm background executor submits jobs with backend owner id" {
             ctx.ran = true;
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const ctx: *Ctx = @ptrCast(@alignCast(ptr));
             ctx.deinit_called = true;
         }

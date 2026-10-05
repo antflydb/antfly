@@ -452,7 +452,7 @@ test "boundary native trainer allocation failures distinguish phase limits resiz
     try std.testing.expectEqual(error.OutOfMemory, failures.translate(error.OutOfMemory));
     try std.testing.expectEqual(.backing_allocator, failures.snapshot().?.allocation.kind);
     try std.testing.expectEqual(@as(usize, 16), failures.snapshot().?.allocation.live_bytes);
-    try std.testing.expectEqualSlices(u8, &([_]u8{7} ** 16), bytes);
+    try std.testing.expectEqualSlices(u8, &(@as([16]u8, @splat(7))), bytes);
 
     // A recovered terminal failure in one domain cannot hide a later backing
     // failure in the other: the shared operation record observes actual order.
@@ -687,7 +687,7 @@ const NeckedFixture = struct {
         }
     }
 
-    fn deinit(self: *NeckedFixture) void {
+    pub fn deinit(self: *NeckedFixture) void {
         self.store.deinitOwned();
         self.arena.deinit();
         self.samples.deinit();
@@ -746,6 +746,46 @@ test "boundary native trainer distills a necked ModernBERT from a teacher and le
     var plain = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), source, config, &fixture.samples, parameters.items, options, null);
     defer plain.deinit();
     try std.testing.expect(!std.mem.eql(u8, &distilled.fingerprint, &plain.fingerprint));
+}
+
+test "boundary native trainer prefetches the next microbatch's teacher states without changing the run" {
+    const a = std.testing.allocator;
+    var fixture: NeckedFixture = undefined;
+    try fixture.init(a, false);
+    defer fixture.deinit();
+    // Two epochs with accumulation over an odd batch count cross an epoch
+    // boundary and an end-of-epoch partial flush.
+    var runs: [2]struct { losses: std.ArrayListUnmanaged(f32) = .empty, weights: std.ArrayListUnmanaged(f32) = .empty, calls: usize = 0, steps: usize = 0, prefetched: u64 = 0 } = .{ .{}, .{} };
+    defer for (&runs) |*result| {
+        result.losses.deinit(a);
+        result.weights.deinit(a);
+    };
+    for (&runs, [_]bool{ false, true }) |*result, prefetch| {
+        var teacher = SyntheticTeacher{ .hidden = fixture.config.encoder.hidden_size };
+        var options = NeckedFixture.options(teacher.teacher(1));
+        options.run.epochs = 2;
+        options.run.accumulation = 2;
+        if (prefetch) options.distillation.?.prefetch = std.testing.io;
+        var distilled = try trainer.Trainer.init(a, &fixture.store, fixture.tokenizer.tokenizer(), fixture.source, fixture.config, &fixture.samples, fixture.parameters.items, options, null);
+        defer distilled.deinit();
+        while (try distilled.next(null)) |report| {
+            const terms = report.terms orelse continue;
+            try result.losses.append(a, terms.distillation);
+            result.steps += 1;
+        }
+        result.calls = teacher.calls;
+        result.prefetched = distilled.prefetched_microbatches;
+        for (distilled.optimizer.owner.regular_params.items) |slot| try result.weights.appendSlice(a, slot.weights);
+    }
+    try std.testing.expect(runs[0].steps > 2);
+    try std.testing.expectEqual(runs[0].steps, runs[1].steps);
+    // One encode per microbatch either way: never past the run's end.
+    try std.testing.expectEqual(runs[0].steps, runs[0].calls);
+    try std.testing.expectEqual(runs[1].steps, runs[1].calls);
+    try std.testing.expectEqual(@as(u64, 0), runs[0].prefetched);
+    try std.testing.expectEqual(@as(u64, runs[1].steps - 1), runs[1].prefetched);
+    try std.testing.expectEqualSlices(f32, runs[0].losses.items, runs[1].losses.items);
+    try std.testing.expectEqualSlices(f32, runs[0].weights.items, runs[1].weights.items);
 }
 
 test "boundary native trainer fits an identity neck to the teacher before the first update" {

@@ -10,8 +10,8 @@ const httpx = @import("httpx");
 const credentials = @import("credential_source_identity.zig");
 const sync = @import("antfly_platform").sync;
 
-pub const Operation = enum { embedding, generation, reranking };
-pub const Provider = enum { openai, openrouter, ollama, antfly, gemini, vertex, cohere, bedrock };
+pub const Operation = enum { embedding, generation, reranking, decision };
+pub const Provider = enum { openai, openrouter, ollama, antfly, gemini, vertex, cohere, bedrock, jev };
 pub const EndpointIdentity = struct {
     provider: Provider,
     endpoint: []const u8,
@@ -75,7 +75,7 @@ pub const Policy = struct {
         return policy;
     }
 
-    fn validate(self: Policy) !void {
+    pub fn validate(self: Policy) !void {
         if (self.burst == 0) return error.InvalidRateLimitPolicy;
         if (self.pacing == .completion and (self.requests_per_minute == 0 or self.burst != 1))
             return error.InvalidRateLimitPolicy;

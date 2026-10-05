@@ -65,6 +65,10 @@ pub const Distillation = struct {
     fit: neck_fit.Options = .{},
     /// Borrowed diagnostics: sees each step's aligned student and teacher rows.
     observer: ?distillation.Observer = null,
+    /// Encode the next microbatch's teacher states on this `Io` while the
+    /// current step runs. The prefetch is a cache: it never enters the
+    /// checkpoint or fingerprint, and a mismatched one is discarded.
+    prefetch: ?std.Io = null,
 };
 pub const Options = struct {
     /// Borrowed diagnostics over decisions already produced by the step.
@@ -227,6 +231,9 @@ pub const Trainer = struct {
     recomputed_future_host_bytes: usize = 0,
     order: []u32 = &.{},
     order_epoch: ?u64 = null,
+    prefetch: ?*Prefetch = null,
+    /// Microbatches whose teacher states came from a prefetch (diagnostics).
+    prefetched_microbatches: u64 = 0,
     fingerprint: [32]u8,
     resident_device_upper_bound_bytes: usize = 0,
     busy: std.atomic.Value(bool) = .init(false),
@@ -288,8 +295,8 @@ pub const Trainer = struct {
         self.run_plan = try run.Plan.init(run_config, source, .{ .train_sha256 = dataset.sha256, .schema_sha256 = dataset.schemas_sha256, .calibration_sha256 = options.calibration_sha256, .test_sha256 = options.test_sha256, .examples = std.math.cast(u32, dataset.index.len) orelse return error.BoundaryTrainingRunLimitExceeded }, options.limits.run);
         // Validate the actual schedule before reading or updating any batch.
         _ = try objectives.scales(config.head, .{ .optimizer_step = 0, .total_optimizer_steps = self.run_plan.total_optimizer_steps, .gold_start = options.gold_start, .gold_end = options.gold_end, .gold_hold_fraction = options.gold_hold_fraction });
-        inline for (std.meta.fields(objectives.Weights)) |field| {
-            const weight = @field(options.weights, field.name);
+        inline for (comptime std.meta.fieldNames(objectives.Weights)) |reflected_name| {
+            const weight = @field(options.weights, reflected_name);
             if (!std.math.isFinite(weight) or weight < 0) return error.InvalidBoundaryTrainingRun;
         }
         if (options.distillation) |value| {
@@ -459,6 +466,7 @@ pub const Trainer = struct {
 
     pub fn deinit(self: *Trainer) void {
         std.debug.assert(!self.busy.load(.acquire));
+        self.discardPrefetch();
         const a = self.host_budget.allocator();
         if (self.plan) |*plan| plan.deinit();
         self.validators.deinit();
@@ -504,6 +512,7 @@ pub const Trainer = struct {
         if (self.plan) |*plan| plan.deinit();
         self.plan = null;
         self.plan_key = null;
+        self.discardPrefetch();
         self.host_budget.allocator().free(self.order);
         self.order = &.{};
         self.order_epoch = null;
@@ -598,19 +607,30 @@ pub const Trainer = struct {
             self.validators.options.match_options.control = null;
         }
         const a = self.host_budget.allocator();
-        if (self.order_epoch != pos.epoch) {
-            a.free(self.order);
-            self.order = &.{};
-            self.order_epoch = null;
-            self.order = try self.run_plan.epochOrder(a, pos.epoch, control);
-            self.order_epoch = pos.epoch;
+        // The microbatch and its teacher states come from the prefetch when
+        // it was loaded for this position, else they are loaded here.
+        var batch: Microbatch = undefined;
+        var teacher_states: ?TeacherStates = null;
+        defer if (teacher_states) |*states| states.deinit();
+        if (self.takePrefetch(pos)) |prefetched| {
+            // Join before taking the batch: the worker borrows its items and
+            // prepared batch until the encode returns.
+            const encoded = prefetched.future.await(prefetched.io);
+            batch = prefetched.batch;
+            a.destroy(prefetched);
+            errdefer batch.deinit();
+            teacher_states = try encoded;
+        } else {
+            batch = try self.loadMicrobatch(a, pos, control);
+            errdefer batch.deinit();
+            if (self.options.distillation) |value| teacher_states = try value.teacher.encode(value.teacher.ptr, a, batch.inputs, &batch.prepared, control);
         }
-        const samples = try a.alloc(data.Sample, pos.count);
-        var initialized: usize = 0;
-        defer {
-            for (samples[0..initialized]) |*sample| sample.deinit();
-            a.free(samples);
-        }
+        defer batch.deinit();
+        const schemas = batch.schemas;
+        const annotations = batch.annotations;
+        const prepared = &batch.prepared;
+        // Overlap the next microbatch's teacher encode with this step.
+        self.startPrefetch(a, control);
         var caller_budget = Budget{ .backing = a, .limit = self.options.limits.max_recomputed_batch_scratch_bytes };
         var caller_observer = MemoryObserver{ .failures = &self.memory_failures, .domain = .host };
         caller_observer.attach(&caller_budget);
@@ -619,26 +639,8 @@ pub const Trainer = struct {
         var arena = std.heap.ArenaAllocator.init(if (self.options.activation_profile == .layer_recompute_v1) caller_budget.allocator() else a);
         defer arena.deinit();
         const scratch = arena.allocator();
-        const schemas = try scratch.alloc(*const schema.CompiledSchema, pos.count);
-        const annotations = try scratch.alloc(targets.Annotations, pos.count);
-        const inputs = try scratch.alloc(processor.Item, pos.count);
-        for (samples, schemas, annotations, inputs, self.order[pos.offset..][0..pos.count]) |*sample, *s, *annotation, *input, index| {
-            sample.* = try self.dataset.sample(index, control, null);
-            initialized += 1;
-            s.* = &sample.schema;
-            annotation.* = sample.annotations;
-            input.* = .{ .text = sample.row.text, .schema = &sample.schema };
-        }
-        var processor_options = self.options.processor;
-        processor_options.control = control;
-        var prepared = try processor.prepare(a, self.tokenizer, inputs, processor_options);
-        defer prepared.deinit();
-        // The teacher encodes the same items; its states stay live through
-        // the step, which borrows them.
-        var teacher_states: ?TeacherStates = if (self.options.distillation) |value| try value.teacher.encode(value.teacher.ptr, a, inputs, &prepared, control) else null;
-        defer if (teacher_states) |*states| states.deinit();
         self.memory_failures.begin(.graph_preparation);
-        try self.ensurePlan(&prepared, schemas, control);
+        try self.ensurePlan(prepared, schemas, control);
         self.memory_failures.begin(.batch_preparation);
         const plan = &self.plan.?;
         const instruction_control_readback_upper_bound = try plan.instructionControlReadbackUpperBound();
@@ -663,7 +665,7 @@ pub const Trainer = struct {
                 break :combine all;
             };
             try self.checkRecomputedHost();
-            break :blk try plan.run(&self.cb, parameters, &prepared, schemas, annotations, context, control);
+            break :blk try plan.run(&self.cb, parameters, prepared, schemas, annotations, context, control);
         };
         var result_live = true;
         defer if (result_live) result.deinit(&self.cb);
@@ -696,7 +698,7 @@ pub const Trainer = struct {
                     .tensor = if (route.kind != .absent) if (route.gradient_index) |index| result.backward.gradients.outputs[index] else null else null,
                     .elements = slot.weights.len,
                 };
-                try observe(fixture.observer_context, .{ .backend = &self.cb, .prepared = &prepared, .result = &result, .gradients = gradients, .optimizer_loss = optimizer_loss, .zero_loss_fallback = zero_loss_fallback });
+                try observe(fixture.observer_context, .{ .backend = &self.cb, .prepared = prepared, .result = &result, .gradients = gradients, .optimizer_loss = optimizer_loss, .zero_loss_fallback = zero_loss_fallback });
             };
         }
         var gradient_control_bytes: usize = 0;
@@ -743,6 +745,142 @@ pub const Trainer = struct {
             break :gpu try self.optimizer.submitResident(identity, optimizer_loss, gradients.items, control);
         };
         return .{ .epoch = pos.epoch, .batch = pos.batch, .examples = pos.count, .terms = terms, .coverage = coverage, .optimizer = updated, .decision_fingerprint = decisions, .host_peak_bytes = self.host_budget.peak, .backend_peak_bytes = self.backend_budget.peak, .resident_device_upper_bound_bytes = self.resident_device_upper_bound_bytes, .transfers = transfers, .resident_gradient_control_bytes = gradient_control_bytes, .resident_instruction_control_readback_upper_bound_bytes = instruction_control_readback_upper_bound, .zero_loss_fallback = zero_loss_fallback };
+    }
+
+    /// One microbatch's samples, schemas, annotations, items and prepared
+    /// student batch. The items borrow the samples; a teacher borrows the
+    /// items and the prepared batch.
+    const Microbatch = struct {
+        allocator: Allocator,
+        position: run.Position,
+        samples: []data.Sample,
+        schemas: []*const schema.CompiledSchema,
+        annotations: []targets.Annotations,
+        inputs: []processor.Item,
+        prepared: processor.PreparedBatch,
+
+        fn deinit(self: *Microbatch) void {
+            self.prepared.deinit();
+            for (self.samples) |*sample| sample.deinit();
+            self.allocator.free(self.samples);
+            self.allocator.free(self.schemas);
+            self.allocator.free(self.annotations);
+            self.allocator.free(self.inputs);
+            self.* = undefined;
+        }
+
+        fn matches(self: *const Microbatch, pos: run.Position) bool {
+            return self.position.epoch == pos.epoch and self.position.offset == pos.offset and self.position.count == pos.count;
+        }
+    };
+
+    /// The next microbatch, loaded while the current step runs, with its
+    /// teacher encode in flight on `io`. Never part of checkpoint state.
+    const Prefetch = struct {
+        io: std.Io,
+        batch: Microbatch,
+        future: std.Io.Future(anyerror!TeacherStates),
+    };
+
+    fn loadMicrobatch(self: *Trainer, a: Allocator, pos: run.Position, control: ?Control) !Microbatch {
+        if (self.order_epoch != pos.epoch) {
+            a.free(self.order);
+            self.order = &.{};
+            self.order_epoch = null;
+            self.order = try self.run_plan.epochOrder(a, pos.epoch, control);
+            self.order_epoch = pos.epoch;
+        }
+        const samples = try a.alloc(data.Sample, pos.count);
+        var initialized: usize = 0;
+        errdefer {
+            for (samples[0..initialized]) |*sample| sample.deinit();
+            a.free(samples);
+        }
+        const schemas = try a.alloc(*const schema.CompiledSchema, pos.count);
+        errdefer a.free(schemas);
+        const annotations = try a.alloc(targets.Annotations, pos.count);
+        errdefer a.free(annotations);
+        const inputs = try a.alloc(processor.Item, pos.count);
+        errdefer a.free(inputs);
+        for (samples, schemas, annotations, inputs, self.order[pos.offset..][0..pos.count]) |*sample, *s, *annotation, *input, index| {
+            sample.* = try self.dataset.sample(index, control, null);
+            initialized += 1;
+            s.* = &sample.schema;
+            annotation.* = sample.annotations;
+            input.* = .{ .text = sample.row.text, .schema = &sample.schema };
+        }
+        var processor_options = self.options.processor;
+        processor_options.control = control;
+        const prepared = try processor.prepare(a, self.tokenizer, inputs, processor_options);
+        return .{ .allocator = a, .position = pos, .samples = samples, .schemas = schemas, .annotations = annotations, .inputs = inputs, .prepared = prepared };
+    }
+
+    /// The position the next call will load items for, assuming this call's
+    /// microbatch is submitted: null at the run's end (including a final
+    /// partial flush or `max_optimizer_steps`).
+    fn predictedNext(self: *const Trainer) ?run.Position {
+        const identity = self.optimizer.identity();
+        const accumulated = self.optimizer.owner.accum_count + 1;
+        const stepped = accumulated == self.run_plan.config.accumulation;
+        var following = controller.Identity{ .optimizer_step = identity.optimizer_step + @intFromBool(stepped), .microbatch_step = identity.microbatch_step + 1 };
+        var accum: u32 = if (stepped) 0 else @intCast(accumulated);
+        var pos = self.run_plan.position(following, accum) catch return null;
+        if (pos.requires_flush) {
+            following.optimizer_step += 1;
+            accum = 0;
+            pos = self.run_plan.position(following, accum) catch return null;
+        }
+        if (pos.complete or pos.count == 0) return null;
+        return pos;
+    }
+
+    fn encodeTeacher(teacher: Teacher, a: Allocator, inputs: []const processor.Item, prepared: *const processor.PreparedBatch) anyerror!TeacherStates {
+        return teacher.encode(teacher.ptr, a, inputs, prepared, null);
+    }
+
+    /// Loads the predicted next microbatch on this thread (borrowing this
+    /// call's control) and starts its teacher encode concurrently. Any
+    /// failure only skips the prefetch; the next call loads synchronously.
+    fn startPrefetch(self: *Trainer, a: Allocator, control: ?Control) void {
+        const value = self.options.distillation orelse return;
+        const io = value.prefetch orelse return;
+        std.debug.assert(self.prefetch == null);
+        const pos = self.predictedNext() orelse return;
+        const prefetch = a.create(Prefetch) catch return;
+        prefetch.* = .{ .io = io, .batch = self.loadMicrobatch(a, pos, control) catch {
+            a.destroy(prefetch);
+            return;
+        }, .future = undefined };
+        prefetch.future = io.concurrent(encodeTeacher, .{ value.teacher, a, prefetch.batch.inputs, &prefetch.batch.prepared }) catch {
+            prefetch.batch.deinit();
+            a.destroy(prefetch);
+            return;
+        };
+        self.prefetch = prefetch;
+    }
+
+    /// The pending prefetch when it was loaded for `pos`; any other is
+    /// discarded (a retried step, a restore, or a misprediction).
+    fn takePrefetch(self: *Trainer, pos: run.Position) ?*Prefetch {
+        const prefetch = self.prefetch orelse return null;
+        if (!prefetch.batch.matches(pos)) {
+            self.discardPrefetch();
+            return null;
+        }
+        self.prefetch = null;
+        self.prefetched_microbatches += 1;
+        return prefetch;
+    }
+
+    fn discardPrefetch(self: *Trainer) void {
+        const prefetch = self.prefetch orelse return;
+        self.prefetch = null;
+        if (prefetch.future.cancel(prefetch.io)) |states| {
+            var owned = states;
+            owned.deinit();
+        } else |_| {}
+        prefetch.batch.deinit();
+        self.host_budget.allocator().destroy(prefetch);
     }
 
     fn ensurePlan(self: *Trainer, prepared: *const processor.PreparedBatch, schemas: []const *const schema.CompiledSchema, control: ?Control) !void {

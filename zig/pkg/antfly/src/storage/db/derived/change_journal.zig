@@ -124,6 +124,44 @@ pub const BorrowedBinaryRecordScratch = struct {
         self.* = undefined;
     }
 
+    pub fn retainedCapacityBytes(self: *const BorrowedBinaryRecordScratch) usize {
+        return (self.changed_doc_keys.capacity + self.deleted_doc_keys.capacity +
+            self.overwritten_doc_keys.capacity + self.changed_artifact_keys.capacity) * @sizeOf([]const u8) +
+            self.target_hints.capacity * @sizeOf(TargetHint);
+    }
+
+    pub inline fn trimRetainedCapacity(self: *BorrowedBinaryRecordScratch, alloc: Allocator, max_bytes: usize) void {
+        if (self.retainedCapacityBytes() <= max_bytes) return;
+        self.trimOversizedBuffers(alloc, max_bytes);
+    }
+
+    noinline fn trimOversizedBuffers(self: *BorrowedBinaryRecordScratch, alloc: Allocator, max_bytes: usize) void {
+        // Discard the largest buffers first, preserving ordinary-size scratch
+        // after an exceptional record. Trimming never allocates or retains
+        // more than the caller's aggregate capacity limit.
+        while (self.retainedCapacityBytes() > max_bytes) {
+            const capacities = [_]usize{
+                self.changed_doc_keys.capacity * @sizeOf([]const u8),
+                self.deleted_doc_keys.capacity * @sizeOf([]const u8),
+                self.overwritten_doc_keys.capacity * @sizeOf([]const u8),
+                self.changed_artifact_keys.capacity * @sizeOf([]const u8),
+                self.target_hints.capacity * @sizeOf(TargetHint),
+            };
+            var largest: usize = 0;
+            for (capacities, 0..) |bytes, i| if (bytes > capacities[largest]) {
+                largest = i;
+            };
+            switch (largest) {
+                0 => self.changed_doc_keys.clearAndFree(alloc),
+                1 => self.deleted_doc_keys.clearAndFree(alloc),
+                2 => self.overwritten_doc_keys.clearAndFree(alloc),
+                3 => self.changed_artifact_keys.clearAndFree(alloc),
+                4 => self.target_hints.clearAndFree(alloc),
+                else => unreachable,
+            }
+        }
+    }
+
     fn reset(self: *BorrowedBinaryRecordScratch) void {
         self.changed_doc_keys.clearRetainingCapacity();
         self.deleted_doc_keys.clearRetainingCapacity();
@@ -159,36 +197,39 @@ pub fn deinitRecord(alloc: Allocator, record: *Record) void {
     record.* = undefined;
 }
 
-fn appendUniqueString(
-    alloc: Allocator,
-    list: *std.ArrayListUnmanaged([]const u8),
-    value: []const u8,
-) !void {
-    if (value.len == 0) return;
-    for (list.items) |existing| {
-        if (std.mem.eql(u8, existing, value)) return;
-    }
+fn appendUniqueStringIndexed(alloc: Allocator, list: *std.ArrayListUnmanaged([]const u8), seen: *std.StringHashMapUnmanaged(void), value: []const u8) !void {
+    if (value.len == 0 or seen.contains(value)) return;
     const owned = try alloc.dupe(u8, value);
     errdefer alloc.free(owned);
+    try seen.put(alloc, owned, {});
+    errdefer _ = seen.remove(owned);
     try list.append(alloc, owned);
 }
 
 pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatch, sequence: u64) !Record {
+    var changed_doc_keys_seen = std.StringHashMapUnmanaged(void).empty;
+    defer changed_doc_keys_seen.deinit(alloc);
     var changed_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (changed_doc_keys.items) |key| alloc.free(key);
         changed_doc_keys.deinit(alloc);
     }
+    var deleted_doc_keys_seen = std.StringHashMapUnmanaged(void).empty;
+    defer deleted_doc_keys_seen.deinit(alloc);
     var deleted_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (deleted_doc_keys.items) |key| alloc.free(key);
         deleted_doc_keys.deinit(alloc);
     }
+    var overwritten_doc_keys_seen = std.StringHashMapUnmanaged(void).empty;
+    defer overwritten_doc_keys_seen.deinit(alloc);
     var overwritten_doc_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (overwritten_doc_keys.items) |key| alloc.free(key);
         overwritten_doc_keys.deinit(alloc);
     }
+    var changed_artifact_keys_seen = std.StringHashMapUnmanaged(void).empty;
+    defer changed_artifact_keys_seen.deinit(alloc);
     var changed_artifact_keys = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (changed_artifact_keys.items) |key| alloc.free(key);
@@ -198,7 +239,7 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
     errdefer target_hints.deinit(alloc);
 
     for (batch.documents) |doc| {
-        if (doc.action == .upsert) try appendUniqueString(alloc, &changed_doc_keys, doc.key);
+        if (doc.action == .upsert) try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, doc.key);
         if (doc.action == .upsert) {
             try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
             try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
@@ -214,8 +255,8 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
             }
         }
     }
-    for (batch.deleted_keys) |key| try appendUniqueString(alloc, &deleted_doc_keys, key);
-    for (batch.overwritten_doc_keys) |key| try appendUniqueString(alloc, &overwritten_doc_keys, key);
+    for (batch.deleted_keys) |key| try appendUniqueStringIndexed(alloc, &deleted_doc_keys, &deleted_doc_keys_seen, key);
+    for (batch.overwritten_doc_keys) |key| try appendUniqueStringIndexed(alloc, &overwritten_doc_keys, &overwritten_doc_keys_seen, key);
     if (batch.deleted_keys.len > 0) {
         try appendUniqueHintAlloc(alloc, &target_hints, .full_text);
         try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
@@ -229,7 +270,7 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
         try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
         try appendUniqueHintAlloc(alloc, &target_hints, .algebraic);
     }
-    for (batch.changed_artifact_keys) |key| try appendUniqueString(alloc, &changed_artifact_keys, key);
+    for (batch.changed_artifact_keys) |key| try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, key);
     for (batch.changed_artifact_keys) |key| {
         if (internal_keys.isGraphEdgeArtifactKey(key)) {
             try appendUniqueHintAlloc(alloc, &target_hints, .graph);
@@ -259,47 +300,49 @@ pub fn recordFromDerivedBatch(alloc: Allocator, batch: derived_types.DerivedBatc
 
     if (batch.dense_embeddings.len > 0) try appendUniqueHintAlloc(alloc, &target_hints, .dense_vector);
     for (batch.dense_embeddings) |embedding| {
-        if (embedding.artifact_key) |artifact_key| try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
+        if (embedding.artifact_key) |artifact_key| try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, artifact_key);
     }
 
     if (batch.sparse_embeddings.len > 0) try appendUniqueHintAlloc(alloc, &target_hints, .sparse_vector);
     for (batch.sparse_embeddings) |embedding| {
-        if (embedding.artifact_key) |artifact_key| try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
+        if (embedding.artifact_key) |artifact_key| try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, artifact_key);
     }
 
     if (batch.graph_doc_clears.len > 0 or batch.graph_writes.len > 0 or batch.graph_deletes.len > 0) {
         try appendUniqueHintAlloc(alloc, &target_hints, .graph);
     }
-    for (batch.graph_doc_clears) |clear| try appendUniqueString(alloc, &changed_doc_keys, clear.key);
-    for (batch.graph_writes) |write| try appendUniqueString(alloc, &changed_doc_keys, write.source);
+    for (batch.graph_doc_clears) |clear| try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, clear.key);
+    for (batch.graph_writes) |write| try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source);
     // Edge deletes preserve the source document. Recording the source as
     // deleted makes graph replay clear its complete adjacency instead of only
     // applying the target-specific artifact deletion.
-    for (batch.graph_deletes) |delete| try appendUniqueString(alloc, &changed_doc_keys, delete.source);
+    for (batch.graph_deletes) |delete| try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source);
     for (batch.graph_writes) |write| {
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, write.source, write.index_name, write.edge_type, write.target);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source, write.index_name, write.edge_type, write.target, write.source, write.edge_id);
         defer alloc.free(artifact_key);
-        try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
+        try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, artifact_key);
     }
     for (batch.graph_deletes) |delete| {
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, delete.source, delete.index_name, delete.edge_type, delete.target);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source, delete.index_name, delete.edge_type, delete.target, delete.source, delete.edge_id);
         defer alloc.free(artifact_key);
-        try appendUniqueString(alloc, &changed_artifact_keys, artifact_key);
+        try appendUniqueStringIndexed(alloc, &changed_artifact_keys, &changed_artifact_keys_seen, artifact_key);
     }
 
     if (batch.generated_enrichment_refs.len > 0) try appendUniqueHintAlloc(alloc, &target_hints, .enrichment);
     for (batch.generated_enrichment_refs) |ref| {
-        try appendUniqueString(alloc, &changed_doc_keys, ref.doc_key);
+        try appendUniqueStringIndexed(alloc, &changed_doc_keys, &changed_doc_keys_seen, ref.doc_key);
     }
 
-    return .{
-        .sequence = sequence,
-        .changed_doc_keys = try changed_doc_keys.toOwnedSlice(alloc),
-        .deleted_doc_keys = try deleted_doc_keys.toOwnedSlice(alloc),
-        .overwritten_doc_keys = try overwritten_doc_keys.toOwnedSlice(alloc),
-        .changed_artifact_keys = try changed_artifact_keys.toOwnedSlice(alloc),
-        .target_hints = try target_hints.toOwnedSlice(alloc),
-    };
+    // Transfer each list into a record that already has a cleanup owner.
+    // Later shrinking allocations may fail after earlier fields transferred.
+    var record: Record = .{ .sequence = sequence };
+    errdefer deinitRecord(alloc, &record);
+    record.changed_doc_keys = try changed_doc_keys.toOwnedSlice(alloc);
+    record.deleted_doc_keys = try deleted_doc_keys.toOwnedSlice(alloc);
+    record.overwritten_doc_keys = try overwritten_doc_keys.toOwnedSlice(alloc);
+    record.changed_artifact_keys = try changed_artifact_keys.toOwnedSlice(alloc);
+    record.target_hints = try target_hints.toOwnedSlice(alloc);
+    return record;
 }
 
 /// Build the normal key lists from a derived batch while explicitly narrowing
@@ -404,14 +447,14 @@ pub fn looksLikeBinaryRecord(raw: []const u8) bool {
 fn hintMask(hints: []const TargetHint) u8 {
     var mask: u8 = 0;
     for (hints) |hint| {
-        const bit: u3 = @intCast(@intFromEnum(hint));
+        const bit: u3 = @intCast(@backingInt(hint));
         mask |= (@as(u8, 1) << bit);
     }
     return mask;
 }
 
 pub fn singleHintMask(hint: TargetHint) u8 {
-    const bit: u3 = @intCast(@intFromEnum(hint));
+    const bit: u3 = @intCast(@backingInt(hint));
     return (@as(u8, 1) << bit);
 }
 
@@ -433,47 +476,47 @@ pub fn encodedRecordHintMask(raw: []const u8) !u8 {
 
 fn decodeHintMask(alloc: Allocator, mask: u8) ![]TargetHint {
     var count: usize = 0;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.enrichment))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.full_text))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.dense_vector))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.sparse_vector))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.graph))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.algebraic))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.resolution))) != 0) count += 1;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.promotion))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.enrichment))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.full_text))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.dense_vector))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.sparse_vector))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.graph))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.algebraic))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.resolution))) != 0) count += 1;
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.promotion))) != 0) count += 1;
     if (count == 0) return &.{};
 
     const hints = try alloc.alloc(TargetHint, count);
     var index: usize = 0;
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.enrichment))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.enrichment))) != 0) {
         hints[index] = .enrichment;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.full_text))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.full_text))) != 0) {
         hints[index] = .full_text;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.dense_vector))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.dense_vector))) != 0) {
         hints[index] = .dense_vector;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.sparse_vector))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.sparse_vector))) != 0) {
         hints[index] = .sparse_vector;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.graph))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.graph))) != 0) {
         hints[index] = .graph;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.algebraic))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.algebraic))) != 0) {
         hints[index] = .algebraic;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.resolution))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.resolution))) != 0) {
         hints[index] = .resolution;
         index += 1;
     }
-    if ((mask & (@as(u8, 1) << @intFromEnum(TargetHint.promotion))) != 0) {
+    if ((mask & (@as(u8, 1) << @backingInt(TargetHint.promotion))) != 0) {
         hints[index] = .promotion;
         index += 1;
     }
@@ -645,8 +688,14 @@ fn decodeBinaryStringListBorrowedScratch(
 ) BinaryDecodeError![]const []const u8 {
     list.clearRetainingCapacity();
     const count = try cursor.readInt(u32);
-    if (count == 0) return &.{};
+    if (count == 0) {
+        list.clearAndFree(alloc);
+        return &.{};
+    }
 
+    if (count > cursor.remaining() / @sizeOf(u32)) return error.UnexpectedEndOfInput;
+    const useful_capacity = std.ArrayListUnmanaged([]const u8).growCapacity(count);
+    if (list.capacity > useful_capacity *| 2) list.clearAndFree(alloc);
     try list.ensureTotalCapacity(alloc, @intCast(count));
     var index: usize = 0;
     while (index < count) : (index += 1) {
@@ -683,6 +732,55 @@ fn decodeBinaryRecord(alloc: Allocator, raw: []const u8) !Record {
     if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
     return record;
 }
+
+/// Allocation-free, resumable key scan for adjacency refresh. Store only byte
+/// offsets across turns; payload bytes remain borrowed from the replay cursor.
+/// Skipped document keys consume work too, so a large unrelated list cannot
+/// hide unbounded decode work inside a mutation lease.
+pub const GraphRefreshCursor = struct {
+    offset: usize = 0,
+    field: u8 = 0,
+    remaining: ?u32 = null,
+    mask: u8 = 0,
+
+    pub const Item = union(enum) { skipped, deleted: []const u8, artifact: []const u8, done };
+
+    pub fn next(self: *@This(), raw: []const u8) !Item {
+        if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
+        var cursor = BinaryCursor{ .raw = raw, .index = self.offset };
+        if (self.offset == 0) {
+            cursor.index = binary_magic.len;
+            _ = try cursor.readInt(u16);
+            _ = try cursor.readInt(u64);
+            _ = try cursor.readInt(u8);
+            self.mask = try cursor.readInt(u8);
+            if (self.mask & 0xf0 != 0) return error.InvalidBinaryRecord;
+        }
+        while (self.field < 4) {
+            if (self.mask & (@as(u8, 1) << @intCast(self.field)) == 0) {
+                self.field += 1;
+                continue;
+            }
+            if (self.remaining == null) self.remaining = try cursor.readInt(u32);
+            if (self.remaining.? == 0) {
+                self.field += 1;
+                self.remaining = null;
+                continue;
+            }
+            const key = try cursor.readBytes(try cursor.readInt(u32));
+            self.remaining.? -= 1;
+            self.offset = cursor.index;
+            return switch (self.field) {
+                1 => .{ .deleted = key },
+                3 => .{ .artifact = key },
+                else => .skipped,
+            };
+        }
+        if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
+        self.offset = cursor.index;
+        return .done;
+    }
+};
 
 pub fn decodeBinaryRecordBorrowed(alloc: Allocator, raw: []const u8) !BorrowedBinaryRecord {
     if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
@@ -724,34 +822,51 @@ pub fn decodeBinaryRecordBorrowed(alloc: Allocator, raw: []const u8) !BorrowedBi
     };
 }
 
-pub fn decodeBinaryRecordBorrowedScratch(
-    alloc: Allocator,
-    raw: []const u8,
-    scratch: *BorrowedBinaryRecordScratch,
-) !Record {
+/// Fields needed by a consumer. Unselected fields are still structurally
+/// validated, without allocating their descriptor arrays.
+pub const RecordFields = struct {
+    changed_doc_keys: bool = true,
+    deleted_doc_keys: bool = true,
+    overwritten_doc_keys: bool = true,
+    changed_artifact_keys: bool = true,
+};
+
+pub fn decodeBinaryRecordBorrowedScratch(alloc: Allocator, raw: []const u8, scratch: *BorrowedBinaryRecordScratch) !Record {
+    return decodeBinaryRecordBorrowedScratchSelected(alloc, raw, scratch, .{});
+}
+
+fn decodeSelectedList(alloc: Allocator, cursor: *BinaryCursor, list: *std.ArrayListUnmanaged([]const u8), present: bool, selected: bool) ![]const []const u8 {
+    if (!present) return &.{};
+    if (selected) return decodeBinaryStringListBorrowedScratch(alloc, cursor, list);
+    const count = try cursor.readInt(u32);
+    for (0..count) |_| _ = try cursor.readBytes(try cursor.readInt(u32));
+    return &.{};
+}
+
+pub fn decodeBinaryRecordBorrowedScratchSelected(alloc: Allocator, raw: []const u8, scratch: *BorrowedBinaryRecordScratch, fields: RecordFields) !Record {
     if (!looksLikeBinaryRecord(raw)) return error.InvalidBinaryRecord;
     scratch.reset();
-
-    var cursor = BinaryCursor{
-        .raw = raw[binary_magic.len..],
-        .index = 0,
-    };
-
+    var cursor = BinaryCursor{ .raw = raw[binary_magic.len..], .index = 0 };
     const version = try cursor.readInt(u16);
     const sequence = try cursor.readInt(u64);
-    const target_hints = try decodeHintMaskBorrowedScratch(alloc, try cursor.readInt(u8), scratch);
+    const hint_mask = try cursor.readInt(u8);
     const field_mask: FieldMask = @bitCast(try cursor.readInt(u8));
-
-    var record: Record = .{
+    // Prior-window capacity for absent/unselected fields cannot displace the
+    // current record's working set, even when below the retention ceiling.
+    if (!field_mask.changed_doc_keys or !fields.changed_doc_keys) scratch.changed_doc_keys.clearAndFree(alloc);
+    if (!field_mask.deleted_doc_keys or !fields.deleted_doc_keys) scratch.deleted_doc_keys.clearAndFree(alloc);
+    if (!field_mask.overwritten_doc_keys or !fields.overwritten_doc_keys) scratch.overwritten_doc_keys.clearAndFree(alloc);
+    if (!field_mask.changed_artifact_keys or !fields.changed_artifact_keys) scratch.changed_artifact_keys.clearAndFree(alloc);
+    if (@popCount(hint_mask) <= 1) scratch.target_hints.clearAndFree(alloc);
+    const record: Record = .{
         .version = version,
         .sequence = sequence,
-        .target_hints = target_hints,
+        .target_hints = try decodeHintMaskBorrowedScratch(alloc, hint_mask, scratch),
+        .changed_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.changed_doc_keys, field_mask.changed_doc_keys, fields.changed_doc_keys),
+        .deleted_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.deleted_doc_keys, field_mask.deleted_doc_keys, fields.deleted_doc_keys),
+        .overwritten_doc_keys = try decodeSelectedList(alloc, &cursor, &scratch.overwritten_doc_keys, field_mask.overwritten_doc_keys, fields.overwritten_doc_keys),
+        .changed_artifact_keys = try decodeSelectedList(alloc, &cursor, &scratch.changed_artifact_keys, field_mask.changed_artifact_keys, fields.changed_artifact_keys),
     };
-
-    if (field_mask.changed_doc_keys) record.changed_doc_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.changed_doc_keys);
-    if (field_mask.deleted_doc_keys) record.deleted_doc_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.deleted_doc_keys);
-    if (field_mask.overwritten_doc_keys) record.overwritten_doc_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.overwritten_doc_keys);
-    if (field_mask.changed_artifact_keys) record.changed_artifact_keys = try decodeBinaryStringListBorrowedScratch(alloc, &cursor, &scratch.changed_artifact_keys);
     if (cursor.remaining() != 0) return error.InvalidBinaryRecord;
     return record;
 }
@@ -1319,4 +1434,131 @@ test "change journal emits resolution and graph hints for changed asset artifact
 
     try std.testing.expect(recordHasHint(record, .graph));
     try std.testing.expect(recordHasHint(record, .resolution));
+}
+
+test "change journal graph refresh cursor resumes every key without allocating bodies" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeRecord(alloc, .{ .sequence = 42, .changed_doc_keys = &.{"unrelated"}, .deleted_doc_keys = &.{ "a", "b" }, .overwritten_doc_keys = &.{"skip"}, .changed_artifact_keys = &.{ "edge1", "edge2" } });
+    defer alloc.free(payload);
+    var cursor: GraphRefreshCursor = .{};
+    try std.testing.expect(try cursor.next(payload) == .skipped);
+    try std.testing.expectEqualStrings("a", (try cursor.next(payload)).deleted);
+    const resumed = cursor;
+    try std.testing.expectEqualStrings("b", (try cursor.next(payload)).deleted);
+    cursor = resumed;
+    try std.testing.expectEqualStrings("b", (try cursor.next(payload)).deleted);
+    try std.testing.expect(try cursor.next(payload) == .skipped);
+    try std.testing.expectEqualStrings("edge1", (try cursor.next(payload)).artifact);
+    try std.testing.expectEqualStrings("edge2", (try cursor.next(payload)).artifact);
+    try std.testing.expect(try cursor.next(payload) == .done);
+    var truncated: GraphRefreshCursor = .{};
+    while (truncated.next(payload[0 .. payload.len - 1])) |item| {
+        try std.testing.expect(item != .done);
+    } else |err| try std.testing.expectEqual(error.UnexpectedEndOfInput, err);
+}
+
+test "change journal graph indexed record retains unique first occurrence ordering on allocation failures" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var record = try recordFromDerivedBatch(alloc, .{
+                .deleted_keys = &.{ "b", "a", "b" },
+                .overwritten_doc_keys = &.{ "a", "a", "b" },
+                .changed_artifact_keys = &.{ "edge2", "edge1", "edge2" },
+                .generated_enrichment_refs = &.{
+                    .{ .kind = .asset, .doc_key = "a", .index_name = "context", .artifact_name = "context" },
+                    .{ .kind = .asset, .doc_key = "a", .index_name = "context", .artifact_name = "context" },
+                },
+            }, 42);
+            defer deinitRecord(alloc, &record);
+            try std.testing.expectEqual(@as(usize, 2), record.deleted_doc_keys.len);
+            try std.testing.expectEqualStrings("b", record.deleted_doc_keys[0]);
+            try std.testing.expectEqualStrings("a", record.deleted_doc_keys[1]);
+            try std.testing.expectEqual(@as(usize, 2), record.overwritten_doc_keys.len);
+            try std.testing.expectEqualStrings("a", record.overwritten_doc_keys[0]);
+            try std.testing.expectEqualStrings("b", record.overwritten_doc_keys[1]);
+            try std.testing.expectEqual(@as(usize, 2), record.changed_artifact_keys.len);
+            try std.testing.expectEqualStrings("edge2", record.changed_artifact_keys[0]);
+            try std.testing.expectEqualStrings("edge1", record.changed_artifact_keys[1]);
+            try std.testing.expectEqual(@as(usize, 1), record.changed_doc_keys.len);
+            try std.testing.expectEqualStrings("a", record.changed_doc_keys[0]);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "change journal borrowed binary scratch retention is bounded" {
+    const alloc = std.testing.allocator;
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    try scratch.changed_doc_keys.ensureTotalCapacity(alloc, 100);
+    const pointer = scratch.changed_doc_keys.items.ptr;
+    scratch.trimRetainedCapacity(alloc, scratch.retainedCapacityBytes());
+    try std.testing.expectEqual(pointer, scratch.changed_doc_keys.items.ptr);
+    scratch.trimRetainedCapacity(alloc, 0);
+    try std.testing.expectEqual(@as(usize, 0), scratch.retainedCapacityBytes());
+    try scratch.changed_doc_keys.append(alloc, "after trim");
+    try std.testing.expectEqualStrings("after trim", scratch.changed_doc_keys.items[0]);
+}
+
+test "change journal selected decode validates skipped lists without retaining them" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"changed"},
+        .deleted_doc_keys = &.{"deleted"},
+        .overwritten_doc_keys = &.{"overwritten"},
+        .changed_artifact_keys = &.{"artifact"},
+        .target_hints = &.{.graph},
+    });
+    defer alloc.free(payload);
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    _ = try decodeBinaryRecordBorrowedScratch(alloc, payload, &scratch);
+    const graph = try decodeBinaryRecordBorrowedScratchSelected(alloc, payload, &scratch, .{
+        .changed_doc_keys = false,
+        .overwritten_doc_keys = false,
+    });
+    try std.testing.expectEqualStrings("deleted", graph.deleted_doc_keys[0]);
+    try std.testing.expectEqualStrings("artifact", graph.changed_artifact_keys[0]);
+    try std.testing.expectEqual(@as(usize, 0), scratch.changed_doc_keys.capacity);
+    try std.testing.expectEqual(@as(usize, 0), scratch.overwritten_doc_keys.capacity);
+    const text = try decodeBinaryRecordBorrowedScratchSelected(alloc, payload, &scratch, .{ .changed_artifact_keys = false });
+    try std.testing.expectEqualStrings("changed", text.changed_doc_keys[0]);
+    try std.testing.expectEqual(@as(usize, 0), scratch.changed_artifact_keys.capacity);
+    // A truncated ignored artifact is still corrupt, rather than silently accepted.
+    try std.testing.expectError(error.UnexpectedEndOfInput, decodeBinaryRecordBorrowedScratchSelected(alloc, payload[0 .. payload.len - 1], &scratch, .{ .changed_artifact_keys = false }));
+    const trailing = try std.mem.concat(alloc, u8, &.{ payload, "x" });
+    defer alloc.free(trailing);
+    try std.testing.expectError(error.InvalidBinaryRecord, decodeBinaryRecordBorrowedScratchSelected(alloc, trailing, &scratch, .{ .changed_artifact_keys = false }));
+}
+
+test "change journal selected decode rejects impossible list counts before allocating" {
+    const alloc = std.testing.allocator;
+    const payload = try encodeRecord(alloc, .{ .sequence = 1, .changed_doc_keys = &.{"key"} });
+    defer alloc.free(payload);
+    // The first list begins after magic, version, sequence, hints and fields.
+    @memset(payload[payload.len - 11 ..][0..4], 0xff);
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    try std.testing.expectError(error.UnexpectedEndOfInput, decodeBinaryRecordBorrowedScratch(alloc, payload, &scratch));
+    try std.testing.expectEqual(@as(usize, 0), scratch.changed_doc_keys.capacity);
+}
+
+test "change journal trimming preserves small buffers after an oversized record" {
+    const alloc = std.testing.allocator;
+    var scratch: BorrowedBinaryRecordScratch = .{};
+    defer scratch.deinit(alloc);
+    try scratch.changed_doc_keys.ensureTotalCapacity(alloc, 8192);
+    try scratch.deleted_doc_keys.append(alloc, "deleted");
+    try scratch.target_hints.append(alloc, .full_text);
+    const deleted_pointer = scratch.deleted_doc_keys.items.ptr;
+    const hint_pointer = scratch.target_hints.items.ptr;
+    scratch.trimRetainedCapacity(alloc, 4096);
+    try std.testing.expectEqual(@as(usize, 0), scratch.changed_doc_keys.capacity);
+    try std.testing.expectEqual(deleted_pointer, scratch.deleted_doc_keys.items.ptr);
+    try std.testing.expectEqual(hint_pointer, scratch.target_hints.items.ptr);
+    try std.testing.expect(scratch.retainedCapacityBytes() <= 4096);
+    scratch.trimRetainedCapacity(alloc, 0);
+    try std.testing.expectEqual(@as(usize, 0), scratch.retainedCapacityBytes());
 }

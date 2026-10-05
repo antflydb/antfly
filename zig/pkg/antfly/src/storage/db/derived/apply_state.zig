@@ -241,7 +241,7 @@ pub fn loadAppliedSequenceWithCheckpoint(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !u64 {
-    if (comptime builtin.os.tag == .freestanding) return try loadAppliedSequence(alloc, store, index_name);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try loadAppliedSequence(alloc, store, index_name);
     const path = checkpoint_path orelse return try loadAppliedSequence(alloc, store, index_name);
     const checkpoint = loadProjectionCheckpoint(alloc, io, path, index_name) catch |err| switch (err) {
         error.FileNotFound => return 0,
@@ -257,7 +257,7 @@ pub fn loadProjectionCheckpointWithSidecar(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !ProjectionCheckpoint {
-    if (comptime builtin.os.tag == .freestanding) {
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) {
         return .{ .applied_sequence = try loadAppliedSequence(alloc, store, index_name) };
     }
     const path = checkpoint_path orelse return .{ .applied_sequence = try loadAppliedSequence(alloc, store, index_name) };
@@ -313,7 +313,7 @@ pub fn saveAppliedSequenceWithCheckpoint(
     index_name: []const u8,
     sequence: u64,
 ) !void {
-    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequence(store, index_name, sequence);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequence(store, index_name, sequence);
     if (checkpoint_path) |path| {
         try setAppliedSequencesCheckpoint(alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
             .index_name = index_name,
@@ -381,7 +381,7 @@ pub fn saveAppliedSequencesWithCheckpoint(
     updates: []const AppliedSequenceUpdate,
 ) !void {
     if (updates.len == 0) return;
-    if (comptime builtin.os.tag == .freestanding) return try saveAppliedSequences(store, updates);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequences(store, updates);
     if (checkpoint_path) |path| {
         try saveAppliedSequencesCheckpoint(alloc, io, path, store, updates);
         return;
@@ -405,7 +405,7 @@ pub fn clearAppliedSequenceWithCheckpoint(
     checkpoint_path: ?[]const u8,
     index_name: []const u8,
 ) !void {
-    if (comptime builtin.os.tag == .freestanding) return try clearAppliedSequence(store, index_name);
+    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try clearAppliedSequence(store, index_name);
     if (checkpoint_path) |path| {
         try clearAppliedSequenceCheckpoint(alloc, io, path, store, index_name);
         return;
@@ -428,7 +428,7 @@ const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.owned) self.store.deinit();
     }
 };
@@ -466,7 +466,7 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
 const CheckpointMap = struct {
     map: std.StringHashMapUnmanaged(ProjectionCheckpoint) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         var it = self.map.iterator();
         while (it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
         self.map.deinit(alloc);
@@ -597,7 +597,7 @@ fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, inde
 
 test "ordered artifact inventory projection snapshot owns a coherent checkpoint and publication fence" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = @import("../artifact_publication.zig");
     const epoch = @import("../artifact_projection_epoch.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -665,7 +665,7 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
 
 test "ordered artifact inventory projection sidecar transitions revoke completion before publication" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("../db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const publication = @import("../artifact_publication.zig");
     const epoch = @import("../artifact_projection_epoch.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -910,10 +910,10 @@ fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
         pos += name_len;
         if (checkpoint.map.contains(name)) return error.InvalidDerivedApplyState;
         const status: ProjectionStatus = switch (status_raw) {
-            @intFromEnum(ProjectionStatus.clean) => .clean,
-            @intFromEnum(ProjectionStatus.rebuilding) => .rebuilding,
-            @intFromEnum(ProjectionStatus.degraded) => .degraded,
-            @intFromEnum(ProjectionStatus.repair_required) => .repair_required,
+            @backingInt(ProjectionStatus.clean) => .clean,
+            @backingInt(ProjectionStatus.rebuilding) => .rebuilding,
+            @backingInt(ProjectionStatus.degraded) => .degraded,
+            @backingInt(ProjectionStatus.repair_required) => .repair_required,
             else => return error.InvalidDerivedApplyState,
         };
         try checkpoint.putMax(alloc, name, .{
@@ -961,7 +961,7 @@ fn encodeCheckpoint(alloc: Allocator, checkpoint: *const CheckpointMap) ![]u8 {
         const value = checkpoint.map.get(name) orelse return error.InvalidDerivedApplyState;
         try appendCheckpointInt(alloc, &out, u32, @intCast(name.len));
         try appendCheckpointInt(alloc, &out, u64, value.applied_sequence);
-        try appendCheckpointInt(alloc, &out, u8, @intFromEnum(value.status));
+        try appendCheckpointInt(alloc, &out, u8, @backingInt(value.status));
         try appendCheckpointInt(alloc, &out, u64, value.generation);
         try appendCheckpointInt(alloc, &out, u64, value.config_hash);
         try appendCheckpointInt(alloc, &out, u8, @intFromBool(value.published_count != null));
@@ -1236,7 +1236,7 @@ test "projection checkpoint reads v2 without inventing a publication certificate
     try appendCheckpointInt(alloc, &encoded, u32, 1);
     try appendCheckpointInt(alloc, &encoded, u32, name.len);
     try appendCheckpointInt(alloc, &encoded, u64, 44);
-    try appendCheckpointInt(alloc, &encoded, u8, @intFromEnum(ProjectionStatus.clean));
+    try appendCheckpointInt(alloc, &encoded, u8, @backingInt(ProjectionStatus.clean));
     try appendCheckpointInt(alloc, &encoded, u64, 9);
     try appendCheckpointInt(alloc, &encoded, u64, 0x1234);
     try encoded.appendSlice(alloc, name);

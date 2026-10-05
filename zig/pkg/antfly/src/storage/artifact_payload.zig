@@ -198,7 +198,7 @@ pub const Reference = struct {
         // Validate the envelope without manufacturing a full vector allocation.
         if (!std.mem.eql(u8, header[0..codec.magic.len], &codec.magic) or
             std.mem.readInt(u16, header[8..10], .little) != codec.codec_version or
-            header[10] != @intFromEnum(codec.Kind.dense_embedding) or dims == 0 or
+            header[10] != @backingInt(codec.Kind.dense_embedding) or dims == 0 or
             @as(u64, dims) * 4 + 4 != std.mem.readInt(u32, header[codec.header_len - 4 ..][0..4], .little))
             return error.InvalidVectorReference;
         return .{ .header = header.*, .dims = dims, .digest = value[reference_len - 32 ..][0..32].* };
@@ -273,7 +273,7 @@ pub const DenseReadStats = struct {
     lease_fallbacks: u64 = 0,
 
     pub fn add(self: *DenseReadStats, other: DenseReadStats) void {
-        inline for (std.meta.fields(DenseReadStats)) |field| @field(self, field.name) +|= @field(other, field.name);
+        inline for (comptime std.meta.fieldNames(DenseReadStats)) |reflected_name| @field(self, reflected_name) +|= @field(other, reflected_name);
     }
 };
 
@@ -386,12 +386,15 @@ pub const Session = struct {
         if (header.kind != .dense_embedding) return value;
         const reference = try Reference.forArtifact(key, value);
         const alloc = self.arena.allocator();
-        if (self.findPrepared(reference) == null) {
-            // Admit metadata before retaining a new payload. Growing the index
-            // frees its previous allocation instead of retaining arena copies.
-            try self.prepared.ensureTotalCapacity(self.alloc, self.prepared.count() + 1);
-            const artifact = try alloc.dupe(u8, value);
-            self.prepared.putAssumeCapacityNoClobber(.{ .reference = reference, .artifact = artifact }, {});
+        const borrowed: Prepared = .{ .reference = reference, .artifact = &.{} };
+        // ArrayHashMap attempts growth before probing. At capacity, preserve
+        // allocation-free duplicates; otherwise insertion needs one probe.
+        if (self.prepared.count() >= self.prepared.capacity() and self.findPrepared(reference) != null)
+            return try alloc.dupe(u8, &reference.encode());
+        const entry = try self.prepared.getOrPut(self.alloc, borrowed);
+        if (!entry.found_existing) {
+            errdefer _ = self.prepared.swapRemove(borrowed);
+            entry.key_ptr.artifact = try alloc.dupe(u8, value);
             self.durable = false;
         }
         return try alloc.dupe(u8, &reference.encode());

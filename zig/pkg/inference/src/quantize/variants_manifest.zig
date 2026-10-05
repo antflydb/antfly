@@ -229,7 +229,7 @@ pub fn writeClipclapVariantsManifest(allocator: Allocator, io: std.Io, model_dir
 
     const path = try std.fs.path.join(allocator, &.{ model_dir, "antfly_inference_variants.json" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
 }
 
 pub fn writeGliner2VariantsManifest(allocator: Allocator, io: std.Io, model_dir: []const u8) !void {
@@ -319,7 +319,7 @@ pub fn writeGliner2VariantsManifest(allocator: Allocator, io: std.Io, model_dir:
 
     const path = try std.fs.path.join(allocator, &.{ model_dir, "antfly_inference_variants.json" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
 }
 
 pub fn writeFlorence2VariantsManifest(allocator: Allocator, io: std.Io, model_dir: []const u8) !void {
@@ -398,7 +398,7 @@ pub fn writeFlorence2VariantsManifestForModel(
 
     const path = try std.fs.path.join(allocator, &.{ model_dir, "antfly_inference_variants.json" });
     defer allocator.free(path);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text.written() });
 }
 
 fn appendUniqueName(allocator: Allocator, names: *std.ArrayListUnmanaged([]const u8), name: []const u8) !void {
@@ -440,7 +440,7 @@ fn listFileNames(allocator: Allocator, io: std.Io, model_dir: []const u8) !std.A
         names.deinit(allocator);
     }
 
-    var dir = try compat.cwd().openDir(io, model_dir, .{ .iterate = true });
+    var dir = try std.Io.Dir.cwd().openDir(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     var iter = dir.iterate();
     while (try iter.next(io)) |entry| {
@@ -570,8 +570,8 @@ test "ClipClap variants manifest indexes complete GGUF and ONNX variants" {
     const allocator = std.testing.allocator;
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/clipclap-variants-manifest-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
 
     const files = [_][]const u8{
         "text_model.onnx",
@@ -606,14 +606,14 @@ test "ClipClap variants manifest indexes complete GGUF and ONNX variants" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
-    try writeClipclapVariantsManifest(allocator, compat.io(), dir_path);
+    try writeClipclapVariantsManifest(allocator, compat.testingIo(), dir_path);
 
     const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(manifest_path);
-    const raw = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(64 * 1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(64 * 1024));
     defer allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-f32\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-Q4_K\"") != null);
@@ -626,8 +626,8 @@ test "GLiNER2 variants manifest indexes complete GGUF pairs and ONNX default" {
     const allocator = std.testing.allocator;
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/gliner2-variants-manifest-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
 
     const files = [_][]const u8{
         "model.onnx",
@@ -638,14 +638,14 @@ test "GLiNER2 variants manifest indexes complete GGUF pairs and ONNX default" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
-    try writeGliner2VariantsManifest(allocator, compat.io(), dir_path);
+    try writeGliner2VariantsManifest(allocator, compat.testingIo(), dir_path);
 
     const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(manifest_path);
-    const raw = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(64 * 1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(64 * 1024));
     defer allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"family\": \"gliner2_variants/v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-Q4_K\"") != null);
@@ -659,8 +659,8 @@ test "Florence2 variants manifest indexes available GGUF models" {
     const allocator = std.testing.allocator;
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/florence2-variants-manifest-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
 
     const files = [_][]const u8{
         "florence-2-base.gguf",
@@ -670,14 +670,14 @@ test "Florence2 variants manifest indexes available GGUF models" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
-    try writeFlorence2VariantsManifest(allocator, compat.io(), dir_path);
+    try writeFlorence2VariantsManifest(allocator, compat.testingIo(), dir_path);
 
     const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(manifest_path);
-    const raw = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(64 * 1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(64 * 1024));
     defer allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"family\": \"florence2_variants/v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-f32\"") != null);
@@ -689,8 +689,8 @@ test "Florence2 variants manifest indexes alternate published GGUF names" {
     const allocator = std.testing.allocator;
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/florence2-alt-variants-manifest-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
 
     const files = [_][]const u8{
         "florence2.Q4_K.gguf",
@@ -699,14 +699,14 @@ test "Florence2 variants manifest indexes alternate published GGUF names" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
-    try writeFlorence2VariantsManifest(allocator, compat.io(), dir_path);
+    try writeFlorence2VariantsManifest(allocator, compat.testingIo(), dir_path);
 
     const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(manifest_path);
-    const raw = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(64 * 1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(64 * 1024));
     defer allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"family\": \"florence2_variants/v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-Q4_K\"") != null);
@@ -720,19 +720,19 @@ test "Florence2 variants manifest indexes explicit custom GGUF model" {
     const allocator = std.testing.allocator;
     const dir_path = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/florence2-custom-variants-manifest-{d}", .{std.posix.system.getpid()});
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
 
     const custom_name = "model.Q4_K.gguf";
     const custom_path = try std.fs.path.join(allocator, &.{ dir_path, custom_name });
     defer allocator.free(custom_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = custom_path, .data = "" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = custom_path, .data = "" });
 
-    try writeFlorence2VariantsManifestForModel(allocator, compat.io(), dir_path, custom_name);
+    try writeFlorence2VariantsManifestForModel(allocator, compat.testingIo(), dir_path, custom_name);
 
     const manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(manifest_path);
-    const raw = try compat.cwd().readFileAlloc(compat.io(), manifest_path, allocator, .limited(64 * 1024));
+    const raw = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), manifest_path, allocator, .limited(64 * 1024));
     defer allocator.free(raw);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"family\": \"florence2_variants/v1\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, raw, "\"id\": \"gguf-Q4_K\"") != null);

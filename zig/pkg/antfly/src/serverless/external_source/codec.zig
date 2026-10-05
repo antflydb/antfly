@@ -17,7 +17,7 @@ const Allocator = std.mem.Allocator;
 const external_source = @import("types.zig");
 
 const magic = "AFXS";
-const version: u32 = 15;
+const version: u32 = 17;
 
 pub const DecodeLimits = struct {
     max_artifact_bytes: usize = 256 * 1024 * 1024,
@@ -54,14 +54,17 @@ const DecodeBudget = struct {
 };
 
 pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8 {
+    return encodeVersion(alloc, inventory, version);
+}
+fn encodeVersion(alloc: Allocator, inventory: external_source.Inventory, format_version: u32) ![]u8 {
     try inventory.validate();
 
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
 
     try out.appendSlice(alloc, magic);
-    try appendU32(alloc, &out, version);
-    try out.append(alloc, @intFromEnum(inventory.format));
+    try appendU32(alloc, &out, format_version);
+    try out.append(alloc, @backingInt(inventory.format));
     try appendBytes(alloc, &out, inventory.source_id);
     try appendBytes(alloc, &out, inventory.source_uri);
     try appendBytes(alloc, &out, inventory.snapshot_id);
@@ -87,6 +90,13 @@ pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8
             try appendBytes(alloc, &out, partition.column_id);
             try appendBytes(alloc, &out, partition.string_value);
         }
+        if (format_version >= 16) for ([_][]const external_source.FieldMetric{ file.lower_bounds, file.upper_bounds }) |metrics| {
+            try appendU32(alloc, &out, @intCast(metrics.len));
+            for (metrics) |metric| {
+                try appendOptionalI32(alloc, &out, metric.field_id);
+                try appendBytes(alloc, &out, metric.value);
+            }
+        };
         try appendU32(alloc, &out, @intCast(file.row_groups.len));
         for (file.row_groups) |row_group| {
             try appendU32(alloc, &out, row_group.ordinal);
@@ -116,18 +126,25 @@ pub fn encodeAlloc(alloc: Allocator, inventory: external_source.Inventory) ![]u8
                 try appendOptionalF64(alloc, &out, chunk.stats_max_f64);
                 try out.append(alloc, if (chunk.nullable) 1 else 0);
                 try appendOptionalI32(alloc, &out, chunk.field_id);
+                if (format_version >= 17) {
+                    try appendOptionalI64(alloc, &out, if (chunk.offset_index_offset) |v| @intCast(v) else null);
+                    try appendOptionalI64(alloc, &out, if (chunk.offset_index_length) |v| v else null);
+                    try appendOptionalI64(alloc, &out, if (chunk.column_index_offset) |v| @intCast(v) else null);
+                    try appendOptionalI64(alloc, &out, if (chunk.column_index_length) |v| v else null);
+                }
             }
         }
     }
 
-    try appendU32(alloc, &out, @intCast(inventory.deleted_row_groups.len));
-    for (inventory.deleted_row_groups) |group| {
-        try appendBytes(alloc, &out, group.file_id);
-        try appendU32(alloc, &out, group.row_group_ordinal);
-        try appendU32(alloc, &out, @intCast(group.row_ordinals.len));
-        for (group.row_ordinals) |ordinal| try appendU64(alloc, &out, ordinal);
+    if (format_version >= 15) {
+        try appendU32(alloc, &out, @intCast(inventory.deleted_row_groups.len));
+        for (inventory.deleted_row_groups) |group| {
+            try appendBytes(alloc, &out, group.file_id);
+            try appendU32(alloc, &out, group.row_group_ordinal);
+            try appendU32(alloc, &out, @intCast(group.row_ordinals.len));
+            for (group.row_ordinals) |ordinal| try appendU64(alloc, &out, ordinal);
+        }
     }
-
     return try out.toOwnedSlice(alloc);
 }
 
@@ -148,7 +165,7 @@ pub fn decodeAllocWithLimits(
     if (!std.mem.eql(u8, bytes[0..magic.len], magic)) return error.InvalidExternalSourceInventoryMagic;
     cursor += magic.len;
     const got_version = try readU32(bytes, &cursor);
-    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != 8 and got_version != 9 and got_version != 10 and got_version != 11 and got_version != 12 and got_version != 13 and got_version != 14 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
+    if (got_version != 2 and got_version != 3 and got_version != 4 and got_version != 5 and got_version != 6 and got_version != 7 and got_version != 8 and got_version != 9 and got_version != 10 and got_version != 11 and got_version != 12 and got_version != 13 and got_version != 14 and got_version != 15 and got_version != 16 and got_version != version) return error.UnsupportedExternalSourceInventoryVersion;
     if (cursor >= bytes.len) return error.InvalidExternalSourceInventory;
     const format = try decodeFormat(bytes[cursor]);
     cursor += 1;
@@ -209,6 +226,10 @@ pub fn decodeAllocWithLimits(
             keep_partition = true;
             initialized_partitions += 1;
         }
+        const lower_bounds: []external_source.FieldMetric = if (got_version >= 16) try readMetrics(alloc, bytes, &cursor, &budget) else &.{};
+        errdefer if (!keep_file) external_source.FieldMetric.freeAll(alloc, lower_bounds);
+        const upper_bounds: []external_source.FieldMetric = if (got_version >= 16) try readMetrics(alloc, bytes, &cursor, &budget) else &.{};
+        errdefer if (!keep_file) external_source.FieldMetric.freeAll(alloc, upper_bounds);
         const raw_row_group_count = try readU32(bytes, &cursor);
         const row_group_count = try budget.admitCount(external_source.RowGroup, bytes, cursor, raw_row_group_count);
         const row_groups = try alloc.alloc(external_source.RowGroup, row_group_count);
@@ -267,6 +288,10 @@ pub fn decodeAllocWithLimits(
                     break :blk raw == 1;
                 } else false;
                 const field_id: ?i32 = if (got_version >= 12) try readOptionalI32(bytes, &cursor) else null;
+                var index_fields: [4]?u64 = @splat(null);
+                if (got_version >= 17) for (&index_fields) |*field| {
+                    if (try readOptionalI64(bytes, &cursor)) |value| field.* = std.math.cast(u64, value) orelse return error.InvalidExternalSourceInventory;
+                };
                 chunk.* = .{
                     .column_id = column_id,
                     .file_offset = chunk_file_offset,
@@ -289,6 +314,10 @@ pub fn decodeAllocWithLimits(
                     .stats_max_f64 = stats_max_f64,
                     .nullable = nullable,
                     .field_id = field_id,
+                    .offset_index_offset = index_fields[0],
+                    .offset_index_length = if (index_fields[1]) |v| std.math.cast(u32, v) orelse return error.InvalidExternalSourceInventory else null,
+                    .column_index_offset = index_fields[2],
+                    .column_index_length = if (index_fields[3]) |v| std.math.cast(u32, v) orelse return error.InvalidExternalSourceInventory else null,
                 };
                 keep_chunk = true;
                 initialized_chunks += 1;
@@ -314,6 +343,8 @@ pub fn decodeAllocWithLimits(
             .partition_spec_id = partition_spec_id,
             .partition_field_count = encoded_partition_field_count orelse @intCast(partition_count),
             .partition_values = partition_values,
+            .lower_bounds = lower_bounds,
+            .upper_bounds = upper_bounds,
             .row_groups = row_groups,
         };
         keep_file = true;
@@ -382,6 +413,23 @@ fn readBytesAlloc(alloc: Allocator, bytes: []const u8, cursor: *usize) ![]u8 {
     if (cursor.* > bytes.len or len > bytes.len - cursor.*) return error.InvalidExternalSourceInventory;
     const out = try alloc.dupe(u8, bytes[cursor.* .. cursor.* + len]);
     cursor.* += len;
+    return out;
+}
+
+fn readMetrics(a: Allocator, bytes: []const u8, cursor: *usize, budget: *DecodeBudget) ![]external_source.FieldMetric {
+    const raw_count = try readU32(bytes, cursor);
+    const count = try budget.admitCount(external_source.FieldMetric, bytes, cursor.*, raw_count);
+    const out = try a.alloc(external_source.FieldMetric, count);
+    errdefer a.free(out);
+    var initialized: usize = 0;
+    errdefer for (out[0..initialized]) |metric| a.free(metric.value);
+    for (out) |*metric| {
+        const id = try readOptionalI32(bytes, cursor) orelse return error.InvalidExternalSourceInventory;
+        if (id < 0) return error.InvalidExternalSourceInventory;
+        metric.* = .{ .field_id = id, .value = try readBytesAlloc(a, bytes, cursor) };
+        initialized += 1;
+    }
+    try external_source.FieldMetric.normalize(out);
     return out;
 }
 
@@ -560,6 +608,8 @@ test "external source inventory codec round-trips file inventory" {
         .data_sequence_number = 42,
         .partition_spec_id = 7,
         .partition_field_count = 1,
+        .lower_bounds = try external_source.FieldMetric.cloneAll(alloc, &.{.{ .field_id = 2, .value = @constCast("\x01\x00\x00\x00\x00\x00\x20\x00") }}),
+        .upper_bounds = try external_source.FieldMetric.cloneAll(alloc, &.{.{ .field_id = 2, .value = @constCast("\x02\x00\x00\x00\x00\x00\x20\x00") }}),
         .partition_values = try alloc.dupe(external_source.PartitionValue, &[_]external_source.PartitionValue{.{
             .column_id = try alloc.dupe(u8, "region"),
             .string_value = try alloc.dupe(u8, "us-west"),
@@ -583,6 +633,10 @@ test "external source inventory codec round-trips file inventory" {
                     .decimal_precision = 0,
                     .decimal_scale = 0,
                     .field_id = 2,
+                    .offset_index_offset = 800,
+                    .offset_index_length = 32,
+                    .column_index_offset = 832,
+                    .column_index_length = 40,
                     .stats_min_i64 = 10,
                     .stats_max_i64 = 20,
                     .stats_min_bytes = try alloc.dupe(u8, "acct:a"),
@@ -632,6 +686,13 @@ test "external source inventory codec round-trips file inventory" {
     try std.testing.expectEqual(@as(i32, 0), decoded.files[0].row_groups[0].column_chunks[0].decimal_precision);
     try std.testing.expectEqual(@as(i32, 0), decoded.files[0].row_groups[0].column_chunks[0].decimal_scale);
     try std.testing.expectEqual(@as(?i32, 2), decoded.files[0].row_groups[0].column_chunks[0].field_id);
+    try std.testing.expectEqualSlices(u8, inventory.files[0].lower_bounds[0].value, decoded.files[0].lower_bounds[0].value);
+    try std.testing.expectEqualSlices(u8, inventory.files[0].upper_bounds[0].value, decoded.files[0].upper_bounds[0].value);
+    try std.testing.expectEqual(@as(i32, 2), decoded.files[0].lower_bounds[0].field_id);
+    try std.testing.expectEqual(@as(?u64, 800), decoded.files[0].row_groups[0].column_chunks[0].offset_index_offset);
+    try std.testing.expectEqual(@as(?u32, 32), decoded.files[0].row_groups[0].column_chunks[0].offset_index_length);
+    try std.testing.expectEqual(@as(?u64, 832), decoded.files[0].row_groups[0].column_chunks[0].column_index_offset);
+    try std.testing.expectEqual(@as(?u32, 40), decoded.files[0].row_groups[0].column_chunks[0].column_index_length);
     try std.testing.expectEqual(@as(?i64, 10), decoded.files[0].row_groups[0].column_chunks[0].stats_min_i64);
     try std.testing.expectEqual(@as(?i64, 20), decoded.files[0].row_groups[0].column_chunks[0].stats_max_i64);
     try std.testing.expectEqualStrings("acct:a", decoded.files[0].row_groups[0].column_chunks[0].stats_min_bytes.?);
@@ -649,17 +710,15 @@ test "external source inventory codec round-trips file inventory" {
     const owned_deleted_groups = inventory.deleted_row_groups;
     inventory.deleted_row_groups = &.{};
     defer inventory.deleted_row_groups = owned_deleted_groups;
-    const current_without_deletes = try encodeAlloc(alloc, inventory);
-    defer alloc.free(current_without_deletes);
-    // Version 14 ended immediately after the file inventory. Prove durable
-    // artifacts published before delete sets were introduced remain readable.
-    const legacy = try alloc.dupe(u8, current_without_deletes[0 .. current_without_deletes.len - @sizeOf(u32)]);
+    // Emit the complete prior layout, without bounds or delete vectors.
+    const legacy = try encodeVersion(alloc, inventory, 14);
     defer alloc.free(legacy);
-    std.mem.writeInt(u32, legacy[magic.len..][0..4], 14, .little);
     var decoded_legacy = try decodeAlloc(alloc, legacy);
     defer decoded_legacy.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), decoded_legacy.deleted_row_groups.len);
     try std.testing.expectEqual(@as(usize, 1), decoded_legacy.files.len);
+    try std.testing.expectEqual(@as(usize, 0), decoded_legacy.files[0].lower_bounds.len);
+    try std.testing.expect(decoded_legacy.files[0].row_groups[0].column_chunks[0].offset_index_offset == null);
 }
 
 test "external source inventory codec rejects forged counts before allocation" {
@@ -668,7 +727,7 @@ test "external source inventory codec rejects forged counts before allocation" {
     defer encoded.deinit(alloc);
     try encoded.appendSlice(alloc, magic);
     try appendU32(alloc, &encoded, version);
-    try encoded.append(alloc, @intFromEnum(external_source.Format.parquet));
+    try encoded.append(alloc, @backingInt(external_source.Format.parquet));
     try appendBytes(alloc, &encoded, "source");
     try appendBytes(alloc, &encoded, "s3://bucket/source");
     try appendBytes(alloc, &encoded, "snapshot");

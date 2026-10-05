@@ -69,6 +69,8 @@ const hosted_freestanding_available_inference_modes = [_][]const u8{
     "disabled_deferred",
 };
 
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
+
 pub const Capabilities = struct {
     freestanding_build: bool = builtin.os.tag == .freestanding,
     // C ABI threading contract, like sqlite3_threadsafe(): "serialized"
@@ -157,7 +159,7 @@ pub const InferenceOpenOptions = struct {
 };
 
 pub fn capabilitiesForProfile(profile: Profile) Capabilities {
-    const freestanding = builtin.os.tag == .freestanding;
+    const freestanding = is_hostless;
     const hosted = profile == .hosted;
     const available_modes: []const []const u8 = if (hosted)
         if (freestanding)

@@ -57,7 +57,7 @@ const Reader = struct {
         return bytes;
     }
 
-    fn read(self: @This(), offset: u64, len: u64) ![]u8 {
+    pub fn read(self: @This(), offset: u64, len: u64) ![]u8 {
         try self.cancellation.check();
         if (offset > self.source.byte_len or len > self.source.byte_len - offset) return error.InvalidGraphSegment;
         return self.store.getVerifiedRangeAllocWithBudget(self.alloc, self.source.artifact_id, self.source.byte_len, self.source.checksum, offset, std.math.cast(usize, len) orelse return error.GraphMetricBuildBudgetExceeded, self.cancellation, self.remaining) catch |err| switch (err) {

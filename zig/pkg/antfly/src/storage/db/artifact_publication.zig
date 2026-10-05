@@ -193,7 +193,7 @@ pub const Command = struct {
     /// an explicit deletion) represent completed work for this stream.
     pub fn outputSources(self: Command) !std.StaticBitSet(max_source_documents) {
         if (self.sources.len > max_source_documents or self.mutations.len == 0) return error.InvalidBatchRequest;
-        var result = std.StaticBitSet(max_source_documents).initEmpty();
+        var result = std.StaticBitSet(max_source_documents).empty;
         for (self.mutations) |effect| {
             if (effect.source_index >= self.sources.len) return error.InvalidBatchRequest;
             result.set(effect.source_index);
@@ -737,7 +737,7 @@ pub fn stageRejection(txn: anytype, command: Command, index: u64, reason: Reject
     if (index == 0) return error.InvalidBatchRequest;
     var raw: [77]u8 = undefined;
     @memcpy(raw[0..4], "APX1");
-    raw[4] = @intFromEnum(reason);
+    raw[4] = @backingInt(reason);
     @memcpy(raw[5..37], &command.publication_digest);
     std.mem.writeInt(u64, raw[37..45], index, .little);
     std.crypto.hash.Blake3.hash(raw[0..45], raw[45..77], .{});
@@ -833,13 +833,13 @@ pub fn validateRequest(alloc: std.mem.Allocator, request: anytype) !void {
     const command = request.artifact_publication orelse return;
     try command.validate(alloc);
     const defaults: @TypeOf(request) = .{};
-    inline for (@typeInfo(@TypeOf(request)).@"struct".fields) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "artifact_publication") and
-            !std.mem.eql(u8, field.name, "sync_level") and !std.mem.eql(u8, field.name, "timestamp"))
+    inline for (@typeInfo(@TypeOf(request)).@"struct".field_names, @typeInfo(@TypeOf(request)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !std.mem.eql(u8, reflected_name, "artifact_publication") and
+            !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "timestamp"))
         {
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
-                if (@field(request, field.name).len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(@field(request, field.name), @field(defaults, field.name))) return error.InvalidBatchRequest;
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (@field(request, reflected_name).len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(@field(request, reflected_name), @field(defaults, reflected_name))) return error.InvalidBatchRequest;
         }
     }
 }
@@ -880,8 +880,28 @@ pub fn validateSources(alloc: std.mem.Allocator, txn: anytype, namespace: Namesp
     }
 }
 
+pub const UploadRecoveryTick = struct {
+    now_ns: u64,
+    trigger: enum { maintenance, explicit },
+};
+
+pub const UploadRecoveryInvocation = struct {
+    io: std.Io,
+    now_ns: u64,
+    inventory: @import("artifact_publication_transport.zig").RecoveryInventory,
+    trigger: @FieldType(UploadRecoveryTick, "trigger"),
+};
+
+pub const UploadRecovery = struct {
+    should_poll: *const fn (*anyopaque, UploadRecoveryTick) bool,
+    recover: *const fn (*anyopaque, UploadRecoveryInvocation) anyerror!bool,
+};
+
 pub const Dispatcher = struct {
     ptr: *anyopaque,
+    /// Borrowed synchronous owner capability. Storage releases its snapshot
+    /// before recovery; absence leaves external publication recovery inert.
+    upload_recovery: ?UploadRecovery = null,
     /// No storage/apply lock may be held here. Success means bounded queue
     /// admission only; output remains pending until the local durable receipt.
     enqueue: *const fn (*anyopaque, Namespace, []const u8) anyerror!void,
@@ -1012,7 +1032,12 @@ pub fn prepareBaseVectors(alloc: std.mem.Allocator, command: Command, catalogs: 
         } else try deleted.append(scratch, artifact_key);
         for (consumers.items) |consumer| try coverage.append(scratch, .{ .index_name = consumer.name, .generation = consumer.generation, .document_key = identity.doc_key, .artifact_names = consumer.artifact_names });
     }
-    return .{ .arena = arena, .coverage = try coverage.toOwnedSlice(scratch), .batch = .{ .dense_embeddings = try dense.toOwnedSlice(scratch), .sparse_embeddings = try sparse.toOwnedSlice(scratch), .changed_artifact_keys = try changed.toOwnedSlice(scratch), .deleted_keys = try deleted.toOwnedSlice(scratch) } };
+    const owned_result_coverage = try coverage.toOwnedSlice(scratch);
+    const owned_result_dense = try dense.toOwnedSlice(scratch);
+    const owned_result_sparse = try sparse.toOwnedSlice(scratch);
+    const owned_result_changed = try changed.toOwnedSlice(scratch);
+    const owned_result_deleted = try deleted.toOwnedSlice(scratch);
+    return .{ .arena = arena, .coverage = owned_result_coverage, .batch = .{ .dense_embeddings = owned_result_dense, .sparse_embeddings = owned_result_sparse, .changed_artifact_keys = owned_result_changed, .deleted_keys = owned_result_deleted } };
 }
 
 /// Point-only accounting in the final writer snapshot. Counter migration is
@@ -1266,7 +1291,7 @@ test "ordered artifact inventory publication projects every shared consumer and 
         std.mem.writeInt(u32, &length, @intCast(config.name.len), .little);
         try catalog.appendSlice(alloc, &length);
         try catalog.appendSlice(alloc, config.name);
-        try catalog.append(alloc, @intFromEnum(config.kind));
+        try catalog.append(alloc, @backingInt(config.kind));
         std.mem.writeInt(u32, &length, @intCast(config.config_json.len), .little);
         try catalog.appendSlice(alloc, &length);
         try catalog.appendSlice(alloc, config.config_json);
@@ -1333,7 +1358,7 @@ test "ordered artifact inventory publication coverage is point bounded idempoten
     const alloc = std.testing.allocator;
     const Txn = struct {
         rows: std.StringHashMap([]u8),
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var iterator = self.rows.iterator();
             while (iterator.next()) |entry| {
                 std.testing.allocator.free(entry.key_ptr.*);

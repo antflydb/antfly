@@ -225,7 +225,7 @@ fn mutationStamp(txn: anytype, authority: publication.Authority) !publication.Di
     var raw: [owners.encoded_size + 17]u8 = @splat(0);
     @memcpy(raw[0..owners.encoded_size], &owner.encode());
     if (owner.kind == .raft) {
-        const marker = txn.get(&keys.raft_document_applied_entry_key) catch |err| if (err == error.NotFound) null else return err;
+        const marker = txn.get(&keys.ordered_document_applied_entry_key) catch |err| if (err == error.NotFound) null else return err;
         if (marker) |value| {
             if (value.len != 16) return error.ArtifactCatalogCorrupt;
             const position: publication.Position = .{ .raft = .{ .term = std.mem.readInt(u64, value[0..8], .little), .index = std.mem.readInt(u64, value[8..16], .little) } };
@@ -421,7 +421,7 @@ test "ordered artifact inventory authored retirement resumes past live prefixes 
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    const path = try alloc.dupeZ(u8, path_buffer[0..path_len]);
+    const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
     defer alloc.free(path);
     var store = try docstore.DocStore.open(alloc, path, .{});
     defer store.close();
@@ -573,7 +573,7 @@ test "ordered artifact inventory authored retirement cache binds owner clock epo
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-        const path = try alloc.dupeZ(u8, path_buffer[0..path_len]);
+        const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
         defer alloc.free(path);
         var store = try docstore.DocStore.open(alloc, path, .{});
         defer store.close();
@@ -597,7 +597,7 @@ test "ordered artifact inventory authored retirement cache binds owner clock epo
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 1, .little);
-        const writes = [_]docstore.KVPair{ .{ .key = primary, .value = "{}" }, .{ .key = &keys.raft_document_applied_entry_key, .value = &marker } };
+        const writes = [_]docstore.KVPair{ .{ .key = primary, .value = "{}" }, .{ .key = &keys.ordered_document_applied_entry_key, .value = &marker } };
         try store.putBatch(writes[0..@as(usize, if (kind == .raft) 2 else 1)], &.{});
         {
             var invalidated = (try prepareRetirementPage(alloc, &store, 41, .{})).?;
@@ -646,7 +646,7 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-        const path = try alloc.dupeZ(u8, path_buffer[0..path_len]);
+        const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
         defer alloc.free(path);
         var store = try docstore.DocStore.open(alloc, path, .{});
         defer store.close();
@@ -674,7 +674,7 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
         var marker: [16]u8 = undefined;
         std.mem.writeInt(u64, marker[0..8], 1, .little);
         std.mem.writeInt(u64, marker[8..16], 1, .little);
-        const writes = [_]docstore.KVPair{ .{ .key = primary, .value = "{}" }, .{ .key = ttl, .value = &timestamp }, .{ .key = artifact, .value = value }, .{ .key = &keys.raft_document_applied_entry_key, .value = &marker } };
+        const writes = [_]docstore.KVPair{ .{ .key = primary, .value = "{}" }, .{ .key = ttl, .value = &timestamp }, .{ .key = artifact, .value = value }, .{ .key = &keys.ordered_document_applied_entry_key, .value = &marker } };
         const actual = writes[0..@as(usize, if (kind == .raft) 4 else 3)];
         // Merely writing authored bytes through generic/import ingress does
         // not create acceptance, even with valid physical input revisions.

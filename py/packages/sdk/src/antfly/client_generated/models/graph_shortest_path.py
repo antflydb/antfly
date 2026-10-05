@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
     from ..models.graph_edge_weight_range import GraphEdgeWeightRange
     from ..models.graph_path_endpoint import GraphPathEndpoint
+    from ..models.graph_relationship_filter import GraphRelationshipFilter
 
 
 T = TypeVar("T", bound="GraphShortestPath")
@@ -39,6 +40,11 @@ class GraphShortestPath:
     Attributes:
         from_ (GraphPathEndpoint):
         to (GraphPathEndpoint):
+        edge_filter (GraphRelationshipFilter | Unset): AND predicates applied to every relationship before neighbor
+            admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use
+            explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have
+            inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a
+            created_at value. Invalid timestamp properties never match.
         direction (EdgeDirection | Unset): Direction of edges to query:
             - out: Outgoing edges from the node
             - in: Incoming edges to the node
@@ -70,6 +76,7 @@ class GraphShortestPath:
 
     from_: GraphPathEndpoint
     to: GraphPathEndpoint
+    edge_filter: GraphRelationshipFilter | Unset = UNSET
     direction: EdgeDirection | Unset = UNSET
     edge_types: list[str] | Unset = UNSET
     max_depth: int | Unset = 10
@@ -115,6 +122,10 @@ class GraphShortestPath:
         from_ = self.from_.to_dict()
 
         to = self.to.to_dict()
+
+        edge_filter: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.edge_filter, Unset):
+            edge_filter = self.edge_filter.to_dict()
 
         direction: str | Unset = UNSET
         if not isinstance(self.direction, Unset):
@@ -182,6 +193,8 @@ class GraphShortestPath:
                 "to": to,
             }
         )
+        if edge_filter is not UNSET:
+            field_dict["edge_filter"] = edge_filter
         if direction is not UNSET:
             field_dict["direction"] = direction
         if edge_types is not UNSET:
@@ -220,11 +233,19 @@ class GraphShortestPath:
         from ..models.graph_document_wildcard_filter import GraphDocumentWildcardFilter
         from ..models.graph_edge_weight_range import GraphEdgeWeightRange
         from ..models.graph_path_endpoint import GraphPathEndpoint
+        from ..models.graph_relationship_filter import GraphRelationshipFilter
 
         d = dict(src_dict)
         from_ = GraphPathEndpoint.from_dict(d.pop("from"))
 
         to = GraphPathEndpoint.from_dict(d.pop("to"))
+
+        _edge_filter = d.pop("edge_filter", UNSET)
+        edge_filter: GraphRelationshipFilter | Unset
+        if isinstance(_edge_filter, Unset):
+            edge_filter = UNSET
+        else:
+            edge_filter = GraphRelationshipFilter.from_dict(_edge_filter)
 
         _direction = d.pop("direction", UNSET)
         direction: EdgeDirection | Unset
@@ -400,6 +421,7 @@ class GraphShortestPath:
         graph_shortest_path = cls(
             from_=from_,
             to=to,
+            edge_filter=edge_filter,
             direction=direction,
             edge_types=edge_types,
             max_depth=max_depth,

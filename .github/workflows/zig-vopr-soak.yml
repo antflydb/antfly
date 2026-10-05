@@ -117,6 +117,7 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
+
       - name: Test soak orchestration
         run: |
           python3 -m unittest discover -s scripts/ci -p test_zig_vopr_soak.py
@@ -172,6 +173,7 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
+
       - name: Restore the pinned runner for this revision
         id: runner_cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -183,7 +185,7 @@ jobs:
         working-directory: zig
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/vopr-build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build vopr-build -Doptimize=safe --summary all \
             --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
       - name: Retain runner build disk measurements
         if: always()
@@ -404,12 +406,13 @@ jobs:
           echo "$compiler_description"
           grep -q 'dynamically linked' <<<"$compiler_description"
           echo "$zig_path/bin" >> "$GITHUB_PATH"
+
       - name: Build production executable and qualify owner publication
         id: production-build
         working-directory: zig
         run: |
           python3 "$GITHUB_WORKSPACE/scripts/ci/measure_disk_usage.py" --output "$RUNNER_TEMP/production-e2e-soak/build-disk.json" --path /mnt/cache --path "$GITHUB_WORKSPACE" -- \
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly antfly-storage-owner-source-test -Doptimize=safe --summary all \
             2>&1 | tee "$RUNNER_TEMP/production-e2e-soak/build.log"
           sha256sum zig-out/bin/antfly > "$RUNNER_TEMP/production-e2e-soak/binary.sha256"
           tar -C zig-out/bin -czf "$RUNNER_TEMP/production-e2e-soak/antfly.tar.gz" antfly
@@ -417,7 +420,7 @@ jobs:
         working-directory: zig
         run: |
           for iteration in $(seq 1 20); do
-            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=ReleaseSafe --summary all \
+            python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build antfly-storage-owner-source-test -Doptimize=safe --summary all \
               > "$RUNNER_TEMP/production-e2e-soak/owner-$iteration.log" 2>&1
           done
       - name: Retain production binary and build evidence

@@ -682,6 +682,9 @@ export interface QueryOptions {
   aggregations?: Record<string, AggregationRequest>;
 }
 
+export type GraphRelationshipFilter = components["schemas"]["GraphRelationshipFilter"];
+export type GraphRelationshipPropertyPredicate =
+  components["schemas"]["GraphRelationshipPropertyPredicate"];
 // System catalog resources and lifecycle requests.
 export type DatabaseCatalogRecord = components["schemas"]["DatabaseCatalogRecord"];
 export type NamespaceCatalogRecord = components["schemas"]["NamespaceCatalogRecord"];

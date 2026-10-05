@@ -35,7 +35,7 @@ const contracts = @import("backend_contracts.zig");
 const model_runtime = @import("model_runtime.zig");
 const quant_matmul = @import("quant_matmul.zig");
 
-const c_std = @cImport(@cInclude("stdlib.h"));
+const c_std = std.c;
 
 pub const TimingStats = model_runtime.RuntimeDebugTimingStats;
 
@@ -1021,7 +1021,7 @@ const ExecutorKvMetadataLayer = struct {
         return .{ .allocator = allocator, .pool_id = pool_id, .lazy_device_reserve = lazy_device_reserve };
     }
 
-    fn deinit(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime) void {
+    pub fn deinit(self: *ExecutorKvMetadataLayer, storage: *runtime.kv.storage_runtime.KvStorageRuntime) void {
         self.releaseOwnedSequence(storage) catch {};
         self.logical_blocks.deinit(self.allocator);
         self.* = undefined;
@@ -1441,7 +1441,7 @@ const RuntimeContext = struct {
         self.mirrored_kv_compacted = false;
     }
 
-    fn deinit(self: *RuntimeContext) void {
+    pub fn deinit(self: *RuntimeContext) void {
         // Sampled and greedy pipelining intentionally leave the next frame
         // submitted after returning a token. The runtime borrows the shared
         // Metal provider, so its ComputeBackend teardown does not own or drain

@@ -50,7 +50,7 @@ pub const digest = @import("restore_staging_contract.zig").digest;
 
 test "restore empty generation proves pristine owner and rejects source import" {
     for ([_][]const u8{ "{}", "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"integer\"}},\"additionalProperties\":false}}}}" }) |definition| {
-        const db = @import("db.zig");
+        const db = @import("antfly_source_root").antfly_sources.physical_db;
         const alloc = std.testing.allocator;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
@@ -95,7 +95,7 @@ test "restore empty generation proves pristine owner and rejects source import" 
 }
 
 test "restore graph empty generation rejects physical artifacts before staging" {
-    const db = @import("db.zig");
+    const db = @import("antfly_source_root").antfly_sources.physical_db;
     const alloc = std.testing.allocator;
     for ([_]enum { clean, edge, primary_artifact }{ .clean, .edge, .primary_artifact }) |case| {
         var tmp = std.testing.tmpDir(.{});
@@ -296,7 +296,7 @@ test "native restore artifact phase cannot skip row fencing or mutate logical pr
         .target_schema_digest = @splat(5),
         .preserve_artifacts = true,
     };
-    const before: Progress = .{ .scope = scope };
+    const before: Progress = .{ .scope = scope, .source_generation_proofs_complete = true };
     const raw = try before.encode(alloc);
     defer alloc.free(raw);
     const Read = struct {

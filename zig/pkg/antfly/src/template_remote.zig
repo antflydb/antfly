@@ -102,7 +102,7 @@ test "template remote byte budget reads the reloadable config snapshot" {
         fn health(_: *anyopaque) scraping.RemoteContentConfig.RuntimeHealth {
             return .{
                 .generation = 1,
-                .hash = [_]u8{0} ** 32,
+                .hash = @as([32]u8, @splat(0)),
                 .last_reload_failed = false,
                 .stale_snapshot = false,
                 .reload_successes = 0,
@@ -774,7 +774,7 @@ const ResolvedRemoteContentFetchOptions = struct {
     s3_credentials: ?scraping.S3CredentialsConfig = null,
     http_headers: ?[]scraping.HTTPHeader = null,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.s3_credentials) |*creds| creds.deinit(alloc);
         if (self.http_headers) |headers| {
             for (headers) |header| {
@@ -1522,9 +1522,9 @@ test "template remote S3 credentials fall back to standard AWS environment" {
     defer if (old_access) |value| alloc.free(value);
     const old_secret = common_secrets.envValueOwned(alloc, "AWS_SECRET_ACCESS_KEY");
     defer if (old_secret) |value| alloc.free(value);
-    const old_access_z = if (old_access) |value| try alloc.dupeZ(u8, value) else null;
+    const old_access_z = if (old_access) |value| try alloc.dupeSentinel(u8, value, 0) else null;
     defer if (old_access_z) |value| alloc.free(value);
-    const old_secret_z = if (old_secret) |value| try alloc.dupeZ(u8, value) else null;
+    const old_secret_z = if (old_secret) |value| try alloc.dupeSentinel(u8, value, 0) else null;
     defer if (old_secret_z) |value| alloc.free(value);
     defer {
         if (old_access_z) |value| {
@@ -1715,7 +1715,7 @@ test "template remote preserves PDF content type across a multi-megabyte downloa
     const alloc = std.testing.allocator;
 
     const FakePdfBackend = struct {
-        fn extract(_: *const anyopaque, a: Allocator, _: []const u8) ![]u8 {
+        pub fn extract(_: *const anyopaque, a: Allocator, _: []const u8) ![]u8 {
             return try a.dupe(u8, "pdf extracted text");
         }
 
@@ -1794,7 +1794,7 @@ test "template remote renders remoteMedia pdf mode=render with injected pdf back
     const alloc = std.testing.allocator;
 
     const FakePdfBackend = struct {
-        fn extract(_: *const anyopaque, a: Allocator, _: []const u8) ![]u8 {
+        pub fn extract(_: *const anyopaque, a: Allocator, _: []const u8) ![]u8 {
             return try a.dupe(u8, "pdf extracted text");
         }
 
@@ -2139,7 +2139,7 @@ test "PDF extract mode emits text even when the media-part limit is exhausted" {
     defer alloc.free(json_doc);
 
     const FakePdfBackend = struct {
-        fn extract(_: *const anyopaque, a: Allocator, _: []const u8) ![]u8 {
+        pub fn extract(_: *const anyopaque, a: Allocator, _: []const u8) ![]u8 {
             return try a.dupe(u8, "extracted text");
         }
 

@@ -210,6 +210,7 @@ pub const AntflyRootImports = struct {
         // The public/test facade exposes the whole implementation. Production
         // archives use the owner constructors below to keep caches independent.
         self.configureBase(mod, link_libc);
+        mod.addImport("antfly_inference_host", self.inference_host);
         self.configureServerContracts(mod);
         mod.addImport("antfly_lite_options", self.lite_options);
         inline for (import_table) |entry| mod.addImport(entry.name, @field(self, entry.field));
@@ -383,7 +384,7 @@ pub const AntflyRootImports = struct {
 
     pub fn configureServerless(self: @This(), b: *std.Build, mod: *std.Build.Module, link_libc: bool) void {
         self.configureDatabase(mod, link_libc);
-        self.configureServerContracts(mod);
+        mod.addImport("antfly_provision_contract", self.provision_contract);
         inline for (.{
             "inference_api", "inference_config_openapi", "middleware_openapi",
             "s3_openapi",    "scraping_openapi",         "vectorindex",
@@ -394,9 +395,19 @@ pub const AntflyRootImports = struct {
 
     /// This driver exercises storage and HTTP API implementations in one root.
     pub fn configureStorageBenchmark(self: @This(), b: *std.Build, mod: *std.Build.Module) void {
+        mod.addImport("antfly_inference_host", self.inference_host);
         self.configureStorageDependencies(b, mod, true);
         inline for (api_imports) |field| self.addImport(mod, field);
         mod.addImport("antfly_openapi_specs", self.embedded_openapi);
+    }
+
+    /// Shared runtime contracts for standalone test and implementation roots.
+    /// These imports own no storage, consensus, or inference implementation.
+    pub fn configureRuntimeContracts(self: @This(), mod: *std.Build.Module) void {
+        mod.addImport("antfly_cancellation", self.cancellation);
+        mod.addImport("antfly_cache_budget", self.cache_budget);
+        mod.addImport("antfly_runtime_abi", self.runtime_abi);
+        mod.addImport("antfly_runtime_fs", self.runtime_fs);
     }
 
     fn configureBase(self: @This(), mod: *std.Build.Module, link_libc: bool) void {
@@ -404,10 +415,7 @@ pub const AntflyRootImports = struct {
         self.storage_boundary.configureProfile(mod, false, false, self.boundary_profile);
         mod.addOptions("build_options", self.build_options);
         mod.addImport("antfly_platform", self.platform);
-        mod.addImport("antfly_cancellation", self.cancellation);
-        mod.addImport("antfly_cache_budget", self.cache_budget);
-        mod.addImport("antfly_runtime_abi", self.runtime_abi);
-        mod.addImport("antfly_runtime_fs", self.runtime_fs);
+        self.configureRuntimeContracts(mod);
         mod.addImport("antfly_inference_bridge", self.inference_bridge);
         mod.addImport("antfly_public_limits", self.public_limits);
         mod.addImport("antfly_template_content", self.template_content);
@@ -430,7 +438,6 @@ pub const AntflyRootImports = struct {
         mod.addImport("antfly_inference_request_types", self.inference_request_types);
         mod.addImport("antfly_inference_runtime_paths", self.inference_runtime_paths);
         mod.addImport("antfly_inference_query_embedding_cache", self.inference_query_embedding_cache);
-        mod.addImport("antfly_inference_host", self.inference_host);
         if (link_libc and !self.platform_link_libc) {
             platform_build.addFilesystemCapacitySource(
                 mod,

@@ -328,7 +328,7 @@ const RecoveredWal = struct {
     bytes: []u8,
     replay: vector_wal.Replay,
 
-    fn deinit(self: *RecoveredWal) void {
+    pub fn deinit(self: *RecoveredWal) void {
         self.replay.deinit();
         self.alloc.free(self.bytes);
         self.* = undefined;
@@ -4185,7 +4185,7 @@ const CompactionMerge = struct {
         start: usize = 0,
         valid: usize = 0,
 
-        fn read(self: *ReadWindow, alloc: Allocator, block: RetainedBlock, offset: usize, len: usize, target: usize) ![]const u8 {
+        pub fn read(self: *ReadWindow, alloc: Allocator, block: RetainedBlock, offset: usize, len: usize, target: usize) ![]const u8 {
             if (self.identity == block.shared.identity and offset >= self.start and offset - self.start <= self.valid and len <= self.valid - (offset - self.start))
                 return self.bytes[offset - self.start ..][0..len];
             const block_len = block.bytes().len;
@@ -4298,7 +4298,7 @@ const CompactionMerge = struct {
         return self;
     }
 
-    fn deinit(self: *CompactionMerge) void {
+    pub fn deinit(self: *CompactionMerge) void {
         self.source.store.alloc.free(self.oversized.vector.bytes);
         self.source.store.alloc.free(self.oversized.residual.bytes);
         for (self.windows.items) |*window| {
@@ -5179,7 +5179,7 @@ test "grouped projection queue includes oversized fallbacks and unavailable help
     defer store.deinit();
     var writer = try vector_block.Writer.initWithEncoding(alloc, 1, 0, 1, 1, .float32);
     defer writer.deinit();
-    const large = [_]f32{1.25} ** 4097;
+    const large = @as([4097]f32, @splat(1.25));
     const Entry = struct {
         key: []const u8,
         vector: []const f32,
@@ -6522,7 +6522,7 @@ test "source vector payloads adaptive location cache admits repeats and releases
     defer cache.deinit();
     try cache.attachManager(alloc, &manager);
     try std.testing.expectEqual(@as(u64, 0), cache.resident_bytes.load(.monotonic));
-    const digest = [_]u8{7} ** 32;
+    const digest = @as([32]u8, @splat(7));
     const located: LocatedValue = .{ .block = .{ .reader_index = 0, .reader_generation = 1, .reader_shard_id = 0, .location = undefined } };
     cache.put(&digest, 42, located);
     try std.testing.expectEqual(@as(u64, 0), cache.resident_bytes.load(.monotonic));
@@ -6663,7 +6663,7 @@ test "vector block streaming delta merge skips superseded corruption and preserv
         defer a.free(bytes);
         try store.publishGeneration(generation, 0, &.{.{ .shard_id = 0, .bytes = bytes }}, generation == 1);
     }
-    const padding = [_]f32{0.25} ** 256;
+    const padding = @as([256]f32, @splat(0.25));
     try store.appendBatch(try store.nextBatchId(), &.{
         .{ .kind = .upsert, .key = "wal", .source_sequence = 11, .revision = 1, .vector = &.{3.125} },
         .{ .kind = .upsert, .key = "padding", .source_sequence = 11, .revision = 1, .vector = &padding },

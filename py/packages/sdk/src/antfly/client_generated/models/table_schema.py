@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
     from ..models.dynamic_template import DynamicTemplate
+    from ..models.external_lake_table_source import ExternalLakeTableSource
     from ..models.relational_check_constraint import RelationalCheckConstraint
     from ..models.relational_column_expression import RelationalColumnExpression
     from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
@@ -36,6 +37,8 @@ class TableSchema:
             enforce_types; explicitly setting enforce_types to false is invalid.
             Existing JSON document write and read APIs remain available. This
             setting alone does not declare primary keys or unique constraints.
+        base_source (ExternalLakeTableSource | Unset): Read-only authoritative Parquet or Iceberg source. A serving
+            statement pins its inventory and object versions before returning rows.
         column_defaults (list[RelationalColumnExpression] | Unset): Immutable typed expressions applied only to absent
             columns on new
             writes, never explicit null. Defaults cannot reference columns.
@@ -89,6 +92,7 @@ class TableSchema:
 
     version: int | Unset = UNSET
     storage_mode: TableStorageMode | Unset = UNSET
+    base_source: ExternalLakeTableSource | Unset = UNSET
     column_defaults: list[RelationalColumnExpression] | Unset = UNSET
     generated_columns: list[RelationalColumnExpression] | Unset = UNSET
     checks: list[RelationalCheckConstraint] | Unset = UNSET
@@ -112,6 +116,10 @@ class TableSchema:
         storage_mode: str | Unset = UNSET
         if not isinstance(self.storage_mode, Unset):
             storage_mode = self.storage_mode.value
+
+        base_source: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.base_source, Unset):
+            base_source = self.base_source.to_dict()
 
         column_defaults: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.column_defaults, Unset):
@@ -189,6 +197,8 @@ class TableSchema:
             field_dict["version"] = version
         if storage_mode is not UNSET:
             field_dict["storage_mode"] = storage_mode
+        if base_source is not UNSET:
+            field_dict["base_source"] = base_source
         if column_defaults is not UNSET:
             field_dict["column_defaults"] = column_defaults
         if generated_columns is not UNSET:
@@ -221,6 +231,7 @@ class TableSchema:
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.dynamic_template import DynamicTemplate
+        from ..models.external_lake_table_source import ExternalLakeTableSource
         from ..models.relational_check_constraint import RelationalCheckConstraint
         from ..models.relational_column_expression import RelationalColumnExpression
         from ..models.relational_foreign_key_constraint import RelationalForeignKeyConstraint
@@ -238,6 +249,13 @@ class TableSchema:
             storage_mode = UNSET
         else:
             storage_mode = TableStorageMode(_storage_mode)
+
+        _base_source = d.pop("base_source", UNSET)
+        base_source: ExternalLakeTableSource | Unset
+        if isinstance(_base_source, Unset):
+            base_source = UNSET
+        else:
+            base_source = ExternalLakeTableSource.from_dict(_base_source)
 
         _column_defaults = d.pop("column_defaults", UNSET)
         column_defaults: list[RelationalColumnExpression] | Unset = UNSET
@@ -337,6 +355,7 @@ class TableSchema:
         table_schema = cls(
             version=version,
             storage_mode=storage_mode,
+            base_source=base_source,
             column_defaults=column_defaults,
             generated_columns=generated_columns,
             checks=checks,

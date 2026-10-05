@@ -607,8 +607,8 @@ test "relational index system merge page admission bounds work and authenticates
     try std.testing.expectError(error.InvalidMergePage, pages.validateRequest(request));
     request = seal(request);
     try std.testing.expect(!std.mem.eql(u8, &digest, &request.merge_page.?.digest));
-    const too_many = [_]types.BatchWrite{.{ .key = "b", .value = "{}" }} ** (pages.max_rows + 1);
-    const times = [_]u64{123} ** (pages.max_rows + 1);
+    const too_many = @as([(pages.max_rows + 1)]types.BatchWrite, @splat(.{ .key = "b", .value = "{}" }));
+    const times = @as([(pages.max_rows + 1)]u64, @splat(123));
     request.writes = &too_many;
     request.merge_page.?.timestamps = &times;
     request = seal(request);
@@ -687,23 +687,22 @@ test "relational index system merge pages commit effects and cursors with reopen
         base_row.merge_page.?.next = "m";
         base_row = seal(base_row);
         try std.testing.expectError(error.KeyOutOfRange, db.batch(base_row));
-        // Exercise the existing flush path that drops the apply lock after
-        // page admission. The page must restart preparation before committing
-        // its cursor, while the receiver base write remains independent.
-        db.bulk_ingest_coalescer.active = true;
-        {
-            const pending_key = try alloc.dupe(u8, "m");
-            errdefer alloc.free(pending_key);
-            const pending_value = try alloc.dupe(u8, "{\"id\":9,\"doubled\":18}");
-            errdefer alloc.free(pending_value);
-            try db.bulk_ingest_coalescer.entries.append(alloc, .{ .key = pending_key, .value = pending_value, .kind = .write });
-        }
+        // Bulk writes commit directly. Preserve the receiver's base row and
+        // atomically commit the copied row with its merge cursor while bulk
+        // admission is active; reopen must retain both effects.
+        try db.beginPrimaryStoreAutoBulkIngestSession();
+        try apply(&db, &index, .{ .writes = &.{.{ .key = "m", .value = "{\"id\":9,\"doubled\":18}" }} });
         try apply(&db, &index, row);
-        try std.testing.expectEqual(@as(u64, 1), db.bulk_ingest_coalescer.stats.flush_calls.load(.monotonic));
-        try std.testing.expectEqual(@as(usize, 0), db.bulk_ingest_coalescer.entries.items.len);
-        db.bulk_ingest_coalescer.active = false;
+        try db.finishPrimaryStoreAutoBulkIngestSessionWithOptions(.{});
+        try std.testing.expect(!db.bulk_ingest_session.snapshot().active_session);
         db.close();
         db = try db_mod.DB.open(alloc, directory.path(), options);
+        const base_row_after_reopen = (try db.get(alloc, "m")).?;
+        defer alloc.free(base_row_after_reopen);
+        var base_value = try std.json.parseFromSlice(std.json.Value, alloc, base_row_after_reopen, .{});
+        defer base_value.deinit();
+        try std.testing.expectEqual(@as(i64, 9), base_value.value.object.get("id").?.integer);
+        try std.testing.expectEqual(@as(i64, 18), base_value.value.object.get("doubled").?.integer);
         try apply(&db, &index, cleanup); // old cleanup cannot delete copied b
         try apply(&db, &index, row);
         try apply(&db, &index, .{ .merge_checkpoint = checkpoint }); // must not reset cursor

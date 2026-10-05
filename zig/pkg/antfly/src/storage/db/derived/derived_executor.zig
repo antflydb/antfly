@@ -58,6 +58,8 @@ pub const Executor = struct {
         has_workers: *const fn (ptr: *anyopaque) bool,
         fail_if_unhealthy: *const fn (ptr: *anyopaque) anyerror!void,
         add_worker: *const fn (ptr: *anyopaque, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) anyerror!void,
+        pause_worker: *const fn (ptr: *anyopaque, name: []const u8) anyerror!bool,
+        resume_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         remove_worker: *const fn (ptr: *anyopaque, name: []const u8) void,
         applied_sequence: *const fn (ptr: *anyopaque, name: []const u8) ?u64,
         snapshot_stats: *const fn (ptr: *anyopaque) types.DerivedWorkerStats,
@@ -96,6 +98,17 @@ pub const Executor = struct {
 
     pub fn addWorker(self: *Executor, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) !void {
         return try self.vtable.add_worker(self.ptr, name, kind, applied_sequence);
+    }
+
+    /// Drain execution without releasing the registration or replay watermark.
+    /// The structural owner must resume it or remove it after catalog commit.
+    pub fn pauseWorker(self: *Executor, name: []const u8) !bool {
+        return try self.vtable.pause_worker(self.ptr, name);
+    }
+
+    /// Rollback reuses the existing registration and never allocates.
+    pub fn resumeWorker(self: *Executor, name: []const u8) void {
+        self.vtable.resume_worker(self.ptr, name);
     }
 
     pub fn removeWorker(self: *Executor, name: []const u8) void {
@@ -190,6 +203,7 @@ const ManualWorker = struct {
     kind: index_manager_mod.ManagedIndexRef,
     applied_sequence: u64,
     target_sequence: u64,
+    paused: bool = false,
 };
 
 const ManualRuntime = struct {
@@ -206,7 +220,7 @@ const ManualRuntime = struct {
     backlog: backlog_tracker_mod.Tracker,
     workers: std.ArrayListUnmanaged(ManualWorker) = .empty,
 
-    fn deinit(self: *ManualRuntime) void {
+    pub fn deinit(self: *ManualRuntime) void {
         for (self.workers.items) |*worker| {
             self.alloc.free(worker.name);
         }
@@ -232,6 +246,22 @@ const ManualRuntime = struct {
             .target_sequence = applied_sequence,
         });
         self.workers.items[self.workers.items.len - 1].kind.name = self.workers.items[self.workers.items.len - 1].name;
+    }
+
+    fn pauseWorker(self: *ManualRuntime, name: []const u8) !bool {
+        for (self.workers.items) |*worker| {
+            if (!std.mem.eql(u8, worker.name, name)) continue;
+            if (worker.paused) return error.DerivedWorkerAlreadyPaused;
+            worker.paused = true;
+            return true;
+        }
+        return false;
+    }
+
+    fn resumeWorker(self: *ManualRuntime, name: []const u8) void {
+        for (self.workers.items) |*worker| {
+            if (std.mem.eql(u8, worker.name, name)) worker.paused = false;
+        }
     }
 
     fn removeWorker(self: *ManualRuntime, name: []const u8) void {
@@ -358,6 +388,8 @@ const ManualRuntime = struct {
         for (self.workers.items) |*worker| {
             worker.target_sequence = @max(worker.target_sequence, sequence);
             if (worker.target_sequence <= worker.applied_sequence) continue;
+            // Manual execution cannot wait for a structural owner on this same thread.
+            if (worker.paused) return error.DerivedWorkerPaused;
             try wait.check();
 
             const result = try self.catchUpWorker(worker);
@@ -406,6 +438,8 @@ const ManualRuntime = struct {
             if (!indexNameInList(worker.name, index_names)) continue;
             worker.target_sequence = @max(worker.target_sequence, sequence);
             if (worker.target_sequence <= worker.applied_sequence) continue;
+            // Manual execution cannot wait for a structural owner on this same thread.
+            if (worker.paused) return error.DerivedWorkerPaused;
             try wait.check();
 
             const result = try self.catchUpWorker(worker);
@@ -505,6 +539,8 @@ const manual_vtable = Executor.VTable{
     .has_workers = manualHasWorkers,
     .fail_if_unhealthy = manualFailIfUnhealthy,
     .add_worker = manualAddWorker,
+    .pause_worker = manualPauseWorker,
+    .resume_worker = manualResumeWorker,
     .remove_worker = manualRemoveWorker,
     .applied_sequence = manualAppliedSequence,
     .snapshot_stats = manualSnapshotStats,
@@ -542,6 +578,16 @@ fn manualFailIfUnhealthy(ptr: *anyopaque) !void {
 fn manualAddWorker(ptr: *anyopaque, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) !void {
     const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
     return try runtime.addWorker(name, kind, applied_sequence);
+}
+
+fn manualPauseWorker(ptr: *anyopaque, name: []const u8) !bool {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    return try runtime.pauseWorker(name);
+}
+
+fn manualResumeWorker(ptr: *anyopaque, name: []const u8) void {
+    const runtime: *ManualRuntime = @ptrCast(@alignCast(ptr));
+    runtime.resumeWorker(name);
 }
 
 fn manualRemoveWorker(ptr: *anyopaque, name: []const u8) void {
@@ -651,6 +697,8 @@ const io_threaded_vtable = Executor.VTable{
     .has_workers = ioThreadedHasWorkers,
     .fail_if_unhealthy = ioThreadedFailIfUnhealthy,
     .add_worker = ioThreadedAddWorker,
+    .pause_worker = ioThreadedPauseWorker,
+    .resume_worker = ioThreadedResumeWorker,
     .remove_worker = ioThreadedRemoveWorker,
     .applied_sequence = ioThreadedAppliedSequence,
     .snapshot_stats = ioThreadedSnapshotStats,
@@ -691,6 +739,16 @@ fn ioThreadedFailIfUnhealthy(ptr: *anyopaque) !void {
 fn ioThreadedAddWorker(ptr: *anyopaque, name: []const u8, kind: index_manager_mod.ManagedIndexRef, applied_sequence: u64) !void {
     const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
     return try runtime.addWorker(name, kind, applied_sequence);
+}
+
+fn ioThreadedPauseWorker(ptr: *anyopaque, name: []const u8) !bool {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    return try runtime.pauseWorker(name);
+}
+
+fn ioThreadedResumeWorker(ptr: *anyopaque, name: []const u8) void {
+    const runtime: *io_threaded_runtime_mod.DerivedRuntime = @ptrCast(@alignCast(ptr));
+    runtime.resumeWorker(name);
 }
 
 fn ioThreadedRemoveWorker(ptr: *anyopaque, name: []const u8) void {

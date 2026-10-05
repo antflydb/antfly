@@ -55,11 +55,11 @@ pub const TextMemoryAttributionStats = struct {
     text_segment_residency_evictions: u64 = 0,
 
     pub fn accumulate(self: *@This(), other: @This()) void {
-        inline for (@typeInfo(@This()).@"struct".fields) |field| {
-            if (comptime std.mem.eql(u8, field.name, "text_max_segment_bytes")) {
-                @field(self, field.name) = @max(@field(self, field.name), @field(other, field.name));
+        inline for (comptime std.meta.fieldNames(@This())) |reflected_name| {
+            if (comptime std.mem.eql(u8, reflected_name, "text_max_segment_bytes")) {
+                @field(self, reflected_name) = @max(@field(self, reflected_name), @field(other, reflected_name));
             } else {
-                @field(self, field.name) +|= @field(other, field.name);
+                @field(self, reflected_name) +|= @field(other, reflected_name);
             }
         }
     }

@@ -54,7 +54,7 @@ pub const Progress = struct {
         @memcpy(out[0..4], "ACV1");
         std.mem.writeInt(u32, out[4..8], self.schema_version, .little);
         @memcpy(out[8..40], &self.owner);
-        out[40] = @intFromEnum(self.state);
+        out[40] = @backingInt(self.state);
         out[41] = 0;
         std.mem.writeInt(u16, out[42..44], self.failed_check, .little);
         std.mem.writeInt(u64, out[44..52], self.rows_scanned, .little);
@@ -143,7 +143,7 @@ pub const Page = struct {
         var progress = try status(&read, view);
         if (progress.state != .validating) return null;
         const expected = if (try optional(&read, progress_key)) |raw| try page_alloc.dupe(u8, raw) else null;
-        const range = try ranges.decodeRangeAlloc(page_alloc, (try optional(&read, ranges.range_key)) orelse &([_]u8{0} ** 8));
+        const range = try ranges.decodeRangeAlloc(page_alloc, (try optional(&read, ranges.range_key)) orelse &(@as([8]u8, @splat(0))));
         const lower = try internal.documentExactPrefixAlloc(page_alloc, range.start);
         const upper: []const u8 = if (range.end.len != 0) try internal.documentExactPrefixAlloc(page_alloc, range.end) else &.{internal.user_namespace + 1};
         if (progress.cursor.len != 0 and (std.mem.order(u8, progress.cursor, lower) == .lt or std.mem.order(u8, progress.cursor, upper) != .lt)) return error.InvalidConstraintProgress;
@@ -217,7 +217,7 @@ pub const Page = struct {
         return .{ .arena = arena, .view = view, .namespace_generation = namespace_generation, .expected = expected, .next = progress, .failed_hash = failed_hash, .records_examined = inspected };
     }
 
-    /// Caller holds apply-exclusive and snapshot/HA mutation admission.
+    /// Caller holds apply-exclusive and snapshot/hot-standby mutation admission.
     pub fn commit(self: *Page, core: anytype) !void {
         if (self.consumed) return error.ConstraintPageConsumed;
         self.consumed = true;

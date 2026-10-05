@@ -25,7 +25,7 @@ fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const
     });
     run.addFileInput(b.path("../scripts/pyproject.toml"));
     run.addFileInput(b.path("../scripts/uv.lock"));
-    run.addFileArg(b.path(script_path));
+    run.addFileArg2(b.path(script_path), .{ .make_absolute = true });
     run.addArgs(args);
     return run;
 }
@@ -40,7 +40,7 @@ fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run, prefixed: bool)
         run.addFileInput(b.path("../scripts/public_openapi_overlays.py"));
     }
     run.addArg("--depfile");
-    _ = run.addDepFileOutputArg("openapi.d");
+    _ = run.addDepFileOutputArg2("openapi.d", .{ .make_absolute = true });
 }
 
 fn addGeneratedDirectory(
@@ -71,7 +71,7 @@ fn addGeneratedDirectory(
 pub fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
     const check = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{"--compare"});
     addOpenApiJoinInputs(b, check, true);
-    check.addFileArg(b.path("../openapi.yaml"));
+    check.addFileArg2(b.path("../openapi.yaml"), .{ .make_absolute = true });
     return check;
 }
 
@@ -79,14 +79,14 @@ fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
     addOpenApiJoinInputs(b, join, false);
     join.addArg("--output");
-    return join.addOutputFileArg("openapi.public.joined.yaml");
+    return join.addOutputFileArg2("openapi.public.joined.yaml", .{ .make_absolute = true });
 }
 
 fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
     const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
     addOpenApiJoinInputs(b, join, true);
     join.addArg("--output");
-    return join.addOutputFileArg("openapi.public.prefixed.yaml");
+    return join.addOutputFileArg2("openapi.public.prefixed.yaml", .{ .make_absolute = true });
 }
 
 /// Embed source schemas through Zig's ordinary file inputs, independently of
@@ -158,11 +158,11 @@ pub fn addOpenApiSourceSteps(
     openapi_codegen: *std.Build.Step.Compile,
 ) struct { regen: *std.Build.Step.Run, check: *std.Build.Step.Run, public_spec: std.Build.LazyPath } {
     const regen = b.addSystemCommand(&.{"python3"});
-    regen.addFileArg(b.path("tools/sync_generated.py"));
+    regen.addFileArg2(b.path("tools/sync_generated.py"), .{ .make_absolute = true });
     regen.addArg("sync");
     regen.has_side_effects = true;
     const check = b.addSystemCommand(&.{"python3"});
-    check.addFileArg(b.path("tools/sync_generated.py"));
+    check.addFileArg2(b.path("tools/sync_generated.py"), .{ .make_absolute = true });
     check.addArg("check");
     // Always inspect the destination, even when generation is cached. Missing
     // and extra files must be detected without mutating the source tree.
@@ -325,10 +325,10 @@ pub fn addOpenApiSourceSteps(
                 _ = tree.addCopyDirectory(module.directory, module.destination[prefix.len..], .{});
             }
         }
-        regen.addDirectoryArg(tree.getDirectory());
-        regen.addArg(b.pathFromRoot(destination));
-        check.addDirectoryArg(tree.getDirectory());
-        check.addArg(b.pathFromRoot(destination));
+        regen.addDirectoryArg2(tree.getDirectory(), .{ .make_absolute = true });
+        regen.addArg(b.root.joinString(b.allocator, destination) catch @panic("OOM"));
+        check.addDirectoryArg2(tree.getDirectory(), .{ .make_absolute = true });
+        check.addArg(b.root.joinString(b.allocator, destination) catch @panic("OOM"));
     }
     return .{ .regen = regen, .check = check, .public_spec = public_spec };
 }
@@ -339,7 +339,7 @@ pub const CommittedOptions = struct {
     client_root: std.Build.LazyPath,
     server_root: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     httpx: *std.Build.Module,
     json: *std.Build.Module,
     export_modules: bool = false,
@@ -497,6 +497,7 @@ pub fn createCommittedModules(b: *std.Build, options: CommittedOptions) Committe
     inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
     inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
+    common_openapi_mod.addImport("antfly_provider_openapi", provider_openapi_mod);
     common_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
     common_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
     common_openapi_mod.addImport("antfly_middleware_openapi", middleware_openapi_mod);

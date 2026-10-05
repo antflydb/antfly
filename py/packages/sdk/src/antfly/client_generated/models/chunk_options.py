@@ -21,7 +21,10 @@ class ChunkOptions:
     """Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults.
 
     Attributes:
-        max_chunks (int | Unset): Maximum number of chunks to generate per document.
+        max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (the default when omitted)
+            means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks
+            beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially
+            truncated.
         threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0).
         text (TextChunkOptions | Unset): Options specific to text chunking.
         audio (AudioChunkOptions | Unset): Options specific to audio chunking.

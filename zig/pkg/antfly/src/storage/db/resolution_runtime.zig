@@ -25,6 +25,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
@@ -68,7 +69,7 @@ pub const RecordWrite = struct {
     target_hints: ?[]const change_journal_mod.TargetHint = null,
     /// Publish completion metadata only after the writer finishes the primary,
     /// split-delta, and HA handoff. The DB writer batches this metadata while
-    /// it still owns the HA mutation/fencing boundary.
+    /// it still owns the hot-standby mutation/fencing boundary.
     publish_resolution_handoff: bool = false,
 };
 
@@ -534,7 +535,7 @@ const PendingRecordCommit = struct {
     artifact_writes: std.ArrayListUnmanaged(ArtifactWrite) = .empty,
     artifact_deletes: std.ArrayListUnmanaged([]const u8) = .empty,
 
-    fn deinit(self: *PendingRecordCommit, alloc: Allocator) void {
+    pub fn deinit(self: *PendingRecordCommit, alloc: Allocator) void {
         for (self.full_keys.items) |key| alloc.free(@constCast(key));
         for (self.graph_only_keys.items) |key| alloc.free(@constCast(key));
         for (self.artifact_writes.items) |write| alloc.free(@constCast(write.value));
@@ -575,7 +576,7 @@ pub fn reviewOverrideArtifactKeyAlloc(
 const StoreOverrideProvider = struct {
     parsed: std.json.Parsed(std.json.Value),
 
-    fn deinit(self: *StoreOverrideProvider) void {
+    pub fn deinit(self: *StoreOverrideProvider) void {
         self.parsed.deinit();
     }
     fn provider(self: *StoreOverrideProvider) resolver_lib.OverrideProvider {
@@ -631,6 +632,13 @@ pub fn recordReviewDecision(
     try store.put(override_key, bytes);
 }
 
+pub const ReviewDecision = struct {
+    local_id: []const u8,
+    decision: resolver_lib.Decision,
+    table: []const u8,
+    key: []const u8,
+};
+
 pub fn buildReviewDecisionBytesAlloc(
     gpa: std.mem.Allocator,
     existing_raw: ?[]const u8,
@@ -639,43 +647,48 @@ pub fn buildReviewDecisionBytesAlloc(
     table: []const u8,
     key: []const u8,
 ) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(gpa);
-    try out.append(gpa, '{');
-    var first = true;
+    return buildReviewDecisionsBytesAlloc(gpa, existing_raw, &.{.{ .local_id = local_id, .decision = decision, .table = table, .key = key }});
+}
 
-    // Copy existing entries, replacing any for this local_id.
+/// Apply a curation batch in linear expected time. Preserve unrelated entries
+/// while parsing and serializing the override object once, regardless of the
+/// number of mentions redirected by a merge.
+pub fn buildReviewDecisionsBytesAlloc(gpa: std.mem.Allocator, existing_raw: ?[]const u8, decisions: []const ReviewDecision) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var object: std.json.ObjectMap = .empty;
     if (existing_raw) |raw| {
-        if (std.json.parseFromSlice(std.json.Value, gpa, raw, .{})) |parsed| {
-            var p = parsed;
-            defer p.deinit();
-            if (p.value == .object) {
-                var it = p.value.object.iterator();
-                while (it.next()) |e| {
-                    if (std.mem.eql(u8, e.key_ptr.*, local_id)) continue;
-                    const v_str = try std.json.Stringify.valueAlloc(gpa, e.value_ptr.*, .{});
-                    defer gpa.free(v_str);
-                    const kv = try std.fmt.allocPrint(gpa, "{f}:{s}", .{ std.json.fmt(e.key_ptr.*, .{}), v_str });
-                    defer gpa.free(kv);
-                    if (!first) try out.append(gpa, ',');
-                    first = false;
-                    try out.appendSlice(gpa, kv);
-                }
-            }
-        } else |_| {}
+        if (std.json.parseFromSlice(std.json.Value, scratch, raw, .{})) |parsed| {
+            if (parsed.value == .object) object = parsed.value.object;
+        } else |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => {},
+        }
     }
+    for (decisions) |update| {
+        var value: std.json.ObjectMap = .empty;
+        try value.put(scratch, "decision", .{ .string = @tagName(update.decision) });
+        try value.put(scratch, "table", .{ .string = update.table });
+        try value.put(scratch, "key", .{ .string = update.key });
+        try object.put(scratch, update.local_id, .{ .object = value });
+    }
+    return std.json.Stringify.valueAlloc(gpa, std.json.Value{ .object = object }, .{});
+}
 
-    if (!first) try out.append(gpa, ',');
-    const entry = try std.fmt.allocPrint(gpa, "{f}:{{\"decision\":\"{s}\",\"table\":{f},\"key\":{f}}}", .{
-        std.json.fmt(local_id, .{}),
-        @tagName(decision),
-        std.json.fmt(table, .{}),
-        std.json.fmt(key, .{}),
+test "batched review decisions preserve unrelated overrides and escaped identities" {
+    const alloc = testing.allocator;
+    const raw = try buildReviewDecisionsBytesAlloc(alloc, "{\"keep\":{\"decision\":\"reject\"},\"replace\":{\"decision\":\"reject\"}}", &.{
+        .{ .local_id = "replace", .decision = .match, .table = "entities", .key = "survivor" },
+        .{ .local_id = "quoted\"id", .decision = .match, .table = "entities", .key = "survivor" },
     });
-    defer gpa.free(entry);
-    try out.appendSlice(gpa, entry);
-    try out.append(gpa, '}');
-    return try out.toOwnedSlice(gpa);
+    defer alloc.free(raw);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 3), parsed.value.object.count());
+    try testing.expectEqualStrings("reject", parsed.value.object.get("keep").?.object.get("decision").?.string);
+    try testing.expectEqualStrings("survivor", parsed.value.object.get("replace").?.object.get("key").?.string);
+    try testing.expectEqualStrings("survivor", parsed.value.object.get("quoted\"id").?.object.get("key").?.string);
 }
 
 /// Adapts the storage `DenseEmbedder` to the resolver's `MentionEmbedder` seam,
@@ -2412,7 +2425,7 @@ const MapStore = struct {
     alloc: std.mem.Allocator,
     map: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *MapStore) void {
+    pub fn deinit(self: *MapStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -2673,7 +2686,7 @@ const FakeStore = struct {
     alloc: std.mem.Allocator,
     map: std.StringHashMapUnmanaged([]u8) = .empty,
 
-    fn deinit(self: *FakeStore) void {
+    pub fn deinit(self: *FakeStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -2796,7 +2809,7 @@ const CaptureWriter = struct {
     graph_only_calls: u64 = 0,
     handoff_calls: u64 = 0,
 
-    fn deinit(self: *CaptureWriter) void {
+    pub fn deinit(self: *CaptureWriter) void {
         for (self.keys.items) |k| self.alloc.free(k);
         self.keys.deinit(self.alloc);
     }
@@ -3191,7 +3204,7 @@ const FakeSource = struct {
         return .{ .matched_entries = matched, .last_sequence = last };
     }
 
-    fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
+    pub fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
         return error.Unsupported;
     }
     fn latest(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!u64 {
@@ -3952,7 +3965,7 @@ const FakeCandidateSource = struct {
     last_ann_k: usize = 0,
     last_scan_limit: usize = 0,
 
-    fn deinit(self: *FakeCandidateSource) void {
+    pub fn deinit(self: *FakeCandidateSource) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -4329,7 +4342,7 @@ test "SourceCandidateProvider shares prefix scans and negatively caches redirect
     var resolver = try resolver_lib.Resolver.initFromParts(alloc, "entities", "{{ lower _entity.label }}/{{ slug _entity.text }}", .{}, false, "");
     defer resolver.deinit();
     var provider = SourceCandidateProvider{ .source = .{ .ptr = &fake, .vtable = &.{ .get = Fake.get, .get_many = Fake.getMany, .scan_prefix = Fake.scan } }, .resolver = &resolver, .table = "entities", .mode = .prefix, .ann_index_name = "", .candidate_limit = 2 };
-    const entities = [_]resolver_lib.ExtractedEntity{.{ .local_id = "one", .label = "person", .text = "Ada" }} ** 100;
+    const entities = @as([100]resolver_lib.ExtractedEntity, @splat(.{ .local_id = "one", .label = "person", .text = "Ada" }));
     var lists: [100][]const resolver_lib.Candidate = undefined;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();

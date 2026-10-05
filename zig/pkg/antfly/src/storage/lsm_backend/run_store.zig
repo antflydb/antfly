@@ -377,7 +377,7 @@ pub const Store = struct {
 };
 
 test "writer owner narrow publication scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const allocator = std.heap.smp_allocator;
     const clock = @import("antfly_platform").time;
     for ([_]usize{ 1000, 10000, 100000 }) |count_runs| {

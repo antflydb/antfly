@@ -28,7 +28,7 @@ pub const Budget = struct { records: usize = 256, bytes: usize = 2 * 1024 * 1024
 fn namespacePrefix(kind: integrity.Kind) [integrity.namespace.len + 1]u8 {
     var result: [integrity.namespace.len + 1]u8 = undefined;
     @memcpy(result[0..integrity.namespace.len], integrity.namespace);
-    result[integrity.namespace.len] = @intFromEnum(kind);
+    result[integrity.namespace.len] = @backingInt(kind);
     return result;
 }
 
@@ -145,8 +145,8 @@ test "relational integrity range transfer follows logical claim routing and pres
     try copyToUnpublished(alloc, null, &source, &destination, &lower, "");
     const after = source_backend.snapshotMaintenanceStats();
     try std.testing.expectEqual(
-        before.mutable_snapshot_clone_by_reason[@intFromEnum(lsm.MutableSnapshotReason.bound_read_txn)].calls,
-        after.mutable_snapshot_clone_by_reason[@intFromEnum(lsm.MutableSnapshotReason.bound_read_txn)].calls,
+        before.mutable_snapshot_clone_by_reason[@backingInt(lsm.MutableSnapshotReason.bound_read_txn)].calls,
+        after.mutable_snapshot_clone_by_reason[@backingInt(lsm.MutableSnapshotReason.bound_read_txn)].calls,
     );
     var read = try destination.beginReadTxn();
     defer read.abort();

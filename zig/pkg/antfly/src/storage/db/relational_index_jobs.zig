@@ -34,7 +34,7 @@ const Digest = [32]u8;
 pub const progress_prefix = "\x00\x00__metadata__:relational_index_progress:";
 const header_len = 140;
 const max_cursor_bytes = @import("relational_index_limits.zig").max_cursor_key_bytes;
-const full_range = [_]u8{0} ** 8;
+const full_range = @as([8]u8, @splat(0));
 
 fn digest(bytes: []const u8) Digest {
     var result: Digest = undefined;
@@ -94,9 +94,9 @@ pub const Progress = struct {
         @memcpy(out[8..20], &self.id.encode());
         @memcpy(out[20..52], &self.owner);
         @memcpy(out[52..84], &self.comparison);
-        out[84] = @intFromEnum(self.state);
-        out[85] = @intFromEnum(self.failure);
-        out[86] = @intFromEnum(self.phase);
+        out[84] = @backingInt(self.state);
+        out[85] = @backingInt(self.failure);
+        out[86] = @backingInt(self.phase);
         out[87] = 0;
         std.mem.writeInt(u64, out[88..96], self.rows_scanned, .little);
         std.mem.writeInt(u32, out[96..100], @intCast(self.cursor.len), .little);
@@ -227,7 +227,7 @@ pub const Budget = struct {
     bytes: usize = 1024 * 1024,
     time_ns: u64 = 5 * std.time.ns_per_ms,
 
-    fn validate(self: Budget) !void {
+    pub fn validate(self: Budget) !void {
         if (self.records == 0 or self.records > 4096 or self.bytes == 0 or self.bytes > 16 * 1024 * 1024 or
             self.time_ns == 0 or self.time_ns > std.time.ns_per_s) return error.InvalidRelationalIndexBudget;
     }

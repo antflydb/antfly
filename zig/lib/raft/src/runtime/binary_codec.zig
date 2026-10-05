@@ -160,7 +160,7 @@ pub const BinaryCodec = struct {
     fn encodeMessage(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), msg: core.Message) !void {
         if (msg.responses.len != 0) return error.UnsupportedMessageResponses;
 
-        try out.append(alloc, @intFromEnum(msg.msg_type));
+        try out.append(alloc, @backingInt(msg.msg_type));
         try appendInt(u64, alloc, out, msg.from);
         try appendInt(u64, alloc, out, msg.to);
         try appendInt(u64, alloc, out, msg.term);
@@ -181,7 +181,7 @@ pub const BinaryCodec = struct {
     fn encodeMessageFixed(out: []u8, cursor: *usize, msg: core.Message) !void {
         if (msg.responses.len != 0) return error.UnsupportedMessageResponses;
 
-        appendFixedByte(out, cursor, @intFromEnum(msg.msg_type));
+        appendFixedByte(out, cursor, @backingInt(msg.msg_type));
         appendFixedInt(u64, out, cursor, msg.from);
         appendFixedInt(u64, out, cursor, msg.to);
         appendFixedInt(u64, out, cursor, msg.term);
@@ -252,14 +252,14 @@ pub const BinaryCodec = struct {
     fn encodeEntry(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), entry: core.Entry) !void {
         try appendInt(u64, alloc, out, entry.term);
         try appendInt(u64, alloc, out, entry.index);
-        try out.append(alloc, @intFromEnum(entry.entry_type));
+        try out.append(alloc, @backingInt(entry.entry_type));
         try appendBytes(alloc, out, entry.data);
     }
 
     fn encodeEntryFixed(out: []u8, cursor: *usize, entry: core.Entry) void {
         appendFixedInt(u64, out, cursor, entry.term);
         appendFixedInt(u64, out, cursor, entry.index);
-        appendFixedByte(out, cursor, @intFromEnum(entry.entry_type));
+        appendFixedByte(out, cursor, @backingInt(entry.entry_type));
         appendFixedBytesLen(out, cursor, entry.data);
     }
 
@@ -332,35 +332,35 @@ pub const BinaryCodec = struct {
 
     fn decodeMessageType(tag: u8) ?core.message.MessageType {
         return switch (tag) {
-            @intFromEnum(core.message.MessageType.propose) => .propose,
-            @intFromEnum(core.message.MessageType.pre_vote) => .pre_vote,
-            @intFromEnum(core.message.MessageType.pre_vote_response) => .pre_vote_response,
-            @intFromEnum(core.message.MessageType.request_vote) => .request_vote,
-            @intFromEnum(core.message.MessageType.request_vote_response) => .request_vote_response,
-            @intFromEnum(core.message.MessageType.append_entries) => .append_entries,
-            @intFromEnum(core.message.MessageType.append_entries_response) => .append_entries_response,
-            @intFromEnum(core.message.MessageType.heartbeat) => .heartbeat,
-            @intFromEnum(core.message.MessageType.heartbeat_response) => .heartbeat_response,
-            @intFromEnum(core.message.MessageType.snapshot) => .snapshot,
-            @intFromEnum(core.message.MessageType.snapshot_response) => .snapshot_response,
-            @intFromEnum(core.message.MessageType.transfer_leader) => .transfer_leader,
-            @intFromEnum(core.message.MessageType.forget_leader) => .forget_leader,
-            @intFromEnum(core.message.MessageType.timeout_now) => .timeout_now,
-            @intFromEnum(core.message.MessageType.read_index) => .read_index,
-            @intFromEnum(core.message.MessageType.read_index_response) => .read_index_response,
-            @intFromEnum(core.message.MessageType.storage_append) => .storage_append,
-            @intFromEnum(core.message.MessageType.storage_append_response) => .storage_append_response,
-            @intFromEnum(core.message.MessageType.storage_apply) => .storage_apply,
-            @intFromEnum(core.message.MessageType.storage_apply_response) => .storage_apply_response,
+            @backingInt(core.message.MessageType.propose) => .propose,
+            @backingInt(core.message.MessageType.pre_vote) => .pre_vote,
+            @backingInt(core.message.MessageType.pre_vote_response) => .pre_vote_response,
+            @backingInt(core.message.MessageType.request_vote) => .request_vote,
+            @backingInt(core.message.MessageType.request_vote_response) => .request_vote_response,
+            @backingInt(core.message.MessageType.append_entries) => .append_entries,
+            @backingInt(core.message.MessageType.append_entries_response) => .append_entries_response,
+            @backingInt(core.message.MessageType.heartbeat) => .heartbeat,
+            @backingInt(core.message.MessageType.heartbeat_response) => .heartbeat_response,
+            @backingInt(core.message.MessageType.snapshot) => .snapshot,
+            @backingInt(core.message.MessageType.snapshot_response) => .snapshot_response,
+            @backingInt(core.message.MessageType.transfer_leader) => .transfer_leader,
+            @backingInt(core.message.MessageType.forget_leader) => .forget_leader,
+            @backingInt(core.message.MessageType.timeout_now) => .timeout_now,
+            @backingInt(core.message.MessageType.read_index) => .read_index,
+            @backingInt(core.message.MessageType.read_index_response) => .read_index_response,
+            @backingInt(core.message.MessageType.storage_append) => .storage_append,
+            @backingInt(core.message.MessageType.storage_append_response) => .storage_append_response,
+            @backingInt(core.message.MessageType.storage_apply) => .storage_apply,
+            @backingInt(core.message.MessageType.storage_apply_response) => .storage_apply_response,
             else => null,
         };
     }
 
     fn decodeEntryType(tag: u8) ?core.types.EntryType {
         return switch (tag) {
-            @intFromEnum(core.types.EntryType.normal) => .normal,
-            @intFromEnum(core.types.EntryType.conf_change) => .conf_change,
-            @intFromEnum(core.types.EntryType.conf_change_v2) => .conf_change_v2,
+            @backingInt(core.types.EntryType.normal) => .normal,
+            @backingInt(core.types.EntryType.conf_change) => .conf_change,
+            @backingInt(core.types.EntryType.conf_change_v2) => .conf_change_v2,
             else => null,
         };
     }

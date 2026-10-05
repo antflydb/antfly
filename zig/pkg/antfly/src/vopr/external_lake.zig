@@ -105,7 +105,7 @@ pub const Scenario = struct {
             return bytes;
         }
 
-        fn read(self: *@This(), object_version: []const u8) ![]u8 {
+        pub fn read(self: *@This(), object_version: []const u8) ![]u8 {
             const object = range_io.ObjectRef{
                 .bucket = "bucket",
                 .key = "table/data.parquet",

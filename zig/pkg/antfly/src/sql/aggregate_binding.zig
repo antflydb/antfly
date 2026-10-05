@@ -22,11 +22,12 @@ pub const Bound = struct {
     names: []const []const u8,
     having: ?scalar.Program,
     orders: []const scalar.Program,
+    order_outputs: []const ?usize = &.{},
 };
 
 pub fn aggregateKind(name: []const u8) ?operators.Aggregate.Kind {
     if (std.mem.eql(u8, name, "$pattern_set")) return .pattern_set;
-    inline for (std.meta.fields(operators.Aggregate.Kind)) |field| if (std.mem.eql(u8, name, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(operators.Aggregate.Kind).@"enum".field_names, @typeInfo(operators.Aggregate.Kind).@"enum".field_values) |reflected_name, field_value| if (std.mem.eql(u8, name, reflected_name)) return @fromBackingInt(field_value);
     return null;
 }
 pub fn contains(node: *const ast.Scalar) bool {
@@ -296,6 +297,14 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, .{}, settings);
         name.* = try alloc.dupe(u8, projection.alias orelse if (projection.field.len != 0) projection.field else if (projection.expression.?.* == .call) projection.expression.?.call.name else "?column?");
     }
+    const order_outputs = try alloc.alloc(?usize, order_nodes.len);
+    for (order_nodes, order_outputs) |node, *slot_| {
+        slot_.* = null;
+        for (outputs, 0..) |output, index| if (same(node, output)) {
+            slot_.* = index;
+            break;
+        };
+    }
     const orders = try alloc.alloc(scalar.Program, order_nodes.len);
     for (order_nodes, orders) |node, *program| program.* = try scalar.bindWithSettings(alloc, node, columns, parameters, .{}, settings);
     const having_program = if (having) |node| try scalar.bindExpectedWithSettings(alloc, node, columns, parameters, .boolean, .{}, settings) else null;
@@ -304,7 +313,7 @@ pub fn bindWithSettings(alloc: Allocator, table: ?catalog.Table, statement: ast.
         const kind = input.projections[index].?.output_type.kind;
         if (kind != null and kind != .boolean) return error.SqlTypeMismatch;
     };
-    return .{ .input = input, .group_count = groups.len, .specs = specs, .inputs = try builder.inputs.toOwnedSlice(alloc), .filters = try builder.filters.toOwnedSlice(alloc), .outputs = programs, .names = names, .having = having_program, .orders = orders };
+    return .{ .input = input, .group_count = groups.len, .specs = specs, .inputs = try builder.inputs.toOwnedSlice(alloc), .filters = try builder.filters.toOwnedSlice(alloc), .outputs = programs, .names = names, .having = having_program, .orders = orders, .order_outputs = order_outputs };
 }
 
 test "aggregate binding separates row input from grouped expressions and deduplicates aggregates" {

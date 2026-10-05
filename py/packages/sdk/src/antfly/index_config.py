@@ -167,6 +167,7 @@ class GraphNodeMapping:
 
     model: GraphNodeModel = "document"
     target: str | int | float | None = None
+    source: str | int | float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +177,7 @@ class GraphEdgeMapping:
     type: str | int | float | None = None
     weight: str | int | float | None = None
     metadata: Mapping[str, Any] | None = None
+    edge_id: str | int | float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,13 +213,19 @@ def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
         if source.nodes is not None and source.nodes.model not in ("document", "external"):
             raise ValueError(f"sources[{index}].nodes.model is invalid")
         if source.nodes is not None:
-            target = source.nodes.target
-            if target is not None and (isinstance(target, bool) or not isinstance(target, (str, int, float))):
-                raise ValueError(f"sources[{index}].nodes.target must be a string or number")
-            if isinstance(target, (int, float)) and not isinstance(target, bool) and not isfinite(target):
-                raise ValueError(f"sources[{index}].nodes.target must be finite")
+            for field_name, value in (("target", source.nodes.target), ("source", source.nodes.source)):
+                if value is not None and (isinstance(value, bool) or not isinstance(value, (str, int, float))):
+                    raise ValueError(f"sources[{index}].nodes.{field_name} must be a string or number")
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and not isfinite(value):
+                    raise ValueError(f"sources[{index}].nodes.{field_name} must be finite")
+            if source.nodes.source is not None and (source.edge is None or source.edge.edge_id is None):
+                raise ValueError(f"sources[{index}].nodes.source requires edge.edge_id")
         if source.edge is not None:
-            for field_name, value in (("type", source.edge.type), ("weight", source.edge.weight)):
+            for field_name, value in (
+                ("type", source.edge.type),
+                ("weight", source.edge.weight),
+                ("edge_id", source.edge.edge_id),
+            ):
                 if value is not None and (isinstance(value, bool) or not isinstance(value, (str, int, float))):
                     raise ValueError(f"sources[{index}].edge.{field_name} must be a string or number")
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and not isfinite(value):
@@ -242,6 +250,7 @@ def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
                 for key, value in {
                     "model": source.nodes.model,
                     "target": source.nodes.target,
+                    "source": source.nodes.source,
                 }.items()
                 if value is not None
             }
@@ -250,6 +259,7 @@ def graph_index_sources(*sources: GraphArtifactSource) -> list[dict[str, Any]]:
                 key: value
                 for key, value in {
                     "type": source.edge.type,
+                    "edge_id": source.edge.edge_id,
                     "weight": source.edge.weight,
                     "metadata": (
                         _clone_json_value(source.edge.metadata, f"sources[{index}].edge.metadata")

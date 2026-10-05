@@ -37,14 +37,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     cli.fatal("unknown tablespace subcommand: {s}", .{subcommand});
 }
 
-fn listTablespaces(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
+pub fn listTablespaces(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
     var resp = try client.inner.listTablespaces();
     defer resp.deinit();
     if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
     if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
 }
 
-fn getTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn getTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const tablespace_name = nextNameArg(args, "tablespace name is required");
     var resp = try client.inner.getTablespace(tablespace_name);
     defer resp.deinit();
@@ -52,7 +52,7 @@ fn getTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     if (resp.data) |parsed| try cli.writeJson(allocator, io, parsed.value);
 }
 
-fn createTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn createTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var parsed = parseCreateArgs(allocator, args);
     defer parsed.deinit(allocator);
     const tablespace_name = parsed.tablespace_name orelse cli.fatal("tablespace name is required", .{});
@@ -66,7 +66,7 @@ fn createTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_cl
     if (resp.data) |data| try cli.writeJson(allocator, io, data.value);
 }
 
-fn dropTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn dropTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const tablespace_name = nextNameArg(args, "tablespace name is required");
     var resp = try client.inner.dropTablespace(tablespace_name);
     defer resp.deinit();
@@ -79,7 +79,7 @@ const CreateArgs = struct {
     location_json: ?[]const u8 = null,
     placement_policy_json: ?[]const u8 = null,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.location_json) |value| alloc.free(value);
         if (self.placement_policy_json) |value| alloc.free(value);
     }

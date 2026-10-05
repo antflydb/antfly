@@ -58,7 +58,7 @@ const Options = struct {
     graph_runtime_strategy: ?graph_runtime.Strategy = null,
     print_timing: bool = false,
 
-    fn deinit(self: *Options, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *Options, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
         self.image_paths.deinit(allocator);
         self.audio_paths.deinit(allocator);

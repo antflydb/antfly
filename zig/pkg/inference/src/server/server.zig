@@ -93,6 +93,7 @@ const ops = @import("../ops/ops.zig");
 const runtime = @import("../runtime/root.zig");
 const tabular_mod = @import("../tabular/root.zig");
 const c_file = @import("../util/c_file.zig");
+const ascii_compat = @import("../util/ascii_compat.zig");
 const a4b_prepared_pack = @import("../ops/cuda/a4b_prepared_pack.zig");
 const native_backend_choice = @import("../native_backend_choice.zig");
 const pjrt_lib = if (build_options.enable_pjrt) @import("pjrt") else struct {
@@ -828,8 +829,8 @@ fn gemma4MtpAssistantSiblingPath(
     const suffix = "-gguf";
     if (!std.mem.endsWith(u8, model_path, suffix)) return null;
     const base_name = std.fs.path.basename(model_path);
-    if (std.ascii.indexOfIgnoreCase(base_name, "gemma-4-") == null) return null;
-    if (std.ascii.indexOfIgnoreCase(base_name, "-qat-") == null) return null;
+    if (ascii_compat.indexOfIgnoreCase(base_name, "gemma-4-") == null) return null;
+    if (ascii_compat.indexOfIgnoreCase(base_name, "-qat-") == null) return null;
     const sibling = std.fmt.allocPrint(
         allocator,
         "{s}-unquantized-assistant",
@@ -2125,7 +2126,7 @@ fn allocCompletionId(allocator: std.mem.Allocator) ![]u8 {
     const value = std.mem.readInt(u64, &bytes, .little);
     var scratch: [16]u8 = undefined;
     const rendered = try std.fmt.bufPrint(&scratch, "{x}", .{value});
-    var padded = [_]u8{'0'} ** 16;
+    var padded = @as([16]u8, @splat('0'));
     @memcpy(padded[padded.len - rendered.len ..], rendered);
     return std.fmt.allocPrint(allocator, "chatcmpl-{s}", .{padded[0..]});
 }
@@ -2497,7 +2498,7 @@ const OnnxDependencies = struct {
     paths: std.ArrayListUnmanaged([]u8) = .empty,
     valid: bool = true,
 
-    fn deinit(self: *OnnxDependencies, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *OnnxDependencies, allocator: std.mem.Allocator) void {
         for (self.paths.items) |path| allocator.free(path);
         self.paths.deinit(allocator);
         self.* = .{};
@@ -2704,9 +2705,9 @@ fn addCompatibilityManifestFacts(
     signature: *std.crypto.hash.sha2.Sha256,
     man: *const manifest_mod.ModelManifest,
 ) void {
-    const model_type: u8 = @intFromEnum(man.model_type);
-    const model_type_origin: u8 = @intFromEnum(man.model_type_origin);
-    const native_arch_hint: u8 = @intFromEnum(man.native_arch_hint);
+    const model_type: u8 = @backingInt(man.model_type);
+    const model_type_origin: u8 = @backingInt(man.model_type_origin);
+    const native_arch_hint: u8 = @backingInt(man.native_arch_hint);
     signature.update(&.{ model_type, model_type_origin, native_arch_hint });
     updateCompatibilitySignatureSlice(signature, man.config_model_arch);
     updateCompatibilitySignatureSlice(signature, man.gliner_model_type);
@@ -3193,7 +3194,7 @@ const DiscoveredModelListing = struct {
     /// Compatibility derived from the artifact and available runtime paths.
     compatibility_level: []const u8,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.manifest.deinit();
         self.* = undefined;
     }
@@ -4156,7 +4157,7 @@ pub const Node = struct {
     pub fn attachIo(self: *Node, io: std.Io) !void {
         if (self.hard_cancellation_watchdog) |watchdog| try watchdog.start(io);
         self.session_manager.io = io;
-        self.model_manager.attachIo(io);
+        try self.model_manager.attachIo(io);
     }
 
     /// Select the executor for direct model-family work. Production nodes
@@ -6488,7 +6489,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(if (scoring) []f32 else []gliner_mod.Entity, row, @enumFromInt(@intFromEnum(observation.execution(items.len))));
+            item.slot.setValue(if (scoring) []f32 else []gliner_mod.Entity, row, @fromBackingInt(@backingInt(observation.execution(items.len))));
         }
     }
 
@@ -6566,7 +6567,7 @@ pub const Node = struct {
             .generation = @intFromPtr(model),
             .task = .embed,
             .schema = instruction orelse "",
-            .option_key = @as(u64, @intFromEnum(task_type)) * 2 + @intFromBool(instruction != null),
+            .option_key = @as(u64, @backingInt(task_type)) * 2 + @intFromBool(instruction != null),
             .transform = if (sparse) "text-sparse" else "text-dense",
             .resource_class = executorMicrobatchResourceClass(model.session.backend()),
         }, .{
@@ -6611,7 +6612,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue(DirectSparseEmbedding, row, @enumFromInt(@intFromEnum(observation.execution(items.len))));
+            item.slot.setValue(DirectSparseEmbedding, row, @fromBackingInt(@backingInt(observation.execution(items.len))));
         }
     }
 
@@ -6646,7 +6647,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, vector, @enumFromInt(@intFromEnum(observation.execution(items.len))));
+            item.slot.setValue([]f32, vector, @fromBackingInt(@backingInt(observation.execution(items.len))));
         }
     }
 
@@ -6733,7 +6734,7 @@ pub const Node = struct {
                 item.slot.fail(err);
                 continue;
             };
-            item.slot.setValue([]f32, row, @enumFromInt(@intFromEnum(batch.execution)));
+            item.slot.setValue([]f32, row, @fromBackingInt(@backingInt(batch.execution)));
         }
     }
 
@@ -6798,7 +6799,7 @@ pub const Node = struct {
             []f32,
             io,
             shared,
-            .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .embed, .schema = instruction orelse "", .option_key = @as(u64, @intFromEnum(task_type)) * 2 + @intFromBool(instruction != null), .transform = if (raw) "rgba8" else "encoded-image", .resource_class = executorMicrobatchResourceClass(model.session.backend()) },
+            .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .embed, .schema = instruction orelse "", .option_key = @as(u64, @backingInt(task_type)) * 2 + @intFromBool(instruction != null), .transform = if (raw) "rgba8" else "encoded-image", .resource_class = executorMicrobatchResourceClass(model.session.backend()) },
             .{ .mode = .native, .preferred_items = contract.batch.preferred_items, .max_items = contract.batch.max_items, .max_bytes = if (raw) std.math.maxInt(usize) else contract.batch.max_encoded_media_bytes, .max_pixels = contract.batch.max_decoded_pixels orelse std.math.maxInt(u64), .max_wait_us = self.config.executor_microbatch_max_wait_us },
             shapes,
             identities,
@@ -7056,7 +7057,7 @@ pub const Node = struct {
         prompt_tokens: usize,
         completion_tokens: usize,
 
-        fn deinit(self: *Qwen3VlReadResult, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Qwen3VlReadResult, allocator: std.mem.Allocator) void {
             allocator.free(self.text);
             self.* = undefined;
         }
@@ -10001,7 +10002,7 @@ pub const Node = struct {
             return null;
         }
 
-        const dir_z = self.allocator.dupeZ(u8, dir_path) catch return null;
+        const dir_z = self.allocator.dupeSentinel(u8, dir_path, 0) catch return null;
         defer self.allocator.free(dir_z);
 
         const cc = c_file.c;
@@ -10046,7 +10047,7 @@ pub const Node = struct {
             return null;
         }
 
-        const dir_z = self.allocator.dupeZ(u8, self.config.models_dir) catch return null;
+        const dir_z = self.allocator.dupeSentinel(u8, self.config.models_dir, 0) catch return null;
         defer self.allocator.free(dir_z);
 
         const cc = c_file.c;
@@ -10378,7 +10379,7 @@ pub const Node = struct {
         prompt_token_limit: usize,
         media_admission: generation.NativeGenerationMediaAdmission,
 
-        fn deinit(self: *NativePromptEstimate) void {
+        pub fn deinit(self: *NativePromptEstimate) void {
             self.allocator.free(self.prompt);
             self.encoded.deinit();
         }
@@ -10998,8 +10999,10 @@ pub const Node = struct {
             };
         }
 
+        // Report usage in the tokens `target_tokens` is measured in; a
+        // whitespace word count undercounts unspaced scripts such as CJK.
         const prompt_tokens = switch (input.value) {
-            .text => |text| estimateTextTokens(text),
+            .text => |text| lib_chunker.fixed_text.countTextTokens(ctx.allocator, text) catch estimateTextTokens(text),
             .binary => 0,
         };
 
@@ -13061,7 +13064,7 @@ pub const Node = struct {
         audio_slices: [][]const []const u8 = &.{},
         content_parts: [][]const generation.Message.ContentPart = &.{},
 
-        fn deinit(self: *OwnedGenerateMessages) void {
+        pub fn deinit(self: *OwnedGenerateMessages) void {
             for (self.messages) |msg| {
                 self.allocator.free(msg.content);
                 if (msg.tool_calls) |calls| self.allocator.free(calls);
@@ -13802,7 +13805,7 @@ pub const Node = struct {
         manifest: manifest_mod.ModelManifest,
         executor_contract: ResolvedInferenceExecutorContract,
 
-        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             allocator.free(self.requested_model);
             allocator.free(self.model_path);
             self.manifest.deinit();
@@ -13862,7 +13865,7 @@ pub const Node = struct {
             return if (self.owns_outer_lock) null else self.mutex;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (!self.owns_outer_lock) return;
             self.mutex.unlock();
             self.owns_outer_lock = false;
@@ -15115,7 +15118,7 @@ pub const Node = struct {
         images: [][]const u8,
         image_owned: []bool,
 
-        fn deinit(self: *ParsedMultimodalRerankDocument) void {
+        pub fn deinit(self: *ParsedMultimodalRerankDocument) void {
             self.allocator.free(self.text);
             self.allocator.free(self.qwen_content);
             for (self.images, self.image_owned) |img, owned| if (owned) self.allocator.free(img);
@@ -17439,7 +17442,7 @@ pub const Node = struct {
         prompt_cache: ?*const whisper_prompt_mod.PromptCache = null,
         prompt_scratch: [3]whisper_prompt_mod.ForcedDecoderId = undefined,
 
-        fn deinit(self: *WhisperRuntime) void {
+        pub fn deinit(self: *WhisperRuntime) void {
             if (self.composite_handle) |*handle| handle.release();
             self.composite_handle = null;
             if (self.model_handle) |*handle| handle.release();
@@ -17662,7 +17665,7 @@ pub const Node = struct {
         segments: []api.DictationSegment,
         words: []api.DictationWord,
 
-        fn deinit(self: *ApiSegments, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *ApiSegments, allocator: std.mem.Allocator) void {
             allocator.free(self.segments);
             allocator.free(self.words);
         }
@@ -18532,7 +18535,7 @@ pub const Node = struct {
         events: []api.TranscriptionEvent,
         words: []api.DictationWord,
 
-        fn deinit(self: *ApiEvents, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *ApiEvents, allocator: std.mem.Allocator) void {
             allocator.free(self.events);
             allocator.free(self.words);
         }
@@ -20210,7 +20213,7 @@ const DirectExtractionOptions = struct {
     prompt: ?[]u8 = null,
     max_tokens: ?usize = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.prompt) |prompt| self.allocator.free(prompt);
         self.* = undefined;
     }
@@ -20241,7 +20244,7 @@ const DirectExtractionInputs = struct {
     prompt: ?[]u8 = null,
     max_tokens: ?usize = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.texts.items) |text| self.allocator.free(@constCast(text));
         self.texts.deinit(self.allocator);
         self.images.deinit(self.allocator);
@@ -20273,7 +20276,7 @@ fn directExtractionMediaShape(
 
 fn validateDirectExtractionRequest(request: extracting_api.Request) !void {
     try validateExtractionCardinality(request.inputs.len);
-    var attachment_counts = [_]usize{0} ** max_serial_family_batch_items;
+    var attachment_counts = @as([max_serial_family_batch_items]usize, @splat(0));
     for (request.attachments) |attachment| {
         if (attachment.input_index >= request.inputs.len or attachment.bytes.len == 0)
             return error.InvalidExtractionAttachment;
@@ -20634,7 +20637,7 @@ const ExtractionPreflightMemory = struct {
         return .{ .lease = lease, .bounded = .{ .backing = std.heap.smp_allocator, .limit = bytes } };
     }
 
-    fn deinit(self: *ExtractionPreflightMemory) void {
+    pub fn deinit(self: *ExtractionPreflightMemory) void {
         std.debug.assert(self.bounded.live == 0);
         self.lease.release();
     }
@@ -20643,7 +20646,7 @@ const ExtractionPreflightMemory = struct {
         return self.allocation_failure.translate(err);
     }
 
-    fn version(self: *ExtractionPreflightMemory, bytes: []const u8, max_request_bytes: usize) !u32 {
+    pub fn version(self: *ExtractionPreflightMemory, bytes: []const u8, max_request_bytes: usize) !u32 {
         self.allocation_failure.clear();
         return extraction_v2.versionJson(self.allocation_failure.allocator(&self.bounded), bytes, .{ .max_request_bytes = max_request_bytes }) catch |err|
             return self.translate(err);
@@ -20861,6 +20864,25 @@ test "gliner boundary v2 direct cancellation and HTTP capacity use existing admi
     try std.testing.expectEqual(@as(i64, 0), node.metrics.extraction_v2.active.impl.value);
 }
 
+test "node attachment propagates model eviction scheduling failure" {
+    var unavailable_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .nothing,
+    });
+    defer unavailable_io.deinit();
+    var available_io = std.Io.Threaded.init(std.testing.allocator, .{
+        .async_limit = .nothing,
+        .concurrent_limit = .limited(1),
+    });
+    defer available_io.deinit();
+    var node = try Node.init(std.testing.allocator, .{ .keep_alive_ms = 1 });
+    defer node.deinit();
+    try std.testing.expectError(error.ConcurrencyUnavailable, node.attachIo(unavailable_io.io()));
+    try std.testing.expect(!node.model_manager.eviction_loop_started);
+    try node.attachIo(available_io.io());
+    try std.testing.expect(node.model_manager.eviction_loop_started);
+}
+
 test "gliner boundary v2 direct control binds cold and cached Metal process guards" {
     const Fake = struct {
         fn backend(_: *anyopaque) backends_mod.BackendType {
@@ -20904,7 +20926,7 @@ test "gliner boundary v2 version probe shares memory admission and recovers decl
     var node = try Node.init(a, .{ .generation_budget_overrides = .{ .host_limit_bytes = 4096, .scratch_limit_bytes = 4096 } });
     defer node.deinit();
     const small = "{\"schema_version\":2}";
-    const shallow = "{\"schema_version\":2,\"unused\":[" ++ ("0," ** 256) ++ "0]}";
+    const shallow = "{\"schema_version\":2,\"unused\":[" ++ (z17RepeatString("0,", 256)) ++ "0]}";
     {
         var memory = try ExtractionPreflightMemory.init(&node);
         defer memory.deinit();
@@ -20992,7 +21014,7 @@ test "gliner boundary legacy direct preflight attributes serialization denial an
     var oversized = small;
     // Valid JSON, within the 16 MiB serialization ceiling, but larger than the
     // explicitly configured owner before the version parser can be entered.
-    oversized.schema_json = "{\"entities\":[\"person\"]}" ++ (" " ** 16384);
+    oversized.schema_json = "{\"entities\":[\"person\"]}" ++ (z17RepeatString(" ", 16384));
     resetRequestWorkTestCounters();
     try std.testing.expectError(error.MemoryBudgetExceeded, node.extractDirect(a, "unused", oversized));
     try std.testing.expectEqual(@as(usize, 0), request_work_test_counters.model_load_attempts);
@@ -21386,7 +21408,7 @@ const ResolvedExtractionOutput = struct {
     entities: [][]@import("../pipelines/ner.zig").Entity,
     relations: ?[][]gliner_mod.Relation,
 
-    fn deinit(self: *ResolvedExtractionOutput, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ResolvedExtractionOutput, allocator: std.mem.Allocator) void {
         for (self.entities) |entities| {
             for (entities) |entity| {
                 allocator.free(entity.text);
@@ -24079,7 +24101,7 @@ const RecordingServer = struct {
     allocator: std.mem.Allocator,
     routes: std.ArrayListUnmanaged(RecordingRoute) = .empty,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.routes.items) |route| self.allocator.free(route.path);
         self.routes.deinit(self.allocator);
     }
@@ -24281,7 +24303,7 @@ test "generation SSE orders finish then usage then done" {
         allocator: std.mem.Allocator,
         events: std.ArrayListUnmanaged([]u8) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.events.items) |event| self.allocator.free(event);
             self.events.deinit(self.allocator);
         }
@@ -24321,7 +24343,7 @@ test "generation SSE omits usage unless requested" {
         allocator: std.mem.Allocator,
         events: std.ArrayListUnmanaged([]u8) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.events.items) |event| self.allocator.free(event);
             self.events.deinit(self.allocator);
         }
@@ -24895,7 +24917,7 @@ test "generate parser consumes generic image and audio media parts strictly" {
 
 test "generate parser borrows framed media without copying" {
     const allocator = std.testing.allocator;
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     png[12..16].* = .{ 'I', 'H', 'D', 'R' };
     std.mem.writeInt(u32, png[16..20], 1, .big);
@@ -24936,7 +24958,7 @@ test "generate parser releases mixed owned and borrowed media on every allocatio
     ;
     var parsed = try std.json.parseFromSlice(api.GenerateRequest, backing_allocator, request_json, .{});
     defer parsed.deinit();
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     png[12..16].* = .{ 'I', 'H', 'D', 'R' };
     std.mem.writeInt(u32, png[16..20], 1, .big);
@@ -25224,7 +25246,7 @@ test "direct generation image admission subtracts resident bytes from capacity" 
     var node = try Node.init(std.testing.allocator, .{ .max_concurrent_requests = 1 });
     defer node.deinit();
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 1024, .big);
@@ -25685,7 +25707,7 @@ test "direct dense embed rejects borrowed image expansion before model loading" 
     const models_root = try tmp.dir.realPathFileAlloc(std.testing.io, "models", allocator);
     defer allocator.free(models_root);
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 800, .big);
@@ -25712,7 +25734,7 @@ test "read decoded image budget rejects aggregate expansion and overflow" {
     const admission = ReadRequestAdmission{ .units = 1, .byte_cap = 1024, .resident_byte_cap = 1024, .decoded_pixel_cap = 4 };
     var budget = ReadDecodedImageBudget.init(admission, 2);
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 2, .big);
@@ -25782,7 +25804,7 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
 
     // Two 24-byte PNG headers each declare a modest 800x800 canvas. They fit
     // the encoded-media ceiling but together exceed one 16 MiB admission unit.
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 800, .big);
@@ -26352,7 +26374,7 @@ test "transcription session append buffers raw pcm before the transcriber loads 
     defer node.deinit();
 
     var created = try node.transcription_sessions.create(allocator, .{
-        .id = transcription_sessions.formatId([_]u8{0xab} ** 16),
+        .id = transcription_sessions.formatId(@as([16]u8, @splat(0xab))),
         .model = "missing",
         .now_wall_s = 0,
         .now_mono_ns = platform.time.monotonicNs(),
@@ -26489,7 +26511,7 @@ test "transcription session append accepts framed raw pcm and the events stream 
     var node = try Node.init(allocator, .{ .max_concurrent_requests = 1 });
     defer node.deinit();
     var created = try node.transcription_sessions.create(allocator, .{
-        .id = transcription_sessions.formatId([_]u8{0xcd} ** 16),
+        .id = transcription_sessions.formatId(@as([16]u8, @splat(0xcd))),
         .model = "missing",
         .now_wall_s = 0,
         .now_mono_ns = platform.time.monotonicNs(),
@@ -26650,7 +26672,7 @@ test "read image preflight maps malformed dimension and aggregate errors before 
         try std.testing.expectEqual(@as(u16, 400), response.status.code);
     }
 
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
     std.mem.writeInt(u32, png[16..20], 2, .big);
@@ -27139,8 +27161,8 @@ test "direct extraction rejects conflicting per-image prompts" {
 }
 
 test "shared classification validation bounds labels and Cartesian work" {
-    const texts = [_][]const u8{"text"} ** 33;
-    const labels = [_][]const u8{"label"} ** 125;
+    const texts = @as([33][]const u8, @splat("text"));
+    const labels = @as([125][]const u8, @splat("label"));
     try std.testing.expectError(error.InferenceBatchTooLarge, validateClassificationInvocation(&texts, &labels));
     try std.testing.expectError(error.InvalidClassificationRequest, validateClassificationInvocation(&.{"text"}, &.{""}));
     try validateClassificationInvocation(&.{ "first", "second" }, &.{ "a", "b" });
@@ -29425,7 +29447,7 @@ fn dirContainsModel(path: []const u8) bool {
         return false;
     }
 
-    const path_z = std.heap.page_allocator.dupeZ(u8, path) catch return false;
+    const path_z = std.heap.page_allocator.dupeSentinel(u8, path, 0) catch return false;
     defer std.heap.page_allocator.free(path_z);
     const dir = c_file.c.opendir(path_z.ptr);
     if (dir == null) return false;
@@ -29482,7 +29504,7 @@ const ParsedChunkRequestInput = struct {
     value: lib_chunker.Input,
     owns_binary: bool = false,
 
-    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         if (self.owns_binary) switch (self.value) {
             .binary => |binary| allocator.free(binary.data),
             .text => {},
@@ -29521,7 +29543,7 @@ fn chunkInputWorkingAdmission(
         );
         const frame_pixels = std.math.mul(usize, @as(usize, info.width), @as(usize, info.height)) catch
             return error.ImageTooLarge;
-        const max_frames = if (config.max_chunks > 0) config.max_chunks else (lib_chunker.FixedChunkConfig{}).max_chunks;
+        const max_frames = if (config.max_chunks > 0) config.max_chunks else lib_chunker.default_gif_max_frames;
         const potential_pixels = std.math.mul(usize, frame_pixels, max_frames) catch
             std.math.maxInt(usize);
         const admitted_pixels = @min(
@@ -29898,7 +29920,7 @@ const ParsedDenseEmbedInputs = struct {
     parse_errors: std.ArrayListUnmanaged(EmbedItemError) = .empty,
     total_count: usize = 0,
 
-    fn deinit(self: *ParsedDenseEmbedInputs, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ParsedDenseEmbedInputs, allocator: std.mem.Allocator) void {
         self.texts.deinit(allocator);
         for (self.images.items) |item| if (item.owned) allocator.free(@constCast(item.bytes));
         self.images.deinit(allocator);
@@ -30884,7 +30906,7 @@ const DenseEmbedPartialResult = struct {
     embeddings: []?[]f32,
     errors: []EmbedItemError,
 
-    fn deinit(self: *DenseEmbedPartialResult, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *DenseEmbedPartialResult, allocator: std.mem.Allocator) void {
         for (self.embeddings) |maybe_embedding| {
             if (maybe_embedding) |embedding| allocator.free(embedding);
         }
@@ -31117,7 +31139,7 @@ const AudioEmbeddingAssetGuard = struct {
         self.held = false;
     }
 
-    fn deinit(self: *AudioEmbeddingAssetGuard) void {
+    pub fn deinit(self: *AudioEmbeddingAssetGuard) void {
         self.release();
     }
 };
@@ -32624,7 +32646,7 @@ test "multimodal rerank parser borrows framed image attachments" {
     ;
     var parsed = try std.json.parseFromSlice(api.RerankRequest, allocator, body, .{});
     defer parsed.deinit();
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     const attachments = [_]httpx.attachment_envelope.Attachment{.{
         .mime_type = "image/png",
@@ -32648,7 +32670,7 @@ test "multimodal rerank parser borrows framed image attachments" {
 }
 
 test "Qwen3-VL multimodal reranker reserves projector scratch before execution" {
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     png[12..16].* = .{ 'I', 'H', 'D', 'R' };
     std.mem.writeInt(u32, png[16..20], 227, .big);
@@ -33931,7 +33953,7 @@ const DecodedDataUri = struct {
     mime_type: ?[]u8,
     data: []u8,
 
-    fn deinit(self: DecodedDataUri, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: DecodedDataUri, allocator: std.mem.Allocator) void {
         if (self.mime_type) |mime_type| allocator.free(mime_type);
         allocator.free(self.data);
     }
@@ -34463,7 +34485,7 @@ test "laya extraction v2 serves typed decisions over HTTP and embedded calls" {
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
     // 64 public inputs expand into 192 questions, exceeding the executor's
     // 128-input ceiling only if questions are incorrectly counted as inputs.
-    const repeated_inputs = [_]struct { content: []const u8 }{.{ .content = "please find the document" }} ** 64;
+    const repeated_inputs = @as([64]struct { content: []const u8 }, @splat(.{ .content = "please find the document" }));
     const original_request = try std.json.parseFromSlice(std.json.Value, a, body, .{});
     defer original_request.deinit();
     const expanded_body = try std.json.Stringify.valueAlloc(a, .{ .model = "model", .schema_version = 2, .inputs = repeated_inputs, .schema = original_request.value.object.get("schema").? }, .{});
@@ -34567,4 +34589,15 @@ test "Decide extraction v2 serves classifications through HTTP handler" {
     try std.testing.expectEqualStrings("refund", classes[0].object.get("label").?.string);
     try std.testing.expectEqualStrings("low", classes[1].object.get("label").?.string);
     try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

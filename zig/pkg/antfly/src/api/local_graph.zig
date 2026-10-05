@@ -12,6 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+const relationship_filter = @import("../graph/relationship_filter.zig");
 pub const std = @import("std");
 pub const CancellationToken = @import("antfly_cancellation").CancellationToken;
 pub const db_mod = struct {
@@ -93,6 +94,7 @@ pub const GraphExpandRequest = struct {
         for (self.target_constraint_keys) |key| alloc.free(key);
         if (self.target_constraint_keys.len > 0) alloc.free(self.target_constraint_keys);
         freeConstStrings(alloc, self.params.edge_types);
+        self.params.edge_filter.deinit(alloc);
         freeGraphMetricReads(alloc, self.metrics);
         if (self.tensor_access_path) |*path| path.deinit(alloc);
         if (self.tensor_program) |*program| program.deinit(alloc);
@@ -332,6 +334,7 @@ pub const GraphNodeIdentityJson = struct {
 };
 
 pub const GraphExpandParamsJson = struct {
+    edge_filter: relationship_filter.Filter = .{},
     edge_types: []const []const u8 = &.{},
     direction: []const u8 = "out",
     max_depth: u32 = 1,
@@ -424,6 +427,8 @@ pub const GraphEdgesRequestJson = struct {
 };
 
 pub const GraphEdgeJson = struct {
+    edge_id: []const u8 = "",
+    owner_document: []const u8 = "",
     source: []const u8,
     target: []const u8,
     edge_type: []const u8,
@@ -620,12 +625,18 @@ pub fn dupeGraphPathEdge(
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     errdefer if (metadata.len > 0) alloc.free(metadata);
     return .{
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = edge.traversal_direction,
@@ -639,6 +650,8 @@ pub fn freeOwnedGraphPathEdge(
     alloc.free(edge.source);
     alloc.free(edge.target);
     alloc.free(edge.edge_type);
+    if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+    if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
     if (edge.metadata.len > 0) alloc.free(edge.metadata);
 }
 
@@ -819,6 +832,8 @@ pub fn frontierItemToSearchRequest(
     var params = req.params;
     params.edge_types = try dupConstStrings(alloc, req.params.edge_types);
     errdefer freeConstStrings(alloc, params.edge_types);
+    params.edge_filter = try params.edge_filter.clone(alloc);
+    errdefer params.edge_filter.deinit(alloc);
     if (req.defer_result_limit) params.max_results = graph_query_mod.graph_metric_candidate_limit + 1;
 
     const name = try alloc.dupe(u8, req.name);
@@ -924,6 +939,7 @@ pub fn freeExpandSearchRequest(alloc: std.mem.Allocator, req: db_mod.types.Searc
             }
         }
         freeConstStrings(alloc, graph_query.query.params.edge_types);
+        graph_query.query.params.edge_filter.deinit(alloc);
         freeGraphMetricReads(alloc, graph_query.query.metrics);
     }
     if (req.graph_queries.len > 0) alloc.free(req.graph_queries);
@@ -1082,6 +1098,9 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
     errdefer freeKeys(alloc, exclude_edges);
     const edge_types = try dupConstStrings(alloc, parsed.value.params.edge_types);
     errdefer freeConstStrings(alloc, edge_types);
+    try parsed.value.params.edge_filter.validate(alloc);
+    const edge_filter = try parsed.value.params.edge_filter.clone(alloc);
+    errdefer edge_filter.deinit(alloc);
 
     const out = GraphExpandRequest{
         .name = name,
@@ -1103,6 +1122,7 @@ pub fn parseGraphExpandRequest(alloc: std.mem.Allocator, body: []const u8) !Grap
         .resolved_doc_filter_wire_context = if (parsed_filter) |filter| filter.context else null,
         .params = .{
             .edge_types = edge_types,
+            .edge_filter = edge_filter,
             .direction = if (std.mem.eql(u8, parsed.value.params.direction, "in"))
                 .in
             else if (std.mem.eql(u8, parsed.value.params.direction, "both"))
@@ -1557,7 +1577,7 @@ pub fn graphResultNodeHasExcludedEdge(
         if (tables.len != path.len) return error.InvalidGraphPath;
     }
     for (edges, 0..) |edge, index| {
-        const edge_key = try allocEdgeExclusionKey(
+        const edge_key = try allocRelationshipExclusionKey(
             alloc,
             .{
                 .table = graphResultNodePathTable(source_table, node, index),
@@ -1569,6 +1589,8 @@ pub fn graphResultNodeHasExcludedEdge(
             },
             edge.traversal_direction,
             edge.edge_type,
+            edge.edge_id,
+            edge.owner_document,
         );
         defer alloc.free(edge_key);
         if (exclude_edge_set.contains(edge_key)) return true;
@@ -1694,6 +1716,7 @@ pub fn cloneGraphPatternMatch(
     }
 
     return .{
+        .computed_json = if (match.computed_json) |bytes| try alloc.dupe(u8, bytes) else null,
         .bindings = bindings,
         .path = path,
         .null_aliases = null_aliases,
@@ -1871,6 +1894,10 @@ pub fn clonePathEdge(
     errdefer alloc.free(target);
     const edge_type = try alloc.dupe(u8, edge.edge_type);
     errdefer alloc.free(edge_type);
+    const edge_id = try alloc.dupe(u8, edge.edge_id);
+    errdefer alloc.free(edge_id);
+    const owner_document = try alloc.dupe(u8, edge.owner_document);
+    errdefer alloc.free(owner_document);
     const metadata = if (edge.metadata.len > 0) try alloc.dupe(u8, edge.metadata) else "";
     errdefer if (metadata.len > 0) alloc.free(metadata);
 
@@ -1878,6 +1905,8 @@ pub fn clonePathEdge(
         .source = source,
         .target = target,
         .edge_type = edge_type,
+        .edge_id = edge_id,
+        .owner_document = owner_document,
         .weight = edge.weight,
         .metadata = metadata,
         .traversal_direction = edge.traversal_direction,
@@ -1888,6 +1917,8 @@ pub fn freeOwnedPathEdge(alloc: std.mem.Allocator, edge: graph_query_mod.PathEdg
     alloc.free(edge.source);
     alloc.free(edge.target);
     alloc.free(edge.edge_type);
+    if (edge.edge_id.len > 0) alloc.free(edge.edge_id);
+    if (edge.owner_document.len > 0) alloc.free(edge.owner_document);
     if (edge.metadata.len > 0) alloc.free(edge.metadata);
 }
 
@@ -1938,6 +1969,8 @@ pub fn encodeGraphEdgesResponseForWire(alloc: std.mem.Allocator, res: GraphEdges
             .source = edge.source,
             .target = edge.target,
             .edge_type = edge.edge_type,
+            .edge_id = edge.edge_id,
+            .owner_document = edge.owner_document,
             .weight = edge.weight,
             .created_at = edge.created_at,
             .updated_at = edge.updated_at,
@@ -1971,4 +2004,22 @@ pub fn validateGraphMetricReadsForDistributedTransport(metrics: []const graph_qu
         if (metric.seed_nodes.len != 0 or metric.damping != null)
             return error.GraphMetricPersonalizationUnsupported;
     }
+}
+
+pub fn allocRelationshipExclusionKey(
+    alloc: std.mem.Allocator,
+    from: graph_node_identity.Ref,
+    to: graph_node_identity.Ref,
+    direction: ?graph_mod.EdgeDirection,
+    edge_type: []const u8,
+    edge_id: []const u8,
+    owner_document: []const u8,
+) ![]u8 {
+    if (edge_id.len == 0) return allocEdgeExclusionKey(alloc, from, to, direction, edge_type);
+    const direction_tag = [_]u8{graphPathTraversalDirectionTag(direction)};
+    return compositeIdentityAlloc(alloc, &.{
+        "path-edge-v2",                                from.table orelse return error.InvalidGraphPath, from.key,
+        to.table orelse return error.InvalidGraphPath, to.key,                                          direction_tag[0..],
+        edge_type,                                     edge_id,                                         owner_document,
+    });
 }

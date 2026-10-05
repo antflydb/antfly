@@ -90,8 +90,10 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
         .file_allocator = alloc,
         // Full DB graph apply crosses the LSM and debug allocator on this
         // fiber. Match the production-shaped DB/DataServer VOPR campaigns,
-        // rather than the generic scheduler's 1 MiB task stack.
-        .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+        // rather than the generic scheduler's 1 MiB task stack. 8 MiB
+        // overflowed in Debug builds on the comparable production-shaped
+        // Raft-merge campaign (data/runtime.zig); use the same 32 MiB.
+        .tasks = .{ .stack_size = 32 * 1024 * 1024 },
     });
     defer runtime_io.deinit();
     runtime_io.monotonic_ns = 200 * std.time.ns_per_day;
@@ -136,7 +138,7 @@ test "graph ownership cleanup runs on borrowed VoprIo before replicated merge" {
             try std.testing.expectError(error.RaftApplyWriterUnavailable, server_test_adapter.applyOrdered(&database, merge, .{ .term = 1, .index = 2 }));
             try std.testing.expectEqual(@as(u64, 1), (try database.orderedApplyReceipt()).?.index);
             database.startResidentBackgroundWorkersIfNeeded();
-            if (database.artifact_repair_metadata_future == null) return error.GraphMaintenanceWorkerMissing;
+            if (database.independent_maintenance.future == null) return error.GraphMaintenanceWorkerMissing;
             const graph = &database.core.index_manager.graphIndex("g").?.index;
             for (0..100) |_| {
                 if (!graph.ownershipTransitionPending()) break;
@@ -212,7 +214,7 @@ test "relational replicated admission is identical across local memory envelopes
     const alloc = std.testing.allocator;
     for ([_]u64{ 256 * 1024, 4 * 1024 * 1024 }) |capacity| {
         var options = resource_manager_mod.Options{ .identity_allocator = alloc };
-        options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = capacity };
+        options.budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = capacity };
         var resources = resource_manager_mod.ResourceManager.init(options);
         defer resources.deinit(alloc);
         var path_tmp = try TestDirectory.init("db");
@@ -227,8 +229,8 @@ test "relational replicated admission is identical across local memory envelopes
         const catalog = db.core.table_catalog.encode();
         try db.core.store.putBatch(&.{.{ .key = table_catalog_mod.key, .value = &catalog }}, &.{});
         const txn = try db.beginTransaction(100);
-        try db.writeReplicatedTransactionAtRaftEntry(txn, .{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 });
-        try std.testing.expectError(error.TransactionTooLarge, db.writeReplicatedTransactionAtRaftEntry(txn, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} }, .{ .term = 1, .index = 2 }));
+        try db.writeReplicatedTransactionAtOrderedReceipt(txn, .{ .writes = &.{.{ .key = "a", .value = "{\"n\":1}" }} }, .{ .term = 1, .index = 1 });
+        try std.testing.expectError(error.TransactionTooLarge, db.writeReplicatedTransactionAtOrderedReceipt(txn, .{ .writes = &.{.{ .key = "b", .value = "{\"n\":2}" }} }, .{ .term = 1, .index = 2 }));
         try std.testing.expectEqual(@as(u64, 1), (try db.orderedApplyReceipt()).?.index);
         var intents = try db.core.collectTransactionIntentBatch(alloc, txn);
         defer intents.deinit(alloc);
@@ -282,7 +284,7 @@ test "db relational one-shot recovery resolves orphaned intents into packed rows
         break :blk key;
     };
     var record_value: [33]u8 = undefined;
-    record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    record_value[0] = @backingInt(transactions_mod.TxnStatus.committed);
     std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
     std.mem.writeInt(u64, record_value[9..17], commit_ts, .little);
     std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
@@ -668,7 +670,7 @@ test "db repair activation restarts unjournaled source races without penalizing 
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 1, .little);
             std.mem.writeInt(u64, marker[8..16], 4, .little);
-            try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+            try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
             try txn.put(primary, "{\"title\":\"beta\"}");
             try txn.commit();
         } else try server_test_adapter.applyOrdered(&db, .{ .writes = &.{.{ .key = "doc", .value = "{\"title\":\"beta\"}" }}, .sync_level = .write }, .{ .term = 1, .index = 4 });
@@ -852,13 +854,13 @@ test "db replicated transaction commits each raft receipt atomically" {
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
-    const txn_id: transactions_mod.TxnId = .{0x5a} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(0x5a);
     const participant = "table:receipts:group:7";
     const begin_entry: OrderedApplyReceipt = .{ .term = 3, .index = 11 };
     const prepare_entry: OrderedApplyReceipt = .{ .term = 3, .index = 12 };
     const resolve_entry: OrderedApplyReceipt = .{ .term = 3, .index = 13 };
 
-    _ = try db.beginReplicatedTransactionAtRaftEntry(
+    _ = try db.beginReplicatedTransactionAtOrderedReceipt(
         txn_id,
         12_000,
         12_000,
@@ -870,7 +872,7 @@ test "db replicated transaction commits each raft receipt atomically" {
     try std.testing.expectEqualDeep(begin_entry, (try db.orderedApplyReceipt()).?);
 
     // An exact begin replay is fenced before it can alter the existing record.
-    _ = try db.beginReplicatedTransactionAtRaftEntry(
+    _ = try db.beginReplicatedTransactionAtOrderedReceipt(
         txn_id,
         99_000,
         99_000,
@@ -881,12 +883,12 @@ test "db replicated transaction commits each raft receipt atomically" {
     );
     try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try db.getTransactionStatus(txn_id));
 
-    try db.writeReplicatedTransactionAtRaftEntry(txn_id, .{
+    try db.writeReplicatedTransactionAtOrderedReceipt(txn_id, .{
         .writes = &.{.{ .key = "doc:receipt", .value = "{\"title\":\"transaction\"}" }},
     }, prepare_entry);
     try std.testing.expectEqualDeep(prepare_entry, (try db.orderedApplyReceipt()).?);
 
-    try db.resolveReplicatedTransactionAtRaftEntry(
+    try db.resolveReplicatedTransactionAtOrderedReceipt(
         txn_id,
         .committed,
         15_000,
@@ -907,7 +909,7 @@ test "db replicated transaction commits each raft receipt atomically" {
         .writes = &.{.{ .key = "doc:receipt", .value = "{\"title\":\"newer\"}" }},
         .timestamp_ns = 16_000,
     });
-    try db.resolveReplicatedTransactionAtRaftEntry(
+    try db.resolveReplicatedTransactionAtOrderedReceipt(
         txn_id,
         .committed,
         15_000,
@@ -1065,9 +1067,9 @@ test "db raced replicated transaction completion persists receipt and participan
     var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
     defer db.close();
 
-    const txn_id: transactions_mod.TxnId = .{0x6b} ** 16;
+    const txn_id: transactions_mod.TxnId = @splat(0x6b);
     const participant = "table:receipts:group:8";
-    _ = try db.beginReplicatedTransactionAtRaftEntry(
+    _ = try db.beginReplicatedTransactionAtOrderedReceipt(
         txn_id,
         20_000,
         20_000,
@@ -1076,7 +1078,7 @@ test "db raced replicated transaction completion persists receipt and participan
         true,
         .{ .term = 4, .index = 21 },
     );
-    try db.writeReplicatedTransactionAtRaftEntry(txn_id, .{
+    try db.writeReplicatedTransactionAtOrderedReceipt(txn_id, .{
         .writes = &.{.{ .key = "doc:raced-receipt", .value = "{\"title\":\"transaction\"}" }},
     }, .{ .term = 4, .index = 22 });
 
@@ -1099,7 +1101,7 @@ test "db raced replicated transaction completion persists receipt and participan
         .sync_level = .write,
     }, null, .{
         .bypass_replication_write_gate = true,
-        .raft_applied_entry_marker = resolve_entry,
+        .ordered_apply_receipt = resolve_entry,
         .transaction_resolution = .{
             .txn_id = txn_id,
             .status = .committed,
@@ -1361,7 +1363,7 @@ test "db transaction recovery runtime rebuilds all derived effects for committed
             break :blk_key key;
         };
         var record_value: [33]u8 = undefined;
-        record_value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+        record_value[0] = @backingInt(transactions_mod.TxnStatus.committed);
         std.mem.writeInt(u64, record_value[1..9], 1_000, .little);
         std.mem.writeInt(u64, record_value[9..17], 2_000, .little);
         std.mem.writeInt(u64, record_value[17..25], 1_000, .little);
@@ -2656,7 +2658,7 @@ fn testGraphGenerationHeadFence(accepted_before_switch: bool) !void {
             defer context.destroy();
         }
     };
-    if (!accepted_before_switch) try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &pinned.read.?, asset_key });
+    if (!accepted_before_switch) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &pinned.read.?, asset_key });
     const context = try planning.Context.create(alloc, &pinned.read.?, "doc", "relations", asset_key, "{}");
     defer context.destroy();
     const inherited = for (context.base.artifact_sources) |guard| {
@@ -2791,7 +2793,7 @@ test "db ordered artifact inventory graph planning inherits selected extraction 
             try std.testing.expectEqualStrings(head, selected_context.base.artifact_sources[0].key);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned.read.?, plan.core.head_key, @as([]const u8, &head_raw) });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned.read.?, plan.core.head_key, @as([]const u8, &head_raw) });
     const context = try planning.Context.createWithProof(alloc, &pinned.read.?, "doc", "relations", plan.core.head_key, &head_raw);
     defer context.destroy();
     try std.testing.expectEqual(@as(usize, 1), context.base.artifact_sources.len);
@@ -2978,25 +2980,45 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
             try txn.put(counter_key, &saved_counter);
             try txn.commit();
         }
+        const owner = @import("../capi/server_owner.zig");
         const Capture = struct {
             refused: bool = true,
+            calls: usize = 0,
             hint: ?transport.RecoveryHint = null,
-            fn enqueue(ptr: *anyopaque, namespace: [24]u8, bytes: []const u8) !void {
-                const self: *@This() = @ptrCast(@alignCast(ptr));
-                if (self.refused) return error.ResourceLimitExceeded;
-                self.hint = (try transport.RecoveryHint.decode(bytes)) orelse return error.InvalidBatchRequest;
-                try std.testing.expectEqualDeep(namespace, self.hint.?.namespace);
+            fn enqueue(ptr: ?*anyopaque, group_id: u64, namespace: *const [24]u8, bytes: owner.kernel_owner_abi.BorrowedBytes) callconv(.c) owner.kernel_owner_abi.Status {
+                const self: *@This() = @ptrCast(@alignCast(ptr orelse return .invalid_argument));
+                if (group_id != 77) return .invalid_argument;
+                self.calls += 1;
+                if (self.refused) return .resource_limit_exceeded;
+                self.hint = (transport.RecoveryHint.decode(bytes.slice()) catch return .invalid_argument) orelse return .invalid_argument;
+                if (!std.mem.eql(u8, namespace, &self.hint.?.namespace)) return .invalid_argument;
+                return .ok;
             }
         };
         var capture: Capture = .{};
-        db.local_execution.artifact_publication_dispatcher = .{ .ptr = &capture, .enqueue = Capture.enqueue };
+        var hooks: owner.StorageOwnerRuntimeHooks = .{
+            .group_id = 77,
+            .config = .{ .artifact_publication_ctx = &capture, .artifact_publication_enqueue_fn = Capture.enqueue },
+        };
+        db.local_execution.artifact_publication_dispatcher = hooks.artifactPublicationDispatcher();
         defer db.local_execution.artifact_publication_dispatcher = null;
-        try std.testing.expectError(error.ResourceLimitExceeded, db.advanceArtifactUploadRecovery());
-        try std.testing.expectEqual(@as(u64, 0), db.artifact_upload_recovery_cursor.load(.acquire));
+        try std.testing.expectError(error.ResourceLimitExceeded, engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(u64, 0), hooks.artifact_upload_recovery.cursor.load(.acquire));
+        try std.testing.expect(hooks.artifact_upload_recovery.retry_after_ns.load(.acquire) != 0);
+        // Pin the deadline ahead of every possible runtime tick. Suppression
+        // must happen before the recovery/admission callback, even after refusal.
+        hooks.artifact_upload_recovery.retry_after_ns.store(std.math.maxInt(u64), .release);
         capture.refused = false;
+        try std.testing.expect(!try engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(usize, 1), capture.calls);
         try std.testing.expect(try db.advanceArtifactUploadRecovery());
         recovered = capture.hint.?;
         try std.testing.expectEqual(@as(u64, 4), recovered.?.created_index);
+        try std.testing.expectEqual(@as(usize, 2), capture.calls);
+        // The next maintenance opportunity uses the same production binding.
+        hooks.artifact_upload_recovery.retry_after_ns.store(0, .release);
+        try std.testing.expect(try engine.test_support.advanceArtifactUploadRecoveryMaintenance(&db));
+        try std.testing.expectEqual(@as(usize, 3), capture.calls);
         // A delayed hint for a retired incarnation advances only the Raft
         // watermark. It cannot consume this upload or credit a receipt.
         var stale = recovered.?.request();
@@ -3060,7 +3082,7 @@ fn testAcceptedArtifactUpload(inject_missing_counter: bool) !void {
                 try std.testing.expectEqualDeep(selector.publication_digest, result.receipt.publication_digest);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Verify.run, .{ &latest, command });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Verify.run, .{ &latest, command });
     }
     const validation = @import("db/artifact_producer_validation.zig");
     var clean_page = (try validation.prepareRaft(alloc, db.core.store)).?;
@@ -3217,9 +3239,9 @@ test "db ordered artifact inventory idle upload retirement replays across owners
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
                 const inventory = try transport.recoveryInventory(&read, namespace);
-                var tracker: transport.RecoveryTracker = .{};
+                var tracker: @import("artifact_upload_recovery.zig").RecoveryTracker = .{};
                 try std.testing.expect(tracker.observe(inventory, 0, 0) == null);
-                const hint = tracker.observe(inventory, transport.RecoveryTracker.idle_ns, 0).?;
+                const hint = tracker.observe(inventory, @import("artifact_upload_recovery.zig").RecoveryTracker.idle_ns, 0).?;
                 if (before_chunk) |expected| try std.testing.expectEqualDeep(expected, hint) else before_chunk = hint;
             }
             try server_test_adapter.applyOrdered(&db, .{ .artifact_publication_transport = .{ .action = .chunk, .namespace = namespace, .publication_digest = begin.publication_digest, .manifest_root = begin.proposedManifest().root(), .chunk_base64 = base64 } }, .{ .term = 1, .index = 6 });
@@ -3229,9 +3251,9 @@ test "db ordered artifact inventory idle upload retirement replays across owners
             const inventory = try transport.recoveryInventory(&read, namespace);
             try std.testing.expectEqual(@as(usize, 1), inventory.count);
             try std.testing.expect(!inventory.entries[0].complete);
-            var tracker: transport.RecoveryTracker = .{};
+            var tracker: @import("artifact_upload_recovery.zig").RecoveryTracker = .{};
             _ = tracker.observe(inventory, 0, 0);
-            const hint = tracker.observe(inventory, transport.RecoveryTracker.idle_ns, 0).?;
+            const hint = tracker.observe(inventory, @import("artifact_upload_recovery.zig").RecoveryTracker.idle_ns, 0).?;
             if (after_chunk) |expected| try std.testing.expectEqualDeep(expected, hint) else after_chunk = hint;
         }
         var reopened = try DB.open(alloc, path, options);
@@ -3399,7 +3421,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
             try std.testing.expectEqual(publication.Rejection.baseline_pending, (try publication.rejected(&read, rejected)).?.reason);
             try std.testing.expectError(error.NotFound, read.get(vector_key));
         }
-        try std.testing.checkAllAllocationFailures(alloc, Harness.prepare, .{ command, catalog.catalogs });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.prepare, .{ command, catalog.catalogs });
         var prepared = try publication.prepareEffects(alloc, command, catalog.catalogs);
         defer prepared.deinit();
         try std.testing.expectEqual(@as(usize, 2), prepared.batch.documents.len);
@@ -3413,7 +3435,7 @@ test "db ordered artifact inventory chunk publication authenticates complete set
             try std.testing.expectError(error.NotFound, read.get(one));
             try std.testing.expectEqualDeep(rows.manifest.?, try chunks.Manifest.decode(try read.get(manifest_key)));
         }
-        try std.testing.checkAllAllocationFailures(alloc, Harness.checkCapture, .{ &db, zero });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.checkCapture, .{ &db, zero });
         {
             var absent = try Harness.captureVector(alloc, &db, one);
             defer absent.deinit();
@@ -3507,14 +3529,14 @@ test "db ordered artifact inventory asset publication authenticates output and p
         var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
         activation.publication_digest = activation.digest();
         try server_test_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 3 });
-        try std.testing.checkAllAllocationFailures(alloc, Harness.checkCapture, .{&db});
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.checkCapture, .{&db});
         for ([_][]const u8{ "first", "second" }, [_][]const u8{ first_key, second_key }, 0..) |name, key, ordinal| {
             var token = try Harness.capture(&db, name);
             defer token.deinit();
             const command = try token.command(&.{.{ .family = .document_artifact, .key = key, .value = name, .source_index = 0 }});
             var prepared = try asset.prepare(alloc, command, catalog.catalogs);
             defer prepared.deinit();
-            if (ordinal == 0) try std.testing.checkAllAllocationFailures(alloc, Harness.checkPrepare, .{ command, catalog.catalogs });
+            if (ordinal == 0) try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Harness.checkPrepare, .{ command, catalog.catalogs });
             try std.testing.expectEqual(@as(usize, 1), prepared.batch.documents.len);
             try std.testing.expectEqual(@as(usize, 2), prepared.coverage[0].artifact_keys.len);
             const forged = try token.command(&.{.{ .family = .document_artifact, .key = if (ordinal == 0) second_key else first_key, .value = name, .source_index = 0 }});
@@ -3611,7 +3633,7 @@ test "db ordered artifact inventory full text replay publishes physical coverage
                 try guard.requireCurrent(&read);
             }
         };
-        try std.testing.checkAllAllocationFailures(alloc, Validate.run, .{ &db, saved.generation });
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Validate.run, .{ &db, saved.generation });
         {
             var plan = try db.core.index_manager.acquireWritePlanSnapshot();
             defer plan.release();
@@ -3799,7 +3821,7 @@ test "db ordered artifact inventory materialization replay cut is owner local at
             var marker: [16]u8 = undefined;
             std.mem.writeInt(u64, marker[0..8], 1, .little);
             std.mem.writeInt(u64, marker[8..16], 5, .little);
-            try txn.put(&internal_keys.raft_document_applied_entry_key, &marker);
+            try txn.put(&internal_keys.ordered_document_applied_entry_key, &marker);
             try txn.put(artifact_key, "unjournaled artifact");
             try txn.commit();
         }
@@ -4013,19 +4035,19 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     var index_key: [prefix.len + 16]u8 = undefined;
     @memcpy(index_key[0..prefix.len], prefix);
     @memcpy(index_key[prefix.len..], &txn);
-    _ = try db.beginReplicatedTransactionAtRaftEntry(txn, 10000, 10000, &.{ "a", "b", "c" }, false, false, .{ .term = 3, .index = 1 });
-    try db.markReplicatedTransactionParticipantResolvedAtRaftEntry(txn, "a", .{ .term = 3, .index = 2 });
+    _ = try db.beginReplicatedTransactionAtOrderedReceipt(txn, 10000, 10000, &.{ "a", "b", "c" }, false, false, .{ .term = 3, .index = 1 });
+    try db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(txn, "a", .{ .term = 3, .index = 2 });
     {
         var read = try db.core.store.beginProbeTxn();
         defer read.abort();
         try std.testing.expectError(error.NotFound, read.get(&index_key));
     }
-    try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }));
+    try std.testing.expectError(error.InvalidParticipant, db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{ "b", "absent" }, .{ .term = 3, .index = 3 }));
     try std.testing.expectEqual(@as(u64, 2), (try db.orderedApplyReceipt()).?.index);
-    try db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{"b"}, .{ .term = 3, .index = 3 });
+    try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"b"}, .{ .term = 3, .index = 3 });
     // Exact replay is fenced before payload admission, preserving the durable
     // marker together with the indexed membership and migrated resolution.
-    try db.markReplicatedTransactionParticipantsResolvedAtRaftEntry(txn, &.{"absent"}, .{ .term = 3, .index = 3 });
+    try db.markReplicatedTransactionParticipantsResolvedAtOrderedReceipt(txn, &.{"absent"}, .{ .term = 3, .index = 3 });
     db.close();
     opened = false;
     db = try DB.open(alloc, path, .{ .start_index_workers = false });
@@ -4035,7 +4057,7 @@ test "db transaction batched acknowledgement migration preserves legacy replay a
     defer transactions_mod.freeParticipantList(alloc, pending);
     try std.testing.expectEqual(@as(usize, 1), pending.len);
     try std.testing.expectEqualStrings("c", pending[0]);
-    try db.markReplicatedTransactionParticipantResolvedAtRaftEntry(txn, "c", .{ .term = 3, .index = 4 });
+    try db.markReplicatedTransactionParticipantResolvedAtOrderedReceipt(txn, "c", .{ .term = 3, .index = 4 });
     const complete = try db.getUnresolvedTransactionParticipants(alloc, txn);
     defer transactions_mod.freeParticipantList(alloc, complete);
     try std.testing.expectEqual(@as(usize, 0), complete.len);
@@ -4067,7 +4089,7 @@ test "db transaction recovery observes admission replacement after execution bin
     };
     var gate: Gate = .{};
     // Rebinding occurs after recovery has retained its execution capabilities.
-    db.local_execution.replication_write_gate = .{ .primary = .{ .ptr = &gate, .check_fn = Gate.check } };
+    db.local_execution.replication_write_gate = .{ .borrowed = .{ .ptr = &gate, .check_fn = Gate.check } };
     const context = db.transaction_runtime.?.local.?.config;
     try std.testing.expectError(error.TestRecoveryAdmissionClosed, context.resolve_local_fn.?(context.local_resolution_ctx.?, txn_id, .committed, 2_000));
     try std.testing.expectEqual(@as(usize, 1), gate.calls);
@@ -4081,4 +4103,119 @@ test "db transaction recovery observes admission replacement after execution bin
     defer alloc.free(value);
     try std.testing.expectEqualStrings("{\"title\":\"recovered\"}", value);
     try std.testing.expect(gate.calls > 1);
+}
+
+test "db ordered artifact inventory follower completes initial build under durable admission across reopen" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const leader_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/admission-leader", .{tmp.sub_path});
+    defer alloc.free(leader_path);
+    const follower_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/admission-follower", .{tmp.sub_path});
+    defer alloc.free(follower_path);
+    const options: OpenOptions = .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 2 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false };
+    var leader = try DB.open(alloc, leader_path, options);
+    defer leader.close();
+    try leader.setSchemaJson(alloc, "{}");
+    try leader.addIndex(.{ .name = "admitted_text", .kind = .full_text, .config_json = "{}" });
+    var command = try leader.artifactInventoryCommand(alloc);
+    defer command.catalogs.deinit(alloc);
+    var follower = try DB.open(alloc, follower_path, options);
+    defer follower.close();
+    try follower.setSchemaJson(alloc, "{}");
+    try server_test_adapter.applyOrdered(&follower, .{ .writes = &.{.{ .key = "doc", .value = "{\"text\":\"retained follower source\"}" }} }, .{ .term = 1, .index = 1 });
+    const owner = try follower.relationalTopologyIdentity();
+    const scope: @import("db/online_source_contract.zig").Scope = .{
+        .authority = .raft,
+        .fence = .{ .role = .merge_source, .transition_id = 7, .attempt = 1, .admission_epoch = owner.next_epoch, .owner_group_id = 2, .peer_group_id = 3, .namespace = owner.namespace, .catalog_digest = owner.catalog_digest },
+        .receiver_namespace = .{ .table_id = 1, .shard_id = 3, .range_id = 3 },
+        .consumer_epoch = 1,
+        .copy_attempt = .{ .donor_term = 1, .sequence = 1 },
+    };
+    const request: types.BatchRequest = .{ .artifact_catalog = command, .online_source = .{ .admit = .{ .scope = scope, .artifact_catalog = command.binding } } };
+    var saw_pending = false;
+    var completed = false;
+    for (0..256) |turn| {
+        server_test_adapter.applyOrdered(&follower, request, .{ .term = 1, .index = 2 }) catch |err| {
+            if (err != error.ArtifactCatalogDrift) return err;
+            saw_pending = true;
+            if (turn == 0) {
+                follower.close();
+                follower = try DB.open(alloc, follower_path, options);
+                try std.testing.expectError(error.ArtifactCatalogEpochChanged, follower.advanceOrderedArtifactInitialBuild(&.{}, .{ .token = @splat(0xff) }));
+            }
+            continue;
+        };
+        completed = true;
+        break;
+    }
+    try std.testing.expect(saw_pending);
+    try std.testing.expect(completed);
+    try server_test_adapter.applyOrdered(&follower, request, .{ .term = 1, .index = 2 });
+    try std.testing.expect((try follower.artifactInventoryStatus()).ready);
+    try std.testing.expectEqual(@as(u64, 2), (try follower.orderedApplyReceipt()).?.index);
+    const document = (try follower.get(alloc, "doc")).?;
+    defer alloc.free(document);
+    try std.testing.expect(std.mem.indexOf(u8, document, "retained follower source") != null);
+    var result = try follower.search(alloc, .{ .index_name = "admitted_text", .query = .{ .match = .{ .field = "_all", .text = "retained" } }, .limit = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+}
+
+test "server ordered graph cleanup applies complete planner pages and duplicate receipts" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("ordered-graph-cleanup");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
+    const contract = @import("graph_cleanup_contract.zig");
+    const key = try contract.ownerJobKeyAlloc(alloc, "owner");
+    defer alloc.free(key);
+    const value = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7, .phase = .inputs });
+    defer alloc.free(value);
+    try db.core.store.put(key, value);
+    var index: u64 = 1;
+    while (index <= 3) : (index += 1) {
+        var response = (try db.lookup(alloc, "", .{ .relational_topology_json = "{\"mode\":\"graph_endpoint_cleanup\"}" })).?;
+        defer response.deinit(alloc);
+        var status = try std.json.parseFromSlice(types.GraphEndpointCleanupStatus, alloc, response.json, .{});
+        defer status.deinit();
+        try std.testing.expect(status.value.pending);
+        const req = status.value.request();
+        try server_test_adapter.applyOrdered(&db, req, .{ .term = 1, .index = index });
+        try server_test_adapter.applyOrdered(&db, req, .{ .term = 1, .index = index });
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, key));
+    try std.testing.expect((try db.prepareGraphEndpointCleanupBatch(alloc)) == null);
+}
+
+test "server group timestamp survives relational schema upgrade and reopen" {
+    const metadata = @import("server_group_metadata.zig");
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("server-group-schema");
+    defer directory.cleanup();
+    const schema_v1 = "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}";
+    const schema_v2 = "{\"version\":2,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"note\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}}}";
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_v1);
+        try std.testing.expectEqual(@as(u64, 1234), try metadata.ensureGroupCreatedAtMillis(&db, alloc, 7, 1234));
+    }
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try db.setSchemaJson(alloc, schema_v2);
+        try std.testing.expectEqual(@as(?u64, 1234), try metadata.getGroupCreatedAtMillis(&db, alloc, 7));
+        try std.testing.expectEqual(@as(u64, 1234), try metadata.ensureGroupCreatedAtMillis(&db, alloc, 7, 5678));
+        const raw = (try db.get(alloc, "\x00\x00__metadata__:data_group_created_at:7")).?;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings("1234", raw);
+    }
+    {
+        var db = try DB.open(alloc, directory.path(), .{ .start_index_workers = false, .start_optional_runtimes = false });
+        defer db.close();
+        try std.testing.expectEqual(@as(?u64, 1234), try metadata.getGroupCreatedAtMillis(&db, alloc, 7));
+    }
 }

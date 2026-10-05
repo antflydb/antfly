@@ -508,7 +508,7 @@ test "ordered artifact inventory obligations survive stale completion and seal o
             std.testing.allocator.free(removed.key);
             std.testing.allocator.free(removed.value);
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var iterator = self.values.iterator();
             while (iterator.next()) |entry| {
                 std.testing.allocator.free(entry.key_ptr.*);

@@ -122,6 +122,126 @@ fn hashBulkEntryKey(namespace: backend_types.Namespace, key: []const u8) u64 {
     return hasher.final();
 }
 
+/// Point reads must not walk the growing unordered bulk arena. Borrow keys
+/// from its stable entry arena, retain the latest duplicate, and compare full
+/// namespace/key bytes so hash collisions never affect read-your-writes.
+const BulkAppendIndex = struct {
+    const Key = struct { namespace: backend_types.Namespace, key: []const u8 };
+    const Context = struct {
+        pub fn hash(_: @This(), key: Key) u64 {
+            return hashBulkEntryKey(key.namespace, key.key);
+        }
+        pub fn eql(_: @This(), left: Key, right: Key) bool {
+            return compareNamespace(left.namespace, right.namespace) == .eq and std.mem.eql(u8, left.key, right.key);
+        }
+    };
+    entries: std.HashMapUnmanaged(Key, usize, Context, 80) = .{},
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        self.entries.deinit(alloc);
+        self.* = .{};
+    }
+    fn clear(self: *@This()) void {
+        self.entries.clearRetainingCapacity();
+    }
+    fn append(self: *@This(), alloc: Allocator, state: *State, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
+        // Reserve both containers before publishing either change. Failed
+        // allocation leaves the prior overlay and its index consistent.
+        try self.entries.ensureUnusedCapacity(alloc, 1);
+        try state.entries.ensureUnusedCapacity(alloc, 1);
+        const entry_allocator = try state.ensureArenaAllocator(alloc);
+        const entry = try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false);
+        const index = state.entryCount();
+        state.entries.appendAssumeCapacity(entry);
+        self.entries.putAssumeCapacity(.{ .namespace = namespaceOf(entry), .key = entry.key }, index);
+    }
+    fn get(self: *const @This(), state: *const State, namespace: backend_types.Namespace, key: []const u8) ?state_mod.OwnedEntry {
+        const index = self.entries.get(.{ .namespace = namespace, .key = key }) orelse return null;
+        return state.entryAt(index);
+    }
+};
+
+/// Lazily index only transaction keys for prefix admission. Once initialized,
+/// mutations update this tree instead of cloning unordered key/value overlays.
+const WriterPrefixIndex = struct {
+    state: ?ActiveMemTable = null,
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.state) |*state| state.deinit(alloc);
+        self.state = null;
+    }
+
+    fn record(self: *@This(), alloc: Allocator, namespace: backend_types.Namespace, key: []const u8, tombstone: bool) void {
+        if (self.state) |*state| state.upsert(alloc, namespace, key, "", tombstone) catch {
+            // This is an optional cache: a successful authoritative mutation
+            // must stay successful. The next probe rebuilds after cache OOM.
+            self.deinit(alloc);
+        };
+    }
+
+    fn ensure(self: *@This(), alloc: Allocator, mutable: *const ActiveMemTable, bulk: *const State) !*const ActiveMemTable {
+        if (self.state == null) {
+            var state: ActiveMemTable = .{};
+            errdefer state.deinit(alloc);
+            for (0..mutable.entryCount()) |i| {
+                const entry = mutable.entryAt(i);
+                try state.upsert(alloc, namespaceOf(entry), entry.key, "", entry.tombstone);
+            }
+            for (0..bulk.entryCount()) |i| {
+                const entry = bulk.entryAt(i);
+                try state.upsert(alloc, namespaceOf(entry), entry.key, "", entry.tombstone);
+            }
+            self.state = state;
+        }
+        return &self.state.?;
+    }
+};
+
+/// Seek a pinned committed generation and merge only matching pending keys.
+/// No write-cursor snapshot or document payload copy is needed for admission.
+fn writerHasPrefix(comptime BackendType: type, writer: anytype, namespace: backend_types.Namespace, prefix: []const u8) !bool {
+    const overlay = try writer.prefix_index.ensure(writer.allocator, &writer.mutable, &writer.bulk_appends);
+    var index = overlay.lowerBound(namespace, prefix);
+    while (index < overlay.entryCount()) : (index += 1) {
+        const entry = overlay.entryAt(index);
+        if (compareNamespace(namespaceOf(entry), namespace) != .eq or !std.mem.startsWith(u8, entry.key, prefix)) break;
+        if (!entry.tombstone) return true;
+    }
+    var snapshot = capture: {
+        const locked = lockBackend(BackendType, writer.backend);
+        defer unlockBackend(BackendType, writer.backend, locked);
+        var base = try writer.backend.mutable.snapshot(writer.allocator);
+        errdefer base.deinit(writer.allocator);
+        const immutable = if (@hasDecl(BackendType, "snapshotImmutableMemtables")) try writer.backend.snapshotImmutableMemtables() else &.{};
+        errdefer releaseImmutableMemtableSnapshotList(BackendType, writer.backend, immutable);
+        var view = try RunReadView.pin(writer.backend, writer.metadata_allocator);
+        errdefer view.release(writer.backend);
+        try view.prepareCursor(writer.backend);
+        break :capture .{ .base = base, .immutable = immutable, .view = view };
+    };
+    defer {
+        const locked = lockBackend(BackendType, writer.backend);
+        defer unlockBackend(BackendType, writer.backend, locked);
+        snapshot.view.release(writer.backend);
+        releaseImmutableMemtableSnapshotList(BackendType, writer.backend, snapshot.immutable);
+        snapshot.base.deinit(writer.allocator);
+    }
+    const upper = try writer.metadata_allocator.dupe(u8, prefix);
+    defer writer.metadata_allocator.free(upper);
+    var upper_len = upper.len;
+    while (upper_len > 0 and upper[upper_len - 1] == 255) upper_len -= 1;
+    if (upper_len > 0) upper[upper_len - 1] += 1;
+    var cursor = try MergeCursor(BackendType, State).initView(writer.metadata_allocator, writer.backend, &snapshot.base, snapshot.immutable, snapshot.view, namespace, false);
+    if (upper_len > 0) cursor.setUpperBound(upper[0..upper_len]);
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(prefix);
+    while (row) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, prefix)) break;
+        if (overlay.findIndex(namespace, entry.key) == null) return true;
+        row = try cursor.next();
+    }
+    return false;
+}
+
 fn bulkStateHasDuplicateKeys(allocator: Allocator, state: *const State) !bool {
     var index: std.AutoHashMapUnmanaged(u64, std.ArrayListUnmanaged(usize)) = .{};
     defer {
@@ -160,11 +280,11 @@ fn releaseHeldValues(held_values: *std.ArrayListUnmanaged([]u8), allocator: Allo
     held_values.* = .empty;
 }
 
-fn recordCursorValueBorrow(backend: anytype) void {
+pub fn recordCursorValueBorrow(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorValueBorrow")) backend.recordCursorValueBorrow();
 }
 
-fn recordCursorValueCopy(backend: anytype) void {
+pub fn recordCursorValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorValueCopy")) backend.recordCursorValueCopy();
 }
 
@@ -184,19 +304,19 @@ fn restoreCursorScanValueStats(cursor: anytype, previous: ?bool) void {
     }
 }
 
-fn recordPointValueBorrow(backend: anytype) void {
+pub fn recordPointValueBorrow(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointValueBorrow")) backend.recordPointValueBorrow();
 }
 
-fn recordPointValueCopy(backend: anytype) void {
+pub fn recordPointValueCopy(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointValueCopy")) backend.recordPointValueCopy();
 }
 
-fn recordPointRunPrecheck(backend: anytype) void {
+pub fn recordPointRunPrecheck(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointRunPrecheck")) backend.recordPointRunPrecheck();
 }
 
-fn recordPointRunPrecheckSurvivor(backend: anytype) void {
+pub fn recordPointRunPrecheckSurvivor(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPointRunPrecheckSurvivor")) backend.recordPointRunPrecheckSurvivor();
 }
 
@@ -206,7 +326,7 @@ fn canBorrowReaderRetainedState(backend: anytype) bool {
     return @hasField(BackendType, "active_readers") and backend.active_readers > 0;
 }
 
-fn retainActiveMutableValueReader(backend: anytype) bool {
+pub fn retainActiveMutableValueReader(backend: anytype) bool {
     if (@hasDecl(@TypeOf(backend.*), "retainActiveMutableValueReader")) {
         backend.retainActiveMutableValueReader();
         return true;
@@ -214,12 +334,12 @@ fn retainActiveMutableValueReader(backend: anytype) bool {
     return false;
 }
 
-fn releaseActiveMutableValueReader(backend: anytype, retained: bool) void {
+pub fn releaseActiveMutableValueReader(backend: anytype, retained: bool) void {
     if (!retained) return;
     if (@hasDecl(@TypeOf(backend.*), "releaseActiveMutableValueReader")) backend.releaseActiveMutableValueReader();
 }
 
-fn canBorrowActiveMutableValues(backend: anytype) bool {
+pub fn canBorrowActiveMutableValues(backend: anytype) bool {
     if (@hasDecl(@TypeOf(backend.*), "canBorrowActiveMutableValues")) return backend.canBorrowActiveMutableValues();
     return false;
 }
@@ -229,7 +349,7 @@ fn shouldRetainActiveMutableValueReader(backend: anytype) bool {
     return true;
 }
 
-fn prepareMutableForWrite(backend: anytype) !void {
+pub fn prepareMutableForWrite(backend: anytype) !void {
     if (@hasDecl(@TypeOf(backend.*), "prepareMutableForWrite")) try backend.prepareMutableForWrite();
 }
 
@@ -256,19 +376,19 @@ fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *Acti
     }
 }
 
-fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTable) !void {
+pub fn enforceMutableWriteAdmission(backend: anytype, incoming: *const ActiveMemTable) !void {
     if (@hasDecl(@TypeOf(backend.*), "enforceMutableWriteAdmission")) {
         try backend.enforceMutableWriteAdmission(incoming);
     }
 }
 
-fn enforceSortedWriteAdmission(backend: anytype, incoming: *const State) !void {
+pub fn enforceSortedWriteAdmission(backend: anytype, incoming: *const State) !void {
     if (@hasDecl(@TypeOf(backend.*), "enforceSortedWriteAdmission")) {
         try backend.enforceSortedWriteAdmission(incoming);
     }
 }
 
-fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
+pub fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
     const BackendType = @TypeOf(backend.*);
     if (@hasDecl(BackendType, "noteWriteMutationLocked")) {
         backend.noteWriteMutationLocked();
@@ -279,25 +399,25 @@ fn notePotentialMaintenanceDebtLocked(backend: anytype) void {
     }
 }
 
-fn finishCommittedWalAppend(backend: anytype) void {
+pub fn finishCommittedWalAppend(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "finishCommittedWalAppend")) {
         backend.finishCommittedWalAppend();
     }
 }
 
-fn recordCursorBlockReadahead(backend: anytype) void {
+pub fn recordCursorBlockReadahead(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorBlockReadahead")) backend.recordCursorBlockReadahead();
 }
 
-fn recordCursorTableIndexHit(backend: anytype) void {
+pub fn recordCursorTableIndexHit(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorTableIndexHit")) backend.recordCursorTableIndexHit();
 }
 
-fn recordCursorTableIndexMiss(backend: anytype) void {
+pub fn recordCursorTableIndexMiss(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordCursorTableIndexMiss")) backend.recordCursorTableIndexMiss();
 }
 
-fn recordPrefixBloomNegative(backend: anytype) void {
+pub fn recordPrefixBloomNegative(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordPrefixBloomNegative")) {
         backend.recordPrefixBloomNegative();
     } else if (@hasDecl(@TypeOf(backend.*), "recordBloomNegative")) {
@@ -305,7 +425,7 @@ fn recordPrefixBloomNegative(backend: anytype) void {
     }
 }
 
-fn recordBlockPrefixBloomNegative(backend: anytype) void {
+pub fn recordBlockPrefixBloomNegative(backend: anytype) void {
     if (@hasDecl(@TypeOf(backend.*), "recordBlockPrefixBloomNegative")) {
         backend.recordBlockPrefixBloomNegative();
     } else if (@hasDecl(@TypeOf(backend.*), "recordBloomNegative")) {
@@ -341,7 +461,7 @@ fn runtimeScratchAllocator(fallback: Allocator) Allocator {
     return std.heap.smp_allocator;
 }
 
-fn localBlockCacheEnabled(backend: anytype) bool {
+pub fn localBlockCacheEnabled(backend: anytype) bool {
     if (@hasDecl(@TypeOf(backend.*), "localBlockCacheEnabled")) {
         return backend.localBlockCacheEnabled();
     }
@@ -384,7 +504,7 @@ const RunGroup = struct {
     largest_key: []const u8,
     run_indices: []usize,
 
-    fn deinit(self: *RunGroup, allocator: Allocator) void {
+    pub fn deinit(self: *RunGroup, allocator: Allocator) void {
         allocator.free(self.run_indices);
         self.* = undefined;
     }
@@ -2480,7 +2600,7 @@ const RunBatchIndexState = struct {
     // block cache so dense adjacent batches retain their amortized path.
     direct_prefix_block_index: ?usize = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.handle.release();
         if (self.block_handle) |*handle| handle.release();
         self.* = undefined;
@@ -2507,7 +2627,7 @@ const RunBatchIndexHandles = struct {
     allocator: Allocator,
     items: std.ArrayListUnmanaged(RunBatchIndexState) = .empty,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         for (self.items.items) |*item| item.deinit();
         self.items.deinit(self.allocator);
         self.* = undefined;
@@ -3194,7 +3314,7 @@ fn CurrentReadLayout(comptime BackendType: type) type {
             return layout;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.mutable_snapshot) |snapshot| snapshot.release(self.backend);
             self.read_view.release(self.backend);
             releaseImmutableMemtableSnapshotList(BackendType, self.backend, self.immutable_memtables);
@@ -3488,7 +3608,7 @@ fn releaseImmutableMemtableSnapshotList(
     }
 }
 
-fn releaseImmutableMemtablePins(
+pub fn releaseImmutableMemtablePins(
     comptime BackendType: type,
     backend: *BackendType,
     snapshot: []const *const State,
@@ -3501,7 +3621,7 @@ fn releaseImmutableMemtablePins(
 /// Release the exact shared mutable generation returned by
 /// `snapshotMutableStateWithReason`. Fallback backends return owned snapshots
 /// and do not implement this hook.
-fn releaseMutableReadSnapshot(
+pub fn releaseMutableReadSnapshot(
     comptime BackendType: type,
     backend: *BackendType,
     snapshot: *const State,
@@ -4029,7 +4149,7 @@ pub fn BoundCurrentScanTxn(comptime BackendType: type) type {
             };
         }
 
-        fn deinitOwned(self: *@This(), backend: *BackendType) void {
+        pub fn deinitOwned(self: *@This(), backend: *BackendType) void {
             switch (self.*) {
                 .owned => |state| {
                     if (@hasDecl(BackendType, "retireOwnedMutableSnapshot")) {
@@ -4339,6 +4459,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         namespace: backend_types.Namespace,
         mutable: ActiveMemTable,
         bulk_appends: State = .{},
+        bulk_index: BulkAppendIndex = .{},
+        prefix_index: WriterPrefixIndex = .{},
         cursor_overlay: ?State = null,
         cursor_base_mutable: ?State = null,
         cursor_immutable_memtables: []const *const State = &.{},
@@ -4375,6 +4497,8 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         pub fn abort(self: *@This()) void {
             if (self.closed) return;
             const backend = self.backend;
+            self.bulk_index.deinit(self.allocator);
+            self.prefix_index.deinit(self.allocator);
             self.mutable.deinit(self.allocator);
             self.bulk_appends.deinit(self.allocator);
             self.invalidateCursorSnapshot();
@@ -4389,6 +4513,10 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         pub fn commit(self: *@This()) !void {
             if (self.closed) return error.TransactionClosed;
+            defer if (self.closed) {
+                self.bulk_index.deinit(self.allocator);
+                self.prefix_index.deinit(self.allocator);
+            };
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
@@ -4466,6 +4594,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         fn drainBulkAppendsToMutable(self: *@This()) !void {
             if (self.bulk_appends.entryCount() == 0) return;
             try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+            self.bulk_index.clear();
         }
 
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
@@ -4511,7 +4640,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
 
             const duplicate_check_start_ns = platform_time.monotonicNs();
-            if (try bulkStateHasDuplicateKeys(self.allocator, &self.bulk_appends)) {
+            if (self.bulk_index.entries.count() != entries) {
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, elapsedNs(duplicate_check_start_ns));
                 try self.drainBulkAppendsToMutable();
                 return false;
@@ -4643,14 +4772,9 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
 
         pub fn get(self: *@This(), key: []const u8) ![]const u8 {
             if (self.closed) return error.TransactionClosed;
-            var bulk_idx = self.bulk_appends.entryCount();
-            while (bulk_idx > 0) {
-                bulk_idx -= 1;
-                const entry = self.bulk_appends.entryAt(bulk_idx);
-                if (compareEntryTo(entry, self.namespace, key) == .eq) {
-                    if (entry.tombstone) return error.NotFound;
-                    return entry.value;
-                }
+            if (self.bulk_index.get(&self.bulk_appends, self.namespace, key)) |entry| {
+                if (entry.tombstone) return error.NotFound;
+                return entry.value;
             }
             if (self.mutable.findIndex(self.namespace, key)) |idx| {
                 const entry = self.mutable.entryAt(idx);
@@ -4734,19 +4858,13 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
             for (keys, 0..) |key, i| {
-                var bulk_idx = self.bulk_appends.entryCount();
-                while (bulk_idx > 0) {
-                    bulk_idx -= 1;
-                    const entry = self.bulk_appends.entryAt(bulk_idx);
-                    if (compareEntryTo(entry, self.namespace, key) == .eq) {
-                        overlay_point_gets += 1;
-                        if (entry.tombstone) {
-                            misses += 1;
-                        } else {
-                            values[i] = entry.value;
-                            hits += 1;
-                        }
-                        break;
+                if (self.bulk_index.get(&self.bulk_appends, self.namespace, key)) |entry| {
+                    overlay_point_gets += 1;
+                    if (entry.tombstone) {
+                        misses += 1;
+                    } else {
+                        values[i] = entry.value;
+                        hits += 1;
                     }
                 } else {
                     if (self.mutable.findIndex(self.namespace, key)) |idx| {
@@ -4808,18 +4926,20 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, self.namespace, key, value, false);
             self.invalidateCursorSnapshot();
+            self.prefix_index.record(self.allocator, self.namespace, key, false);
         }
 
         pub fn appendPut(self: *@This(), key: []const u8, value: []const u8) !void {
             if (self.closed) return error.TransactionClosed;
             if (self.batch_options.mode == .bulk_ingest and self.mutable.entryCount() == 0) {
-                const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
-                try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, self.namespace, key, value, false));
+                try self.bulk_index.append(self.allocator, &self.bulk_appends, self.namespace, key, value);
                 self.invalidateCursorSnapshot();
+                self.prefix_index.record(self.allocator, self.namespace, key, false);
                 return;
             }
             try self.mutable.appendUpsert(self.allocator, self.namespace, key, value, false);
             self.invalidateCursorSnapshot();
+            self.prefix_index.record(self.allocator, self.namespace, key, false);
         }
 
         pub fn delete(self: *@This(), key: []const u8) !void {
@@ -4827,6 +4947,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, self.namespace, key, "", true);
             self.invalidateCursorSnapshot();
+            self.prefix_index.record(self.allocator, self.namespace, key, true);
+        }
+
+        pub fn hasPrefix(self: *@This(), prefix: []const u8) !bool {
+            if (self.closed) return error.TransactionClosed;
+            return writerHasPrefix(BackendType, self, self.namespace, prefix);
         }
 
         pub fn openCursor(self: *@This()) !LocalCursor {
@@ -7644,6 +7770,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         backend: *BackendType,
         mutable: ActiveMemTable,
         bulk_appends: State = .{},
+        bulk_index: BulkAppendIndex = .{},
+        prefix_index: WriterPrefixIndex = .{},
         cursor_overlay: ?State = null,
         cursor_base_mutable: ?State = null,
         cursor_read_view: ?RunReadView = null,
@@ -7679,6 +7807,8 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         pub fn abort(self: *@This()) void {
             if (self.closed) return;
             const backend = self.backend;
+            self.bulk_index.deinit(self.allocator);
+            self.prefix_index.deinit(self.allocator);
             self.mutable.deinit(self.allocator);
             self.bulk_appends.deinit(self.allocator);
             self.invalidateCursorSnapshot();
@@ -7693,6 +7823,10 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         pub fn commit(self: *@This()) !void {
             if (self.closed) return error.TransactionClosed;
+            defer if (self.closed) {
+                self.bulk_index.deinit(self.allocator);
+                self.prefix_index.deinit(self.allocator);
+            };
             const wire_credit = if (comptime @hasDecl(BackendType, "prepareManifestCredit")) try self.backend.prepareManifestCredit(&self.mutable, &self.bulk_appends) else 0;
             const locked = lockBackend(BackendType, self.backend);
             defer unlockBackend(BackendType, self.backend, locked);
@@ -7770,6 +7904,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         fn drainBulkAppendsToMutable(self: *@This()) !void {
             if (self.bulk_appends.entryCount() == 0) return;
             try state_mod.applyStateMoveToMutable(&self.mutable, self.allocator, &self.bulk_appends);
+            self.bulk_index.clear();
         }
 
         fn tryCommitDirectBulkAppends(self: *@This()) !bool {
@@ -7815,7 +7950,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             if (@hasDecl(BackendType, "recordBulkAppendAttempt")) self.backend.recordBulkAppendAttempt(entries);
 
             const duplicate_check_start_ns = platform_time.monotonicNs();
-            if (try bulkStateHasDuplicateKeys(self.allocator, &self.bulk_appends)) {
+            if (self.bulk_index.entries.count() != entries) {
                 if (@hasDecl(BackendType, "recordBulkAppendFallbackDuplicateKeys")) self.backend.recordBulkAppendFallbackDuplicateKeys(entries, elapsedNs(duplicate_check_start_ns));
                 try self.drainBulkAppendsToMutable();
                 return false;
@@ -7947,14 +8082,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
 
         pub fn get(self: *@This(), namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
             if (self.closed) return error.TransactionClosed;
-            var bulk_idx = self.bulk_appends.entryCount();
-            while (bulk_idx > 0) {
-                bulk_idx -= 1;
-                const entry = self.bulk_appends.entryAt(bulk_idx);
-                if (compareEntryTo(entry, namespace, key) == .eq) {
-                    if (entry.tombstone) return error.NotFound;
-                    return entry.value;
-                }
+            if (self.bulk_index.get(&self.bulk_appends, namespace, key)) |entry| {
+                if (entry.tombstone) return error.NotFound;
+                return entry.value;
             }
             if (self.mutable.findIndex(namespace, key)) |idx| {
                 const entry = self.mutable.entryAt(idx);
@@ -7994,15 +8124,9 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             var miss_count: usize = 0;
             var overlay_point_gets: usize = 0;
             for (keys, 0..) |key, i| {
-                var bulk_idx = self.bulk_appends.entryCount();
-                while (bulk_idx > 0) {
-                    bulk_idx -= 1;
-                    const entry = self.bulk_appends.entryAt(bulk_idx);
-                    if (compareEntryTo(entry, namespace, key) == .eq) {
-                        overlay_point_gets += 1;
-                        if (!entry.tombstone) values[i] = entry.value;
-                        break;
-                    }
+                if (self.bulk_index.get(&self.bulk_appends, namespace, key)) |entry| {
+                    overlay_point_gets += 1;
+                    if (!entry.tombstone) values[i] = entry.value;
                 } else if (self.mutable.findIndex(namespace, key)) |idx| {
                     overlay_point_gets += 1;
                     const entry = self.mutable.entryAt(idx);
@@ -8035,18 +8159,20 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, namespace, key, value, false);
             self.invalidateCursorSnapshot();
+            self.prefix_index.record(self.allocator, namespace, key, false);
         }
 
         pub fn appendPut(self: *@This(), namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
             if (self.closed) return error.TransactionClosed;
             if (self.batch_options.mode == .bulk_ingest and self.mutable.entryCount() == 0) {
-                const entry_allocator = try self.bulk_appends.ensureArenaAllocator(self.allocator);
-                try self.bulk_appends.entries.append(self.allocator, try state_mod.initArenaEntry(entry_allocator, namespace, key, value, false));
+                try self.bulk_index.append(self.allocator, &self.bulk_appends, namespace, key, value);
                 self.invalidateCursorSnapshot();
+                self.prefix_index.record(self.allocator, namespace, key, false);
                 return;
             }
             try self.mutable.appendUpsert(self.allocator, namespace, key, value, false);
             self.invalidateCursorSnapshot();
+            self.prefix_index.record(self.allocator, namespace, key, false);
         }
 
         pub fn delete(self: *@This(), namespace: backend_types.Namespace, key: []const u8) !void {
@@ -8054,6 +8180,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             try self.drainBulkAppendsToMutable();
             try self.mutable.upsert(self.allocator, namespace, key, "", true);
             self.invalidateCursorSnapshot();
+            self.prefix_index.record(self.allocator, namespace, key, true);
+        }
+
+        pub fn hasPrefix(self: *@This(), namespace: backend_types.Namespace, prefix: []const u8) !bool {
+            if (self.closed) return error.TransactionClosed;
+            return writerHasPrefix(BackendType, self, namespace, prefix);
         }
 
         pub fn openCursor(self: *@This(), namespace: backend_types.Namespace) !LocalCursor {
@@ -8155,11 +8287,11 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
         retained_readers: usize = 0,
         active_batches: usize = 0,
 
-        fn retainReader(self: *@This()) void {
+        pub fn retainReader(self: *@This()) void {
             self.retained_readers += 1;
         }
 
-        fn releaseReader(self: *@This()) void {
+        pub fn releaseReader(self: *@This()) void {
             std.debug.assert(self.retained_readers > 0);
             self.retained_readers -= 1;
         }
@@ -8179,7 +8311,7 @@ test "lsm namespace write txn keeps merged mutable state when flush fails after 
 
         fn finalizeExitedBatchMode(_: *@This(), _: backend_types.BatchOptions) !void {}
 
-        fn finalizeWriteReaderRelease(_: *@This()) !void {}
+        pub fn finalizeWriteReaderRelease(_: *@This()) !void {}
 
         fn getMergedWithOverlay(
             _: *@This(),
@@ -8222,11 +8354,11 @@ test "lsm namespace write txn releases local mutable state when wal append fails
         retained_readers: usize = 0,
         active_batches: usize = 0,
 
-        fn retainReader(self: *@This()) void {
+        pub fn retainReader(self: *@This()) void {
             self.retained_readers += 1;
         }
 
-        fn releaseReader(self: *@This()) void {
+        pub fn releaseReader(self: *@This()) void {
             std.debug.assert(self.retained_readers > 0);
             self.retained_readers -= 1;
         }
@@ -8240,7 +8372,7 @@ test "lsm namespace write txn releases local mutable state when wal append fails
             self.active_batches -= 1;
         }
 
-        fn appendWalForState(_: *@This(), _: *const State) !void {
+        pub fn appendWalForState(_: *@This(), _: *const State) !void {
             return error.InjectedWalFailure;
         }
 
@@ -8248,7 +8380,7 @@ test "lsm namespace write txn releases local mutable state when wal append fails
 
         fn finalizeExitedBatchMode(_: *@This(), _: backend_types.BatchOptions) !void {}
 
-        fn finalizeWriteReaderRelease(_: *@This()) !void {}
+        pub fn finalizeWriteReaderRelease(_: *@This()) !void {}
     };
 
     var backend = TestBackend{
@@ -8618,4 +8750,50 @@ test "lsm merge cursor caps retained mutable source scratch" {
 
     _ = try cursor.mutableSourceEntryScratch(Cursor.min_retained_mutable_source_entry_scratch + 1);
     try std.testing.expectEqual(Cursor.min_retained_mutable_source_entry_scratch * 2, cursor.mutable_source_entry_bytes.?.len);
+}
+
+test "bulk append index preserves namespaces duplicates and allocation failure atomicity" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var state: State = .{};
+            defer state.deinit(alloc);
+            var index: BulkAppendIndex = .{};
+            defer index.deinit(alloc);
+            try index.append(alloc, &state, .{}, "key", "first");
+            try index.append(alloc, &state, .{ .name = "other" }, "key", "other");
+            index.append(alloc, &state, .{}, "key", "last") catch |err| {
+                try std.testing.expectEqualStrings("first", index.get(&state, .{}, "key").?.value);
+                try std.testing.expectEqualStrings("other", index.get(&state, .{ .name = "other" }, "key").?.value);
+                return err;
+            };
+            try std.testing.expectEqualStrings("last", index.get(&state, .{}, "key").?.value);
+            try std.testing.expectEqualStrings("other", index.get(&state, .{ .name = "other" }, "key").?.value);
+            try std.testing.expect(index.get(&state, .{}, "missing") == null);
+            index.clear();
+            try std.testing.expect(index.get(&state, .{}, "key") == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
+}
+
+test "bulk append index prefix cache releases partial allocations and invalidates failed updates" {
+    const Fixture = struct {
+        fn run(alloc: Allocator) !void {
+            var mutable: ActiveMemTable = .{ .ordered_enabled = false };
+            defer mutable.deinit(alloc);
+            var bulk: State = .{};
+            defer bulk.deinit(alloc);
+            var prefix: WriterPrefixIndex = .{};
+            defer prefix.deinit(alloc);
+            try mutable.upsert(alloc, .{}, "a", "old", false);
+            _ = try prefix.ensure(alloc, &mutable, &bulk);
+            try mutable.upsert(alloc, .{}, "b", "new", false);
+            prefix.record(alloc, .{}, "b", false);
+            try std.testing.expectEqualStrings("new", try mutable.get(.{}, "b"));
+            const index = try prefix.ensure(alloc, &mutable, &bulk);
+            try std.testing.expect(index.findIndex(.{}, "a") != null);
+            try std.testing.expect(index.findIndex(.{}, "b") != null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

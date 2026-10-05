@@ -338,7 +338,7 @@ const PullReport = struct {
     file: []u8,
     progress: capi.InferencePullProgress,
 
-    fn deinit(self: *PullReport) void {
+    pub fn deinit(self: *PullReport) void {
         alloc.free(self.model);
         alloc.free(self.file);
     }
@@ -480,7 +480,7 @@ pub export fn antfly_inference_pull_json(
 const StreamEvent = struct {
     data: []u8,
 
-    fn deinit(self: *StreamEvent) void {
+    pub fn deinit(self: *StreamEvent) void {
         alloc.free(self.data);
     }
 };
@@ -578,7 +578,7 @@ const StreamCall = struct {
 
     fn cancel(_: *StreamCall) void {}
 
-    fn deinit(self: *StreamCall) void {
+    pub fn deinit(self: *StreamCall) void {
         self.pending.deinit(alloc);
         if (self.stream_error) |message| alloc.free(message);
         if (self.response) |response| alloc.free(response.body);
@@ -725,7 +725,7 @@ test "capi inference calls reject null, closed, and database handles" {
     try std.testing.expectEqual(capi.ErrorCode.invalid_argument, antfly_inference_list_models_json(handle, &out));
 }
 
-test "capi inference lists models and reports route errors with the runtime's JSON" {
+test "capi inference lists models and reports route errors with the runtime JSON" {
     if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
     var test_tmp = try db.TestDirectoryType.init("capi-inference");
     defer test_tmp.cleanup();
@@ -906,7 +906,7 @@ test "capi inference pull rejects invalid requests with a JSON error" {
 // Downloads from the model hub, so it runs only when
 // ANTFLY_INFERENCE_PULL_TEST_MODEL names a (small) model to pull, e.g.
 // sparse-encoder-testing/splade-bert-tiny-nq-onnx.
-test "capi inference pulls a model with progress into the handle's models directory" {
+test "capi inference pulls a model with progress into the handle models directory" {
     if (!db.localInferenceRuntimeAvailable()) return error.SkipZigTest;
     const model = std.mem.span(std.c.getenv("ANTFLY_INFERENCE_PULL_TEST_MODEL") orelse return error.SkipZigTest);
     var test_tmp = try db.TestDirectoryType.init("capi-inference-pull");

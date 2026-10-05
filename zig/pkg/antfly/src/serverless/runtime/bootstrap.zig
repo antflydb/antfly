@@ -145,7 +145,7 @@ const S3ClientPool = struct {
         return .{ .alloc = alloc, .io_impl = io_impl };
     }
 
-    fn deinit(self: *S3ClientPool) void {
+    pub fn deinit(self: *S3ClientPool) void {
         for (self.entries.items) |*entry| {
             entry.client.deinit();
             if (entry.credential_context) |context| {
@@ -218,7 +218,7 @@ const GcsClientPool = struct {
         return .{ .alloc = alloc, .io = io };
     }
 
-    fn deinit(self: *GcsClientPool) void {
+    pub fn deinit(self: *GcsClientPool) void {
         for (self.entries.items) |*entry| {
             entry.client.deinit();
             self.alloc.destroy(entry.impl);
@@ -323,7 +323,7 @@ const OwnedS3Target = struct {
     bucket: []u8,
     prefix: []u8,
 
-    fn deinit(self: *OwnedS3Target, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedS3Target, alloc: Allocator) void {
         alloc.free(self.bucket);
         alloc.free(self.prefix);
         self.* = undefined;
@@ -334,7 +334,7 @@ const OwnedGcsTarget = struct {
     bucket: []u8,
     prefix: []u8,
 
-    fn deinit(self: *OwnedGcsTarget, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedGcsTarget, alloc: Allocator) void {
         alloc.free(self.bucket);
         alloc.free(self.prefix);
         self.* = undefined;

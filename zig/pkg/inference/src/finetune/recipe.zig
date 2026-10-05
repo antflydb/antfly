@@ -437,7 +437,7 @@ const TrainableParameterSnapshot = struct {
         return .{ .allocator = allocator, .tensors = tensors };
     }
 
-    fn deinit(self: *TrainableParameterSnapshot) void {
+    pub fn deinit(self: *TrainableParameterSnapshot) void {
         for (self.tensors) |tensor| self.allocator.free(tensor);
         self.allocator.free(self.tensors);
         self.* = undefined;
@@ -1000,7 +1000,7 @@ fn copySmokeArtifactFromQwenTokenizerBundle(
     if (c_file.fileExists(allocator, src_path)) {
         const contents = try c_file.readFile(allocator, src_path);
         defer allocator.free(contents);
-        try compat.cwd().writeFile(io, .{ .sub_path = dst_path, .data = contents });
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst_path, .data = contents });
         return;
     }
 
@@ -1158,8 +1158,8 @@ fn writeOwnedTextFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8
 }
 
 fn writeTextFile(io: std.Io, path: []const u8, contents: []const u8) !void {
-    if (std.fs.path.dirname(path)) |dir_name| try compat.cwd().createDirPath(io, dir_name);
-    try compat.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
+    if (std.fs.path.dirname(path)) |dir_name| try std.Io.Dir.cwd().createDirPath(io, dir_name);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = contents });
 }
 
 fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tensors: []const WriteTensorF32) !void {
@@ -1185,14 +1185,14 @@ fn writeHeaderAndTensorsF32(allocator: std.mem.Allocator, path: []const u8, tens
     }
     try writer.writeByte('}');
 
-    var file = try compat.cwd().createFile(compat.io(), path, .{ .truncate = true });
-    defer file.close(compat.io());
+    var file = try std.Io.Dir.cwd().createFile(compat.testingIo(), path, .{ .truncate = true });
+    defer file.close(compat.testingIo());
 
     var len_buf: [8]u8 = undefined;
     std.mem.writeInt(u64, &len_buf, header_buf.written().len, .little);
-    try file.writeStreamingAll(compat.io(), &len_buf);
-    try file.writeStreamingAll(compat.io(), header_buf.written());
-    for (tensors) |tensor| try file.writeStreamingAll(compat.io(), std.mem.sliceAsBytes(tensor.data));
+    try file.writeStreamingAll(compat.testingIo(), &len_buf);
+    try file.writeStreamingAll(compat.testingIo(), header_buf.written());
+    for (tensors) |tensor| try file.writeStreamingAll(compat.testingIo(), std.mem.sliceAsBytes(tensor.data));
 }
 
 fn makeFilledF32(allocator: std.mem.Allocator, len: usize, value: f32) ![]f32 {
@@ -3172,7 +3172,7 @@ const DpoBatchOwned = struct {
     rejected_lengths: []u32,
     sft_chosen_loss: []f32,
 
-    fn deinit(self: DpoBatchOwned, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: DpoBatchOwned, allocator: std.mem.Allocator) void {
         allocator.free(self.policy_chosen_logps);
         allocator.free(self.policy_rejected_logps);
         allocator.free(self.ref_chosen_logps);
@@ -3199,7 +3199,7 @@ const DpoPreferenceSamplesOwned = struct {
     arena: std.heap.ArenaAllocator,
     samples: []const preference_harness.PreferenceSample,
 
-    fn deinit(self: *DpoPreferenceSamplesOwned) void {
+    pub fn deinit(self: *DpoPreferenceSamplesOwned) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -3208,7 +3208,7 @@ const DpoPreferenceSamplesOwned = struct {
 const SftPreparedExamplesOwned = struct {
     examples: []gemma4.PreparedExampleInput,
 
-    fn deinit(self: *SftPreparedExamplesOwned, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SftPreparedExamplesOwned, allocator: std.mem.Allocator) void {
         for (self.examples) |*example| freeGemmaPreparedExample(allocator, example);
         allocator.free(self.examples);
         self.* = undefined;
@@ -3227,7 +3227,7 @@ const GrpoPromptBatchOwned = struct {
     prompts: []const []const i32,
     targets: []const []const u8,
 
-    fn deinit(self: *GrpoPromptBatchOwned) void {
+    pub fn deinit(self: *GrpoPromptBatchOwned) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -3239,7 +3239,7 @@ const GemmaPreparedPromptBatchOwned = struct {
     summaries: []gemma4.PreparedInputsSummary,
     targets: []const []const u8,
 
-    fn deinit(self: *GemmaPreparedPromptBatchOwned) void {
+    pub fn deinit(self: *GemmaPreparedPromptBatchOwned) void {
         for (self.summaries) |*summary| gemma4.freePreparedInputsSummary(self.allocator, summary);
         self.allocator.free(self.prompts);
         self.allocator.free(self.summaries);
@@ -3604,7 +3604,7 @@ fn runOptimizerBackedQwen2Sft(
     try validateNonGemmaAdapterOptions(adapter);
     const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .lora_sft),
             .alpha = adapterAlpha(adapter),
@@ -3690,7 +3690,7 @@ const DpoTextRowsOwned = struct {
     arena: std.heap.ArenaAllocator,
     rows: []DpoTextRow,
 
-    fn deinit(self: *DpoTextRowsOwned) void {
+    pub fn deinit(self: *DpoTextRowsOwned) void {
         self.arena.deinit();
         self.* = undefined;
     }
@@ -3719,9 +3719,10 @@ fn loadDpoTextRows(
         try rows.append(aa, try std.json.parseFromSliceLeaky(DpoTextRow, aa, line, .{ .ignore_unknown_fields = true }));
     }
     if (rows.items.len == 0) return error.EmptyBatch;
+    const owned_result_rows = try rows.toOwnedSlice(aa);
     return .{
         .arena = arena,
-        .rows = try rows.toOwnedSlice(aa),
+        .rows = owned_result_rows,
     };
 }
 
@@ -3832,7 +3833,7 @@ fn runOptimizerBackedGemmaDpo(
     try validateGemmaPreferenceLifecycleOptions(recipe);
     try validateGemmaDpoObjectiveOptions(recipe);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .dpo),
             .alpha = adapterAlpha(adapter),
@@ -4102,7 +4103,7 @@ fn runOptimizerBackedQwen2Dpo(
     try validateNonGemmaAdapterOptions(adapter);
     const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .dpo),
             .alpha = adapterAlpha(adapter),
@@ -4353,7 +4354,7 @@ fn runOptimizerBackedGemmaGrpo(
     try validateGemmaPreferenceLifecycleOptions(recipe);
     try validateGemmaGrpoObjectiveOptions(recipe);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try gemma4.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .grpo),
             .alpha = adapterAlpha(adapter),
@@ -4712,7 +4713,7 @@ fn runOptimizerBackedQwen2Grpo(
     try validateNonGemmaAdapterOptions(adapter);
     const bootstrap_target_modules = try adapterTargetModulesForQwen(adapter, default_target_modules);
 
-    compat.cwd().access(compat.io(), bootstrap_dir, .{}) catch {
+    std.Io.Dir.cwd().access(compat.testingIo(), bootstrap_dir, .{}) catch {
         var bootstrap = try colqwen2.bootstrapLoRABundle(allocator, base_model_dir, bootstrap_dir, .{
             .rank = adapterRank(adapter, .grpo),
             .alpha = adapterAlpha(adapter),
@@ -5633,7 +5634,7 @@ const GrpoBatchOwned = struct {
     new_logps: []f32,
     rewards: []f32,
 
-    fn deinit(self: *GrpoBatchOwned) void {
+    pub fn deinit(self: *GrpoBatchOwned) void {
         self.allocator.free(self.completions);
         self.allocator.free(self.new_logps);
         self.allocator.free(self.rewards);
@@ -6077,7 +6078,7 @@ fn isQwen35Family(family: []const u8) bool {
 }
 
 fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    return std.ascii.indexOfIgnoreCase(haystack, needle) != null;
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
 }
 
 fn containsQwen35Signal(path: []const u8) bool {

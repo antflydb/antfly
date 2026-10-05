@@ -61,7 +61,7 @@ const Rows = struct {
     arena: std.heap.ArenaAllocator,
     items: []const Row,
     exhausted: bool,
-    fn deinit(self: *Rows) void {
+    pub fn deinit(self: *Rows) void {
         self.arena.deinit();
     }
 };

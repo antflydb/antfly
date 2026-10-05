@@ -86,7 +86,7 @@ pub const FileSnapshotStore = struct {
     cfg: FileSnapshotStoreConfig,
     io_impl: std.Io.Threaded,
     root_dir: []u8,
-    upload_locks: [1024]std.atomic.Mutex = [_]std.atomic.Mutex{.unlocked} ** 1024,
+    upload_locks: [1024]std.atomic.Mutex = @as([1024]std.atomic.Mutex, @splat(.unlocked)),
     artifact_ledger_mutex: std.atomic.Mutex = .unlocked,
     artifact_usage: ArtifactUsage = .{},
     artifact_reserved: ArtifactUsage = .{},

@@ -131,6 +131,7 @@ pub const TableApi = struct {
         CommittedGraphMetricMaterializationRejected,
         WriteOutcomeUnknown,
         DocIdentityUnavailable,
+        ExternalLakeReadOnly,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
         HAFencedPrimary,
@@ -812,6 +813,7 @@ pub const storage_read_temporarily_unavailable_retry_after_seconds: u32 = 1;
 /// Stable, machine-readable reasons for a retryable query 503. Keep this set in
 /// sync with QueryTemporarilyUnavailableError in the public OpenAPI contract.
 pub const QueryTemporarilyUnavailableReason = enum {
+    decision_provider_unavailable,
     doc_identity_unavailable,
     read_requires_primary,
     standby_read_unavailable,
@@ -827,6 +829,7 @@ pub fn queryTemporarilyUnavailableOwnedResponse(
     reason: QueryTemporarilyUnavailableReason,
 ) !OwnedResponse {
     const message: []const u8 = switch (reason) {
+        .decision_provider_unavailable => "decision provider unavailable",
         .doc_identity_unavailable => "doc identity unavailable",
         .read_requires_primary => "read requires primary",
         .standby_read_unavailable => "standby read unavailable",
@@ -1801,6 +1804,7 @@ fn executeOwnedTableBatch(alloc: std.mem.Allocator, table_name: []const u8, batc
         // commit result instead of blindly replaying non-idempotent transforms.
         error.WriteOutcomeUnknown => return .{ .status = 409, .body = try alloc.dupe(u8, "write outcome unknown") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.ExternalLakeReadOnly => return .{ .status = 400, .body = try alloc.dupe(u8, "external lake tables are read-only") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
         error.HAFencedPrimary => return .{ .status = 409, .body = try alloc.dupe(u8, "fenced primary rejects writes") },
@@ -6580,7 +6584,7 @@ test "public table graph metric action handler returns status response" {
             };
         }
 
-        fn executeGraphMetricAction(
+        pub fn executeGraphMetricAction(
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
             table_name: []const u8,

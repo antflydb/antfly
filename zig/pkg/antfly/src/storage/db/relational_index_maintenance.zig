@@ -34,7 +34,7 @@ pub fn prepareCommand(parent_alloc: std.mem.Allocator, txn: *docstore.DocStore.T
     if (index.generation != command.generation or index.slot != command.slot or
         !std.mem.eql(u8, &index.tuple.fingerprint, &command.comparison)) return error.PreparedGenerationChanged;
     const range = try @import("range_state.zig").decodeRangeAlloc(alloc, (txn.get(@import("range_state.zig").range_key) catch |err| switch (err) {
-        error.NotFound => &([_]u8{0} ** 8),
+        error.NotFound => &(@as([8]u8, @splat(0))),
         else => return err,
     }));
     defer alloc.free(range.start);

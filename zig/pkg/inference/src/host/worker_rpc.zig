@@ -362,7 +362,7 @@ pub const Endpoint = struct {
             self.mutex.unlock(self.io);
         }
         var description: [21]u8 = undefined;
-        description[0] = @intFromEnum(kind);
+        description[0] = @backingInt(kind);
         std.mem.writeInt(u64, description[1..9], request_id, .little);
         std.mem.writeInt(u32, description[9..13], @intCast(payload.metadata.len), .little);
         std.mem.writeInt(u64, description[13..21], try payload.bodySize(), .little);
@@ -405,7 +405,7 @@ pub const Endpoint = struct {
         if (self.closed.load(.acquire)) return error.InferenceWorkerUnavailable;
         var header: [header_len]u8 = undefined;
         @memcpy(header[0..4], "AFW3");
-        header[4] = @intFromEnum(kind);
+        header[4] = @backingInt(kind);
         std.mem.writeInt(u64, header[5..13], id, .little);
         std.mem.writeInt(u32, header[13..17], @intCast(payload.len), .little);
         try self.output.writeStreamingAll(self.io, &header);
@@ -635,7 +635,7 @@ const TestPair = struct {
         try self.child.start();
     }
 
-    fn deinit(self: *TestPair) void {
+    pub fn deinit(self: *TestPair) void {
         self.parent.deinit();
         self.child.deinit();
         for (self.files) |file| file.close(std.testing.io);
@@ -841,7 +841,7 @@ test "inference worker truncated logical messages close transport and release re
     try pair.init();
     defer pair.deinit();
     var offer: [21]u8 = @splat(0);
-    offer[0] = @intFromEnum(MessageKind.request);
+    offer[0] = @backingInt(MessageKind.request);
     std.mem.writeInt(u64, offer[1..9], 1, .little);
     std.mem.writeInt(u64, offer[13..21], 2 * max_frame_bytes, .little);
     try pair.parent.sendFrame(.offer, 99, &offer);

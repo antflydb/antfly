@@ -110,11 +110,11 @@ pub fn validateRequest(req: anytype) !void {
     const command = req.artifact_catalog orelse return;
     try command.validate();
     const empty: @TypeOf(req) = .{};
-    inline for (std.meta.fields(@TypeOf(req))) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "artifact_catalog") and !std.mem.eql(u8, field.name, "sync_level") and !std.mem.eql(u8, field.name, "online_source") and !std.mem.eql(u8, field.name, "merge_checkpoint") and !std.mem.eql(u8, field.name, "merge_replication")) {
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
-                if (@field(req, field.name).len != 0) return error.InvalidArtifactCatalogCommand;
-            } else if (!std.meta.eql(@field(req, field.name), @field(empty, field.name))) return error.InvalidArtifactCatalogCommand;
+    inline for (@typeInfo(@TypeOf(req)).@"struct".field_names, @typeInfo(@TypeOf(req)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !std.mem.eql(u8, reflected_name, "artifact_catalog") and !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "online_source") and !std.mem.eql(u8, reflected_name, "merge_checkpoint") and !std.mem.eql(u8, reflected_name, "merge_replication")) {
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (@field(req, reflected_name).len != 0) return error.InvalidArtifactCatalogCommand;
+            } else if (!std.meta.eql(@field(req, reflected_name), @field(empty, reflected_name))) return error.InvalidArtifactCatalogCommand;
         }
     }
     if (req.online_source) |source| if (source != .admit or req.merge_checkpoint != null or req.merge_replication != null or !std.meta.eql(source.admit.artifact_catalog, @as(?Binding, command.binding))) return error.InvalidArtifactCatalogCommand;
@@ -238,7 +238,7 @@ const TestTxn = struct {
     fn init() TestTxn {
         return .{ .values = std.StringHashMap([]u8).init(std.testing.allocator) };
     }
-    fn deinit(self: *TestTxn) void {
+    pub fn deinit(self: *TestTxn) void {
         var it = self.values.valueIterator();
         while (it.next()) |value| std.testing.allocator.free(value.*);
         self.values.deinit();

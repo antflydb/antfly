@@ -501,7 +501,7 @@ const AntflyReaderState = struct {
         return .{ .ptr = state, .vtable = &.{ .read = read, .read_reported = readReported, .deinit = deinit } };
     }
 
-    fn deinit(ptr: *anyopaque) void {
+    pub fn deinit(ptr: *anyopaque) void {
         const self: *AntflyReaderState = @ptrCast(@alignCast(ptr));
         self.alloc.free(self.api_url);
         self.alloc.free(self.model);
@@ -518,7 +518,7 @@ const AntflyReaderState = struct {
         self.auth_header = .{ "Authorization", try std.fmt.allocPrint(self.alloc, "Bearer {s}", .{token}) };
     }
 
-    fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
+    pub fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
         return (try readReported(ptr, alloc, req)).items;
     }
 
@@ -867,7 +867,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             }
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const self: *Self = @ptrCast(@alignCast(ptr));
             self.deinitState();
             self.alloc.destroy(self);
@@ -894,7 +894,7 @@ fn CloudReaderState(comptime provider: Provider) type {
             }
         }
 
-        fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
+        pub fn read(ptr: *anyopaque, alloc: Allocator, req: Request) anyerror![]Result {
             const self: *Self = @ptrCast(@alignCast(ptr));
             return switch (provider) {
                 .openai => try self.readOpenAi(alloc, req),

@@ -74,7 +74,10 @@ pub fn decodeTupleAlloc(alloc: Allocator, bytes: []const u8) ![][]u8 {
     var pos: usize = 0;
     while (pos < bytes.len) {
         const component = try componentAt(bytes, pos);
-        try out.append(alloc, try alloc.dupe(u8, component.payload));
+        // Reserve the ownership slot first: an append allocation failure must
+        // never strand an already-duplicated provenance payload.
+        try out.ensureUnusedCapacity(alloc, 1);
+        out.appendAssumeCapacity(try alloc.dupe(u8, component.payload));
         pos = component.next;
         if (pos < bytes.len) {
             if (bytes[pos] != '|') return error.InvalidTokenComponent;

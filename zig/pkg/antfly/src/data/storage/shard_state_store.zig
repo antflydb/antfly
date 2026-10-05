@@ -1869,7 +1869,7 @@ const DeletePhysicalRangeScratch = struct {
         self.after_key.clearRetainingCapacity();
     }
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         self.key_bytes.deinit(alloc);
         self.key_spans.deinit(alloc);
         self.after_key.deinit(alloc);
@@ -2270,14 +2270,14 @@ test "paged authoritative reconciliation removes stale out-of-range documents be
 
     const projected_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-reconcile-projected", .{tmp.sub_path});
     defer alloc.free(projected_path);
-    const projected_path_z = try alloc.dupeZ(u8, projected_path);
+    const projected_path_z = try alloc.dupeSentinel(u8, projected_path, 0);
     defer alloc.free(projected_path_z);
     var projected = try docstore.DocStore.open(alloc, projected_path_z.ptr, .{});
     defer projected.close();
 
     const source_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/paged-reconcile-source", .{tmp.sub_path});
     defer alloc.free(source_path);
-    const source_path_z = try alloc.dupeZ(u8, source_path);
+    const source_path_z = try alloc.dupeSentinel(u8, source_path, 0);
     defer alloc.free(source_path_z);
     var source = try docstore.DocStore.open(alloc, source_path_z.ptr, .{});
     defer source.close();
@@ -2445,14 +2445,14 @@ test "paged authoritative reconciliation is allocation-failure safe" {
 
     const projected_path = try std.fmt.allocPrint(setup_alloc, ".zig-cache/tmp/{s}/paged-reconcile-oom-projected", .{tmp.sub_path});
     defer setup_alloc.free(projected_path);
-    const projected_path_z = try setup_alloc.dupeZ(u8, projected_path);
+    const projected_path_z = try setup_alloc.dupeSentinel(u8, projected_path, 0);
     defer setup_alloc.free(projected_path_z);
     var projected = try docstore.DocStore.open(setup_alloc, projected_path_z.ptr, .{});
     defer projected.close();
 
     const source_path = try std.fmt.allocPrint(setup_alloc, ".zig-cache/tmp/{s}/paged-reconcile-oom-source", .{tmp.sub_path});
     defer setup_alloc.free(source_path);
-    const source_path_z = try setup_alloc.dupeZ(u8, source_path);
+    const source_path_z = try setup_alloc.dupeSentinel(u8, source_path, 0);
     defer setup_alloc.free(source_path_z);
     var source = try docstore.DocStore.open(setup_alloc, source_path_z.ptr, .{});
     defer source.close();
@@ -2519,7 +2519,7 @@ test "group state range scan is allocation-failure safe" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/group-state-range-oom", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
     defer store.close();
@@ -2845,7 +2845,7 @@ pub fn appendOperationEffects(
                     var rejection_buf: [176]u8 = undefined;
                     const owned_key = try alloc.dupe(u8, try arbitration.rejectionKey(&rejection_buf, group_id, guard.index));
                     errdefer alloc.free(owned_key);
-                    const owned_value = try alloc.dupe(u8, &.{@intFromEnum(rejection)});
+                    const owned_value = try alloc.dupe(u8, &.{@backingInt(rejection)});
                     errdefer alloc.free(owned_value);
                     try writes.append(alloc, .{ .key = owned_key, .value = owned_value });
                 } else if (!std.meta.eql(before, online_reservation)) {
@@ -2869,7 +2869,7 @@ pub fn appendOperationEffects(
                 const context = request.merge_replication orelse return error.InvalidMergePage;
                 merge_copy_allowed = merge_state.copyAllowed(merge_receiver_state, context);
                 if (!merge_copy_allowed) continue;
-                const required_page_protocol = if (request.merge_page.?.source.retention != null) data_raft_protocol.batch_source_scope_protocol_version else if (request.merge_page.?.source.integrity != null) data_raft_protocol.batch_relational_transfer_protocol_version else if (request.merge_page.?.next_snapshot_position != null) data_raft_protocol.batch_native_snapshot_protocol_version else if (request.merge_page.?.chunk != null) data_raft_protocol.batch_merge_chunk_protocol_version else data_raft_protocol.batch_merge_page_protocol_version;
+                const required_page_protocol = if (db_types.requiresGraphRelationshipProtocol(request)) data_raft_protocol.batch_merge_retirements_protocol_version else if (request.merge_page.?.source.retention != null) data_raft_protocol.batch_source_scope_protocol_version else if (request.merge_page.?.source.integrity != null) data_raft_protocol.batch_relational_transfer_protocol_version else if (request.merge_page.?.next_snapshot_position != null) data_raft_protocol.batch_native_snapshot_protocol_version else if (request.merge_page.?.chunk != null) data_raft_protocol.batch_merge_chunk_protocol_version else data_raft_protocol.batch_merge_page_protocol_version;
                 if (raft_batch_protocol_version < required_page_protocol) return error.RaftBatchMergeProtocolNotActivated;
                 if (page_progress == null) return error.MergePageSourceMissing;
                 try pages.validateRange(alloc, merge_receiver_state.?, request);
@@ -3753,7 +3753,7 @@ const merge_source_state_encoded_len = 1 + 1 + 8 + 8 + 8;
 fn encodeMergeSourceState(state: AppliedMergeSourceState) [merge_source_state_encoded_len]u8 {
     var encoded: [merge_source_state_encoded_len]u8 = undefined;
     encoded[0] = merge_source_state_format_version;
-    encoded[1] = @intFromEnum(state.phase);
+    encoded[1] = @backingInt(state.phase);
     std.mem.writeInt(u64, encoded[2..10], state.transition_id, .little);
     std.mem.writeInt(u64, encoded[10..18], state.receiver_group_id, .little);
     std.mem.writeInt(u64, encoded[18..26], state.applied_index, .little);
@@ -3881,7 +3881,7 @@ fn encodeSplitStateAlloc(alloc: std.mem.Allocator, state: AppliedSplitState) ![]
     const buf = try alloc.alloc(u8, total_len);
     errdefer alloc.free(buf);
     var pos: usize = 0;
-    buf[pos] = @intFromEnum(state.phase);
+    buf[pos] = @backingInt(state.phase);
     pos += 1;
     std.mem.writeInt(u64, buf[pos..][0..8], state.transition_id, .little);
     pos += 8;
@@ -3941,7 +3941,7 @@ fn encodeSplitTerminalAlloc(alloc: std.mem.Allocator, terminal: AppliedSplitTerm
         return error.SplitTerminalTooLarge;
     const encoded = try alloc.alloc(u8, encoded_len);
     encoded[0] = split_terminal_format_version;
-    encoded[1] = @intFromEnum(terminal.outcome);
+    encoded[1] = @backingInt(terminal.outcome);
     std.mem.writeInt(u64, encoded[2..10], terminal.transition_id, .little);
     std.mem.writeInt(u64, encoded[10..18], terminal.attempt_epoch, .little);
     std.mem.writeInt(u64, encoded[18..26], terminal.destination_group_id, .little);
@@ -4056,7 +4056,7 @@ test "shard state store persists ranges and document state" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-store", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -4108,7 +4108,7 @@ test "shard state store persists split lifecycle and ownership" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-split", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -4307,7 +4307,7 @@ test "shard state store decodes legacy split acknowledgement layouts" {
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/legacy-split-ack", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
     defer store.close();
@@ -4485,7 +4485,7 @@ test "shard state snapshot round trips split control state" {
     defer source_tmp.cleanup();
     const source_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-source", .{source_tmp.sub_path});
     defer std.testing.allocator.free(source_path);
-    const source_path_z = try std.testing.allocator.dupeZ(u8, source_path);
+    const source_path_z = try std.testing.allocator.dupeSentinel(u8, source_path, 0);
     defer std.testing.allocator.free(source_path_z);
     var source = try docstore.DocStore.open(std.testing.allocator, source_path_z.ptr, .{});
     defer source.close();
@@ -4535,7 +4535,7 @@ test "shard state snapshot round trips split control state" {
     defer target_tmp.cleanup();
     const target_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/snapshot-target", .{target_tmp.sub_path});
     defer std.testing.allocator.free(target_path);
-    const target_path_z = try std.testing.allocator.dupeZ(u8, target_path);
+    const target_path_z = try std.testing.allocator.dupeSentinel(u8, target_path, 0);
     defer std.testing.allocator.free(target_path_z);
     var target = try docstore.DocStore.open(std.testing.allocator, target_path_z.ptr, .{});
     defer target.close();
@@ -4629,7 +4629,7 @@ test "shard state store finalize split reclaims right-hand document range" {
 
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-finalize", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
-    const path_z = try std.testing.allocator.dupeZ(u8, path);
+    const path_z = try std.testing.allocator.dupeSentinel(u8, path, 0);
     defer std.testing.allocator.free(path_z);
 
     var store = try docstore.DocStore.open(std.testing.allocator, path_z.ptr, .{});
@@ -4688,14 +4688,14 @@ test "shard state store records and replays split deltas" {
 
     const src_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-deltas-src", .{tmp.sub_path});
     defer std.testing.allocator.free(src_path);
-    const src_path_z = try std.testing.allocator.dupeZ(u8, src_path);
+    const src_path_z = try std.testing.allocator.dupeSentinel(u8, src_path, 0);
     defer std.testing.allocator.free(src_path_z);
     var src = try docstore.DocStore.open(std.testing.allocator, src_path_z.ptr, .{});
     defer src.close();
 
     const dst_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-deltas-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_path);
-    const dst_path_z = try std.testing.allocator.dupeZ(u8, dst_path);
+    const dst_path_z = try std.testing.allocator.dupeSentinel(u8, dst_path, 0);
     defer std.testing.allocator.free(dst_path_z);
     var dst = try docstore.DocStore.open(std.testing.allocator, dst_path_z.ptr, .{});
     defer dst.close();
@@ -4761,14 +4761,14 @@ test "shard state store captures right-hand split handoff and filters delta catc
 
     const src_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-handoff-src", .{tmp.sub_path});
     defer std.testing.allocator.free(src_path);
-    const src_path_z = try std.testing.allocator.dupeZ(u8, src_path);
+    const src_path_z = try std.testing.allocator.dupeSentinel(u8, src_path, 0);
     defer std.testing.allocator.free(src_path_z);
     var src = try docstore.DocStore.open(std.testing.allocator, src_path_z.ptr, .{});
     defer src.close();
 
     const dst_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/shard-state-handoff-dst", .{tmp.sub_path});
     defer std.testing.allocator.free(dst_path);
-    const dst_path_z = try std.testing.allocator.dupeZ(u8, dst_path);
+    const dst_path_z = try std.testing.allocator.dupeSentinel(u8, dst_path, 0);
     defer std.testing.allocator.free(dst_path_z);
     var dst = try docstore.DocStore.open(std.testing.allocator, dst_path_z.ptr, .{});
     defer dst.close();

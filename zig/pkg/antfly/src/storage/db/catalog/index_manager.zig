@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 const storage_build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const platform_clock = platform.clock;
@@ -160,7 +161,7 @@ const FreshDenseNativeGeneration = struct {
     relative_index_path: []u8,
     generation_id: u128,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.alloc.free(self.shadow_root);
         self.alloc.free(self.index_path);
         self.alloc.free(self.relative_index_path);
@@ -298,6 +299,7 @@ pub var test_before_source_vector_checkpoint: ?struct {
 const sparse_backfill_batch_size: usize = 1024;
 const vector_backfill_page_items: usize = 1024;
 const vector_backfill_page_bytes: usize = 16 * 1024 * 1024;
+const dense_lsm_posting_apply_working_set_factor: u64 = 8;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
 
@@ -308,6 +310,10 @@ pub const ManagedIndexRef = struct {
     /// Zero preserves the conservative fallback for callers that only know
     /// the projection kind (for example status-only catalog entries).
     estimated_dense_vector_bytes: u64 = 0,
+    /// How many times larger than the raw vector the estimate above is. The
+    /// memory ceiling scales with it, while an independent work ceiling
+    /// preserves unscaled vector and non-vector work per window.
+    dense_replay_working_set_factor: u64 = 1,
 };
 
 pub const LsmOwnerStats = struct {
@@ -481,7 +487,7 @@ const TextMergeBudgetAllocator = struct {
         };
     }
 
-    fn deinit(self: *TextMergeBudgetAllocator) void {
+    pub fn deinit(self: *TextMergeBudgetAllocator) void {
         std.debug.assert(self.live_bytes.load(.acquire) == 0);
         std.debug.assert(self.task_live_bytes.load(.acquire) == 0);
         if (self.reservation) |*reservation| reservation.release();
@@ -769,7 +775,7 @@ const TextMergeScheduler = struct {
         segment_ids: []u64,
         task_token: *const anyopaque,
 
-        fn deinit(self: *InFlightMerge, alloc: Allocator) void {
+        pub fn deinit(self: *InFlightMerge, alloc: Allocator) void {
             alloc.free(self.index_name);
             alloc.free(self.segment_ids);
             self.* = undefined;
@@ -784,7 +790,7 @@ const TextMergeScheduler = struct {
         quarantined_at_ns: u64,
         retry_after_ns: u64,
 
-        fn deinit(self: *QuarantinedMerge, alloc: Allocator) void {
+        pub fn deinit(self: *QuarantinedMerge, alloc: Allocator) void {
             alloc.free(self.index_name);
             alloc.free(self.segment_ids);
             alloc.free(self.error_name);
@@ -811,8 +817,9 @@ const TextMergeScheduler = struct {
     last_merge_elapsed_ns: u64 = 0,
     last_merge_peak_task_alloc_bytes: u64 = 0,
     deferred_for_pressure: u64 = 0,
+    forced_drains: u64 = 0,
 
-    fn deinit(self: *TextMergeScheduler, alloc: Allocator) void {
+    pub fn deinit(self: *TextMergeScheduler, alloc: Allocator) void {
         for (self.in_flight.items) |*merge| merge.deinit(alloc);
         self.in_flight.deinit(alloc);
         for (self.quarantined.items) |*merge| merge.deinit(alloc);
@@ -1473,8 +1480,8 @@ pub const IndexManager = struct {
     /// Action-partitioned discovery rings. Automatic reconstruction never
     /// spends its bounded inspection budget walking retry-only or manual debt,
     /// while exact queue lengths make wake/terminal classification O(1).
-    failed_index_load_action_queues: [std.meta.fields(IndexLoadRecoveryAction).len]FailedIndexLoadActionQueue =
-        [_]FailedIndexLoadActionQueue{.{}} ** std.meta.fields(IndexLoadRecoveryAction).len,
+    failed_index_load_action_queues: [@typeInfo(IndexLoadRecoveryAction).@"enum".field_names.len]FailedIndexLoadActionQueue =
+        @as([@typeInfo(IndexLoadRecoveryAction).@"enum".field_names.len]FailedIndexLoadActionQueue, @splat(.{})),
     // Durable repair intents gate service independently of load failures. A
     // replacement may load successfully after pointer activation while its
     // intent is still in activating/validating; queries must remain closed
@@ -1616,7 +1623,7 @@ pub const IndexManager = struct {
             return .{ .bitmap = roaring.RoaringBitmap.init(alloc) };
         }
 
-        fn deinit(self: *TextMergeDeletionDelta) void {
+        pub fn deinit(self: *TextMergeDeletionDelta) void {
             self.bitmap.deinit();
             self.* = undefined;
         }
@@ -1723,6 +1730,17 @@ pub const IndexManager = struct {
         // producer admission sample this bit without taking every index's
         // apply mutex, so it must not be a plain concurrently-mutated bool.
         compaction_pending: std.atomic.Value(bool) = .init(false),
+        // A merge's byte reservation is sized from a point-in-time estimate,
+        // but deletion deltas that commit while the merge builds also compete
+        // inside that same fixed ceiling (see TextMergeBudgetAllocator). Under
+        // a sustained heavy write rate, a wide merge plan can take long enough
+        // to build that accumulating deltas alone exhaust the reservation,
+        // and retrying the identical plan hits the same wall every time since
+        // the write rate has not changed. Shrink the segment count admitted
+        // per attempt after such a failure so the next merge builds faster
+        // and has a narrower window to accumulate deltas in, and let it grow
+        // back on success so steady state is unaffected.
+        merge_segment_cap: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
 
         pub fn lockAnalysisShared(self: *TextIndex) void {
             self.analysis_mutex.lockShared();
@@ -1808,7 +1826,7 @@ pub const IndexManager = struct {
             };
         }
 
-        fn deinit(self: *OwnedFieldAnalyzer, alloc: Allocator) void {
+        pub fn deinit(self: *OwnedFieldAnalyzer, alloc: Allocator) void {
             alloc.free(self.field);
             alloc.free(self.char_filters);
             alloc.free(self.filters);
@@ -1855,7 +1873,7 @@ pub const IndexManager = struct {
         deleted: ?roaring.RoaringBitmap = null,
         deleted_count: u32 = 0,
 
-        fn deinit(self: *TextMergeSourceSegment, alloc: Allocator) void {
+        pub fn deinit(self: *TextMergeSourceSegment, alloc: Allocator) void {
             _ = alloc;
             if (self.deleted) |*deleted| deleted.deinit();
             self.* = undefined;
@@ -1945,12 +1963,21 @@ pub const IndexManager = struct {
                 defer reader.deinit();
                 for (0..reader.doc_count) |doc_idx| {
                     const doc_id: u32 = @intCast(doc_idx);
-                    if (try reader.docOrdinal(doc_id)) |ordinal| {
-                        _ = ordinal;
-                        ordinal_count += 1;
-                    } else if (try reader.storedDoc(doc_id)) |stored| {
+                    // The stored id is the document's own unique key and takes
+                    // priority: chunk members intentionally share their
+                    // parent's ordinal (see result_shape.zig), so an ordinal
+                    // alone cannot distinguish one chunk from its siblings.
+                    // Keying by ordinal first would collide every sibling
+                    // chunk into the same slot and discard the rest as
+                    // "duplicates" even though they are distinct live
+                    // documents. Ordinal-only identity remains correct for
+                    // any document that genuinely has no stored id.
+                    if (try reader.storedDoc(doc_id)) |stored| {
                         _ = stored;
                         id_count += 1;
+                    } else if (try reader.docOrdinal(doc_id)) |ordinal| {
+                        _ = ordinal;
+                        ordinal_count += 1;
                     } else {
                         return error.MissingMergeDocumentIdentity;
                     }
@@ -1976,10 +2003,10 @@ pub const IndexManager = struct {
                 for (0..reader.doc_count) |doc_idx| {
                     const doc_id: u32 = @intCast(doc_idx);
                     const location: OutputLocation = .{ .segment = @intCast(output_idx), .doc = doc_id };
-                    if (try reader.docOrdinal(doc_id)) |ordinal| {
-                        try insertOrdinal(ordinals, ordinal, location);
-                    } else if (try reader.storedDoc(doc_id)) |stored| {
+                    if (try reader.storedDoc(doc_id)) |stored| {
                         try insertId(ids, stored.id, location);
+                    } else if (try reader.docOrdinal(doc_id)) |ordinal| {
+                        try insertOrdinal(ordinals, ordinal, location);
                     } else unreachable;
                 }
             }
@@ -2082,7 +2109,7 @@ pub const IndexManager = struct {
         source_current: bool,
         bitmaps: []?roaring.RoaringBitmap,
 
-        fn deinit(self: *TextMergePublicationDeletes, alloc: Allocator) void {
+        pub fn deinit(self: *TextMergePublicationDeletes, alloc: Allocator) void {
             for (self.bitmaps) |*maybe_deleted| {
                 if (maybe_deleted.*) |*deleted| deleted.deinit();
             }
@@ -2242,7 +2269,7 @@ pub const IndexManager = struct {
         manager: *IndexManager,
         index_name: []u8,
 
-        fn deinit(self: *DenseVectorLoadContext, alloc: Allocator) void {
+        pub fn deinit(self: *DenseVectorLoadContext, alloc: Allocator) void {
             alloc.free(self.index_name);
             alloc.destroy(self);
         }
@@ -2319,7 +2346,7 @@ pub const IndexManager = struct {
         const DefaultRawReadLimitBytes: u64 = 32 * 1024 * 1024;
         const MaxRawReadLimitBytes: u64 = 64 * 1024 * 1024;
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (benchMetricsEnabled() and (self.matrix_generation_attempts != 0 or self.matrix_captured_vectors != 0)) {
                 const batch = self.source_batch_reads;
                 std.log.info("antfly_bench_dense_matrix_load index={s} generation_attempts={d} generation_rejections={d} generation_vectors={d} fallback_vectors={d} source_batches={d} source_vectors={d} source_bytes={d} source_lock_wait_ns={d} source_locked_ns={d} scratch_fallbacks={d} primary_lookup_ns={d} payload_consume_ns={d} positional_batches={d} positional_bytes={d} lease_fallbacks={d} captured_vectors={d}", .{
@@ -2612,7 +2639,7 @@ pub const IndexManager = struct {
             return value;
         }
 
-        fn getManySorted(self: *@This(), store: *docstore_mod.DocStore, keys: []const []const u8, values: []?[]const u8) !void {
+        pub fn getManySorted(self: *@This(), store: *docstore_mod.DocStore, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);
             if (keys.len == 0) return;
@@ -2720,7 +2747,7 @@ pub const IndexManager = struct {
         reverse_values: std.AutoHashMapUnmanaged(u64, bool) = .empty,
         reverse_metadata: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             var it = self.metadata.valueIterator();
             while (it.next()) |value| alloc.free(value.*);
             var reverse_it = self.reverse_metadata.valueIterator();
@@ -2817,7 +2844,7 @@ pub const IndexManager = struct {
             return err;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.arena) |*arena| arena.deinit();
             if (self.budget) |*budget| budget.deinit();
             self.* = .{};
@@ -2838,7 +2865,7 @@ pub const IndexManager = struct {
         physical_reads: u64 = 0,
         physical_bytes: u64 = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.scratch.deinit();
             if (self.cold_reader) |*reader| reader.deinit();
             self.generation.release();
@@ -2886,6 +2913,18 @@ pub const IndexManager = struct {
     pub const SparseCompactionResult = sparse_mod.SparseIndex.SegmentCompactionResult;
 
     pub const GraphIndex = struct {
+        /// Volatile source refresh frontier for enrichment adjacency. Protected
+        /// by apply_mutex; never certifies consumer completion or replay retention.
+        /// A recreated/reopened generation starts from its durable checkpoint.
+        neighbor_source_sequence: u64 = 0,
+        neighbor_refresh: struct {
+            sequence: u64 = 0,
+            cursor: @import("../derived/change_journal.zig").GraphRefreshCursor = .{},
+            cleanup_phase: u8 = 0,
+            cleanup_cursor: ?[]u8 = null,
+        } = .{},
+        neighbor_refresh_applying: bool = false,
+
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
@@ -2895,6 +2934,16 @@ pub const IndexManager = struct {
         ttl_duration_ns: u64 = 0,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
+
+        pub fn invalidateNeighborSource(self: *@This()) void {
+            self.neighbor_source_sequence = 0;
+            if (!self.neighbor_refresh_applying) self.clearNeighborRefresh();
+        }
+
+        pub fn clearNeighborRefresh(self: *@This()) void {
+            if (self.neighbor_refresh.cleanup_cursor) |key| self.index.alloc.free(key);
+            self.neighbor_refresh = .{};
+        }
     };
 
     const OpenedIndex = union(types.IndexKind) {
@@ -2904,7 +2953,7 @@ pub const IndexManager = struct {
         graph: GraphIndex,
         algebraic: AlgebraicIndex,
 
-        fn deinit(self: *OpenedIndex, manager: *IndexManager) void {
+        pub fn deinit(self: *OpenedIndex, manager: *IndexManager) void {
             switch (self.*) {
                 .full_text => |*entry| manager.freeTextIndexEntry(entry),
                 .dense_vector => |*entry| manager.freeDenseIndexEntry(entry),
@@ -2925,7 +2974,7 @@ pub const IndexManager = struct {
         opened: ?OpenedIndex = null,
         err: ?anyerror = null,
 
-        fn deinit(self: *OpenResult, manager: *IndexManager) void {
+        pub fn deinit(self: *OpenResult, manager: *IndexManager) void {
             if (self.opened) |*opened| opened.deinit(manager);
             self.* = .{};
         }
@@ -5873,6 +5922,74 @@ pub const IndexManager = struct {
             }
         }
 
+        fn appendDenseFieldParsed(
+            alloc: Allocator,
+            field: DenseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            const vector = (try mapper.extractDenseVectorFieldFromParsed(alloc, root, field.field_name, field.dims)) orelse return;
+            errdefer alloc.free(vector);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendDenseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .vector = vector,
+            });
+        }
+
+        fn appendSparseFieldParsed(
+            alloc: Allocator,
+            field: SparseFieldWritePlan,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            var sparse_vec = (try mapper.extractSparseVectorFieldFromParsed(alloc, root, field.field_name)) orelse return;
+            errdefer sparse_vec.deinit(alloc);
+            const index_name = try alloc.dupe(u8, field.index_name);
+            errdefer alloc.free(index_name);
+            const owned_doc_key = try alloc.dupe(u8, doc_key);
+            errdefer alloc.free(owned_doc_key);
+            try appendSparseEmbeddingToExtractedWrite(alloc, extracted, .{
+                .index_name = index_name,
+                .doc_key = owned_doc_key,
+                .indices = sparse_vec.indices,
+                .values = sparse_vec.values,
+            });
+            sparse_vec.indices = &.{};
+            sparse_vec.values = &.{};
+        }
+
+        /// Document-mode analogue of
+        /// `appendIndexFieldEmbeddingsFromPreparedToExtractedWrite` for raw
+        /// writes that have no relational ordinal row to consult: both dense
+        /// and sparse direct-field vectors come from the parsed JSON body
+        /// alone, read against this owned per-generation snapshot instead of
+        /// the live `dense_indexes`/`sparse_indexes` catalog arrays. Safe to
+        /// call after the catalog lock that produced this snapshot has been
+        /// released, including across chunking/inference work.
+        pub fn appendIndexFieldEmbeddingsFromParsedToExtractedWrite(
+            self: WritePlanSnapshot,
+            alloc: Allocator,
+            doc_key: []const u8,
+            root: std.json.Value,
+            extracted: *mapper.ExtractedWrite,
+        ) !void {
+            for (self.dense_fields) |field| {
+                if (hasExplicitDenseEmbedding(extracted.dense_embeddings, field.index_name)) continue;
+                try appendDenseFieldParsed(alloc, field, doc_key, root, extracted);
+            }
+            for (self.sparse_fields) |field| {
+                if (hasExplicitSparseEmbedding(extracted.sparse_embeddings, field.index_name)) continue;
+                try appendSparseFieldParsed(alloc, field, doc_key, root, extracted);
+            }
+        }
+
         fn generatedConsumerSatisfied(
             extracted: mapper.ExtractedWrite,
             kind: enrichment_types.GeneratedEnrichmentKind,
@@ -6425,7 +6542,7 @@ pub const IndexManager = struct {
     }
 
     fn reopenDenseIndexStorage(self: *IndexManager, entry: *DenseIndex, path: []const u8) !void {
-        const zpath = try self.alloc.dupeZ(u8, path);
+        const zpath = try self.alloc.dupeSentinel(u8, path, 0);
         defer self.alloc.free(zpath);
 
         const dense_cfg = try parseDenseConfig(self.alloc, entry.config.config_json);
@@ -6553,7 +6670,7 @@ pub const IndexManager = struct {
         entry.index.close();
         deleteIndexDirIfPresent(path);
 
-        const zpath = try self.alloc.dupeZ(u8, path);
+        const zpath = try self.alloc.dupeSentinel(u8, path, 0);
         defer self.alloc.free(zpath);
         entry.index = try sparse_mod.SparseIndex.open(self.alloc, zpath, .{
             .no_sync = self.relaxed_split_durability,
@@ -6574,6 +6691,7 @@ pub const IndexManager = struct {
 
         pub fn reset(self: *@This(), index_name: []const u8) !void {
             const entry = self.manager.graphIndex(index_name) orelse return error.IndexNotFound;
+            entry.invalidateNeighborSource();
             try entry.index.resetForArtifactRebuild();
             entry.index.reconcileOwnershipRange(self.manager.byte_range.start, self.manager.byte_range.end);
         }
@@ -6734,6 +6852,7 @@ pub const IndexManager = struct {
     }
 
     fn deinitGraphIndexEntry(self: *IndexManager, entry: *GraphIndex, abandon_after_crash: bool) void {
+        entry.clearNeighborRefresh();
         if (abandon_after_crash) {
             entry.index.abandonAfterCrash();
         } else {
@@ -6845,6 +6964,18 @@ pub const IndexManager = struct {
         }
         self.alloc.free(self.base_path);
         self.native_read_scratch.destroy();
+        // PR #957 review on the #938 escalation commit: the process-wide
+        // ResourceManager's replay-document-not-visible tracker is keyed in
+        // part by this IndexManager's own address (see
+        // resource_manager_mod.replayOwnerIdFromPtr), so it must be told
+        // this owner is gone -- both to let that address be reused by a
+        // later IndexManager without inheriting stale retry/skip state, and
+        // so the tracker cannot grow without bound across DB/table
+        // open-close churn. Do this before destroying resource_manager
+        // below, in case it is the same instance as owned_resource_manager.
+        if (self.resource_manager) |manager| {
+            manager.removeReplayNotVisibleOwner(resource_manager_mod.replayOwnerIdFromPtr(self));
+        }
         if (self.owned_resource_manager) |manager| {
             manager.deinit(self.alloc);
             self.alloc.destroy(manager);
@@ -6982,11 +7113,11 @@ pub const IndexManager = struct {
     }
 
     fn failedIndexLoadActionQueue(self: *IndexManager, action: IndexLoadRecoveryAction) *FailedIndexLoadActionQueue {
-        return &self.failed_index_load_action_queues[@intFromEnum(action)];
+        return &self.failed_index_load_action_queues[@backingInt(action)];
     }
 
     fn failedIndexLoadActionQueueConst(self: *const IndexManager, action: IndexLoadRecoveryAction) *const FailedIndexLoadActionQueue {
-        return &self.failed_index_load_action_queues[@intFromEnum(action)];
+        return &self.failed_index_load_action_queues[@backingInt(action)];
     }
 
     pub fn hasLoadFailures(self: *IndexManager) bool {
@@ -7717,7 +7848,7 @@ pub const IndexManager = struct {
         err_name: []const u8,
         repair_claim_owner_id: u128,
 
-        fn deinit(self: *@This(), manager: *IndexManager) void {
+        pub fn deinit(self: *@This(), manager: *IndexManager) void {
             if (self.name_key) |name| manager.alloc.free(name);
             if (self.status_config) |*cfg| cfg.deinit(manager.alloc);
             if (self.failure_config) |*cfg| cfg.deinit(manager.alloc);
@@ -7995,7 +8126,7 @@ pub const IndexManager = struct {
             token: FailedIndexLoadToken,
             authority: FailedIndexLoadRetryAuthority,
 
-            fn deinit(task: *@This(), alloc: Allocator) void {
+            pub fn deinit(task: *@This(), alloc: Allocator) void {
                 alloc.free(task.name);
                 task.cfg.deinit(alloc);
                 task.* = undefined;
@@ -9172,7 +9303,7 @@ pub const IndexManager = struct {
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.saveProjectionCheckpointMetadata(.{
             .applied_sequence = checkpoint.applied_sequence,
-            .status = @intFromEnum(checkpoint.status),
+            .status = @backingInt(checkpoint.status),
             .generation = checkpoint.generation,
             .config_hash = checkpoint.config_hash,
         });
@@ -9199,10 +9330,10 @@ pub const IndexManager = struct {
         return .{
             .applied_sequence = applied_sequence,
             .status = switch (checkpoint.status) {
-                @intFromEnum(apply_state.ProjectionStatus.clean) => .clean,
-                @intFromEnum(apply_state.ProjectionStatus.rebuilding) => .rebuilding,
-                @intFromEnum(apply_state.ProjectionStatus.degraded) => .degraded,
-                @intFromEnum(apply_state.ProjectionStatus.repair_required) => .repair_required,
+                @backingInt(apply_state.ProjectionStatus.clean) => .clean,
+                @backingInt(apply_state.ProjectionStatus.rebuilding) => .rebuilding,
+                @backingInt(apply_state.ProjectionStatus.degraded) => .degraded,
+                @backingInt(apply_state.ProjectionStatus.repair_required) => .repair_required,
                 else => .repair_required,
             },
             .generation = checkpoint.generation,
@@ -9356,18 +9487,18 @@ pub const IndexManager = struct {
             const resource_stats = manager.snapshot();
             cache_reclaim_requests = resource_stats.reclaim_requests;
             cache_reclaimed_bytes = resource_stats.reclaimed_bytes;
-            const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
-            const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
-            const ft_residency = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)];
-            const text_merge = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)];
-            const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
-            const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
-            const lsm_table_builder = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)];
-            const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
-            const lsm_wal_write = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)];
-            const lsm_wal_retention = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)];
-            const lsm_recovery = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_recovery_working_set)];
-            const derived_backlog = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)];
+            const ft_pending = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)];
+            const ft_build = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)];
+            const ft_residency = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_segment_residency)];
+            const text_merge = resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)];
+            const lsm_cache = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)];
+            const lsm_compaction = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)];
+            const lsm_table_builder = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)];
+            const lsm_state = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)];
+            const lsm_wal_write = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_wal_write_working_set)];
+            const lsm_wal_retention = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_wal_retention)];
+            const lsm_recovery = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_recovery_working_set)];
+            const derived_backlog = resource_stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)];
             ft_pending_used = ft_pending.used_bytes;
             ft_pending_peak = ft_pending.peak_bytes;
             ft_build_used = ft_build.used_bytes;
@@ -9522,12 +9653,12 @@ pub const IndexManager = struct {
                 lsm_stats.read_snapshot_mutable_rotations,
                 lsm_stats.read_snapshot_mutable_rotation_bytes_total,
                 lsm_stats.read_snapshot_mutable_rotation_peak_bytes,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].calls,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].bytes_total,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].calls,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].bytes_total,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.other)].calls,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.other)].bytes_total,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].bytes_total,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].bytes_total,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.other)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.other)].bytes_total,
             },
         );
         std.log.info(
@@ -9833,7 +9964,7 @@ pub const IndexManager = struct {
         entries: []GraphMetricWorkerSnapshotEntry,
         names: []u8,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.manager.alloc.free(self.names);
             self.manager.alloc.free(self.entries);
             if (self.manager.io) |io| {
@@ -9853,7 +9984,7 @@ pub const IndexManager = struct {
     fn graphMetricWorkerSnapshotAlloc(self: *IndexManager) !GraphMetricWorkerSnapshot {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) {
             const entries = try self.alloc.alloc(GraphMetricWorkerSnapshotEntry, 0);
             errdefer self.alloc.free(entries);
@@ -10305,7 +10436,7 @@ pub const IndexManager = struct {
     ) !GraphMetricPlannedSchedulerSweepResult {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
-        if (self.graph_retirement_closed.load(.acquire)) return error.IntegrityTopologyBusy;
+        if (!self.graphRetirementAdmissionOpen()) return error.IntegrityTopologyBusy;
         if (self.graph_artifact_rebuild_pending) return .{};
         return try self.runGraphMetricPlannedCoordinatorSweepUnlocked(options);
     }
@@ -11634,7 +11765,7 @@ pub const IndexManager = struct {
         key: ?[]u8 = null,
         value: ?[]u8 = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.key) |key| self.alloc.free(key);
             if (self.value) |value| self.alloc.free(value);
             self.* = undefined;
@@ -11734,6 +11865,7 @@ pub const IndexManager = struct {
                 );
             }
         }
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
             try self.persistEnrichmentCatalog(store);
@@ -11808,6 +11940,7 @@ pub const IndexManager = struct {
             try opened.append(self.alloc, cfg.name);
         }
 
+        for (self.enrichments.items) |entry| try self.validateNeighborDependencyGraph(entry);
         const has_generated_enrichment_targets = try self.computeGeneratedEnrichmentTargetCache();
         if (enrichments_changed) {
             try self.persistEnrichmentCatalog(store);
@@ -12176,7 +12309,7 @@ pub const IndexManager = struct {
         const total_len = std.math.add(usize, generated_artifact_cleanup_header_len, payload_len) catch return error.InvalidArgument;
         const out = try self.alloc.alloc(u8, total_len);
         std.mem.writeInt(u64, out[0..8], generated_artifact_cleanup_magic, .little);
-        std.mem.writeInt(u32, out[8..12], @intFromEnum(phase), .little);
+        std.mem.writeInt(u32, out[8..12], @backingInt(phase), .little);
         std.mem.writeInt(u32, out[12..16], chunk_len, .little);
         std.mem.writeInt(u32, out[16..20], embedding_len, .little);
         std.mem.writeInt(u32, out[20..24], embedding_name_count, .little);
@@ -12219,7 +12352,7 @@ pub const IndexManager = struct {
         const total_len = std.math.add(usize, generated_artifact_cleanup_header_len, payload_len) catch return error.InvalidArgument;
         const out = try self.alloc.alloc(u8, total_len);
         std.mem.writeInt(u64, out[0..8], generated_artifact_cleanup_magic, .little);
-        std.mem.writeInt(u32, out[8..12], @intFromEnum(phase), .little);
+        std.mem.writeInt(u32, out[8..12], @backingInt(phase), .little);
         std.mem.writeInt(u32, out[12..16], chunk_len, .little);
         std.mem.writeInt(u32, out[16..20], embedding_len, .little);
         std.mem.writeInt(u32, out[20..24], record.embedding_name_count, .little);
@@ -12458,7 +12591,7 @@ pub const IndexManager = struct {
             scanned: usize = 0,
             stopped: bool = false,
 
-            fn deinit(state: *@This()) void {
+            pub fn deinit(state: *@This()) void {
                 for (state.deletes.items) |delete_key| state.manager.alloc.free(delete_key);
                 state.deletes.deinit(state.manager.alloc);
                 if (state.last_key) |last_key| state.manager.alloc.free(last_key);
@@ -12476,6 +12609,7 @@ pub const IndexManager = struct {
                 if (!should_delete) should_delete = cleanupRecordMatchesEmbedding(state.record, candidate);
                 if (!should_delete) if (state.graph_index_name) |index_name| {
                     should_delete = internal_keys.matchesGraphEdgeIndexName(candidate, index_name) or
+                        internal_keys.matchesGraphRetirementIndexName(candidate, index_name) or
                         internal_keys.matchesGraphAssetStateIndexName(candidate, index_name) or
                         internal_keys.matchesGraphEdgeContenderIndexName(candidate, index_name) or
                         internal_keys.matchesGraphGlobalEdgeContenderIndexName(candidate, index_name);
@@ -13656,6 +13790,13 @@ pub const IndexManager = struct {
         }
     };
 
+    pub fn hasAssetNeighborContext(self: *const IndexManager) bool {
+        for (self.enrichments.items) |entry| {
+            if (entry.kind == .asset and entry.neighbor_context_json.len != 0) return true;
+        }
+        return false;
+    }
+
     /// Read-only scheduling lookup for graph-edge mutations: does any
     /// admitted asset enrichment sample `neighbor_context` adjacency from the
     /// named graph index, and in which orientations? An edge write or delete
@@ -13825,10 +13966,12 @@ pub const IndexManager = struct {
             initialized += 1;
         }
         for (self.dense_indexes.items) |entry| {
+            const working_set_factor = self.denseReplayWorkingSetFactor();
             refs[initialized] = .{
                 .name = try alloc.dupe(u8, entry.config.name),
                 .kind = .dense_vector,
-                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32),
+                .estimated_dense_vector_bytes = @as(u64, entry.dims) * @sizeOf(f32) *| working_set_factor,
+                .dense_replay_working_set_factor = working_set_factor,
             };
             initialized += 1;
         }
@@ -13881,33 +14024,33 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
             if (entry.source_artifact_names.len > 0) {
-                for (entry.source_artifact_names) |value| try names.append(alloc, try alloc.dupe(u8, value));
+                for (entry.source_artifact_names) |value| try appendOwnedString(alloc, &names, value);
             } else if (entry.chunk_name) |value| {
-                try names.append(alloc, try alloc.dupe(u8, value));
+                try appendOwnedString(alloc, &names, value);
             }
             return try names.toOwnedSlice(alloc);
         }
         for (self.dense_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
             if (entry.embedding_names.len > 0) {
-                for (entry.embedding_names) |value| try names.append(alloc, try alloc.dupe(u8, value));
+                for (entry.embedding_names) |value| try appendOwnedString(alloc, &names, value);
             } else if (!entry.external and !entry.managed_direct_field) {
-                if (entry.embedding_name) |value| try names.append(alloc, try alloc.dupe(u8, value));
+                if (entry.embedding_name) |value| try appendOwnedString(alloc, &names, value);
             }
             return try names.toOwnedSlice(alloc);
         }
         for (self.sparse_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
             if (entry.embedding_names.len > 0) {
-                for (entry.embedding_names) |value| try names.append(alloc, try alloc.dupe(u8, value));
+                for (entry.embedding_names) |value| try appendOwnedString(alloc, &names, value);
             } else if (!entry.external and !entry.managed_direct_field) {
-                if (entry.embedding_name) |value| try names.append(alloc, try alloc.dupe(u8, value));
+                if (entry.embedding_name) |value| try appendOwnedString(alloc, &names, value);
             }
             return try names.toOwnedSlice(alloc);
         }
         for (self.graph_indexes.items) |entry| {
             if (!std.mem.eql(u8, entry.config.name, name)) continue;
-            for (entry.artifact_sources) |source| try names.append(alloc, try alloc.dupe(u8, source.artifact_name));
+            for (entry.artifact_sources) |source| try appendOwnedString(alloc, &names, source.artifact_name);
             return try names.toOwnedSlice(alloc);
         }
         return try names.toOwnedSlice(alloc);
@@ -13988,6 +14131,17 @@ pub const IndexManager = struct {
         return out;
     }
 
+    fn artifactRequiresCommittedGraph(self: *const IndexManager, name: []const u8) bool {
+        var current = name;
+        var hops: usize = 0;
+        while (current.len != 0 and hops <= self.enrichments.items.len) : (hops += 1) {
+            const cfg = self.getEnrichmentByName(current) orelse return false;
+            if (cfg.neighbor_context_json.len != 0) return true;
+            current = cfg.source_artifact_name;
+        }
+        return false;
+    }
+
     pub fn planGeneratedEnrichments(
         self: *const IndexManager,
         alloc: Allocator,
@@ -14028,19 +14182,19 @@ pub const IndexManager = struct {
                 }
                 asset_emitted[entry_index] = true;
                 emit_progress = true;
-                try requests.append(alloc, .{
+                try appendOwnedGeneratedRequest(alloc, &requests, .{
                     .kind = .asset,
-                    .index_name = try alloc.dupe(u8, entry.name),
-                    .artifact_name = try alloc.dupe(u8, entry.name),
-                    .doc_key = try alloc.dupe(u8, doc_key),
-                    .source_field = try alloc.dupe(u8, entry.source_field),
-                    .source_template = if (entry.source_template.len > 0) try alloc.dupe(u8, entry.source_template) else "",
-                    .upstream_artifact_name = if (entry.source_artifact_name.len > 0) try alloc.dupe(u8, entry.source_artifact_name) else "",
+                    .index_name = entry.name,
+                    .artifact_name = entry.name,
+                    .doc_key = doc_key,
+                    .source_field = entry.source_field,
+                    .source_template = if (entry.source_template.len > 0) entry.source_template else "",
+                    .upstream_artifact_name = if (entry.source_artifact_name.len > 0) entry.source_artifact_name else "",
                     .full_text_index = entry.full_text_index,
-                    .content_type = if (entry.content_type.len > 0) try alloc.dupe(u8, entry.content_type) else "",
-                    .producer_json = if (entry.producer_json.len > 0) try alloc.dupe(u8, entry.producer_json) else "",
-                    .neighbor_context_json = if (entry.neighbor_context_json.len > 0) try alloc.dupe(u8, entry.neighbor_context_json) else "",
-                    .execution_json = if (entry.execution_json.len > 0) try alloc.dupe(u8, entry.execution_json) else "",
+                    .content_type = if (entry.content_type.len > 0) entry.content_type else "",
+                    .producer_json = if (entry.producer_json.len > 0) entry.producer_json else "",
+                    .neighbor_context_json = if (entry.neighbor_context_json.len > 0) entry.neighbor_context_json else "",
+                    .execution_json = if (entry.execution_json.len > 0) entry.execution_json else "",
                 });
             }
             if (emit_final_pass) break :emit_loop;
@@ -14084,38 +14238,38 @@ pub const IndexManager = struct {
                 const embedding_name = entry.embedding_name orelse entry.config.name;
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                 if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
-                    try requests.append(alloc, .{
+                    try appendOwnedGeneratedRequest(alloc, &requests, .{
                         .kind = .chunk_text,
-                        .index_name = try alloc.dupe(u8, entry.config.name),
-                        .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
-                        .doc_key = try alloc.dupe(u8, doc_key),
-                        .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                        .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                        .index_name = entry.config.name,
+                        .artifact_name = chunk_cfg.artifact_name,
+                        .doc_key = doc_key,
+                        .source_field = chunk_cfg.source_field,
+                        .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
-                        .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
                         .full_text_index = chunk_cfg.full_text_index,
-                        .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunking_execution_json) else "",
+                        .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) chunk_cfg.chunking_execution_json else "",
                     });
                 }
                 if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name, embedding_name)) {
-                    try requests.append(alloc, .{
+                    try appendOwnedGeneratedRequest(alloc, &requests, .{
                         .kind = .dense_embedding,
-                        .index_name = try alloc.dupe(u8, entry.config.name),
-                        .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
-                        .embedding_name = try alloc.dupe(u8, embedding_name),
+                        .index_name = entry.config.name,
+                        .artifact_name = chunk_cfg.artifact_name,
+                        .embedding_name = embedding_name,
                         .embedding_input = chunk_cfg.embedding_input,
                         .input_kind = input_kind,
-                        .doc_key = try alloc.dupe(u8, doc_key),
-                        .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                        .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                        .doc_key = doc_key,
+                        .source_field = chunk_cfg.source_field,
+                        .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                         .expected_dims = entry.dims,
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
-                        .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
                         .full_text_index = chunk_cfg.full_text_index,
-                        .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                        .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
+                        .producer_json = if (embedding_cfg.producer_json.len > 0) embedding_cfg.producer_json else "",
+                        .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) chunk_cfg.embedding_execution_json else "",
                     });
                 }
             } else {
@@ -14134,43 +14288,43 @@ pub const IndexManager = struct {
                         if (chunk_cfg.source_artifact_name.len == 0)
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
-                            try requests.append(alloc, .{
+                            try appendOwnedGeneratedRequest(alloc, &requests, .{
                                 .kind = .dense_embedding,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .index_name = entry.config.name,
+                                .artifact_name = chunk_cfg.name,
+                                .embedding_name = embedding_name,
                                 .embedding_input = embedding_cfg.embedding_input,
                                 // A named embedding producer consumes the
                                 // chunk artifact emitted by a separate
                                 // producer, even when that chunk producer
                                 // itself reads the parent document directly.
                                 .input_kind = .materialized_chunks,
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
-                                .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                                .doc_key = doc_key,
+                                .source_field = embedding_cfg.source_field,
+                                .source_template = if (embedding_cfg.source_template.len > 0) embedding_cfg.source_template else "",
                                 .expected_dims = entry.dims,
                                 .chunk_size = chunk_cfg.chunk_size,
                                 .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
                                 .full_text_index = chunk_cfg.full_text_index,
-                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                                .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) embedding_cfg.producer_json else "",
+                                .execution_json = if (embedding_cfg.execution_json.len > 0) embedding_cfg.execution_json else "",
                             });
                         }
                     } else {
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
-                            try requests.append(alloc, .{
+                            try appendOwnedGeneratedRequest(alloc, &requests, .{
                                 .kind = .dense_embedding,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
+                                .index_name = entry.config.name,
                                 .artifact_name = "",
-                                .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .embedding_name = embedding_name,
                                 .embedding_input = embedding_cfg.embedding_input,
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
-                                .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                                .doc_key = doc_key,
+                                .source_field = embedding_cfg.source_field,
+                                .source_template = if (embedding_cfg.source_template.len > 0) embedding_cfg.source_template else "",
                                 .expected_dims = entry.dims,
-                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                                .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) embedding_cfg.producer_json else "",
+                                .execution_json = if (embedding_cfg.execution_json.len > 0) embedding_cfg.execution_json else "",
                             });
                         }
                     }
@@ -14193,35 +14347,35 @@ pub const IndexManager = struct {
                 const embedding_name = if (chunk_cfg.embedding_name) |name| name else entry.config.name;
                 const embedding_cfg = self.getEnrichment(.embedding, embedding_name) orelse return error.InvalidIndexConfig;
                 if (generatorHasChunking(chunk_cfg) and !hasGeneratedChunkRequest(requests.items, doc_key, chunk_cfg.source_field, chunk_cfg.source_template, chunk_cfg.artifact_name)) {
-                    try requests.append(alloc, .{
+                    try appendOwnedGeneratedRequest(alloc, &requests, .{
                         .kind = .chunk_text,
-                        .index_name = try alloc.dupe(u8, entry.config.name),
-                        .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
-                        .doc_key = try alloc.dupe(u8, doc_key),
-                        .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                        .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                        .index_name = entry.config.name,
+                        .artifact_name = chunk_cfg.artifact_name,
+                        .doc_key = doc_key,
+                        .source_field = chunk_cfg.source_field,
+                        .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                         .chunk_size = chunk_cfg.chunk_size,
                         .chunk_overlap = chunk_cfg.chunk_overlap,
-                        .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                        .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
                         .full_text_index = chunk_cfg.full_text_index,
-                        .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunking_execution_json) else "",
+                        .execution_json = if (chunk_cfg.chunking_execution_json.len > 0) chunk_cfg.chunking_execution_json else "",
                     });
                 }
-                try requests.append(alloc, .{
+                try appendOwnedGeneratedRequest(alloc, &requests, .{
                     .kind = .sparse_embedding,
-                    .index_name = try alloc.dupe(u8, entry.config.name),
-                    .artifact_name = try alloc.dupe(u8, chunk_cfg.artifact_name),
-                    .embedding_name = try alloc.dupe(u8, embedding_name),
+                    .index_name = entry.config.name,
+                    .artifact_name = chunk_cfg.artifact_name,
+                    .embedding_name = embedding_name,
                     .input_kind = input_kind,
-                    .doc_key = try alloc.dupe(u8, doc_key),
-                    .source_field = try alloc.dupe(u8, chunk_cfg.source_field),
-                    .source_template = if (chunk_cfg.source_template.len > 0) try alloc.dupe(u8, chunk_cfg.source_template) else "",
+                    .doc_key = doc_key,
+                    .source_field = chunk_cfg.source_field,
+                    .source_template = if (chunk_cfg.source_template.len > 0) chunk_cfg.source_template else "",
                     .chunk_size = chunk_cfg.chunk_size,
                     .chunk_overlap = chunk_cfg.chunk_overlap,
-                    .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                    .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
                     .full_text_index = chunk_cfg.full_text_index,
-                    .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                    .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) try alloc.dupe(u8, chunk_cfg.embedding_execution_json) else "",
+                    .producer_json = if (embedding_cfg.producer_json.len > 0) embedding_cfg.producer_json else "",
+                    .execution_json = if (chunk_cfg.embedding_execution_json.len > 0) chunk_cfg.embedding_execution_json else "",
                 });
             } else {
                 var single_embedding_name: [1][]const u8 = undefined;
@@ -14239,34 +14393,34 @@ pub const IndexManager = struct {
                         if (chunk_cfg.source_artifact_name.len == 0)
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
-                            try requests.append(alloc, .{
+                            try appendOwnedGeneratedRequest(alloc, &requests, .{
                                 .kind = .sparse_embedding,
-                                .index_name = try alloc.dupe(u8, entry.config.name),
-                                .artifact_name = try alloc.dupe(u8, chunk_cfg.name),
-                                .embedding_name = try alloc.dupe(u8, embedding_name),
+                                .index_name = entry.config.name,
+                                .artifact_name = chunk_cfg.name,
+                                .embedding_name = embedding_name,
                                 .input_kind = .materialized_chunks,
-                                .doc_key = try alloc.dupe(u8, doc_key),
-                                .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
-                                .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
+                                .doc_key = doc_key,
+                                .source_field = embedding_cfg.source_field,
+                                .source_template = if (embedding_cfg.source_template.len > 0) embedding_cfg.source_template else "",
                                 .chunk_size = chunk_cfg.chunk_size,
                                 .chunk_overlap = chunk_cfg.chunk_overlap,
-                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) try alloc.dupe(u8, chunk_cfg.chunker_json) else "",
+                                .chunker_json = if (chunk_cfg.chunker_json.len > 0) chunk_cfg.chunker_json else "",
                                 .full_text_index = chunk_cfg.full_text_index,
-                                .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                                .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
+                                .producer_json = if (embedding_cfg.producer_json.len > 0) embedding_cfg.producer_json else "",
+                                .execution_json = if (embedding_cfg.execution_json.len > 0) embedding_cfg.execution_json else "",
                             });
                         }
                     } else if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, "", embedding_name)) {
-                        try requests.append(alloc, .{
+                        try appendOwnedGeneratedRequest(alloc, &requests, .{
                             .kind = .sparse_embedding,
-                            .index_name = try alloc.dupe(u8, entry.config.name),
+                            .index_name = entry.config.name,
                             .artifact_name = "",
-                            .embedding_name = try alloc.dupe(u8, embedding_name),
-                            .doc_key = try alloc.dupe(u8, doc_key),
-                            .source_field = try alloc.dupe(u8, embedding_cfg.source_field),
-                            .source_template = if (embedding_cfg.source_template.len > 0) try alloc.dupe(u8, embedding_cfg.source_template) else "",
-                            .producer_json = if (embedding_cfg.producer_json.len > 0) try alloc.dupe(u8, embedding_cfg.producer_json) else "",
-                            .execution_json = if (embedding_cfg.execution_json.len > 0) try alloc.dupe(u8, embedding_cfg.execution_json) else "",
+                            .embedding_name = embedding_name,
+                            .doc_key = doc_key,
+                            .source_field = embedding_cfg.source_field,
+                            .source_template = if (embedding_cfg.source_template.len > 0) embedding_cfg.source_template else "",
+                            .producer_json = if (embedding_cfg.producer_json.len > 0) embedding_cfg.producer_json else "",
+                            .execution_json = if (embedding_cfg.execution_json.len > 0) embedding_cfg.execution_json else "",
                         });
                     }
                 }
@@ -14309,6 +14463,11 @@ pub const IndexManager = struct {
                     if (request.embedding_name.len > 0) request.embedding_name else request.index_name,
                 ),
             };
+        }
+        for (requests.items) |*request| {
+            request.requires_committed_graph = request.neighbor_context_json.len != 0 or
+                self.artifactRequiresCommittedGraph(request.upstream_artifact_name) or
+                (request.input_kind != .document and self.artifactRequiresCommittedGraph(request.artifact_name));
         }
         return try requests.toOwnedSlice(alloc);
     }
@@ -14412,7 +14571,7 @@ pub const IndexManager = struct {
         for (self.dense_indexes.items) |entry| {
             if (entry.external or entry.chunk_name != null or entry.embedding_name != null or entry.embedding_names.len > 0) continue;
             if (containsOwnedString(fields.items, entry.field_name)) continue;
-            try fields.append(alloc, try alloc.dupe(u8, entry.field_name));
+            try appendOwnedString(alloc, &fields, entry.field_name);
         }
         for (self.sparse_indexes.items) |entry| {
             if (try parseSparseGeneratorConfig(alloc, entry.config.config_json)) |generator| {
@@ -14420,7 +14579,7 @@ pub const IndexManager = struct {
                 continue;
             }
             if (containsOwnedString(fields.items, entry.field_name)) continue;
-            try fields.append(alloc, try alloc.dupe(u8, entry.field_name));
+            try appendOwnedString(alloc, &fields, entry.field_name);
         }
         return try fields.toOwnedSlice(alloc);
     }
@@ -15191,7 +15350,7 @@ pub const IndexManager = struct {
         embedding_name: ?[]u8 = null,
         embedding_names: [][]u8 = &.{},
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.chunk_name) |value| alloc.free(value);
             for (self.source_artifact_names) |value| alloc.free(value);
             if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
@@ -15652,7 +15811,7 @@ pub const IndexManager = struct {
         // Use the publication predicate, including implicit full-text chunk
         // routing. A failed dependency inspection must conservatively schedule
         // replay, which will surface the error, never silently skip a delete.
-        return textIndexShouldConsumeDoc(self, entry, key) catch true;
+        return textIndexShouldRetireDeletedDoc(self, entry, key) catch true;
     }
 
     pub fn textIndexIsChunkBacked(self: *const IndexManager, alloc: Allocator, name: ?[]const u8) !bool {
@@ -15777,6 +15936,17 @@ pub const IndexManager = struct {
     fn densePostingSidecarEnabled() bool {
         return densePostingWalMutationStoreEnabled() or
             environmentFlag("ANTFLY_HBC_POSTING_SIDECAR", false);
+    }
+
+    /// Replay windows are sized from estimated bytes per vector. Storage that
+    /// cannot host the native posting store (Lite) applies through
+    /// HBC-over-LSM, where one write transaction owns a copy of every point
+    /// read until it commits: the measured working set is about 57 KiB per
+    /// 1536-dimension vector, not 6 KiB.
+    pub fn denseReplayWorkingSetFactor(self: *const IndexManager) u64 {
+        if (self.configuredDenseNativePostingStoreSupported() and
+            nativeBackupStoragePublicationCompatible(self.effectiveDenseStorage())) return 1;
+        return dense_lsm_posting_apply_working_set_factor;
     }
 
     fn configuredDenseNativePostingStoreSupported(self: *const IndexManager) bool {
@@ -16938,12 +17108,12 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |entry| {
             if (entry.chunk_name) |configured| {
                 if (std.mem.eql(u8, configured, chunk_name)) {
-                    try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+                    try appendOwnedString(alloc, &names, entry.config.name);
                 }
             } else if (containsOwnedString(entry.source_artifact_names, chunk_name)) {
-                try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+                try appendOwnedString(alloc, &names, entry.config.name);
             } else if (entry.source_artifact_names.len == 0 and include_default_full_text) {
-                try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+                try appendOwnedString(alloc, &names, entry.config.name);
             }
         }
         return try names.toOwnedSlice(alloc);
@@ -17024,7 +17194,7 @@ pub const IndexManager = struct {
                 (entry.external and std.mem.eql(u8, entry.config.name, embedding_name));
             if (!consumes) continue;
             if (entry.dims != dims) return error.ConflictingEnrichmentConfig;
-            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+            try appendOwnedString(alloc, &names, entry.config.name);
         }
         return try names.toOwnedSlice(alloc);
     }
@@ -17079,7 +17249,7 @@ pub const IndexManager = struct {
                 break :blk false;
             };
             if (!depends) continue;
-            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+            try appendOwnedString(alloc, &names, entry.config.name);
         }
         for (self.sparse_indexes.items) |entry| {
             const depends = (if (entry.chunk_name) |name| dependent_artifacts.contains(name) else false) or
@@ -17091,7 +17261,7 @@ pub const IndexManager = struct {
             };
             if (!depends) continue;
             if (containsOwnedString(names.items, entry.config.name)) continue;
-            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+            try appendOwnedString(alloc, &names, entry.config.name);
         }
         if (include_non_vector) {
             var include_default_full_text = false;
@@ -17111,13 +17281,13 @@ pub const IndexManager = struct {
                     break :blk if (entry.source_artifact_names.len == 0) include_default_full_text else false;
                 };
                 if (!depends or containsOwnedString(names.items, entry.config.name)) continue;
-                try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+                try appendOwnedString(alloc, &names, entry.config.name);
             }
             for (self.graph_indexes.items) |entry| {
                 for (entry.artifact_sources) |source| {
                     if (!dependent_artifacts.contains(source.artifact_name) or
                         containsOwnedString(names.items, entry.config.name)) continue;
-                    try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+                    try appendOwnedString(alloc, &names, entry.config.name);
                 }
             }
         }
@@ -17263,7 +17433,7 @@ pub const IndexManager = struct {
         }
         for (self.sparse_indexes.items) |entry| {
             if (!sparseEntryConsumesEmbedding(&entry, embedding_name)) continue;
-            try names.append(alloc, try alloc.dupe(u8, entry.config.name));
+            try appendOwnedString(alloc, &names, entry.config.name);
         }
         return try names.toOwnedSlice(alloc);
     }
@@ -17341,7 +17511,9 @@ pub const IndexManager = struct {
     }
 
     pub fn graphRetirementAdmissionOpen(self: *const IndexManager) bool {
-        return !self.graph_retirement_closed.load(.acquire);
+        if (self.graph_retirement_closed.load(.acquire)) return false;
+        if (self.primary_store) |store| if (store.graphEndpointCleanupBlocksReads() catch true) return false;
+        return true;
     }
 
     /// Call only while holding catalog_mutex exclusively. The Raft apply
@@ -17699,6 +17871,23 @@ pub const IndexManager = struct {
         defer entry.unlockAnalysisShared();
         if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
         return try textIndexShouldConsumeDoc(self, entry, key);
+    }
+
+    /// Like textPublicationContextConsumesKeyAssumeCatalogLocked, for a key
+    /// being deleted: also retires members of chunk artifacts that no longer
+    /// route into the index.
+    pub fn textPublicationContextRetiresDeletedKeyAssumeCatalogLocked(
+        self: *IndexManager,
+        index_name: []const u8,
+        context: TextPublicationContext,
+        key: []const u8,
+    ) !bool {
+        const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
+        if (entry.instance_id != context.instance_id) return error.IndexNotFound;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        if (entry.projection_revision != context.projection_revision) return error.IndexNotFound;
+        return try textIndexShouldRetireDeletedDoc(self, entry, key);
     }
 
     /// Plan the natural segment fan-out before producer admission. Projection
@@ -18244,6 +18433,7 @@ pub const IndexManager = struct {
             .last_merge_error = types.RuntimeErrorName.init(self.text_merge_scheduler.lastMergeError(now_ns)),
             .retry_after_ns = self.text_merge_scheduler.retryAfterNs(now_ns),
             .deferred_for_pressure = self.text_merge_scheduler.deferred_for_pressure,
+            .forced_drains = self.text_merge_scheduler.forced_drains,
         };
 
         for (self.text_indexes.items) |*entry| {
@@ -18305,6 +18495,7 @@ pub const IndexManager = struct {
             .last_merge_error = types.RuntimeErrorName.init(self.text_merge_scheduler.lastMergeErrorForIndex(index_name, now_ns)),
             .retry_after_ns = self.text_merge_scheduler.retryAfterNsForIndex(index_name, now_ns),
             .deferred_for_pressure = self.text_merge_scheduler.deferred_for_pressure,
+            .forced_drains = self.text_merge_scheduler.forced_drains,
         };
 
         const entry = self.textIndexEntry(index_name) orelse return stats;
@@ -18511,7 +18702,7 @@ pub const IndexManager = struct {
             return self.arena_owner.?.allocator();
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.arena_owner) |*arena| arena.deinit();
             for (self.owned_vectors.items) |vector| alloc.free(vector);
             for (self.owned_metadata.items) |metadata| alloc.free(metadata);
@@ -19807,7 +19998,7 @@ pub const IndexManager = struct {
         };
         try entry.index.saveProjectionCheckpointMetadata(.{
             .applied_sequence = projection_checkpoint.applied_sequence,
-            .status = @intFromEnum(projection_checkpoint.status),
+            .status = @backingInt(projection_checkpoint.status),
             .generation = projection_checkpoint.generation,
             .config_hash = projection_checkpoint.config_hash,
         });
@@ -19889,7 +20080,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteIndexDirUsingIoIfPresentFallible(self: *const IndexManager, path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         if (self.io) |io| {
             try std.Io.Dir.cwd().deleteTree(io, path);
             return;
@@ -19904,7 +20095,7 @@ pub const IndexManager = struct {
     }
 
     pub fn writeRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -19920,7 +20111,7 @@ pub const IndexManager = struct {
     }
 
     pub fn clearRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -20059,7 +20250,7 @@ pub const IndexManager = struct {
     }
 
     fn writeActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, relative_active_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         if (!validRelativeRepairIndexRoot(std.fs.path.basename(canonical_path), relative_active_path)) return error.InvalidIndexRootPointer;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -20077,7 +20268,7 @@ pub const IndexManager = struct {
     }
 
     fn clearActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
@@ -20124,7 +20315,7 @@ pub const IndexManager = struct {
         }
         const path = try self.activeIndexPath(name);
         defer self.alloc.free(path);
-        if (builtin.os.tag == .freestanding) return 0;
+        if (is_hostless) return 0;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -20367,7 +20558,7 @@ pub const IndexManager = struct {
     }
 
     fn pruneCanonicalIndexRootAfterPointerInstall(canonical_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -20640,7 +20831,7 @@ pub const IndexManager = struct {
                 const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 const persistent_opts = persistent_mod.PersistentIndexOptions{
@@ -20858,7 +21049,7 @@ pub const IndexManager = struct {
                 defer self.alloc.free(path);
                 const native_physical_v2 = try self.activeIndexRootPointerUsesNativeV2(cfg.name);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 const index = try self.alloc.create(hbc_mod.HBCIndex);
@@ -21135,7 +21326,7 @@ pub const IndexManager = struct {
                 const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 var index = try sparse_mod.SparseIndex.open(self.alloc, zpath, .{
@@ -21250,9 +21441,9 @@ pub const IndexManager = struct {
                     reverse_dir.close(io_impl.io());
                     break :blk false;
                 };
-                const zforward = try self.alloc.dupeZ(u8, forward_path);
+                const zforward = try self.alloc.dupeSentinel(u8, forward_path, 0);
                 defer self.alloc.free(zforward);
-                const zreverse = try self.alloc.dupeZ(u8, reverse_path);
+                const zreverse = try self.alloc.dupeSentinel(u8, reverse_path, 0);
                 defer self.alloc.free(zreverse);
 
                 var cloned_cfg = try types.IndexConfig.clone(self.alloc, cfg);
@@ -21867,6 +22058,37 @@ pub const IndexManager = struct {
                 }
             },
         }
+        try self.validateNeighborDependencyGraph(cfg);
+    }
+
+    /// Neighbor sampling adds graph-source dependencies to the ordinary asset
+    /// DAG. Reject feedback through generated graph sources, including indirect
+    /// asset/chunk chains, before publication can schedule endpoint producers.
+    fn validateNeighborDependencyGraph(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig) !void {
+        var seen = std.StringHashMapUnmanaged(void).empty;
+        defer seen.deinit(self.alloc);
+        try self.visitNeighborDependencies(root, root, &seen);
+    }
+
+    fn visitNeighborDependencies(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig, cfg: enrichment_catalog.EnrichmentConfig, seen: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (seen.contains(cfg.name)) return;
+        try seen.put(self.alloc, cfg.name, {});
+        if (cfg.source_artifact_name.len != 0)
+            try self.visitNeighborArtifact(root, cfg.source_artifact_name, seen);
+        if (cfg.neighbor_context_json.len != 0) {
+            var context = try enrichment_neighbor_context.parseConfigJson(self.alloc, cfg.neighbor_context_json);
+            defer context.deinit(self.alloc);
+            for (self.graph_indexes.items) |entry| {
+                if (!std.mem.eql(u8, entry.config.name, context.graph_index)) continue;
+                for (entry.artifact_sources) |source|
+                    try self.visitNeighborArtifact(root, source.artifact_name, seen);
+            }
+        }
+    }
+
+    fn visitNeighborArtifact(self: *const IndexManager, root: enrichment_catalog.EnrichmentConfig, name: []const u8, seen: *std.StringHashMapUnmanaged(void)) anyerror!void {
+        if (std.mem.eql(u8, root.name, name)) return error.InvalidEnrichmentConfig;
+        if (self.getEnrichmentByName(name)) |cfg| try self.visitNeighborDependencies(root, cfg.*, seen);
     }
 
     fn validateEnrichmentCatalogGraph(self: *const IndexManager) !void {
@@ -22039,7 +22261,20 @@ pub const IndexManager = struct {
                 else => return err,
             };
             if (maybe_task) |task| return task;
-            if (!has_in_flight and !self.text_merge_scheduler.indexHasActiveQuarantine(entry.config.name, now_ns)) TextMergeScheduler.noteComplete(entry);
+            // A null task can mean genuinely nothing left to merge, or a
+            // transient planning miss (every eligible segment already
+            // in-flight or quarantined, a resource-pressure defer inside
+            // beginTextMergeTaskForEntry, etc). Clearing compaction_pending
+            // here without re-checking whether the index still needs a
+            // merge would drop the only signal that would have retried it:
+            // nothing else re-arms compaction_pending once it is cleared.
+            if (!has_in_flight and !self.text_merge_scheduler.indexHasActiveQuarantine(entry.config.name, now_ns)) {
+                if (try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy())) {
+                    TextMergeScheduler.schedule(entry);
+                } else {
+                    TextMergeScheduler.noteComplete(entry);
+                }
+            }
         }
         return null;
     }
@@ -22280,6 +22515,11 @@ pub const IndexManager = struct {
                 result.elapsed_ns,
                 result.peak_task_alloc_bytes,
             );
+            // A completed merge proves the current write rate can sustain a
+            // merge this wide; let the next plan use the policy's normal
+            // width again instead of staying shrunk from an earlier
+            // mid-build budget failure (see merge_segment_cap).
+            entry.merge_segment_cap.store(std.math.maxInt(u32), .release);
         }
         return applied;
     }
@@ -22287,6 +22527,23 @@ pub const IndexManager = struct {
     pub fn cancelTextMergeTask(self: *IndexManager, task: *const TextMergeTask) void {
         self.completeTextMergeTaskTracking(task);
         if (self.textIndexEntry(task.index_name)) |entry| TextMergeScheduler.schedule(entry);
+    }
+
+    /// Like `cancelTextMergeTask`, but for a merge whose byte reservation ran
+    /// out mid-build rather than at admission. Retrying the identical plan
+    /// would hit the same wall under the same write rate (deletion deltas
+    /// that commit while the merge builds compete inside that same fixed
+    /// ceiling; see `TextMergeBudgetAllocator` and `merge_segment_cap`), so
+    /// shrink the segment count admitted for this index's next attempt
+    /// instead of spinning on a doomed plan.
+    pub fn noteTextMergeResourceBudgetExceeded(self: *IndexManager, task: *const TextMergeTask) void {
+        self.completeTextMergeTaskTracking(task);
+        if (self.textIndexEntry(task.index_name)) |entry| {
+            const attempted: u32 = @intCast(task.merge_indices.len);
+            const shrunk = @max(2, attempted / 2);
+            entry.merge_segment_cap.store(shrunk, .release);
+            TextMergeScheduler.schedule(entry);
+        }
     }
 
     pub fn noteTextMergeFailure(self: *IndexManager, task: *const TextMergeTask, err: anyerror) void {
@@ -22339,7 +22596,24 @@ pub const IndexManager = struct {
         }
         if (infos.items.len < 2) return null;
 
-        const planned = (try activeTextMergePolicy().plan(self.alloc, infos.items)) orelse return null;
+        const policy = activeTextMergePolicy();
+        const planned = (try policy.plan(self.alloc, infos.items)) orelse blk: {
+            // The tiered policy found nothing to merge (for example every
+            // eligible segment floors to the same effective size under
+            // floor_segment_size, or no pair fits under max_segment_size)
+            // while the index still holds more live segments than its
+            // steady-state tier target. Force-drain the smallest eligible
+            // segments so producer admission always has a merge in flight to
+            // wait on instead of retrying TextMergeBackpressureTimeout
+            // against a scheduler that gave up.
+            if (snap.segments.len <= policy.max_segments_per_tier) return null;
+            self.text_merge_scheduler.forced_drains += 1;
+            break :blk try text_index_maintenance.planForceDrainFromInfos(
+                self.alloc,
+                infos.items,
+                force_merge_max_segments_at_once,
+            );
+        };
         defer self.alloc.free(planned);
         if (planned.len < 2) return null;
 
@@ -22348,7 +22622,16 @@ pub const IndexManager = struct {
         // a smaller merge can make forward progress. Adapt admission down to
         // a pair before reporting pressure; otherwise a synchronous
         // `full_index` drain can mistake one oversized plan for no merge debt.
-        var admitted_len = planned.len;
+        //
+        // A prior execution of this same width may also have run out of its
+        // byte reservation mid-build (deletion deltas that commit while a
+        // wide merge is still building compete inside that same fixed
+        // ceiling), which the admission walk-down below cannot see since the
+        // static reservation estimate for this width alone still fits.
+        // Start from whatever width last actually finished instead of
+        // re-admitting the same doomed plan every attempt.
+        var admitted_len = @min(planned.len, @as(usize, entry.merge_segment_cap.load(.acquire)));
+        if (admitted_len < 2) admitted_len = @min(planned.len, 2);
         var task = while (true) {
             break self.copyTextMergeTask(entry.config.name, &entry.persistent, snap, planned[0..admitted_len]) catch |err| switch (err) {
                 error.ResourceBudgetExceeded => {
@@ -22702,10 +22985,15 @@ pub const IndexManager = struct {
             while (delta_iter.next()) |doc_id| {
                 if (doc_id >= frozen_seg.reader.doc_count) return error.InvalidSegment;
 
-                const location = if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
-                    result.outputForOrdinal(ordinal)
-                else if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
+                // Mirror buildPublicationLookup's identity priority: the
+                // stored id is the document's own unique key and must be
+                // checked first, since chunk members share their parent's
+                // ordinal and buildPublicationLookup keyed them by id, not
+                // ordinal, whenever a stored id was present.
+                const location = if (try frozen_seg.reader.storedDoc(doc_id)) |stored|
                     result.outputForId(stored.id)
+                else if (try frozen_seg.reader.docOrdinal(doc_id)) |ordinal|
+                    result.outputForOrdinal(ordinal)
                 else
                     null;
                 const output = location orelse return error.MissingMergeDocumentIdentity;
@@ -24378,16 +24666,16 @@ pub const IndexManager = struct {
             );
             if (self.resource_manager) |manager| {
                 const resource_stats = manager.snapshot();
-                const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
-                const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
-                const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
-                const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
-                const lsm_table_builder = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)];
-                const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
-                const lsm_wal_write = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)];
-                const lsm_wal_retention = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)];
-                const lsm_recovery = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_recovery_working_set)];
-                const derived_backlog = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)];
+                const ft_pending = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)];
+                const ft_build = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)];
+                const lsm_cache = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)];
+                const lsm_compaction = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)];
+                const lsm_table_builder = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)];
+                const lsm_state = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)];
+                const lsm_wal_write = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_wal_write_working_set)];
+                const lsm_wal_retention = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_wal_retention)];
+                const lsm_recovery = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_recovery_working_set)];
+                const derived_backlog = resource_stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)];
                 const lsm_stats = self.snapshotLsmMaintenanceStats();
                 const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
                 const lsm_resource_used = lsm_cache.used_bytes +| lsm_compaction.used_bytes +| lsm_table_builder.used_bytes +| lsm_state.used_bytes +| lsm_wal_write.used_bytes +| lsm_recovery.used_bytes;
@@ -25146,32 +25434,11 @@ pub const IndexManager = struct {
         return try doc_ids.toOwnedSlice(alloc);
     }
 
-    fn deleteGraphDocsEntry(self: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
-        var deletes = std.ArrayListUnmanaged(graph_mod.BatchDelete).empty;
-        defer {
-            for (deletes.items) |delete| {
-                self.alloc.free(@constCast(delete.source));
-                self.alloc.free(@constCast(delete.target));
-                self.alloc.free(@constCast(delete.edge_type));
-            }
-            deletes.deinit(self.alloc);
-        }
-
-        for (keys) |key| {
-            const edges = try entry.index.getPhysicalEdgesForDeletion(self.alloc, key, "", .both);
-            defer graph_mod.GraphIndex.freeEdges(self.alloc, edges);
-
-            for (edges) |edge| {
-                try deletes.append(self.alloc, .{
-                    .source = try self.alloc.dupe(u8, edge.source),
-                    .target = try self.alloc.dupe(u8, edge.target),
-                    .edge_type = try self.alloc.dupe(u8, edge.edge_type),
-                    .clear_all_private_state = true,
-                });
-            }
-        }
-
-        try entry.index.batchApply(&.{}, deletes.items);
+    fn deleteGraphDocsEntry(_: *IndexManager, entry: *GraphIndex, keys: []const []const u8) !void {
+        if (keys.len > 0) entry.invalidateNeighborSource();
+        // The graph index owns the relationship identity and ownership rules.
+        // Reuse its cleanup path for both endpoint and fact-document deletion.
+        try entry.index.deleteOwnedEdgesForDocs(keys);
     }
 
     fn applyGraphWritesEntry(self: *IndexManager, entry: *GraphIndex, writes: []const types.GraphEdgeWrite) !void {
@@ -25232,6 +25499,8 @@ pub const IndexManager = struct {
                     parsed.edge_type,
                     parsed.target_doc_key,
                     parsed.doc_key,
+                    parsed.edge_id,
+                    if (parsed.edge_id.len > 0 and parsed.logical_source.len > 0) parsed.doc_key else "",
                     &snapshots,
                 );
                 try state.entry.index.replaceContributionSnapshots(snapshots.items);
@@ -25317,18 +25586,14 @@ pub const IndexManager = struct {
         defer batch_deletes.deinit(self.alloc);
 
         for (writes) |write| {
-            // Range admission follows the OWNING document, exactly like the
-            // artifact key: an entity-sourced edge's canonical source key
-            // (write.owner non-empty) can hash into a different shard range
-            // than the producing document, and filtering by it would make
-            // the owner's shard silently drop the mutation.
-            const range_key = if (write.owner.len > 0) write.owner else write.source;
-            if (!self.keyInRange(range_key)) continue;
+            if (!self.keyInRange(if (write.owner_document.len > 0) write.owner_document else if (write.owner.len > 0) write.owner else write.source)) continue;
             if (!std.mem.eql(u8, write.index_name, entry.config.name)) continue;
             try batch_writes.append(self.alloc, .{
                 .source = write.source,
                 .target = write.target,
                 .edge_type = write.edge_type,
+                .edge_id = write.edge_id,
+                .owner_document = write.owner_document,
                 .weight = write.weight,
                 .created_at = write.created_at,
                 .updated_at = write.updated_at,
@@ -25339,18 +25604,24 @@ pub const IndexManager = struct {
         }
 
         for (deletes) |delete| {
-            const range_key = if (delete.owner.len > 0) delete.owner else delete.source;
-            if (!self.keyInRange(range_key)) continue;
+            if (!self.keyInRange(if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source)) continue;
             if (!std.mem.eql(u8, delete.index_name, entry.config.name)) continue;
             try batch_deletes.append(self.alloc, .{
                 .source = delete.source,
                 .target = delete.target,
                 .edge_type = delete.edge_type,
+                .edge_id = delete.edge_id,
+                .owner_document = delete.owner_document,
                 .owner = delete.owner,
-                .preserve_if_member = snapshot_mode == .retire_owner and delete.owner.len == 0,
+                .preserve_if_member = snapshot_mode == .retire_owner and delete.owner.len == 0 and delete.edge_id.len == 0,
             });
         }
 
+        // Ordinary replay can temporarily withdraw an owner in an older
+        // window before replaying its latest artifacts. A producer must refresh
+        // again rather than treating that intermediate sidecar as current.
+        if (batch_writes.items.len > 0 or batch_deletes.items.len > 0)
+            entry.invalidateNeighborSource();
         try entry.index.batchApply(batch_writes.items, batch_deletes.items);
         if (entry.ttl_duration_ns != 0 or graphEntryHasContributors(entry)) {
             const primary = self.primary_store orelse return error.MissingPrimaryStore;
@@ -25359,7 +25630,7 @@ pub const IndexManager = struct {
             const arena = arena_state.allocator();
             var snapshots = std.ArrayListUnmanaged(graph_mod.ContributionSnapshot).empty;
             for (batch_writes.items) |write| {
-                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, &snapshots);
+                try appendGraphContributionSnapshot(arena, primary, entry, write.source, write.edge_type, write.target, write.owner, write.edge_id, write.owner_document, &snapshots);
             }
             for (batch_deletes.items) |delete| {
                 if (snapshot_mode == .retire_owner) {
@@ -25367,11 +25638,13 @@ pub const IndexManager = struct {
                         .source = delete.source,
                         .target = delete.target,
                         .edge_type = delete.edge_type,
-                        .owner = if (delete.owner.len > 0) delete.owner else delete.source,
+                        .edge_id = delete.edge_id,
+                        .owner_document = delete.owner_document,
+                        .owner = if (delete.owner_document.len > 0) delete.owner_document else if (delete.owner.len > 0) delete.owner else delete.source,
                         .contributions = &.{},
                     });
                 } else {
-                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, &snapshots);
+                    try appendGraphContributionSnapshot(arena, primary, entry, delete.source, delete.edge_type, delete.target, delete.owner, delete.edge_id, delete.owner_document, &snapshots);
                 }
             }
             try entry.index.replaceContributionSnapshots(snapshots.items);
@@ -25386,9 +25659,11 @@ pub const IndexManager = struct {
         edge_type: []const u8,
         target: []const u8,
         owner: []const u8,
+        edge_id: []const u8,
+        owner_document: []const u8,
         snapshots: *std.ArrayListUnmanaged(graph_mod.ContributionSnapshot),
     ) !void {
-        const artifact_key = try internal_keys.graphEdgeArtifactKeyWithSourceAlloc(alloc, if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source);
+        const artifact_key = try internal_keys.graphRelationshipArtifactKeyAlloc(alloc, if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source, entry.config.name, edge_type, target, source, edge_id);
         const raw = primary.get(alloc, artifact_key) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -25434,7 +25709,9 @@ pub const IndexManager = struct {
             .source = source,
             .edge_type = edge_type,
             .target = target,
-            .owner = if (owner.len > 0) owner else source,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
+            .owner = if (owner_document.len > 0) owner_document else if (owner.len > 0) owner else source,
             .contributions = try contributors.toOwnedSlice(alloc),
         });
     }
@@ -29706,6 +29983,7 @@ pub const IndexManager = struct {
             for (legacy_keys) |key| self.alloc.free(@constCast(key));
         }
 
+        sortLegacyOrdinalProbes(legacy_keys, missing_ordinals);
         try mutable_txn.getManySorted(legacy_keys, legacy_values);
         for (legacy_values, missing_ordinals) |maybe_raw, ordinal| {
             if (maybe_raw) |raw| {
@@ -30089,6 +30367,18 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
     return try self.textIndexIsChunkBacked(self.alloc, entry.config.name);
 }
 
+fn textIndexShouldRetireDeletedDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
+    if (try textIndexShouldConsumeDoc(self, entry, key)) return true;
+    // A chunk artifact whose enrichment was deleted no longer routes into the
+    // default index, but members it published earlier may still be posted
+    // there. Deleting its rows must also retire those postings; retiring an
+    // absent member is a no-op.
+    if (entry.chunk_name != null or entry.source_artifact_names.len > 0) return false;
+    if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
+    const chunk_name = (try internal_keys.artifactNameView(key)) orelse return true;
+    return self.getEnrichment(.chunk, chunk_name) == null;
+}
+
 fn visibleBaseDocumentRowKey(self: *const IndexManager, key: []const u8) bool {
     return if (self.relational_base_rows)
         internal_keys.isRelationalRowKey(key)
@@ -30143,7 +30433,7 @@ fn coverageIdentityForConfig(cfg: types.IndexConfig) IndexManager.CoverageIdenti
 
 fn appendCatalogConfig(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, cfg: types.IndexConfig) !void {
     try appendStr(out, alloc, cfg.name);
-    try out.append(alloc, @intFromEnum(cfg.kind));
+    try out.append(alloc, @backingInt(cfg.kind));
     try appendStr(out, alloc, cfg.config_json);
     try appendU64(out, alloc, coverageGenerationForConfig(cfg));
 }
@@ -30241,11 +30531,11 @@ pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConf
         const kind_value = data[pos];
         pos += 1;
         const kind: types.IndexKind = switch (kind_value) {
-            @intFromEnum(types.IndexKind.full_text) => .full_text,
-            @intFromEnum(types.IndexKind.dense_vector) => .dense_vector,
-            @intFromEnum(types.IndexKind.sparse_vector) => .sparse_vector,
-            @intFromEnum(types.IndexKind.graph) => .graph,
-            @intFromEnum(types.IndexKind.algebraic) => .algebraic,
+            @backingInt(types.IndexKind.full_text) => .full_text,
+            @backingInt(types.IndexKind.dense_vector) => .dense_vector,
+            @backingInt(types.IndexKind.sparse_vector) => .sparse_vector,
+            @backingInt(types.IndexKind.graph) => .graph,
+            @backingInt(types.IndexKind.algebraic) => .algebraic,
             else => return error.InvalidIndexCatalog,
         };
 
@@ -30364,7 +30654,7 @@ test "index catalog preserves coverage generation and migrates legacy generation
     try appendU32(&legacy, alloc, 1);
     try appendU32(&legacy, alloc, 1);
     try appendStr(&legacy, alloc, "semantic_idx");
-    try legacy.append(alloc, @intFromEnum(types.IndexKind.dense_vector));
+    try legacy.append(alloc, @backingInt(types.IndexKind.dense_vector));
     try appendStr(&legacy, alloc, config_json);
 
     const legacy_decoded = try deserializeCatalog(alloc, legacy.items);
@@ -30381,7 +30671,7 @@ test "index create preserves authoritative coverage generation" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -30449,7 +30739,7 @@ test "index catalog preserves malformed vector config for quarantine" {
     try appendU32(&encoded, alloc, 2);
     try appendU32(&encoded, alloc, 1);
     try appendStr(&encoded, alloc, "bad_dense");
-    try encoded.append(alloc, @intFromEnum(types.IndexKind.dense_vector));
+    try encoded.append(alloc, @backingInt(types.IndexKind.dense_vector));
     try appendStr(&encoded, alloc, "{");
     try appendU64(&encoded, alloc, 42);
 
@@ -30486,7 +30776,7 @@ const DenseConfig = struct {
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
 
-    fn deinit(self: *const DenseConfig, alloc: Allocator) void {
+    pub fn deinit(self: *const DenseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
         if (self.embedding_name) |embedding_name| alloc.free(embedding_name);
         for (self.embedding_names) |embedding_name| alloc.free(embedding_name);
@@ -30706,7 +30996,7 @@ const TextConfig = struct {
     source_selected_fields: []?[]u8 = &.{},
     selected_field: ?[]u8 = null,
 
-    fn deinit(self: *const TextConfig, alloc: Allocator) void {
+    pub fn deinit(self: *const TextConfig, alloc: Allocator) void {
         if (self.source_artifact_name) |source_artifact_name| alloc.free(source_artifact_name);
         for (self.source_artifact_names) |name| alloc.free(name);
         if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
@@ -30752,7 +31042,7 @@ const OwnedTextIndexConfig = struct {
         };
     }
 
-    fn deinit(self: *OwnedTextIndexConfig, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedTextIndexConfig, alloc: Allocator) void {
         self.config.deinit(alloc);
         if (self.chunk_name) |name| alloc.free(name);
         for (self.source_artifact_names) |name| alloc.free(name);
@@ -30763,6 +31053,14 @@ const OwnedTextIndexConfig = struct {
         self.* = undefined;
     }
 };
+
+/// Reserve before cloning so a request either stays borrowed or transfers
+/// as a complete owned value. Partial string clones unwind in the shared helper.
+fn appendOwnedGeneratedRequest(alloc: Allocator, requests: *std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest), borrowed: enrichment_types.GeneratedEnrichmentRequest) !void {
+    try requests.ensureUnusedCapacity(alloc, 1);
+    const owned = try enrichment_types.cloneGeneratedRequest(alloc, borrowed);
+    requests.appendAssumeCapacity(owned);
+}
 
 const GeneratorConfig = struct {
     source_field: []u8,
@@ -30777,7 +31075,7 @@ const GeneratorConfig = struct {
     full_text_index: bool = false,
     embedding_input: enrichment_types.EmbeddingInput = .text,
 
-    fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
+    pub fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
         alloc.free(self.source_field);
         if (self.source_template.len > 0) alloc.free(self.source_template);
         alloc.free(self.artifact_name);
@@ -30794,7 +31092,7 @@ const SparseConfig = struct {
     embedding_name: ?[]u8 = null,
     embedding_names: [][]u8 = &.{},
 
-    fn deinit(self: *const SparseConfig, alloc: Allocator) void {
+    pub fn deinit(self: *const SparseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
         if (self.embedding_name) |name| alloc.free(name);
         for (self.embedding_names) |name| alloc.free(name);
@@ -30814,6 +31112,8 @@ pub const GraphNodeModel = enum {
 
 pub const GraphArtifactMapping = struct {
     node_model: GraphNodeModel = .document,
+    source_template: []u8 = "",
+    edge_id_template: []u8 = "",
     target_template: []u8 = "",
     edge_type_template: []u8 = "",
     weight_template: []u8 = "",
@@ -30821,30 +31121,24 @@ pub const GraphArtifactMapping = struct {
     context_doc_fields: []const []u8 = &.{},
 
     pub fn clone(alloc: Allocator, mapping: GraphArtifactMapping) !GraphArtifactMapping {
-        const context_doc_fields: [][]u8 = if (mapping.context_doc_fields.len > 0)
-            try alloc.alloc([]u8, mapping.context_doc_fields.len)
-        else
-            @constCast(&.{});
-        var initialized: usize = 0;
-        errdefer {
-            for (context_doc_fields[0..initialized]) |field| alloc.free(field);
-            if (context_doc_fields.len > 0) alloc.free(context_doc_fields);
+        var result = GraphArtifactMapping{ .node_model = mapping.node_model };
+        errdefer result.deinit(alloc);
+        inline for ([_][]const u8{ "source_template", "edge_id_template", "target_template", "edge_type_template", "weight_template", "metadata_template_json" }) |field| {
+            const value = @field(mapping, field);
+            if (value.len > 0) @field(result, field) = try alloc.dupe(u8, value);
         }
-        for (mapping.context_doc_fields, 0..) |field, i| {
-            context_doc_fields[i] = try alloc.dupe(u8, field);
-            initialized += 1;
+        if (mapping.context_doc_fields.len > 0) {
+            const fields = try alloc.alloc([]u8, mapping.context_doc_fields.len);
+            @memset(fields, @constCast(""));
+            result.context_doc_fields = fields;
+            for (mapping.context_doc_fields, fields) |field, *owned| owned.* = try alloc.dupe(u8, field);
         }
-        return .{
-            .node_model = mapping.node_model,
-            .target_template = if (mapping.target_template.len > 0) try alloc.dupe(u8, mapping.target_template) else "",
-            .edge_type_template = if (mapping.edge_type_template.len > 0) try alloc.dupe(u8, mapping.edge_type_template) else "",
-            .weight_template = if (mapping.weight_template.len > 0) try alloc.dupe(u8, mapping.weight_template) else "",
-            .metadata_template_json = if (mapping.metadata_template_json.len > 0) try alloc.dupe(u8, mapping.metadata_template_json) else "",
-            .context_doc_fields = context_doc_fields,
-        };
+        return result;
     }
 
     pub fn deinit(self: *GraphArtifactMapping, alloc: Allocator) void {
+        if (self.source_template.len > 0) alloc.free(self.source_template);
+        if (self.edge_id_template.len > 0) alloc.free(self.edge_id_template);
         if (self.target_template.len > 0) alloc.free(self.target_template);
         if (self.edge_type_template.len > 0) alloc.free(self.edge_type_template);
         if (self.weight_template.len > 0) alloc.free(self.weight_template);
@@ -30867,13 +31161,13 @@ pub const GraphArtifactSource = struct {
     mention_edge_type: []u8 = "",
 
     pub fn clone(alloc: Allocator, source: GraphArtifactSource) !GraphArtifactSource {
-        return .{
-            .artifact_name = try alloc.dupe(u8, source.artifact_name),
-            .path = if (source.path.len > 0) try alloc.dupe(u8, source.path) else "",
-            .format = source.format,
-            .mapping = try GraphArtifactMapping.clone(alloc, source.mapping),
-            .mention_edge_type = if (source.mention_edge_type.len > 0) try alloc.dupe(u8, source.mention_edge_type) else "",
-        };
+        var result = GraphArtifactSource{ .artifact_name = @constCast(""), .format = source.format };
+        errdefer result.deinit(alloc);
+        result.artifact_name = try alloc.dupe(u8, source.artifact_name);
+        if (source.path.len > 0) result.path = try alloc.dupe(u8, source.path);
+        result.mapping = try GraphArtifactMapping.clone(alloc, source.mapping);
+        if (source.mention_edge_type.len > 0) result.mention_edge_type = try alloc.dupe(u8, source.mention_edge_type);
+        return result;
     }
 
     pub fn deinit(self: *GraphArtifactSource, alloc: Allocator) void {
@@ -31079,7 +31373,7 @@ const ParsedTextArtifactSources = struct {
     names: [][]u8 = &.{},
     selected_fields: []?[]u8 = &.{},
 
-    fn deinit(self: *const ParsedTextArtifactSources, alloc: Allocator) void {
+    pub fn deinit(self: *const ParsedTextArtifactSources, alloc: Allocator) void {
         for (self.names) |name| alloc.free(name);
         if (self.names.len > 0) alloc.free(self.names);
         freeOptionalOwnedStrings(alloc, self.selected_fields);
@@ -31775,22 +32069,31 @@ fn parseDenseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConfi
     else
         false;
 
+    const owned_source_field = try alloc.dupe(u8, source_field.string);
+    errdefer alloc.free(owned_source_field);
+    const owned_source_template: []u8 = if (generator.object.get("source_template")) |value|
+        if (value == .string and value.string.len > 0) try alloc.dupe(u8, value.string) else &.{}
+    else
+        &.{};
+    errdefer alloc.free(owned_source_template);
+    const owned_artifact_name = if (chunk_name_value) |value|
+        try alloc.dupe(u8, value.string)
+    else if (artifact_value) |value|
+        try alloc.dupe(u8, value.string)
+    else
+        try alloc.dupe(u8, source_field.string);
+    errdefer alloc.free(owned_artifact_name);
+    const owned_embedding_name = if (generator.object.get("embedding_name")) |value|
+        try alloc.dupe(u8, value.string)
+    else
+        null;
+    errdefer if (owned_embedding_name) |value| alloc.free(value);
+
     return .{
-        .source_field = try alloc.dupe(u8, source_field.string),
-        .source_template = if (generator.object.get("source_template")) |value|
-            if (value == .string and value.string.len > 0) try alloc.dupe(u8, value.string) else &.{}
-        else
-            &.{},
-        .artifact_name = if (chunk_name_value) |value|
-            try alloc.dupe(u8, value.string)
-        else if (artifact_value) |value|
-            try alloc.dupe(u8, value.string)
-        else
-            try alloc.dupe(u8, source_field.string),
-        .embedding_name = if (generator.object.get("embedding_name")) |value|
-            try alloc.dupe(u8, value.string)
-        else
-            null,
+        .source_field = owned_source_field,
+        .source_template = owned_source_template,
+        .artifact_name = owned_artifact_name,
+        .embedding_name = owned_embedding_name,
         .chunk_size = if (generator.object.get("chunk_size")) |value|
             std.math.cast(u32, value.integer) orelse return error.InvalidIndexConfig
         else
@@ -31843,22 +32146,31 @@ fn parseSparseGeneratorConfig(alloc: Allocator, raw: []const u8) !?GeneratorConf
     else
         false;
 
+    const owned_source_field = try alloc.dupe(u8, source_field.string);
+    errdefer alloc.free(owned_source_field);
+    const owned_source_template: []u8 = if (generator.object.get("source_template")) |value|
+        if (value == .string and value.string.len > 0) try alloc.dupe(u8, value.string) else &.{}
+    else
+        &.{};
+    errdefer alloc.free(owned_source_template);
+    const owned_artifact_name = if (chunk_name_value) |value|
+        try alloc.dupe(u8, value.string)
+    else if (artifact_value) |value|
+        try alloc.dupe(u8, value.string)
+    else
+        try alloc.dupe(u8, source_field.string);
+    errdefer alloc.free(owned_artifact_name);
+    const owned_embedding_name = if (generator.object.get("embedding_name")) |value|
+        try alloc.dupe(u8, value.string)
+    else
+        null;
+    errdefer if (owned_embedding_name) |value| alloc.free(value);
+
     return .{
-        .source_field = try alloc.dupe(u8, source_field.string),
-        .source_template = if (generator.object.get("source_template")) |value|
-            if (value == .string and value.string.len > 0) try alloc.dupe(u8, value.string) else &.{}
-        else
-            &.{},
-        .artifact_name = if (chunk_name_value) |value|
-            try alloc.dupe(u8, value.string)
-        else if (artifact_value) |value|
-            try alloc.dupe(u8, value.string)
-        else
-            try alloc.dupe(u8, source_field.string),
-        .embedding_name = if (generator.object.get("embedding_name")) |value|
-            try alloc.dupe(u8, value.string)
-        else
-            null,
+        .source_field = owned_source_field,
+        .source_template = owned_source_template,
+        .artifact_name = owned_artifact_name,
+        .embedding_name = owned_embedding_name,
         .chunk_size = if (generator.object.get("chunk_size")) |value|
             std.math.cast(u32, value.integer) orelse return error.InvalidIndexConfig
         else
@@ -32110,7 +32422,7 @@ pub fn graphConfigConsumesArtifact(alloc: Allocator, raw: []const u8, artifact_n
 }
 
 pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
-    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{ .parse_numbers = false });
     defer parsed.deinit();
     const root = parsed.value;
     if (root != .object) return error.InvalidIndexConfig;
@@ -32133,10 +32445,13 @@ pub fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     if (root.object.get("sources") != null and root.object.get("source") != null) return error.InvalidIndexConfig;
     const algebraic_semiring_traversal = try parseGraphAlgebraicSemiringTraversal(root);
     const max_edges_per_document: u32 = if (root.object.get("max_edges_per_document")) |value| blk: {
-        if (value != .integer or value.integer < 0 or value.integer > @as(i64, graph_asset_state.hard_max_edges_per_document)) {
-            return error.InvalidIndexConfig;
-        }
-        break :blk @intCast(value.integer);
+        const count = switch (value) {
+            .integer => |v| v,
+            .number_string => |text| std.fmt.parseInt(i64, text, 10) catch return error.InvalidIndexConfig,
+            else => return error.InvalidIndexConfig,
+        };
+        if (count < 0 or count > @as(i64, graph_asset_state.hard_max_edges_per_document)) return error.InvalidIndexConfig;
+        break :blk @intCast(count);
     } else 0;
     const artifact_sources: []GraphArtifactSource = if (root.object.get("sources") != null)
         try parseGraphArtifactSources(alloc, root)
@@ -32348,6 +32663,7 @@ fn jsonNumberAsF64(value: std.json.Value) !f64 {
     return switch (value) {
         .integer => |v| @floatFromInt(v),
         .float => |v| v,
+        .number_string => |text| std.fmt.parseFloat(f64, text) catch error.InvalidIndexConfig,
         else => error.InvalidIndexConfig,
     };
 }
@@ -32356,6 +32672,10 @@ fn jsonNumberAsU32(value: std.json.Value) !u32 {
     return switch (value) {
         .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else error.InvalidIndexConfig,
         .float => |v| if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @intFromFloat(v) else error.InvalidIndexConfig,
+        .number_string => |text| blk: {
+            const v = std.fmt.parseFloat(f64, text) catch return error.InvalidIndexConfig;
+            break :blk if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @as(u32, @intFromFloat(v)) else error.InvalidIndexConfig;
+        },
         else => error.InvalidIndexConfig,
     };
 }
@@ -32486,7 +32806,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
 
     if (root.object.get("nodes")) |nodes| {
         if (nodes != .object) return error.InvalidIndexConfig;
-        if (nodes.object.get("source") != null) return error.InvalidIndexConfig;
+        mapping.source_template = try parseOptionalGraphTemplate(alloc, nodes, "source");
         if (nodes.object.get("model")) |model| {
             if (model != .string) return error.InvalidIndexConfig;
             if (std.mem.eql(u8, model.string, "document")) {
@@ -32503,6 +32823,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
     if (root.object.get("edge")) |edge| {
         if (edge != .object) return error.InvalidIndexConfig;
         mapping.edge_type_template = try parseOptionalGraphTemplate(alloc, edge, "type");
+        mapping.edge_id_template = try parseOptionalGraphTemplate(alloc, edge, "edge_id");
         mapping.weight_template = try parseOptionalGraphTemplate(alloc, edge, "weight");
         if (edge.object.get("metadata")) |metadata| {
             mapping.metadata_template_json = try std.json.Stringify.valueAlloc(alloc, metadata, .{});
@@ -32514,6 +32835,7 @@ fn parseGraphArtifactMapping(alloc: Allocator, root: std.json.Value) !GraphArtif
         mapping.context_doc_fields = try parseGraphContextDocFields(alloc, context);
     }
 
+    if (mapping.source_template.len > 0 and mapping.edge_id_template.len == 0) return error.InvalidIndexConfig;
     try validateGraphMappingTemplates(mapping);
     return mapping;
 }
@@ -32545,6 +32867,8 @@ fn parseGraphContextDocFields(alloc: Allocator, context: std.json.Value) ![]cons
 }
 
 fn validateGraphMappingTemplates(mapping: GraphArtifactMapping) !void {
+    try validateGraphTemplateDocFields(mapping.source_template, mapping.context_doc_fields);
+    try validateGraphTemplateDocFields(mapping.edge_id_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.target_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.edge_type_template, mapping.context_doc_fields);
     try validateGraphTemplateDocFields(mapping.weight_template, mapping.context_doc_fields);
@@ -32843,7 +33167,7 @@ test "graph config parses artifact mapping templates and context fields" {
     try std.testing.expect(std.mem.indexOf(u8, mapping.metadata_template_json, "_item.evidence") != null);
 }
 
-test "graph config rejects source owner overrides undeclared doc fields and unsupported paths" {
+test "graph config rejects source mappings without ids undeclared doc fields and unsupported paths" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"artifact":"relations_v1"},"edge":{"type":"{{ _doc.value.tenant_id }}"}}
@@ -32961,7 +33285,7 @@ fn ensureIndexDir(alloc: Allocator, base_path: []const u8, path: []const u8) !vo
     const parent_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{base_path});
     defer alloc.free(parent_path);
 
-    if (builtin.os.tag != .freestanding) {
+    if (!is_hostless) {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), parent_path);
@@ -32978,7 +33302,7 @@ fn ensureIndexDirDurable(
     base_path: []const u8,
     path: []const u8,
 ) !void {
-    if (builtin.os.tag == .freestanding) return;
+    if (is_hostless) return;
 
     if (shared_io) |io| {
         return ensureIndexDirDurableWithIo(alloc, io, base_path, path);
@@ -33006,7 +33330,7 @@ fn ensureIndexDirDurableWithIo(
 }
 
 fn deleteIndexDirIfPresent(path: []const u8) void {
-    if (builtin.os.tag == .freestanding) return;
+    if (is_hostless) return;
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33014,7 +33338,7 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
 }
 
 fn repairShadowRootInProgress(path: []const u8) bool {
-    if (builtin.os.tag == .freestanding) return false;
+    if (is_hostless) return false;
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33150,7 +33474,7 @@ test "repair shadow cleanup isolates malformed pointer ownership" {
     defer tmp.cleanup();
     var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const base_path = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const base_path_z = try alloc.dupeZ(u8, base_path);
+    const base_path_z = try alloc.dupeSentinel(u8, base_path, 0);
     defer alloc.free(base_path_z);
     var store = try docstore_mod.DocStore.open(alloc, base_path_z, .{});
     defer store.close();
@@ -33249,7 +33573,7 @@ test "dense native migration policy is fail closed when provisioned" {
     const Gate = struct {
         permitted: bool = false,
 
-        fn read(ptr: *const anyopaque) bool {
+        pub fn read(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             return self.permitted;
         }
@@ -33260,7 +33584,7 @@ test "dense native migration policy is fail closed when provisioned" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33296,7 +33620,7 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     const Gate = struct {
         permitted: bool,
 
-        fn read(ptr: *const anyopaque) bool {
+        pub fn read(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             return self.permitted;
         }
@@ -33307,7 +33631,7 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33476,7 +33800,7 @@ test "native pointer validation reads authority through configured storage" {
 
 test "fresh dense admission remains legacy before the native capability floor" {
     const Gate = struct {
-        fn read(_: *const anyopaque) bool {
+        pub fn read(_: *const anyopaque) bool {
             return false;
         }
     };
@@ -33486,7 +33810,7 @@ test "fresh dense admission remains legacy before the native capability floor" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33521,7 +33845,7 @@ test "fresh dense admission reclaims a broken orphan construction pointer" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33565,7 +33889,7 @@ test "fresh dense admission reclaims a certified generation orphaned before cata
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33616,7 +33940,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33673,7 +33997,7 @@ test "fresh native dense backfill extends a shared vector generation without a s
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33723,7 +34047,7 @@ test "standalone dense native migration still requires an explicit physical gene
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33919,6 +34243,81 @@ fn legacyDenseOrdinalMappingKey(alloc: Allocator, index_name: []const u8, ordina
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:ordinal:{d}", .{ index_name, ordinal });
 }
 
+/// Legacy ordinal keys spell the ordinal in decimal, so numeric order is not
+/// byte order ("...:999" sorts after "...:1000"). Sorted multi-gets require
+/// ascending keys; Lite rejects anything else with InvalidBatch. Reorder the
+/// keys byte-wise, keeping each ordinal paired with its key.
+fn sortLegacyOrdinalProbes(keys: [][]const u8, ordinals: []doc_identity.DocOrdinal) void {
+    std.debug.assert(keys.len == ordinals.len);
+    if (keys.len < 2) return;
+    var ordered = true;
+    for (keys[1..], keys[0 .. keys.len - 1]) |key, previous| {
+        if (std.mem.order(u8, previous, key) == .gt) {
+            ordered = false;
+            break;
+        }
+    }
+    if (ordered) return;
+    const Context = struct {
+        keys: [][]const u8,
+        ordinals: []doc_identity.DocOrdinal,
+
+        pub fn lessThan(ctx: @This(), lhs: usize, rhs: usize) bool {
+            return std.mem.lessThan(u8, ctx.keys[lhs], ctx.keys[rhs]);
+        }
+        pub fn swap(ctx: @This(), lhs: usize, rhs: usize) void {
+            std.mem.swap([]const u8, &ctx.keys[lhs], &ctx.keys[rhs]);
+            std.mem.swap(doc_identity.DocOrdinal, &ctx.ordinals[lhs], &ctx.ordinals[rhs]);
+        }
+    };
+    // Sort both arrays together, with no heap scratch or extra failure path.
+    std.sort.pdqContext(0, keys.len, Context{ .keys = keys, .ordinals = ordinals });
+}
+
+test "legacy dense ordinal probes are byte-ordered for sorted multi-gets" {
+    const alloc = std.testing.allocator;
+    var ordinals = [_]doc_identity.DocOrdinal{ 9, 999, 1000, 10000 };
+    var keys: [ordinals.len][]const u8 = undefined;
+    for (&keys, ordinals) |*key, ordinal| key.* = try legacyDenseOrdinalMappingKey(alloc, "vec", ordinal);
+    defer for (keys) |key| alloc.free(@constCast(key));
+    // Numeric order is not byte order once the decimal widths differ.
+    try std.testing.expect(std.mem.order(u8, keys[1], keys[2]) == .gt);
+
+    sortLegacyOrdinalProbes(&keys, &ordinals);
+    for (keys[1..], keys[0 .. keys.len - 1]) |key, previous| {
+        try std.testing.expect(std.mem.order(u8, previous, key) == .lt);
+    }
+    for (keys, ordinals) |key, ordinal| {
+        const expected = try legacyDenseOrdinalMappingKey(alloc, "vec", ordinal);
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, key);
+    }
+}
+
+test "legacy dense ordinal probes preserve pairs through partition sorting" {
+    const alloc = std.testing.allocator;
+    var ordinals: [257]doc_identity.DocOrdinal = undefined;
+    var keys: [ordinals.len][]const u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| alloc.free(@constCast(key));
+    for (&keys, &ordinals, 0..) |*key, *ordinal, i| {
+        ordinal.* = @intCast((i * 73) % ordinals.len);
+        key.* = try legacyDenseOrdinalMappingKey(alloc, "vec:ordinal_member", ordinal.*);
+        initialized += 1;
+    }
+    sortLegacyOrdinalProbes(keys[0..0], ordinals[0..0]);
+    sortLegacyOrdinalProbes(keys[0..1], ordinals[0..1]);
+    sortLegacyOrdinalProbes(&keys, &ordinals);
+    // Repeat an already sorted batch to exercise the allocation-free fast path.
+    sortLegacyOrdinalProbes(&keys, &ordinals);
+    for (keys, ordinals, 0..) |key, ordinal, i| {
+        if (i > 0) try std.testing.expect(std.mem.lessThan(u8, keys[i - 1], key));
+        const expected = try legacyDenseOrdinalMappingKey(alloc, "vec:ordinal_member", ordinal);
+        defer alloc.free(expected);
+        try std.testing.expectEqualStrings(expected, key);
+    }
+}
+
 fn legacyDenseOrdinalMemberPrefix(alloc: Allocator, index_name: []const u8, ordinal: doc_identity.DocOrdinal) ![]u8 {
     return std.fmt.allocPrint(alloc, "\x00\x00__metadata__:dense:{s}:ordinal_member:{d}:", .{ index_name, ordinal });
 }
@@ -33987,7 +34386,7 @@ test "dense metadata lookups read legacy textual rows" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -34306,12 +34705,12 @@ fn serializeObservedTextFieldAnalyzers(alloc: Allocator, observed: []const mappe
     for (observed) |item| {
         try appendStr(&out, alloc, item.field_name);
         try appendStr(&out, alloc, item.analyzer_name);
-        try out.append(alloc, @intFromEnum(item.field_type));
+        try out.append(alloc, @backingInt(item.field_type));
         try out.append(alloc, if (item.do_index) 1 else 0);
         try out.append(alloc, if (item.store) 1 else 0);
         try out.append(alloc, if (item.doc_values) 1 else 0);
         try out.append(alloc, if (item.sortable) 1 else 0);
-        try out.append(alloc, @intFromEnum(item.missing_null_policy));
+        try out.append(alloc, @backingInt(item.missing_null_policy));
         try out.append(alloc, if (item.include_in_all) 1 else 0);
     }
 
@@ -34347,7 +34746,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
             const mapping = if (version >= 2) mapping_blk: {
                 const mapping_len: usize = if (version >= 3) 7 else 6;
                 if (pos + mapping_len > data.len) return error.InvalidIndexCatalog;
-                const field_type: schema_mod.AntflyType = @enumFromInt(data[pos]);
+                const field_type: schema_mod.AntflyType = @fromBackingInt(@intCast(data[pos]));
                 pos += 1;
                 const do_index = data[pos] != 0;
                 pos += 1;
@@ -34416,7 +34815,7 @@ const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.owned) self.store.deinit();
     }
 };
@@ -34503,7 +34902,7 @@ const IndexManagerOwnedWrite = struct {
     value: []u8,
     term: IndexManagerTerm,
 
-    fn deinit(self: *IndexManagerOwnedWrite, alloc: Allocator) void {
+    pub fn deinit(self: *IndexManagerOwnedWrite, alloc: Allocator) void {
         alloc.free(self.key);
         alloc.free(self.value);
         self.* = undefined;
@@ -34586,7 +34985,7 @@ const IndexManagerSimRuntime = struct {
         return runtime;
     }
 
-    fn deinit(self: *IndexManagerSimRuntime) void {
+    pub fn deinit(self: *IndexManagerSimRuntime) void {
         if (self.source_manager_open) {
             self.source_manager.deinit();
             self.source_manager_open = false;
@@ -35104,7 +35503,7 @@ fn reportReducedIndexManagerSchedule(
 }
 
 fn randomIndexManagerWriteSpec(random: std.Random) IndexManagerSimDocSpec {
-    return @enumFromInt(random.uintLessThan(u8, 4));
+    return @fromBackingInt(@intCast(random.uintLessThan(u8, 4)));
 }
 
 fn runIndexManagerReplayCase(
@@ -35612,7 +36011,7 @@ test "dense cache policy comes from resource manager instead of index config" {
     defer cleanupIndexManagerDir(path);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 2048,
         .hard_limit_bytes = 4096,
     };
@@ -35697,7 +36096,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -35941,7 +36340,7 @@ test "sparse multi-source requests carry semantic producer identity" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -36036,7 +36435,7 @@ test "sparse single-source embedding name drives generation replay and search" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -36508,7 +36907,7 @@ test "full text single artifact name accepts textual asset source" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -36664,7 +37063,7 @@ test "dense vector id uses deterministic key hash with legacy mapping fallback" 
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -36710,7 +37109,7 @@ test "production exact dense scorer cancels during bounded vector work" {
     defer alloc.free(root);
     const hbc_path = try std.fs.path.join(alloc, &.{ root, "exact-cancellation-hbc" });
     defer alloc.free(hbc_path);
-    const hbc_path_z = try alloc.dupeZ(u8, hbc_path);
+    const hbc_path_z = try alloc.dupeSentinel(u8, hbc_path, 0);
     defer alloc.free(hbc_path_z);
 
     var manager = try IndexManager.init(alloc, root);
@@ -36792,7 +37191,7 @@ test "dense vector id ignores ordinal metadata for a different doc" {
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -36883,7 +37282,7 @@ test "dense vector id allocator spills preferred-id collisions without aliasing 
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -36980,7 +37379,7 @@ test "dense metadata prefetch includes legacy ordinal vector ids" {
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37116,7 +37515,7 @@ test "dense index manager accepts explicit embedding writes after addAllNoBackfi
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37234,7 +37633,7 @@ test "index manager advertises typed tensor access paths for vector and graph in
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37424,7 +37823,7 @@ test "full text dictionary publication rejects duplicate semantic owners" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37473,7 +37872,7 @@ test "observed full text analyzers publish shared dictionary ownership" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37550,7 +37949,7 @@ test "observed analyzer publication leaves runtime and metadata unchanged on reg
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37609,7 +38008,7 @@ test "observed analyzer publication waits for active analysis readers" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37679,7 +38078,7 @@ test "text query lease retains snapshot and analyzer across catalog removal" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37716,7 +38115,7 @@ test "text publication planning rejects a same-name catalog replacement" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37761,7 +38160,7 @@ test "text publication admission refreshes a projection revision change" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37849,7 +38248,7 @@ test "observed dynamic sortable field capability reports covered queryable state
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37917,7 +38316,7 @@ test "dynamic field observation keeps status cached and validates only selected 
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38006,7 +38405,7 @@ test "declared runtime sortable field capability reports covered queryable state
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38079,7 +38478,7 @@ test "declared runtime geo field capability reports covered filterable state" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38154,7 +38553,7 @@ test "declared runtime sortable field capability is queryable for empty index" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38207,7 +38606,7 @@ test "empty text index refreshes schema committed after index provisioning" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38254,7 +38653,7 @@ test "fresh text generation persists provenance before its first segment" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -38296,7 +38695,7 @@ test "non-empty text generation accepts deployed v11 schema provenance" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -38353,7 +38752,7 @@ test "empty generation adopts schema provenance after schema-only crash boundary
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -38402,7 +38801,7 @@ test "non-empty schema-less text generation fails closed when a schema appears" 
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38455,7 +38854,7 @@ test "non-empty text generation without provenance fails closed" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38492,7 +38891,7 @@ test "deleted-only text generation cannot adopt different schema provenance" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38549,7 +38948,7 @@ test "shadow text generation owns provenance without mutating active generation"
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const shadow_path = try std.fmt.allocPrint(alloc, "{s}/shadow", .{path});
     defer alloc.free(shadow_path);
@@ -38622,7 +39021,7 @@ test "observed dynamic sortable field capability stays declared for sparse doc v
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38680,10 +39079,10 @@ test "observed dynamic sortable field capability stays declared for sparse doc v
 fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
     var chunk = std.ArrayListUnmanaged(u8).empty;
     defer chunk.deinit(alloc);
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 3))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 3))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
     try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 10.0))));
     try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 11.0))));
     try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 20.0))));
@@ -38693,10 +39092,10 @@ fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
 
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(alloc);
-    try data.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
-    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try data.append(alloc, @backingInt(typed_dv.ValueType.f64_val));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
     const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
-    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(@as(u64, chunk_end))));
     try data.appendSlice(alloc, compressed);
     return try data.toOwnedSlice(alloc);
 }
@@ -38708,7 +39107,7 @@ test "observed dynamic sortable field capability stays declared for duplicate do
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38862,7 +39261,7 @@ test "dense bulk-ingest uses recursive bulk build for large empty index batch" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38926,7 +39325,7 @@ test "dense bulk-ingest populates primary ordinal vector cache before first look
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39021,7 +39420,7 @@ test "dense embedding writes prefer inline vectors over artifact reloads" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39114,7 +39513,7 @@ test "loadConfiguredIndexesParallel quarantines worker errors on borrowed std Io
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39171,7 +39570,7 @@ test "dense apply resource manager accounts working bytes and releases them" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39212,7 +39611,7 @@ test "dense apply resource manager accounts working bytes and releases them" {
     };
     try manager.applyDenseEmbeddingWritesByName(&store, "dv_v1", &writes);
 
-    const stats = resource_manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)];
+    const stats = resource_manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)];
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
     try std.testing.expect(stats.peak_bytes >= (@as(u64, 3 * @sizeOf(f32)) + @as(u64, "doc:tracked".len)));
 }
@@ -39224,7 +39623,7 @@ test "dense replay-shaped bulk apply skips identical and replaces changed vector
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39467,7 +39866,7 @@ test "dense vector load session switches to retained LSM ownership before reserv
     const dims: usize = 4;
     const vector_bytes = hbc_mod.estimateDecodedVectorResidencyBytes(dims);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -39493,7 +39892,7 @@ test "dense vector load session switches to retained LSM ownership before reserv
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/residency-fallback", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var index = try hbc_mod.HBCIndex.open(alloc, path_z, .{ .dims = dims, .max_cached_vectors = 8 });
     defer index.close();
@@ -39517,7 +39916,7 @@ test "production external vector session evolves a saturated decoded resident se
     const dims: usize = 2;
     const vector_bytes = hbc_mod.estimateDecodedVectorResidencyBytes(dims);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes * 2,
         .hard_limit_bytes = vector_bytes * 2,
     };
@@ -39585,7 +39984,7 @@ test "dense vector load session is bounded by the shared apply working-set budge
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)] = .{
         .soft_limit_bytes = 8,
         .hard_limit_bytes = 16,
     };
@@ -39611,7 +40010,7 @@ test "dense vector load session is bounded by the shared apply working-set budge
     try std.testing.expectEqual(@as(usize, 1), budget_session.vector_cache.count());
     budget_session.deinit();
 
-    const stats = resource_manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)];
+    const stats = resource_manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)];
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
     try std.testing.expect(stats.hard_limit_rejections > 0);
 }
@@ -39965,7 +40364,7 @@ test "generated artifact cleanup upgrades v2 debt without losing its cursor or o
     const raw = try alloc.alloc(u8, raw_len);
     defer alloc.free(raw);
     std.mem.writeInt(u64, raw[0..8], IndexManager.generated_artifact_cleanup_v2_magic, .little);
-    std.mem.writeInt(u32, raw[8..12], @intFromEnum(IndexManager.GeneratedArtifactCleanupPhase.generated_artifacts), .little);
+    std.mem.writeInt(u32, raw[8..12], @backingInt(IndexManager.GeneratedArtifactCleanupPhase.generated_artifacts), .little);
     std.mem.writeInt(u32, raw[12..16], @intCast(chunk_name.len), .little);
     std.mem.writeInt(u32, raw[16..20], @intCast(embedding_name.len), .little);
     std.mem.writeInt(u32, raw[20..24], @intCast(cursor.len), .little);
@@ -41102,7 +41501,7 @@ test "dense artifact preload session reuses cached raw values across calls" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -41198,7 +41597,7 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -41435,7 +41834,7 @@ test "dense index manager accepts external embedding indexes without enrichments
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -41491,7 +41890,7 @@ test "production external scorers use bounded cache-first artifact batches" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -41821,7 +42220,7 @@ test "external dense embedding writes persist deterministic vector mappings" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -41877,7 +42276,7 @@ test "external dense embedding writes use stable vector ids and ordinal member r
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42007,7 +42406,7 @@ test "primary dense stable vector ids survive identity namespace reassignment" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42100,7 +42499,7 @@ test "external dense embedding writes keep search working after incremental repl
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42325,7 +42724,7 @@ test "dense index manager stress applies explicit embedding writes on lsm backen
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42431,7 +42830,7 @@ test "dense HBC batchInsertWithMetadata works after addAllNoBackfill" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42469,7 +42868,7 @@ test "dense HBC batchInsertWithMetadata works after text batch setup" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42555,12 +42954,12 @@ test "text merge task carries concurrent deletes into publication" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 64 * 1024 * 1024,
         .hard_limit_bytes = 64 * 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
@@ -42571,7 +42970,7 @@ test "text merge task carries concurrent deletes into publication" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42712,6 +43111,173 @@ test "text merge task carries concurrent deletes into publication" {
     try std.testing.expectEqual(@as(u64, 11), published.liveDocCount());
 }
 
+test "text merge publication keeps every chunk member sharing one parent ordinal" {
+    // Chunk members intentionally share their parent document's ordinal
+    // (see result_shape.zig) but each still carries its own unique stored
+    // id, exactly like every real (non-benchmark) text-indexing path -
+    // introducer.zig's buildSegmentWithExtraSections calls
+    // addStoredDocBorrowed unconditionally for every document. A merge
+    // publication that keys identity by ordinal alone treats every sibling
+    // chunk after the first as a duplicate of the same identity and drops
+    // it; keying by the always-unique stored id first (this fix) must keep
+    // all of them.
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    var manager = try IndexManager.init(alloc, path);
+    defer manager.deinit();
+    manager.updateRange(.{ .start = "", .end = "" });
+
+    try manager.addAllNoBackfill(&store, &.{
+        .{
+            .name = "ft_v1",
+            .kind = .full_text,
+            .config_json = "{}",
+        },
+    });
+    const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+
+    // Build a segment the same way production chunk-backed indexing does:
+    // every document keeps its stored id (unlike indexTextKernelDocuments,
+    // which sets store_documents=false for its embedded-kernel-benchmark
+    // caller only).
+    const indexKeepingStoredIds = struct {
+        fn run(mgr: *IndexManager, e: *IndexManager.TextIndex, docs: []const introducer_mod.TextDocument) !void {
+            var segment_arena_state = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer segment_arena_state.deinit();
+            var build_ctx = TextSegmentSinkBuildContext{
+                .alloc = segment_arena_state.allocator(),
+                .projection_batch = .{ .docs = docs, .observed_field_analyzers = &.{} },
+                .text_analysis = e.text_analysis,
+                .build_options = .{ .resource_manager = mgr.resource_manager },
+            };
+            _ = try e.persistent.indexSegmentFromSinkBuilder(&build_ctx, buildTextSegmentIntoSink);
+            try mgr.finalizeTextBatchMutations(e, .{
+                .compact_text_segment_threshold = 2,
+                .defer_text_compaction = true,
+            }, .{ .indexed_any = true });
+        }
+    }.run;
+
+    // Parent "p1" has three chunks sharing ordinal 500, split across both
+    // source segments so the merge must reconcile a same-ordinal collision
+    // both within and across its inputs. Parent "p2" has one chunk with a
+    // different ordinal as a control.
+    const fields_p1_0 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk zero" }};
+    const fields_p1_1 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk one" }};
+    try indexKeepingStoredIds(&manager, entry, &.{
+        .{ .id = "chunk:p1:0", .stored_data = "{\"n\":0}", .text_fields = &fields_p1_0, .doc_ordinal = 500 },
+        .{ .id = "chunk:p1:1", .stored_data = "{\"n\":1}", .text_fields = &fields_p1_1, .doc_ordinal = 500 },
+    });
+
+    const fields_p1_2 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "alpha chunk two" }};
+    const fields_p2_0 = [_]introducer_mod.TextField{.{ .field_name = "body", .text = "beta chunk zero" }};
+    try indexKeepingStoredIds(&manager, entry, &.{
+        .{ .id = "chunk:p1:2", .stored_data = "{\"n\":2}", .text_fields = &fields_p1_2, .doc_ordinal = 500 },
+        .{ .id = "chunk:p2:0", .stored_data = "{\"n\":0}", .text_fields = &fields_p2_0, .doc_ordinal = 600 },
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), entry.persistent.snapshot().segments.len);
+    try std.testing.expectEqual(@as(u64, 4), entry.persistent.snapshot().liveDocCount());
+
+    // Two segments sit well under the tiered policy's steady-state tier
+    // target, so drive the merge directly rather than through the
+    // scheduler (which would correctly decline to merge this few segments
+    // outside this test).
+    const snap = entry.persistent.acquireSnapshot();
+    defer snap.release();
+    var task = try manager.copyTextMergeTask("ft_v1", &entry.persistent, snap, &.{ 0, 1 });
+    defer task.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), task.merge_indices.len);
+    // beginTextMergeTaskForEntry performs these two steps after
+    // copyTextMergeTask; replicate them so the concurrent delete below
+    // records into this task's deletion state and finishTextMergeTask
+    // recognizes the task as still in flight instead of stale.
+    try entry.attachMergeDeletionState(alloc, task.deletion_state);
+    defer entry.detachMergeDeletionState(task.deletion_state);
+    try manager.text_merge_scheduler.registerSource(alloc, task.index_name, task.source, task.deletion_state);
+
+    // Race a delete of exactly one chunk (sharing ordinal 500 with two live
+    // siblings) against the unlocked build, the same way a concurrent
+    // rewrite races a scheduled merge in production.
+    const opts: IndexBatchOptions = .{ .defer_text_compaction = true };
+    try manager.deleteTextBatchByNameWithOptions("ft_v1", &.{"chunk:p1:1"}, opts);
+
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    var merged_docs: u32 = 0;
+    for (result.prepared_segments) |*prepared| {
+        var reader = try segment_mod.SegmentReader.init(alloc, prepared.data.bytes());
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    for (result.segments) |segment_bytes| {
+        var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
+        defer reader.deinit();
+        merged_docs += reader.doc_count;
+    }
+    // Nothing is dropped at merge-build time: the concurrent delete has not
+    // applied to the frozen snapshot the merge built from.
+    try std.testing.expectEqual(@as(u32, 4), merged_docs);
+
+    // The concurrent delete forces the off-lock identity lookup. Before this
+    // fix, building it raised error.DuplicateMergeDocumentIdentity the
+    // moment it saw the second document with ordinal 500 and silently
+    // dropped every subsequent same-ordinal sibling from the publication.
+    try std.testing.expectError(
+        error.TextMergePublicationLookupRequired,
+        manager.finishTextMergeTask(&task, &result),
+    );
+    try IndexManager.prepareTextMergeTaskPublicationLookup(&task, &result);
+    try std.testing.expect(result.publication_lookup_built);
+    // Every document here has a stored id, so identity is keyed by id, not
+    // by the shared ordinal: no ordinal-collision path was even exercised,
+    // and every chunk (including the two ordinal-500 siblings besides the
+    // one that raced a delete) kept its own distinct identity slot.
+    try std.testing.expectEqual(@as(usize, 0), result.output_ordinals.len);
+    try std.testing.expect(result.outputForId("chunk:p1:0") != null);
+    try std.testing.expect(result.outputForId("chunk:p1:1") != null);
+    try std.testing.expect(result.outputForId("chunk:p1:2") != null);
+    try std.testing.expect(result.outputForId("chunk:p2:0") != null);
+
+    const applied = try manager.finishTextMergeTask(&task, &result);
+    try std.testing.expect(applied);
+    try std.testing.expectEqual(@as(u64, 0), manager.textMergeStats().failed_merges);
+
+    const published = entry.persistent.snapshot();
+    try std.testing.expectEqual(@as(usize, 1), published.segments.len);
+    // Exactly the raced delete's target is gone; its two ordinal-500
+    // siblings and the unrelated ordinal-600 chunk all survived.
+    try std.testing.expectEqual(@as(u32, 3), published.liveDocCount());
+
+    const seg = &published.segments[0];
+    var seen = std.StringHashMapUnmanaged(bool).empty;
+    defer {
+        var it = seen.keyIterator();
+        while (it.next()) |key| alloc.free(key.*);
+        seen.deinit(alloc);
+    }
+    for (0..seg.reader.doc_count) |doc_idx| {
+        const stored = (try seg.reader.storedDoc(@intCast(doc_idx))) orelse return error.TestUnexpectedResult;
+        const is_deleted = if (seg.shared.deleted) |*deleted| deleted.contains(@intCast(doc_idx)) else false;
+        try seen.put(alloc, try alloc.dupe(u8, stored.id), is_deleted);
+    }
+    try std.testing.expectEqual(@as(usize, 4), seen.count());
+    try std.testing.expectEqual(true, seen.get("chunk:p1:1").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p1:0").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p1:2").?);
+    try std.testing.expectEqual(false, seen.get("chunk:p2:0").?);
+}
+
 test "text merge deletion delta allocation failure invalidates task state" {
     const alloc = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(alloc, .{});
@@ -42742,7 +43308,7 @@ test "text merge deletion states synchronize recording with per-index detach" {
 
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 128 * 1024,
         .hard_limit_bytes = 256 * 1024,
     };
@@ -42814,7 +43380,7 @@ test "text merge deletion states synchronize recording with per-index detach" {
 test "text merge deletion deltas share the admitted task byte ceiling" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 256,
         .hard_limit_bytes = 512,
     };
@@ -42855,7 +43421,7 @@ test "text merge persistent publication charges share the admitted task byte cei
     const alloc = std.testing.allocator;
     const hard_limit = 4096;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = hard_limit,
         .hard_limit_bytes = hard_limit,
     };
@@ -42889,12 +43455,12 @@ test "heap-backed text merge reservation covers output and publication working s
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 64 * 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
@@ -42907,7 +43473,7 @@ test "heap-backed text merge reservation covers output and publication working s
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42986,7 +43552,7 @@ test "text merge task retires all-deleted file-backed inputs" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43352,7 +43918,7 @@ test "vector mutation revision certification batches sorted keys without reorder
         missing: bool = false,
         fail: bool = false,
 
-        fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+        pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
             self.calls += 1;
             try std.testing.expect(keys.len <= 256);
             if (self.fail) return error.Corrupted;
@@ -43395,7 +43961,7 @@ test "vector mutation revision certification batches sorted keys without reorder
 test "native projection build scratch reuses bounded memory and releases on failure" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = .{
         .soft_limit_bytes = 4096,
         .hard_limit_bytes = 4096,
     };
@@ -43476,7 +44042,7 @@ test "native read scratch pool participates in hard-budget reclamation" {
 fn testNativeReadScratchReclamation(cross_pool: bool) !void {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .soft_limit_bytes = 8192,
         .hard_limit_bytes = 8192,
     };
@@ -43550,7 +44116,7 @@ test "native residual scratch reuses capacity and releases its bounded reservati
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .soft_limit_bytes = 4096,
         .hard_limit_bytes = 4096,
     };
@@ -43590,7 +44156,7 @@ test "force text compaction supersedes in-flight scheduled merge" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43659,7 +44225,7 @@ test "text merge task records input and output bytes" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43732,7 +44298,7 @@ test "text delete clears handed-off stale docs outside current range" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43783,7 +44349,7 @@ test "text merge failure quarantines source segments" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43826,11 +44392,26 @@ test "text merge failure quarantines source segments" {
     try std.testing.expectEqual(@as(u64, 1), stats.quarantined_merges);
     try std.testing.expectEqual(@as(u64, @intCast(task.source.len)), stats.quarantined_segments);
     try std.testing.expectEqualStrings("InvalidChunk", stats.last_merge_error.slice());
+    // Quarantine is scoped to the failed inputs, not the entire index.
+    // Force-drain debt may still schedule the remaining healthy segments.
+    var healthy_task = (try manager.beginTextMergeTask()) orelse return error.TestUnexpectedResult;
+    defer healthy_task.deinit(alloc);
+    for (healthy_task.source) |healthy| {
+        for (task.source) |quarantined| {
+            try std.testing.expect(healthy.id != quarantined.id);
+        }
+    }
+    var healthy_result = try IndexManager.executeTextMergeTask(alloc, &healthy_task);
+    defer healthy_result.deinit(alloc);
+    try std.testing.expect(try manager.finishTextMergeTask(&healthy_task, &healthy_result));
+    // Only one healthy output remains, so no further merge can consume the
+    // failed inputs until their quarantine expires.
     var blocked_task = try manager.beginTextMergeTask();
     if (blocked_task) |*unexpected| {
         unexpected.deinit(alloc);
         return error.TestUnexpectedResult;
     }
+    try std.testing.expectEqual(stats.quarantined_segments, manager.textMergeStats().quarantined_segments);
 
     const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
     try std.testing.expect(entry.compaction_pending.load(.acquire));
@@ -43843,20 +44424,20 @@ test "text merge resource manager accounts pending bytes and active buffers" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
@@ -43864,7 +44445,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43906,9 +44487,9 @@ test "text merge resource manager accounts pending bytes and active buffers" {
     try std.testing.expect(merge_stats.pending_bytes > 0);
     try std.testing.expectEqual(merge_stats.pending_bytes, merge_stats.pending_heap_bytes + merge_stats.pending_mmap_bytes);
     var resource_stats = resource_manager.snapshot();
-    try std.testing.expectEqual(merge_stats.pending_heap_bytes, resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes);
+    try std.testing.expectEqual(merge_stats.pending_heap_bytes, resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes);
     if (merge_stats.pending_heap_bytes > 1) {
-        try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].soft_limit_events > 0);
+        try std.testing.expect(resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)].soft_limit_events > 0);
     }
 
     var wide_source_count: usize = 0;
@@ -43918,22 +44499,22 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         defer task.deinit(alloc);
 
         resource_stats = resource_manager.snapshot();
-        try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes > 0);
-        try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0);
+        try std.testing.expect(resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].used_bytes > 0);
+        try std.testing.expect(resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0);
         wide_source_count = task.source.len;
         wide_reservation_bytes = task.bufferReservationBytes() orelse return error.MissingWideMergeReservation;
         manager.cancelTextMergeTask(&task);
     }
 
     resource_stats = resource_manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].used_bytes);
 
     // Reconfigure the same manager address so the policy-selected wide task
     // is above the normal hard limit but within the bounded 2x allowance. It
     // should remain wide rather than degrading to pairwise compaction.
     try std.testing.expect(wide_reservation_bytes > 1);
     var bounded_budgets = budgets;
-    bounded_budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes =
+    bounded_budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes =
         (wide_reservation_bytes + 1) / 2;
     resource_manager = resource_manager_mod.ResourceManager.init(.{
         .budgets = bounded_budgets,
@@ -43948,7 +44529,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
     resource_stats = resource_manager.snapshot();
     try std.testing.expectEqual(
         @as(u64, 1),
-        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].oversized_single_grants,
+        resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].oversized_single_grants,
     );
 
     // Restore the original budget for the concurrent-pressure case below.
@@ -43961,7 +44542,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
     // Even one byte of concurrent usage must reject another merge rather than
     // multiplying the bounded allocator cap.
     try std.testing.expect(wide_source_count > 2);
-    const hard_limit = budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes;
+    const hard_limit = budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes;
     try std.testing.expect(wide_reservation_bytes <= hard_limit * 2);
     var tracked_merge_usage: u64 = 0;
     resource_manager.observeUsage(.text_merge_buffers, &tracked_merge_usage, 1);
@@ -43969,7 +44550,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
 
     try std.testing.expect((try manager.beginTextMergeTask()) == null);
     resource_stats = resource_manager.snapshot();
-    try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0);
+    try std.testing.expect(resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0);
 }
 
 test "text merge resource pressure defers background merges" {
@@ -43978,11 +44559,11 @@ test "text merge resource pressure defers background merges" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
@@ -43990,7 +44571,7 @@ test "text merge resource pressure defers background merges" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44060,7 +44641,7 @@ test "force compact skips clean text indexes" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44112,7 +44693,7 @@ test "force compact accounts text merge buffers via resource manager" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         // File-backed merges reserve an 8 MiB baseline plus measured segment
         // working set. Keep the hard limit above that baseline so this test
@@ -44120,7 +44701,7 @@ test "force compact accounts text merge buffers via resource manager" {
         .hard_limit_bytes = 64 * 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
@@ -44128,7 +44709,7 @@ test "force compact accounts text merge buffers via resource manager" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44169,10 +44750,10 @@ test "force compact accounts text merge buffers via resource manager" {
     const resource_stats = resource_manager.snapshot();
     try std.testing.expectEqual(
         @as(u64, 0),
-        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes,
+        resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].used_bytes,
     );
     try std.testing.expect(
-        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0,
+        resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0,
     );
 }
 
@@ -44182,12 +44763,12 @@ test "best effort force compact defers under text merge pressure" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .defer_background_work,
     };
@@ -44198,7 +44779,7 @@ test "best effort force compact defers under text merge pressure" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44250,12 +44831,12 @@ test "best effort force compact stops on resource budget rejection" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .reject_work,
     };
@@ -44263,7 +44844,7 @@ test "best effort force compact stops on resource budget rejection" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44307,7 +44888,7 @@ test "best effort force compact stops on resource budget rejection" {
 
     const resource_stats = resource_manager.snapshot();
     try std.testing.expect(
-        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0,
+        resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0,
     );
 }
 
@@ -44325,12 +44906,12 @@ test "best effort force compact resumes after modeled reopen under relaxed press
     try modeled_storage.syncParentAbsolute(".zig-cache/tmp");
 
     var pressured_budgets = resource_manager_mod.Options.defaultBudgets();
-    pressured_budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    pressured_budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
     var pressured_policies = resource_manager_mod.Options.defaultPolicies();
-    pressured_policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    pressured_policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .defer_background_work,
     };
@@ -44350,7 +44931,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     {
@@ -44467,7 +45048,7 @@ test "authoritative posting capture starts inside an existing replay session" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -44580,7 +45161,7 @@ test "completed native publication defers to capture ownership without starting 
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -44682,7 +45263,7 @@ test "stable native finalization certifies an empty dense index" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -44714,7 +45295,7 @@ test "quiescent vector finalization defers to another index owner without losing
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -44800,7 +45381,7 @@ test "retired LSM owner clone counters survive index generations" {
         .mutable_snapshot_clone_peak_bytes = 3072,
         .bulk_ingest_current_scan_clone_peak_active_bytes = 2048,
     };
-    first.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bulk_current_scan)] = .{
+    first.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.bulk_current_scan)] = .{
         .calls = 2,
         .bytes_total = 4096,
         .peak_bytes = 3072,
@@ -45093,13 +45674,58 @@ test "exact sparse vector generation remains eligible for mutation capture befor
 }
 const StoreBatchOptions = backend_types.BatchOptions;
 
+test "graph artifact mapping and source clones release partial allocations" {
+    const Case = struct {
+        fn run(alloc: Allocator) !void {
+            const mapping = GraphArtifactMapping{
+                .source_template = @constCast("{{ _item.source }}"),
+                .edge_id_template = @constCast("{{ _doc.key }}"),
+                .target_template = @constCast("{{ _item.target }}"),
+                .edge_type_template = @constCast("RELATES_TO"),
+                .weight_template = @constCast("{{ _item.weight }}"),
+                .metadata_template_json = @constCast("{\"group_id\":\"g\"}"),
+                .context_doc_fields = &.{ @constCast("group_id"), @constCast("valid_at"), @constCast("") },
+            };
+            var copy = try GraphArtifactMapping.clone(alloc, mapping);
+            defer copy.deinit(alloc);
+            try std.testing.expectEqualStrings(mapping.edge_id_template, copy.edge_id_template);
+            var source = try GraphArtifactSource.clone(alloc, .{
+                .artifact_name = @constCast("facts"),
+                .path = @constCast("$.relations"),
+                .mapping = mapping,
+                .mention_edge_type = @constCast("MENTIONS"),
+            });
+            defer source.deinit(alloc);
+            try std.testing.expectEqualStrings(mapping.source_template, source.mapping.source_template);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "graph projection preserves numeric literals in configured templates" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{"max_edges_per_document":10,"metrics":{"pagerank":{"damping":0.8,"tolerance":0.00001,"max_iterations":20}},"source":{"artifact":"facts","nodes":{"source":"{{ _item.source }}"},"edge":{"edge_id":18446744073709551615,"metadata":{"score":1.0000000000000001,"large":18446744073709551615}}}}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 10), cfg.max_edges_per_document);
+    try std.testing.expectEqual(@as(u32, 20), cfg.metric_configs[0].max_iterations);
+    try std.testing.expectEqual(@as(f64, 0.8), cfg.metric_configs[0].damping);
+    try std.testing.expectEqual(@as(f64, 0.00001), cfg.metric_configs[0].tolerance);
+    try std.testing.expectEqualStrings("18446744073709551615", cfg.artifact_sources[0].mapping.edge_id_template);
+    try std.testing.expectEqualStrings("{\"score\":1.0000000000000001,\"large\":18446744073709551615}", cfg.artifact_sources[0].mapping.metadata_template_json);
+    for ([_][]const u8{ "{\"max_edges_per_document\":-1}", "{\"max_edges_per_document\":1.5}", "{\"max_edges_per_document\":1000001}", "{\"metrics\":{\"pagerank\":{\"max_iterations\":1.5}}}" }) |raw| {
+        try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc, raw));
+    }
+}
+
 test "replay matrix reads exact native base plus captured updates and fences deletes and newer generations" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer primary.close();
@@ -45241,7 +45867,7 @@ test "source checkpoint leaves ANN capture admission open after pinning the nati
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer primary.close();
@@ -45305,7 +45931,7 @@ test "native member bindings preserve updates deletes old readers and restart" {
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer primary.close();
@@ -45456,7 +46082,7 @@ test "dense query bundle pins primary metadata and exact source through replacem
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer primary.close();
@@ -45534,7 +46160,7 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
     var resources = resource_manager_mod.ResourceManager.init(.{});
@@ -45790,4 +46416,90 @@ test "graph artifact rebuild lease drains scheduler pins and excludes new snapsh
     while (!pending.acquired.load(.acquire)) @import("antfly_platform").time.yieldNow();
     try std.testing.expect(!manager.catalog_mutex.tryLockShared());
     pending.release.store(true, .release);
+}
+
+test "text force drain schedules policy misses above the tier target" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = 1, .floor_segment_size = 0 });
+    defer setBenchmarkTextMergePolicyOverride(null);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
+    defer alloc.free(path_z);
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.initWithOptions(alloc, path, .{});
+        defer manager.deinit();
+        manager.updateRange(.{ .start = "", .end = "" });
+        try manager.addAllNoBackfill(&store, &.{.{ .name = "ft_v1", .kind = .full_text, .config_json = "{\"field\":\"title\"}" }});
+        const opts: IndexBatchOptions = .{ .compact_text = false, .compact_text_segment_threshold = 2, .defer_text_compaction = true };
+        for (0..12) |i| {
+            const key = try std.fmt.allocPrint(alloc, "doc:{d}", .{i});
+            defer alloc.free(key);
+            const value = try std.fmt.allocPrint(alloc, "{{\"title\":\"force drain {d}\"}}", .{i});
+            defer alloc.free(value);
+            try store.putBatch(&.{.{ .key = key, .value = value }}, &.{});
+            try manager.indexTextBatchByNameWithOptions(&store, "ft_v1", &.{.{ .key = key, .value = value }}, opts);
+            if (i == 0) {
+                // Every source fits individually, but no pair fits the ordinary
+                // plan. A wider bounded merge can still compact their shared
+                // section overhead and reduce the segment count.
+                const first = manager.textIndexEntry("ft_v1").?.persistent.snapshot().segments[0];
+                const source_bytes = first.data.bytes().len;
+                setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 10, .max_segment_size = source_bytes + source_bytes / 2, .floor_segment_size = 0 });
+            }
+        }
+        const entry = manager.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+        try std.testing.expectEqual(@as(usize, 12), entry.persistent.snapshot().segments.len);
+        try std.testing.expect(entry.compaction_pending.load(.acquire));
+        if (try manager.beginTextMergeTask()) |returned| {
+            var task = returned;
+            defer task.deinit(alloc);
+            manager.cancelTextMergeTask(&task);
+        } else return error.ForceDrainWasNotScheduled;
+    }
+    // Reopen must discover the same debt even though no ordinary plan fits.
+    var reopened = try IndexManager.initWithOptions(alloc, path, .{});
+    defer reopened.deinit();
+    reopened.updateRange(.{ .start = "", .end = "" });
+    try reopened.load(&store);
+    const reopened_entry = reopened.textIndexEntry("ft_v1") orelse return error.IndexNotFound;
+    try std.testing.expect(reopened_entry.compaction_pending.load(.acquire));
+    var task = (try reopened.beginTextMergeTask()) orelse return error.ForceDrainWasNotScheduled;
+    defer task.deinit(alloc);
+    try std.testing.expect(task.source.len >= 2);
+    var result = try IndexManager.executeTextMergeTask(alloc, &task);
+    defer result.deinit(alloc);
+    try std.testing.expect(try reopened.finishTextMergeTask(&task, &result));
+    try std.testing.expect(reopened_entry.persistent.snapshot().segments.len < 12);
+    // A tier target that already covers all segments must still go idle.
+    setBenchmarkTextMergePolicyOverride(.{ .max_segments_per_tier = 20, .max_segment_size = 1, .floor_segment_size = 0 });
+    try std.testing.expect((try reopened.beginTextMergeTask()) == null);
+    try std.testing.expect(!reopened_entry.compaction_pending.load(.acquire));
+}
+
+test "generator config ownership unwinds dense and sparse partial allocation" {
+    const F = struct {
+        fn run(alloc: Allocator, dense: bool) !void {
+            const raw = if (dense)
+                \\{"generator":{"kind":"dense_embedding","source_field":"body","source_template":"{{body}}","artifact_name":"chunks","embedding_name":"embedding","chunk_size":8,"chunk_overlap":2}}
+            else
+                \\{"generator":{"kind":"sparse_embedding","source_field":"body","source_template":"{{body}}","artifact_name":"chunks","embedding_name":"embedding","chunk_size":8,"chunk_overlap":2}}
+            ;
+            const cfg = (if (dense) try parseDenseGeneratorConfig(alloc, raw) else try parseSparseGeneratorConfig(alloc, raw)).?;
+            defer cfg.deinit(alloc);
+            try std.testing.expectEqualStrings("body", cfg.source_field);
+            try std.testing.expectEqualStrings("chunks", cfg.artifact_name);
+            try std.testing.expectEqualStrings("embedding", cfg.embedding_name.?);
+        }
+    };
+    for ([_]bool{ true, false }) |dense| try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{dense});
+}
+
+fn appendOwnedString(alloc: Allocator, out: *std.ArrayListUnmanaged([]u8), value: []const u8) !void {
+    try out.ensureUnusedCapacity(alloc, 1);
+    out.appendAssumeCapacity(try alloc.dupe(u8, value));
 }

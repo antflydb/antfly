@@ -1307,13 +1307,13 @@ test "serverless query session propagates cancellation through full and cached r
         full_calls: usize = 0,
         range_calls: usize = 0,
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
 
         fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts_mod.ArtifactMetadata {
             return error.UnexpectedPut;
         }
 
-        fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
+        pub fn getAlloc(_: *anyopaque, _: Allocator, _: []const u8) ![]u8 {
             return error.NonCancellableFullReadUsed;
         }
 

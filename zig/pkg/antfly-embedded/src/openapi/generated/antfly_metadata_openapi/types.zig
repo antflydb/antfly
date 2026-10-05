@@ -4171,6 +4171,7 @@ pub const ForeignSource = struct {
 
 /// A stateful global query. The target table is required on this route.
 pub const GlobalStatefulQueryRequest = struct {
+    evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
@@ -4248,6 +4249,7 @@ pub const GlobalStatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", false },
         .{ "query", "query", true },
@@ -4299,6 +4301,10 @@ pub const GlobalStatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluate) |value| {
+            try jw.objectField("evaluate");
+            try jw.write(value);
+        }
         if (self.table_target) |value| {
             try jw.objectField("table_target");
             try jw.write(value);
@@ -7181,7 +7187,7 @@ pub const QueryConflictError = union(enum) {
     }
 };
 
-/// A stable failure envelope for query embedding and reranking dependencies.
+/// A stable failure envelope for query embedding, reranking, and decision dependencies.
 pub const QueryDependencyError = struct {
     code: []const u8,
     /// Legacy alias of code. Use code for programmatic handling.
@@ -7189,6 +7195,76 @@ pub const QueryDependencyError = struct {
     message: []const u8,
     retryable: bool,
 };
+
+/// Evaluate expressions after global retrieval merging, before final offset/limit. Candidates require candidate_count; matches require max_rows and fail if the full qualifying population exceeds that budget. Cursor pagination, reranking, pruning, and ordinary aggregations cannot be combined with evaluation. NULL inputs skip inference; errors fail.
+pub const QueryEvaluation = struct {
+    /// Evaluate completed bindings of this named graph MATCH instead of retrieval hits. Fields use alias.document.path or alias.key. Existing graph aggregates cannot be combined with this stage.
+    graph_query: ?[]const u8 = null,
+    scope: []const u8,
+    candidate_count: ?i64 = null,
+    max_rows: ?i64 = null,
+    compute: std.json.ArrayHashMap(QueryExpression),
+    /// Exactly one of eq, neq, lt, lte, gt, gte (two expressions), is_null (expression), not (predicate), and, or (predicate arrays). Comparisons propagate NULL.
+    where: ?std.json.ArrayHashMap(std.json.Value) = null,
+    order_by: ?[]const std.json.Value = null,
+    aggregations: ?std.json.ArrayHashMap(std.json.Value) = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "graph_query", "graph_query", true },
+        .{ "scope", "scope", false },
+        .{ "candidate_count", "candidate_count", true },
+        .{ "max_rows", "max_rows", true },
+        .{ "compute", "compute", false },
+        .{ "where", "where", true },
+        .{ "order_by", "order_by", true },
+        .{ "aggregations", "aggregations", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.graph_query) |value| {
+            try jw.objectField("graph_query");
+            try jw.write(value);
+        }
+        try jw.objectField("scope");
+        try jw.write(self.scope);
+        if (self.candidate_count) |value| {
+            try jw.objectField("candidate_count");
+            try jw.write(value);
+        }
+        if (self.max_rows) |value| {
+            try jw.objectField("max_rows");
+            try jw.write(value);
+        }
+        try jw.objectField("compute");
+        try jw.write(self.compute);
+        if (self.where) |value| {
+            try jw.objectField("where");
+            try jw.write(value);
+        }
+        if (self.order_by) |value| {
+            try jw.objectField("order_by");
+            try jw.write(value);
+        }
+        if (self.aggregations) |value| {
+            try jw.objectField("aggregations");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Exactly one of literal, field, ref, or call. A call requires input and decider. ai_decide requires questions; ai_probability requires statement; ai_choice and ai_score require instructions and criteria. Named refs may select nested JSON members with dotted paths. Binding cycles are invalid.
+pub const QueryExpression = std.json.Value;
 
 /// A public filter or exclusion query contains an invalid or unsupported node.
 pub const QueryFilterError = struct {
@@ -7284,6 +7360,8 @@ pub const QueryHighlight = struct {
 
 /// A single query result hit
 pub const QueryHit = struct {
+    /// Named query-time computed values, separate from stored source.
+    _computed: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// ID of the record.
     _id: []const u8,
     /// Relevance score of the hit, normalized so higher values always rank first.
@@ -7304,6 +7382,7 @@ pub const QueryHit = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "_computed", "_computed", true },
         .{ "_id", "_id", false },
         .{ "_score", "_score", false },
         .{ "_distance", "_distance", true },
@@ -7325,6 +7404,10 @@ pub const QueryHit = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self._computed) |value| {
+            try jw.objectField("_computed");
+            try jw.write(value);
+        }
         try jw.objectField("_id");
         try jw.write(self._id);
         try jw.objectField("_score");
@@ -7635,6 +7718,7 @@ pub const QueryProfile = struct {
 };
 
 pub const QueryRequest = struct {
+    evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
@@ -7708,6 +7792,7 @@ pub const QueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
@@ -7757,6 +7842,10 @@ pub const QueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluate) |value| {
+            try jw.objectField("evaluate");
+            try jw.write(value);
+        }
         if (self.table_target) |value| {
             try jw.objectField("table_target");
             try jw.write(value);
@@ -7956,6 +8045,8 @@ pub const QueryResponses = struct {
 
 /// Result of a canonical query operation.
 pub const QueryResult = struct {
+    /// Function evaluation scope, population, usage, and scoped aggregations.
+    evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
     /// Aggregation results keyed by the user-defined aggregation names from the request. Contains computed metrics or buckets depending on the aggregation type.
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
@@ -7977,6 +8068,7 @@ pub const QueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
@@ -7999,6 +8091,10 @@ pub const QueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluation) |value| {
+            try jw.objectField("evaluation");
+            try jw.write(value);
+        }
         if (self.hits) |value| {
             try jw.objectField("hits");
             try jw.write(value);
@@ -8044,6 +8140,8 @@ pub const QueryResult = struct {
 
 /// Fields shared by canonical and stateful query result envelopes.
 pub const QueryResultBase = struct {
+    /// Function evaluation scope, population, usage, and scoped aggregations.
+    evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
     /// Aggregation results keyed by the user-defined aggregation names from the request. Contains computed metrics or buckets depending on the aggregation type.
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
@@ -8064,6 +8162,7 @@ pub const QueryResultBase = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
@@ -8085,6 +8184,10 @@ pub const QueryResultBase = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluation) |value| {
+            try jw.objectField("evaluation");
+            try jw.write(value);
+        }
         if (self.hits) |value| {
             try jw.objectField("hits");
             try jw.write(value);
@@ -13432,6 +13535,7 @@ pub const SqlSettingValue = std.json.Value;
 
 /// Stateful Antfly query request. Canonical clients use graph_queries; deprecated graph_searches is retained only at the stateful public transport boundary for the v0.2 transition window.
 pub const StatefulQueryRequest = struct {
+    evaluate: ?QueryEvaluation = null,
     table_target: ?CatalogTableTarget = null,
     /// Literal table name in default.public. Global queries require exactly one of table or table_target.
     table: ?[]const u8 = null,
@@ -13509,6 +13613,7 @@ pub const StatefulQueryRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluate", "evaluate", true },
         .{ "table_target", "table_target", true },
         .{ "table", "table", true },
         .{ "query", "query", true },
@@ -13560,6 +13665,10 @@ pub const StatefulQueryRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluate) |value| {
+            try jw.objectField("evaluate");
+            try jw.write(value);
+        }
         if (self.table_target) |value| {
             try jw.objectField("table_target");
             try jw.write(value);
@@ -13767,6 +13876,8 @@ pub const StatefulQueryResponses = struct {
 
 /// Result emitted by the stateful compatibility transport.
 pub const StatefulQueryResult = struct {
+    /// Function evaluation scope, population, usage, and scoped aggregations.
+    evaluation: ?std.json.ArrayHashMap(std.json.Value) = null,
     hits: ?QueryHits = null,
     /// Aggregation results keyed by the user-defined aggregation names from the request. Contains computed metrics or buckets depending on the aggregation type.
     aggregations: ?std.json.ArrayHashMap(AggregationResult) = null,
@@ -13788,6 +13899,7 @@ pub const StatefulQueryResult = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "evaluation", "evaluation", true },
         .{ "hits", "hits", true },
         .{ "aggregations", "aggregations", true },
         .{ "analyses", "analyses", true },
@@ -13810,6 +13922,10 @@ pub const StatefulQueryResult = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.evaluation) |value| {
+            try jw.objectField("evaluation");
+            try jw.write(value);
+        }
         if (self.hits) |value| {
             try jw.objectField("hits");
             try jw.write(value);
@@ -16973,11 +17089,11 @@ fn openApiParseObject(
     @setEvalBranchQuota(100_000);
     const struct_info = @typeInfo(T).@"struct";
     if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
-    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (openapi_fields.len != struct_info.field_names.len) @compileError("OpenAPI object field descriptors must match the generated struct");
     if (.object_begin != try source.next()) return error.UnexpectedToken;
 
     var result: T = undefined;
-    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var fields_seen = @as([struct_info.field_names.len]bool, @splat(false));
     while (true) {
         var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         const field_name = switch (name_token.?) {
@@ -16986,9 +17102,9 @@ fn openApiParseObject(
             else => return error.UnexpectedToken,
         };
 
-        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
-            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+            if (field_attrs.@"comptime") @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field_name_zig);
+            if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
             if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 openApiFreeAllocatedToken(allocator, name_token.?);
                 name_token = null;
@@ -16996,14 +17112,14 @@ fn openApiParseObject(
                 if (fields_seen[i]) {
                     switch (options.duplicate_field_behavior) {
                         .use_first => {
-                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            _ = try std.json.innerParse(Field, allocator, source, options);
                             break;
                         },
                         .@"error" => return error.DuplicateField,
                         .use_last => {},
                     }
                 }
-                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                @field(result, field_name_zig) = try std.json.innerParse(Field, allocator, source, options);
                 fields_seen[i] = true;
                 break;
             }
@@ -17026,19 +17142,19 @@ fn openApiParseObjectFromValue(
     @setEvalBranchQuota(100_000);
     const struct_info = @typeInfo(T).@"struct";
     if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
-    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (openapi_fields.len != struct_info.field_names.len) @compileError("OpenAPI object field descriptors must match the generated struct");
     if (source != .object) return error.UnexpectedToken;
     var result: T = undefined;
-    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var fields_seen = @as([struct_info.field_names.len]bool, @splat(false));
     var it = source.object.iterator();
     while (it.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
-            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+            if (field_attrs.@"comptime") @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field_name_zig);
+            if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
             if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
-                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                @field(result, field_name_zig) = try std.json.innerParseFromValue(Field, allocator, entry.value_ptr.*, options);
                 fields_seen[i] = true;
                 break;
             }
@@ -17048,12 +17164,13 @@ fn openApiParseObjectFromValue(
     return result;
 }
 
-fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".field_names.len]bool) !void {
     @setEvalBranchQuota(100_000);
-    inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
-        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+    const struct_info = @typeInfo(T).@"struct";
+    inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+        if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
         if (!fields_seen[i]) {
-            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+            if (field_attrs.defaultValue(Field)) |default| @field(result, field_name_zig) = default else return error.MissingField;
         }
     }
 }

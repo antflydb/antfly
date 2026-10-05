@@ -54,7 +54,7 @@ const Fixture = struct {
         const encoder = try modern.parseConfig(a, bytes);
         return .{ .tmp = tmp, .path = path, .session = session, .cfg = factory.getLayaConfig(session).?, .encoder = encoder };
     }
-    fn deinit(self: *Fixture, a: std.mem.Allocator) void {
+    pub fn deinit(self: *Fixture, a: std.mem.Allocator) void {
         self.session.close();
         a.free(self.path);
         self.tmp.cleanup();
@@ -94,7 +94,7 @@ test "laya tree rows restart positions per branch and isolate siblings" {
         // Every question branch restarts at the end of the trunk.
         for (row.anchors, 0..) |anchor, qi| {
             try std.testing.expectEqual(@as(i64, @intCast(trunk)), row.positions[@intCast(anchor)]);
-            try std.testing.expectEqual(@as(i64, @intFromEnum(questions[qi].kind)), row.kinds[@intCast(anchor)]);
+            try std.testing.expectEqual(@as(i64, @backingInt(questions[qi].kind)), row.kinds[@intCast(anchor)]);
             for (row.anchors, 0..) |other, qj| if (qi != qj) {
                 try std.testing.expect(!row.visible(@intCast(anchor), @intCast(other)));
             };
@@ -187,7 +187,7 @@ test "laya packed encoder on a one-segment tree reproduces the unpacked encoder"
     var positions: [n]i64 = undefined;
     var segments: [n]i64 = undefined;
     var kinds: [n]i64 = undefined;
-    const mask = [_]i64{1} ** n;
+    const mask = @as([n]i64, @splat(1));
     for (&ids, &positions, &segments, &kinds, 0..) |*id, *p, *s, *k, i| {
         id.* = @intCast((i * 7 + 3) % synthetic.vocab_size);
         p.* = @intCast(i);
@@ -614,7 +614,7 @@ test "laya packed pipeline batches many small states into fewer session calls" {
     var worst_act: f32 = 0;
     for (result.decisions, unbatched.decisions) |left, right| {
         worst_prob = @max(worst_prob, try maxError(left.probabilities, right.probabilities));
-        worst_act = @max(worst_act, @abs(left.act_probability - right.act_probability));
+        worst_act = @max(worst_act, @abs(left.act_probability.? - right.act_probability.?));
     }
     std.debug.print("Laya multi-row batching: {d} states, worst probability error={d}, worst act error={d}\n", .{ state_count, worst_prob, worst_act });
     try std.testing.expect(worst_prob < 1e-5);
@@ -704,7 +704,7 @@ test "laya packed pipeline groups shared states and preserves request order" {
         const alone = try pipeline.execute(a, fixture.session, tok, fixture.cfg, &.{task}, null);
         unpacked_tokens += alone.prompt_tokens;
         try std.testing.expect(try maxError(alone.decisions[0].probabilities, decision.probabilities) < 1e-5);
-        try std.testing.expectApproxEqAbs(alone.decisions[0].act_probability, decision.act_probability, 1e-5);
+        try std.testing.expectApproxEqAbs(alone.decisions[0].act_probability.?, decision.act_probability.?, 1e-5);
     }
     // The shared state is encoded once instead of once per question.
     try std.testing.expect(result.prompt_tokens < unpacked_tokens);

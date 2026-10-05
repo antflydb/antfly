@@ -44,8 +44,8 @@ const CleanupCursor = struct {
         @memcpy(buffer[0..4], "SGC1");
         buffer[4..28].* = self.namespace;
         buffer[28..60].* = self.pin;
-        buffer[60] = @intFromEnum(self.mode);
-        buffer[61] = @intFromEnum(self.tree);
+        buffer[60] = @backingInt(self.mode);
+        buffer[61] = @backingInt(self.tree);
         std.mem.writeInt(u16, buffer[62..64], @intCast(self.directory.len), .little);
         @memcpy(buffer[64..][0..self.directory.len], self.directory.bytes());
         const body_len = 64 + self.directory.len;
@@ -152,6 +152,7 @@ fn verifyInventory(alloc: Allocator, io: std.Io, root: []const u8, handle: seal.
 /// Caller holds the DB apply lock. The normal path never exposes prepared
 /// admission to another writer. Restart retries complete this same frozen cut.
 pub fn ensureAssumeApply(db: *DB, scope: ledger.Scope) !void {
+    if (try db.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
     if (comptime @import("builtin").os.tag == .freestanding) return error.UnsupportedPlatform;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
@@ -257,6 +258,7 @@ pub fn publicationCertificateIfPresent(db: *DB, scope: ledger.Scope, cancellatio
 }
 
 pub fn preparePublication(db: *DB, scope: ledger.Scope, cancellation: Cancellation) !snapshot.Certificate {
+    if (try db.core.store.hasGraphEndpointCleanup()) return error.IntegrityTopologyBusy;
     const alloc = db.alloc;
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     try cancellation.check();
@@ -340,7 +342,7 @@ pub fn reclaimReleased(db: *DB, scope: ledger.Scope) !void {
     };
     if (found.progress.phase != .released) return error.OnlineSourceScopeChanged;
     if (found.progress.local_cleanup_complete) return;
-    _ = db.source_pin_gc_epoch.fetchAdd(1, .acq_rel);
+    _ = db.source_pin_cleanup.epoch.fetchAdd(1, .acq_rel);
     cleanupLocated(db, found) catch |err| {
         db.recordSourcePinCleanupFailure(err);
         return err;
@@ -360,12 +362,12 @@ pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork 
     if (comptime @import("builtin").os.tag == .freestanding) return CleanupWork.init(.failing, budget);
     const io = db.backend_runtime.filesystemIo() orelse return error.BackendRuntimeIoUnavailable;
     var work = CleanupWork.init(io, budget);
-    const epoch = db.source_pin_gc_epoch.load(.acquire);
+    const epoch = db.source_pin_cleanup.epoch.load(.acquire);
     if (epoch == 0) return work;
     // Preserve useful work even when a different slot reports an error: the
     // shared maintenance scheduler must not back off healthy cleanup pages.
     defer if (work.completed_units != 0) {
-        _ = db.source_pin_gc_work_units.fetchAdd(@intCast(work.completed_units), .acq_rel);
+        _ = db.source_pin_cleanup.work_units.fetchAdd(@intCast(work.completed_units), .acq_rel);
     };
     // The common document-only owner pays one bounded read-only startup scan,
     // not directory creation, locking, cursor writes or per-mutation probes.
@@ -444,10 +446,10 @@ pub fn reconcileReleasedWithBudget(db: *DB, budget: CleanupBudget) !CleanupWork 
 }
 
 fn clearCleanupDebt(db: *DB, epoch: u64) void {
-    if (db.source_pin_gc_epoch.cmpxchgStrong(epoch, 0, .acq_rel, .acquire) != null) return;
-    db.source_pin_gc_error.store(0, .release);
-    db.source_pin_gc_failure_streak.store(0, .release);
-    db.source_pin_gc_next_ns.store(0, .release);
+    if (db.source_pin_cleanup.epoch.cmpxchgStrong(epoch, 0, .acq_rel, .acquire) != null) return;
+    db.source_pin_cleanup.error_code.store(0, .release);
+    db.source_pin_cleanup.failure_streak.store(0, .release);
+    db.source_pin_cleanup.next_ns.store(0, .release);
 }
 
 fn cleanupLocated(db: *DB, found: ledger.Located) !void {
@@ -673,10 +675,10 @@ test "relational index system source pin interrupted cleanup reserves slot acros
         if (db.sourcePinCleanupStatus().failures != 0) break;
     }
     try std.testing.expectEqualStrings("OnlineSourceCorrupt", db.sourcePinCleanupStatus().last_error.?);
-    db.source_pin_gc_next_ns.store(0, .release);
-    const units_before = db.source_pin_gc_work_units.load(.acquire);
+    db.source_pin_cleanup.next_ns.store(0, .release);
+    const units_before = db.source_pin_cleanup.work_units.load(.acquire);
     try std.testing.expect(try db.runSourcePinCleanupStep());
-    try std.testing.expect(db.source_pin_gc_work_units.load(.acquire) > units_before);
+    try std.testing.expect(db.source_pin_cleanup.work_units.load(.acquire) > units_before);
     // Useful later-slot work keeps the next pass prompt despite the earlier
     // damaged cursor, while zero-progress errors retain exponential backoff.
     try std.testing.expect(db.sourcePinCleanupStatus().next_attempt_ns <= @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_ms);

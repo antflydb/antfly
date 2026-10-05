@@ -1431,7 +1431,7 @@ else
                     return existing;
                 }
             }
-            const owned_path = try self.allocator.dupeZ(u8, path);
+            const owned_path = try self.allocator.dupeSentinel(u8, path, 0);
             var owned_path_active = true;
             errdefer if (owned_path_active) self.allocator.free(owned_path);
 
@@ -2995,9 +2995,9 @@ fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
     defer closeFd(new_parent_fd);
 
     const allocator = std.heap.page_allocator;
-    const old_base_name_z = try allocator.dupeZ(u8, old_base_name);
+    const old_base_name_z = try allocator.dupeSentinel(u8, old_base_name, 0);
     defer allocator.free(old_base_name_z);
-    const new_base_name_z = try allocator.dupeZ(u8, new_base_name);
+    const new_base_name_z = try allocator.dupeSentinel(u8, new_base_name, 0);
     defer allocator.free(new_base_name_z);
 
     while (true) {
@@ -3026,9 +3026,9 @@ fn renameAbsolutePosix(old_path: []const u8, new_path: []const u8) !void {
 
 fn renameAbsoluteDirectPosix(old_path: []const u8, new_path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const old_path_z = try allocator.dupeZ(u8, old_path);
+    const old_path_z = try allocator.dupeSentinel(u8, old_path, 0);
     defer allocator.free(old_path_z);
-    const new_path_z = try allocator.dupeZ(u8, new_path);
+    const new_path_z = try allocator.dupeSentinel(u8, new_path, 0);
     defer allocator.free(new_path_z);
 
     while (true) {
@@ -3082,7 +3082,7 @@ fn createAtomicWriteFdPosix(path: []const u8) !std.posix.fd_t {
 
 fn deleteFilePathPosix(path: []const u8) !void {
     const allocator = std.heap.page_allocator;
-    const path_z = try allocator.dupeZ(u8, path);
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(path_z);
 
     while (true) {
@@ -5160,9 +5160,10 @@ test "shared native fd cache blocks before opening more than 64 files across sto
     // Every task intentionally holds a lease or waits in descriptor admission.
     // Give the threaded test executor one slot per task so the harness itself
     // cannot become the bottleneck before the >64 contention point is reached.
+    // Keep the platform's default stack size: the linked test graph's static
+    // TLS can exceed a hand-picked 512 KiB stack on glibc (pthread EINVAL).
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{
         .async_limit = .limited(worker_count),
-        .stack_size = 512 * 1024,
     });
     defer io_impl.deinit();
     const io = io_impl.io();

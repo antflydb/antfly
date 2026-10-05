@@ -29,6 +29,7 @@ pub const metadata_mutation_not_admitted_value = "true";
 pub fn canonicalTransportError(err: anyerror) anyerror {
     return switch (err) {
         error.SocketUnconnected => error.ConnectionResetByPeer,
+        error.UnexpectedEof => error.InvalidResponse,
         else => err,
     };
 }
@@ -146,24 +147,24 @@ pub const RequestDeliveryTracker = struct {
         may_have_been_sent,
     };
 
-    state: std.atomic.Value(u8) = .init(@intFromEnum(State.unknown)),
+    state: std.atomic.Value(u8) = .init(@backingInt(State.unknown)),
 
     /// Enter an executor whose send boundary is not yet known. The executor
     /// may subsequently prove `not_sent` or advance to `may_have_been_sent`.
     pub fn markUnknown(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.unknown), .release);
+        self.state.store(@backingInt(State.unknown), .release);
     }
 
     pub fn markNotSent(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.not_sent), .release);
+        self.state.store(@backingInt(State.not_sent), .release);
     }
 
     pub fn markMayHaveBeenSent(self: *RequestDeliveryTracker) void {
-        self.state.store(@intFromEnum(State.may_have_been_sent), .release);
+        self.state.store(@backingInt(State.may_have_been_sent), .release);
     }
 
     pub fn load(self: *const RequestDeliveryTracker) State {
-        return @enumFromInt(self.state.load(.acquire));
+        return @fromBackingInt(@intCast(self.state.load(.acquire)));
     }
 };
 
@@ -348,15 +349,16 @@ test "request executor invalidates caller-side delivery proof at its boundary" {
 test "disconnected executor errors preserve uncertain mutation delivery without replay" {
     const Disconnected = struct {
         calls: usize = 0,
+        failure: anyerror = error.SocketUnconnected,
         fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: HttpRequest) anyerror!HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            return error.SocketUnconnected;
+            return self.failure;
         }
         fn stream(ptr: *anyopaque, _: std.mem.Allocator, _: HttpRequest, _: StreamWriter) anyerror!bool {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.calls += 1;
-            return error.SocketUnconnected;
+            return self.failure;
         }
     };
     var disconnected = Disconnected{};
@@ -382,7 +384,17 @@ test "disconnected executor errors preserve uncertain mutation delivery without 
     try std.testing.expectError(error.ConnectionResetByPeer, streaming.execute(std.testing.allocator, request, writer));
     try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
     try std.testing.expectEqual(@as(usize, 3), disconnected.calls);
+    disconnected.failure = error.UnexpectedEof;
+    tracker.markNotSent();
+    try std.testing.expectError(error.InvalidResponse, executor.execute(std.testing.allocator, request));
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+    try std.testing.expectEqual(@as(usize, 4), disconnected.calls);
+    tracker.markNotSent();
+    try std.testing.expectError(error.InvalidResponse, executor.executeStream(std.testing.allocator, request, writer));
+    try std.testing.expectEqual(RequestDeliveryTracker.State.unknown, tracker.load());
+    try std.testing.expectEqual(@as(usize, 5), disconnected.calls);
     try std.testing.expectEqual(error.OutOfMemory, canonicalTransportError(error.OutOfMemory));
+    try std.testing.expectEqual(error.InvalidResponse, canonicalTransportError(error.UnexpectedEof));
 }
 
 test "http common types compile" {

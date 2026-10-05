@@ -77,7 +77,7 @@ fn defaultInferenceOnnxRoot(b: *std.Build, target: std.Build.ResolvedTarget) []c
 fn addLocalHttpxModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
 ) *std.Build.Module {
     return b.createModule(.{
         .root_source_file = b.path("lib/httpx/src/httpx.zig"),
@@ -156,11 +156,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     else
         false;
     const inference_blas_root_opt = b.option([]const u8, "blas-root", "Path to system BLAS root with include/ and lib/ for non-macOS native acceleration");
-    const inference_system_blas_available = link_libc and (target.result.os.tag == .macos or inference_blas_root_opt != null);
-    const inference_enable_system_blas = if (link_libc)
-        b.option(bool, "system-blas", "Enable system BLAS acceleration for native CPU math") orelse inference_system_blas_available
-    else
-        false;
+    const inference_blas = @import("pkg/inference/build/blas.zig").configure(b, link_libc, target.result.os.tag == .macos, inference_blas_root_opt != null);
+    const inference_enable_system_blas = inference_blas.system;
     const inference_blas_root = if (inference_enable_system_blas and target.result.os.tag != .macos)
         inference_blas_root_opt
     else
@@ -228,7 +225,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     b.step("regen-snowball", "Regenerate checked-in Zig Snowball stemmers").dependOn(&snowball_steps.regen.step);
     b.step("check-snowball", "Check checked-in Zig Snowball stemmers are current").dependOn(&snowball_steps.compare.step);
     const openapi_build = b.lazyImport(@This(), "openapi") orelse return null;
-    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .ReleaseSafe);
+    const openapi_codegen = openapi_build.addCompiler(b, b.path("lib/openapi"), b.graph.host, .safe);
     const openapi_sources = addOpenApiSourceSteps(b, openapi_build, openapi_codegen);
     const update_public_openapi = b.addUpdateSourceFiles();
     update_public_openapi.addCopyFileToSource(openapi_sources.public_spec, "../openapi.yaml");
@@ -260,7 +257,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root = b.path("lib/sql"),
         .target = target,
         .optimize = optimize,
-        .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .ReleaseSafe),
+        .codegen = yacc_build.addCompiler(b, b.path("lib/yacc"), b.graph.host, .safe),
         .compare_tool = tools_build.addFileCompareTool(b, b.path("tools")),
         .grammar_label = "lib/sql/grammar/antfly_sql.y",
     });
@@ -290,9 +287,9 @@ pub fn create(b: *std.Build) ?Artifacts {
     // remains below the full database compilation and integration test roots.
     sql_tests.step.max_rss = 1536 * 1024 * 1024;
     // The complete compiler/executor corpus includes exhaustive allocation-fault
-    // runs (about 137 MiB process RSS in ReleaseSafe). This scheduling estimate
+    // runs and parallel partition lifecycle checks. This scheduling estimate
     // is independent of the executor's per-statement memory admission tests.
-    run_sql_tests.step.max_rss = 192 * 1024 * 1024;
+    run_sql_tests.step.max_rss = 384 * 1024 * 1024;
     b.step("sql-test", "Run SQL compilation, catalog binding, and native execution contract tests").dependOn(&run_sql_tests.step);
     const pgwire_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/pgwire_test_root.zig"),
@@ -307,7 +304,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     // requires unrelated native imports this module does not provide.
     const pgwire_tests = b.addTest(.{
         .root_module = pgwire_test_mod,
-        .filters = b.args orelse &.{"pgwire"},
+        .filters = buildArguments(b) orelse &.{"pgwire"},
     });
     const run_pgwire_tests = b.addRunArtifact(pgwire_tests);
     pgwire_tests.step.max_rss = 1024 * 1024 * 1024;
@@ -405,6 +402,16 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
         .link_libc = link_libc,
     });
+    const evented_enrichment_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/raft/enrichment_executor_test.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    evented_enrichment_test_mod.addImport("antfly_platform", platform_mod);
+    const evented_enrichment_tests = b.addTest(.{ .root_module = evented_enrichment_test_mod });
+    b.step("evented-enrichment-test", "Test enrichment io_uring lifetime, concurrent tasks, cancellation, and file I/O")
+        .dependOn(&b.addRunArtifact(evented_enrichment_tests).step);
+
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),
         .target = target,
@@ -443,10 +450,10 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     // Isolated image/hash benchmarks own a fixed ReleaseFast profile.
-    const hash_bench_mod = if (optimize == .ReleaseFast) hash_mod else b.createModule(.{
+    const hash_bench_mod = if (optimize == .fast) hash_mod else b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
     });
     const vectorindex_mod = b.createModule(.{
         .root_source_file = b.path("lib/vectorindex/src/mod.zig"),
@@ -670,6 +677,7 @@ pub fn create(b: *std.Build) ?Artifacts {
             .wasm_memory_model = b.option([]const u8, "wasm-memory-model", "Inference WASM memory model: wasm32 or wasm64") orelse "wasm32",
             .enable_webgpu = b.option(bool, "webgpu", "Enable WebGPU for inference WASM") orelse false,
             .enable_system_blas = inference_enable_system_blas,
+            .enable_runtime_openblas = inference_blas.runtime,
             .blas_root = inference_blas_root,
             .link_libc = link_libc,
             .skip_openapi = false,
@@ -768,7 +776,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .paths = inference_config.paths,
         .backend = inference_config.backend,
         .graph = inference_graph,
-        .args = b.args,
+        .args = buildArguments(b),
         .step_prefix = "inference-",
         .add_native_process_test = platform_build.addNativeProcessTest,
         .runtime_test_filter = b.option(bool, "runtime-test-filter", "Build inference tests once and filter them at runtime") orelse false,
@@ -777,13 +785,13 @@ pub fn create(b: *std.Build) ?Artifacts {
     const inference_wasm_jinja = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = inference_wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
     });
     const inference_wasm_platform = platform_build.createModule(b, .{
         .root_source_file = b.path("lib/platform/src/root.zig"),
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
         .target = inference_wasm_target,
-        .optimize = .ReleaseSafe,
+        .optimize = .safe,
         .link_libc = false,
     });
     const inference_steps = @import("pkg/inference/build/integration.zig").add(inference_workflow, inference_wasm_jinja, inference_wasm_platform);
@@ -812,6 +820,11 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     runtime_fs_mod.addImport("antfly_platform", platform_mod);
+    // usermgr/user_manager.zig and the storage it transitively reaches need
+    // these three ABI modules, which usermgr_mod didn't declare.
+    usermgr_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    usermgr_mod.addImport("antfly_cache_budget", cache_budget_mod);
+    usermgr_mod.addImport("antfly_runtime_fs", runtime_fs_mod);
     const provision_contract_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/metadata/provision_contract.zig"),
         .target = target,
@@ -988,7 +1001,6 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = optimize,
     });
     inference_runtime_paths_mod.addImport("antfly_platform", platform_mod);
-    inference_runtime_paths_mod.addImport("inference_server", inference_server_mod);
     const inference_query_embedding_cache_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/inference/providers/query_embedding_cache.zig"),
         .target = target,
@@ -1155,6 +1167,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .platform_target = target,
         .filesystem_capacity_source_file = b.path("lib/platform/src/filesystem_capacity.c"),
     };
+    antfly_imports.configureRuntimeContracts(usermgr_mod);
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
@@ -1165,6 +1178,24 @@ pub fn create(b: *std.Build) ?Artifacts {
     sql_test_mod.addImport("antfly_hash", hash_mod);
     sql_test_mod.addImport("bloom", bloom_mod);
     sql_test_mod.link_libc = link_libc;
+    const refinement_bench_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/sql_refinement_bench_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.storage_boundary.configureSources(refinement_bench_mod, false, false);
+    refinement_bench_mod.addImport("sql_parser", sql_parser_mod);
+    refinement_bench_mod.addImport("antfly_platform", platform_mod);
+    refinement_bench_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
+    refinement_bench_mod.addImport("antfly_regex", regex_mod);
+    refinement_bench_mod.addImport("antfly_hash", hash_mod);
+    refinement_bench_mod.addImport("bloom", bloom_mod);
+    refinement_bench_mod.link_libc = link_libc;
+    const refinement_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native refinements benchmark"} });
+    b.step("sql-native-refinement-bench", "Compare native expression, aggregate and window spill refinements").dependOn(&b.addRunArtifact(refinement_bench).step);
+    const pipeline_bench = b.addTest(.{ .root_module = refinement_bench_mod, .filters = &.{"native pipeline refinements benchmark"} });
+    b.step("sql-native-pipeline-bench", "Compare shared typed DAGs and block result delivery").dependOn(&b.addRunArtifact(pipeline_bench).step);
+
     antfly_imports.storage_boundary.configureSources(storage_mod, false, false);
     var production_antfly_imports = antfly_imports;
     production_antfly_imports.build_options = production_build_options;
@@ -1393,7 +1424,7 @@ pub fn create(b: *std.Build) ?Artifacts {
 
     const lib_hash_tests = b.addTest(.{
         .root_module = hash_mod,
-        .filters = b.args orelse &.{},
+        .filters = buildArguments(b) orelse &.{},
     });
     const run_lib_hash_tests = b.addRunArtifact(lib_hash_tests);
     const lib_hash_test_step = b.step("lib-hash-test", "Run standalone lib/hash tests");
@@ -1401,7 +1432,7 @@ pub fn create(b: *std.Build) ?Artifacts {
 
     const lib_vectorindex_tests = b.addTest(.{
         .root_module = vectorindex_mod,
-        .filters = b.args orelse &.{},
+        .filters = buildArguments(b) orelse &.{},
     });
     const run_lib_vectorindex_tests = b.addRunArtifact(lib_vectorindex_tests);
     const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
@@ -1409,7 +1440,7 @@ pub fn create(b: *std.Build) ?Artifacts {
 
     const vector_kernel_mod = b.createModule(.{ .root_source_file = b.path("lib/vector/src/quantizer.zig"), .target = target, .optimize = optimize });
     vector_kernel_mod.addImport("protobuf", protobuf_mod);
-    const vector_kernel_tests = b.addTest(.{ .root_module = vector_kernel_mod, .filters = b.args orelse &.{} });
+    const vector_kernel_tests = b.addTest(.{ .root_module = vector_kernel_mod, .filters = buildArguments(b) orelse &.{} });
     const run_vector_kernel_tests = b.addRunArtifact(vector_kernel_tests);
     b.step("lib-vector-kernel-test", "Run standalone quantizer kernel tests (no external recall fixtures)").dependOn(&run_vector_kernel_tests.step);
 
@@ -1519,8 +1550,8 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     b.step("lib-image-bench", "Build and install lib-image-bench").dependOn(&b.addInstallArtifact(image_benchmark, .{}).step);
 
-    const pdf_bench_optimize = b.option(std.builtin.OptimizeMode, "pdf-optimize", "Optimization for the isolated PDF executable") orelse .ReleaseFast;
-    const pdf_bench_hash = if (pdf_bench_optimize == .ReleaseFast) hash_bench_mod else if (pdf_bench_optimize == optimize) hash_mod else b.createModule(.{
+    const pdf_bench_optimize = b.option(std.lang.Optimize, "pdf-optimize", "Optimization for the isolated PDF executable") orelse .fast;
+    const pdf_bench_hash = if (pdf_bench_optimize == .fast) hash_bench_mod else if (pdf_bench_optimize == optimize) hash_mod else b.createModule(.{
         .root_source_file = b.path("lib/hash/src/mod.zig"),
         .target = target,
         .optimize = pdf_bench_optimize,
@@ -1621,6 +1652,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_lib_ha_compat_tests = owner_tests.run_lib_ha_compat_tests;
     const antfly_test_step = owner_tests.antfly_test_step;
     const unit_test_step = owner_tests.unit_test_step;
+    unit_test_step.dependOn(&b.addRunArtifact(openapi_docs_test).step);
     unit_test_step.dependOn(&run_sql_tests.step);
     unit_test_step.dependOn(&run_pgwire_tests.step);
     unit_test_step.dependOn(&pdf_integration.run.step);
@@ -1788,12 +1820,12 @@ pub fn create(b: *std.Build) ?Artifacts {
         if (entry.found_existing) continue;
         tests.root_module.addObject(consumer_test_metadata.object);
         inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-            tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+            tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
     const standalone_initial_fk_tests = owner_tests.standalone_initial_fk_tests;
     standalone_initial_fk_tests.root_module.addObject(consumer_test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-        standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+        standalone_initial_fk_tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const run_standalone_initial_fk_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_initial_fk_tests);
     b.step("antfly-standalone-initial-fk-test", "Run linked native standalone initial-FK owner publication tests").dependOn(&run_standalone_initial_fk_tests.step);
     const graph_transfer_tests = b.addTest(.{ .root_module = b.createModule(.{
@@ -1801,13 +1833,15 @@ pub fn create(b: *std.Build) ?Artifacts {
         .target = target,
         .optimize = optimize,
     }) });
+    graph_transfer_tests.root_module.addImport("antfly_hash", hash_mod);
     const run_graph_transfer_tests = b.addRunArtifact(graph_transfer_tests);
     b.step("antfly-graph-transfer-test", "Validate certified graph artifact generation transfer").dependOn(&run_graph_transfer_tests.step);
-    owner_tests.unit_test_step.dependOn(&run_graph_transfer_tests.step);
+    // The storage lanes already own every named graph-transfer contract.
+    // Keep this focused target without compiling a duplicate aggregate image.
     const standalone_policy_ha_tests = owner_tests.standalone_policy_ha_tests;
     standalone_policy_ha_tests.root_module.addObject(consumer_test_metadata.object);
     inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
-        standalone_policy_ha_tests.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
+        standalone_policy_ha_tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     const run_standalone_policy_ha_tests = antfly_tests_build.addFilteredTestRunArtifact(b, standalone_policy_ha_tests);
     b.step("antfly-standalone-policy-ha-test", "Run native standalone and HA row-policy publication regressions").dependOn(&run_standalone_policy_ha_tests.step);
     // Native activation must remain covered by the existing physical-owner
@@ -1815,6 +1849,24 @@ pub fn create(b: *std.Build) ?Artifacts {
     for ([_]*std.Build.Step.Run{ run_standalone_initial_fk_tests, run_standalone_policy_ha_tests }) |run| {
         owner_tests.storage_test_step.dependOn(&run.step);
         owner_tests.integration_test_step.dependOn(&run.step);
+    }
+
+    // These three compile real CLI/server boot paths (Lite command tests,
+    // the standalone runtime's HA/hot-standby/Lite surface, and the public
+    // API parity e2e suite) that reach the real storage-kernel owner through
+    // api/kernel_owner_source.zig the same way production does, independent
+    // of the control-only source selection most unit tests use. Each already
+    // compiles from its own dedicated module (not the shared antfly_test_mod
+    // or standalone_runtime_test_mod), so linking the owner archive here
+    // reaches only this one compile per fixture.
+    for ([_]*std.Build.Step.Compile{
+        owner_tests.lite_cmd_tests,
+        owner_tests.lib_standalone_runtime_tests,
+        owner_tests.public_api_parity_tests,
+    }) |tests| {
+        tests.root_module.addObject(consumer_test_metadata.object);
+        inline for (.{ .storage_kernel, .enrichment_compute, .inference }) |unit|
+            tests.root_module.linkLibrary(runtime_library_artifacts[@backingInt(@as(@import("pkg/antfly/build/runtime.zig").RuntimeLibraryUnit, unit))].?);
     }
 
     const storage_owner_runs = @import("pkg/antfly/build/storage_owner_tests.zig").add(b, target, optimize, production_antfly_imports, vopr_mod, lmdb_engine_mod, runtime_library_artifacts);
@@ -1850,7 +1902,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .root_module = maintenance_process_mod,
     });
     maintenance_process.root_module.linkLibrary(
-        runtime_library_artifacts[@intFromEnum(RuntimeLibraryUnit.api_kernel)].?,
+        runtime_library_artifacts[@backingInt(RuntimeLibraryUnit.api_kernel)].?,
     );
     const run_maintenance_process = b.addRunArtifact(maintenance_process);
     run_maintenance_process.has_side_effects = true;
@@ -1905,7 +1957,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     // Lite administration shares storage; serving shares the server runtime.
     for ([_]RuntimeLibraryUnit{ .storage_kernel, .distributed, .api_kernel, .enrichment_compute, .inference }) |unit| {
-        lite_main.root_module.linkLibrary(runtime_library_artifacts[@intFromEnum(unit)].?);
+        lite_main.root_module.linkLibrary(runtime_library_artifacts[@backingInt(unit)].?);
     }
     const lite_cli_smoke = b.addExecutable(.{
         .name = "antfly-lite-cli-smoke",
@@ -1916,9 +1968,9 @@ pub fn create(b: *std.Build) ?Artifacts {
         }),
     });
     const run_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_cli_smoke.addArtifactArg(lite_main);
+    run_lite_cli_smoke.addArtifactArg2(lite_main, .{ .make_absolute = true });
     const run_antfly_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_antfly_lite_cli_smoke.addArtifactArg(antfly_main);
+    run_antfly_lite_cli_smoke.addArtifactArg2(antfly_main, .{ .make_absolute = true });
     const lite_main_tests = b.addTest(.{
         .root_module = b.createModule(lite_module_options),
         .filters = &.{"lite main compiles"},
@@ -2044,4 +2096,19 @@ pub fn create(b: *std.Build) ?Artifacts {
         &b.top_level_steps.get("inference-finetune-test").?.step,
     });
     return .{ .runtime = runtime, .inference = inference_graph, .wasm = wasm.artifact, .inference_steps = inference_steps };
+}
+
+fn buildArguments(b: *std.Build) ?[]const []const u8 {
+    if (!b.available_options_map.contains("test-filter"))
+        return b.option([]const []const u8, "test-filter", "Compile-time test filters (runtime filters follow --)");
+    const input = b.user_input_options.get("test-filter") orelse return null;
+    return switch (input) {
+        .scalar => |value| blk: {
+            const values = b.allocator.alloc([]const u8, 1) catch @panic("OOM");
+            values[0] = value;
+            break :blk values;
+        },
+        .list => |values| values.items,
+        else => null,
+    };
 }

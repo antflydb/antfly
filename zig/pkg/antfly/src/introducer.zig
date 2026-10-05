@@ -71,12 +71,12 @@ const TextBuildScratch = struct {
         resetScratchList(u32, alloc, &self.positions, retained_bytes);
     }
 
-    fn deinit(self: *TextBuildScratch, alloc: Allocator) void {
+    pub fn deinit(self: *TextBuildScratch, alloc: Allocator) void {
         self.hits.deinit(alloc);
         self.positions.deinit(alloc);
     }
 
-    fn estimatedMemoryBytes(self: *const TextBuildScratch) u64 {
+    pub fn estimatedMemoryBytes(self: *const TextBuildScratch) u64 {
         return (@as(u64, @intCast(self.hits.capacity)) * @sizeOf(inverted.InvertedIndexBuilder.TermHit)) +
             (@as(u64, @intCast(self.positions.capacity)) * @sizeOf(u32));
     }
@@ -104,7 +104,7 @@ const FieldPostingsBuilder = struct {
         };
     }
 
-    fn deinit(self: *FieldPostingsBuilder, alloc: Allocator) void {
+    pub fn deinit(self: *FieldPostingsBuilder, alloc: Allocator) void {
         _ = alloc;
         if (!self.active) return;
         self.builder.deinit();
@@ -131,7 +131,7 @@ const FieldPostingsBuilder = struct {
         return try self.builder.buildAlloc(output_alloc);
     }
 
-    fn estimatedMemoryBytes(self: *const FieldPostingsBuilder) u64 {
+    pub fn estimatedMemoryBytes(self: *const FieldPostingsBuilder) u64 {
         if (!self.active) return 0;
         return self.builder.estimatedMemoryBytes();
     }
@@ -972,7 +972,7 @@ const TextIndexSortEntry = struct {
     doc_index: usize,
     keys: []TextIndexSortValue,
 
-    fn deinit(self: *TextIndexSortEntry, alloc: Allocator) void {
+    pub fn deinit(self: *TextIndexSortEntry, alloc: Allocator) void {
         for (self.keys) |*key| key.deinit(alloc);
         alloc.free(self.keys);
         self.* = undefined;
@@ -988,7 +988,7 @@ const TextIndexSortValue = union(enum) {
     id: []const u8,
     numeric_val: typed_dv.NumericValue,
 
-    fn deinit(self: *TextIndexSortValue, alloc: Allocator) void {
+    pub fn deinit(self: *TextIndexSortValue, alloc: Allocator) void {
         switch (self.*) {
             .bytes_val => |bytes| alloc.free(bytes),
             else => {},
@@ -2869,7 +2869,7 @@ test "buildSegmentFromTextWithAnalysisOptions releases full text working set aft
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };

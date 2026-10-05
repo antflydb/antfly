@@ -905,45 +905,45 @@ pub const A4bForkJoinCommandLowerer = struct {
 
     pub fn build(self: *A4bForkJoinCommandLowerer, options: BuildOptions) !void {
         self.prefix_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.input)), .access = .read },
             .{ .range = .whole(.norm_slot, options.pre_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.normalized)), .access = .write },
         };
         self.shared_gate_up_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.normalized)), .access = .read },
             .{ .range = .whole(.quant_slot, options.shared_gate_slot), .access = .read },
             .{ .range = .whole(.quant_slot, options.shared_up_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.shared_gated)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.shared_gated)), .access = .write },
         };
         self.router_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.normalized)), .access = .read },
             .{ .range = .whole(.quant_slot, options.router_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.route_plan)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.route_plan)), .access = .write },
         };
         self.routed_gate_up_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.route_plan)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.normalized)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.route_plan)), .access = .read },
             .{ .range = .whole(.quant_slot, options.routed_gate_slot), .access = .read },
             .{ .range = .whole(.quant_slot, options.routed_up_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.routed_gated)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.routed_gated)), .access = .write },
         };
         self.shared_down_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.shared_gated)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.shared_gated)), .access = .read },
             .{ .range = .whole(.quant_slot, options.shared_down_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.shared_projected)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.shared_projected)), .access = .write },
         };
         self.routed_down_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.routed_gated)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.route_plan)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.routed_gated)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.route_plan)), .access = .read },
             .{ .range = .whole(.quant_slot, options.routed_down_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.routed_projected)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.routed_projected)), .access = .write },
         };
         self.post_join_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.input)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.shared_projected)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.routed_projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.shared_projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.routed_projected)), .access = .read },
             .{ .range = .whole(.norm_slot, options.post_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.output)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.output)), .access = .write },
         };
 
         self.ops = .{
@@ -1028,14 +1028,14 @@ pub const AttentionSetupCommandLowerer = struct {
         self.linear_resource_count = 0;
         self.scratch_size_count = 0;
         const setup_input_resource: ResourceRange = if (options.has_attention_pre_norm)
-            .whole(.scratch_slot, @intFromEnum(Resource.projection_input))
+            .whole(.scratch_slot, @backingInt(Resource.projection_input))
         else
-            .whole(.scratch_slot, @intFromEnum(Resource.attention_input));
+            .whole(.scratch_slot, @backingInt(Resource.attention_input));
 
         self.pre_norm_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attention_input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attention_input)), .access = .read },
             .{ .range = .whole(.norm_slot, options.attention_pre_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.projection_input)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.projection_input)), .access = .write },
         };
 
         self.linear_resources[self.linear_resource_count] = .{ .range = setup_input_resource, .access = .read };
@@ -1048,34 +1048,34 @@ pub const AttentionSetupCommandLowerer = struct {
             self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.quant_slot, options.v_linear_slot), .access = .read };
             self.linear_resource_count += 1;
         }
-        self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.q)), .access = .write };
+        self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.q)), .access = .write };
         self.linear_resource_count += 1;
         if (!options.shares_kv) {
-            self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k)), .access = .write };
+            self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.k)), .access = .write };
             self.linear_resource_count += 1;
-            self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.v)), .access = .write };
+            self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.v)), .access = .write };
             self.linear_resource_count += 1;
         }
 
         self.q_rope_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.q)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.q)), .access = .read },
             .{ .range = .whole(.norm_slot, options.q_head_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.q_ready)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.q_ready)), .access = .write },
         };
         self.k_rope_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.k)), .access = .read },
             .{ .range = .whole(.norm_slot, options.k_head_norm_slot), .access = .read },
             .{ .range = .whole(.kv_cache, options.attention_layer_index * 2), .access = .write },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k_ready)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.k_ready)), .access = .write },
         };
         self.v_norm_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.v)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.v)), .access = .read },
             .{ .range = .whole(.kv_cache, options.attention_layer_index * 2 + 1), .access = .write },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.v_ready)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.v_ready)), .access = .write },
         };
         self.kv_seed_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k_ready)), .access = .read },
-            .{ .range = if (options.value_norm) .whole(.scratch_slot, @intFromEnum(Resource.v_ready)) else .whole(.scratch_slot, @intFromEnum(Resource.v)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.k_ready)), .access = .read },
+            .{ .range = if (options.value_norm) .whole(.scratch_slot, @backingInt(Resource.v_ready)) else .whole(.scratch_slot, @backingInt(Resource.v)), .access = .read },
             .{ .range = .whole(.kv_cache, options.attention_layer_index * 2), .access = .write },
             .{ .range = .whole(.kv_cache, options.attention_layer_index * 2 + 1), .access = .write },
         };
@@ -1110,14 +1110,14 @@ pub const AttentionSetupCommandLowerer = struct {
         }
 
         const rows = options.rows;
-        self.addScratchSize(@intFromEnum(Resource.attention_input), rows * options.hidden_size * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.projection_input), rows * options.hidden_size * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.q), rows * options.attention_input_size * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.k), rows * options.kv_dim * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.v), rows * options.kv_dim * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.q_ready), rows * options.attention_input_size * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.k_ready), rows * options.kv_dim * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.v_ready), rows * options.kv_dim * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.attention_input), rows * options.hidden_size * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.projection_input), rows * options.hidden_size * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.q), rows * options.attention_input_size * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.k), rows * options.kv_dim * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.v), rows * options.kv_dim * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.q_ready), rows * options.attention_input_size * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.k_ready), rows * options.kv_dim * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.v_ready), rows * options.kv_dim * @sizeOf(f32));
         self.command_view = try self.command_storage.build(self.ops[0..self.op_count], .{}, self.scratch_sizes[0..self.scratch_size_count]);
         self.plan_view = self.command_view.planView();
     }
@@ -1169,21 +1169,21 @@ pub const AttentionProjectCommandLowerer = struct {
 
     pub fn build(self: *AttentionProjectCommandLowerer, options: BuildOptions) !void {
         self.attention_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.q)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.v)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attention_output)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.q)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.k)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.v)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attention_output)), .access = .write },
         };
         self.linear_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attention_output)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attention_output)), .access = .read },
             .{ .range = .whole(.quant_slot, options.output_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.projected)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.projected)), .access = .write },
         };
         self.post_norm_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.projected)), .access = .read },
             .{ .range = .whole(.norm_slot, options.post_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.residual)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.output)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.residual)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.output)), .access = .write },
         };
         self.ops = .{
             .{ .kind = .attention, .source = options.source, .region = options.region, .resources = &self.attention_resources },
@@ -1242,45 +1242,45 @@ pub const FfnPleCommandLowerer = struct {
 
     pub fn build(self: *FfnPleCommandLowerer, options: BuildOptions) !void {
         self.pre_gate_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.input)), .access = .read },
             .{ .range = .whole(.norm_slot, options.pre_gate_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.inv_scale)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.inv_scale)), .access = .write },
         };
         self.pair_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.input)), .access = .read },
             .{ .range = .whole(.norm_slot, options.pre_gate_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.inv_scale)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.inv_scale)), .access = .read },
             .{ .range = .whole(.quant_slot, options.gate_linear_slot), .access = .read },
             .{ .range = .whole(.quant_slot, options.up_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_gated)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_gated)), .access = .write },
         };
         self.down_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_gated)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_gated)), .access = .read },
             .{ .range = .whole(.quant_slot, options.down_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_projected)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_projected)), .access = .write },
         };
         self.post_down_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_projected)), .access = .read },
             .{ .range = .whole(.norm_slot, options.post_down_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.residual)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_output)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.residual)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_output)), .access = .write },
         };
         self.ple_gate_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_output)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_output)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_input)), .access = .read },
             .{ .range = .whole(.quant_slot, options.ple_gate_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_gated)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_gated)), .access = .write },
         };
         self.ple_proj_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_gated)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_gated)), .access = .read },
             .{ .range = .whole(.quant_slot, options.ple_proj_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_projected)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_projected)), .access = .write },
         };
         self.ple_post_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_projected)), .access = .read },
             .{ .range = .whole(.norm_slot, options.ple_post_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_output)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.output)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_output)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.output)), .access = .write },
         };
         self.ops = .{
             .{ .kind = .ffn_pre_norm_scale, .source = options.source, .region = options.region, .resources = &self.pre_gate_resources },
@@ -1404,14 +1404,14 @@ pub const GatedLayerCommandLowerer = struct {
         self.linear_resource_count = 0;
         self.scratch_size_count = 0;
         const setup_input_resource: ResourceRange = if (options.has_attention_pre_norm)
-            .whole(.scratch_slot, @intFromEnum(Resource.projection_input))
+            .whole(.scratch_slot, @backingInt(Resource.projection_input))
         else
-            .whole(.scratch_slot, @intFromEnum(Resource.attention_input));
+            .whole(.scratch_slot, @backingInt(Resource.attention_input));
 
         self.pre_norm_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attention_input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attention_input)), .access = .read },
             .{ .range = .whole(.norm_slot, options.attention_pre_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.projection_input)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.projection_input)), .access = .write },
         };
 
         self.linear_resources[self.linear_resource_count] = .{ .range = setup_input_resource, .access = .read };
@@ -1424,94 +1424,94 @@ pub const GatedLayerCommandLowerer = struct {
             self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.quant_slot, options.v_linear_slot), .access = .read };
             self.linear_resource_count += 1;
         }
-        self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.q)), .access = .write };
+        self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.q)), .access = .write };
         self.linear_resource_count += 1;
         if (!options.shares_kv) {
-            self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k)), .access = .write };
+            self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.k)), .access = .write };
             self.linear_resource_count += 1;
-            self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.v)), .access = .write };
+            self.linear_resources[self.linear_resource_count] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.v)), .access = .write };
             self.linear_resource_count += 1;
         }
 
         self.q_rope_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.q)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.q)), .access = .read },
             .{ .range = .whole(.norm_slot, options.q_head_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.q_ready)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.q_ready)), .access = .write },
         };
         self.k_rope_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.k)), .access = .read },
             .{ .range = .whole(.norm_slot, options.k_head_norm_slot), .access = .read },
             .{ .range = .whole(.kv_cache, options.attention_layer_index * 2), .access = .write },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k_ready)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.k_ready)), .access = .write },
         };
         self.v_norm_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.v)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.v)), .access = .read },
             .{ .range = .whole(.kv_cache, options.attention_layer_index * 2 + 1), .access = .write },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.v_ready)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.v_ready)), .access = .write },
         };
         self.attention_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.q_ready)), .access = .read },
-            .{ .range = if (options.shares_kv) .whole(.kv_cache, options.attention_layer_index * 2) else .whole(.scratch_slot, @intFromEnum(Resource.k_ready)), .access = .read },
-            .{ .range = if (options.shares_kv) .whole(.kv_cache, options.attention_layer_index * 2 + 1) else .whole(.scratch_slot, @intFromEnum(Resource.v_ready)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attention_output)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.q_ready)), .access = .read },
+            .{ .range = if (options.shares_kv) .whole(.kv_cache, options.attention_layer_index * 2) else .whole(.scratch_slot, @backingInt(Resource.k_ready)), .access = .read },
+            .{ .range = if (options.shares_kv) .whole(.kv_cache, options.attention_layer_index * 2 + 1) else .whole(.scratch_slot, @backingInt(Resource.v_ready)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attention_output)), .access = .write },
         };
         self.kv_seed_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.k_ready)), .access = .read },
-            .{ .range = if (options.value_norm) .whole(.scratch_slot, @intFromEnum(Resource.v_ready)) else .whole(.scratch_slot, @intFromEnum(Resource.v)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.k_ready)), .access = .read },
+            .{ .range = if (options.value_norm) .whole(.scratch_slot, @backingInt(Resource.v_ready)) else .whole(.scratch_slot, @backingInt(Resource.v)), .access = .read },
             .{ .range = .whole(.kv_cache, options.attention_layer_index * 2), .access = .write },
             .{ .range = .whole(.kv_cache, options.attention_layer_index * 2 + 1), .access = .write },
         };
         self.attention_linear_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attention_output)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attention_output)), .access = .read },
             .{ .range = .whole(.quant_slot, options.attention_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attention_projected)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attention_projected)), .access = .write },
         };
         self.attention_post_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attention_projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attention_projected)), .access = .read },
             .{ .range = .whole(.norm_slot, options.attention_post_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.residual)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attn_added)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.residual)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attn_added)), .access = .write },
         };
         self.ffn_pre_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attn_added)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attn_added)), .access = .read },
             .{ .range = .whole(.norm_slot, options.ffn_pre_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.inv_scale)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.inv_scale)), .access = .write },
         };
         self.ffn_pair_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attn_added)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attn_added)), .access = .read },
             .{ .range = .whole(.norm_slot, options.ffn_pre_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.inv_scale)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.inv_scale)), .access = .read },
             .{ .range = .whole(.quant_slot, options.gate_linear_slot), .access = .read },
             .{ .range = .whole(.quant_slot, options.up_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_gated)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_gated)), .access = .write },
         };
         self.ffn_down_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_gated)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_gated)), .access = .read },
             .{ .range = .whole(.quant_slot, options.down_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_projected)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_projected)), .access = .write },
         };
         self.ffn_post_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_projected)), .access = .read },
             .{ .range = .whole(.norm_slot, options.ffn_post_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.attn_added)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_output)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.attn_added)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_output)), .access = .write },
         };
         self.ple_gate_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_output)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_output)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_input)), .access = .read },
             .{ .range = .whole(.quant_slot, options.ple_gate_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_gated)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_gated)), .access = .write },
         };
         self.ple_proj_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_gated)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_gated)), .access = .read },
             .{ .range = .whole(.quant_slot, options.ple_proj_linear_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_projected)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_projected)), .access = .write },
         };
         self.ple_post_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ple_projected)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ple_projected)), .access = .read },
             .{ .range = .whole(.norm_slot, options.ple_post_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.ffn_output)), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.output)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.ffn_output)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.output)), .access = .write },
         };
 
         const rows = @max(options.rows, 1);
@@ -1620,26 +1620,26 @@ pub const GatedLayerCommandLowerer = struct {
             ffn_gate_op.quant_matmul,
             ffn_down_op.quant_matmul,
         );
-        self.addScratchSize(@intFromEnum(Resource.attention_input), rows * options.hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.projection_input), rows * options.hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.q), rows * options.attention_input_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.k), rows * options.kv_dim * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.v), rows * options.kv_dim * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.q_ready), rows * options.attention_input_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.k_ready), rows * options.kv_dim * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.v_ready), rows * options.kv_dim * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.attention_output), rows * options.attention_input_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.attention_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.residual), rows * options.hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.attn_added), rows * options.hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.inv_scale), rows * options.hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.ffn_gated), rows * options.intermediate_size * ffn_gated_dtype.byteSize(), ffn_gated_dtype);
-        self.addScratchSize(@intFromEnum(Resource.ffn_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
-        self.addScratchSize(@intFromEnum(Resource.ffn_output), rows * options.hidden_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.attention_input), rows * options.hidden_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.projection_input), rows * options.hidden_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.q), rows * options.attention_input_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.k), rows * options.kv_dim * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.v), rows * options.kv_dim * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.q_ready), rows * options.attention_input_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.k_ready), rows * options.kv_dim * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.v_ready), rows * options.kv_dim * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.attention_output), rows * options.attention_input_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.attention_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.residual), rows * options.hidden_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.attn_added), rows * options.hidden_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.inv_scale), rows * options.hidden_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.ffn_gated), rows * options.intermediate_size * ffn_gated_dtype.byteSize(), ffn_gated_dtype);
+        self.addScratchSize(@backingInt(Resource.ffn_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
+        self.addScratchSize(@backingInt(Resource.ffn_output), rows * options.hidden_size * @sizeOf(f32), .f32);
         if (options.include_ple) {
-            self.addScratchSize(@intFromEnum(Resource.ple_input), rows * options.ple_hidden_size * @sizeOf(f32), .f32);
-            self.addScratchSize(@intFromEnum(Resource.ple_gated), rows * options.ple_hidden_size * @sizeOf(f32), .f32);
-            self.addScratchSize(@intFromEnum(Resource.ple_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
+            self.addScratchSize(@backingInt(Resource.ple_input), rows * options.ple_hidden_size * @sizeOf(f32), .f32);
+            self.addScratchSize(@backingInt(Resource.ple_gated), rows * options.ple_hidden_size * @sizeOf(f32), .f32);
+            self.addScratchSize(@backingInt(Resource.ple_projected), rows * options.hidden_size * @sizeOf(f32), .f32);
         }
 
         self.command_view = try self.command_storage.build(self.ops[0..self.op_count], .{}, self.scratch_sizes[0..self.scratch_size_count]);
@@ -1725,22 +1725,22 @@ pub const TailCommandLowerer = struct {
     pub fn build(self: *TailCommandLowerer, options: BuildOptions) !void {
         self.scratch_size_count = 0;
         self.norm_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.input)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.input)), .access = .read },
             .{ .range = .whole(.norm_slot, options.final_norm_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.normalized)), .access = .write },
         };
         self.linear_resources = .{
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.normalized)), .access = .read },
             .{ .range = .whole(.quant_slot, options.lm_head_slot), .access = .read },
-            .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.logits)), .access = .write },
+            .{ .range = .whole(.scratch_slot, @backingInt(Resource.logits)), .access = .write },
         };
-        self.argmax_resources[0] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.logits)), .access = .read };
-        self.argmax_resources[1] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.token)), .access = .write };
+        self.argmax_resources[0] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.logits)), .access = .read };
+        self.argmax_resources[1] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.token)), .access = .write };
         var argmax_resource_count: usize = 2;
         if (options.lm_head_refine_slot) |refine_slot| {
             // Candidate refinement reuses the normalized hidden row and reads
             // the checkpoint-format head that backs the lossy nomination head.
-            self.argmax_resources[argmax_resource_count] = .{ .range = .whole(.scratch_slot, @intFromEnum(Resource.normalized)), .access = .read };
+            self.argmax_resources[argmax_resource_count] = .{ .range = .whole(.scratch_slot, @backingInt(Resource.normalized)), .access = .read };
             argmax_resource_count += 1;
             self.argmax_resources[argmax_resource_count] = .{ .range = .whole(.quant_slot, refine_slot), .access = .read };
             argmax_resource_count += 1;
@@ -1758,10 +1758,10 @@ pub const TailCommandLowerer = struct {
             },
             .{ .kind = .tail_argmax, .source = options.source, .region = options.region, .resources = self.argmax_resources[0..argmax_resource_count] },
         };
-        self.addScratchSize(@intFromEnum(Resource.input), options.hidden_size * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.normalized), options.hidden_size * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.logits), options.vocab_size * @sizeOf(f32));
-        self.addScratchSize(@intFromEnum(Resource.token), @sizeOf(u32));
+        self.addScratchSize(@backingInt(Resource.input), options.hidden_size * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.normalized), options.hidden_size * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.logits), options.vocab_size * @sizeOf(f32));
+        self.addScratchSize(@backingInt(Resource.token), @sizeOf(u32));
         self.command_view = try self.command_storage.build(&self.ops, .{}, self.scratch_sizes[0..self.scratch_size_count]);
         self.plan_view = self.command_view.planView();
     }
@@ -2452,15 +2452,15 @@ test "metal command planner keeps A4B branch and join hazards resource specific"
     const plan = lowerer.view();
 
     const expected_dependencies = [_]ResourceDependency{
-        .{ .producer_op_index = 0, .consumer_op_index = 1, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.normalized)) },
-        .{ .producer_op_index = 0, .consumer_op_index = 2, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.normalized)) },
-        .{ .producer_op_index = 0, .consumer_op_index = 3, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.normalized)) },
-        .{ .producer_op_index = 2, .consumer_op_index = 3, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.route_plan)) },
-        .{ .producer_op_index = 1, .consumer_op_index = 4, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.shared_gated)) },
-        .{ .producer_op_index = 3, .consumer_op_index = 5, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.routed_gated)) },
-        .{ .producer_op_index = 2, .consumer_op_index = 5, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.route_plan)) },
-        .{ .producer_op_index = 4, .consumer_op_index = 6, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.shared_projected)) },
-        .{ .producer_op_index = 5, .consumer_op_index = 6, .resource = .whole(.scratch_slot, @intFromEnum(A4bForkJoinCommandLowerer.Resource.routed_projected)) },
+        .{ .producer_op_index = 0, .consumer_op_index = 1, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.normalized)) },
+        .{ .producer_op_index = 0, .consumer_op_index = 2, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.normalized)) },
+        .{ .producer_op_index = 0, .consumer_op_index = 3, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.normalized)) },
+        .{ .producer_op_index = 2, .consumer_op_index = 3, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.route_plan)) },
+        .{ .producer_op_index = 1, .consumer_op_index = 4, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.shared_gated)) },
+        .{ .producer_op_index = 3, .consumer_op_index = 5, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.routed_gated)) },
+        .{ .producer_op_index = 2, .consumer_op_index = 5, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.route_plan)) },
+        .{ .producer_op_index = 4, .consumer_op_index = 6, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.shared_projected)) },
+        .{ .producer_op_index = 5, .consumer_op_index = 6, .resource = .whole(.scratch_slot, @backingInt(A4bForkJoinCommandLowerer.Resource.routed_projected)) },
     };
     try std.testing.expectEqualDeep(&expected_dependencies, plan.dependencies);
 
@@ -2524,7 +2524,7 @@ test "metal command planner handles row-1 attention setup dependency shape" {
     try std.testing.expect(!plan.planned_ops[4].barrier_before);
     var found_q = false;
     for (command.scratch_slots) |scratch| {
-        if (scratch.slot == @intFromEnum(AttentionSetupCommandLowerer.Resource.q)) {
+        if (scratch.slot == @backingInt(AttentionSetupCommandLowerer.Resource.q)) {
             found_q = true;
             try std.testing.expectEqual(@as(usize, 10 * 2048 * @sizeOf(f32)), scratch.bytes);
             try std.testing.expectEqual(@as(usize, 1), scratch.first_op);
@@ -2711,7 +2711,7 @@ test "metal command planner handles full quantized row-1 layer dependency shape"
     }
     var found_ffn_scratch = false;
     for (command.scratch_slots) |scratch| {
-        if (scratch.slot == @intFromEnum(GatedLayerCommandLowerer.Resource.ffn_gated)) {
+        if (scratch.slot == @backingInt(GatedLayerCommandLowerer.Resource.ffn_gated)) {
             found_ffn_scratch = true;
             try std.testing.expectEqual(@as(usize, 8192 * @sizeOf(f32)), scratch.bytes);
             try std.testing.expectEqual(@as(usize, 9), scratch.first_op);
@@ -2763,9 +2763,9 @@ test "metal command planner handles gated layer without ple" {
         try std.testing.expect(planned.kind != .ple_post_norm_residual);
     }
     for (command.scratch_slots) |scratch| {
-        try std.testing.expect(scratch.slot != @intFromEnum(GatedLayerCommandLowerer.Resource.ple_input));
-        try std.testing.expect(scratch.slot != @intFromEnum(GatedLayerCommandLowerer.Resource.ple_gated));
-        try std.testing.expect(scratch.slot != @intFromEnum(GatedLayerCommandLowerer.Resource.ple_projected));
+        try std.testing.expect(scratch.slot != @backingInt(GatedLayerCommandLowerer.Resource.ple_input));
+        try std.testing.expect(scratch.slot != @backingInt(GatedLayerCommandLowerer.Resource.ple_gated));
+        try std.testing.expect(scratch.slot != @backingInt(GatedLayerCommandLowerer.Resource.ple_projected));
     }
 }
 
@@ -2857,15 +2857,15 @@ test "metal command planner sizes quantized prefill layer scratch for row batche
     var found_ffn = false;
     var found_ple = false;
     for (command.scratch_slots) |scratch| {
-        if (scratch.slot == @intFromEnum(PrefillGatedLayerCommandLowerer.Resource.q_ready)) {
+        if (scratch.slot == @backingInt(PrefillGatedLayerCommandLowerer.Resource.q_ready)) {
             found_q = true;
             try std.testing.expectEqual(@as(usize, 10 * 2048 * @sizeOf(f32)), scratch.bytes);
         }
-        if (scratch.slot == @intFromEnum(PrefillGatedLayerCommandLowerer.Resource.ffn_gated)) {
+        if (scratch.slot == @backingInt(PrefillGatedLayerCommandLowerer.Resource.ffn_gated)) {
             found_ffn = true;
             try std.testing.expectEqual(@as(usize, 10 * 8192 * @sizeOf(f32)), scratch.bytes);
         }
-        if (scratch.slot == @intFromEnum(PrefillGatedLayerCommandLowerer.Resource.ple_gated)) {
+        if (scratch.slot == @backingInt(PrefillGatedLayerCommandLowerer.Resource.ple_gated)) {
             found_ple = true;
             try std.testing.expectEqual(@as(usize, 10 * 1024 * @sizeOf(f32)), scratch.bytes);
         }
@@ -3021,17 +3021,17 @@ test "metal command planner can size FFN intermediates as f16 resident scratch" 
     var found_gate_up_command = false;
     var found_down_command = false;
     for (command.scratch_slots) |scratch| {
-        if (scratch.slot == @intFromEnum(PrefillGatedLayerCommandLowerer.Resource.ffn_gated)) {
+        if (scratch.slot == @backingInt(PrefillGatedLayerCommandLowerer.Resource.ffn_gated)) {
             found_ffn_gated = true;
             try std.testing.expectEqual(ActivationDType.f16, scratch.dtype);
             try std.testing.expectEqual(@as(usize, 10 * 8192 * @sizeOf(u16)), scratch.bytes);
         }
-        if (scratch.slot == @intFromEnum(PrefillGatedLayerCommandLowerer.Resource.ffn_projected)) {
+        if (scratch.slot == @backingInt(PrefillGatedLayerCommandLowerer.Resource.ffn_projected)) {
             found_ffn_projected = true;
             try std.testing.expectEqual(ActivationDType.f32, scratch.dtype);
             try std.testing.expectEqual(@as(usize, 10 * 2048 * @sizeOf(f32)), scratch.bytes);
         }
-        if (scratch.slot == @intFromEnum(PrefillGatedLayerCommandLowerer.Resource.attention_output)) {
+        if (scratch.slot == @backingInt(PrefillGatedLayerCommandLowerer.Resource.attention_output)) {
             found_attention = true;
             try std.testing.expectEqual(ActivationDType.f32, scratch.dtype);
             try std.testing.expectEqual(@as(usize, 10 * 2048 * @sizeOf(f32)), scratch.bytes);
@@ -3161,7 +3161,7 @@ test "metal command planner can size single-row decode FFN intermediates as f16 
     var found_gate_up_command = false;
     var found_down_command = false;
     for (command.scratch_slots) |scratch| {
-        if (scratch.slot == @intFromEnum(GatedLayerCommandLowerer.Resource.ffn_gated)) {
+        if (scratch.slot == @backingInt(GatedLayerCommandLowerer.Resource.ffn_gated)) {
             found_ffn_gated = true;
             try std.testing.expectEqual(ActivationDType.f16, scratch.dtype);
             try std.testing.expectEqual(@as(usize, 8192 * @sizeOf(u16)), scratch.bytes);
@@ -3242,7 +3242,7 @@ test "metal command planner keeps unsupported f16 FFN descriptors in f32 scratch
         var found_gate_up_command = false;
         var found_down_command = false;
         for (command.scratch_slots) |scratch| {
-            if (scratch.slot == @intFromEnum(PrefillGatedLayerCommandLowerer.Resource.ffn_gated)) {
+            if (scratch.slot == @backingInt(PrefillGatedLayerCommandLowerer.Resource.ffn_gated)) {
                 found_ffn_gated = true;
                 try std.testing.expectEqual(ActivationDType.f32, scratch.dtype);
                 try std.testing.expectEqual(case.rows * 8192 * @sizeOf(f32), scratch.bytes);
@@ -3331,7 +3331,7 @@ test "metal command planner handles row-1 tail dependency shape" {
     try std.testing.expect(plan.planned_ops[2].barrier_before);
     var found_logits = false;
     for (command.scratch_slots) |scratch| {
-        if (scratch.slot == @intFromEnum(TailCommandLowerer.Resource.logits)) {
+        if (scratch.slot == @backingInt(TailCommandLowerer.Resource.logits)) {
             found_logits = true;
             try std.testing.expectEqual(@as(usize, 262144 * @sizeOf(f32)), scratch.bytes);
             try std.testing.expectEqual(@as(usize, 1), scratch.first_op);
@@ -3360,7 +3360,7 @@ test "metal command planner tracks lm-head refine dependencies" {
     try std.testing.expectEqual(@as(usize, 4), command.ops[2].resource_count);
     const argmax_resources = command.resources[command.ops[2].resource_start..][0..command.ops[2].resource_count];
     try std.testing.expectEqual(ResourceKind.scratch_slot, argmax_resources[2].range.kind);
-    try std.testing.expectEqual(@intFromEnum(TailCommandLowerer.Resource.normalized), argmax_resources[2].range.id);
+    try std.testing.expectEqual(@backingInt(TailCommandLowerer.Resource.normalized), argmax_resources[2].range.id);
     try std.testing.expectEqual(ResourceKind.quant_slot, argmax_resources[3].range.kind);
     try std.testing.expectEqual(@as(usize, 41), argmax_resources[3].range.id);
 }
@@ -3418,7 +3418,7 @@ test "metal command planner appends graph command plans into a frame plan" {
     try std.testing.expect(view.ops[15].resource_start >= first.commandView().resources.len);
     var found_ffn_scratch = false;
     for (view.scratch_slots) |scratch| {
-        if (scratch.slot == @intFromEnum(GatedLayerCommandLowerer.Resource.ffn_gated)) {
+        if (scratch.slot == @backingInt(GatedLayerCommandLowerer.Resource.ffn_gated)) {
             found_ffn_scratch = true;
             try std.testing.expectEqual(@as(usize, 8192 * @sizeOf(f32)), scratch.bytes);
             try std.testing.expectEqual(@as(usize, 9), scratch.first_op);
@@ -3636,7 +3636,7 @@ test "metal command planner builds quantized prefill graph command plan before e
     try std.testing.expect(cursor.complete());
     var found_logits = false;
     for (view.scratch_slots) |scratch| {
-        if (scratch.slot == @intFromEnum(TailCommandLowerer.Resource.logits)) {
+        if (scratch.slot == @backingInt(TailCommandLowerer.Resource.logits)) {
             found_logits = true;
             try std.testing.expectEqual(@as(usize, 262144 * @sizeOf(f32)), scratch.bytes);
         }

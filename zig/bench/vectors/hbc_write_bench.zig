@@ -257,7 +257,7 @@ const StorageHarness = struct {
         return harness;
     }
 
-    fn deinit(self: *StorageHarness) void {
+    pub fn deinit(self: *StorageHarness) void {
         if (self.counting_ctx) |ctx| self.allocator.destroy(ctx);
         if (self.native_backing) |backing| {
             backing.deinit();
@@ -343,7 +343,7 @@ const Scenario = struct {
         };
     }
 
-    fn deinit(self: *Scenario) void {
+    pub fn deinit(self: *Scenario) void {
         self.index.close();
         self.storage_harness.storage().deleteTree(self.root_dir) catch {};
         self.storage_harness.deinit();

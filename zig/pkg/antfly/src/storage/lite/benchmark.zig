@@ -122,7 +122,7 @@ test "lite throughput benchmark vacuum catchup" {
         const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/catchup.aflite", .{tmp.sub_path});
         defer a.free(path);
         var budgets = resource.Options.defaultBudgets();
-        budgets[@intFromEnum(resource.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
+        budgets[@backingInt(resource.Slice.lite_native_page_cache)] = .{ .soft_limit_bytes = 32768, .hard_limit_bytes = 65536 };
         var manager = resource.ResourceManager.init(.{ .budgets = budgets });
         var file = try native.NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true, .resource_manager = &manager });
         defer file.close();

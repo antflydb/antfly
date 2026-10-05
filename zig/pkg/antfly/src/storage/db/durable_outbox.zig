@@ -62,7 +62,7 @@ pub fn durableReplicationOutboxKeyAlloc(
     // requests prepare before apply admission and may observe the same next
     // LSN; distinct payloads must still never overwrite each other's outbox.
     var hasher = std.crypto.hash.Blake3.init(.{});
-    hasher.update(&.{@intFromEnum(kind)});
+    hasher.update(&.{@backingInt(kind)});
     var identity_context: [16]u8 = undefined;
     std.mem.writeInt(u64, identity_context[0..8], root_generation, .big);
     std.mem.writeInt(u64, identity_context[8..16], from_lsn, .big);
@@ -73,7 +73,7 @@ pub fn durableReplicationOutboxKeyAlloc(
     @memcpy(&id, digest[0..id.len]);
     const key = try alloc.alloc(u8, replication_outbox_v2_prefix.len + 1 + id.len);
     @memcpy(key[0..replication_outbox_v2_prefix.len], replication_outbox_v2_prefix);
-    key[replication_outbox_v2_prefix.len] = @intFromEnum(kind);
+    key[replication_outbox_v2_prefix.len] = @backingInt(kind);
     @memcpy(key[replication_outbox_v2_prefix.len + 1 ..], &id);
     return key;
 }
@@ -83,12 +83,12 @@ pub fn durableReplicationOutboxKindFromKey(key: []const u8) !Kind {
         key.len != replication_outbox_v2_prefix.len + 1 + replication_outbox_id_len)
         return error.InvalidHAOutbox;
     return switch (key[replication_outbox_v2_prefix.len]) {
-        @intFromEnum(Kind.batch) => .batch,
-        @intFromEnum(Kind.replay) => .replay,
-        @intFromEnum(Kind.schema) => .schema,
-        @intFromEnum(Kind.restore_batch) => .restore_batch,
-        @intFromEnum(Kind.primary_effect) => .primary_effect,
-        @intFromEnum(Kind.row_policy) => .row_policy,
+        @backingInt(Kind.batch) => .batch,
+        @backingInt(Kind.replay) => .replay,
+        @backingInt(Kind.schema) => .schema,
+        @backingInt(Kind.restore_batch) => .restore_batch,
+        @backingInt(Kind.primary_effect) => .primary_effect,
+        @backingInt(Kind.row_policy) => .row_policy,
         else => error.InvalidHAOutbox,
     };
 }

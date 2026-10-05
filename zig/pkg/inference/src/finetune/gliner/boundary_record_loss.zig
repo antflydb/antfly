@@ -99,7 +99,7 @@ fn hashInt(hash: *std.crypto.hash.sha2.Sha256, value: usize) void {
     std.mem.writeInt(u64, &bytes, @intCast(value), .little);
     hash.update(&bytes);
 }
-fn validate(group: Group, work: *Work) !usize {
+pub fn validate(group: Group, work: *Work) !usize {
     try work.check();
     const t = group.target;
     const m = group.matches;
@@ -444,7 +444,7 @@ pub fn computeWithBackends(a: Allocator, groups: []const Group, options: Options
 const TestOwner = struct {
     target: matching.TargetMap,
     matches: matching.Matches,
-    fn deinit(self: *TestOwner) void {
+    pub fn deinit(self: *TestOwner) void {
         self.matches.deinit();
         self.target.deinit();
     }

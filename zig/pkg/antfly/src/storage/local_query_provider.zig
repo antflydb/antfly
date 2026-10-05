@@ -62,6 +62,8 @@ fn executeSearch(
     out_failure: *abi.FailureIdentity,
 ) abi.Status {
     const alloc = std.heap.c_allocator;
+    if (request.dialect == .public) query_api.validateStoragePublicQueryRequest(alloc, request.request_json.slice()) catch |err|
+        return fail(err, parseOperation(request.dialect), out_failure);
     var owned = switch (request.dialect) {
         .internal => query_api.parseQueryRequest(
             alloc,
@@ -339,7 +341,7 @@ fn fail(
         err,
         .local_query,
         abi.abi_version,
-        @intFromEnum(operation),
+        @backingInt(operation),
     );
     return out_failure.status;
 }

@@ -114,13 +114,13 @@ pub fn validateBatchRequest(request: anytype) !void {
     const control = request.artifact_publication_transport orelse return;
     try control.validate();
     const defaults: @TypeOf(request) = .{};
-    inline for (@typeInfo(@TypeOf(request)).@"struct".fields) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "artifact_publication_transport") and
-            !std.mem.eql(u8, field.name, "sync_level") and !std.mem.eql(u8, field.name, "timestamp"))
+    inline for (@typeInfo(@TypeOf(request)).@"struct".field_names, @typeInfo(@TypeOf(request)).@"struct".field_types) |reflected_name, field_type| {
+        if (comptime !std.mem.eql(u8, reflected_name, "artifact_publication_transport") and
+            !std.mem.eql(u8, reflected_name, "sync_level") and !std.mem.eql(u8, reflected_name, "timestamp"))
         {
-            if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
-                if (@field(request, field.name).len != 0) return error.InvalidBatchRequest;
-            } else if (!std.meta.eql(@field(request, field.name), @field(defaults, field.name))) return error.InvalidBatchRequest;
+            if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
+                if (@field(request, reflected_name).len != 0) return error.InvalidBatchRequest;
+            } else if (!std.meta.eql(@field(request, reflected_name), @field(defaults, reflected_name))) return error.InvalidBatchRequest;
         }
     }
 }
@@ -581,7 +581,7 @@ pub const RecoveryHint = struct {
         @memcpy(raw[28..60], &self.publication_digest);
         @memcpy(raw[60..92], &self.root);
         std.mem.writeInt(u64, raw[92..100], self.created_index, .little);
-        raw[100] = @intFromEnum(self.action);
+        raw[100] = @backingInt(self.action);
         @memcpy(raw[101..133], &self.observed_progress);
         return raw;
     }
@@ -614,7 +614,7 @@ pub const RecoveryInventory = struct {
     count: usize = 0,
     pub const Entry = struct { hint: RecoveryHint, complete: bool, progress: Digest };
 
-    fn nextReady(self: RecoveryInventory, after: u64) ?RecoveryHint {
+    pub fn nextReady(self: RecoveryInventory, after: u64) ?RecoveryHint {
         var first: ?RecoveryHint = null;
         var next: ?RecoveryHint = null;
         for (self.entries[0..self.count]) |entry| {
@@ -644,65 +644,6 @@ pub fn recoveryInventory(txn: anytype, namespace: Namespace) !RecoveryInventory 
         result.count += 1;
     }
     return result;
-}
-
-/// Bounded local failure detector. Clocks select proposals only: replicated
-/// retirement checks the exact incarnation/progress in its writer snapshot.
-/// Restart, clock regression, or newly observed progress starts a fresh grace
-/// period. A pending ready upload cannot starve retirement of an idle one.
-pub const RecoveryTracker = struct {
-    pub const idle_ns: u64 = 5 * std.time.ns_per_min;
-    const Slot = struct { identity: RecoveryHint, progress: Digest, since: u64 };
-    slots: [max_active_uploads]?Slot = @splat(null),
-    prefer_abandon: bool = false,
-
-    pub fn observe(self: *RecoveryTracker, inventory: RecoveryInventory, now: u64, after: u64) ?RecoveryHint {
-        var current: [max_active_uploads]?Slot = @splat(null);
-        var first: ?RecoveryHint = null;
-        var next: ?RecoveryHint = null;
-        for (inventory.entries[0..inventory.count], 0..) |entry, i| {
-            if (entry.complete) continue;
-            var since = now;
-            for (self.slots) |maybe| if (maybe) |previous| {
-                if (std.meta.eql(previous.identity, entry.hint) and std.mem.eql(u8, &previous.progress, &entry.progress) and now >= previous.since) {
-                    since = previous.since;
-                    break;
-                }
-            };
-            current[i] = .{ .identity = entry.hint, .progress = entry.progress, .since = since };
-            if (now - since < idle_ns) continue;
-            var hint = entry.hint;
-            hint.action = .abandon;
-            hint.observed_progress = entry.progress;
-            if (first == null or hint.created_index < first.?.created_index) first = hint;
-            if (hint.created_index > after and (next == null or hint.created_index < next.?.created_index)) next = hint;
-        }
-        self.slots = current;
-        const abandon = next orelse first;
-        const ready = inventory.nextReady(after);
-        const result = if (self.prefer_abandon) abandon orelse ready else ready orelse abandon;
-        if (result) |hint| self.prefer_abandon = hint.action == .finalize;
-        return result;
-    }
-};
-
-test "artifact publication upload idle detector resets on progress and inventory changes" {
-    var inventory: RecoveryInventory = .{};
-    inventory.count = 1;
-    inventory.entries[0] = .{ .hint = .{ .namespace = @splat(1), .publication_digest = @splat(2), .root = @splat(3), .created_index = 1 }, .complete = false, .progress = @splat(4) };
-    var tracker: RecoveryTracker = .{};
-    try std.testing.expect(tracker.observe(inventory, 0, 0) == null);
-    try std.testing.expect(tracker.observe(inventory, RecoveryTracker.idle_ns - 1, 0) == null);
-    inventory.entries[0].progress = @splat(5);
-    try std.testing.expect(tracker.observe(inventory, RecoveryTracker.idle_ns, 0) == null);
-    try std.testing.expect(tracker.observe(inventory, RecoveryTracker.idle_ns * 2 - 1, 0) == null);
-    const abandoned = tracker.observe(inventory, RecoveryTracker.idle_ns * 2, 0).?;
-    try std.testing.expectEqual(.abandon, abandoned.action);
-    try std.testing.expectEqualDeep(inventory.entries[0].progress, abandoned.observed_progress);
-    try std.testing.expect(tracker.observe(.{}, RecoveryTracker.idle_ns * 2, 0) == null);
-    try std.testing.expect(tracker.observe(inventory, RecoveryTracker.idle_ns * 3, 0) == null);
-    inventory.entries[0].complete = true;
-    try std.testing.expectEqual(.finalize, tracker.observe(inventory, RecoveryTracker.idle_ns * 3, 0).?.action);
 }
 
 /// No accepted receipt, rejection, or completion credit is created here.
@@ -924,7 +865,7 @@ test "artifact publication upload stages exact retries and atomically retires qu
         deny_payload_reads: bool = false,
         reads: usize = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var it = self.map.iterator();
             while (it.next()) |entry| {
                 self.alloc.free(entry.key_ptr.*);
@@ -1031,12 +972,16 @@ test "artifact publication upload stages exact retries and atomically retires qu
     try std.testing.expectEqual(@as(u64, 20_002), (try nextRecovery(&txn, ready.namespace, 20_000)).?.created_index);
     try std.testing.expectEqual(@as(u64, 20_000), (try nextRecovery(&txn, ready.namespace, 20_002)).?.created_index);
     const inventory = try recoveryInventory(&txn, ready.namespace);
-    var tracker: RecoveryTracker = .{};
-    try std.testing.expectEqual(.finalize, tracker.observe(inventory, 0, 0).?.action);
-    try std.testing.expectEqual(.finalize, tracker.observe(inventory, RecoveryTracker.idle_ns - 1, 0).?.action);
-    const abandoned = tracker.observe(inventory, RecoveryTracker.idle_ns, 0).?;
-    try std.testing.expectEqual(.abandon, abandoned.action);
-    try std.testing.expectEqual(@as(u64, 20_001), abandoned.created_index);
+    const abandoned = blk: {
+        for (inventory.entries[0..inventory.count]) |entry| {
+            if (entry.hint.created_index != 20_001) continue;
+            var hint = entry.hint;
+            hint.action = .abandon;
+            hint.observed_progress = entry.progress;
+            break :blk hint;
+        }
+        return error.TestUnexpectedResult;
+    };
     const abandonment_bytes = abandoned.encode();
     try std.testing.expectEqualDeep(abandoned, (try RecoveryHint.decode(&abandonment_bytes)).?);
     // Clocks and process memory cannot grant durable retirement authority.
@@ -1053,11 +998,16 @@ test "artifact publication upload stages exact retries and atomically retires qu
     try stageBegin(alloc, &txn, replacement, 21_000);
     try std.testing.expect(!try stageAbandon(&txn, abandoned.request()));
     const replacing = try recoveryInventory(&txn, ready.namespace);
-    var restarted: RecoveryTracker = .{};
-    try std.testing.expectEqual(.finalize, restarted.observe(replacing, RecoveryTracker.idle_ns * 2, 0).?.action);
-    try std.testing.expectEqual(.finalize, restarted.observe(replacing, 0, 0).?.action); // clock regression resets grace
-    const retire_replacement = restarted.observe(replacing, RecoveryTracker.idle_ns, 0).?;
-    try std.testing.expectEqual(.abandon, retire_replacement.action);
+    const retire_replacement = blk: {
+        for (replacing.entries[0..replacing.count]) |entry| {
+            if (entry.hint.created_index != 21_000) continue;
+            var hint = entry.hint;
+            hint.action = .abandon;
+            hint.observed_progress = entry.progress;
+            break :blk hint;
+        }
+        return error.TestUnexpectedResult;
+    };
     txn.deny_payload_reads = false;
     try stageChunk(&txn, replacement.namespace, replacement.publication_digest, replacement.root(), 0, "bytes");
     txn.deny_payload_reads = true;
@@ -1073,7 +1023,7 @@ test "artifact publication upload prunes only by ordered age" {
     const Fake = struct {
         alloc: Allocator,
         map: std.StringHashMapUnmanaged([]u8) = .empty,
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var it = self.map.iterator();
             while (it.next()) |entry| {
                 self.alloc.free(entry.key_ptr.*);

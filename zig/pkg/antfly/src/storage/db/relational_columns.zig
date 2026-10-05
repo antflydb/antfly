@@ -280,7 +280,7 @@ test "relational columnar partial reuse bounds byte amplification and fragments"
 fn appendPage(list: *std.ArrayListUnmanaged(u8), alloc: alloc_type, end: usize, ref: ?payloads.Ref) !void {
     try appendInt(list, alloc, u16, @intCast(end));
     try appendInt(list, alloc, u64, if (ref) |r| r.bytes else 0);
-    try list.appendSlice(alloc, if (ref) |r| &r.digest else &([_]u8{0} ** 32));
+    try list.appendSlice(alloc, if (ref) |r| &r.digest else &(@as([32]u8, @splat(0))));
     try appendInt(list, alloc, u16, if (ref) |r| r.source_first else 0);
     try appendInt(list, alloc, u16, if (ref) |r| r.source_rows else 0);
 }
@@ -517,7 +517,7 @@ fn ColumnBuilder(comptime DBType: type) type {
                             existing.source_rows = @intCast(row_end - row_first);
                             try references.append(scratch, .{ .digest = digest, .bytes = existing.bytes, .retains = 1 });
                         } else {
-                            writer.entries = .{ .items = local, .capacity = local.len };
+                            writer.entries = .{ .items = local, .capacity = local.len, .pointer_stability = .{} };
                             _ = self.db.relational_column_maintenance.payload_encoding_bytes.fetchAdd(raw_bytes, .monotonic);
                             const values = try writer.build();
                             const encoded = try checked(scratch, values);
@@ -608,7 +608,7 @@ fn ColumnBuilder(comptime DBType: type) type {
 
         fn checkpoint(ptr: ?*anyopaque, key: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            if (self.db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+            if (self.db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
             const owner_limit = if (@import("builtin").is_test) test_owner_limit orelse 1024 else 1024;
             if (self.owners >= owner_limit or (self.owners != 0 and platform_time.monotonicNs() >= self.deadline_ns)) {
                 self.continuation = (try keys.decodeStoredDocumentRowKeyAlloc(self.alloc, key)).?;
@@ -652,7 +652,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             var view = (try self.db.core.acquireSchemaVersionView(version)) orelse return error.UnknownSchemaVersion;
             defer view.release();
             try validateOrdinalPages(ordinal_pages, rows.len, view.tableSchema().relational_columns.len);
-            var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.artifact_repair_metadata_stop };
+            var block = Block{ .alloc = scratch, .scope = &scope, .generation = self.generation, .index = range.block, .table = view.tableSchema().*, .layout = view.physicalLayout(), .rows = rows, .ordinal_pages = ordinal_pages, .stop = &self.db.independent_maintenance.stopping };
             defer block.deinit();
             var dirty = try read.openCursor();
             defer dirty.close();
@@ -872,7 +872,7 @@ fn ColumnBuilder(comptime DBType: type) type {
             }
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.known_payloads.deinit(self.alloc);
             if (self.view) |*view| view.release();
             self.arena.deinit();
@@ -1100,7 +1100,7 @@ const Cleanup = struct {
     pages: usize = 0,
     inline_page: ?[]u8 = null,
 
-    fn deinit(self: @This(), alloc: alloc_type) void {
+    pub fn deinit(self: @This(), alloc: alloc_type) void {
         if (self.inline_page) |page| alloc.free(page);
     }
 
@@ -1139,7 +1139,7 @@ fn stageCleanup(db: anytype, alloc: alloc_type, read: *store_mod.DocStore.Txn, f
     while (entry) |first| {
         if (!std.mem.startsWith(u8, first.key, dirty_prefix)) break;
         if (to.len != 0 and std.mem.order(u8, first.key[dirty_prefix.len..], to) != .lt) break;
-        if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+        if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
@@ -1196,7 +1196,7 @@ fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namesp
     var locked = true;
     defer if (locked) db.core.unlockApplyShared();
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-    if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+    if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     const token = read.get(cleanup_key) catch |err| switch (err) {
@@ -1215,7 +1215,7 @@ fn drainCleanupWithLimit(db: anytype, alloc: alloc_type, generation: u64, namesp
             locked = true;
         }
         if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
-        if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+        if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
         var txn = try db.core.store.beginWriteTxn();
         var live = true;
         defer if (live) txn.abort();
@@ -1536,7 +1536,7 @@ const Directory = struct {
         }
         return .{ .alloc = alloc, .cursor = cursor, .prefix = dir, .pending = if (entry) |kv| .{ .key = kv.key, .value = kv.value } else null };
     }
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.cursor.close();
         self.alloc.free(self.prefix);
     }
@@ -1561,7 +1561,7 @@ const DirtyRanges = struct {
     cursor: store_mod.DocStore.Txn.CursorAdapter,
     pending: ?[]const u8,
     pending_bytes: ?u64 = 0,
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.plans.deinit();
         self.cursor.close();
     }
@@ -1978,7 +1978,7 @@ fn compact(db: anytype, alloc: alloc_type, namespace: u64, adaptive: bool) !bool
     const cleanup = try stageCleanup(db, alloc, &read, range.start, builder.continuation orelse range.end, manifest_bytes, token, namespace);
     defer cleanup.deinit(alloc);
     if (comptime @import("builtin").is_test) if (test_before_publish) |hook| try hook.run(hook.context);
-    if (db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+    if (db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
     db.core.lockApplyShared();
     locked = true;
     if (namespace != db.core.schemaNamespaceGeneration()) return error.PreparedGenerationChanged;
@@ -2195,7 +2195,7 @@ fn pruneRange(db: anytype, alloc: alloc_type, lower: []const u8, upper: []const 
         }
         fn visit(ptr: ?*anyopaque, key: []const u8, value: []const u8) !store_mod.DocStore.ScanAction {
             const self: *@This() = @ptrCast(@alignCast(ptr.?));
-            if (self.db.artifact_repair_metadata_stop.load(.acquire)) return error.Canceled;
+            if (self.db.independent_maintenance.stopping.load(.acquire)) return error.Canceled;
             const scratch = self.arena.allocator();
             if (self.deletes.items.len != 0 and self.bytes +| key.len +| value.len > maintenance_bytes) {
                 self.exhausted = false;
@@ -2319,7 +2319,7 @@ const Block = struct {
     scan_options: ?types.ScanOptions = null,
     stop: ?*const std.atomic.Value(bool) = null,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         var it = self.decoded_payloads.valueIterator();
         while (it.next()) |payload| payload.*.release();
         self.decoded_payloads.deinit(self.alloc);
@@ -2339,7 +2339,7 @@ const Block = struct {
         bitmaps: []const u8 = &.{},
         cells: ?[]?codec.Cell = null,
         pages: ?ColumnPages = null,
-        loaded_pages: std.StaticBitSet(max_rows) = .initEmpty(),
+        loaded_pages: std.StaticBitSet(max_rows) = .empty,
         read_payload: bool = false,
         logical: ?[]?std.json.Value = null,
         json_views: ?[]?*JsonView = null,
@@ -2675,7 +2675,7 @@ const Block = struct {
         return logical;
     }
 
-    fn evaluate(self: *@This(), filter: scan_plan.Filter, candidates: []const bool, out: []bool) !void {
+    pub fn evaluate(self: *@This(), filter: scan_plan.Filter, candidates: []const bool, out: []bool) !void {
         try self.checkWork();
         @memset(out, false);
         if (std.mem.indexOfScalar(bool, candidates, true) == null) return;

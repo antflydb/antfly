@@ -101,7 +101,7 @@ fn recipeKey(entry: Entry, limits: Limits) ![32]u8 {
             const expected = try std.fmt.bufPrint(&name, "__gliner25.encoder.dropout.{s}.{d}", .{ @tagName(value.site.kind), value.site.layer });
             if (!std.mem.eql(u8, expected, entry.name)) return error.InvalidBoundaryReplayRecipe;
             string(&hash, "encoder_site_element_v1");
-            integer(&hash, @intFromEnum(value.site.kind));
+            integer(&hash, @backingInt(value.site.kind));
             integer(&hash, value.site.layer);
             integer(&hash, value.streamId());
         },
@@ -300,7 +300,7 @@ pub const Recipes = struct {
         if (self.entries.len > self.options.limits.max_recipes or self.entries.len != self.replay_inputs.len) return error.InvalidBoundaryReplayRecipe;
         var hash = Sha.init(.{});
         hash.update(abi ++ ".recipes");
-        inline for (std.meta.fields(Limits)) |field| integer(&hash, @field(self.options.limits, field.name));
+        inline for (comptime std.meta.fieldNames(Limits)) |reflected_name| integer(&hash, @field(self.options.limits, reflected_name));
         integer(&hash, self.entries.len);
         var work = Work{ .options = .{ .limits = self.options.limits, .control = control } };
         var largest: usize = 0;
@@ -594,7 +594,7 @@ test "boundary regional replay generated masks preserve all counter bits and fre
 }
 
 test "boundary regional replay generated setup and materialization unwind every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseGenerated, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseGenerated, .{});
 }
 
 fn exerciseSupplied(a: Allocator) !void {
@@ -663,7 +663,7 @@ test "boundary regional replay explicit mask pins reject mutation cancellation m
 }
 
 test "boundary regional replay explicit mask metadata unwinds every allocation failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, exerciseSupplied, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, exerciseSupplied, .{});
 }
 
 test "boundary regional replay cached recipes forget construction control and honor current request cancellation" {

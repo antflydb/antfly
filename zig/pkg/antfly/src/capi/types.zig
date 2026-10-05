@@ -94,7 +94,7 @@ pub const OpenOptions = extern struct {
     // database's writer lock (ANTFLY_BUSY), like sqlite3_busy_timeout. 0
     // fails immediately.
     busy_timeout_ms: u64 = 0,
-    reserved: [8]u64 = .{0} ** 8,
+    reserved: [8]u64 = @splat(0),
 };
 
 /// Options for `antfly_inference_open`. Same prefix-compatible contract as
@@ -116,7 +116,7 @@ pub const InferenceOptions = extern struct {
     scratch_budget_mb: u32 = 0,
     /// Per-call deadline in milliseconds; 0 means none.
     call_timeout_ms: u64 = 0,
-    reserved: [8]u64 = .{0} ** 8,
+    reserved: [8]u64 = @splat(0),
 };
 
 /// One progress report passed to an `antfly_inference_pull_json` callback.
@@ -256,36 +256,36 @@ pub const ErrorCode = enum(c_int) {
 
 pub fn errorCodeName(code: c_int) [*:0]const u8 {
     return switch (code) {
-        @intFromEnum(ErrorCode.ok) => "ANTFLY_OK",
-        @intFromEnum(ErrorCode.invalid_argument) => "ANTFLY_INVALID_ARGUMENT",
-        @intFromEnum(ErrorCode.not_found) => "ANTFLY_NOT_FOUND",
-        @intFromEnum(ErrorCode.version_conflict) => "ANTFLY_VERSION_CONFLICT",
-        @intFromEnum(ErrorCode.intent_conflict) => "ANTFLY_INTENT_CONFLICT",
-        @intFromEnum(ErrorCode.txn_not_found) => "ANTFLY_TXN_NOT_FOUND",
-        @intFromEnum(ErrorCode.busy) => "ANTFLY_BUSY",
-        @intFromEnum(ErrorCode.outcome_unknown) => "ANTFLY_OUTCOME_UNKNOWN",
-        @intFromEnum(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
-        @intFromEnum(ErrorCode.stalled) => "ANTFLY_STALLED",
-        @intFromEnum(ErrorCode.cancelled) => "ANTFLY_CANCELLED",
-        @intFromEnum(ErrorCode.internal) => "ANTFLY_INTERNAL",
+        @backingInt(ErrorCode.ok) => "ANTFLY_OK",
+        @backingInt(ErrorCode.invalid_argument) => "ANTFLY_INVALID_ARGUMENT",
+        @backingInt(ErrorCode.not_found) => "ANTFLY_NOT_FOUND",
+        @backingInt(ErrorCode.version_conflict) => "ANTFLY_VERSION_CONFLICT",
+        @backingInt(ErrorCode.intent_conflict) => "ANTFLY_INTENT_CONFLICT",
+        @backingInt(ErrorCode.txn_not_found) => "ANTFLY_TXN_NOT_FOUND",
+        @backingInt(ErrorCode.busy) => "ANTFLY_BUSY",
+        @backingInt(ErrorCode.outcome_unknown) => "ANTFLY_OUTCOME_UNKNOWN",
+        @backingInt(ErrorCode.unsupported) => "ANTFLY_UNSUPPORTED",
+        @backingInt(ErrorCode.stalled) => "ANTFLY_STALLED",
+        @backingInt(ErrorCode.cancelled) => "ANTFLY_CANCELLED",
+        @backingInt(ErrorCode.internal) => "ANTFLY_INTERNAL",
         else => "ANTFLY_UNKNOWN_ERROR",
     };
 }
 
 pub fn errorCodeDescription(code: c_int) [*:0]const u8 {
     return switch (code) {
-        @intFromEnum(ErrorCode.ok) => "operation completed successfully",
-        @intFromEnum(ErrorCode.invalid_argument) => "an argument, request, path, or open mode is invalid",
-        @intFromEnum(ErrorCode.not_found) => "the requested database object was not found",
-        @intFromEnum(ErrorCode.version_conflict) => "a version predicate did not match the current document version",
-        @intFromEnum(ErrorCode.intent_conflict) => "a transaction intent conflicts with the requested operation",
-        @intFromEnum(ErrorCode.txn_not_found) => "the requested transaction was not found",
-        @intFromEnum(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
-        @intFromEnum(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
-        @intFromEnum(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
-        @intFromEnum(ErrorCode.stalled) => "a bounded drain made no forward progress for its configured stall window and gave up",
-        @intFromEnum(ErrorCode.cancelled) => "the caller cancelled the operation",
-        @intFromEnum(ErrorCode.internal) => "an internal error occurred",
+        @backingInt(ErrorCode.ok) => "operation completed successfully",
+        @backingInt(ErrorCode.invalid_argument) => "an argument, request, path, or open mode is invalid",
+        @backingInt(ErrorCode.not_found) => "the requested database object was not found",
+        @backingInt(ErrorCode.version_conflict) => "a version predicate did not match the current document version",
+        @backingInt(ErrorCode.intent_conflict) => "a transaction intent conflicts with the requested operation",
+        @backingInt(ErrorCode.txn_not_found) => "the requested transaction was not found",
+        @backingInt(ErrorCode.busy) => "the requested resource is temporarily busy or changed during streaming; stabilize it and retry",
+        @backingInt(ErrorCode.outcome_unknown) => "the operation was published, but crash durability could not be confirmed; inspect the destination and do not retry automatically",
+        @backingInt(ErrorCode.unsupported) => "the operation requires a capability that is not supported by this platform or filesystem",
+        @backingInt(ErrorCode.stalled) => "a bounded drain made no forward progress for its configured stall window and gave up",
+        @backingInt(ErrorCode.cancelled) => "the caller cancelled the operation",
+        @backingInt(ErrorCode.internal) => "an internal error occurred",
         else => "unknown Antfly error code",
     };
 }
@@ -436,10 +436,10 @@ test "run until idle no-progress error maps to a dedicated stalled ABI code, not
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.RunUntilIdleNoProgress));
     try std.testing.expectEqual(ErrorCode.stalled, mapError(error.EnrichmentWaitTimeout));
     try std.testing.expect(ErrorCode.stalled != ErrorCode.internal);
-    try std.testing.expectEqualStrings("ANTFLY_STALLED", std.mem.span(errorCodeName(@intFromEnum(ErrorCode.stalled))));
+    try std.testing.expectEqualStrings("ANTFLY_STALLED", std.mem.span(errorCodeName(@backingInt(ErrorCode.stalled))));
     try std.testing.expectEqualStrings(
         "ANTFLY_INTERNAL",
-        std.mem.span(errorCodeName(@intFromEnum(ErrorCode.internal))),
+        std.mem.span(errorCodeName(@backingInt(ErrorCode.internal))),
     );
 }
 

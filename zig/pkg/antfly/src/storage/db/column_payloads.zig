@@ -43,7 +43,7 @@ fn hashInt(hash: *std.crypto.hash.Blake3, comptime T: type, value: T) void {
 pub fn identity(value_type: dv.ValueType, values: []const ?dv.TypedValue) [32]u8 {
     var hash = std.crypto.hash.Blake3.init(.{});
     hash.update("ACP1");
-    hash.update(&.{@intFromEnum(value_type)});
+    hash.update(&.{@backingInt(value_type)});
     for (values, 0..) |maybe_value, row| if (maybe_value) |value| {
         hashInt(&hash, u32, @intCast(row));
         switch (value) {

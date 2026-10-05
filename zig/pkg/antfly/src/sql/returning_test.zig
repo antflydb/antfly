@@ -239,5 +239,5 @@ test "SQL RETURNING owns partial preparation and projected results under allocat
     };
     var compiled = try compiler.compile(std.testing.allocator, "INSERT INTO items (_id,n,j) VALUES ('a',4,CAST('null' AS json)) RETURNING _id,n+g,label,j,s", .{});
     defer compiled.deinit();
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Check.run, .{&compiled});
 }

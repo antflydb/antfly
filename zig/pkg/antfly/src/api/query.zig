@@ -38,6 +38,7 @@ pub const SemanticResolver = query_contract.SemanticResolver;
 
 pub const parseQueryRequest = query_contract.parseQueryRequest;
 pub const parseGraphMetricRequestsAlloc = query_contract.parseGraphMetricRequestsAlloc;
+pub const validateStoragePublicQueryRequest = query_contract.validateStoragePublicQueryRequest;
 pub const parsePublicQueryRequest = query_contract.parsePublicQueryRequest;
 pub const parsePublicQueryRequestWithDeadline = query_contract.parsePublicQueryRequestWithDeadline;
 pub const isPublicQueryValidationError = query_contract.isPublicQueryValidationError;
@@ -1018,7 +1019,7 @@ const GraphAggregateResultBuilder = struct {
         self.value = self.distinct_values.items.len;
     }
 
-    fn deinit(self: *GraphAggregateResultBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphAggregateResultBuilder, alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         self.distinct_seen.deinit(alloc);
         for (self.distinct_values.items) |value| {
@@ -1063,7 +1064,7 @@ const GraphSearchResultBuilder = struct {
     total_hits: u32 = 0,
     truncated: bool = false,
 
-    fn deinit(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         self.node_identities.deinit(alloc);
         for (self.nodes.items) |*node| node.deinit(alloc);
@@ -1629,7 +1630,7 @@ const GraphMetricResultBuilder = struct {
     score_limit: usize,
     status: ?db_mod.types.GraphMetricStatus = null,
 
-    fn deinit(self: *GraphMetricResultBuilder, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphMetricResultBuilder, alloc: std.mem.Allocator) void {
         if (self.name.len > 0) alloc.free(self.name);
         if (self.index_name.len > 0) alloc.free(self.index_name);
         if (self.metric_name.len > 0) alloc.free(self.metric_name);
@@ -4508,7 +4509,7 @@ fn consumerTests() type {
         }
 
         test "query merge allocation scales with the selected page" {
-            const large_stored = "x" ** 1024;
+            const large_stored = z17RepeatString("x", 1024);
             var input_hits: [2048]db_mod.types.SearchHit = undefined;
             for (&input_hits) |*hit| {
                 hit.* = .{
@@ -9776,4 +9777,15 @@ fn consumerTests() type {
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

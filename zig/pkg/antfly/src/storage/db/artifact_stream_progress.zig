@@ -368,7 +368,7 @@ pub fn prepareDocumentClosure(alloc: std.mem.Allocator, txn: anytype, root: u128
 test "ordered artifact inventory authored vectors close provider scope without reinference" {
     const alloc = std.testing.allocator;
     const inventory = @import("artifact_inventory.zig");
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const keys = @import("../internal_keys.zig");
     const input = @import("artifact_producer_input.zig");
     const authored = @import("artifact_authored_acceptance.zig");
@@ -466,7 +466,7 @@ test "ordered artifact inventory authored vectors close provider scope without r
 
 test "ordered artifact inventory document stream closure requires current outputs including absence" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const input = @import("artifact_producer_input.zig");
     const keys = @import("../internal_keys.zig");
     for ([_]bool{ true, false }) |dense| {
@@ -601,7 +601,7 @@ test "ordered artifact inventory document stream closure requires current output
                         defer closure.deinit();
                     }
                 };
-                try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan });
+                try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{ &read, db.root_incarnation, request, plan });
             }
             if (pass == 0) {
                 // Unrelated writes must not restart an owner-local stream.
@@ -620,7 +620,7 @@ test "ordered artifact inventory document stream closure requires current output
                 var marker: [16]u8 = undefined;
                 std.mem.writeInt(u64, marker[0..8], 1, .little);
                 std.mem.writeInt(u64, marker[8..16], index + 2, .little);
-                try db.core.store.putBatch(&.{ .{ .key = output, .value = value }, .{ .key = &keys.raft_document_applied_entry_key, .value = &marker } }, &.{});
+                try db.core.store.putBatch(&.{ .{ .key = output, .value = value }, .{ .key = &keys.ordered_document_applied_entry_key, .value = &marker } }, &.{});
                 var read = try db.core.store.beginReadTxn();
                 defer read.abort();
                 try std.testing.expect((try publication.readReceipt(&read, command, source)) != null);

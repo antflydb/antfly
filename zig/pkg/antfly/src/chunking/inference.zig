@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const httpx = @import("httpx");
 const inference_api = @import("inference_api");
 const chunking_types = @import("types.zig");
@@ -364,7 +365,7 @@ const EncodedChunkRequest = struct {
     metadata_or_json: []u8,
     envelope: ?httpx.attachment_envelope.EncodedSegments = null,
 
-    fn deinit(self: *EncodedChunkRequest, alloc: Allocator) void {
+    pub fn deinit(self: *EncodedChunkRequest, alloc: Allocator) void {
         if (self.envelope) |*envelope| envelope.deinit();
         alloc.free(self.metadata_or_json);
         self.* = undefined;

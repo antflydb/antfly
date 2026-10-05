@@ -60,7 +60,7 @@ pub const TestDirectory = struct {
         };
         errdefer result.tmp.cleanup();
         const root_len = try result.tmp.dir.realPath(std.testing.io, &result.path_buffer);
-        const suffix = try std.fmt.bufPrintZ(result.path_buffer[root_len..], "/{s}", .{name});
+        const suffix = try std.fmt.bufPrintSentinel(result.path_buffer[root_len..], "/{s}", .{name}, 0);
         result.path_len = root_len + suffix.len;
         return result;
     }

@@ -83,7 +83,7 @@ pub const RaftApplyStore = struct {
     handle: ?*anyopaque,
     listeners: std.ArrayListUnmanaged(*ListenerRegistration) = .empty,
     listeners_mutex: std.Io.Mutex = .init,
-    ha_adapter: ?*@import("metadata_hot_standby_adapter.zig").Adapter = null,
+    hot_standby_adapter: ?*@import("metadata_hot_standby_adapter.zig").Adapter = null,
 
     pub const RestoreJobRow = struct {
         key: []u8,
@@ -109,7 +109,7 @@ pub const RaftApplyStore = struct {
 
     pub fn deinit(self: *RaftApplyStore) void {
         abi.antfly_metadata_apply_store_close(self.handle);
-        if (self.ha_adapter) |adapter| {
+        if (self.hot_standby_adapter) |adapter| {
             adapter.io_impl.deinit();
             self.alloc.destroy(adapter);
         }
@@ -226,7 +226,7 @@ pub const RaftApplyStore = struct {
         return try std.json.parseFromSlice(T, alloc, response.slice(), .{ .allocate = .alloc_always });
     }
 
-    pub fn bindHA(self: *RaftApplyStore, gate: ?@import("db/replication_contract.zig").WriteGate, mirror: ?@import("db/replication_contract.zig").AsyncEffectMirror) !void {
+    pub fn bindHotStandby(self: *RaftApplyStore, gate: ?@import("db/replication_contract.zig").WriteGate, mirror: ?@import("db/replication_contract.zig").AsyncEffectMirror) !void {
         const Adapter = @import("metadata_hot_standby_adapter.zig").Adapter;
         const next = try self.alloc.create(Adapter);
         errdefer self.alloc.destroy(next);
@@ -234,25 +234,25 @@ pub const RaftApplyStore = struct {
         errdefer next.io_impl.deinit();
         const port = next.asPort();
         try statusToError(abi.antfly_metadata_apply_store_bind_ha(self.handle, &.{ .port = &port }));
-        if (self.ha_adapter) |old| {
+        if (self.hot_standby_adapter) |old| {
             old.io_impl.deinit();
             self.alloc.destroy(old);
         }
-        self.ha_adapter = next;
+        self.hot_standby_adapter = next;
     }
-    pub fn flushHAOutbox(self: *RaftApplyStore) !void {
+    pub fn flushHotStandbyOutbox(self: *RaftApplyStore) !void {
         _ = try self.projection(bool, .{ .kind = .flush_ha_outbox });
     }
-    pub fn applyHARecord(self: *RaftApplyStore, record: @import("db/replication_record.zig").RecordView) !void {
+    pub fn applyHotStandbyRecord(self: *RaftApplyStore, record: @import("db/replication_record.zig").RecordView) !void {
         const bytes = try @import("db/replication_record.zig").encodeAlloc(self.alloc, record);
         defer self.alloc.free(bytes);
         _ = try self.projection(bool, .{ .kind = .apply_ha_record, .key = .fromSlice(bytes) });
     }
-    pub fn exportHACheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8) !@import("hot_standby/metadata_effects.zig").CheckpointArtifact {
+    pub fn exportHotStandbyCheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8) !@import("hot_standby/metadata_effects.zig").CheckpointArtifact {
         _ = io; // IO is performed by the owning native metadata runtime.
         return self.projection(@import("hot_standby/metadata_effects.zig").CheckpointArtifact, .{ .kind = .export_ha_checkpoint, .key = .fromSlice(path) });
     }
-    pub fn importHACheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8, size_bytes: u64) !void {
+    pub fn importHotStandbyCheckpoint(self: *RaftApplyStore, io: std.Io, path: []const u8, size_bytes: u64) !void {
         _ = io;
         _ = try self.projection(bool, .{ .kind = .import_ha_checkpoint, .key = .fromSlice(path), .arg0 = size_bytes });
     }
@@ -287,7 +287,7 @@ pub const RaftApplyStore = struct {
         return self.projectionWithAllocator(bool, alloc, .{ .kind = .restore_staging_authority_allowed, .group_id = group_id, .key = .fromSlice(&id), .arg0 = node_id, .arg1 = owner_group orelse 0 });
     }
     pub fn loadRestoreStagingReceipt(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id, state: restore_staging.State, owner_group: u64) !?[]u8 {
-        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_staging_receipt, .group_id = group_id, .key = .fromSlice(&id), .arg0 = @intFromEnum(state), .arg1 = owner_group });
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_staging_receipt, .group_id = group_id, .key = .fromSlice(&id), .arg0 = @backingInt(state), .arg1 = owner_group });
     }
     pub fn captureProvisioningCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !restore_staging.ProvisioningProjection {
         return self.projectionWithAllocator(restore_staging.ProvisioningProjection, alloc, .{ .kind = .provisioning_catalog, .group_id = group_id });

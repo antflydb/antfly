@@ -45,8 +45,8 @@ const Graph = struct {
     }
 };
 const execution_options = seeded.Options{ .execution = .resident_metal, .gradient = .{ .require_all_gradients = true } };
-const identity = seeded.StepIdentity{ .binding = .{0x19} ** 32, .optimizer_step = 4, .microbatch = 7 };
-const decisions = [_]u8{0x51} ** 32;
+const identity = seeded.StepIdentity{ .binding = @splat(0x19), .optimizer_step = 4, .microbatch = 7 };
+const decisions = @as([32]u8, @splat(0x51));
 
 fn constructionCheck(a: Allocator, profile: usize) !void {
     var graph = try Graph.init(a);
@@ -129,7 +129,7 @@ const Inputs = struct {
         }
     }
 
-    fn deinit(self: *Inputs, cb: *const ops.ComputeBackend) void {
+    pub fn deinit(self: *Inputs, cb: *const ops.ComputeBackend) void {
         self.release(cb, 0, self.values.len);
     }
 
@@ -191,7 +191,7 @@ test "resident session Metal direct two and three stages retain caller bindings 
                 defer prefix.deinit();
                 inputs.release(&cb, 0, 3);
                 try fixture.expectValues(a, &cb, try prefix.logits(0), &.{ 2, 0, 6, 12, 10, 18 }, 0, 0, "prefix dropout");
-                var tape = try prefix.forwardSuffix(identity, .{0x24} ** 32, inputs.runtime(&buffer, 3, 5), null);
+                var tape = try prefix.forwardSuffix(identity, @splat(0x24), inputs.runtime(&buffer, 3, 5), null);
                 defer tape.deinit();
                 inputs.release(&cb, 3, 5);
                 try finish(a, &cb, &tape, &wrt);
@@ -205,10 +205,10 @@ test "resident session Metal direct two and three stages retain caller bindings 
                 var stages = try session.forward(&cb, inputs.runtime(&buffer, 0, 3), identity, null);
                 defer stages.deinit();
                 inputs.release(&cb, 0, 3);
-                try stages.advance(identity, .{0x24} ** 32, inputs.runtime(&buffer, 3, 4), null);
+                try stages.advance(identity, @splat(0x24), inputs.runtime(&buffer, 3, 4), null);
                 inputs.release(&cb, 3, 4);
                 try fixture.expectValues(a, &cb, try stages.logits(0), &.{ 100, 324, 4, 0, 100, 324 }, 0, 0, "candidate scores");
-                try stages.advance(identity, .{0x47} ** 32, inputs.runtime(&buffer, 4, 5), null);
+                try stages.advance(identity, @splat(0x47), inputs.runtime(&buffer, 4, 5), null);
                 inputs.release(&cb, 4, 5);
                 var tape = try stages.finish();
                 defer tape.deinit();
@@ -249,7 +249,7 @@ test "resident session Metal rejects nonfinite cotangents stale decisions and ca
         try tape.sealDecisions(decisions);
         switch (failure) {
             0 => try std.testing.expectError(error.InvalidTrainingCotangent, tape.backward(identity, decisions, 1, &.{nonfinite}, null)),
-            1 => try std.testing.expectError(error.TrainingDecisionIdentityMismatch, tape.backward(identity, .{0x37} ** 32, 1, &.{seed}, null)),
+            1 => try std.testing.expectError(error.TrainingDecisionIdentityMismatch, tape.backward(identity, @splat(0x37), 1, &.{seed}, null)),
             2 => {
                 var stale = identity;
                 stale.optimizer_step += 1;

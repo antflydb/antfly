@@ -74,3 +74,11 @@ test "system catalog routing and transport discovery" {
     _ = @import("api/distributed_candidate_source.zig");
     _ = @import("api/distributed_entity_sink.zig");
 }
+
+test {
+    _ = @import("api/lake_sql_cursor.zig");
+}
+
+test {
+    _ = @import("api/lake_sql_integration_test.zig");
+}

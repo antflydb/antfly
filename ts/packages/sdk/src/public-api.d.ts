@@ -4883,7 +4883,7 @@ export interface components {
              * @description Stable machine-readable retry classification.
              * @enum {string}
              */
-            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "distributed_query_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable";
+            code: "doc_identity_unavailable" | "read_requires_primary" | "standby_read_unavailable" | "distributed_query_unavailable" | "storage_read_temporarily_unavailable" | "index_rebuilding" | "query_embedding_temporarily_unavailable" | "reranker_temporarily_unavailable" | "decision_provider_unavailable";
             /** @description Human-readable error summary. */
             message: string;
             /**
@@ -4892,10 +4892,10 @@ export interface components {
              */
             retryable: true;
         };
-        /** @description A stable failure envelope for query embedding and reranking dependencies. */
+        /** @description A stable failure envelope for query embedding, reranking, and decision dependencies. */
         QueryDependencyError: {
             /** @enum {string} */
-            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "query_timeout";
+            code: "embedding_index_not_found" | "query_embedding_input_too_large" | "query_embedding_overloaded" | "query_embedding_rate_limited" | "query_embedding_upstream_failure" | "reranker_rate_limited" | "reranker_upstream_failure" | "decision_limit_exceeded" | "invalid_decision_evaluation" | "decision_provider_unavailable" | "decision_rate_limited" | "decision_upstream_failure" | "query_timeout";
             /** @description Legacy alias of code. Use code for programmatic handling. */
             error: string;
             message: string;
@@ -10001,7 +10001,65 @@ export interface components {
             namespace?: string;
             table: string;
         };
+        /**
+         * @description Evaluate expressions after global retrieval merging, before final
+         *     offset/limit. Candidates require candidate_count; matches require
+         *     max_rows and fail if the full qualifying population exceeds that budget.
+         *     Cursor pagination, reranking, pruning, and ordinary aggregations cannot
+         *     be combined with evaluation. NULL inputs skip inference; errors fail.
+         */
+        QueryEvaluation: {
+            /** @description Evaluate completed bindings of this named graph MATCH instead of retrieval hits. Fields use alias.document.path or alias.key. Existing graph aggregates cannot be combined with this stage. */
+            graph_query?: string;
+            /** @enum {string} */
+            scope: "candidates" | "matches";
+            candidate_count?: number;
+            max_rows?: number;
+            compute: {
+                [key: string]: components["schemas"]["QueryExpression"];
+            };
+            /** @description Exactly one of eq, neq, lt, lte, gt, gte (two expressions), is_null (expression), not (predicate), and, or (predicate arrays). Comparisons propagate NULL. */
+            where?: {
+                [key: string]: unknown;
+            };
+            order_by?: {
+                expression: components["schemas"]["QueryExpression"];
+                descending?: boolean;
+            }[];
+            aggregations?: {
+                [key: string]: {
+                    /** @enum {string} */
+                    type: "terms" | "avg" | "sum" | "count";
+                    expression: components["schemas"]["QueryExpression"];
+                };
+            };
+        };
+        /**
+         * @description Exactly one of literal, field, ref, or call. A call requires input and
+         *     decider. ai_decide requires questions; ai_probability requires statement;
+         *     ai_choice and ai_score require instructions and criteria. Named refs may
+         *     select nested JSON members with dotted paths. Binding cycles are invalid.
+         */
+        QueryExpression: {
+            literal?: unknown;
+            field?: string;
+            ref?: string;
+            /** @enum {string} */
+            call?: "ai_decide" | "ai_choice" | "ai_score" | "ai_probability";
+            input?: components["schemas"]["QueryExpression"];
+            decider?: string;
+            questions?: {
+                [key: string]: unknown;
+            };
+            statement?: string;
+            instructions?: string;
+            /** @description Choice ID map or ordered score level array. */
+            criteria?: {
+                [key: string]: string;
+            } | string[];
+        };
         QueryRequest: {
+            evaluate?: components["schemas"]["QueryEvaluation"];
             table_target?: components["schemas"]["CatalogTableTarget"];
             /**
              * @description Literal table name in default.public. Global queries require exactly one of table or table_target.
@@ -11155,6 +11213,10 @@ export interface components {
         };
         /** @description A single query result hit */
         QueryHit: {
+            /** @description Named query-time computed values, separate from stored source. */
+            _computed?: {
+                [key: string]: unknown;
+            };
             /** @description ID of the record. */
             _id: string;
             /**
@@ -11288,6 +11350,10 @@ export interface components {
         };
         /** @description Fields shared by canonical and stateful query result envelopes. */
         QueryResultBase: {
+            /** @description Function evaluation scope, population, usage, and scoped aggregations. */
+            evaluation?: {
+                [key: string]: unknown;
+            };
             hits?: components["schemas"]["QueryHits"];
             /**
              * @description Aggregation results keyed by the user-defined aggregation names from the request.
@@ -11443,6 +11509,10 @@ export interface components {
         };
         /** @description A typed, weighted connection between documents */
         Edge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             /**
              * Format: byte
              * @description Base64-encoded source document key
@@ -11602,6 +11672,10 @@ export interface components {
             length?: number;
         };
         PathEdge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             source?: string;
             target?: string;
             type?: string;
@@ -12522,7 +12596,7 @@ export interface components {
         };
         /** @description Per-request configuration for chunking. All fields are optional - zero/omitted values use chunker defaults. */
         ChunkOptions: {
-            /** @description Maximum number of chunks to generate per document. */
+            /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
             max_chunks?: number;
             /**
              * Format: float
@@ -12550,7 +12624,6 @@ export interface components {
          *       "provider": "antfly",
          *       "api_url": "http://localhost:8080",
          *       "model": "fixed",
-         *       "max_chunks": 50,
          *       "text": {
          *         "target_tokens": 500,
          *         "overlap_tokens": 50,
@@ -12615,7 +12688,7 @@ export interface components {
              * @example fixed
              */
             model?: string;
-            /** @description Maximum number of chunks to generate per document. Zero uses the chunker default. */
+            /** @description Maximum number of chunks to generate per document. Zero (or omitted, the default) means unlimited — the document is chunked in full with no cap. Set an explicit value up to 4096 to bound chunk count for very large inputs. */
             max_chunks?: number;
             /** Format: float */
             threshold?: number;
@@ -12748,7 +12821,7 @@ export interface components {
             full_text_index?: boolean;
             /** @description Produced asset content type for asset enrichments. */
             content_type?: string;
-            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. */
+            /** @description Write-only producer configuration. Cannot be combined with producer_json or transcriber. Decision producers use type=decision and config={version, decider, questions}, where decider is a frozen Antfly or Jev DeciderConfig. Outputs include answers, usage, resolved model, specification hash, version, and source fingerprint. Change version or specification to rebuild through the enrichment lifecycle. */
             producer?: {
                 [key: string]: unknown;
             };
@@ -12757,7 +12830,7 @@ export interface components {
              * @description Write-only serialized producer configuration. For managed embedding enrichments Antfly stores a canonical semantic producer identity here; credentials and execution policy are excluded.
              */
             producer_json?: string;
-            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator or extractor); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
+            /** @description Optional bounded sample of the document's graph neighbors appended to the producer input. Only valid on asset enrichments whose producer consumes rendered prompt text (generator, extractor, or decision); producers that treat the source as a media locator (copy, reader, transcriber, document_extraction) reject it. Only same-shard graph state is sampled; a graph index without local state for a document yields empty neighbors at runtime while the graph index reference itself is validated at admission. */
             neighbor_context?: components["schemas"]["EnrichmentNeighborContextConfig"];
             /** @description Non-semantic execution policy for this enrichment producer. This does not participate in generated artifact identity. */
             execution?: components["schemas"]["ExecutionPolicy"];
@@ -12989,10 +13062,14 @@ export interface components {
              * @enum {string}
              */
             model?: "document" | "external";
+            /** @description Logical source endpoint. When set, edge.edge_id is required; the artifact document remains the durable owner. */
+            source?: components["schemas"]["GraphTemplateValue"];
             target?: components["schemas"]["GraphTemplateValue"];
         };
-        /** @description Maps each artifact item to an edge type, weight, and public metadata. */
+        /** @description Maps each artifact item to a relationship identity, type, weight, and public metadata. */
         GraphArtifactEdgeMappingConfig: {
+            /** @description Stable application relationship ID. Required with nodes.source. Replays update the same identity; distinct IDs preserve parallel relationships. */
+            edge_id?: components["schemas"]["GraphTemplateValue"];
             type?: components["schemas"]["GraphTemplateValue"];
             weight?: components["schemas"]["GraphTemplateValue"];
             /** @description JSON metadata template copied onto each materialized edge. Sensitive keys are omitted from create responses. */
@@ -13632,6 +13709,38 @@ export interface components {
          * @enum {string}
          */
         TableStorageMode: "document" | "relational";
+        ExternalLakeCredentialRef: {
+            /** @description Name of a configured external_io connection with lake_read capability. */
+            ref: string;
+            /** @description Allowed object prefix relative to the configured bucket or filesystem root. */
+            scope?: string;
+        };
+        ExternalLakeSnapshotSelector: {
+            /** @enum {string} */
+            mode: "current" | "snapshot_id" | "object_version_digest";
+            /** @description Required for snapshot_id; selects an Iceberg snapshot. */
+            id?: string;
+            /** @description Required for object_version_digest; pins a Parquet object inventory. */
+            digest?: string;
+        };
+        /** @description Read-only authoritative Parquet or Iceberg source. A serving statement pins its inventory and object versions before returning rows. */
+        ExternalLakeTableSource: {
+            /** @enum {string} */
+            kind: "external";
+            table_id: string;
+            /** @enum {string} */
+            format: "parquet" | "iceberg";
+            uri: string;
+            /** @default auto */
+            schema_fingerprint?: string;
+            /**
+             * @default read_only
+             * @enum {string}
+             */
+            write_policy?: "read_only";
+            credentials?: components["schemas"]["ExternalLakeCredentialRef"];
+            snapshot?: components["schemas"]["ExternalLakeSnapshotSelector"];
+        };
         RelationalColumnExpression: {
             column: string;
             expression: components["schemas"]["RelationalScalarExpression"];
@@ -13926,6 +14035,8 @@ export interface components {
              */
             readonly version?: number;
             storage_mode?: components["schemas"]["TableStorageMode"];
+            /** @description External tables require relational storage mode and are read-only. Omit for native tables. */
+            base_source?: components["schemas"]["ExternalLakeTableSource"];
             /**
              * @description Immutable typed expressions applied only to absent columns on new
              *     writes, never explicit null. Defaults cannot reference columns.
@@ -16935,6 +17046,34 @@ export interface components {
             /** @description Non-scoring structured stored-document predicate evaluated for this alias. Serverless execution rejects document filters on aliases qualified with a different table because its published snapshot contains only the queried table. Explicitly qualifying an alias with the queried table is equivalent to omitting `table`. */
             filter?: components["schemas"]["GraphDocumentFilter"];
         };
+        GraphRelationshipPropertyPredicate: {
+            /** @description JSON pointer to /metadata/... or /edge_id, /owner_document, /source, /target, /type, /weight, /created_at, /updated_at. */
+            field: string;
+            /** @enum {string} */
+            op: "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "is_null" | "is_not_null";
+            /** @description Non-null scalar comparison value. Omit for is_null and is_not_null. */
+            value?: unknown;
+            /**
+             * @description Datetime compares RFC3339 instants rather than string ordering.
+             * @default scalar
+             * @enum {string}
+             */
+            value_type?: "scalar" | "datetime";
+        };
+        /** @description AND predicates applied to every relationship before neighbor admission, path ranking, and match counting. Missing or null properties fail comparisons, including ne; use explicit null operators. Maximum 64 predicates and 64 KiB of predicate fields and values. Time intervals have inclusive lower and exclusive upper bounds. Missing/null valid-time bounds are open; known_at requires a created_at value. Invalid timestamp properties never match. */
+        GraphRelationshipFilter: {
+            properties?: components["schemas"]["GraphRelationshipPropertyPredicate"][];
+            /**
+             * Format: date-time
+             * @description Require metadata.valid_at <= instant < metadata.invalid_at.
+             */
+            valid_at?: string;
+            /**
+             * Format: date-time
+             * @description Require metadata.created_at <= instant < metadata.expired_at.
+             */
+            known_at?: string;
+        };
         /** @description Inclusive per-edge weight filter. At least one bound is required. Bounds must be finite and non-negative; when both are present, min must not exceed max. This filters individual stored edges and does not constrain the aggregate path objective. */
         GraphEdgeWeightRange: {
             /** Format: double */
@@ -16944,6 +17083,7 @@ export interface components {
         };
         /** @description Structural edge expansion from the `from` alias to the `to` alias. Direction defaults to `out`; use `in` to reverse the stored edge or `both` to match an undirected relationship without duplicating stored edges. A fixed single-hop relationship preserves physical self-loops and may bind two distinct aliases to the same node identity. Variable-length expansion uses node-simple paths: a (table, key) identity is visited at most once within one expanded edge path, except when closing onto an already bound target alias for an explicit cycle. Exact distributed and serverless execution rejects planner-required reverse variable expansion when the source tables of unnamed intermediate nodes cannot be proven. Express cross-table multi-hop patterns as explicit single-hop edges with a table-qualified alias at each table boundary. */
         GraphMatchEdge: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphIdentifier"];
             to: components["schemas"]["GraphIdentifier"];
             /** @description Stored-edge direction relative to `from`; defaults to `out`. */
@@ -17085,6 +17225,7 @@ export interface components {
         };
         /** @description Breadth-first traversal with request-wide deduplication by exact table-qualified node identity. Direction defaults to `out`; use `both` to traverse a relationship as undirected without storing a reciprocal edge. */
         GraphTraversal: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             start: components["schemas"]["GraphNodeSelector"];
             /** @description Stored-edge direction relative to each expanded node; defaults to `out`. */
             direction?: components["schemas"]["EdgeDirection"];
@@ -17133,6 +17274,7 @@ export interface components {
         };
         /** @description Find the best path from `from` to `to` in the requested stored-edge direction. */
         GraphShortestPath: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
@@ -17158,8 +17300,9 @@ export interface components {
             index: string;
             shortest_path: components["schemas"]["GraphShortestPath"];
         };
-        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction and type, and are ordered best-first by the selected objective. */
+        /** @description Find up to `k` loopless paths from `from` to `to` in the requested stored-edge direction. Results are unique by ordered table-qualified node identities plus stored-edge direction, type, edge ID and fact owner, and are ordered best-first by the selected objective. */
         GraphKShortestPaths: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             /** @description Stored-edge direction relative to each expanded path node; defaults to `out`. */
@@ -17290,6 +17433,7 @@ export interface components {
          * @description Deprecated graph_searches traversal and path parameters.
          */
         GraphQueryParams: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             /** @description At most 64 unique edge types totaling at most 64 KiB. */
             edge_types?: components["schemas"]["GraphEdgeType"][];
             direction?: components["schemas"]["EdgeDirection"];
@@ -17314,6 +17458,7 @@ export interface components {
          * @description Deprecated linear graph_searches pattern edge.
          */
         PatternEdgeStep: {
+            edge_filter?: components["schemas"]["GraphRelationshipFilter"];
             /** @description Empty or omitted matches every edge type; otherwise at most 64 unique types totaling at most 64 KiB. */
             types?: components["schemas"]["GraphEdgeType"][];
             direction?: components["schemas"]["EdgeDirection"];
@@ -17402,6 +17547,10 @@ export interface components {
         };
         /** @description A deterministic bounded prefix of projected bindings from a canonical graph MATCH query. Inspect stats.truncated to determine whether enumeration was exhaustive. */
         GraphBindingsResult: {
+            /** @description Evaluated values parallel to returned rows, when decision evaluation was requested. */
+            computed?: {
+                [key: string]: unknown;
+            }[];
             /**
              * @description Stable discriminator for the graph result shape. (enum property replaced by openapi-typescript)
              * @enum {string}
@@ -17447,6 +17596,10 @@ export interface components {
         GraphPathEdgeDirection: "out" | "in";
         /** @description One edge in a canonical path. `from` and `to` are the exact ordered traversal endpoints, not unqualified physical edge keys, so identity remains unambiguous across tables and for equal keys in different tables. */
         GraphPathEdge: {
+            /** @description Application relationship ID. Absent on legacy tuple relationships. IDs are scoped to this graph index, owning document, and endpoint/type tuple. */
+            edge_id?: string;
+            /** @description Owning fact document key in the graph index table when it differs from the logical source. The document is the authority for replay and deletion. */
+            owner_document?: string;
             from: components["schemas"]["GraphPathEndpoint"];
             to: components["schemas"]["GraphPathEndpoint"];
             direction: components["schemas"]["GraphPathEdgeDirection"];
@@ -17583,6 +17736,9 @@ export interface components {
          * @description Deprecated graph_searches pattern response row.
          */
         PatternMatch: {
+            _computed?: {
+                [key: string]: unknown;
+            };
             bindings?: {
                 [key: string]: components["schemas"]["LegacyGraphResultNode"];
             };
@@ -20167,9 +20323,9 @@ export interface components {
             true_probability?: number;
             /**
              * Format: float
-             * @description Auxiliary model estimate for acting. Does not authorize or execute a tool call.
+             * @description Auxiliary model estimate for acting, from models with an action head (Laya). Does not authorize or execute a tool call.
              */
-            act_probability: number;
+            act_probability?: number;
         };
         ExtractionAttributeLabel: {
             label: string;
@@ -20321,7 +20477,7 @@ export interface components {
              * @example fixed
              */
             model?: string;
-            /** @description Maximum number of chunks to generate per document. */
+            /** @description Maximum number of chunks to generate per document. Zero (the default when omitted) means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially truncated. */
             max_chunks?: number;
             /**
              * Format: float

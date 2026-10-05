@@ -234,7 +234,8 @@ pub const Socket = struct {
 
     /// Closes the socket.
     pub fn close(self: *Self) void {
-        self.io.vtable.netClose(self.io.userdata, @ptrCast((&self.handle)[0..1]));
+        const socket: net.Socket = .{ .handle = self.handle, .address = undefined };
+        self.io.vtable.netClose(self.io.userdata, (&socket)[0..1]);
     }
 
     /// Shuts down reads and writes without releasing the handle. This is used
@@ -427,11 +428,11 @@ pub const Socket = struct {
 
     fn netRead(self: *Self, buffer: []u8) net.Stream.Reader.Error!usize {
         var bufs = [_][]u8{buffer};
-        return self.io.vtable.netRead(self.io.userdata, self.handle, &bufs);
+        return (try (try self.io.operate(.{ .net_read = .{ .socket_handle = self.handle, .data = &bufs } })).net_read).data_len;
     }
 
     fn netWrite(self: *Self, data: []const u8) net.Stream.Writer.Error!usize {
-        return self.io.vtable.netWrite(self.io.userdata, self.handle, "", &.{data}, 1);
+        return try (try self.io.operate(.{ .net_write = .{ .socket_handle = self.handle, .data = &.{data} } })).net_write;
     }
 
     fn netReadTask(self: *Self, buffer: []u8, result: *net.Stream.Reader.Error!usize) void {
@@ -813,10 +814,15 @@ pub const SocketIoWriter = struct {
             p.socket.sendAll(buffered) catch return error.WriteFailed;
             return w.consumeAll();
         }
-        const n = p.socket.io.vtable.netWrite(p.socket.io.userdata, p.socket.handle, w.buffered(), bufs, splat) catch |err| {
+        const n = (p.socket.io.operate(.{ .net_write = .{
+            .socket_handle = p.socket.handle,
+            .header = w.buffered(),
+            .data = bufs,
+            .splat = splat,
+        } }) catch |err| {
             if (err == error.Canceled) p.socket.io.recancel();
             return error.WriteFailed;
-        };
+        }).net_write catch return error.WriteFailed;
         return w.consume(n);
     }
 
@@ -1291,7 +1297,7 @@ fn addressToPosix(address: Address, storage: *PosixAddress) posix.socklen_t {
         .ip4 => |ip4| {
             storage.in = .{
                 .port = std.mem.nativeToBig(u16, ip4.port),
-                .addr = @bitCast(ip4.bytes),
+                .addr = std.mem.bytesToValue(u32, &ip4.bytes),
             };
             return @sizeOf(posix.sockaddr.in);
         },
@@ -1311,7 +1317,7 @@ fn addressFromPosix(storage: *const PosixAddress) Address {
     return switch (storage.any.family) {
         posix.AF.INET => .{ .ip4 = .{
             .port = std.mem.bigToNative(u16, storage.in.port),
-            .bytes = @bitCast(storage.in.addr),
+            .bytes = std.mem.toBytes(storage.in.addr),
         } },
         posix.AF.INET6 => .{ .ip6 = .{
             .port = std.mem.bigToNative(u16, storage.in6.port),
@@ -1331,7 +1337,7 @@ fn listenPosix(addr: Address, io: Io, options: TcpListener.ListenOptions) !net.S
     const socket_flags = posix.SOCK.STREAM |
         if (Io.Threaded.socket_flags_unsupported) 0 else posix.SOCK.CLOEXEC;
     const socket_fd: posix.socket_t = socket: while (true) {
-        const rc = posix.system.socket(family, socket_flags, @intFromEnum(net.Protocol.tcp));
+        const rc = posix.system.socket(family, socket_flags, @backingInt(net.Protocol.tcp));
         switch (posix.errno(rc)) {
             .SUCCESS => break :socket @intCast(rc),
             .INTR => continue,

@@ -79,7 +79,7 @@ pub fn prepareRaft(alloc: std.mem.Allocator, store: anytype) !?Prepared {
         arena.deinit();
         return null;
     }
-    const marker = try read.get(&keys.raft_document_applied_entry_key);
+    const marker = try read.get(&keys.ordered_document_applied_entry_key);
     if (marker.len != 16) return error.ArtifactCatalogCorrupt;
     const term = std.mem.readInt(u64, marker[0..8], .little);
     const index = std.mem.readInt(u64, marker[8..16], .little);
@@ -138,7 +138,7 @@ pub fn stageRaft(alloc: std.mem.Allocator, txn: anytype, command: publication.Co
     _ = try activation_boundary.requireAuthority(txn, authority);
     if (before.baseline_complete) return true;
     if (!std.mem.eql(u8, before.cursor, page_control.expected_cursor)) return false;
-    const marker = try txn.get(&keys.raft_document_applied_entry_key);
+    const marker = try txn.get(&keys.ordered_document_applied_entry_key);
     if (marker.len != 16) return error.ArtifactCatalogCorrupt;
     const term = std.mem.readInt(u64, marker[0..8], .little);
     const index = std.mem.readInt(u64, marker[8..16], .little);

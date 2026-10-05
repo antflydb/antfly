@@ -734,7 +734,7 @@ pub fn decodeValue(alloc: std.mem.Allocator, namespace: publication.Namespace, d
         error.OutOfMemory => return err,
         else => return error.SourceSnapshotCorrupt,
     };
-    var outputs = std.StaticBitSet(publication.max_source_documents).initEmpty();
+    var outputs = std.StaticBitSet(publication.max_source_documents).empty;
     for (proof.proof.effects) |effect| outputs.set(effect.source_index);
     var selected = false;
     for (bitmap, 0..) |bits, byte_index| {

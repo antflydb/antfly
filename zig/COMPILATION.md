@@ -262,6 +262,34 @@ claims serialized them. This removes that admission bottleneck without
 increasing runner size or the deadline; a matched CI rerun must establish the
 resulting wall time.
 
+### October macOS compile-memory follow-up
+
+The baseline Linux GNU reservations above remain scoped to their measured
+profiles. macOS reservations now provision 28 GiB for storage, 14 GiB for API,
+20 GiB for inference, and 4 GiB for CLI. The storage claim covers the reported
+22–23 GB peak with at least 25% headroom. The other increases are provisional
+headroom over claims reported as exceeded, **not new measured peaks**. No CPU
+kernel or Accelerate behavior changes with these scheduling reservations.
+
+Re-measure each affected unit with empty caches and `-j1` on the affected host
+and product profile. Then validate concurrent admission on a 48 GiB host with
+at least 8 GiB left outside the build budget. Do not extrapolate the historical
+Linux measurements to a different target, optimization mode, or backend set.
+
+`diagnose-zig-build-memory.sh` now assigns each polling pass a sample ID.
+Summarize its trace with:
+
+```sh
+python3 scripts/summarize_zig_compile_memory.py /tmp/build.rss.tsv \
+  --output /tmp/build.units.json
+```
+
+The report retains per-unit peak commands, recommends whole-GiB reservations
+with 25% headroom, and reports the sampled aggregate compiler RSS. Legacy
+six-column traces produce an explicitly approximate aggregate upper envelope.
+Sampling can miss short-lived peaks; retain raw traces and build provenance.
+Final reservation qualification still requires fresh cold-build evidence.
+
 ### C API composition
 
 `libantfly` links the sectioned PIC storage and enrichment artifacts, plus the
@@ -599,7 +627,7 @@ Build both the executable and canonical C API:
 ```sh
 zig build antfly capi \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -619,7 +647,7 @@ zig build antfly capi \
   --cache-dir /tmp/antfly-candidate-local-cache \
   --global-cache-dir /tmp/antfly-candidate-global-cache \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \
@@ -634,20 +662,20 @@ Do not compare a cold candidate with a warm baseline.
 
 ```sh
 zig build antfly capi \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false \
   -Dproduction-lsm-only=true
 
 zig build capi-test capi-smoke antfly-standalone-runtime-test \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Donnx=false \
   -Dmetal=false \
   -Dsystem-blas=false
 
 zig build \
-  -Doptimize=Debug \
+  -Doptimize=debug \
   -Dproduction-lsm-only=false
 
 zig build lmdb-test antfly-storage-lmdb-test
@@ -683,7 +711,7 @@ zig build antfly capi \
   --cache-dir /tmp/antfly-report-local-cache \
   --global-cache-dir /tmp/antfly-report-global-cache \
   -Dtarget=aarch64-linux-musl \
-  -Doptimize=ReleaseFast \
+  -Doptimize=fast \
   -Dstrip=true \
   -Dcpu=baseline \
   -Donnx=false \

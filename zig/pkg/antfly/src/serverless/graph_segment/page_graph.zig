@@ -38,7 +38,7 @@ pub const Root = struct {
     pub const metadata_version = 1;
 
     pub fn encode(self: Root) [encoded_bytes]u8 {
-        var bytes = [_]u8{0} ** encoded_bytes;
+        var bytes = @as([encoded_bytes]u8, @splat(0));
         @memcpy(bytes[0..8], "AFGROOT3");
         @memcpy(bytes[96..128], &self.domain);
         std.mem.writeInt(u64, bytes[80..88], self.nodes, .little);
@@ -121,7 +121,7 @@ const Planner = struct {
     removed_edges: u64 = 0,
     added_edges: u64 = 0,
 
-    fn deinit(self: *Planner) void {
+    pub fn deinit(self: *Planner) void {
         var changes = self.changes.keyIterator();
         while (changes.next()) |key| self.alloc.free(key.*);
         self.changes.deinit(self.alloc);

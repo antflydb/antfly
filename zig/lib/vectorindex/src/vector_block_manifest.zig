@@ -112,7 +112,7 @@ pub const Manifest = struct {
         writeU32(out[52..56], self.shard_count);
         writeU32(out[56..60], @intCast(self.segments.len));
         writeU32(out[60..64], @intCast(self.coverages.len));
-        writeU32(out[64..68], @intFromEnum(self.score_precision));
+        writeU32(out[64..68], @backingInt(self.score_precision));
         writeU32(out[68..72], Crc32.hash(out[0..68]));
         var pos = header_size;
         for (self.sealed_wals.slice()) |extent| {

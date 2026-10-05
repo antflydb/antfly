@@ -86,7 +86,7 @@ pub const SynonymWriter = struct {
 
         // 1. Number of groups
         const num_groups: u32 = @intCast(self.groups.items.len);
-        try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, num_groups))));
+        try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, num_groups))));
 
         // 2. Each group as length-prefixed roaring bitmap
         for (self.groups.items) |*group| {
@@ -97,7 +97,7 @@ pub const SynonymWriter = struct {
             const bitmap_bytes = try bitmap.toBytes(self.alloc);
             defer self.alloc.free(bitmap_bytes);
 
-            try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(bitmap_bytes.len))))));
+            try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(bitmap_bytes.len))))));
             try out.appendSlice(self.alloc, bitmap_bytes);
         }
 
@@ -129,7 +129,7 @@ pub const SynonymWriter = struct {
         defer self.alloc.free(fst_data);
 
         // 4. Write FST length + data
-        try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, @as(u32, @intCast(fst_data.len))))));
+        try out.appendSlice(self.alloc, &@as([4]u8, @bitCast(@as(u32, @as(u32, @intCast(fst_data.len))))));
         try out.appendSlice(self.alloc, fst_data);
 
         return try self.alloc.dupe(u8, out.items);

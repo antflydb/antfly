@@ -363,47 +363,47 @@ pub const Scenario = struct {
         name ++ ".production-data-plane-managed-index-publication",
     };
 
-    const production_baseline_ordinal: usize = @intFromEnum(Mode.production_data_plane_baseline);
-    const production_graph_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph);
-    const production_split_ordinal: usize = @intFromEnum(Mode.production_data_plane);
-    const production_graph_split_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split);
-    const production_graph_split_transport_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_transport_failure);
-    const production_graph_split_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_owner_restart);
-    const production_graph_split_partial_write_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_partial_write);
-    const production_graph_split_resource_pressure_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_resource_pressure);
-    const production_join_split_ordinal: usize = @intFromEnum(Mode.production_data_plane_join_split);
-    const production_durable_join_takeover_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_takeover);
-    const production_durable_join_cancellation_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_cancellation);
-    const production_durable_join_worker_retry_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_worker_retry);
-    const production_durable_join_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_owner_restart);
-    const production_durable_join_retry_exhaustion_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_retry_exhaustion);
-    const production_durable_join_cancellation_overlap_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_cancellation_overlapping_faults);
-    const production_durable_join_cancellation_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_durable_join_cancellation_owner_restart);
-    const production_graph_split_overlapping_faults_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_overlapping_faults);
-    const production_graph_split_socket_pressure_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_split_socket_pressure);
-    const production_service_rate_ordinal: usize = @intFromEnum(Mode.production_data_plane_service_rate);
-    const production_graph_hydration_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_hydration);
-    const production_graph_cancellation_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_cancellation);
-    const production_graph_cancellation_transport_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_cancellation_transport_failure);
-    const production_graph_authorization_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_inflight_authorization_revocation);
-    const production_graph_stale_snapshot_ordinal: usize = @intFromEnum(Mode.production_data_plane_graph_stale_snapshot_retry_exhaustion);
-    const production_global_query_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query);
-    const production_global_query_cancellation_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_cancellation);
-    const production_global_query_authorization_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_inflight_authorization_revocation);
-    const production_global_query_transport_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_transport_failure);
-    const production_global_query_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_global_query_owner_restart);
-    const production_query_cache_service_rate_ordinal: usize = @intFromEnum(Mode.production_data_plane_query_embedding_cache_service_rate);
-    const production_serverless_fencing_ordinal: usize = @intFromEnum(Mode.production_data_plane_serverless_generation_progress_conflict);
-    const production_replication_backfill_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_backfill_service_rate);
-    const production_replication_schema_change_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_schema_change_service_rate);
-    const production_replication_owner_restart_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_owner_restart_service_rate);
-    const production_replication_source_crash_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_source_crash_service_rate);
-    const production_replication_cancellation_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_cancellation_service_rate);
-    const production_replication_stale_owner_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_stale_owner_service_rate);
-    const production_replication_topology_change_ordinal: usize = @intFromEnum(Mode.production_data_plane_replication_topology_change_service_rate);
-    const production_authenticated_tenant_isolation_ordinal: usize = @intFromEnum(Mode.production_data_plane_authenticated_tenant_isolation);
-    const production_disk_capacity_pressure_ordinal: usize = @intFromEnum(Mode.production_data_plane_disk_capacity_pressure);
-    const production_managed_index_publication_ordinal: usize = @intFromEnum(Mode.production_data_plane_managed_index_publication);
+    const production_baseline_ordinal: usize = @backingInt(Mode.production_data_plane_baseline);
+    const production_graph_ordinal: usize = @backingInt(Mode.production_data_plane_graph);
+    const production_split_ordinal: usize = @backingInt(Mode.production_data_plane);
+    const production_graph_split_ordinal: usize = @backingInt(Mode.production_data_plane_graph_split);
+    const production_graph_split_transport_ordinal: usize = @backingInt(Mode.production_data_plane_graph_split_transport_failure);
+    const production_graph_split_owner_restart_ordinal: usize = @backingInt(Mode.production_data_plane_graph_split_owner_restart);
+    const production_graph_split_partial_write_ordinal: usize = @backingInt(Mode.production_data_plane_graph_split_partial_write);
+    const production_graph_split_resource_pressure_ordinal: usize = @backingInt(Mode.production_data_plane_graph_split_resource_pressure);
+    const production_join_split_ordinal: usize = @backingInt(Mode.production_data_plane_join_split);
+    const production_durable_join_takeover_ordinal: usize = @backingInt(Mode.production_data_plane_durable_join_takeover);
+    const production_durable_join_cancellation_ordinal: usize = @backingInt(Mode.production_data_plane_durable_join_cancellation);
+    const production_durable_join_worker_retry_ordinal: usize = @backingInt(Mode.production_data_plane_durable_join_worker_retry);
+    const production_durable_join_owner_restart_ordinal: usize = @backingInt(Mode.production_data_plane_durable_join_owner_restart);
+    const production_durable_join_retry_exhaustion_ordinal: usize = @backingInt(Mode.production_data_plane_durable_join_retry_exhaustion);
+    const production_durable_join_cancellation_overlap_ordinal: usize = @backingInt(Mode.production_data_plane_durable_join_cancellation_overlapping_faults);
+    const production_durable_join_cancellation_owner_restart_ordinal: usize = @backingInt(Mode.production_data_plane_durable_join_cancellation_owner_restart);
+    const production_graph_split_overlapping_faults_ordinal: usize = @backingInt(Mode.production_data_plane_graph_split_overlapping_faults);
+    const production_graph_split_socket_pressure_ordinal: usize = @backingInt(Mode.production_data_plane_graph_split_socket_pressure);
+    const production_service_rate_ordinal: usize = @backingInt(Mode.production_data_plane_service_rate);
+    const production_graph_hydration_ordinal: usize = @backingInt(Mode.production_data_plane_graph_hydration);
+    const production_graph_cancellation_ordinal: usize = @backingInt(Mode.production_data_plane_graph_cancellation);
+    const production_graph_cancellation_transport_ordinal: usize = @backingInt(Mode.production_data_plane_graph_cancellation_transport_failure);
+    const production_graph_authorization_ordinal: usize = @backingInt(Mode.production_data_plane_graph_inflight_authorization_revocation);
+    const production_graph_stale_snapshot_ordinal: usize = @backingInt(Mode.production_data_plane_graph_stale_snapshot_retry_exhaustion);
+    const production_global_query_ordinal: usize = @backingInt(Mode.production_data_plane_global_query);
+    const production_global_query_cancellation_ordinal: usize = @backingInt(Mode.production_data_plane_global_query_cancellation);
+    const production_global_query_authorization_ordinal: usize = @backingInt(Mode.production_data_plane_global_query_inflight_authorization_revocation);
+    const production_global_query_transport_ordinal: usize = @backingInt(Mode.production_data_plane_global_query_transport_failure);
+    const production_global_query_owner_restart_ordinal: usize = @backingInt(Mode.production_data_plane_global_query_owner_restart);
+    const production_query_cache_service_rate_ordinal: usize = @backingInt(Mode.production_data_plane_query_embedding_cache_service_rate);
+    const production_serverless_fencing_ordinal: usize = @backingInt(Mode.production_data_plane_serverless_generation_progress_conflict);
+    const production_replication_backfill_ordinal: usize = @backingInt(Mode.production_data_plane_replication_backfill_service_rate);
+    const production_replication_schema_change_ordinal: usize = @backingInt(Mode.production_data_plane_replication_schema_change_service_rate);
+    const production_replication_owner_restart_ordinal: usize = @backingInt(Mode.production_data_plane_replication_owner_restart_service_rate);
+    const production_replication_source_crash_ordinal: usize = @backingInt(Mode.production_data_plane_replication_source_crash_service_rate);
+    const production_replication_cancellation_ordinal: usize = @backingInt(Mode.production_data_plane_replication_cancellation_service_rate);
+    const production_replication_stale_owner_ordinal: usize = @backingInt(Mode.production_data_plane_replication_stale_owner_service_rate);
+    const production_replication_topology_change_ordinal: usize = @backingInt(Mode.production_data_plane_replication_topology_change_service_rate);
+    const production_authenticated_tenant_isolation_ordinal: usize = @backingInt(Mode.production_data_plane_authenticated_tenant_isolation);
+    const production_disk_capacity_pressure_ordinal: usize = @backingInt(Mode.production_data_plane_disk_capacity_pressure);
+    const production_managed_index_publication_ordinal: usize = @backingInt(Mode.production_data_plane_managed_index_publication);
 
     const metadata_role = vopr.id.stable(name, "role.metadata");
     const public_data_role = vopr.id.stable(name, "role.public-data");
@@ -687,7 +687,7 @@ pub const Scenario = struct {
     const query_cache_producer_operation = vopr.service_rate.Operation.named(name ++ ".query-cache-producer-compute", 5);
     const replication_snapshot_operation = vopr.service_rate.Operation.named(name ++ ".replication-snapshot-step", 40);
     const replication_stream_operation = vopr.service_rate.Operation.named(name ++ ".replication-stream-step", 25);
-    const query_cache_key: query_embedding_cache.Key = [_]u8{0x41} ** 32;
+    const query_cache_key: query_embedding_cache.Key = @as([32]u8, @splat(0x41));
     const service_nodes = [_]vopr.service_rate.Node{
         .{ .id = deployment_node_ids[0], .name = name ++ ".node.1" },
         .{ .id = deployment_node_ids[1], .name = name ++ ".node.2" },
@@ -950,7 +950,12 @@ pub const Scenario = struct {
                 // has a deeper synchronous frame chain than focused suites.
                 // Match a conventional native main-thread stack so VOPR does
                 // not turn ordinary production stack use into a fiber fault.
-                .tasks = .{ .stack_size = 8 * 1024 * 1024 },
+                // 8 MiB overflowed under Debug codegen on the equivalent
+                // single-DataServer Raft-merge campaign; this composition is
+                // deeper still (metadata quorum, three API nodes, a
+                // serverless worker), so use the same 32 MiB headroom as the
+                // other production-shaped VOPR configs.
+                .tasks = .{ .stack_size = 32 * 1024 * 1024 },
                 .network = .{ .max_sockets = 96, .stream_capacity = 256 * 1024 },
                 .files = .{ .capacity_bytes = 64 * 1024 * 1024 },
                 .instrumentation = .{ .enabled = false, .map_digest = 0x4655_4c4c },
@@ -1064,7 +1069,7 @@ pub const Scenario = struct {
             self.service_rate_model.deinit();
         }
 
-        fn deinit(self: *State) void {
+        pub fn deinit(self: *State) void {
             self.releaseRuntime();
             self.sim.deinit();
             std.debug.assert(self.fixture_allocator.deinit() == .ok);
@@ -2443,7 +2448,7 @@ pub const Scenario = struct {
         const production_progress = if (production) |production_fixture| production_fixture.primaryGroupProgress() else null;
         const cluster = state.clusterHealth();
         const resources = state.sim.resourceSnapshot();
-        try builder.addNamed(allocator, name ++ ".mode", if (state.mode) |mode| @as(i64, @intFromEnum(mode)) + 1 else 0);
+        try builder.addNamed(allocator, name ++ ".mode", if (state.mode) |mode| @as(i64, @backingInt(mode)) + 1 else 0);
         try builder.addNamed(allocator, name ++ ".production-phase", if (production) |production_fixture| production_fixture.phaseOrdinal() else 0);
         try builder.addNamed(allocator, name ++ ".production-metadata-phase", if (production) |production_fixture| production_fixture.metadataBootstrapPhaseOrdinal() else 0);
         try builder.addNamed(allocator, name ++ ".production-primary-commit", if (production_progress) |progress| @intCast(progress.commit_index) else 0);
@@ -2475,17 +2480,17 @@ pub const Scenario = struct {
         try builder.addNamed(allocator, name ++ ".production-tenant-identity-docs-read-status", if (production) |production_fixture| production_fixture.tenant_identity_docs_read_status else 0);
         try builder.addNamed(allocator, name ++ ".production-tenant-identity-docs-write-status", if (production) |production_fixture| production_fixture.tenant_identity_docs_write_status else 0);
         try builder.addNamed(allocator, name ++ ".production-tenant-identity-docs-absence-status", if (production) |production_fixture| production_fixture.tenant_identity_docs_absence_status else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-routing-started", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.routing_started)]) else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-forward-started", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.remote_forward_started)]) else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-forward-completed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.remote_forward_completed)]) else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-proposal-accepted", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.proposal_accepted)]) else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-proposal-persisted", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.proposal_persisted)]) else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-apply-confirmed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.apply_confirmed)]) else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-visibility-confirmed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.visibility_confirmed)]) else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-ack-ready", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@intFromEnum(data_runtime.DataRequestLifecyclePhase.response_ack_ready)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-routing-started", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@backingInt(data_runtime.DataRequestLifecyclePhase.routing_started)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-forward-started", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@backingInt(data_runtime.DataRequestLifecyclePhase.remote_forward_started)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-forward-completed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@backingInt(data_runtime.DataRequestLifecyclePhase.remote_forward_completed)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-proposal-accepted", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@backingInt(data_runtime.DataRequestLifecyclePhase.proposal_accepted)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-proposal-persisted", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@backingInt(data_runtime.DataRequestLifecyclePhase.proposal_persisted)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-apply-confirmed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@backingInt(data_runtime.DataRequestLifecyclePhase.apply_confirmed)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-visibility-confirmed", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@backingInt(data_runtime.DataRequestLifecyclePhase.visibility_confirmed)]) else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-ack-ready", if (production) |production_fixture| @intCast(production_fixture.request_lifecycle_counts[@backingInt(data_runtime.DataRequestLifecyclePhase.response_ack_ready)]) else 0);
         try builder.addNamed(allocator, name ++ ".production-request-last-group", if (production) |production_fixture| @intCast(production_fixture.last_request_lifecycle_group) else 0);
         try builder.addNamed(allocator, name ++ ".production-request-last-index", if (production) |production_fixture| @intCast(production_fixture.last_request_lifecycle_index) else 0);
-        try builder.addNamed(allocator, name ++ ".production-request-last-phase", if (production) |production_fixture| @intFromEnum(production_fixture.last_request_lifecycle_phase) + 1 else 0);
+        try builder.addNamed(allocator, name ++ ".production-request-last-phase", if (production) |production_fixture| @backingInt(production_fixture.last_request_lifecycle_phase) + 1 else 0);
         // Observation values are signed, but digests are opaque 64-bit
         // identities. Preserve every bit instead of trapping on hashes whose
         // high bit is set.
@@ -3309,7 +3314,7 @@ pub const StandbyScalingScenario = struct {
                 if (owners.primary) |*primary| std.hash.autoHash(&frontier, primary.lastLsn());
                 std.hash.autoHash(&frontier, owners.promoted_lsn);
                 if (owners.server) |*server|
-                    std.hash.autoHash(&frontier, server.ha_primary_mirror_last_lsn.load(.acquire));
+                    std.hash.autoHash(&frontier, server.hot_standby_primary_mirror_last_lsn.load(.acquire));
                 std.hash.autoHash(&frontier, owners.observed_progress);
             };
         }
@@ -3713,7 +3718,7 @@ fn runExactMode(
 test "full cluster VOPR bounded startup cleanup exact replay" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
-    const ordinal = @intFromEnum(Scenario.Mode.clean);
+    const ordinal = @backingInt(Scenario.Mode.clean);
     for ([_]u64{ 1, 32, 512, 8192 }) |budget| {
         try runExactMode(
             history_allocator.allocator(),
@@ -3736,13 +3741,13 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
     // modes receive a distinct focused gate and join this slice only after
     // their recorded history and exact replay pass within the tier budget.
     const promoted_mode_ordinals = [_]usize{
-        @intFromEnum(Scenario.Mode.clean),
-        @intFromEnum(Scenario.Mode.metadata_partition),
-        @intFromEnum(Scenario.Mode.node_restart),
-        @intFromEnum(Scenario.Mode.graph_inflight_restart),
-        @intFromEnum(Scenario.Mode.graph_topology_churn),
-        @intFromEnum(Scenario.Mode.graph_transport_failure),
-        @intFromEnum(Scenario.Mode.partial_http_write),
+        @backingInt(Scenario.Mode.clean),
+        @backingInt(Scenario.Mode.metadata_partition),
+        @backingInt(Scenario.Mode.node_restart),
+        @backingInt(Scenario.Mode.graph_inflight_restart),
+        @backingInt(Scenario.Mode.graph_topology_churn),
+        @backingInt(Scenario.Mode.graph_transport_failure),
+        @backingInt(Scenario.Mode.partial_http_write),
     };
     for (promoted_mode_ordinals) |mode_ordinal| {
         const mode_id = Scenario.mode_ids[mode_ordinal];
@@ -3752,7 +3757,7 @@ test "full cluster VOPR exact replays the composed deployment and recovery" {
 }
 
 test "full cluster VOPR graph inflight restart repeated exact replay" {
-    const ordinal = @intFromEnum(Scenario.Mode.graph_inflight_restart);
+    const ordinal = @backingInt(Scenario.Mode.graph_inflight_restart);
     for (0..3) |_| {
         var history_allocator: FixtureAllocator = .init;
         defer std.debug.assert(history_allocator.deinit() == .ok);
@@ -3763,14 +3768,14 @@ test "full cluster VOPR graph inflight restart repeated exact replay" {
 test "full cluster graph inflight restart cutoff drains parked hooks" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
-    const ordinal = @intFromEnum(Scenario.Mode.graph_inflight_restart);
+    const ordinal = @backingInt(Scenario.Mode.graph_inflight_restart);
     try runExactMode(history_allocator.allocator(), Scenario.mode_ids[ordinal], ordinal, 19_474, .bounded_lifecycle);
 }
 
 test "full cluster VOPR exact replays resource pressure recovery" {
     var history_allocator: FixtureAllocator = .init;
     defer std.debug.assert(history_allocator.deinit() == .ok);
-    const ordinal = @intFromEnum(Scenario.Mode.resource_pressure);
+    const ordinal = @backingInt(Scenario.Mode.resource_pressure);
     try runExactMode(history_allocator.allocator(), Scenario.mode_ids[ordinal], ordinal, 50_000, .complete);
 }
 

@@ -82,7 +82,7 @@ test "GC objective discovery and cleanup resume within bounded credits" {
         std.mem.writeInt(u64, &upper, if (i == 0) 33 else i, .big);
         try directory.put(&fixture, .{ .id = i + 1, .level = if (i == 0) 0 else 1, .size_bytes = 1, .path = @constCast("gc.sst"), .smallest_namespace_name = null, .smallest_key = &key, .largest_namespace_name = null, .largest_key = &upper, .entry_count = 1, .tombstone_count = if (i == 0) 1 else 0, .bloom_filter = null, .state = null });
     }
-    for ([_]u64{ 0, 8 }) |limit| try std.testing.checkAllAllocationFailures(allocator, Fixture.check, .{ directory, limit });
+    for ([_]u64{ 0, 8 }) |limit| try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Fixture.check, .{ directory, limit });
     var reclaim = Directory.Reclaimer.init(directory);
     var slices: usize = 0;
     while (true) {

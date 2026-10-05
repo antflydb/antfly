@@ -161,7 +161,7 @@ const InitControl = struct {
     fn control(self: *InitControl) Control {
         return .{ .ptr = self, .check_fn = validate };
     }
-    fn validate(raw: ?*anyopaque) !void {
+    pub fn validate(raw: ?*anyopaque) !void {
         const self: *InitControl = @ptrCast(@alignCast(raw orelse return error.TrainingStateIdentityMismatch));
         try check(self.primary);
         try check(self.secondary);
@@ -220,7 +220,7 @@ const ReadControl = struct {
     fn control(self: *ReadControl) Control {
         return .{ .ptr = self, .check_fn = validate };
     }
-    fn validate(raw: ?*anyopaque) !void {
+    pub fn validate(raw: ?*anyopaque) !void {
         const self: *ReadControl = @ptrCast(@alignCast(raw orelse return error.TrainingStateIdentityMismatch));
         try check(self.primary);
         try check(self.secondary);

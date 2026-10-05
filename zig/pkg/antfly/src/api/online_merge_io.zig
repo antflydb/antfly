@@ -85,11 +85,11 @@ test "online merge private standalone rewrite port pins authority and never fabr
     try std.testing.expectEqualStrings("native-owner-clock", observed);
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
     try std.testing.expectError(error.OnlineSourceScopeChanged, port.executeStandaloneRewrite(alloc, 3, "rows", request, .{}, gate));
-    state.role.store(@intFromEnum(gate_mod.Role.standby), .release);
+    state.role.store(@backingInt(gate_mod.Role.standby), .release);
     try std.testing.expectError(error.HAReadOnlyStandby, port.executeStandaloneRewrite(alloc, 2, "rows", request, .{}, gate));
-    state.role.store(@intFromEnum(gate_mod.Role.fenced_primary), .release);
+    state.role.store(@backingInt(gate_mod.Role.fenced_primary), .release);
     try std.testing.expectError(error.HAFencedPrimary, port.executeStandaloneRewrite(alloc, 2, "rows", request, .{}, gate));
-    state.role.store(@intFromEnum(gate_mod.Role.disabled), .release);
+    state.role.store(@backingInt(gate_mod.Role.disabled), .release);
     probe.change_generation = true;
     try std.testing.expectError(error.HAPromotedStandbyRequiresPrimaryOpen, port.executeStandaloneRewrite(alloc, 2, "rows", request, .{}, gate));
     try std.testing.expectEqual(@as(usize, 2), probe.calls);
@@ -198,4 +198,12 @@ test "online merge private port preserves source recovery errors through foreign
         probe.failure = failure;
         try std.testing.expectError(failure, port.execute(std.testing.allocator, 2, "rows", request, .{}));
     }
+
+    // Local storage uses the generic receipt name. Foreign dispatch retains
+    // the released status and its canonical decoded error instead of changing
+    // the wire identity when the implementation is renamed.
+    probe.failure = error.CorruptOrderedApplyReceipt;
+    try std.testing.expectError(error.CorruptRaftAppliedEntry, port.execute(std.testing.allocator, 2, "rows", request, .{}));
+    const local_port: Port = .{ .ptr = &probe, .execute_fn = Probe.execute };
+    try std.testing.expectError(error.CorruptOrderedApplyReceipt, local_port.execute(std.testing.allocator, 2, "rows", request, .{}));
 }

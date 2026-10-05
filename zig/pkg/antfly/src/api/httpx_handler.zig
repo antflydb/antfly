@@ -60,7 +60,7 @@ const AuthenticatedIdentity = http_server_mod.AuthenticatedIdentity;
 
 const common_secrets = @import("../common/secrets.zig");
 const common_config = @import("../common/config.zig");
-const ha_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
+const hot_standby_mutation_inventory = @import("../storage/hot_standby/mutation_inventory.zig");
 const cluster = @import("cluster.zig");
 const cluster_api_http = @import("cluster_api_http.zig");
 const connections_api = @import("connections.zig");
@@ -120,7 +120,7 @@ const ParsedGlobalQueryTable = struct {
     parsed: std.json.Parsed(metadata_openapi.GlobalStatefulQueryRequest),
     table_name: []const u8,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.parsed.deinit();
     }
 };
@@ -206,7 +206,7 @@ const DecodedRequestBody = struct {
     body: []u8,
     allocation: []u8,
 
-    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.allocation);
         self.* = undefined;
     }
@@ -382,6 +382,10 @@ fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []cons
 fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const jsonErrorResponse = AntflyApiHandler.jsonErrorResponse;
     return switch (err) {
+        error.UnsupportedExternalLakeSchemaType => jsonErrorResponse(ctx, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
+        error.ExternalLakeSchemaMismatch => jsonErrorResponse(ctx, 409, "lake files have incompatible column types or the supplied schema fingerprint does not match the detected schema"),
+        error.ExternalLakeSchemaUnavailable => jsonErrorResponse(ctx, 400, "lake schema metadata is unavailable; Parquet inference requires at least one file with a schema"),
+        error.ExternalLakeSchemaTooLarge => jsonErrorResponse(ctx, 400, "detected lake schema exceeds the 1024-column limit"),
         error.ReservedForeignKeySupportIndex => jsonErrorResponse(ctx, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => jsonErrorResponse(ctx, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => jsonErrorResponse(ctx, 409, "foreign-key support changed or is still building; refresh the schema and retry"),
@@ -641,7 +645,7 @@ test "httpx retrieval SSE writes before generation and preserves terminal outcom
             if (!self.json_request) try std.testing.expect(std.mem.indexOf(u8, self.bytes.items, "event: hit\n") != null);
             try std.testing.expectEqual(@as(i64, 128), chain[0].generator.max_tokens);
             if (self.fail_generation) return error.TestGenerationFailure;
-            return .{ .allocator = alloc, .content = try alloc.dupe(u8, ("x" ** 79) ++ "한국어 answer") };
+            return .{ .allocator = alloc, .content = try alloc.dupe(u8, (z17RepeatString("x", 79)) ++ "한국어 answer") };
         }
     };
     const alloc = std.testing.allocator;
@@ -943,7 +947,7 @@ pub const AntflyApiHandler = struct {
         try server.use(httpx.Middleware.bind("antfly-internal-service-auth", self, enforceInternalServiceAuth));
         try server.use(httpx.Middleware.bind("antfly-auth-before-encoded-body", self, authorizeBeforeEncodedBody));
         try server.use(httpx.Middleware.bind("antfly-request-content-encoding", self, decodeRequestContent));
-        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHaMutationPolicy));
+        try server.use(httpx.Middleware.bind("antfly-ha-mutation-policy", self, enforceHotStandbyMutationPolicy));
     }
 
     /// Authenticate and authorize compressed requests before spending CPU or
@@ -1103,8 +1107,8 @@ pub const AntflyApiHandler = struct {
     /// compatibility dispatcher or individual business handlers. The
     /// classifier consumes canonical application paths, so generated
     /// `/db/v1` routes and root contextual routes share one inventory.
-    fn enforceHaMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
-        if (try self.haMutationRejection(ctx)) |response| return response;
+    fn enforceHotStandbyMutationPolicy(self: *AntflyApiHandler, ctx: *httpx.Context, next: *httpx.Next) !httpx.Response {
+        if (try self.hotStandbyMutationRejection(ctx)) |response| return response;
         return next.call(ctx);
     }
 
@@ -1156,7 +1160,7 @@ pub const AntflyApiHandler = struct {
         try self.api_server.reachRequestLifecycle(.ingress, null);
         establishInternalRoutedBatchDeadline(ctx);
         establishInternalTxnPreDecisionDeadline(ctx);
-        if (try self.haMutationRejection(ctx)) |response| {
+        if (try self.hotStandbyMutationRejection(ctx)) |response| {
             try self.api_server.reachRequestLifecycle(.response_ready, null);
             return response;
         }
@@ -1191,15 +1195,15 @@ pub const AntflyApiHandler = struct {
         return self.internalServiceAuthRejection(ctx);
     }
 
-    fn haMutationRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
+    fn hotStandbyMutationRejection(self: *AntflyApiHandler, ctx: *httpx.Context) !?httpx.Response {
         const policy = self.api_server.hotStandbyMutationPolicy();
         if (!policy.failover_safe_mutations_only) return null;
         const path = http_server_mod.stripApiPrefix(ctx.request.uri.path);
-        const mutation = classifyHaMutation(ctx.request.method, path) orelse return null;
+        const mutation = classifyHotStandbyMutation(ctx.request.method, path) orelse return null;
         // Backup and table restore are adapters over the same durable cohort
         // and staging authority; handlers reject uncertified historical cuts.
         if ((mutation.surface == .cluster_restore or mutation.surface == .restore_job or mutation.surface == .table_restore or mutation.surface == .backup) and
-            self.api_server.haCoordinatedRestoreAvailable()) return null;
+            self.api_server.hotStandbyCoordinatedRestoreAvailable()) return null;
         if (policy.catalog_create_enabled and policy.remote_apply_mutations_enabled and
             mutation.surface == .table_catalog and ctx.request.method == .POST)
             return null;
@@ -1213,11 +1217,11 @@ pub const AntflyApiHandler = struct {
         return try ctx.json(.{
             .@"error" = "mutation is not continuously replicated while HA is active",
             .code = "ha_mutation_not_replicated",
-            .surface = @tagName(mutation.surface),
+            .surface = mutation.surface.wireName(),
         });
     }
 
-    fn classifyHaMutation(method: httpx.Method, path: []const u8) ?ha_mutation_inventory.Classification {
+    fn classifyHotStandbyMutation(method: httpx.Method, path: []const u8) ?hot_standby_mutation_inventory.Classification {
         const inventory_method: http_common.Method = switch (method) {
             .GET, .HEAD, .OPTIONS => return null,
             .POST => .POST,
@@ -1232,7 +1236,7 @@ pub const AntflyApiHandler = struct {
                 .disposition = .reject,
             },
         };
-        return ha_mutation_inventory.classify(inventory_method, path);
+        return hot_standby_mutation_inventory.classify(inventory_method, path);
     }
 
     fn metadataNotLeaderResponse(ctx: *httpx.Context) !httpx.Response {
@@ -1360,18 +1364,18 @@ pub const AntflyApiHandler = struct {
 
         // Canonical `/admin/v1/standby` and the pre-0.3 `/admin/v1/ha` alias;
         // the hot-standby handler normalises the path before dispatch.
-        const ha_admin_paths = [_][]const u8{
+        const hot_standby_admin_paths = [_][]const u8{
             admin_routes.standby,
             admin_routes.standby ++ "/*",
             admin_routes.legacy_standby_prefix,
             admin_routes.legacy_standby_prefix ++ "/*",
         };
-        const ha_handler = httpx.Handler.bind(self, haRoute);
-        inline for (ha_admin_paths) |path| {
-            try server.get(path, ha_handler);
-            try server.post(path, ha_handler);
-            try server.put(path, ha_handler);
-            try server.delete(path, ha_handler);
+        const hot_standby_handler = httpx.Handler.bind(self, hotStandbyRoute);
+        inline for (hot_standby_admin_paths) |path| {
+            try server.get(path, hot_standby_handler);
+            try server.post(path, hot_standby_handler);
+            try server.put(path, hot_standby_handler);
+            try server.delete(path, hot_standby_handler);
         }
         try server.post(admin_routes.maintenance_check, httpx.Handler.bind(self, checkStorage));
         try server.post(admin_routes.maintenance_compact, httpx.Handler.bind(self, compactStorage));
@@ -1380,17 +1384,17 @@ pub const AntflyApiHandler = struct {
         try self.registerRaftAdminRoutes(server);
         try server.delete(admin_routes.maintenance_jobs_prefix ++ "*", httpx.Handler.bind(self, cancelStorageMaintenanceJob));
 
-        const ha_internal_paths = [_][]const u8{
+        const hot_standby_internal_paths = [_][]const u8{
             internal_routes.standby,
             internal_routes.standby ++ "/*",
             internal_routes.legacy_standby,
             internal_routes.legacy_standby ++ "/*",
         };
-        inline for (ha_internal_paths) |path| {
-            try server.get(path, ha_handler);
-            try server.post(path, ha_handler);
-            try server.put(path, ha_handler);
-            try server.delete(path, ha_handler);
+        inline for (hot_standby_internal_paths) |path| {
+            try server.get(path, hot_standby_handler);
+            try server.post(path, hot_standby_handler);
+            try server.put(path, hot_standby_handler);
+            try server.delete(path, hot_standby_handler);
         }
 
         const group_prefix = routes.internal_groups_prefix ++ ":group_id";
@@ -1664,7 +1668,7 @@ pub const AntflyApiHandler = struct {
         return try respondOwnedContextualResponse(ctx, &response, self.api_server.alloc);
     }
 
-    fn haRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+    fn hotStandbyRoute(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const method: contextual_operations.Method = switch (ctx.request.method) {
             .GET => .get,
             .POST => .post,
@@ -1673,7 +1677,7 @@ pub const AntflyApiHandler = struct {
             else => return textResponse(ctx, 405, "method not allowed"),
         };
         const body = (try ctx.body()) orelse "";
-        var response = (try self.api_server.executeHaRoute(.{
+        var response = (try self.api_server.executeHotStandbyRoute(.{
             .method = method,
             .target = ctx.request.uri.raw,
             .authorization = ctx.header("authorization"),
@@ -2076,11 +2080,11 @@ pub const AntflyApiHandler = struct {
         return storageMaintenanceJobResponse(ctx, if (cancel) 202 else 200, snapshot);
     }
 
-    fn getStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+    pub fn getStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.readStorageMaintenanceJob(ctx, false);
     }
 
-    fn cancelStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+    pub fn cancelStorageMaintenanceJob(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         return self.readStorageMaintenanceJob(ctx, true);
     }
 
@@ -2691,7 +2695,7 @@ pub const AntflyApiHandler = struct {
         group_id: u64,
         table_name: []u8,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
         }
     };
@@ -2836,7 +2840,7 @@ pub const AntflyApiHandler = struct {
         key: []u8,
         artifact_name: []u8,
 
-        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
             alloc.free(self.table_name);
             alloc.free(self.key);
             alloc.free(self.artifact_name);
@@ -4695,7 +4699,7 @@ pub const AntflyApiHandler = struct {
         fn port(self: *@This()) transactions_api.SessionRegistry.StageValidator {
             return .{ .ptr = self, .validate = validate };
         }
-        fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, previous: ?*const transactions_api.OwnedTransactionCommitRequest, candidate: *transactions_api.OwnedTransactionCommitRequest, statement: *const transactions_api.OwnedTransactionCommitRequest) !void {
+        pub fn validate(ptr: *anyopaque, alloc: std.mem.Allocator, previous: ?*const transactions_api.OwnedTransactionCommitRequest, candidate: *transactions_api.OwnedTransactionCommitRequest, statement: *const transactions_api.OwnedTransactionCommitRequest) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try @import("relational_session_statement.zig").validate(self.server, alloc, previous, candidate, statement, self.context);
         }
@@ -6506,7 +6510,7 @@ pub const AntflyApiHandler = struct {
         logical: ?[]u8 = null,
         table_id: ?u64 = null,
 
-        fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        pub fn deinit(self: @This(), alloc: std.mem.Allocator) void {
             alloc.free(self.physical);
             if (self.logical) |logical| alloc.free(logical);
         }
@@ -7926,7 +7930,29 @@ pub const AntflyApiHandler = struct {
         };
         defer scan_req.deinit(alloc);
 
+        const operation_id = if (relational) "queryRelationalRows" else "scanKeys";
+        if (try self.acquirePublicOperation(ctx, operation_id)) |response| return response;
+        defer self.releasePublicOperation(operation_id);
         const request = operationContext(ctx, authenticated_identity);
+        if (relational) if (binding.logical) |logical| {
+            var lake_adapter: @import("sql_execution.zig").Adapter = .{ .server = self.api_server, .identity = &authenticated_identity, .context = request };
+            const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| return switch (err) {
+                error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
+                error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
+                error.CatalogGenerationChanged, error.ExternalLakeSnapshotMismatch => jsonErrorResponse(ctx, 409, "external table snapshot changed"),
+                error.InvalidQueryRequest, error.InvalidSqlDateTime, error.SqlTypeMismatch, error.UndefinedColumn, error.SqlUnknownColumn, error.RowPolicyUnsupported, error.UnsupportedRowsQuery, error.UnsupportedSqlExecution => jsonErrorResponse(ctx, 400, "external table does not support this read"),
+                error.Canceled, error.Cancelled => error.Canceled,
+                error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
+                else => jsonErrorResponse(ctx, 503, "external table read unavailable"),
+            };
+            if (lake_result) |ndjson| {
+                defer alloc.free(ndjson);
+                var writer = try ctx.streamResponseWithContentType(200, "application/x-ndjson");
+                try writer.write(ndjson);
+                try writer.close();
+                return ctx.response.build();
+            }
+        };
         scan_req.opts.execution_deadline_ns = request.deadline_ns;
         if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null)
             scan_req.opts.cancellation = request.cancellation;
@@ -7957,9 +7983,6 @@ pub const AntflyApiHandler = struct {
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| try http_server_mod.injectRowFilterIntoScanRequest(alloc, &scan_req, value);
 
-        const operation_id = if (relational) "queryRelationalRows" else "scanKeys";
-        if (try self.acquirePublicOperation(ctx, operation_id)) |response| return response;
-        defer self.releasePublicOperation(operation_id);
         const source = self.api_server.table_reads orelse {
             if (relational) return jsonErrorResponse(ctx, 404, "not found");
             _ = ctx.status(404);
@@ -9403,7 +9426,7 @@ const HttpxE2eServer = struct {
         self.thread = try std.testing.io.concurrent(listenHttpxE2eServer, .{&self.server});
     }
 
-    fn deinit(self: *HttpxE2eServer) void {
+    pub fn deinit(self: *HttpxE2eServer) void {
         if (self.thread) |*thread| {
             self.server.stop();
             thread.await(std.testing.io);
@@ -9820,7 +9843,7 @@ pub const SchemaUpdateStatusSource = struct {
 
     fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
 
-    fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
+    pub fn updateSchema(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, schema_json: []const u8) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         try std.testing.expectEqualStrings("docs", table_name);
         try self.replaceSchemaJson(alloc, schema_json);
@@ -9890,7 +9913,7 @@ const SchemaReconcileWriteSource = struct {
         return {};
     }
 
-    fn updateSchema(
+    pub fn updateSchema(
         ptr: *anyopaque,
         _: std.mem.Allocator,
         _: []const u8,
@@ -10058,7 +10081,7 @@ test "internal transaction HTTP responses prove not-proposed only before decisio
         .{ .name = "group_id", .value = "7" },
         .{ .name = "table_name", .value = "docs" },
     };
-    const txn_id = [_]u8{0x42} ** 16;
+    const txn_id = @as([16]u8, @splat(0x42));
 
     const begin_body = try distributed_txn.encodeTxnBeginRequest(std.testing.allocator, .{
         .txn_id = txn_id,
@@ -10287,21 +10310,21 @@ test "internal transaction ingress establishes and validates pre-decision deadli
 }
 
 test "HA mutation middleware fails closed for unregistered HTTP methods" {
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.GET, "/tables/docs") == null);
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.HEAD, "/tables/docs") == null);
-    try std.testing.expect(AntflyApiHandler.classifyHaMutation(.OPTIONS, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.GET, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.HEAD, "/tables/docs") == null);
+    try std.testing.expect(AntflyApiHandler.classifyHotStandbyMutation(.OPTIONS, "/tables/docs") == null);
 
-    const global_query = AntflyApiHandler.classifyHaMutation(.POST, routes.global_query).?;
-    try std.testing.expectEqual(ha_mutation_inventory.Surface.read_like_post, global_query.surface);
-    try std.testing.expectEqual(ha_mutation_inventory.Disposition.read_only, global_query.disposition);
+    const global_query = AntflyApiHandler.classifyHotStandbyMutation(.POST, routes.global_query).?;
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.read_like_post, global_query.surface);
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.read_only, global_query.disposition);
 
-    const unknown_query_suffix = AntflyApiHandler.classifyHaMutation(.POST, "/query/future-action").?;
-    try std.testing.expectEqual(ha_mutation_inventory.Surface.unclassified_non_get, unknown_query_suffix.surface);
-    try std.testing.expectEqual(ha_mutation_inventory.Disposition.reject, unknown_query_suffix.disposition);
+    const unknown_query_suffix = AntflyApiHandler.classifyHotStandbyMutation(.POST, "/query/future-action").?;
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.unclassified_non_get, unknown_query_suffix.surface);
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.reject, unknown_query_suffix.disposition);
 
-    const patch = AntflyApiHandler.classifyHaMutation(.PATCH, "/tables/docs").?;
-    try std.testing.expectEqual(ha_mutation_inventory.Surface.unclassified_non_get, patch.surface);
-    try std.testing.expectEqual(ha_mutation_inventory.Disposition.reject, patch.disposition);
+    const patch = AntflyApiHandler.classifyHotStandbyMutation(.PATCH, "/tables/docs").?;
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Surface.unclassified_non_get, patch.surface);
+    try std.testing.expectEqual(hot_standby_mutation_inventory.Disposition.reject, patch.disposition);
 }
 
 test "httpx multi batch route uses the batch commit hook and public response contract" {
@@ -10344,7 +10367,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
             return error.TestUnexpectedResult;
         }
 
-        fn commitTransaction(
+        pub fn commitTransaction(
             ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const distributed_txn.TableCommitRequest,
@@ -10415,7 +10438,7 @@ test "httpx multi batch route uses the batch commit hook and public response con
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, status.iface(), null, writes.source());
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
         // Restricted test environments may forbid even loopback listeners.
@@ -10661,7 +10684,7 @@ test "httpx stable transaction commit durably hands off recovery before acknowle
     const alloc = std.testing.allocator;
     var status = AuthStatusSource{};
     var writes = FakeWrites{};
-    var api_server = ApiHttpServer.init(alloc, .{}, status.iface(), null, writes.source());
+    var api_server = ApiHttpServer.init(alloc, .{ .deployment_mode = .standalone }, status.iface(), null, writes.source());
     defer api_server.deinit();
     var e2e_server: HttpxE2eServer = undefined;
     e2e_server.init(alloc, &api_server) catch |err| switch (err) {
@@ -12054,7 +12077,7 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
 
     const address = e2e_server.server.boundAddress() orelse return error.AddressNotAvailable;
     const client_io = std.Io.Threaded.global_single_threaded.io();
-    var clients = [_]?httpx.Socket{null} ** 128;
+    var clients = @as([128]?httpx.Socket, @splat(null));
     defer for (&clients) |*slot| {
         if (slot.*) |*client| client.close();
         slot.* = null;
@@ -12144,12 +12167,16 @@ test "httpx production path sheds 128 abandoned queries and preserves control re
     for (&clients) |*slot| {
         if (slot.*) |*client| {
             var linger = std.posix.linger{ .onoff = 1, .linger = 0 };
-            std.posix.setsockopt(
+            // This is best-effort test cleanup: the peer may have already
+            // invalidated the socket, and Zig 0.17 treats EINVAL as
+            // unreachable in the checked wrapper.
+            _ = std.posix.system.setsockopt(
                 client.handle,
                 std.posix.SOL.SOCKET,
                 std.posix.SO.LINGER,
-                std.mem.asBytes(&linger),
-            ) catch {};
+                std.mem.asBytes(&linger).ptr,
+                @sizeOf(std.posix.linger),
+            );
             client.close();
         }
         slot.* = null;
@@ -12715,7 +12742,7 @@ test "httpx SQL connection routes preserve settings and retire prepared resource
         const Reply = struct {
             status: u16,
             body: []u8,
-            fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
                 allocator.free(self.body);
             }
         };
@@ -12849,7 +12876,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             try context.ensureActive();
             // This fixture has no row-policy publication. The production
             // admission path treats that absence as an unprotected table.
-            if (input == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (input == .policy_publication_status) return a.dupe(u8, "null");
             self.calls += 1;
             if (self.replace_after_open and self.calls == 3) return error.CatalogGenerationChanged;
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = self.schema }, .{});
@@ -13379,7 +13406,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .{ .key = "b", .value = "{\"id\":\"u2\",\"status\":\"closed\",\"quantity\":7}" },
         }, .timestamp_ns = 42 });
         var text_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &text_db, raft_mod.read_gate.alreadyReadSafeBarrier());
-        var text_writes = @import("table_writes.zig").BoundTableWriteSource.init("usage_records", &text_db);
+        var text_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &text_db);
         var text_source: Source = .{ .schema = text_schema_json, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = text_schema_json }} };
         var text_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &text_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, text_reads.source(), text_writes.source());
         defer text_server.deinit();
@@ -13709,7 +13736,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             defer timestamp_db.close();
             try timestamp_db.setSchemaJson(alloc, timestamp_schema_json);
             var timestamp_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &timestamp_db, raft_mod.read_gate.alreadyReadSafeBarrier());
-            var timestamp_writes = @import("table_writes.zig").BoundTableWriteSource.init("usage_records", &timestamp_db);
+            var timestamp_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &timestamp_db);
             var timestamp_source: Source = .{ .schema = timestamp_schema_json, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = timestamp_schema_json }} };
             var timestamp_server = ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .session_store = &prepared_durable }, .{ .ptr = &timestamp_source, .vtable = &.{ .status = Source.status, .system_catalog = Source.catalog, .admin_snapshot = Source.snapshot, .free_admin_snapshot = Source.freeSnapshot, .supports_query_definitions = true } }, timestamp_reads.source(), timestamp_writes.source());
             defer timestamp_server.deinit();
@@ -13737,8 +13764,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     }
     {
         // sql-0048/sql-0050 storage half: the cursor's blocking ORDER BY query
-        // falls back from pull streaming to a bounded native result. Its
-        // pgwire DECLARE/FETCH lifecycle is checked in protocol_test.zig.
+        // uses the bounded native spool. Verify pull ownership and ordering
+        // before exercising the pgwire DECLARE/FETCH lifecycle below.
         var user_store = usermgr.MemoryStore.init(alloc);
         defer user_store.deinit();
         var policies = casbin.MemoryAdapter.init(alloc);
@@ -13765,7 +13792,23 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
             .cancel_requested = &canceled,
         };
-        try std.testing.expect((try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) == null);
+        {
+            const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;
+            defer stream.close(stream.context);
+            const expected = [_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" };
+            var offset: usize = 0;
+            while (true) {
+                var page = try stream.next(stream.context, alloc, request, 2);
+                defer page.result.deinit();
+                for (page.result.rows) |row| {
+                    try std.testing.expect(offset < expected.len);
+                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), row[0].integer);
+                    offset += 1;
+                }
+                if (page.exhausted) break;
+            }
+            try std.testing.expectEqual(expected.len, offset);
+        }
         var result_arena = std.heap.ArenaAllocator.init(alloc);
         defer result_arena.deinit();
         var result = try wire_backend.vtable.execute(wire_backend.context, result_arena.allocator(), credential, request);
@@ -13809,7 +13852,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         var frames: @import("../pgwire/protocol.zig").Cursor = .{ .bytes = wire_output.written() };
         const expected_ids = [_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" };
         var row_index: usize = 0;
-        var prepared_seen = [_]bool{false} ** 3;
+        var prepared_seen = @as([3]bool, @splat(false));
         var fetched_one = false;
         var fetched_eight = false;
         while (frames.offset < frames.bytes.len) {
@@ -13860,7 +13903,7 @@ test "httpx SQL executes one relational page with exact integer parameters" {
         defer text_db.close();
         try text_db.setSchemaJson(alloc, text_schema);
         var text_reads = table_reads.BoundTableReadSource.init("usage_records", 7, &text_db, raft_mod.read_gate.alreadyReadSafeBarrier());
-        var text_writes = @import("table_writes.zig").BoundTableWriteSource.init("usage_records", &text_db);
+        var text_writes = @import("antfly_source_root").antfly_sources.table_writes.BoundTableWriteSource.init("usage_records", &text_db);
         var text_source: Source = .{ .schema = text_schema, .records = .{.{ .table_id = 7, .name = "usage_records", .schema_json = text_schema }} };
         var user_store = usermgr.MemoryStore.init(alloc);
         defer user_store.deinit();
@@ -14007,7 +14050,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
         }
         fn catalog(_: *anyopaque, a: std.mem.Allocator, context: operation_contract.RequestContext, input: @import("../system_catalog/server_call.zig").Call) ![]u8 {
             try context.ensureActive();
-            if (input == .policy_publication_status) return error.RowPolicyCatalogChanged;
+            if (input == .policy_publication_status) return a.dupe(u8, "null");
             if (input == .write_validation) return std.json.Stringify.valueAlloc(a, .{ .schema_json = schema_json }, .{});
             if (input != .resolve_many) return error.UnexpectedCatalogCall;
             if (input.resolve_many.targets.len != 1 or !std.mem.eql(u8, input.resolve_many.targets[0].table, "usage_records")) return error.UnexpectedCatalogCall;
@@ -14023,7 +14066,7 @@ test "httpx SQL coordinated UNIQUE owner rejects duplicate batch and updates def
             const self: *Self = @ptrCast(@alignCast(ptr));
             if (opts.relational_integrity_catalog) return .{ .json = try a.dupe(u8, self.envelope), .version = 0 };
             if (opts.relational_activation_json.len != 0) {
-                const coverage = .{ .schema_version = @as(u32, 1), .schema_digest = self.digest, .generation_set = self.generation_set, .owner = [_]u8{1} ** 32, .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = true, .state = activation.State.enforced, .phase = activation.Phase.unique, .rows_scanned = @as(u64, 0), .failure = @as([]const u8, "") };
+                const coverage = .{ .schema_version = @as(u32, 1), .schema_digest = self.digest, .generation_set = self.generation_set, .owner = @as([32]u8, @splat(1)), .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = true, .state = activation.State.enforced, .phase = activation.Phase.unique, .rows_scanned = @as(u64, 0), .failure = @as([]const u8, "") };
                 return .{ .json = try std.json.Stringify.valueAlloc(a, coverage, .{}), .version = 0 };
             }
             if (opts.relational_integrity_jobs_json.len != 0) {
@@ -14438,7 +14481,13 @@ test "httpx lookup revalidates missing catalog bindings across restore" {
         const original = "{\"table_id\":7,\"name\":\"physical-old\"}";
 
         fn catalog(ptr: *anyopaque, alloc: std.mem.Allocator, _: operation_contract.RequestContext, call: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            // This fixture has no row policy publication. The catalog still
+            // authoritatively answers the policy probe before the row lookup.
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            // This fixture has no row-policy publication. The production
+            // admission path treats that absence as an unprotected table.
+            if (call == .policy_publication_status) return alloc.dupe(u8, "null");
             const target = switch (call) {
                 .resolve => |target| target,
                 else => return error.UnexpectedTestCall,
@@ -14946,7 +14995,7 @@ test "httpx schema rewrite accepted job atomically stores draft and preserves id
         admissions: std.atomic.Value(u32) = .init(0),
         creates: std.atomic.Value(u32) = .init(0),
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.key) |value| self.alloc.free(value);
             if (self.row) |value| self.alloc.free(value);
             if (self.plan) |value| self.alloc.free(value);
@@ -15332,4 +15381,15 @@ test "httpx antfly cluster restore preserves backup location validation" {
         "{\"error\":\"unsupported backup location\"}",
         resp.body.?,
     );
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

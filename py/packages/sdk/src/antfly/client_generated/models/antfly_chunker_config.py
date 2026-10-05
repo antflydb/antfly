@@ -33,11 +33,14 @@ class AntflyChunkerConfig:
       is chunked at most once per write.
 
         Example:
-            {'provider': 'antfly', 'api_url': 'http://localhost:8080', 'model': 'fixed', 'max_chunks': 50, 'text':
-                {'target_tokens': 500, 'overlap_tokens': 50, 'separator': '\n\n'}}
+            {'provider': 'antfly', 'api_url': 'http://localhost:8080', 'model': 'fixed', 'text': {'target_tokens': 500,
+                'overlap_tokens': 50, 'separator': '\n\n'}}
 
         Attributes:
-            max_chunks (int | Unset): Maximum number of chunks to generate per document.
+            max_chunks (int | Unset): Maximum number of chunks to generate per document. Zero (the default when omitted)
+                means unlimited: the document is chunked in full. Set an explicit value up to 4096 to cap output; any chunks
+                beyond the cap are silently omitted, so treat a result whose chunk count equals `max_chunks` as potentially
+                truncated.
             threshold (float | Unset): Confidence threshold for model-based chunking (0.0-1.0).
             text (TextChunkOptions | Unset): Options specific to text chunking.
             audio (AudioChunkOptions | Unset): Options specific to audio chunking.

@@ -431,6 +431,7 @@ pub const OwnedBatchRequest = struct {
     transforms: []db_mod.types.DocumentTransform = &.{},
     graph_writes: []db_mod.types.GraphEdgeWrite = &.{},
     graph_deletes: []db_mod.types.GraphEdgeDelete = &.{},
+    graph_endpoint_cleanup_guards: ?std.json.Parsed([]const @import("../storage/graph_cleanup_contract.zig").Guard) = null,
     predicates: []db_mod.types.TransactionVersionPredicate = &.{},
     integrity: []const db_mod.types.TransactionIntegrityOperation = &.{},
     integrity_commands: ?std.json.Parsed([]const @import("../storage/db/relational_integrity_contract.zig").Command) = null,
@@ -465,6 +466,7 @@ pub const OwnedBatchRequest = struct {
     pub fn deinit(self: *OwnedBatchRequest, alloc: std.mem.Allocator) void {
         @import("relational_integrity_wire.zig").free(alloc, self.integrity);
         if (self.integrity_commands) |*commands| commands.deinit();
+        if (self.graph_endpoint_cleanup_guards) |*guards| guards.deinit();
         if (self.range_guards) |*guards| guards.deinit();
         if (self.relational_activation) |*activation| activation.deinit();
         if (self.relational_retirement) |*retirement| retirement.deinit();
@@ -891,6 +893,13 @@ fn parseBatchRequestWithOptions(
     };
     errdefer freeGraphDeletes(alloc, graph_deletes);
 
+    var graph_endpoint_cleanup_guards: ?std.json.Parsed([]const @import("../storage/graph_cleanup_contract.zig").Guard) = null;
+    errdefer if (graph_endpoint_cleanup_guards) |*guards| guards.deinit();
+    if (root.get("_graph_endpoint_cleanup_guards")) |value| {
+        if (!allow_internal or value != .array or value.array.items.len > 256) return error.InvalidBatchRequest;
+        graph_endpoint_cleanup_guards = try std.json.parseFromValue([]const @import("../storage/graph_cleanup_contract.zig").Guard, alloc, value, .{ .allocate = .alloc_always });
+    }
+
     const predicates: []db_mod.types.TransactionVersionPredicate = predicates: {
         const value = root.get("_predicates") orelse break :predicates &.{};
         if (!allow_internal or value != .array) return error.InvalidBatchRequest;
@@ -1100,16 +1109,10 @@ fn parseBatchRequestWithOptions(
     var merge_artifacts: ?std.json.Parsed([]const db_mod.types.BatchWrite) = null;
     errdefer if (merge_artifacts) |*value| value.deinit();
     if (root.get("_merge_artifacts")) |value| {
-        if (!allow_internal or merge_replication == null) return error.InvalidBatchRequest;
+        if (!allow_internal) return error.InvalidBatchRequest;
         merge_artifacts = try std.json.parseFromValue([]const db_mod.types.BatchWrite, alloc, value, .{ .allocate = .alloc_always });
-        try db_mod.types.validateMergeArtifacts(.{
-            .merge_replication = merge_replication,
-            .merge_artifacts = merge_artifacts.?.value,
-            .writes = writes,
-            .deletes = deletes,
-            .transforms = transforms,
-            .predicates = predicates,
-        });
+        // Validate against the complete request below: cleanup afterimages
+        // require the planned page's guards as well as its private flags.
     }
 
     var transition_key: ?[]u8 = null;
@@ -1443,6 +1446,7 @@ fn parseBatchRequestWithOptions(
         .transforms = transforms,
         .graph_writes = graph_writes,
         .graph_deletes = graph_deletes,
+        .graph_endpoint_cleanup_guards = graph_endpoint_cleanup_guards,
         .predicates = predicates,
         .integrity = integrity,
         .integrity_commands = integrity_commands,
@@ -1502,8 +1506,11 @@ fn parseBatchRequestWithOptions(
             .writes = writes,
             .deletes = deletes,
             .transforms = transforms,
+            .graph_endpoint_cleanup_planned = if (root.get("_graph_endpoint_cleanup_planned")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
+            .graph_endpoint_cleanup = if (root.get("_graph_endpoint_cleanup")) |value| if (allow_internal and value == .bool) value.bool else return error.InvalidBatchRequest else false,
             .graph_writes = graph_writes,
             .graph_deletes = graph_deletes,
+            .graph_endpoint_cleanup_guards = if (graph_endpoint_cleanup_guards) |guards| guards.value else &.{},
             .predicates = predicates,
             .timestamp_ns = timestamp_ns,
             .sync_level = sync_level,
@@ -1520,6 +1527,14 @@ fn parseBatchRequestWithOptions(
         },
     };
     try @import("../storage/range_protection.zig").validateRequest(result_value.req);
+    if (!allow_internal) {
+        const keys = @import("../storage/internal_keys.zig");
+        for (result_value.req.writes) |write| if (keys.isGraphEndpointCleanupControlKey(write.key)) return error.InvalidBatchRequest;
+        for (result_value.req.deletes) |key| if (keys.isGraphEndpointCleanupControlKey(key)) return error.InvalidBatchRequest;
+        for (result_value.req.transforms) |transform| if (keys.isGraphEndpointCleanupControlKey(transform.key)) return error.InvalidBatchRequest;
+    }
+    try validateGraphBatchCommand(result_value.req);
+    try db_mod.types.validateMergeArtifacts(result_value.req);
     try merge_pages.validateRequest(result_value.req);
     try @import("../storage/db/merge_proof_adoption.zig").validateRequest(result_value.req);
     try @import("../storage/db/online_source_contract.zig").validateRequest(result_value.req);
@@ -1550,6 +1565,15 @@ pub fn requiresRowSemanticsEnvelope(writes: anytype, predicates: []const db_mod.
     for (writes) |write| if (write.json_null_fields.len != 0) return true;
     for (predicates) |predicate| if (predicate.unique_absence) return true;
     return false;
+}
+
+// Native mutation validation uses a specific graph error; the wire codec
+// retains its invalid-request contract for malformed ownership combinations.
+fn validateGraphBatchCommand(req: db_mod.types.BatchRequest) !void {
+    db_mod.types.validateGraphEndpointCleanupCommand(req) catch |err| switch (err) {
+        error.InvalidGraphEdges => return error.InvalidBatchRequest,
+        else => return err,
+    };
 }
 
 pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchRequest) ![]u8 {
@@ -1585,6 +1609,7 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
     }
     if (req.relational_topology != null and (req.transaction != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
     if (req.relational_generation_gc != null and (req.transaction != null or req.relational_topology != null or req.row_policy_publication != null or req.writes.len != 0 or req.deletes.len != 0 or req.transforms.len != 0 or req.predicates.len != 0 or req.integrity.len != 0 or req.integrity_commands.len != 0 or req.relational_activation != null or req.relational_retirement != null or req.relational_index_maintenance != null or req.split_checkpoint != null or req.split_replication != null or req.split_transition != null or req.merge_checkpoint != null or req.merge_replication != null or req.merge_source_transition != null)) return error.InvalidBatchRequest;
+    try validateGraphBatchCommand(req);
     if (req.relational_generation_gc) |gc| try gc.validate();
     if (req.relational_topology != null and (req.relational_schema_version != null or req.relational_integrity_generation_set != null or req.relational_repair)) return error.InvalidBatchRequest;
     if (req.integrity.len != 0 and (req.transaction == null or req.transaction.? != .prepare)) return error.InvalidBatchRequest;
@@ -1830,11 +1855,19 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(",\"_integrity\":");
         try writer.writeAll(encoded_integrity.items);
     }
+    if (req.graph_endpoint_cleanup_planned) try writer.writeAll(",\"_graph_endpoint_cleanup_planned\":true");
+    if (req.graph_endpoint_cleanup_guards.len != 0) {
+        try writer.writeAll(",\"_graph_endpoint_cleanup_guards\":");
+        const guards_json = try std.json.Stringify.valueAlloc(alloc, req.graph_endpoint_cleanup_guards, .{});
+        defer alloc.free(guards_json);
+        try writer.writeAll(guards_json);
+    }
+    if (req.graph_endpoint_cleanup) try writer.writeAll(",\"_graph_endpoint_cleanup\":true");
     if (req.graph_writes.len > 0) {
         try writer.writeAll(",\"_graph_writes\":[");
         for (req.graph_writes, 0..) |write, i| {
             if (i != 0) try writer.writeByte(',');
-            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f},\"weight\":{d},\"created_at\":\"{d}\",\"updated_at\":\"{d}\",\"metadata_json\":{f}}}", .{
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f},\"weight\":{d},\"created_at\":\"{d}\",\"updated_at\":\"{d}\",\"metadata_json\":{f}", .{
                 std.json.fmt(write.index_name, .{}),
                 std.json.fmt(write.source, .{}),
                 std.json.fmt(write.target, .{}),
@@ -1844,6 +1877,9 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
                 write.updated_at,
                 std.json.fmt(write.metadata_json, .{}),
             });
+            if (write.edge_id.len > 0) try writer.print(",\"edge_id\":{f}", .{std.json.fmt(write.edge_id, .{})});
+            if (write.owner_document.len > 0) try writer.print(",\"owner_document\":{f}", .{std.json.fmt(write.owner_document, .{})});
+            try writer.writeByte('}');
         }
         try writer.writeByte(']');
     }
@@ -1851,12 +1887,16 @@ fn encodeBatchRequestOwned(alloc: std.mem.Allocator, req: db_mod.types.BatchRequ
         try writer.writeAll(",\"_graph_deletes\":[");
         for (req.graph_deletes, 0..) |delete, i| {
             if (i != 0) try writer.writeByte(',');
-            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f}}}", .{
+            try writer.print("{{\"index_name\":{f},\"source\":{f},\"target\":{f},\"edge_type\":{f}", .{
                 std.json.fmt(delete.index_name, .{}),
                 std.json.fmt(delete.source, .{}),
                 std.json.fmt(delete.target, .{}),
                 std.json.fmt(delete.edge_type, .{}),
             });
+            if (delete.edge_id.len > 0) try writer.print(",\"edge_id\":{f}", .{std.json.fmt(delete.edge_id, .{})});
+            if (delete.owner.len > 0) try writer.print(",\"owner\":{f}", .{std.json.fmt(delete.owner, .{})});
+            if (delete.owner_document.len > 0) try writer.print(",\"owner_document\":{f}", .{std.json.fmt(delete.owner_document, .{})});
+            try writer.writeByte('}');
         }
         try writer.writeByte(']');
     }
@@ -2128,6 +2168,12 @@ fn optionalObjectF64(object: std.json.ObjectMap, name: []const u8, default: f64)
     };
 }
 
+fn optionalGraphIdentityString(alloc: std.mem.Allocator, object: std.json.ObjectMap, name: []const u8) ![]const u8 {
+    const value = object.get(name) orelse return "";
+    if (value != .string or value.string.len == 0) return error.InvalidBatchRequest;
+    return alloc.dupe(u8, value.string);
+}
+
 fn parseGraphWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.GraphEdgeWrite {
     if (value != .array) return error.InvalidBatchRequest;
     const writes = try alloc.alloc(db_mod.types.GraphEdgeWrite, value.array.items.len);
@@ -2152,7 +2198,14 @@ fn parseGraphWrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.t
         errdefer alloc.free(edge_type);
         const owned_metadata_json = try alloc.dupe(u8, metadata_json);
         errdefer alloc.free(owned_metadata_json);
+        const edge_id = try optionalGraphIdentityString(alloc, item.object, "edge_id");
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = try optionalGraphIdentityString(alloc, item.object, "owner_document");
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
+        if (owner_document.len > 0 and edge_id.len == 0) return error.InvalidBatchRequest;
         writes[i] = .{
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .index_name = index_name,
             .source = source,
             .target = target,
@@ -2185,7 +2238,18 @@ fn parseGraphDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.
         errdefer alloc.free(target);
         const edge_type = try alloc.dupe(u8, try requiredObjectString(item.object, "edge_type"));
         errdefer alloc.free(edge_type);
+        const edge_id = try optionalGraphIdentityString(alloc, item.object, "edge_id");
+        errdefer if (edge_id.len > 0) alloc.free(edge_id);
+        const owner_document = try optionalGraphIdentityString(alloc, item.object, "owner_document");
+        errdefer if (owner_document.len > 0) alloc.free(owner_document);
+        if (owner_document.len > 0 and edge_id.len == 0) return error.InvalidBatchRequest;
+        const owner = try optionalGraphIdentityString(alloc, item.object, "owner");
+        errdefer if (owner.len > 0) alloc.free(owner);
+        if (owner.len > 0 and owner_document.len > 0) return error.InvalidBatchRequest;
         deletes[i] = .{
+            .owner = owner,
+            .edge_id = edge_id,
+            .owner_document = owner_document,
             .index_name = index_name,
             .source = source,
             .target = target,
@@ -2329,6 +2393,8 @@ fn freeGraphWriteElements(alloc: std.mem.Allocator, writes: []db_mod.types.Graph
         alloc.free(@constCast(write.source));
         alloc.free(@constCast(write.target));
         alloc.free(@constCast(write.edge_type));
+        if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
+        if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
         alloc.free(@constCast(write.metadata_json));
     }
 }
@@ -2344,6 +2410,8 @@ fn freeGraphDeleteElements(alloc: std.mem.Allocator, deletes: []db_mod.types.Gra
         alloc.free(@constCast(delete.source));
         alloc.free(@constCast(delete.target));
         alloc.free(@constCast(delete.edge_type));
+        if (delete.edge_id.len > 0) alloc.free(@constCast(delete.edge_id));
+        if (delete.owner_document.len > 0) alloc.free(@constCast(delete.owner_document));
         if (delete.owner.len > 0) alloc.free(@constCast(delete.owner));
     }
 }
@@ -2373,7 +2441,7 @@ fn consumerTests() type {
             const command: integrity_mod.Command = .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "key\x00\xff" } } };
             const encoded = try encodeBatchRequest(alloc, .{
                 .relational_schema_version = 17,
-                .relational_integrity_generation_set = [_]u8{5} ** 32,
+                .relational_integrity_generation_set = @as([32]u8, @splat(5)),
                 .integrity_commands = &.{command},
                 .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } },
             });
@@ -2382,7 +2450,7 @@ fn consumerTests() type {
             var parsed = try parseInternalBatchRequest(alloc, encoded);
             defer parsed.deinit(alloc);
             try std.testing.expectEqual(@as(?u32, 17), parsed.req.relational_schema_version);
-            try std.testing.expectEqual(@as(?[32]u8, [_]u8{5} ** 32), parsed.req.relational_integrity_generation_set);
+            try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(5))), parsed.req.relational_integrity_generation_set);
             try std.testing.expectEqualSlices(u8, &address.routing, &parsed.req.integrity_commands[0].address.routing);
             try std.testing.expectEqualStrings("key\x00\xff", parsed.req.integrity_commands[0].operation.release.parent_key);
         }
@@ -2436,14 +2504,39 @@ fn consumerTests() type {
         test "distributed txn public batch rejects isolated coordinator generation evidence spoof" {
             try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, "{\"_relational_repair\":true}"));
             const alloc = std.testing.allocator;
-            const encoded = try @import("relational_integrity_wire.zig").encodeGenerationSet(alloc, [_]u8{7} ** 32);
+            const encoded = try @import("relational_integrity_wire.zig").encodeGenerationSet(alloc, @as([32]u8, @splat(7)));
             defer alloc.free(encoded);
             const body = try std.fmt.allocPrint(alloc, "{{\"_relational_integrity_generation_set\":{s}}}", .{encoded});
             defer alloc.free(body);
             try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
             var internal = try parseInternalBatchRequest(alloc, body);
             defer internal.deinit(alloc);
-            try std.testing.expectEqual(@as(?[32]u8, [_]u8{7} ** 32), internal.req.relational_integrity_generation_set);
+            try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), internal.req.relational_integrity_generation_set);
+        }
+
+        test "internal batch graph endpoint cleanup command cannot enter public or mixed batches" {
+            const alloc = std.testing.allocator;
+            const encoded = try encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true });
+            defer alloc.free(encoded);
+            var parsed = try parseInternalBatchRequest(alloc, encoded);
+            defer parsed.deinit(alloc);
+            try std.testing.expect(parsed.req.graph_endpoint_cleanup);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+            try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .deletes = &.{"doc"} }));
+            try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_graph_endpoint_cleanup\":true,\"deletes\":[\"doc\"]}"));
+            const legacy = try encodeBatchRequest(alloc, .{ .graph_deletes = &.{.{ .index_name = "g", .source = "entity", .target = "hub", .edge_type = "R", .owner = "producer" }} });
+            defer alloc.free(legacy);
+            var legacy_parsed = try parseInternalBatchRequest(alloc, legacy);
+            defer legacy_parsed.deinit(alloc);
+            try std.testing.expectEqualStrings("producer", legacy_parsed.req.graph_deletes[0].owner);
+            const job = try @import("../storage/internal_keys.zig").graphEndpointCleanupKeyAlloc(alloc, "hub");
+            defer alloc.free(job);
+            const control_delete = try encodeBatchRequest(alloc, .{ .deletes = &.{job} });
+            defer alloc.free(control_delete);
+            try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, control_delete));
+            var internal_delete = try parseInternalBatchRequest(alloc, control_delete);
+            defer internal_delete.deinit(alloc);
+            try std.testing.expectEqualStrings(job, internal_delete.req.deletes[0]);
         }
 
         test "internal batch parser owns binary staged restore controls and rejects public injection" {
@@ -2490,7 +2583,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 7), prepare.topology_epoch);
             try std.testing.expectEqual(@as(usize, 1), decoded.req.writes.len);
             try std.testing.expectEqual(@as(u64, 41), decoded.req.predicates[0].expected_version);
-            try std.testing.expectEqual([_]u8{7} ** 32, decoded.req.predicates[0].expected_content_digest.?);
+            try std.testing.expectEqual(@as([32]u8, @splat(7)), decoded.req.predicates[0].expected_content_digest.?);
 
             const begin_encoded = try encodeBatchRequest(alloc, .{
                 .transaction = .{ .begin = .{
@@ -2637,6 +2730,8 @@ fn consumerTests() type {
                     .source = "doc:a",
                     .target = "doc:b",
                     .edge_type = "mentions",
+                    .edge_id = "fact:1",
+                    .owner_document = "fact:1",
                     .weight = 0.75,
                     .created_at = 11,
                     .updated_at = 12,
@@ -2647,6 +2742,8 @@ fn consumerTests() type {
                     .source = "doc:c",
                     .target = "doc:d",
                     .edge_type = "mentions",
+                    .edge_id = "fact:1",
+                    .owner_document = "fact:1",
                 }},
             };
             const encoded = try encodeBatchRequest(alloc, request);
@@ -2663,6 +2760,8 @@ fn consumerTests() type {
             try std.testing.expectEqualStrings("{\"target_table\":\"entities\"}", parsed.req.graph_writes[0].metadata_json);
             try std.testing.expectEqual(@as(usize, 1), parsed.req.graph_deletes.len);
             try std.testing.expectEqualStrings("doc:d", parsed.req.graph_deletes[0].target);
+            try std.testing.expectEqualStrings("fact:1", parsed.req.graph_writes[0].edge_id);
+            try std.testing.expectEqualStrings("fact:1", parsed.req.graph_deletes[0].owner_document);
         }
 
         test "internal batch parser requires source acknowledgements to be metadata-only" {
@@ -3061,6 +3160,31 @@ comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
 }
 
+test "internal batch graph endpoint cleanup command isolates planned effects" {
+    const alloc = std.testing.allocator;
+    const keys = @import("../storage/internal_keys.zig");
+    const job = try keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
+    defer alloc.free(job);
+    const encoded = try encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "hub", .generation = 0 }}, .deletes = &.{job}, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .owner = "owner" }} });
+    defer alloc.free(encoded);
+    var parsed = try parseInternalBatchRequest(alloc, encoded);
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.req.graph_endpoint_cleanup_planned);
+    try std.testing.expectEqualStrings("hub", parsed.req.graph_endpoint_cleanup_guards[0].endpoint);
+    try std.testing.expectEqual(@as(u64, 0), parsed.req.graph_endpoint_cleanup_guards[0].generation);
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job} }));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .deletes = &.{job}, .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "other", .generation = 1 }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_endpoint_cleanup_guards = &.{ .{ .endpoint = "hub", .generation = 1 }, .{ .endpoint = "hub", .generation = 2 } } }));
+    try std.testing.expectEqualStrings(job, parsed.req.deletes[0]);
+    try std.testing.expectEqualStrings("owner", parsed.req.graph_deletes[0].owner);
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_writes = &.{.{ .index_name = "g", .source = "a", .target = "b", .edge_type = "R", .edge_id = "fact", .owner = "fact" }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_graph_deletes\":[{\"index_name\":\"g\",\"source\":\"a\",\"target\":\"b\",\"edge_type\":\"R\",\"edge_id\":\"fact\",\"owner\":\"fact\"}]}"));
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, encoded));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup_planned = true }));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .writes = &.{.{ .key = "document", .value = "{}" }} }));
+    try std.testing.expectError(error.InvalidBatchRequest, encodeBatchRequest(alloc, .{ .graph_endpoint_cleanup = true, .graph_endpoint_cleanup_planned = true, .graph_deletes = &.{.{ .index_name = "g", .source = "a", .target = "hub", .edge_type = "R", .owner_document = "fact" }} }));
+}
+
 test "internal batch JSON null and insert precondition codecs survive allocation failures" {
     const Harness = struct {
         fn run(alloc: std.mem.Allocator) !void {
@@ -3085,4 +3209,32 @@ test "internal batch JSON null and insert precondition codecs survive allocation
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "graph cleanup owner replay afterimages survive internal batch round trip" {
+    const alloc = std.testing.allocator;
+    const contract = @import("../storage/graph_cleanup_contract.zig");
+    const key = try contract.ownerJobKeyAlloc(alloc, "owner");
+    defer alloc.free(key);
+    const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7 });
+    defer alloc.free(old);
+    const next = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner", .generation = 7, .phase = .inputs });
+    defer alloc.free(next);
+    const req: db_mod.types.BatchRequest = .{
+        .graph_endpoint_cleanup = true,
+        .graph_endpoint_cleanup_planned = true,
+        .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "owner", .generation = 7, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(old) }},
+        .merge_artifacts = &.{.{ .key = key, .value = next }},
+    };
+    try db_mod.types.validateGraphEndpointCleanupCommand(req);
+    const bytes = try encodeBatchRequest(alloc, req);
+    defer alloc.free(bytes);
+    var parsed = try parseInternalBatchRequest(alloc, bytes);
+    defer parsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), parsed.req.merge_artifacts.len);
+    try std.testing.expectEqualSlices(u8, key, parsed.req.merge_artifacts[0].key);
+    try std.testing.expectEqualSlices(u8, next, parsed.req.merge_artifacts[0].value);
+    try std.testing.expectEqualSlices(u8, &contract.checkpointDigest(old), &parsed.req.graph_endpoint_cleanup_guards[0].checkpoint_digest);
+    try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, bytes));
+    try std.testing.expectError(error.InvalidBatchRequest, parseInternalBatchRequest(alloc, "{\"_merge_artifacts\":[{\"key\":\"arbitrary\",\"value\":\"payload\"}]}"));
 }

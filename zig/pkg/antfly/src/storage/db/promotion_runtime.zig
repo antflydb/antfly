@@ -32,6 +32,7 @@
 
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resolver_lib = @import("antfly_resolver");
 const internal_keys = @import("../internal_keys.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
@@ -579,6 +580,16 @@ pub const PromotionRuntime = struct {
         if (advanced) self.wakeWorker();
     }
 
+    pub const RetirementReadiness = enum { ready, pending, publication_not_owned };
+
+    /// Caller holds catch_up_mutex, fencing the publisher and owner changes.
+    /// Diagnostic strings are deliberately not part of the catalog contract.
+    pub fn retirementReadinessLocked(self: *PromotionRuntime) RetirementReadiness {
+        if (self.applied_sequence.load(.acquire) >= self.target_sequence.load(.acquire)) return .ready;
+        if (self.owner) |owner| if (!owner.isLocalOwner()) return .publication_not_owned;
+        return .pending;
+    }
+
     pub fn stats(self: *PromotionRuntime) types.ReplayStageStats {
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
@@ -802,7 +813,7 @@ const MapStore = struct {
     map: std.StringHashMapUnmanaged([]u8) = .empty,
     put_count: usize = 0,
 
-    fn deinit(self: *MapStore) void {
+    pub fn deinit(self: *MapStore) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
             self.alloc.free(e.key_ptr.*);
@@ -820,7 +831,7 @@ const MapStore = struct {
         self.put_count += 1;
     }
 
-    fn backendStore(self: *MapStore) BackendStore {
+    pub fn backendStore(self: *MapStore) BackendStore {
         return .{ .store_ptr = self };
     }
 
@@ -942,7 +953,7 @@ const CaptureSink = struct {
     batch_calls: usize = 0,
     lost_replies: usize = 0,
 
-    fn deinit(self: *CaptureSink) void {
+    pub fn deinit(self: *CaptureSink) void {
         for (self.keys.items) |k| self.alloc.free(k);
         for (self.tables.items) |t| self.alloc.free(t);
         for (self.storage_tables.items) |maybe_table| if (maybe_table) |table| self.alloc.free(table);
@@ -1367,7 +1378,7 @@ const FakeSource = struct {
         return .{ .matched_entries = matched, .last_sequence = last };
     }
 
-    fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
+    pub fn openCursor(_: *anyopaque, _: Allocator, _: u64, _: replay_source_mod.TargetHint) anyerror!replay_source_mod.MatchingCursor {
         return error.Unsupported;
     }
     fn latest(ptr: *anyopaque, _: Allocator, from_sequence: u64, hint: replay_source_mod.TargetHint) anyerror!u64 {
@@ -1478,12 +1489,28 @@ test "PromotionRuntime waits on source-shard leadership before promoting" {
     try runtime.catchUp();
     try testing.expectEqual(@as(u64, 1), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 0), capture.keys.items.len);
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.publication_not_owned, runtime.retirementReadinessLocked());
+    }
     const follower_stats = runtime.stats();
     try testing.expect(follower_stats.blocked);
     try testing.expectEqualStrings("not_source_group_leader", follower_stats.blocked_reason);
 
     owner.local_owner = true;
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.pending, runtime.retirementReadinessLocked());
+    }
+
     try runtime.catchUp();
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.ready, runtime.retirementReadinessLocked());
+    }
     try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
     const leader_stats = runtime.stats();
@@ -1631,6 +1658,11 @@ test "PromotionRuntime blocked retry observes sink wake generation" {
 
     try testing.expect(!runtime.shouldDelayBlockedRetry(observed_wake_generation));
     try runtime.catchUp();
+    {
+        lockMutex(&runtime.catch_up_mutex);
+        defer runtime.catch_up_mutex.unlock();
+        try testing.expectEqual(PromotionRuntime.RetirementReadiness.ready, runtime.retirementReadinessLocked());
+    }
     try testing.expectEqual(@as(u64, 9), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
 

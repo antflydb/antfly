@@ -780,7 +780,7 @@ test "encodeDocumentPromptWithImageExpansion truncates image placeholder run to 
             return 1024;
         }
 
-        fn deinit(_: @This()) void {}
+        pub fn deinit(_: @This()) void {}
     };
 
     const tok = Tokenizer{ .ptr = @constCast(&TestTokenizer{}), .vtable = &.{

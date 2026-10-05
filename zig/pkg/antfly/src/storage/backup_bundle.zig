@@ -14,10 +14,12 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 
 pub const manifest_schema_version: u32 = 1;
-pub const afb_reader_version: u32 = 5;
+pub const afb_reader_version: u32 = 8;
 pub const base_afb_reader_version: u32 = 2;
 pub const source_generation_admission_reader_version: u32 = 3;
 pub const source_proof_reader_version: u32 = 5;
+pub const relationship_reader_version: u32 = 6;
+pub const retirement_reader_version: u32 = 8;
 pub const max_manifest_bytes: usize = 16 * 1024 * 1024;
 pub const max_objects: usize = 1_000_000;
 pub const max_path_bytes: usize = 4096;
@@ -138,6 +140,10 @@ pub fn parseManifest(alloc: std.mem.Allocator, encoded: []const u8) !ParsedManif
 pub fn validateManifest(manifest: Manifest) !void {
     if (manifest.schema_version != manifest_schema_version) return error.UnsupportedBackupManifestVersion;
     if (manifest.compatibility.min_afb_reader > afb_reader_version) return error.UnsupportedBackupManifestVersion;
+    for (manifest.objects) |object| {
+        if (std.mem.eql(u8, object.role, "graph_relationship_batch") and manifest.compatibility.min_afb_reader < relationship_reader_version)
+            return error.InvalidBackupManifest;
+    }
     if ((manifest.backup_id.len == 0) != (manifest.table_name.len == 0) or
         manifest.backup_id.len > 128 or manifest.table_name.len > 4096)
         return error.InvalidBackupManifest;
@@ -281,7 +287,7 @@ pub fn encodeBlobHeaderAlloc(alloc: std.mem.Allocator, header: BlobHeader) ![]u8
     pos += 8;
     std.mem.writeInt(u64, out[pos..][0..8], header.stored_size_bytes, .little);
     pos += 8;
-    out[pos] = @intFromEnum(header.compression);
+    out[pos] = @backingInt(header.compression);
     pos += 1;
     @memcpy(out[pos..][0..header.sha256.len], &header.sha256);
     return out;
@@ -519,4 +525,16 @@ test "AFB2 trailer locates the footer without scanning payloads" {
         error.InvalidBundleFooter,
         decodeTrailer(&corrupt, 100 + 10 + 42 + trailer_size),
     );
+}
+
+test "AFB2 relationship inventory requires reader version three" {
+    try std.testing.expectEqual(@as(u32, 2), (Compatibility{}).min_afb_reader);
+    try std.testing.expectError(error.InvalidBackupManifest, validateManifest(.{
+        .representation = .portable,
+        .objects = &.{.{ .logical_path = "relationships", .role = "graph_relationship_batch", .size_bytes = 1, .sha256 = "" }},
+    }));
+    try std.testing.expectError(error.UnsupportedBackupManifestVersion, validateManifest(.{
+        .representation = .portable,
+        .compatibility = .{ .min_afb_reader = afb_reader_version + 1 },
+    }));
 }

@@ -48,7 +48,7 @@ test "data raft merge pages chunk spool survives snapshot without exposing incom
     var source = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = first_dir.path() });
     defer source.deinit();
     try std.testing.expect(try source.seedGroupSnapshotIfAbsent(alloc, group, 1, .{ .start = "m", .end = "z" }, &.{}));
-    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", @import("../../common/data_raft_protocol.zig").batch_merge_chunk_protocol_version);
+    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_retirements_protocol_version);
     defer alloc.free(barrier);
     try payload(&source, 1, barrier);
     var checkpoint: types.MergeReplicationCheckpoint = .{ .kind = .accept, .transition_id = 500, .donor_group_id = 501, .receiver_group_id = group, .receiver_base_start = "m", .receiver_base_end = "z", .merged_start = "a", .merged_end = "z" };
@@ -75,11 +75,20 @@ test "data raft merge pages chunk spool survives snapshot without exposing incom
     const before = try source.groupState(alloc, group);
     defer shard.freeGroupStateEntries(alloc, before);
     try std.testing.expectEqual(@as(usize, 0), before.len);
-    const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group);
-    defer alloc.free(snapshot);
+    try std.testing.expectError(error.NativeSnapshotRequired, source.snapshotBuilder().buildSnapshot(alloc, group));
+    const prepared = (try source.prepareSnapshotHandle(group, 5)).?;
+    defer prepared.destroy();
+    var snapshot = std.Io.Writer.Allocating.init(alloc);
+    defer snapshot.deinit();
+    try shard.writeNativeSnapshotPrefixTxn(&prepared.txn, alloc, group, &snapshot.writer, 1, null);
+    try snapshot.writer.writeByte(0);
+    const primary_path = try std.fmt.allocPrintSentinel(alloc, "{s}/native", .{next_dir.path()}, 0);
+    defer alloc.free(primary_path);
+    var primary = try @import("../../storage/docstore.zig").DocStore.open(alloc, primary_path.ptr, .{});
+    defer primary.close();
     var restored = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = next_dir.path() });
     defer restored.deinit();
-    try restored.installSnapshot(alloc, group, 5, snapshot);
+    try restored.installSnapshotWithNativeSource(alloc, group, 5, snapshot.written(), &primary);
     try command(&restored, 6, first);
     try command(&restored, 7, last);
     try command(&restored, 8, first);
@@ -88,9 +97,12 @@ test "data raft merge pages chunk spool survives snapshot without exposing incom
     try std.testing.expectEqual(@as(usize, 1), after.len);
     try std.testing.expectEqualStrings("b", after[0].key);
     try std.testing.expectEqualStrings(value, after[0].value);
-    const completed = try restored.snapshotBuilder().buildSnapshot(alloc, group);
-    defer alloc.free(completed);
-    try std.testing.expect(std.mem.indexOf(u8, completed, "data_group_merge_spool:") == null);
+    const completed_handle = (try restored.prepareSnapshotHandle(group, 8)).?;
+    defer completed_handle.destroy();
+    var completed = std.Io.Writer.Allocating.init(alloc);
+    defer completed.deinit();
+    try shard.writeNativeSnapshotPrefixTxn(&completed_handle.txn, alloc, group, &completed.writer, 1, null);
+    try std.testing.expect(std.mem.indexOf(u8, completed.written(), "data_group_merge_spool:") == null);
 }
 
 test "data raft merge pages persist atomic cursor through snapshot retry and protocol fences" {
@@ -113,7 +125,7 @@ test "data raft merge pages persist atomic cursor through snapshot retry and pro
     checkpoint.page_source = pin;
     checkpoint.page_receiver_namespace = namespace;
     try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, command(&source, 3, .{ .merge_checkpoint = checkpoint }));
-    const active = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_page_protocol_version);
+    const active = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_retirements_protocol_version);
     defer alloc.free(active);
     try payload(&source, 3, active);
     try command(&source, 4, .{ .merge_checkpoint = checkpoint });
@@ -128,11 +140,29 @@ test "data raft merge pages persist atomic cursor through snapshot retry and pro
     page.timestamps = &.{123};
     const row = seal(.{ .merge_replication = context, .merge_page = page, .writes = &.{.{ .key = "b\x00", .value = "{ \"id\": 9007199254740993 }" }} });
     try command(&source, 6, row);
-    const snapshot = try source.snapshotBuilder().buildSnapshot(alloc, group);
-    defer alloc.free(snapshot);
+    // Current merge pages include graph retirement effects and retain a
+    // native primary across snapshots instead of serializing projection rows.
+    try std.testing.expectError(error.NativeSnapshotRequired, source.snapshotBuilder().buildSnapshot(alloc, group));
+    const prepared = (try source.prepareSnapshotHandle(group, 6)).?;
+    defer prepared.destroy();
+    var snapshot = std.Io.Writer.Allocating.init(alloc);
+    defer snapshot.deinit();
+    try shard.writeNativeSnapshotPrefixTxn(&prepared.txn, alloc, group, &snapshot.writer, 1, null);
+    try snapshot.writer.writeByte(0);
+    const primary_path = try std.fmt.allocPrintSentinel(alloc, "{s}/native", .{second_dir.path()}, 0);
+    defer alloc.free(primary_path);
+    var primary = try @import("../../storage/docstore.zig").DocStore.open(alloc, primary_path.ptr, .{});
+    defer primary.close();
+    const source_rows = try source.groupState(alloc, group);
+    defer shard.freeGroupStateEntries(alloc, source_rows);
+    for (source_rows) |item| {
+        const key = try @import("../../storage/internal_keys.zig").documentKeyAlloc(alloc, item.key);
+        defer alloc.free(key);
+        try primary.put(key, item.value);
+    }
     var restored = try store_mod.RaftApplyStore.init(alloc, .{ .root_dir = second_dir.path() });
     defer restored.deinit();
-    try restored.installSnapshot(alloc, group, 6, snapshot);
+    try restored.installSnapshotWithNativeSource(alloc, group, 6, snapshot.written(), &primary);
     try command(&restored, 7, row);
     var changed = row;
     changed.writes = &.{.{ .key = "b\x00", .value = "{\"id\":7}" }};
@@ -186,7 +216,7 @@ test "data raft merge pages snapshot locator requires protocol12 and fences curs
     checkpoint.page_source = pin;
     checkpoint.page_receiver_namespace = namespace;
     try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, command(&store, 3, .{ .merge_checkpoint = checkpoint }));
-    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.source_scope_protocol_version);
+    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_retirements_protocol_version);
     defer alloc.free(barrier);
     try payload(&store, 3, barrier);
     try command(&store, 4, .{ .merge_checkpoint = checkpoint });
@@ -238,7 +268,7 @@ test "data raft merge pages tail requires v12 and resumes fragments through snap
     checkpoint.page_source = pin;
     checkpoint.page_receiver_namespace = namespace;
     try std.testing.expectError(error.RaftBatchMergeProtocolNotActivated, command(&store, 3, .{ .merge_checkpoint = checkpoint }));
-    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.source_scope_protocol_version);
+    const barrier = try batch.encodeProtocolBarrier(alloc, "docs", batch.merge_retirements_protocol_version);
     defer alloc.free(barrier);
     try payload(&store, 3, barrier);
     try command(&store, 4, .{ .merge_checkpoint = checkpoint });
@@ -424,7 +454,7 @@ test "data raft merge pages cleanup verifies pending put delete overlay and exac
         const encoded = try std.json.Stringify.valueAlloc(alloc, request, .{});
         defer alloc.free(encoded);
         const operations = [_]shard.DataOperation{
-            .{ .set_raft_batch_protocol = batch.merge_page_protocol_version },
+            .{ .set_raft_batch_protocol = batch.merge_retirements_protocol_version },
             .{ .set_range = .{ .start = @constCast("m"), .end = @constCast("z") } },
             .{ .put = .{ .key = @constCast("m"), .value = @constCast("base") } },
             .{ .merge_receiver_checkpoint = .{ .checkpoint = accept } },

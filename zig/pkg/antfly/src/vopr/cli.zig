@@ -552,7 +552,7 @@ fn corpusMergeCommand(alloc: std.mem.Allocator, io: std.Io, args: []const []cons
     }.lessThan);
     std.mem.sort(ManifestQuarantine, quarantined, {}, struct {
         fn lessThan(_: void, lhs: ManifestQuarantine, rhs: ManifestQuarantine) bool {
-            return @intFromEnum(lhs.reason) < @intFromEnum(rhs.reason) or (lhs.reason == rhs.reason and lhs.trace_digest < rhs.trace_digest);
+            return @backingInt(lhs.reason) < @backingInt(rhs.reason) or (lhs.reason == rhs.reason and lhs.trace_digest < rhs.trace_digest);
         }
     }.lessThan);
     const manifest = try std.json.Stringify.valueAlloc(alloc, .{

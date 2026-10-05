@@ -9,6 +9,7 @@ const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_inference_config_openapi = @import("antfly_inference_config_openapi");
 const antfly_logging_openapi = @import("antfly_logging_openapi");
 const antfly_middleware_openapi = @import("antfly_middleware_openapi");
+const antfly_provider_openapi = @import("antfly_provider_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 const antfly_scraping_openapi = @import("antfly_scraping_openapi");
 
@@ -339,6 +340,8 @@ pub const Config = struct {
     generators: ?std.json.ArrayHashMap(antfly_generating_openapi.GeneratorConfig) = null,
     /// Named chain configurations for fallback/retry logic. Chains are ordered lists of generators with retry and fallback logic. Each link references a generator by name from the `generators` map. The first chain defined becomes the default when no chain name is specified. **Chain Conditions:** - `on_error`: Try next generator on any error (default) - `on_rate_limit`: Try next only on rate limit (429) errors - `on_timeout`: Try next only on timeout errors - `always`: Always try the next generator **Example:** ```json { "chains": { "default": [ { "generator": "gemini-flash", "retry": { "max_attempts": 3 }, "condition": "on_rate_limit" }, { "generator": "ollama-local" } ], "with-inline": [ { "generator": "gemini-flash" }, { "generator_config": { "provider": "openai", "model": "gpt-4.1" } } ] } } ``` Then in API calls: `chain: "default"` or `chain: "with-inline"`
     chains: ?std.json.ArrayHashMap([]const NamedChainLink) = null,
+    /// Named decision providers for ai_decide and convenience functions.
+    deciders: ?std.json.ArrayHashMap(DeciderConfig) = null,
     /// Named reranker configurations for search result reranking. Define named rerankers that can be referenced by indexes, search queries, and API calls. The first reranker defined becomes the default when no reranker name is specified. **Example:** ```json { "rerankers": { "cohere-english": { "provider": "cohere", "model": "rerank-english-v3.0" }, "antfly-local": { "provider": "antfly", "model": "mxbai-rerank-base-v1", "url": "http://localhost:8080" } } } ```
     rerankers: ?std.json.ArrayHashMap(antfly_reranking_openapi.RerankerConfig) = null,
     /// Named chunker configurations for text chunking. Define named chunkers that can be referenced by indexes and API calls. The first chunker defined becomes the default when no chunker name is specified. **Example:** ```json { "chunkers": { "fixed-500": { "provider": "antfly", "model": "fixed", "target_tokens": 500, "overlap_tokens": 50 }, "semantic": { "provider": "antfly", "model": "semantic-chunker", "api_url": "http://localhost:8080" } } } ```
@@ -382,6 +385,7 @@ pub const Config = struct {
         .{ "embedders", "embedders", true },
         .{ "generators", "generators", true },
         .{ "chains", "chains", true },
+        .{ "deciders", "deciders", true },
         .{ "rerankers", "rerankers", true },
         .{ "chunkers", "chunkers", true },
     };
@@ -552,6 +556,10 @@ pub const Config = struct {
             try jw.objectField("chains");
             try jw.write(value);
         }
+        if (self.deciders) |value| {
+            try jw.objectField("deciders");
+            try jw.write(value);
+        }
         if (self.rerankers) |value| {
             try jw.objectField("rerankers");
             try jw.write(value);
@@ -671,6 +679,78 @@ pub const ConnectionKind = enum {
             .{ "cdc", .cdc },
         });
         return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const DeciderConfig = struct {
+    provider: []const u8,
+    /// Required for Antfly; Jev defaults to jev-latest.
+    model: ?[]const u8 = null,
+    /// Provider base URL; endpoint path is selected by provider.
+    url: ?[]const u8 = null,
+    /// API key or secret reference. Defaults to the provider environment variable.
+    api_key: ?[]const u8 = null,
+    max_rows: ?i64 = null,
+    max_input_tokens: ?i64 = null,
+    rate_limit: ?antfly_provider_openapi.RateLimitConfig = null,
+    batch_size: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "provider", "provider", false },
+        .{ "model", "model", true },
+        .{ "url", "url", true },
+        .{ "api_key", "api_key", true },
+        .{ "max_rows", "max_rows", true },
+        .{ "max_input_tokens", "max_input_tokens", true },
+        .{ "rate_limit", "rate_limit", false },
+        .{ "batch_size", "batch_size", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("provider");
+        try jw.write(self.provider);
+        if (self.model) |value| {
+            try jw.objectField("model");
+            try jw.write(value);
+        }
+        if (self.url) |value| {
+            try jw.objectField("url");
+            try jw.write(value);
+        }
+        if (self.api_key) |value| {
+            try jw.objectField("api_key");
+            try jw.write(value);
+        }
+        if (self.max_rows) |value| {
+            try jw.objectField("max_rows");
+            try jw.write(value);
+        }
+        if (self.max_input_tokens) |value| {
+            try jw.objectField("max_input_tokens");
+            try jw.write(value);
+        }
+        if (self.rate_limit) |value| {
+            try jw.objectField("rate_limit");
+            try jw.write(value);
+        } else if (jw.options.emit_null_optional_fields) {
+            try jw.objectField("rate_limit");
+            try jw.write(@as(?u8, null));
+        }
+        if (self.batch_size) |value| {
+            try jw.objectField("batch_size");
+            try jw.write(value);
+        }
+        try jw.endObject();
     }
 };
 
@@ -2541,11 +2621,11 @@ fn openApiParseObject(
     @setEvalBranchQuota(100_000);
     const struct_info = @typeInfo(T).@"struct";
     if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
-    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (openapi_fields.len != struct_info.field_names.len) @compileError("OpenAPI object field descriptors must match the generated struct");
     if (.object_begin != try source.next()) return error.UnexpectedToken;
 
     var result: T = undefined;
-    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var fields_seen = @as([struct_info.field_names.len]bool, @splat(false));
     while (true) {
         var name_token: ?std.json.Token = try source.nextAllocMax(allocator, .alloc_if_needed, options.max_value_len.?);
         const field_name = switch (name_token.?) {
@@ -2554,9 +2634,9 @@ fn openApiParseObject(
             else => return error.UnexpectedToken,
         };
 
-        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
-            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+            if (field_attrs.@"comptime") @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field_name_zig);
+            if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
             if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 openApiFreeAllocatedToken(allocator, name_token.?);
                 name_token = null;
@@ -2564,14 +2644,14 @@ fn openApiParseObject(
                 if (fields_seen[i]) {
                     switch (options.duplicate_field_behavior) {
                         .use_first => {
-                            _ = try std.json.innerParse(field.type, allocator, source, options);
+                            _ = try std.json.innerParse(Field, allocator, source, options);
                             break;
                         },
                         .@"error" => return error.DuplicateField,
                         .use_last => {},
                     }
                 }
-                @field(result, field.name) = try std.json.innerParse(field.type, allocator, source, options);
+                @field(result, field_name_zig) = try std.json.innerParse(Field, allocator, source, options);
                 fields_seen[i] = true;
                 break;
             }
@@ -2594,19 +2674,19 @@ fn openApiParseObjectFromValue(
     @setEvalBranchQuota(100_000);
     const struct_info = @typeInfo(T).@"struct";
     if (struct_info.is_tuple) @compileError("OpenAPI object parser does not accept tuples");
-    if (openapi_fields.len != struct_info.fields.len) @compileError("OpenAPI object field descriptors must match the generated struct");
+    if (openapi_fields.len != struct_info.field_names.len) @compileError("OpenAPI object field descriptors must match the generated struct");
     if (source != .object) return error.UnexpectedToken;
     var result: T = undefined;
-    var fields_seen = [_]bool{false} ** struct_info.fields.len;
+    var fields_seen = @as([struct_info.field_names.len]bool, @splat(false));
     var it = source.object.iterator();
     while (it.next()) |entry| {
         const field_name = entry.key_ptr.*;
-        inline for (struct_info.fields, openapi_fields, 0..) |field, openapi_field, i| {
-            if (field.is_comptime) @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field.name);
-            if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+        inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+            if (field_attrs.@"comptime") @compileError("comptime fields are not supported: " ++ @typeName(T) ++ "." ++ field_name_zig);
+            if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
             if (std.mem.eql(u8, openapi_field[0], field_name)) {
                 if (openapi_field[2] and entry.value_ptr.* == .null) return error.UnexpectedToken;
-                @field(result, field.name) = try std.json.innerParseFromValue(field.type, allocator, entry.value_ptr.*, options);
+                @field(result, field_name_zig) = try std.json.innerParseFromValue(Field, allocator, entry.value_ptr.*, options);
                 fields_seen[i] = true;
                 break;
             }
@@ -2616,12 +2696,13 @@ fn openApiParseObjectFromValue(
     return result;
 }
 
-fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".fields.len]bool) !void {
+fn openApiFillDefaultStructValues(comptime T: type, comptime openapi_fields: anytype, result: *T, fields_seen: *[@typeInfo(T).@"struct".field_names.len]bool) !void {
     @setEvalBranchQuota(100_000);
-    inline for (@typeInfo(T).@"struct".fields, openapi_fields, 0..) |field, openapi_field, i| {
-        if (comptime !std.mem.eql(u8, field.name, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
+    const struct_info = @typeInfo(T).@"struct";
+    inline for (struct_info.field_names, struct_info.field_types, struct_info.field_attrs, openapi_fields, 0..) |field_name_zig, Field, field_attrs, openapi_field, i| {
+        if (comptime !std.mem.eql(u8, field_name_zig, openapi_field[1])) @compileError("OpenAPI object field descriptor order does not match the generated struct");
         if (!fields_seen[i]) {
-            if (field.defaultValue()) |default| @field(result, field.name) = default else return error.MissingField;
+            if (field_attrs.defaultValue(Field)) |default| @field(result, field_name_zig) = default else return error.MissingField;
         }
     }
 }

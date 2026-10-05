@@ -46,7 +46,7 @@ fn tempTestPath(alloc: Allocator, label: []const u8) ![:0]u8 {
         nonce,
     });
     defer alloc.free(path);
-    return try alloc.dupeZ(u8, path);
+    return try alloc.dupeSentinel(u8, path, 0);
 }
 
 // ============================================================================
@@ -255,6 +255,7 @@ pub const TableSchema = struct {
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
     storage_mode: StorageMode = .document,
+    external_base_source: ?@import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = null,
     /// Immutable provenance of the validation contract, persisted per epoch.
     /// Runtime-only embedders have no public constraints to restore. A schema
     /// derived from the public API must never silently lose those constraints.
@@ -281,7 +282,7 @@ const schema_version_prefix = "\x00\x00__metadata__:schema_v";
 /// Current durable runtime-schema format. Catalog compatibility checks use the
 /// same exported constant so a writer can never silently drift from the format
 /// it advertises in transactional table metadata.
-pub const storage_format_version: u32 = 14;
+pub const storage_format_version: u32 = 15;
 
 /// Serialize a TableSchema to bytes. Caller owns the returned slice.
 pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
@@ -331,6 +332,7 @@ pub fn serializeTextProjectionSchema(alloc: Allocator, schema: TableSchema) ![]u
     var projection_schema = schema;
     projection_schema.declared_fields = &.{};
     projection_schema.storage_mode = .document;
+    projection_schema.external_base_source = null;
     projection_schema.relational_columns = &.{};
     const projection_documents = try alloc.dupe(FullTextDocument, schema.full_text_documents);
     defer alloc.free(projection_documents);
@@ -347,6 +349,10 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     std.debug.assert(format_version >= 11 and format_version <= storage_format_version);
     if (!exactFieldsValid(schema.exact_fields)) return error.InvalidSchema;
     try validateRelationalSchema(alloc, schema);
+    if (schema.external_base_source) |source| {
+        if (schema.storage_mode != .relational) return error.InvalidSchema;
+        try source.binding.validateReadOnlyMvp();
+    }
     if (format_version < 12 and (schema.declared_fields.len != 0 or schema.exact_fields.len != 0)) {
         return error.InvalidSchema;
     }
@@ -382,12 +388,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         try appendOptStr(&buf, alloc, tmpl.path_match);
         try appendOptStr(&buf, alloc, tmpl.path_unmatch);
         try appendOptStr(&buf, alloc, tmpl.match_mapping_type);
-        try buf.append(alloc, @intFromEnum(tmpl.mapping.field_type));
+        try buf.append(alloc, @backingInt(tmpl.mapping.field_type));
         try buf.append(alloc, if (tmpl.mapping.do_index) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.store) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.doc_values) 1 else 0);
         try buf.append(alloc, if (tmpl.mapping.sortable) 1 else 0);
-        try buf.append(alloc, @intFromEnum(tmpl.mapping.missing_null_policy));
+        try buf.append(alloc, @backingInt(tmpl.mapping.missing_null_policy));
         try buf.append(alloc, if (tmpl.mapping.include_in_all) 1 else 0);
         try appendStr(&buf, alloc, tmpl.mapping.analyzer);
     }
@@ -398,12 +404,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         try appendU32(&buf, alloc, @intCast(schema.declared_fields.len));
         for (schema.declared_fields) |field| {
             try appendStr(&buf, alloc, field.field);
-            try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+            try buf.append(alloc, @backingInt(field.mapping.field_type));
             try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
             try buf.append(alloc, if (field.mapping.store) 1 else 0);
             try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
             try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
-            try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+            try buf.append(alloc, @backingInt(field.mapping.missing_null_policy));
             try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
             try appendStr(&buf, alloc, field.mapping.analyzer);
         }
@@ -415,12 +421,12 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
         for (schema.exact_fields) |field| {
             try appendStr(&buf, alloc, field.source_field);
             try appendStr(&buf, alloc, field.field);
-            try buf.append(alloc, @intFromEnum(field.mapping.field_type));
+            try buf.append(alloc, @backingInt(field.mapping.field_type));
             try buf.append(alloc, if (field.mapping.do_index) 1 else 0);
             try buf.append(alloc, if (field.mapping.store) 1 else 0);
             try buf.append(alloc, if (field.mapping.doc_values) 1 else 0);
             try buf.append(alloc, if (field.mapping.sortable) 1 else 0);
-            try buf.append(alloc, @intFromEnum(field.mapping.missing_null_policy));
+            try buf.append(alloc, @backingInt(field.mapping.missing_null_policy));
             try buf.append(alloc, if (field.mapping.include_in_all) 1 else 0);
             try appendStr(&buf, alloc, field.mapping.analyzer);
         }
@@ -467,23 +473,30 @@ fn serializeSchemaFormat(alloc: Allocator, schema: TableSchema, format_version: 
     }
 
     if (format_version >= 13) {
-        try buf.append(alloc, @intFromEnum(schema.storage_mode));
+        try buf.append(alloc, @backingInt(schema.storage_mode));
         try buf.append(alloc, @intFromBool(schema.requires_public_schema));
         try appendU32(&buf, alloc, @intCast(schema.relational_columns.len));
         for (schema.relational_columns) |column| {
             try appendStr(&buf, alloc, column.name);
             try appendStr(&buf, alloc, column.path);
-            try buf.append(alloc, @intFromEnum(column.column_type));
+            try buf.append(alloc, @backingInt(column.column_type));
             try buf.append(alloc, if (column.required) 1 else 0);
             try buf.append(alloc, if (column.allows_null) 1 else 0);
             try buf.append(alloc, if (column.is_json) 1 else 0);
-            try buf.append(alloc, @intFromEnum(column.json_kind));
+            try buf.append(alloc, @backingInt(column.json_kind));
         }
     }
 
-    const result = try alloc.dupe(u8, buf.items);
-    buf.deinit(alloc);
-    return result;
+    if (format_version >= 15) {
+        try buf.append(alloc, @intFromBool(schema.external_base_source != null));
+        if (schema.external_base_source) |source| {
+            const bytes = try std.json.Stringify.valueAlloc(alloc, source.binding, .{});
+            defer alloc.free(bytes);
+            try appendStr(&buf, alloc, bytes);
+        }
+    } else if (schema.external_base_source != null) return error.UnsupportedVersion;
+
+    return buf.toOwnedSlice(alloc);
 }
 
 /// Deserialize a TableSchema from bytes. Dupes all string data so the result
@@ -563,7 +576,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         const match_mapping_type: ?[]const u8 = if (has_match_mapping_type) try alloc.dupe(u8, readStr(data, &pos)) else null;
         errdefer if (match_mapping_type) |p| alloc.free(p);
 
-        const field_type: AntflyType = @enumFromInt(data[pos]);
+        const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
         pos += 1;
         const do_index = data[pos] == 1;
         pos += 1;
@@ -623,7 +636,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         for (fields) |*field| {
             const field_name = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(field_name);
-            const field_type: AntflyType = @enumFromInt(data[pos]);
+            const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
             pos += 1;
             const do_index = data[pos] == 1;
             pos += 1;
@@ -682,7 +695,7 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer alloc.free(source_field);
             const field_name = try alloc.dupe(u8, readStr(data, &pos));
             errdefer alloc.free(field_name);
-            const field_type: AntflyType = @enumFromInt(data[pos]);
+            const field_type: AntflyType = @fromBackingInt(@intCast(data[pos]));
             pos += 1;
             const do_index = data[pos] == 1;
             pos += 1;
@@ -993,8 +1006,23 @@ fn deserializeSchemaOwned(alloc: Allocator, data: []const u8) !TableSchema {
         break :blk columns;
     } else &.{};
 
+    const external = if (fmt_version >= 15 and data[pos] == 1) blk: {
+        pos += 1;
+        const bytes = readStr(data, &pos);
+        var parsed = try std.json.parseFromSlice(@import("../serverless/external_source/catalog_binding.zig").Binding, alloc, bytes, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        if (storage_mode != .relational) return error.InvalidSchema;
+        try parsed.value.validateReadOnlyMvp();
+        const borrowed: @import("../serverless/external_source/schema_binding.zig").OwnedExternalTableBinding = .{ .binding = parsed.value, .table_id = undefined, .source_uri = undefined, .schema_fingerprint = undefined };
+        break :blk try @import("../serverless/external_source/schema_binding.zig").cloneAlloc(alloc, borrowed);
+    } else blk: {
+        if (fmt_version >= 15) pos += 1;
+        break :blk null;
+    };
+
     const result: TableSchema = .{
         .version = version,
+        .external_base_source = external,
         .default_type = default_type,
         .ttl_duration_ns = ttl_duration_ns,
         .ttl_field = ttl_field,
@@ -1099,12 +1127,12 @@ fn validateSerializedSchema(data: []const u8) !void {
         try cursor.readOptStr();
         if (format_version >= 7) try cursor.readOptStr();
         if (format_version >= 7) try cursor.readOptStr();
-        if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+        if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
         try cursor.readBool();
         try cursor.readBool();
         try cursor.readBool();
         if (format_version >= 9) try cursor.readBool();
-        if (format_version >= 11 and (try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected))
+        if (format_version >= 11 and (try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected))
             return error.InvalidSchema;
         try cursor.readBool();
         try cursor.readStr();
@@ -1115,9 +1143,9 @@ fn validateSerializedSchema(data: []const u8) !void {
         try cursor.ensureCount(declared_count, 15);
         for (0..declared_count) |_| {
             try cursor.readStr();
-            if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
             inline for (0..4) |_| try cursor.readBool();
-            if ((try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            if ((try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readStr();
         }
@@ -1127,9 +1155,9 @@ fn validateSerializedSchema(data: []const u8) !void {
         for (0..exact_count) |_| {
             try cursor.readStr();
             try cursor.readStr();
-            if ((try cursor.readU8()) >= std.meta.fields(AntflyType).len) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(AntflyType).len) return error.InvalidSchema;
             inline for (0..4) |_| try cursor.readBool();
-            if ((try cursor.readU8()) != @intFromEnum(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
+            if ((try cursor.readU8()) != @backingInt(MissingNullPolicy.missing_rejected)) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readStr();
         }
@@ -1204,7 +1232,7 @@ fn validateSerializedSchema(data: []const u8) !void {
 
     if (format_version >= 13) {
         switch (try cursor.readU8()) {
-            @intFromEnum(StorageMode.document), @intFromEnum(StorageMode.relational) => {},
+            @backingInt(StorageMode.document), @backingInt(StorageMode.relational) => {},
             else => return error.InvalidSchema,
         }
         try cursor.readBool(); // immutable public-validation provenance
@@ -1213,12 +1241,16 @@ fn validateSerializedSchema(data: []const u8) !void {
         for (0..column_count) |_| {
             try cursor.readStr();
             try cursor.readStr();
-            if ((try cursor.readU8()) >= std.meta.fields(RelationalColumnType).len) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(RelationalColumnType).len) return error.InvalidSchema;
             try cursor.readBool();
             try cursor.readBool();
             try cursor.readBool();
-            if ((try cursor.readU8()) >= std.meta.fields(RelationalJsonKind).len) return error.InvalidSchema;
+            if ((try cursor.readU8()) >= std.meta.fieldNames(RelationalJsonKind).len) return error.InvalidSchema;
         }
+    }
+    if (format_version >= 15) {
+        if (try cursor.readU8() > 1) return error.InvalidSchema;
+        if (data[cursor.pos - 1] == 1) try cursor.readStr();
     }
     try cursor.finish();
 }
@@ -1250,6 +1282,10 @@ fn validateRelationalSchema(alloc: Allocator, schema: TableSchema) !void {
 
 /// Free a schema returned by deserializeSchema.
 pub fn freeSchema(alloc: Allocator, s: TableSchema) void {
+    if (s.external_base_source) |source| {
+        var owned = source;
+        owned.deinit(alloc);
+    }
     alloc.free(s.default_type);
     alloc.free(s.ttl_field);
     for (s.exact_fields) |field| {
@@ -1614,7 +1650,7 @@ const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.owned) self.store.deinit();
     }
 };
@@ -2386,6 +2422,7 @@ const datetime = @import("../datetime.zig");
 pub const formatDateTimeNsAlloc = datetime.formatDateTimeNsAlloc;
 pub const parseRfc3339ToNs = datetime.parseRfc3339ToNs;
 pub const parseDateToNs = datetime.parseDateToNs;
+pub const parseRfc3339ToSignedNs = datetime.parseRfc3339ToSignedNs;
 
 fn isValidDate(value: []const u8) bool {
     return parseDateToNs(value) != null;
@@ -2567,7 +2604,7 @@ test "schema serialize/deserialize round-trip" {
     defer alloc.free(data);
 
     var format_pos: usize = 4;
-    try std.testing.expectEqual(@as(u32, 14), readU32(data, &format_pos));
+    try std.testing.expectEqual(storage_format_version, readU32(data, &format_pos));
 
     const loaded = try deserializeSchema(alloc, data);
     defer freeSchema(alloc, loaded);

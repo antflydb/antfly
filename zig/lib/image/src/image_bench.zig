@@ -20,9 +20,7 @@ const jpeg2000_decode = @import("jpeg2000/decode.zig");
 const png = @import("png.zig");
 const processing = @import("processing.zig");
 const test_support = @import("test_support.zig");
-const c = if (build_options.enable_spng) @cImport({
-    @cInclude("spng.h");
-}) else struct {};
+const c = @import("spng_c");
 
 const BenchError = error{
     InvalidArguments,

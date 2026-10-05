@@ -724,6 +724,7 @@ pub const Status = enum(u32) {
     invalid_graph_transfer = 765,
     graph_generation_mismatch = 766,
     initial_child_provision_already_committed = 767,
+    metadata_replication_pending = 768,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
@@ -768,11 +769,11 @@ test "released main Status identifiers retain their exact names and numeric valu
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
-    inline for (@typeInfo(Status).@"enum".fields) |field| {
-        if (field.value <= 532) {
-            for (field.name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
+    inline for (@typeInfo(Status).@"enum".field_names, @typeInfo(Status).@"enum".field_values) |reflected_name, field_value| {
+        if (field_value <= 532) {
+            for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
-            std_test.mem.writeInt(u32, &encoded, @intCast(field.value), .little);
+            std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
             for (encoded) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             count += 1;
         }

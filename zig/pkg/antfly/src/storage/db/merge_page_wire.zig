@@ -52,19 +52,19 @@ const WireCommand = struct {
 };
 
 comptime {
-    if (@typeInfo(WireCommand).@"struct".fields.len != @typeInfo(pages.Command).@"struct".fields.len)
+    if (@typeInfo(WireCommand).@"struct".field_names.len != @typeInfo(pages.Command).@"struct".field_names.len)
         @compileError("update merge page wire projection for new command fields");
-    if (@typeInfo(WireChunk).@"struct".fields.len != @typeInfo(pages.Chunk).@"struct".fields.len)
+    if (@typeInfo(WireChunk).@"struct".field_names.len != @typeInfo(pages.Chunk).@"struct".field_names.len)
         @compileError("update merge page wire projection for new chunk fields");
 }
 
 pub fn write(command: pages.Command, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
-    inline for (@typeInfo(pages.Command).@"struct".fields) |field| {
-        if (comptime std.mem.eql(u8, field.name, "artifact_effects") or std.mem.eql(u8, field.name, "provenance_effects")) {
-            const effects = @field(command, field.name);
+    inline for (comptime std.meta.fieldNames(pages.Command)) |reflected_name| {
+        if (comptime std.mem.eql(u8, reflected_name, "artifact_effects") or std.mem.eql(u8, reflected_name, "provenance_effects")) {
+            const effects = @field(command, reflected_name);
             if (effects.len != 0) {
-                try stream.objectField(field.name);
+                try stream.objectField(reflected_name);
                 try stream.beginArray();
                 for (effects) |effect| {
                     try stream.beginObject();
@@ -90,26 +90,26 @@ pub fn write(command: pages.Command, stream: anytype) @TypeOf(stream.*).Error!vo
             }
             continue;
         }
-        if (comptime std.mem.eql(u8, field.name, "next_snapshot_position")) {
+        if (comptime std.mem.eql(u8, reflected_name, "next_snapshot_position")) {
             if (command.next_snapshot_position) |position| {
-                try stream.objectField(field.name);
+                try stream.objectField(reflected_name);
                 try binary.write(position, stream);
             }
             continue;
         }
-        if (comptime std.mem.eql(u8, field.name, "chunk")) {
+        if (comptime std.mem.eql(u8, reflected_name, "chunk")) {
             if (command.chunk) |chunk| {
                 try stream.objectField("chunk");
                 try stream.beginObject();
-                inline for (@typeInfo(pages.Chunk).@"struct".fields) |chunk_field| {
-                    if (comptime std.mem.eql(u8, chunk_field.name, "payload")) {
+                inline for (comptime std.meta.fieldNames(pages.Chunk)) |chunk_field_name| {
+                    if (comptime std.mem.eql(u8, chunk_field_name, "payload")) {
                         if (chunk.payload != .row) {
-                            try stream.objectField(chunk_field.name);
+                            try stream.objectField(chunk_field_name);
                             try stream.write(chunk.payload);
                         }
                         continue;
                     }
-                    if (comptime std.mem.eql(u8, chunk_field.name, "data")) {
+                    if (comptime std.mem.eql(u8, chunk_field_name, "data")) {
                         try stream.objectField("data_base64");
                         try stream.beginWriteRaw();
                         try stream.writer.writeByte('"');
@@ -125,15 +125,15 @@ pub fn write(command: pages.Command, stream: anytype) @TypeOf(stream.*).Error!vo
                         try stream.writer.writeByte('"');
                         stream.endWriteRaw();
                     } else {
-                        try stream.objectField(chunk_field.name);
-                        try binary.write(@field(chunk, chunk_field.name), stream);
+                        try stream.objectField(chunk_field_name);
+                        try binary.write(@field(chunk, chunk_field_name), stream);
                     }
                 }
                 try stream.endObject();
             }
         } else {
-            try stream.objectField(field.name);
-            try binary.write(@field(command, field.name), stream);
+            try stream.objectField(reflected_name);
+            try binary.write(@field(command, reflected_name), stream);
         }
     }
     try stream.endObject();
@@ -163,8 +163,8 @@ fn fromWire(alloc: Allocator, wire: WireCommand) std.json.ParseFromValueError!pa
     // chunk. A sender cannot smuggle an independent effect beside its spool.
     if (wire.chunk != null and (wire.artifact_effects.len != 0 or wire.provenance_effects.len != 0)) return error.UnexpectedToken;
     var command: pages.Command = undefined;
-    inline for (@typeInfo(pages.Command).@"struct".fields) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "chunk") and !std.mem.eql(u8, field.name, "artifact_effects") and !std.mem.eql(u8, field.name, "provenance_effects")) @field(command, field.name) = @field(wire, field.name);
+    inline for (comptime std.meta.fieldNames(pages.Command)) |reflected_name| {
+        if (comptime !std.mem.eql(u8, reflected_name, "chunk") and !std.mem.eql(u8, reflected_name, "artifact_effects") and !std.mem.eql(u8, reflected_name, "provenance_effects")) @field(command, reflected_name) = @field(wire, reflected_name);
     }
     if (wire.artifact_effects.len > @import("../retained_effects.zig").max_keys) return error.LengthMismatch;
     const vectors = try alloc.alloc(pages.IntegrityEffect, wire.artifact_effects.len);

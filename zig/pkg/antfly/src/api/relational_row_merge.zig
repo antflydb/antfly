@@ -24,7 +24,7 @@ const Row = struct {
     line: []u8,
     token: []u8,
 
-    fn deinit(row: Row, alloc: Allocator) void {
+    pub fn deinit(row: Row, alloc: Allocator) void {
         alloc.free(row.line);
         alloc.free(row.token);
     }
@@ -146,7 +146,7 @@ test "relational row query fan-in globally orders owner prefixes and keeps bound
     const alloc = std.testing.allocator;
     var merge = try Merger.init(alloc, 2);
     defer merge.deinit();
-    const identity = cursor.identity(1, "by_id", .{0} ** 32);
+    const identity = cursor.identity(1, "by_id", @splat(0));
     for ([_][]const u8{ "bz", "ac", "dy" }) |keys| {
         merge.beginGroup();
         for (keys) |key| {
@@ -169,9 +169,9 @@ test "relational row query fan-in globally orders owner prefixes and keeps bound
 
 test "relational row query fan-in rejects changed logical index duplicate ownership and malformed streams" {
     const alloc = std.testing.allocator;
-    const first = try cursor.encode(alloc, cursor.identity(1, "by_id", .{0} ** 32), "a");
+    const first = try cursor.encode(alloc, cursor.identity(1, "by_id", @splat(0)), "a");
     defer alloc.free(first);
-    const changed = try cursor.encode(alloc, cursor.identity(1, "by_other_id", .{0} ** 32), "b");
+    const changed = try cursor.encode(alloc, cursor.identity(1, "by_other_id", @splat(0)), "b");
     defer alloc.free(changed);
     const first_line = try std.fmt.allocPrint(alloc, "{{\"schema_version\":1,\"cursor\":\"{s}\"}}\n", .{first});
     defer alloc.free(first_line);

@@ -265,7 +265,7 @@ const Builder = struct {
     fn predicateScalar(self: *Builder, input: *const ast.Predicate) anyerror!*const ast.Scalar {
         return switch (input.*) {
             .scalar => |value| value,
-            .comparison => |part| self.scalar(.{ .binary = .{ .op = @enumFromInt(@intFromEnum(ast.Scalar.Binary.eq) + @intFromEnum(part.op)), .left = try self.scalar(.{ .column = part.field }), .right = try self.scalar(.{ .literal = part.value }) } }),
+            .comparison => |part| self.scalar(.{ .binary = .{ .op = @fromBackingInt(@backingInt(ast.Scalar.Binary.eq) + @backingInt(part.op)), .left = try self.scalar(.{ .column = part.field }), .right = try self.scalar(.{ .literal = part.value }) } }),
             .is_null => |part| self.scalar(.{ .unary = .{ .op = if (part.negated) .is_not_null else .is_null, .operand = try self.scalar(.{ .column = part.field }) } }),
             .negation => |part| self.scalar(.{ .unary = .{ .op = .not, .operand = try self.predicateScalar(part) } }),
             .conjunction, .disjunction => |part| self.scalar(.{ .binary = .{ .op = if (input.* == .conjunction) .@"and" else .@"or", .left = try self.predicateScalar(part.left), .right = try self.predicateScalar(part.right) } }),
@@ -305,7 +305,7 @@ const Builder = struct {
         };
         return result;
     }
-    fn extract(self: *Builder, value: *const ast.Scalar, local: Names, keys: *std.ArrayList(Key), range: ?*?Key) anyerror!?*const ast.Scalar {
+    pub fn extract(self: *Builder, value: *const ast.Scalar, local: Names, keys: *std.ArrayList(Key), range: ?*?Key) anyerror!?*const ast.Scalar {
         if (value.* == .binary and value.binary.op == .@"and") {
             const left = try self.extract(value.binary.left, local, keys, range);
             const right = try self.extract(value.binary.right, local, keys, range);

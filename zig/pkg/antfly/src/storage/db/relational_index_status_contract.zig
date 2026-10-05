@@ -29,12 +29,12 @@ pub const Status = struct {
 
     pub fn jsonStringify(self: Status, stream: anytype) @TypeOf(stream.*).Error!void {
         try stream.beginObject();
-        inline for (@typeInfo(Status).@"struct".fields) |field| {
-            try stream.objectField(field.name);
-            if (comptime std.mem.eql(u8, field.name, "range_start") or std.mem.eql(u8, field.name, "range_end"))
-                try @import("relational_integrity_json.zig").write(@field(self, field.name), stream)
+        inline for (comptime std.meta.fieldNames(Status)) |reflected_name| {
+            try stream.objectField(reflected_name);
+            if (comptime std.mem.eql(u8, reflected_name, "range_start") or std.mem.eql(u8, reflected_name, "range_end"))
+                try @import("relational_integrity_json.zig").write(@field(self, reflected_name), stream)
             else
-                try stream.write(@field(self, field.name));
+                try stream.write(@field(self, reflected_name));
         }
         try stream.endObject();
     }

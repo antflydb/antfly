@@ -8,7 +8,7 @@ const Allocator = std.mem.Allocator;
 pub const Unit = enum { year, quarter, month, week, day, hour, minute, second, milliseconds, microseconds, epoch, dow, isodow, doy };
 
 pub fn unit(text: []const u8) ?Unit {
-    inline for (std.meta.fields(Unit)) |field| if (std.ascii.eqlIgnoreCase(text, field.name)) return @enumFromInt(field.value);
+    inline for (@typeInfo(Unit).@"enum".field_names, @typeInfo(Unit).@"enum".field_values) |reflected_name, field_value| if (std.ascii.eqlIgnoreCase(text, reflected_name)) return @fromBackingInt(field_value);
     return null;
 }
 
@@ -62,11 +62,22 @@ pub fn parseDateTimeToNs(text: []const u8) ?u64 {
     return parseRfc3339ToNs(text) orelse parseDateToNs(text);
 }
 
+pub fn parseDateTimeToSignedNs(text: []const u8) ?i128 {
+    if (parseRfc3339ToSignedNs(text)) |ns| return ns;
+    if (text.len != 10 or text[4] != '-' or text[7] != '-' or !digits(text[0..4]) or !digits(text[5..7]) or !digits(text[8..10])) return null;
+    return civilDateTimeToSignedNs(std.fmt.parseInt(i64, text[0..4], 10) catch return null, std.fmt.parseInt(i64, text[5..7], 10) catch return null, std.fmt.parseInt(i64, text[8..10], 10) catch return null, 0, 0, 0, 0);
+}
+
 pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
-    const seconds = ns / std.time.ns_per_s;
-    const nanos = ns % std.time.ns_per_s;
-    const days: i64 = @intCast(seconds / 86_400);
-    const seconds_of_day = seconds % 86_400;
+    return formatDateTimeSignedNsAlloc(alloc, ns);
+}
+
+pub fn formatDateTimeSignedNsAlloc(alloc: Allocator, ns: i128) ![]u8 {
+    if (ns < @as(i128, daysFromCivil(0, 1, 1)) * std.time.ns_per_day or ns >= @as(i128, daysFromCivil(10000, 1, 1)) * std.time.ns_per_day) return error.InvalidDateTime;
+    const seconds = @divFloor(ns, std.time.ns_per_s);
+    const nanos: u64 = @intCast(@mod(ns, std.time.ns_per_s));
+    const days: i64 = @intCast(@divFloor(seconds, 86_400));
+    const seconds_of_day: u64 = @intCast(@mod(seconds, 86_400));
     const civil = civilFromDays(days);
     if (civil.year < 0 or civil.year > 9999) return error.InvalidDateTime;
     return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}Z", .{
@@ -81,6 +92,10 @@ pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
 }
 
 pub fn parseRfc3339ToNs(text: []const u8) ?u64 {
+    return std.math.cast(u64, parseRfc3339ToSignedNs(text) orelse return null);
+}
+
+pub fn parseRfc3339ToSignedNs(text: []const u8) ?i128 {
     if (text.len < 20) return null;
     if (text[4] != '-' or text[7] != '-' or
         (text[10] != 'T' and text[10] != 't') or
@@ -128,7 +143,7 @@ pub fn parseRfc3339ToNs(text: []const u8) ?u64 {
 
     const local_ns = civilDateTimeToSignedNs(year, month, day, hour, minute, second, nanos) orelse return null;
     const offset_ns = @as(i128, offset_seconds) * std.time.ns_per_s;
-    return std.math.cast(u64, local_ns - offset_ns);
+    return local_ns - offset_ns;
 }
 
 pub fn parseDateToNs(value: []const u8) ?u64 {

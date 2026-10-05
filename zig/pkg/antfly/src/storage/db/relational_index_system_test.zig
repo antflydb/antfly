@@ -802,7 +802,7 @@ fn expressionKeyAllocations(test_alloc: std.mem.Allocator) !void {
 }
 
 test "relational index system expression keys share typed bounds historical projections and allocation cleanup" {
-    try std.testing.checkAllAllocationFailures(alloc, expressionKeyAllocations, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, expressionKeyAllocations, .{});
 }
 
 test "relational index system expression keys fence declarations dependency changes and aggregate expansion" {
@@ -943,7 +943,7 @@ test "relational index system restore receipts require local coverage through fa
     try std.testing.expectError(error.RestoreProjectionCorrupt, target.prepareRestoreStagingIndexesStep(alloc, scope.digest()));
     try resetRestoreIndexCoverage(&target, false);
     var standby_gate: @import("../hot_standby/public_gate_state.zig").State = .{};
-    standby_gate.role.store(@intFromEnum(@import("../hot_standby/public_gate_state.zig").Role.standby), .release);
+    standby_gate.role.store(@backingInt(@import("../hot_standby/public_gate_state.zig").Role.standby), .release);
     var raft_index: u64 = 2;
     for ([_]staging.Phase{ .validated, .published }) |phase| {
         // Also exercise same-phase receipt retries: a durable validated or
@@ -1016,8 +1016,8 @@ test "relational index system restore receipts require local coverage through fa
 test "relational index system historical expression failures persist and recover after row correction" {
     const jobs = @import("relational_index_jobs.zig");
     const expressions = @import("../../schema/relational_expression_errors.zig");
-    inline for (@typeInfo(expressions.Error).error_set.?) |field| {
-        const err = @field(expressions.Error, field.name);
+    inline for (@typeInfo(expressions.Error).error_set.error_names.?) |field| {
+        const err = @field(expressions.Error, field);
         try std.testing.expectEqual(if (expressions.isInvalidInput(err)) @as(?jobs.Failure, .invalid_row) else null, jobs.classifyRowFailure(err));
     }
     try std.testing.expectEqual(null, jobs.classifyRowFailure(error.OutOfMemory));
@@ -2417,8 +2417,8 @@ fn replay(primary: *primary_mod.Primary, replica: *db_mod.DB, next: *u64) !void 
     while (next.* <= primary.lastLsn()) : (next.* += 1) {
         var entry = (try primary.log.entryAt(alloc, next.*)) orelse return error.MissingReplicationRecord;
         defer entry.deinit(alloc);
-        try replication_ingress.applyRecord(&replica, entry.record);
-        try replication_ingress.applyRecord(&replica, entry.record);
+        try replication_ingress.applyRecord(replica, entry.record);
+        try replication_ingress.applyRecord(replica, entry.record);
     }
 }
 
@@ -2437,8 +2437,8 @@ test "relational index system standby replays schema churn and rebuilds ready ge
     var last_lsn = std.atomic.Value(u64).init(0);
     var failures = std.atomic.Value(u64).init(0);
     var mirrored = options;
-    mirrored.replication_async_metadata_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .last_lsn = &last_lsn, .failure_count = &failures };
-    mirrored.replication_async_batch_mirror = .{ .publisher = hot_standby_publisher_adapter.bind(&primary), .sync_policy = .{ .mode = .async } };
+    mirrored.replication_async_metadata_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .last_lsn = &last_lsn, .failure_count = &failures });
+    mirrored.replication_async_batch_mirror = hot_standby_publisher_adapter.bindMirror(&primary, .{ .sync_policy = .{ .mode = .async } });
     var source = try db_mod.DB.open(alloc, source_path, mirrored);
     defer source.close();
     var replica = try db_mod.DB.open(alloc, replica_path, options);

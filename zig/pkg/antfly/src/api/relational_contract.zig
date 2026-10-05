@@ -75,13 +75,13 @@ pub const IndexKey = struct {
 /// mapping an unknown value to a permissive default. Reordering wire enums
 /// is harmless; adding/removing/renaming a value fails compilation.
 fn EnumBridge(comptime Wire: type, comptime Native: type) type {
-    const wire_fields = @typeInfo(Wire).@"enum".fields;
-    const native_fields = @typeInfo(Native).@"enum".fields;
+    const wire_fields = @typeInfo(Wire).@"enum".field_names;
+    const native_fields = @typeInfo(Native).@"enum".field_names;
     if (wire_fields.len != native_fields.len)
         @compileError("relational wire/native enum vocabularies differ: " ++ @typeName(Wire));
-    for (wire_fields) |field| {
-        if (!@hasField(Native, field.name))
-            @compileError("relational native enum is missing wire value: " ++ field.name);
+    for (wire_fields) |field_name| {
+        if (!@hasField(Native, field_name))
+            @compileError("relational native enum is missing wire value: " ++ field_name);
     }
     return struct {
         pub const WireType = Wire;
@@ -139,8 +139,8 @@ test "relational contract generated enums round trip through durable vocabulary"
 test "relational contract conversion is independent of generated ordinal order" {
     const Wire = enum { relational, document };
     const Bridge = EnumBridge(Wire, storage.StorageMode);
-    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(Bridge.toNative(.document)));
-    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(Bridge.toNative(.relational)));
+    try std.testing.expectEqual(@as(u8, 0), @backingInt(Bridge.toNative(.document)));
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(Bridge.toNative(.relational)));
     try std.testing.expectEqual(Wire.document, Bridge.toWire(.document));
     try std.testing.expectEqual(Wire.relational, Bridge.toWire(.relational));
 }

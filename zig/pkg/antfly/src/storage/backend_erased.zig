@@ -157,8 +157,8 @@ fn wrapperBoxAllocator(fallback: Allocator) Allocator {
 
 fn replayHintOrdinalFromSingleMask(mask: u8) ?u8 {
     if (mask == 0 or (mask & (mask - 1)) != 0) return null;
-    inline for (std.meta.fields(change_journal_mod.TargetHint)) |field| {
-        if (mask == (@as(u8, 1) << @intCast(field.value))) return @intCast(field.value);
+    inline for (@typeInfo(change_journal_mod.TargetHint).@"enum".field_values) |field_value| {
+        if (mask == (@as(u8, 1) << @intCast(field_value))) return @intCast(field_value);
     }
     return null;
 }
@@ -268,7 +268,7 @@ fn readScopeFromWithParent(alloc: Allocator, handle: anytype, parent: ?ParentRel
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.get(key);
         }
-        fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             return self.handle.getManySorted(keys, values);
         }
@@ -498,6 +498,7 @@ pub const WriteTxn = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        has_prefix: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         delete: *const fn (*anyopaque, []const u8) anyerror!void,
@@ -542,6 +543,18 @@ pub const WriteTxn = struct {
 
     pub fn delete(self: *WriteTxn, key: []const u8) !void {
         try BoundaryAbi.call("delete", self.boundary_dispatch, self.vtable.delete, .{ self.ptr, key });
+    }
+
+    /// Test the current transactional key view without hydrating values.
+    /// Backends without native support retain ordinary cursor semantics.
+    pub fn hasPrefix(self: *WriteTxn, prefix: []const u8) !bool {
+        if (self.vtable.has_prefix) |has_prefix| {
+            return try BoundaryAbi.call("has_prefix", self.boundary_dispatch, has_prefix, .{ self.ptr, prefix });
+        }
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        return std.mem.startsWith(u8, row.key, prefix);
     }
 
     pub fn openCursor(self: *WriteTxn) !Cursor {
@@ -620,6 +633,7 @@ pub const Batch = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
+        has_prefix: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_put: ?*const fn (*anyopaque, []const u8, []const u8) anyerror!void = null,
@@ -685,6 +699,18 @@ pub const Batch = struct {
 
     pub fn delete(self: *Batch, key: []const u8) !void {
         try self.vtable.delete(self.ptr, key);
+    }
+
+    /// Test the current transactional key view without hydrating values.
+    /// Backends without native support retain ordinary cursor semantics.
+    pub fn hasPrefix(self: *Batch, prefix: []const u8) !bool {
+        if (self.vtable.has_prefix) |has_prefix| {
+            return try has_prefix(self.ptr, prefix);
+        }
+        var cursor = try self.openCursor();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return false;
+        return std.mem.startsWith(u8, row.key, prefix);
     }
 
     pub fn openCursor(self: *Batch) !Cursor {
@@ -1192,7 +1218,7 @@ fn cursorFromWithParent(allocator: Allocator, handle: anytype, parent: ?ParentRe
             };
         }
 
-        fn setUpperBound(ptr: *anyopaque, upper: ?[]const u8) void {
+        pub fn setUpperBound(ptr: *anyopaque, upper: ?[]const u8) void {
             unbox(ptr).handle.setUpperBound(upper);
         }
     };
@@ -1236,7 +1262,7 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             return try unbox(ptr).handle.get(key);
         }
 
-        fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(keys, values);
@@ -1249,7 +1275,7 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             }
         }
 
-        fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
+        pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
             errdefer parent.releaseChild();
@@ -1258,7 +1284,7 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
 
-        fn forkRead(alloc: Allocator, ptr: *anyopaque) anyerror!ReadTxn {
+        pub fn forkRead(alloc: Allocator, ptr: *anyopaque) anyerror!ReadTxn {
             const parent = unbox(ptr);
             try parent.retainChild();
             defer parent.releaseChild();
@@ -1273,7 +1299,7 @@ fn readTxnFromWithParent(allocator: Allocator, handle: anytype, parent_release: 
             return readTxnFromWithParent(alloc, forked, anchor);
         }
 
-        fn openReadScope(alloc: Allocator, ptr: *anyopaque) anyerror!ReadScope {
+        pub fn openReadScope(alloc: Allocator, ptr: *anyopaque) anyerror!ReadScope {
             const parent = unbox(ptr);
             try parent.retainChild();
             errdefer parent.releaseChild();
@@ -1318,12 +1344,12 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             return try unbox(ptr).handle.get(key);
         }
 
-        fn getLeased(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
+        pub fn getLeased(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             if (@hasDecl(Handle, "getLeased")) return try unbox(ptr).handle.getLeased(key);
             return try unbox(ptr).handle.get(key);
         }
 
-        fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(keys, values);
@@ -1336,7 +1362,7 @@ pub fn probeTxnFrom(allocator: Allocator, handle: anytype) !ProbeTxn {
             }
         }
 
-        fn getManySortedWithBlockCacheAdmission(
+        pub fn getManySortedWithBlockCacheAdmission(
             ptr: *anyopaque,
             keys: []const []const u8,
             values: []?[]const u8,
@@ -1377,7 +1403,7 @@ pub fn currentScanTxnFrom(allocator: Allocator, handle: anytype) !CurrentScanTxn
             unbox(ptr).requestAbort();
         }
 
-        fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
+        pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
             errdefer parent.releaseChild();
@@ -1420,7 +1446,7 @@ pub fn namespaceReadTxnFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
-        fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
@@ -1433,7 +1459,7 @@ pub fn namespaceReadTxnFrom(
             }
         }
 
-        fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: backend_types.Namespace) anyerror!Cursor {
+        pub fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: backend_types.Namespace) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
             errdefer parent.releaseChild();
@@ -1477,7 +1503,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             return try unbox(ptr).handle.get(key);
         }
 
-        fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (keys.len != values.len) return error.InvalidBatch;
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(keys, values);
@@ -1490,6 +1516,10 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             }
         }
 
+        fn hasPrefix(ptr: *anyopaque, prefix: []const u8) anyerror!bool {
+            return try unbox(ptr).handle.hasPrefix(prefix);
+        }
+
         fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.put(key, value);
         }
@@ -1498,7 +1528,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             try unbox(ptr).handle.delete(key);
         }
 
-        fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
+        pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
             errdefer parent.releaseChild();
@@ -1516,6 +1546,7 @@ pub fn writeTxnFrom(allocator: Allocator, handle: anytype) !WriteTxn {
             .commit = vt.commit,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
+            .has_prefix = if (@hasDecl(Handle, "hasPrefix")) vt.hasPrefix else null,
             .put = vt.put,
             .delete = vt.delete,
             .open_cursor = vt.openCursor,
@@ -1550,7 +1581,7 @@ pub fn namespaceWriteTxnFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
-        fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
         }
 
@@ -1558,7 +1589,7 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
 
-        fn appendPut(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, value: []const u8) anyerror!void {
+        pub fn appendPut(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.appendPut(try mapNamespace(namespace), key, value);
         }
 
@@ -1566,7 +1597,7 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).handle.delete(try mapNamespace(namespace), key);
         }
 
-        fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: backend_types.Namespace) anyerror!Cursor {
+        pub fn openCursor(alloc: Allocator, ptr: *anyopaque, namespace: backend_types.Namespace) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
             errdefer parent.releaseChild();
@@ -1614,11 +1645,11 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             return try unbox(ptr).handle.get(key);
         }
 
-        fn containsManySorted(ptr: *anyopaque, keys: []const []const u8, present: []bool) anyerror!void {
+        pub fn containsManySorted(ptr: *anyopaque, keys: []const []const u8, present: []bool) anyerror!void {
             return unbox(ptr).handle.containsManySorted(keys, present);
         }
 
-        fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             if (@hasDecl(Handle, "getManySorted")) {
                 return try unbox(ptr).handle.getManySorted(keys, values);
             }
@@ -1630,11 +1661,15 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             }
         }
 
+        fn hasPrefix(ptr: *anyopaque, prefix: []const u8) anyerror!bool {
+            return try unbox(ptr).handle.hasPrefix(prefix);
+        }
+
         fn put(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.put(key, value);
         }
 
-        fn appendPut(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
+        pub fn appendPut(ptr: *anyopaque, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.appendPut(key, value);
         }
 
@@ -1642,7 +1677,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             try unbox(ptr).handle.delete(key);
         }
 
-        fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
+        pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
             errdefer parent.releaseChild();
@@ -1651,14 +1686,14 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
 
-        fn setReplayOpaque(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+        pub fn setReplayOpaque(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             if (@hasDecl(Handle, "setReplayOpaque")) {
                 return try unbox(ptr).handle.setReplayOpaque(sequence, payload);
             }
             return error.Unsupported;
         }
 
-        fn setCommitParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Participant) anyerror!void {
+        pub fn setCommitParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Participant) anyerror!void {
             return unbox(ptr).handle.setCommitParticipant(participant);
         }
     };
@@ -1671,6 +1706,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .commit = vt.commit,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
+            .has_prefix = if (@hasDecl(Handle, "hasPrefix")) vt.hasPrefix else null,
             .put = vt.put,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
@@ -1715,7 +1751,7 @@ pub fn namespaceBatchFrom(
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
 
-        fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
+        pub fn getManySorted(ptr: *anyopaque, namespace: backend_types.Namespace, keys: []const []const u8, values: []?[]const u8) anyerror!void {
             try unbox(ptr).handle.getManySorted(try mapNamespace(namespace), keys, values);
         }
 
@@ -1723,7 +1759,7 @@ pub fn namespaceBatchFrom(
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
 
-        fn appendPut(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, value: []const u8) anyerror!void {
+        pub fn appendPut(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.appendPut(try mapNamespace(namespace), key, value);
         }
 
@@ -1757,7 +1793,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn deinit(_: Allocator, ptr: *anyopaque) void {
+        pub fn deinit(_: Allocator, ptr: *anyopaque) void {
             const state = unbox(ptr);
             const box_allocator = state.allocator;
             box_allocator.destroy(state);
@@ -1771,14 +1807,14 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
 
-        fn beginReadWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ReadTxn {
+        pub fn beginReadWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ReadTxn {
             if (Handle == Store) {
                 return try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission);
             }
             return try readTxnFrom(alloc, try unbox(ptr).handle.beginReadWithBlockCacheAdmission(admission));
         }
 
-        fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!ProbeTxn {
+        pub fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!ProbeTxn {
             if (Handle == Store) {
                 return try unbox(ptr).handle.beginProbe();
             }
@@ -1788,14 +1824,14 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try probeTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
 
-        fn beginProbeWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ProbeTxn {
+        pub fn beginProbeWithBlockCacheAdmission(alloc: Allocator, ptr: *anyopaque, admission: backend_types.Namespace.BlockCacheAdmission) anyerror!ProbeTxn {
             if (Handle == Store) {
                 return try unbox(ptr).handle.beginProbeWithBlockCacheAdmission(admission);
             }
             return try probeTxnFrom(alloc, try unbox(ptr).handle.beginProbeWithBlockCacheAdmission(admission));
         }
 
-        fn beginCurrentScan(alloc: Allocator, ptr: *anyopaque) anyerror!CurrentScanTxn {
+        pub fn beginCurrentScan(alloc: Allocator, ptr: *anyopaque) anyerror!CurrentScanTxn {
             if (Handle == Store) {
                 return try unbox(ptr).handle.beginCurrentScan();
             }
@@ -1805,7 +1841,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try currentScanTxnFrom(alloc, try unbox(ptr).handle.beginRead());
         }
 
-        fn beginReplayLaneScan(alloc: Allocator, ptr: *anyopaque, lane_ordinal: u8, from_sequence: u64) anyerror!CurrentScanTxn {
+        pub fn beginReplayLaneScan(alloc: Allocator, ptr: *anyopaque, lane_ordinal: u8, from_sequence: u64) anyerror!CurrentScanTxn {
             if (Handle == Store) {
                 return try unbox(ptr).handle.beginReplayLaneScan(lane_ordinal, from_sequence);
             }
@@ -1823,14 +1859,14 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return try batchFrom(alloc, try unbox(ptr).handle.beginBatch());
         }
 
-        fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: backend_types.BatchOptions) anyerror!Batch {
+        pub fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: backend_types.BatchOptions) anyerror!Batch {
             if (@hasDecl(Handle, "beginBatchWithOptions")) {
                 return try batchFrom(alloc, try unbox(ptr).handle.beginBatchWithOptions(options));
             }
             return try batchFrom(alloc, try unbox(ptr).handle.beginBatch());
         }
 
-        fn sync(ptr: *anyopaque, force: bool) anyerror!void {
+        pub fn sync(ptr: *anyopaque, force: bool) anyerror!void {
             if (Handle == Store) {
                 const state = unbox(ptr);
                 if (state.handle.vtable.sync) |sync_fn| {
@@ -1843,7 +1879,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             }
         }
 
-        fn syncReplayState(ptr: *anyopaque) anyerror!void {
+        pub fn syncReplayState(ptr: *anyopaque) anyerror!void {
             if (Handle == Store) {
                 const state = unbox(ptr);
                 if (state.handle.vtable.sync_replay_state) |sync_replay_state_fn| {
@@ -1863,13 +1899,13 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             }
         }
 
-        fn beginBulkIngestSession(ptr: *anyopaque) anyerror!void {
+        pub fn beginBulkIngestSession(ptr: *anyopaque) anyerror!void {
             if (@hasDecl(Handle, "beginBulkIngestSession")) {
                 try unbox(ptr).handle.beginBulkIngestSession();
             }
         }
 
-        fn finishBulkIngestSession(ptr: *anyopaque, options: backend_types.BulkIngestFinishOptions) anyerror!void {
+        pub fn finishBulkIngestSession(ptr: *anyopaque, options: backend_types.BulkIngestFinishOptions) anyerror!void {
             if (@hasDecl(Handle, "finishBulkIngestSessionWithOptions")) {
                 try unbox(ptr).handle.finishBulkIngestSessionWithOptions(options);
             } else if (@hasDecl(Handle, "finishBulkIngestSession")) {
@@ -1890,41 +1926,41 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             }
         }
 
-        fn abortBulkIngestSession(ptr: *anyopaque) void {
+        pub fn abortBulkIngestSession(ptr: *anyopaque) void {
             if (@hasDecl(Handle, "abortBulkIngestSession")) {
                 unbox(ptr).handle.abortBulkIngestSession();
             }
         }
 
-        fn lastReplaySequence(ptr: *anyopaque, fallback_last: u64) u64 {
+        pub fn lastReplaySequence(ptr: *anyopaque, fallback_last: u64) u64 {
             if (@hasDecl(Handle, "lastReplaySequence")) {
                 return unbox(ptr).handle.lastReplaySequence(fallback_last);
             }
             return fallback_last;
         }
 
-        fn nextReplaySequence(ptr: *anyopaque, fallback_next: u64) u64 {
+        pub fn nextReplaySequence(ptr: *anyopaque, fallback_next: u64) u64 {
             if (@hasDecl(Handle, "nextReplaySequence")) {
                 return unbox(ptr).handle.nextReplaySequence(fallback_next);
             }
             return fallback_next;
         }
 
-        fn appendReplayOpaque(alloc: Allocator, ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
+        pub fn appendReplayOpaque(alloc: Allocator, ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
             if (@hasDecl(Handle, "appendReplayOpaque")) {
                 return try unbox(ptr).handle.appendReplayOpaque(alloc, sequence, payload);
             }
             return error.Unsupported;
         }
 
-        fn iterateReplayFrom(alloc: Allocator, ptr: *anyopaque, from_sequence: u64) anyerror![]ReplayEntry {
+        pub fn iterateReplayFrom(alloc: Allocator, ptr: *anyopaque, from_sequence: u64) anyerror![]ReplayEntry {
             if (@hasDecl(Handle, "iterateReplayFrom")) {
                 return try unbox(ptr).handle.iterateReplayFrom(alloc, from_sequence);
             }
             return error.Unsupported;
         }
 
-        fn forEachReplayFrom(
+        pub fn forEachReplayFrom(
             ptr: *anyopaque,
             from_sequence: u64,
             callback_ctx: *anyopaque,
@@ -1953,7 +1989,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return error.Unsupported;
         }
 
-        fn forEachReplayFromMatchingHintMask(
+        pub fn forEachReplayFromMatchingHintMask(
             ptr: *anyopaque,
             from_sequence: u64,
             required_hint_mask: u8,
@@ -1990,7 +2026,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return error.Unsupported;
         }
 
-        fn forEachReplayLaneFrom(
+        pub fn forEachReplayLaneFrom(
             ptr: *anyopaque,
             lane_ordinal: u8,
             from_sequence: u64,
@@ -2009,7 +2045,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             return error.Unsupported;
         }
 
-        fn truncateReplayUpTo(alloc: Allocator, ptr: *anyopaque, up_to_sequence: u64) anyerror!void {
+        pub fn truncateReplayUpTo(alloc: Allocator, ptr: *anyopaque, up_to_sequence: u64) anyerror!void {
             if (@hasDecl(Handle, "truncateReplayUpTo")) {
                 return try unbox(ptr).handle.truncateReplayUpTo(alloc, up_to_sequence);
             }
@@ -2069,7 +2105,7 @@ pub fn namespaceStoreFrom(
             return @ptrCast(@alignCast(ptr));
         }
 
-        fn deinit(_: Allocator, ptr: *anyopaque) void {
+        pub fn deinit(_: Allocator, ptr: *anyopaque) void {
             const state = unbox(ptr);
             const box_allocator = state.allocator;
             box_allocator.destroy(state);
@@ -2083,7 +2119,7 @@ pub fn namespaceStoreFrom(
             return try namespaceReadTxnFrom(alloc, try unbox(ptr).handle.beginRead(), LocalNamespace, mapNamespace);
         }
 
-        fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!NamespaceReadTxn {
+        pub fn beginProbe(alloc: Allocator, ptr: *anyopaque) anyerror!NamespaceReadTxn {
             if (@hasDecl(HandleDecl, "beginProbe")) {
                 return try namespaceReadTxnFrom(alloc, try unbox(ptr).handle.beginProbe(), LocalNamespace, mapNamespace);
             }
@@ -2098,7 +2134,7 @@ pub fn namespaceStoreFrom(
             return try namespaceBatchFrom(alloc, try unbox(ptr).handle.beginBatch(), LocalNamespace, mapNamespace);
         }
 
-        fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: backend_types.BatchOptions) anyerror!NamespaceBatch {
+        pub fn beginBatchWithOptions(alloc: Allocator, ptr: *anyopaque, options: backend_types.BatchOptions) anyerror!NamespaceBatch {
             if (@hasDecl(HandleDecl, "beginBatchWithOptions")) {
                 return try namespaceBatchFrom(alloc, try unbox(ptr).handle.beginBatchWithOptions(options), LocalNamespace, mapNamespace);
             }

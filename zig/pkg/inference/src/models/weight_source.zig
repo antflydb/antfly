@@ -86,12 +86,12 @@ pub const QuantizedStorage = struct {
     };
 
     pub const PreparedQuantCache = struct {
-        const layout_count = @typeInfo(PreparedQuantLayout).@"enum".fields.len;
+        const layout_count = @typeInfo(PreparedQuantLayout).@"enum".field_names.len;
 
-        entries: [layout_count]?PreparedQuantBuffer = [_]?PreparedQuantBuffer{null} ** layout_count,
+        entries: [layout_count]?PreparedQuantBuffer = @as([layout_count]?PreparedQuantBuffer, @splat(null)),
 
         fn index(layout: PreparedQuantLayout) usize {
-            return @intFromEnum(layout);
+            return @backingInt(layout);
         }
 
         pub fn get(self: *const PreparedQuantCache, layout: PreparedQuantLayout) ?[]u8 {

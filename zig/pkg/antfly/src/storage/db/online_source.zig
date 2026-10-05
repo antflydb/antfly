@@ -70,7 +70,7 @@ fn encode(value: Progress) [encoded_size]u8 {
     @memcpy(bytes[4..28], &value.namespace);
     std.mem.writeInt(u64, bytes[28..36], value.consumer_epoch, .little);
     @memcpy(bytes[36..68], &value.pin);
-    bytes[68] = @intFromEnum(value.phase);
+    bytes[68] = @backingInt(value.phase);
     std.mem.writeInt(u64, bytes[69..77], value.start, .little);
     std.mem.writeInt(u64, bytes[77..85], value.acknowledged, .little);
     std.mem.writeInt(u64, bytes[85..93], value.through_sequence, .little);
@@ -78,7 +78,7 @@ fn encode(value: Progress) [encoded_size]u8 {
     @memcpy(bytes[101..133], &value.cut_digest);
     std.mem.writeInt(u64, bytes[133..141], value.admitted_applied_index, .little);
     @memcpy(bytes[141..173], &value.snapshot_certificate);
-    bytes[173] = @intFromEnum(value.snapshot_phase);
+    bytes[173] = @backingInt(value.snapshot_phase);
     @memcpy(bytes[174..206], &value.local_seal_digest);
     bytes[206] = @intFromBool(value.local_cleanup_complete);
     @memset(bytes[certificate_offset..checksum_offset], 0);
@@ -633,8 +633,8 @@ test "relational index system native rewrite authority clocks survive pin crash 
             const payload = if (request.online_source != null) try effects.encodeOnlineSourceMutationRequestAlloc(alloc, request, sequence_value) else try effects.encodeBatchMutationRequestAlloc(alloc, request);
             defer alloc.free(payload);
             const record: @import("replication_record.zig").RecordView = .{ .kind = .batch_mutation, .payload_codec = .json, .cluster_id = 1, .timeline_id = 1, .epoch = 1, .lsn = lsn, .previous_lsn = lsn - 1, .payload = payload };
-            try replication_ingress.applyRecord(&db, record);
-            try replication_ingress.applyRecord(&db, record);
+            try replication_ingress.applyRecord(db, record);
+            try replication_ingress.applyRecord(db, record);
         }
     };
     const admit: @import("types.zig").BatchRequest = .{ .online_source = .{ .admit = .{ .scope = scope } } };
@@ -670,9 +670,9 @@ test "relational index system native rewrite authority clocks survive pin crash 
     try std.testing.expectError(error.OnlineSourceScopeChanged, Helper.replay(&replica, finish, 9, 5));
     try std.testing.expectEqual(@as(u64, 4), try replica.replicationAppliedSequence());
     try primary.batch(finish);
-    try Helper.replay(&replica, finish, 4, 5);
+    try Helper.replay(&replica, finish, try Helper.sequence(&primary), 5);
     const final = try primary.onlineSourceStatus(scope);
-    try std.testing.expectEqual(@as(u64, 4), final.applied_index);
+    try std.testing.expectEqual(try Helper.sequence(&primary), final.applied_index);
     try std.testing.expectEqualSlices(u8, &final.cut_digest, &(try replica.onlineSourceStatus(scope)).cut_digest);
     try std.testing.expect((try primary.orderedApplyReceipt()) == null);
     try std.testing.expect((try replica.orderedApplyReceipt()) == null);
@@ -681,10 +681,10 @@ test "relational index system native rewrite authority clocks survive pin crash 
     forged.copy_attempt.donor_term = 1;
     try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, .{ .online_source = .{ .admit = .{ .scope = forged } } }, .{ .term = 1, .index = 1 }));
     try std.testing.expectError(error.OnlineSourceScopeChanged, @import("../server_db_adapter.zig").applyOrdered(&primary, .{}, .{ .term = 1, .index = 1 }));
-    try std.testing.expectEqual(@as(u64, 4), try Helper.sequence(&primary));
+    try std.testing.expectEqual(final.applied_index, try Helper.sequence(&primary));
     replica.close();
     replica = try DB.DB.open(alloc, replica_path, options);
-    try std.testing.expectEqual(@as(u64, 4), try Helper.sequence(&replica));
+    try std.testing.expectEqual(final.applied_index, try Helper.sequence(&replica));
     try std.testing.expectEqualSlices(u8, &final.cut_digest, &(try replica.onlineSourceStatus(scope)).cut_digest);
 }
 

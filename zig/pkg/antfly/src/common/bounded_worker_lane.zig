@@ -490,8 +490,8 @@ test "bounded worker lane caps aggregate scratch and handles concurrent submitte
     var capture = Capture{};
     const caller_count = 4;
     const jobs_per_caller = 4;
-    var contexts = [_]*anyopaque{@ptrCast(&capture)} ** jobs_per_caller;
-    var failures = [_]?anyerror{null} ** caller_count;
+    var contexts = @as([jobs_per_caller]*anyopaque, @splat(@ptrCast(&capture)));
+    var failures = @as([caller_count]?anyerror, @splat(null));
     var threads: [caller_count]std.Thread = undefined;
     for (&threads, &failures) |*thread, *failure| thread.* = try std.Thread.spawn(.{}, struct {
         fn run(target: *Executor, items: []const *anyopaque, result: *?anyerror) void {
@@ -568,7 +568,7 @@ test "bounded worker lane drains partial enqueue before reporting close" {
         }
     };
     var capture = Capture{};
-    var contexts = [_]*anyopaque{@ptrCast(&capture)} ** 32;
+    var contexts = @as([32]*anyopaque, @splat(@ptrCast(&capture)));
     var failure: ?anyerror = null;
     const submitter = try std.Thread.spawn(.{}, struct {
         fn run(target: *Executor, items: []const *anyopaque, result: *?anyerror) void {

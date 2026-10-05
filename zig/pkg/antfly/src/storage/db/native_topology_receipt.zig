@@ -19,8 +19,8 @@ pub fn isKey(candidate: []const u8) bool {
 fn key(command: topology.Command) [prefix.len + 2]u8 {
     var result: [prefix.len + 2]u8 = undefined;
     @memcpy(result[0..prefix.len], prefix);
-    result[prefix.len] = @intCast(@intFromEnum(command.fence.role));
-    result[prefix.len + 1] = @intCast(@intFromEnum(command.action));
+    result[prefix.len] = @intCast(@backingInt(command.fence.role));
+    result[prefix.len + 1] = @intCast(@backingInt(command.action));
     return result;
 }
 

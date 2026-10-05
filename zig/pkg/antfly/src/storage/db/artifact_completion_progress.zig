@@ -604,7 +604,7 @@ pub fn collectObsoletePage(alloc: std.mem.Allocator, store: anytype, root: u128)
 
 test "ordered artifact inventory projection completion reconstructs independent receiver evidence" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const certificates = @import("artifact_projection_certificate.zig");
     const native = @import("artifact_native_stream.zig");
     var tmp = std.testing.tmpDir(.{});
@@ -680,7 +680,7 @@ test "ordered artifact inventory projection completion reconstructs independent 
 
 test "ordered artifact inventory completion control verifies independent roots before atomic discharge" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     const native = @import("artifact_native_stream.zig");
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -802,7 +802,7 @@ test "ordered artifact inventory completion control verifies independent roots b
     defer if (queue.bytes) |bytes| alloc.free(bytes);
     source.local_execution.artifact_publication_dispatcher = .{ .ptr = &queue, .enqueue = Queue.enqueue };
     defer source.local_execution.artifact_publication_dispatcher = null;
-    source.artifact_producer_work_retry_after_ns.store(0, .release);
+    source.artifact_producer_scheduler.retry_after_ns.store(0, .release);
     _ = try source.advanceArtifactProducerWorkPage();
     var decoded = try @import("artifact_publication_transport_codec.zig").decodeBorrowed(alloc, queue.bytes orelse return error.TestUnexpectedResult);
     defer decoded.deinit();
@@ -815,7 +815,7 @@ test "ordered artifact inventory completion control verifies independent roots b
 
 test "ordered artifact inventory completion leaves extraction-owned scope pending until certified" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-pending-extraction", .{tmp.sub_path});
@@ -845,7 +845,7 @@ test "ordered artifact inventory completion leaves extraction-owned scope pendin
 
 test "ordered artifact inventory completion never skips an unverified index requirement" {
     const alloc = std.testing.allocator;
-    const db_mod = @import("db.zig");
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/completion-pending-index", .{tmp.sub_path});
@@ -964,7 +964,7 @@ test "ordered artifact inventory completion checkpoint resumes all requirements 
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    const path = try alloc.dupeZ(u8, path_buffer[0..path_len]);
+    const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
     defer alloc.free(path);
     var store = try docstore.DocStore.open(alloc, path, .{});
     defer store.close();
@@ -985,7 +985,7 @@ test "ordered artifact inventory completion checkpoint resumes all requirements 
     for (&nodes, 0..) |*node, ordinal| {
         var id: publication.Digest = @splat(0);
         std.mem.writeInt(u64, id[24..32], ordinal + 1, .big);
-        node.* = .{ .id = id, .kind = @enumFromInt(ordinal % 5), .scope = .document, .name = "fixture" };
+        node.* = .{ .id = id, .kind = @fromBackingInt(@intCast(ordinal % 5)), .scope = .document, .name = "fixture" };
     }
     var plan: Plan = .{ .arena = std.heap.ArenaAllocator.init(alloc), .catalog = authority.catalog_digest, .digest = @splat(8), .nodes = &nodes, .providers = &.{}, .definitions = .empty, .has_projection_requirements = true };
     defer plan.deinit();

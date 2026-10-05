@@ -130,7 +130,7 @@ const OwnedBatch = struct {
         return owned;
     }
 
-    fn deinit(self: *OwnedBatch, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedBatch, alloc: Allocator) void {
         alloc.free(@constCast(self.batch.snapshot.table_id));
         alloc.free(@constCast(self.batch.snapshot.snapshot_id));
         for (self.batch.row_refs) |row_ref| source_binding.freeOwnedRowRef(alloc, row_ref);
@@ -156,6 +156,14 @@ fn cloneColumnAlloc(alloc: Allocator, column: rowsource.ColumnVector) !rowsource
 fn cloneColumnValuesAlloc(alloc: Allocator, values: rowsource.ColumnValues) !rowsource.ColumnValues {
     return switch (values) {
         .bytes => |items| .{ .bytes = try cloneByteSlicesAlloc(alloc, items) },
+        .dictionary_bytes => |items| blk: {
+            const entries = try cloneByteSlicesAlloc(alloc, items.values);
+            errdefer {
+                for (entries) |value| alloc.free(value);
+                alloc.free(entries);
+            }
+            break :blk .{ .dictionary_bytes = .{ .values = entries, .indices = try alloc.dupe(u32, items.indices) } };
+        },
         .json => |items| .{ .json = try cloneByteSlicesAlloc(alloc, items) },
         .i64 => |items| .{ .i64 = try alloc.dupe(i64, items) },
         .f64 => |items| .{ .f64 = try alloc.dupe(f64, items) },
@@ -192,6 +200,7 @@ fn freeColumn(alloc: Allocator, column: rowsource.ColumnVector) void {
     alloc.free(@constCast(column.name));
     alloc.free(@constCast(column.nulls.bytes));
     switch (column.values) {
+        .dictionary_bytes => |items| items.deinit(alloc),
         .bytes, .json => |items| {
             for (items) |item| alloc.free(@constCast(item));
             alloc.free(@constCast(items));

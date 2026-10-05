@@ -123,9 +123,15 @@ pub fn step(db: anytype, command: inventory.Command, context: @import("artifact_
         }
     }
     try db.alignOrderedArtifactCatalog(command, desired, context);
-    var read = try db.core.store.beginReadTxn();
-    defer read.abort();
-    return db.artifactMaterializationsReady(&read, command.catalogs);
+    {
+        var read = try db.core.store.beginReadTxn();
+        defer read.abort();
+        if (try db.artifactMaterializationsReady(&read, command.catalogs)) return true;
+    }
+    // The committed admission owns follower-local initial builds too. Waiting
+    // for leader-only serving maintenance would deadlock its Raft apply cut.
+    try db.advanceOrderedArtifactInitialBuild(desired, context);
+    return false;
 }
 
 fn desiredProducers(alloc: std.mem.Allocator, catalogs: inventory.Catalogs) ![]enrichments.EnrichmentConfig {

@@ -61,7 +61,7 @@ test "cold warmup reopens transient owners without disturbing resident siblings"
             };
         }
         fn free(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-        fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
+        pub fn validate(ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) !bool {
             var current = try snapshot(ptr);
             return contract.matches(&current);
         }
@@ -482,6 +482,93 @@ test "hidden constrained lookup recovers cold compiled owner from exact plan aut
         }, .{})).?);
         try std.testing.expectError(error.TableNotFound, owners.readSource().lookupGroupLocal(alloc, 7196, "hidden", "a", .{}, .read_index));
     }
+}
+
+test "restore publication recovers a cold compiled owner between preparation and admission" {
+    const alloc = std.testing.allocator;
+    const Source = kernel_owner_source.ProvisionedKernelOwnerSource;
+    const staging = @import("db/restore_staging_contract.zig");
+    const schema_json = "{}";
+    const tables = @import("../api/tables.zig");
+    var parsed = try tables.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try tables.deriveRuntimeTableSchema(alloc, parsed);
+    defer @import("schema.zig").freeSchema(alloc, schema);
+    const encoded_schema = try @import("schema.zig").serializeSchema(alloc, schema);
+    defer alloc.free(encoded_schema);
+    const scope: staging.Scope = .{ .plan_id = @splat(1), .plan_digest = @splat(2), .source_artifact_digest = @splat(3), .source_namespace = .{ .table_id = 70, .shard_id = 7001, .range_id = 7001 }, .target_namespace = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .target_schema_digest = staging.digest(encoded_schema) };
+    const bootstrap: staging.OwnerBootstrap = .{ .scope = scope, .table_name = "hidden", .schema_json = schema_json, .indexes_json = "{}", .byte_range = .{ .start = "a", .end = "m" } };
+    const bootstrap_json = try std.json.Stringify.valueAlloc(alloc, bootstrap, .{});
+    defer alloc.free(bootstrap_json);
+    const descriptor: @import("kernel_owner_descriptor.zig").Descriptor = .{ .lsm_root_generation = table_reads.backend_current_root_generation, .identity = .{ .table_id = 71, .shard_id = 7196, .range_id = 7196 }, .schema_json = schema_json, .indexes_json = "{}", .restore_bootstrap_json = bootstrap_json };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", alloc);
+    defer alloc.free(root);
+    const Authority = struct {
+        descriptor: @import("kernel_owner_descriptor.zig").Descriptor,
+        expected: staging.Scope,
+        expected_use: Source.RestoreDescriptorUse = .resolve,
+        reads: usize = 0,
+        fn recover(ptr: *anyopaque, allocator: std.mem.Allocator, group_id: u64, name: []const u8, digest: [32]u8, plan_id: [16]u8, use: Source.RestoreDescriptorUse, context: @import("../api/operation.zig").RequestContext) !Source.OwnedRestoreDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try std.testing.expectEqual(@as(u64, 7196), group_id);
+            try std.testing.expectEqualStrings("hidden", name);
+            try std.testing.expectEqual(self.expected.digest(), digest);
+            try std.testing.expectEqual(self.expected.plan_id, plan_id);
+            try std.testing.expectEqual(self.expected_use, use);
+            self.reads += 1;
+            const schema_owned = try allocator.dupe(u8, self.descriptor.schema_json);
+            errdefer allocator.free(schema_owned);
+            const indexes_owned = try allocator.dupe(u8, self.descriptor.indexes_json);
+            errdefer allocator.free(indexes_owned);
+            const bootstrap_owned = try allocator.dupe(u8, self.descriptor.restore_bootstrap_json);
+            var result = self.descriptor;
+            result.schema_json = schema_owned;
+            result.indexes_json = indexes_owned;
+            result.restore_bootstrap_json = bootstrap_owned;
+            return .{ .descriptor = result };
+        }
+        fn barrier(_: *anyopaque, _: u64, _: []const u8) !void {}
+    };
+    var authority = Authority{ .descriptor = descriptor, .expected = scope };
+    const barrier: read_gate.ReadSafetyBarrier = .{ .ptr = &authority, .vtable = &.{ .wait_read_safe = Authority.barrier } };
+    var owners = Source.init(alloc, root, table_catalog.emptyCatalogSource(), barrier);
+    defer owners.deinit();
+    _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .begin }, null, .{}, .{});
+    const before = try (staging.Progress{ .scope = scope, .phase = .importing, .source_generation_proofs_complete = true }).encode(alloc);
+    defer alloc.free(before);
+    const imported = try (staging.Progress{ .scope = scope, .phase = .imported, .source_generation_proofs_complete = true }).encode(alloc);
+    defer alloc.free(imported);
+    try owners.applyPreparedReplicatedBatchGroupLocal(alloc, 7196, "hidden", descriptor, .{
+        .restore_staging = .{ .import_page = .{ .expected = staging.digest(before), .next = imported, .scope = scope.digest(), .timestamps = &.{} } },
+    });
+    // Lose the hidden descriptor between preparation and Raft admission.
+    // The captured finish must carry its plan identity and recover under
+    // resolution authority after metadata has already published the cohort.
+    _ = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .validate }, null, .{}, .{});
+    const Publication = struct {
+        owners: *Source,
+        authority: *Authority,
+        root: []const u8,
+        barrier: read_gate.ReadSafetyBarrier,
+        fn propose(ptr: *anyopaque, request: db_mod.types.BatchRequest, context: @import("../api/operation.zig").RequestContext) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try context.ensureActive();
+            try std.testing.expectEqual(self.authority.expected.plan_id, request.restore_staging_plan_id.?);
+            try std.testing.expectEqual(self.authority.expected.digest(), request.restore_staging_scope.?);
+            self.owners.deinit();
+            self.owners.* = Source.init(std.testing.allocator, self.root, table_catalog.emptyCatalogSource(), self.barrier);
+            _ = self.owners.withRestoreDescriptorRecovery(.{ .ptr = self.authority, .recover_fn = Authority.recover });
+            self.authority.expected_use = .resolve;
+            _ = (try self.owners.writeSource().batchGroupLocal(std.testing.allocator, 7196, "hidden", request)) orelse return error.TestUnexpectedResult;
+        }
+    };
+    var publication = Publication{ .owners = &owners, .authority = &authority, .root = root, .barrier = barrier };
+    const published = try owners.restoreOwnerControl(alloc, 7196, "hidden", descriptor, .{ .scope = scope, .action = .publish }, .{ .ptr = &publication, .propose = Publication.propose }, .{}, .{});
+    try std.testing.expectEqual(staging.Phase.published, published.phase);
+    try std.testing.expectEqual(@as(usize, 1), authority.reads);
 }
 
 test "transition lease reads unpublished owner metadata without admitting document reads" {
@@ -1085,14 +1172,15 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
         "articles",
         replicated_descriptor.view(),
         .{
-            .deletes = &.{"doc:missing"},
             .timestamp_ns = 4243,
             .sync_level = .full_index,
         },
     );
     {
         // Prepared replay must remain usable while the catalog is unavailable,
-        // and must fail closed if no resident generation was prepared.
+        // and must fail closed if no resident generation was prepared. Use an
+        // empty command: replicated deletes require separately ordered graph
+        // cleanup, which this owner-sharing fixture does not drive.
         const saved_catalog = owner_source.catalog;
         owner_source.catalog = table_catalog.emptyCatalogSource();
         defer owner_source.catalog = saved_catalog;
@@ -1100,7 +1188,7 @@ test "provisioned batch lookup scan and query share one opaque live storage owne
             alloc,
             7001,
             "articles",
-            .{ .deletes = &.{"doc:missing"} },
+            .{},
             true,
             null,
         )) != null);

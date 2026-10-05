@@ -170,7 +170,7 @@ pub const EmbeddingProfile = struct {
     /// It is used only when a request overrides the model's default task text.
     instruction_template: []const u8 = "",
 
-    fn deinit(self: *EmbeddingProfile, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *EmbeddingProfile, allocator: std.mem.Allocator) void {
         if (self.query.prefix.len > 0) allocator.free(self.query.prefix);
         if (self.document.prefix.len > 0) allocator.free(self.document.prefix);
         if (self.instruction_template.len > 0) allocator.free(self.instruction_template);
@@ -422,28 +422,29 @@ pub const ModelManifest = struct {
         copy.allocator = allocator;
         // Clear owned fields before installing any fallible copies, so an
         // allocation failure cannot free storage belonging to the source.
-        inline for (@typeInfo(ModelManifest).@"struct".fields) |field| {
-            if (field.type == []const u8) {
-                @field(copy, field.name) = "";
-            } else if (field.type == ?[]const u8 or field.type == ?[][]const u8) {
-                @field(copy, field.name) = null;
-            } else if (field.type == [][]const u8) {
-                @field(copy, field.name) = &.{};
+        const fields = @typeInfo(ModelManifest).@"struct";
+        inline for (fields.field_names, fields.field_types) |field_name, field_type| {
+            if (field_type == []const u8) {
+                @field(copy, field_name) = "";
+            } else if (field_type == ?[]const u8 or field_type == ?[][]const u8) {
+                @field(copy, field_name) = null;
+            } else if (field_type == [][]const u8) {
+                @field(copy, field_name) = &.{};
             }
         }
         copy.embedding_profile = .{ .task_contract = self.embedding_profile.task_contract };
         copy.gliner_boundary_bundle = null;
         errdefer copy.deinit();
-        inline for (@typeInfo(ModelManifest).@"struct".fields) |field| {
-            const value = @field(self, field.name);
-            if (field.type == []const u8) {
-                if (value.len > 0) @field(copy, field.name) = try allocator.dupe(u8, value);
-            } else if (field.type == ?[]const u8) {
-                if (value) |bytes| @field(copy, field.name) = try allocator.dupe(u8, bytes);
-            } else if (field.type == [][]const u8) {
-                if (value.len > 0) @field(copy, field.name) = try cloneManifestStrings(allocator, value);
-            } else if (field.type == ?[][]const u8) {
-                if (value) |strings| @field(copy, field.name) = try cloneManifestStrings(allocator, strings);
+        inline for (fields.field_names, fields.field_types) |field_name, field_type| {
+            const value = @field(self, field_name);
+            if (field_type == []const u8) {
+                if (value.len > 0) @field(copy, field_name) = try allocator.dupe(u8, value);
+            } else if (field_type == ?[]const u8) {
+                if (value) |bytes| @field(copy, field_name) = try allocator.dupe(u8, bytes);
+            } else if (field_type == [][]const u8) {
+                if (value.len > 0) @field(copy, field_name) = try cloneManifestStrings(allocator, value);
+            } else if (field_type == ?[][]const u8) {
+                if (value) |strings| @field(copy, field_name) = try cloneManifestStrings(allocator, strings);
             }
         }
         copy.embedding_profile.query = .{
@@ -920,7 +921,7 @@ const ArtifactCatalog = struct {
         };
     }
 
-    fn deinit(self: *ArtifactCatalog) void {
+    pub fn deinit(self: *ArtifactCatalog) void {
         if (self.receipt) |*receipt| receipt.deinit();
         self.* = undefined;
     }
@@ -1072,7 +1073,7 @@ const DirectGgufArtifact = struct {
         return path;
     }
 
-    fn deinit(self: *DirectGgufArtifact) void {
+    pub fn deinit(self: *DirectGgufArtifact) void {
         self.catalog.deinit();
         if (self.path) |path| self.allocator.free(path);
         self.allocator.free(self.requested_path);
@@ -2204,7 +2205,7 @@ fn findFirstExtensionInDir(allocator: std.mem.Allocator, base_dir: []const u8, e
         return null;
     }
 
-    const base_dir_z = try allocator.dupeZ(u8, base_dir);
+    const base_dir_z = try allocator.dupeSentinel(u8, base_dir, 0);
     defer allocator.free(base_dir_z);
 
     const dir = c_file.c.opendir(base_dir_z.ptr);
@@ -2272,7 +2273,7 @@ const DiscoveredGgufPaths = struct {
     decoder: ?[]u8 = null,
     projector: ?[]u8 = null,
 
-    fn deinit(self: *DiscoveredGgufPaths, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *DiscoveredGgufPaths, allocator: std.mem.Allocator) void {
         if (self.decoder) |path| allocator.free(path);
         if (self.projector) |path| allocator.free(path);
         self.* = undefined;
@@ -2287,7 +2288,7 @@ const GgufSelection = struct {
     projector_rank: u8 = std.math.maxInt(u8),
     projector_depth: usize = std.math.maxInt(usize),
 
-    fn deinit(self: *GgufSelection, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *GgufSelection, allocator: std.mem.Allocator) void {
         if (self.decoder_key) |key| allocator.free(key);
         if (self.projector_key) |key| allocator.free(key);
         self.decoder_key = null;
@@ -3644,7 +3645,7 @@ const ResolvedClipclapGgufPair = struct {
     clip_path: []const u8,
     clap_path: []const u8,
 
-    fn deinit(self: *ResolvedClipclapGgufPair, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ResolvedClipclapGgufPair, allocator: std.mem.Allocator) void {
         if (self.clip_path.len > 0) allocator.free(self.clip_path);
         if (self.clap_path.len > 0) allocator.free(self.clap_path);
         self.* = .{ .clip_path = "", .clap_path = "" };
@@ -3655,7 +3656,7 @@ const ResolvedGliner2GgufPair = struct {
     encoder_path: []const u8,
     head_path: []const u8,
 
-    fn deinit(self: *ResolvedGliner2GgufPair, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ResolvedGliner2GgufPair, allocator: std.mem.Allocator) void {
         if (self.encoder_path.len > 0) allocator.free(self.encoder_path);
         if (self.head_path.len > 0) allocator.free(self.head_path);
         self.* = .{ .encoder_path = "", .head_path = "" };
@@ -3665,7 +3666,7 @@ const ResolvedGliner2GgufPair = struct {
 const ResolvedFlorence2Gguf = struct {
     model_path: []const u8,
 
-    fn deinit(self: *ResolvedFlorence2Gguf, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *ResolvedFlorence2Gguf, allocator: std.mem.Allocator) void {
         if (self.model_path.len > 0) allocator.free(self.model_path);
         self.* = .{ .model_path = "" };
     }
@@ -5191,11 +5192,11 @@ test "manifest detects gliner gguf head sidecar" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-gliner-head");
     defer allocator.free(dir_path);
-    defer compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
 
     const head_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_head.gguf" });
     defer allocator.free(head_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = head_path, .data = "" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = head_path, .data = "" });
 
     var manifest = try loadFromDir(allocator, dir_path);
     defer manifest.deinit();
@@ -5221,7 +5222,7 @@ test "Qwen3 embedder tokenizer scan policy preserves wrappers and undeclared mod
     try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "[[X][SEP_TEXT]"));
     try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/qwen", "\\\\u005B"));
     try std.testing.expect(!canSkipQwen3EmbedderGlinerTokenScan(&base, "/models/GLiNER-wrapper/qwen", "{}"));
-    var variants = [_]ModelManifest{base} ** 9;
+    var variants = @as([9]ModelManifest, @splat(base));
     variants[0].model_manifest_declarations.model_type = false;
     variants[1].model_manifest_declarations.embedding_style = false;
     variants[2].model_type = .reranker;
@@ -5330,17 +5331,17 @@ test "manifest reads gliner special tokens from tokenizer json" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-gliner-tokenizer-json");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const gliner_config_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner_config.json" });
     defer allocator.free(gliner_config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gliner_config_path, .data = "{\"model_type\":\"gliner2\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = gliner_config_path, .data = "{\"model_type\":\"gliner2\"}" });
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data =
         \\{"version":"1.0","added_tokens":[
@@ -5367,17 +5368,17 @@ test "manifest detects incomplete colqwen bundle" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-colqwen-incomplete");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = config_path, .data = "{\"model_type\":\"qwen2\"}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = config_path, .data = "{\"model_type\":\"qwen2\"}" });
 
     const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
     defer allocator.free(model_manifest_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = model_manifest_path,
         .data = "{\"type\":\"reranker\",\"capabilities\":[\"colqwen\",\"multimodal_late_interaction\"],\"inputs\":[\"text\",\"image\"]}",
     });
@@ -5388,22 +5389,22 @@ test "manifest detects incomplete colqwen bundle" {
 
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data = "{\"version\":\"1.0\",\"model\":{\"type\":\"BPE\",\"vocab\":{},\"merges\":[]}}",
     });
 
     const tokenizer_config_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer_config.json" });
     defer allocator.free(tokenizer_config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_config_path, .data = "{\"model_max_length\":16}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_config_path, .data = "{\"model_max_length\":16}" });
 
     const preprocessor_path = try std.fs.path.join(allocator, &.{ dir_path, "preprocessor_config.json" });
     defer allocator.free(preprocessor_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = preprocessor_path, .data = "{\"patch_size\":14}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = preprocessor_path, .data = "{\"patch_size\":14}" });
 
     const gguf_path = try std.fs.path.join(allocator, &.{ dir_path, "model.gguf" });
     defer allocator.free(gguf_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = gguf_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = gguf_path, .data = "GGUFstub" });
 
     var manifest = try loadFromDir(allocator, dir_path);
     defer manifest.deinit();
@@ -5668,7 +5669,7 @@ test "manifest discovers clip onnx variants and prefers f16 over i8" {
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-clip-onnx-f16-preferred");
     defer {
-        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), model_dir) catch {};
         allocator.free(model_dir);
     }
 
@@ -5683,7 +5684,7 @@ test "manifest discovers clip onnx variants and prefers f16 over i8" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
     var manifest = try loadFromDir(allocator, model_dir);
@@ -5700,7 +5701,7 @@ test "manifest prefers split clip text model over combined model" {
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-clip-text-model-before-combined");
     defer {
-        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), model_dir) catch {};
         allocator.free(model_dir);
     }
 
@@ -5712,7 +5713,7 @@ test "manifest prefers split clip text model over combined model" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
     var manifest = try loadFromDir(allocator, model_dir);
@@ -5727,7 +5728,7 @@ test "manifest discovers clip i8 onnx fallback variants" {
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-clip-onnx-i8-fallback");
     defer {
-        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), model_dir) catch {};
         allocator.free(model_dir);
     }
 
@@ -5738,7 +5739,7 @@ test "manifest discovers clip i8 onnx fallback variants" {
     for (files) |file_name| {
         const path = try std.fs.path.join(allocator, &.{ model_dir, file_name });
         defer allocator.free(path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = path, .data = "" });
     }
 
     var manifest = try loadFromDir(allocator, model_dir);
@@ -5753,15 +5754,15 @@ test "manifest parses clipclap variants gguf pair" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-variants-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q4_K.gguf" });
     defer allocator.free(clip_path);
     const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q4_K.gguf" });
     defer allocator.free(clap_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clip_path, .data = "clip" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clap_path, .data = "clap" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clip_path, .data = "clip" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clap_path, .data = "clap" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -5795,33 +5796,33 @@ test "manifest loads canonical antfly clipclap variants before first gguf fallba
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-canonical-variants");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q4_K.gguf" });
     defer allocator.free(clip_path);
     const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q4_K.gguf" });
     defer allocator.free(clap_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clip_path, .data = "GGUFstub" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clap_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clip_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clap_path, .data = "GGUFstub" });
 
     const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
     defer allocator.free(model_manifest_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = model_manifest_path,
         .data = "{\"type\":\"embedder\",\"tasks\":[\"embed\"],\"inputs\":[\"text\",\"image\",\"audio\"]}",
     });
 
     const clip_config_path = try std.fs.path.join(allocator, &.{ dir_path, "clip_config.json" });
     defer allocator.free(clip_config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = clip_config_path,
         .data = "{\"model_type\":\"clipclap\",\"text_config\":{\"max_position_embeddings\":77}}",
     });
 
     const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(variants_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = variants_path,
         .data =
         \\{
@@ -5853,7 +5854,7 @@ test "manifest ignores stale clipclap variants with missing gguf files" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-stale-variants");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -5884,15 +5885,15 @@ test "manifest falls back to first existing clipclap variant when preferred pair
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-variants-fallback");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const clip_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clip.Q8_0.gguf" });
     defer allocator.free(clip_path);
     const clap_path = try std.fs.path.join(allocator, &.{ dir_path, "clipclap-clap.Q8_0.gguf" });
     defer allocator.free(clap_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clip_path, .data = "clip" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = clap_path, .data = "clap" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clip_path, .data = "clip" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = clap_path, .data = "clap" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -5928,15 +5929,15 @@ test "manifest parses gliner2 variants gguf pair" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-gliner2-variants-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const encoder_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner2-encoder.Q4_K.gguf" });
     defer allocator.free(encoder_path);
     const head_path = try std.fs.path.join(allocator, &.{ dir_path, "gliner2-head.Q4_K.gguf" });
     defer allocator.free(head_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = encoder_path, .data = "GGUFstub" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = head_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = encoder_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = head_path, .data = "GGUFstub" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -5968,12 +5969,12 @@ test "manifest parses florence2 variants gguf model" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-florence2-variants-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q4_K.gguf" });
     defer allocator.free(q4_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q4_path, .data = "GGUFstub" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -6005,15 +6006,15 @@ test "manifest parses lowercase florence variants gguf model" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-florence-lowercase-variants-gguf");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const q8_path = try std.fs.path.join(allocator, &.{ dir_path, "florence2.Q8_0.gguf" });
     defer allocator.free(q8_path);
     const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence2.Q4_K.gguf" });
     defer allocator.free(q4_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q8_path, .data = "GGUFstub" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q8_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q4_path, .data = "GGUFstub" });
 
     var manifest = ModelManifest{ .allocator = allocator };
     defer manifest.deinit();
@@ -6051,41 +6052,41 @@ test "manifest loads canonical antfly florence2 variants before first gguf fallb
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-florence2-canonical-variants");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
     const q8_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q8_0.gguf" });
     defer allocator.free(q8_path);
     const q4_path = try std.fs.path.join(allocator, &.{ dir_path, "florence-2-base.Q4_K.gguf" });
     defer allocator.free(q4_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q8_path, .data = "GGUFstub" });
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = q4_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q8_path, .data = "GGUFstub" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = q4_path, .data = "GGUFstub" });
 
     const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
     defer allocator.free(config_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data = "{\"model_type\":\"florence2\",\"text_config\":{\"d_model\":768},\"vision_config\":{\"image_size\":768}}",
     });
     const model_manifest_path = try std.fs.path.join(allocator, &.{ dir_path, "model_manifest.json" });
     defer allocator.free(model_manifest_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = model_manifest_path,
         .data = "{\"type\":\"reader\",\"tasks\":[\"read\"],\"inputs\":[\"text\",\"image\"]}",
     });
     const tokenizer_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_path, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_path, .data = "{}" });
     const tokenizer_config_path = try std.fs.path.join(allocator, &.{ dir_path, "tokenizer_config.json" });
     defer allocator.free(tokenizer_config_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = tokenizer_config_path, .data = "{}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = tokenizer_config_path, .data = "{}" });
     const preprocessor_path = try std.fs.path.join(allocator, &.{ dir_path, "preprocessor_config.json" });
     defer allocator.free(preprocessor_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = preprocessor_path, .data = "{\"size\":{\"height\":768,\"width\":768}}" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = preprocessor_path, .data = "{\"size\":{\"height\":768,\"width\":768}}" });
 
     const variants_path = try std.fs.path.join(allocator, &.{ dir_path, "antfly_inference_variants.json" });
     defer allocator.free(variants_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = variants_path,
         .data =
         \\{
@@ -6128,7 +6129,7 @@ test "manifest ignores stale florence2 variants with missing gguf files" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-florence2-stale-variants");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -6157,13 +6158,13 @@ test "manifest uses clipclap variants when default ONNX bundle is partial" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-partial-onnx");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
     const onnx_path = try std.fs.path.join(allocator, &.{ dir_path, "text_model.onnx" });
     defer allocator.free(onnx_path);
-    try compat.cwd().writeFile(compat.io(), .{ .sub_path = onnx_path, .data = "" });
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = onnx_path, .data = "" });
 
     var catalog = try ArtifactCatalog.initPublished(allocator, dir_path);
     defer catalog.deinit();
@@ -6174,7 +6175,7 @@ test "manifest keeps default clipclap ONNX when six model files are present" {
     const allocator = std.testing.allocator;
     const dir_path = try testScratchDir(allocator, "manifest-clipclap-complete-onnx");
     defer {
-        compat.cwd().deleteTree(compat.io(), dir_path) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
         allocator.free(dir_path);
     }
 
@@ -6189,7 +6190,7 @@ test "manifest keeps default clipclap ONNX when six model files are present" {
     for (onnx_files) |file_name| {
         const file_path = try std.fs.path.join(allocator, &.{ dir_path, file_name });
         defer allocator.free(file_path);
-        try compat.cwd().writeFile(compat.io(), .{ .sub_path = file_path, .data = "" });
+        try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{ .sub_path = file_path, .data = "" });
     }
 
     var catalog = try ArtifactCatalog.initPublished(allocator, dir_path);
@@ -6243,20 +6244,20 @@ test "manifest detects layoutlmv3 token classification architecture as extractor
     const allocator = std.testing.allocator;
     const model_dir = try testScratchDir(allocator, "manifest-layoutlmv3-token-extractor");
     defer {
-        compat.cwd().deleteTree(compat.io(), model_dir) catch {};
+        std.Io.Dir.cwd().deleteTree(compat.testingIo(), model_dir) catch {};
         allocator.free(model_dir);
     }
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
     const tokenizer_path = try std.fs.path.join(allocator, &.{ model_dir, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = config_path,
         .data =
         \\{"model_type":"layoutlmv3","architectures":["LayoutLMv3ForTokenClassification"],"hidden_size":768,"num_hidden_layers":12,"num_attention_heads":12,"num_labels":2}
         ,
     });
-    try compat.cwd().writeFile(compat.io(), .{
+    try std.Io.Dir.cwd().writeFile(compat.testingIo(), .{
         .sub_path = tokenizer_path,
         .data = "{}",
     });
@@ -6272,8 +6273,8 @@ fn testScratchDir(allocator: std.mem.Allocator, name: []const u8) ![]u8 {
     defer allocator.free(root);
     const dir_path = try std.fs.path.join(allocator, &.{ "/tmp", root, name });
     errdefer allocator.free(dir_path);
-    compat.cwd().deleteTree(compat.io(), dir_path) catch {};
-    try compat.cwd().createDirPath(compat.io(), dir_path);
+    std.Io.Dir.cwd().deleteTree(compat.testingIo(), dir_path) catch {};
+    try std.Io.Dir.cwd().createDirPath(compat.testingIo(), dir_path);
     return dir_path;
 }
 
@@ -7198,48 +7199,48 @@ fn appendTestString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(
 
 fn appendTestMetadataString(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataU32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: u32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.u32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.u32));
     try appendTestLe(u32, allocator, data, value);
 }
 
 fn appendTestMetadataBool(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: bool) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.bool_));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.bool_));
     try appendTestLe(u8, allocator, data, @intFromBool(value));
 }
 
 fn appendTestMetadataF32(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, value: f32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.f32));
     try appendTestLe(u32, allocator, data, @bitCast(value));
 }
 
 fn appendTestMetadataStringArray(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const []const u8) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.string));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.string));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestString(allocator, data, value);
 }
 
 fn appendTestMetadataI32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const i32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.i32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.i32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(i32, allocator, data, value);
 }
 
 fn appendTestMetadataF32Array(allocator: std.mem.Allocator, data: *std.ArrayListUnmanaged(u8), key: []const u8, values: []const f32) !void {
     try appendTestString(allocator, data, key);
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.array));
-    try appendTestLe(u32, allocator, data, @intFromEnum(gguf_format.MetadataValueType.f32));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.array));
+    try appendTestLe(u32, allocator, data, @backingInt(gguf_format.MetadataValueType.f32));
     try appendTestLe(u64, allocator, data, values.len);
     for (values) |value| try appendTestLe(u32, allocator, data, @bitCast(value));
 }
@@ -7481,7 +7482,7 @@ test "span wrapper manifest takes encoder geometry from encoder_config" {
 test "manifest clone owns metadata and unwinds every allocation failure" {
     const allocator = std.testing.allocator;
     var strings = [_][]const u8{ "text", "" };
-    const zero = "0" ** 64;
+    const zero = &@as([64]u8, @splat('0'));
     const pins = [_]boundary_bundle.FilePin{
         .{ .path = "model.safetensors", .size_bytes = 32, .sha256 = zero },
         .{ .path = "config.json", .size_bytes = 1, .sha256 = zero },
@@ -7534,21 +7535,22 @@ test "manifest clone owns metadata and unwinds every allocation failure" {
         fn run(a: std.mem.Allocator, original: *const ModelManifest) !void {
             var copy = try original.clone(a);
             defer copy.deinit();
-            inline for (@typeInfo(ModelManifest).@"struct".fields) |field| {
-                const expected = @field(original, field.name);
-                const actual = @field(copy, field.name);
-                if (field.type == []const u8) {
+            const fields = @typeInfo(ModelManifest).@"struct";
+            inline for (fields.field_names, fields.field_types) |field_name, field_type| {
+                const expected = @field(original, field_name);
+                const actual = @field(copy, field_name);
+                if (field_type == []const u8) {
                     try std.testing.expectEqualStrings(expected, actual);
                     if (expected.len > 0) try std.testing.expect(expected.ptr != actual.ptr);
-                } else if (field.type == ?[]const u8) {
+                } else if (field_type == ?[]const u8) {
                     try std.testing.expectEqual(expected != null, actual != null);
                     if (expected) |value| {
                         try std.testing.expectEqualStrings(value, actual.?);
                         if (value.len > 0) try std.testing.expect(value.ptr != actual.?.ptr);
                     }
-                } else if (field.type == [][]const u8 or field.type == ?[][]const u8) {
-                    const expected_list = if (field.type == ?[][]const u8) expected orelse &.{} else expected;
-                    const actual_list = if (field.type == ?[][]const u8) actual orelse &.{} else actual;
+                } else if (field_type == [][]const u8 or field_type == ?[][]const u8) {
+                    const expected_list = if (field_type == ?[][]const u8) expected orelse &.{} else expected;
+                    const actual_list = if (field_type == ?[][]const u8) actual orelse &.{} else actual;
                     try std.testing.expectEqual(expected_list.len, actual_list.len);
                     for (expected_list, actual_list) |value, owned| {
                         try std.testing.expectEqualStrings(value, owned);
@@ -7565,7 +7567,7 @@ test "manifest clone owns metadata and unwinds every allocation failure" {
             try std.testing.expect(original.gliner_boundary_bundle.?.value.files.ptr != copy.gliner_boundary_bundle.?.value.files.ptr);
         }
     };
-    try std.testing.checkAllAllocationFailures(allocator, Check.run, .{&source});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Check.run, .{&source});
     try std.testing.expectEqualStrings("text", source.inputs[0]);
     try std.testing.expectEqualStrings("Instruct: retrieve\nQuery: ", source.queryPrefix());
 }

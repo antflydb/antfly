@@ -42,11 +42,11 @@ pub const ArenaError = error{
 };
 
 pub const Observation = struct {
-    route_slots: [max_route_width]u8 = [_]u8{invalid_slot} ** max_route_width,
+    route_slots: [max_route_width]u8 = @as([max_route_width]u8, @splat(invalid_slot)),
     /// True when this route entry was absent (or reverse-map-invalid) before
     /// observeRoute repaired the directory. Arena owners use this to upload
     /// exactly the slots whose weight bytes changed.
-    repaired: [max_route_width]bool = [_]bool{false} ** max_route_width,
+    repaired: [max_route_width]bool = @as([max_route_width]bool, @splat(false)),
     count: usize = 0,
     hit_count: usize = 0,
     miss_count: usize = 0,
@@ -73,14 +73,14 @@ pub const ExpertSlotArena = struct {
     active_slots: u8,
     epoch: u64 = 0,
     expert_for_slot: [max_layers][max_slots]u16 =
-        [_][max_slots]u16{[_]u16{invalid_expert} ** max_slots} ** max_layers,
+        @as([max_layers][max_slots]u16, @splat(@as([max_slots]u16, @splat(invalid_expert)))),
     slot_for_expert: [max_layers][max_experts]u8 =
-        [_][max_experts]u8{[_]u8{invalid_slot} ** max_experts} ** max_layers,
+        @as([max_layers][max_experts]u8, @splat(@as([max_experts]u8, @splat(invalid_slot)))),
     use_count: [max_layers][max_slots]u64 =
-        [_][max_slots]u64{[_]u64{0} ** max_slots} ** max_layers,
+        @as([max_layers][max_slots]u64, @splat(@as([max_slots]u64, @splat(0)))),
     last_access_epoch: [max_layers][max_slots]u64 =
-        [_][max_slots]u64{[_]u64{0} ** max_slots} ** max_layers,
-    layer_observation_count: [max_layers]u64 = [_]u64{0} ** max_layers,
+        @as([max_layers][max_slots]u64, @splat(@as([max_slots]u64, @splat(0)))),
+    layer_observation_count: [max_layers]u64 = @as([max_layers]u64, @splat(0)),
 
     pub fn init(active_slots: usize) ArenaError!ExpertSlotArena {
         if (active_slots == 0 or active_slots > max_slots) return error.InvalidCapacity;
@@ -137,7 +137,7 @@ pub const ExpertSlotArena = struct {
             for (self.use_count[layer][0..self.active_slots]) |*count| count.* >>= 1;
         }
         var result = Observation{ .count = experts.len };
-        var pinned = [_]bool{false} ** max_slots;
+        var pinned = @as([max_slots]bool, @splat(false));
 
         // Observe first, before installing misses. This is the only state a
         // zero-sync device route is allowed to use as its all-hit proof.
@@ -285,7 +285,7 @@ test "expert slot arena repairs one miss without evicting current hits" {
     try std.testing.expectEqual(@as(usize, 1), repaired.miss_count);
     try std.testing.expect(!repaired.all_hit_before_update);
 
-    var map = [_]u32{std.math.maxInt(u32)} ** max_experts;
+    var map = @as([max_experts]u32, @splat(std.math.maxInt(u32)));
     try arena.writeExpertToSlotMap(4, 128, &map);
     for (changed) |expert| try std.testing.expect(map[expert] < 8);
     try std.testing.expectEqual(std.math.maxInt(u32), map[7]);

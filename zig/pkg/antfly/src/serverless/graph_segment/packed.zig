@@ -484,7 +484,7 @@ pub fn viewRetainedBytes(data: []const u8) !usize {
 const Dictionary = struct {
     map: std.StringHashMapUnmanaged(u32) = .empty,
     values: std.ArrayListUnmanaged([]const u8) = .empty,
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.map.deinit(alloc);
         self.values.deinit(alloc);
     }
@@ -510,7 +510,7 @@ const Encoding = struct {
     size: usize = header_len,
     local_edges: usize = 0,
     routing_extra: usize = 0,
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.nodes.deinit(alloc);
         self.edge_types.deinit(alloc);
     }

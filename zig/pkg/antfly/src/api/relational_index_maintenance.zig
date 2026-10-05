@@ -143,8 +143,8 @@ test "index maintenance requires canonical decimal and digest observations" {
     try std.testing.expectError(error.InvalidIndexMaintenance, decimal("01"));
     try std.testing.expectError(error.InvalidIndexMaintenance, decimal("+1"));
     try std.testing.expectError(error.InvalidIndexMaintenance, decimal("18446744073709551616"));
-    try std.testing.expectError(error.InvalidIndexMaintenance, digest("AA" ** 32));
-    try std.testing.expectEqual(@as([32]u8, @splat(0xaa)), try digest("aa" ** 32));
+    try std.testing.expectError(error.InvalidIndexMaintenance, digest(z17RepeatString("AA", 32)));
+    try std.testing.expectEqual(@as([32]u8, @splat(0xaa)), try digest(z17RepeatString("aa", 32)));
 }
 
 test "index maintenance resumes partial acknowledgements and fences stale owners" {
@@ -255,4 +255,15 @@ test "index maintenance resumes partial acknowledgements and fences stale owners
     fixture.cancel_after_first = true;
     try std.testing.expectError(error.Canceled, execute(alloc, &fixture, reader, writer, "rows", "by_id", .retry, body, .{ .cancellation = .{ .ptr = &fixture, .is_cancelled_fn = Fixture.cancelledFn } }));
     try std.testing.expectEqual(@as(usize, 3), fixture.commits);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

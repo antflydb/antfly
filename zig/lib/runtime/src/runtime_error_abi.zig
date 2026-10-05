@@ -27,9 +27,9 @@ test "FK publication progress and corrupt retirement proofs retain distinct boun
     const pending = statusFromError(error.GenerationAdmissionAcknowledgementPending);
     const changed = statusFromError(error.GenerationRetirementChanged);
     const corrupted = statusFromError(error.InvalidRetirementSummary);
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), pending.code);
-    try std.testing.expectEqual(@intFromEnum(Code.conflict), changed.code);
-    try std.testing.expectEqual(@intFromEnum(Code.corrupt), corrupted.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), pending.code);
+    try std.testing.expectEqual(@backingInt(Code.conflict), changed.code);
+    try std.testing.expectEqual(@backingInt(Code.corrupt), corrupted.code);
     try std.testing.expect(pending.detail != changed.detail and changed.detail != corrupted.detail);
     const publication_changed = statusFromError(error.GenerationPublicationChanged);
     try std.testing.expectEqual(error.GenerationPublicationChanged, errorFromStatus(publication_changed));
@@ -702,23 +702,61 @@ pub const Detail = enum(c_int) {
     graph_generation_mismatch,
     generation_publication_changed,
     initial_child_provision_already_committed,
+    // Append-only external query details preserve identity across runtime archives.
+    external_lake_read_only,
+    external_lake_snapshot_mismatch,
+    external_lake_schema_mismatch,
+    external_lake_schema_unavailable,
+    external_lake_field_identity_changed,
+    external_lake_object_changed,
+    empty_external_source_snapshot,
+    unsupported_external_lake_schema_type,
+    invalid_parquet_metadata,
+    invalid_parquet_footer,
+    invalid_parquet_footer_magic,
+    invalid_parquet_page,
+    unsupported_parquet_page,
+    parquet_page_too_large,
+    parquet_column_not_found,
+    unsupported_iceberg_schema_evolution,
+    unsupported_iceberg_delete_file,
+    invalid_sql_spill,
 };
 
 pub const Status = extern struct {
     // Keep the wire fields as integers so a newer peer's enum value can be
     // rejected without constructing an invalid exhaustive Zig enum.
-    code: c_int = @intFromEnum(Code.ok),
-    detail: c_int = @intFromEnum(Detail.none),
+    code: c_int = @backingInt(Code.ok),
+    detail: c_int = @backingInt(Detail.none),
 
     pub const ok: Status = .{};
 
     pub fn isOk(self: Status) bool {
-        return self.code == @intFromEnum(Code.ok);
+        return self.code == @backingInt(Code.ok);
     }
 };
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
+        error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
+        error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
+        error.ExternalLakeSchemaUnavailable => status(.unavailable, .external_lake_schema_unavailable),
+        error.ExternalLakeFieldIdentityChanged => status(.conflict, .external_lake_field_identity_changed),
+        error.ExternalLakeObjectChanged => status(.conflict, .external_lake_object_changed),
+        error.EmptyExternalSourceSnapshot => status(.invalid_argument, .empty_external_source_snapshot),
+        error.UnsupportedExternalLakeSchemaType => status(.unsupported, .unsupported_external_lake_schema_type),
+        error.InvalidParquetMetadata => status(.corrupt, .invalid_parquet_metadata),
+        error.InvalidParquetFooter => status(.corrupt, .invalid_parquet_footer),
+        error.InvalidParquetFooterMagic => status(.corrupt, .invalid_parquet_footer_magic),
+        error.InvalidParquetPage => status(.corrupt, .invalid_parquet_page),
+        error.UnsupportedParquetPage => status(.unsupported, .unsupported_parquet_page),
+        error.ParquetPageTooLarge => status(.invalid_argument, .parquet_page_too_large),
+        error.ParquetColumnNotFound => status(.not_found, .parquet_column_not_found),
+        error.UnsupportedIcebergSchemaEvolution => status(.unsupported, .unsupported_iceberg_schema_evolution),
+        error.UnsupportedIcebergDeleteFile => status(.unsupported, .unsupported_iceberg_delete_file),
+        error.InvalidSqlSpill => status(.corrupt, .invalid_sql_spill),
+
         error.SettingAuthorityUnavailable => status(.unavailable, .setting_authority_unavailable),
         error.InvalidGenerationPublication => status(.invalid_argument, .invalid_generation_publication),
         error.GenerationPublicationChanged => status(.conflict, .generation_publication_changed),
@@ -824,7 +862,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.IntentConflict => status(.conflict, .intent_conflict),
         error.VersionConflict => status(.conflict, .version_conflict),
         error.MergePageRequired => status(.conflict, .merge_page_required),
-        error.InvalidResponse => status(.internal, .invalid_response),
+        error.InvalidResponse, error.UnexpectedEof => status(.internal, .invalid_response),
         error.TransitionOperationsRetired => status(.retryable, .transition_operations_retired),
         error.TransitionOperationBusy => status(.retryable, .transition_operation_busy),
         error.UnknownSplitRuntime => status(.not_found, .unknown_split_runtime),
@@ -866,7 +904,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.RetainedEffectsIdentityRequired => status(.conflict, .retained_effects_identity_required),
         error.RetainedEffectsNamespaceMismatch => status(.conflict, .retained_effects_namespace_mismatch),
         error.BackendRuntimeIoUnavailable => status(.unavailable, .backend_runtime_io_unavailable),
-        error.CorruptRaftAppliedEntry => status(.corrupt, .corrupt_raft_applied_entry),
+        error.CorruptRaftAppliedEntry, error.CorruptOrderedApplyReceipt => status(.corrupt, .corrupt_raft_applied_entry),
         error.UnknownSchemaVersion => status(.conflict, .unknown_schema_version),
         error.MetadataHABindingBusy => status(.retryable, .metadata_ha_binding_busy),
         error.MetadataHAOutboxPending => status(.retryable, .metadata_ha_outbox_pending),
@@ -1361,18 +1399,18 @@ pub fn statusFromError(err: anyerror) Status {
 /// not an arbitrary error string across the stable ABI.
 pub fn statusFromErrorWithFallback(err: anyerror, fallback: anyerror) Status {
     const value = statusFromError(err);
-    if (value.detail != @intFromEnum(Detail.none)) return value;
+    if (value.detail != @backingInt(Detail.none)) return value;
     const fallback_value = statusFromError(fallback);
-    std.debug.assert(fallback_value.detail != @intFromEnum(Detail.none));
+    std.debug.assert(fallback_value.detail != @backingInt(Detail.none));
     return fallback_value;
 }
 
 pub fn errorHasStableDetail(err: anyerror) bool {
-    return statusFromError(err).detail != @intFromEnum(Detail.none);
+    return statusFromError(err).detail != @backingInt(Detail.none);
 }
 
 fn status(code: Code, detail: Detail) Status {
-    return .{ .code = @intFromEnum(code), .detail = @intFromEnum(detail) };
+    return .{ .code = @backingInt(code), .detail = @backingInt(detail) };
 }
 
 pub fn errorFromStatus(value: Status) anyerror {
@@ -1393,6 +1431,25 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .external_lake_read_only => "ExternalLakeReadOnly",
+        .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
+        .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
+        .external_lake_schema_unavailable => "ExternalLakeSchemaUnavailable",
+        .external_lake_field_identity_changed => "ExternalLakeFieldIdentityChanged",
+        .external_lake_object_changed => "ExternalLakeObjectChanged",
+        .empty_external_source_snapshot => "EmptyExternalSourceSnapshot",
+        .unsupported_external_lake_schema_type => "UnsupportedExternalLakeSchemaType",
+        .invalid_parquet_metadata => "InvalidParquetMetadata",
+        .invalid_parquet_footer => "InvalidParquetFooter",
+        .invalid_parquet_footer_magic => "InvalidParquetFooterMagic",
+        .invalid_parquet_page => "InvalidParquetPage",
+        .unsupported_parquet_page => "UnsupportedParquetPage",
+        .parquet_page_too_large => "ParquetPageTooLarge",
+        .parquet_column_not_found => "ParquetColumnNotFound",
+        .unsupported_iceberg_schema_evolution => "UnsupportedIcebergSchemaEvolution",
+        .unsupported_iceberg_delete_file => "UnsupportedIcebergDeleteFile",
+        .invalid_sql_spill => "InvalidSqlSpill",
+
         .generation_publication_changed => "GenerationPublicationChanged",
         .initial_child_provision_already_committed => "InitialChildProvisionAlreadyCommitted",
         .initial_child_publication_changed => "InitialChildPublicationChanged",
@@ -2019,46 +2076,47 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
 test "schema epoch conflicts retain a retryable public status" {
     // main published this value before the relational-only tail. Preserve it
     // when both branches append details independently.
-    try std.testing.expectEqual(@as(c_int, 297), @intFromEnum(Detail.unsupported_tensor_type));
-    try std.testing.expectEqual(@as(c_int, 306), @intFromEnum(Detail.vector_store_reference_format_required));
-    try std.testing.expectEqual(@as(c_int, 307), @intFromEnum(Detail.backup_outcome_ambiguous));
-    try std.testing.expectEqual(@as(c_int, 308), @intFromEnum(Detail.metadata_mutation_not_applied));
+    try std.testing.expectEqual(@as(c_int, 297), @backingInt(Detail.unsupported_tensor_type));
+    try std.testing.expectEqual(@as(c_int, 306), @backingInt(Detail.vector_store_reference_format_required));
+    try std.testing.expectEqual(@as(c_int, 307), @backingInt(Detail.backup_outcome_ambiguous));
+    try std.testing.expectEqual(@as(c_int, 308), @backingInt(Detail.metadata_mutation_not_applied));
     const value = statusFromError(error.SchemaInUse);
-    try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
+    try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
     try std.testing.expectEqual(error.SchemaInUse, errorFromStatus(value));
 }
 
 test "transaction capacity rejection retains a permanent public status" {
     const value = statusFromError(error.TransactionTooLarge);
-    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), value.code);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), value.code);
     try std.testing.expectEqual(error.TransactionTooLarge, errorFromStatus(value));
 }
 
 test "stable status preserves deterministic raft rejection and malformed response identity" {
     inline for (.{ error.IntentConflict, error.VersionConflict, error.MergePageRequired }) |err| {
         const value = statusFromError(err);
-        try std.testing.expectEqual(@intFromEnum(Code.conflict), value.code);
+        try std.testing.expectEqual(@backingInt(Code.conflict), value.code);
         try std.testing.expectEqual(err, errorFromStatus(value));
     }
     // A malformed response is not proof that a mutation failed to commit.
     // Preserve its identity without granting automatic retry authority.
     const malformed = statusFromError(error.InvalidResponse);
-    try std.testing.expectEqual(@intFromEnum(Code.internal), malformed.code);
+    try std.testing.expectEqualDeep(malformed, statusFromError(error.UnexpectedEof));
+    try std.testing.expectEqual(@backingInt(Code.internal), malformed.code);
     try std.testing.expectEqual(error.InvalidResponse, errorFromStatus(malformed));
 }
 
 test "stable status preserves public boundary semantics" {
     for ([_]anyerror{ error.IndexRebuilding, error.IncompletePublishedSnapshot, error.DistributedQueryUnavailable }) |err| {
         const readiness = statusFromError(err);
-        try std.testing.expectEqual(@intFromEnum(Code.retryable), readiness.code);
+        try std.testing.expectEqual(@backingInt(Code.retryable), readiness.code);
         try std.testing.expectEqual(err, errorFromStatus(readiness));
     }
     try std.testing.expectEqual(error.ReadIndexTimeout, errorFromStatus(statusFromError(error.ReadIndexTimeout)));
-    try std.testing.expectEqual(@intFromEnum(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
+    try std.testing.expectEqual(@backingInt(Code.timeout), statusFromError(error.ReadIndexTimeout).code);
     try std.testing.expectEqual(error.GenerationTransitionActive, errorFromStatus(statusFromError(error.GenerationTransitionActive)));
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.GenerationTransitionActive).code);
     try std.testing.expectEqual(error.IndexGenerationMismatch, errorFromStatus(statusFromError(error.IndexGenerationMismatch)));
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), statusFromError(error.IndexGenerationMismatch).code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.IndexGenerationMismatch).code);
     try std.testing.expect(Status.ok.isOk());
     try std.testing.expectEqual(error.TableNotFound, errorFromStatus(statusFromError(error.TableNotFound)));
     try std.testing.expectEqual(error.TableVisibilityTimeout, errorFromStatus(statusFromError(error.TableVisibilityTimeout)));
@@ -2095,8 +2153,8 @@ test "stable status preserves public boundary semantics" {
     try std.testing.expectEqual(error.UnsupportedPlatform, errorFromStatus(statusFromError(error.UnsupportedPlatform)));
     try std.testing.expectEqual(error.UnsupportedTransformOperation, errorFromStatus(statusFromError(error.UnsupportedTransformOperation)));
     const schema_history_status = statusFromError(error.BackupSchemaHistoryTooLarge);
-    try std.testing.expectEqual(@intFromEnum(Code.invalid_argument), schema_history_status.code);
-    try std.testing.expectEqual(@intFromEnum(Detail.backup_manifest_too_large), schema_history_status.detail);
+    try std.testing.expectEqual(@backingInt(Code.invalid_argument), schema_history_status.code);
+    try std.testing.expectEqual(@backingInt(Detail.backup_manifest_too_large), schema_history_status.detail);
     try std.testing.expectEqual(error.BackupManifestTooLarge, errorFromStatus(schema_history_status));
     try std.testing.expectEqual(error.HAReadRequiresPrimary, errorFromStatus(statusFromError(error.HAReadRequiresPrimary)));
     try std.testing.expectEqual(error.PersistentDescriptorAdmissionExhausted, errorFromStatus(statusFromError(error.PersistentDescriptorAdmissionExhausted)));
@@ -2127,9 +2185,9 @@ test "stable detail detection distinguishes private errors" {
 }
 
 test "every classified boundary outcome retains its identity" {
-    @setEvalBranchQuota(32 * std.meta.fields(Detail).len);
+    @setEvalBranchQuota(@intCast(32 * (comptime std.meta.fieldNames(Detail)).len));
     const classified = comptime blk: {
-        @setEvalBranchQuota(@typeInfo(Detail).@"enum".fields.len * 8);
+        @setEvalBranchQuota(@typeInfo(Detail).@"enum".field_names.len * 8);
         const details = std.meta.tags(Detail)[1..];
         var errors: [details.len]anyerror = undefined;
         for (details, 0..) |detail, index| {
@@ -2149,20 +2207,20 @@ test "stable status has a C layout" {
 }
 
 test "scheduler admission detail appends without renumbering existing wire outcomes" {
-    try std.testing.expectEqual(@as(c_int, 559), @intFromEnum(Detail.http_connection_closing));
-    try std.testing.expectEqual(@as(c_int, 560), @intFromEnum(Detail.raft_batch_write_transport_outcome_unknown));
-    try std.testing.expectEqual(@as(c_int, 561), @intFromEnum(Detail.concurrency_unavailable));
+    try std.testing.expectEqual(@as(c_int, 559), @backingInt(Detail.http_connection_closing));
+    try std.testing.expectEqual(@as(c_int, 560), @backingInt(Detail.raft_batch_write_transport_outcome_unknown));
+    try std.testing.expectEqual(@as(c_int, 561), @backingInt(Detail.concurrency_unavailable));
     const wire = statusFromError(error.ConcurrencyUnavailable);
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
     try std.testing.expectEqual(error.ConcurrencyUnavailable, errorFromStatus(wire));
 }
 
 test "unknown wire values fail closed" {
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = 999, .detail = 999 }));
-    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @intFromEnum(Code.internal), .detail = 999 }));
+    try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{ .code = @backingInt(Code.internal), .detail = 999 }));
     try std.testing.expectEqual(error.RuntimeBoundaryFailure, errorFromStatus(.{
-        .code = @intFromEnum(Code.invalid_argument),
-        .detail = @intFromEnum(Detail.table_not_found),
+        .code = @backingInt(Code.invalid_argument),
+        .detail = @backingInt(Detail.table_not_found),
     }));
 }
 
@@ -2186,13 +2244,13 @@ test "provider quota errors retain stable boundary details" {
 
 test "generation capacity retains retryability across the runtime boundary" {
     const result = statusFromError(error.GenerationCapacityUnavailable);
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), result.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), result.code);
     try std.testing.expectEqual(error.GenerationCapacityUnavailable, errorFromStatus(result));
 }
 
 test "system catalog errors retain their stable runtime boundary classification" {
     const unavailable = statusFromError(error.SettingAuthorityUnavailable);
-    try std.testing.expectEqual(@intFromEnum(Code.unavailable), unavailable.code);
+    try std.testing.expectEqual(@backingInt(Code.unavailable), unavailable.code);
     try std.testing.expectEqual(error.SettingAuthorityUnavailable, errorFromStatus(unavailable));
     const errors = [_]anyerror{ error.TableTopologyProtocolUpgradeRequired, error.DatabaseNotFound, error.NamespaceNotFound, error.TablespaceNotFound, error.CatalogNotFound, error.CatalogAlreadyExists, error.CatalogGenerationChanged, error.TablespaceInUse, error.NamespaceNotEmpty, error.DatabaseNotEmpty, error.ProtectedCatalogResource, error.InvalidCatalogName, error.InvalidCatalogMutation, error.InvalidTablespaceLocation, error.InvalidTablespacePlacementPolicy, error.CatalogCommandTooLarge, error.InvalidCatalogRecord, error.CatalogIdExhausted };
     for (errors) |err| try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
@@ -2200,7 +2258,7 @@ test "system catalog errors retain their stable runtime boundary classification"
 
 test "ambiguous backup outcome survives runtime transport without rollback authorization" {
     const wire = statusFromError(error.BackupOutcomeAmbiguous);
-    try std.testing.expectEqual(@intFromEnum(Code.conflict), wire.code);
+    try std.testing.expectEqual(@backingInt(Code.conflict), wire.code);
     try std.testing.expectEqual(error.BackupOutcomeAmbiguous, errorFromStatus(wire));
 }
 
@@ -2212,20 +2270,21 @@ test "HA capture availability survives runtime callback transport" {
 
 test "storage owner contention retains retryability and exact identity" {
     const wire = statusFromError(error.StorageBusy);
-    try std.testing.expectEqual(@intFromEnum(Code.retryable), wire.code);
+    try std.testing.expectEqual(@backingInt(Code.retryable), wire.code);
     try std.testing.expect(errorHasStableDetail(error.StorageBusy));
     try std.testing.expectEqual(error.StorageBusy, errorFromStatus(wire));
 }
 
 test "released main Detail identifiers retain their exact names and numeric values" {
+    @setEvalBranchQuota(2000);
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
-    inline for (@typeInfo(Detail).@"enum".fields) |field| {
-        if (field.value <= 370) {
-            for (field.name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
+    inline for (@typeInfo(Detail).@"enum".field_names, @typeInfo(Detail).@"enum".field_values) |reflected_name, field_value| {
+        if (field_value <= 370) {
+            for (reflected_name) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             var encoded: [4]u8 = undefined;
-            std_test.mem.writeInt(u32, &encoded, @intCast(field.value), .little);
+            std_test.mem.writeInt(u32, &encoded, @intCast(field_value), .little);
             for (encoded) |byte| fingerprint = (fingerprint ^ byte) *% 1099511628211;
             count += 1;
         }
@@ -2252,4 +2311,37 @@ test "online merge admission barrier preserves exact identity across runtime arc
     const err = error.OnlineMergeArtifactCatalogUncoordinated;
     try std.testing.expect(errorHasStableDetail(err));
     try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+}
+
+test "ordered receipt corruption preserves the released runtime status" {
+    const old = statusFromError(error.CorruptRaftAppliedEntry);
+    const renamed = statusFromError(error.CorruptOrderedApplyReceipt);
+    try std.testing.expectEqual(old, renamed);
+    try std.testing.expectEqual(error.CorruptRaftAppliedEntry, errorFromStatus(renamed));
+}
+
+test "external lake and spill errors retain exact identity across runtime archives" {
+    for ([_]anyerror{
+        error.ExternalLakeReadOnly,
+        error.ExternalLakeSnapshotMismatch,
+        error.ExternalLakeSchemaMismatch,
+        error.ExternalLakeSchemaUnavailable,
+        error.ExternalLakeFieldIdentityChanged,
+        error.ExternalLakeObjectChanged,
+        error.EmptyExternalSourceSnapshot,
+        error.UnsupportedExternalLakeSchemaType,
+        error.InvalidParquetMetadata,
+        error.InvalidParquetFooter,
+        error.InvalidParquetFooterMagic,
+        error.InvalidParquetPage,
+        error.UnsupportedParquetPage,
+        error.ParquetPageTooLarge,
+        error.ParquetColumnNotFound,
+        error.UnsupportedIcebergSchemaEvolution,
+        error.UnsupportedIcebergDeleteFile,
+        error.InvalidSqlSpill,
+    }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
 }

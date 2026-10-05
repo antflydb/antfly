@@ -24,6 +24,7 @@ pub const Diagnostic = struct {
     retryable: ?bool = null,
 
     pub fn httpStatus(self: Diagnostic) u16 {
+        if (std.mem.eql(u8, self.code, "38000")) return 502;
         if (std.mem.eql(u8, self.code, "0A000")) return 501;
         if (std.mem.eql(u8, self.code, "42501")) return 403;
         if (std.mem.eql(u8, self.code, "53300")) return 503;
@@ -35,6 +36,11 @@ pub const Diagnostic = struct {
 
 pub fn describe(err: anyerror) Diagnostic {
     return switch (err) {
+        error.InvalidDecisionSpecification, error.InvalidDeciderConfig => .{ .code = "22023", .message = "The decision specification is invalid.", .retryable = false },
+        error.UnknownDecider => .{ .code = "42704", .message = "The configured decider does not exist.", .retryable = false },
+        error.DecisionLimitExceeded => .{ .code = "54000", .message = "The decision evaluation budget was exceeded.", .retryable = false },
+        error.DecisionRateLimited, error.DecisionProviderUnavailable, error.MissingDecisionApiKey => .{ .code = "53300", .message = "The decision provider is unavailable or rate limited.", .retryable = false },
+        error.InvalidDecisionOutput, error.DecisionUpstreamFailure, error.DecisionUnauthorized => .{ .code = "38000", .message = "The decision provider failed.", .retryable = false },
         error.SqlPreparedNotFound => .{ .code = "26000", .message = "The prepared resource is unknown, expired or inaccessible.", .retryable = false },
         error.SqlConnectionNotFound => .{ .code = "08003", .message = "The SQL connection is unknown, expired or inaccessible.", .retryable = false },
         error.SqlConnectionWrongOwner => .{ .code = "55000", .message = "The SQL connection belongs to another API node.", .hint = "Send the request to the owner_node_id returned when the connection was opened.", .retryable = false },
@@ -80,6 +86,8 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlReadOnlyTransaction => .{ .code = "25006", .message = "A read-only transaction cannot modify data.", .retryable = false },
         error.InvalidSavepointName, error.SqlSavepointNotFound => .{ .code = "3B001", .message = "The requested savepoint does not exist or its name is invalid.", .retryable = false },
         error.SavepointLimitExceeded => .{ .code = "54000", .message = "The transaction savepoint limit was exceeded.", .hint = "Release earlier savepoints before creating more.", .retryable = false },
+        error.ExternalLakeReadOnly => .{ .code = "25006", .message = "External lake tables are read-only.", .retryable = false },
+        error.ExternalLakeSnapshotMismatch => .{ .code = "40001", .message = "The pinned external lake snapshot changed.", .retryable = true },
         error.UnsupportedSqlExecution, error.UnsupportedSqlShape => .{ .code = "0A000", .message = "This SQL statement or expression is not supported.", .hint = "Use a supported relational SELECT, INSERT, UPDATE, or DELETE statement." },
         error.SqlSchemaRewriteRequiresMetadataOwner => .{ .code = "0A000", .message = "This schema rewrite requires the metadata-owned SQL endpoint.", .hint = "Submit the DDL to the metadata API; no rewrite job was admitted on this data node.", .retryable = false },
         error.RowPolicyUnsupported, error.RowPolicyTopologyUnsupported => .{ .code = "0A000", .message = "Row policy publication is not supported for this table shape.", .hint = "Remove unsupported indexes or topology features before enabling the policy; no publication was started.", .retryable = false },

@@ -1,5 +1,6 @@
 FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS wasmtime
 
+ARG ZIG_VERSION=0.17.0
 ARG WASMTIME_VERSION=v45.0.2
 ARG TARGETARCH
 
@@ -25,8 +26,11 @@ LABEL org.opencontainers.image.source=https://github.com/antflydb/antfly
 LABEL org.opencontainers.image.description="AntflyDB Zig runtime image"
 LABEL org.opencontainers.image.licenses=Elastic-2.0
 
+ARG TARGETARCH
+
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates wget && \
+    if [ "${TARGETARCH}" = amd64 ]; then apt-get install -y --no-install-recommends libopenblas0-pthread; fi && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 antfly && \
     useradd --uid 10001 --gid antfly --create-home --home-dir /home/antfly --shell /usr/sbin/nologin antfly && \

@@ -802,7 +802,7 @@ test "bounded batch preprocessing rejects a decoded image above its wave budget"
 
 test "indexed preprocessing isolates oversized and corrupt media without dropping healthy rows" {
     const alloc = std.testing.allocator;
-    const pixels = [_]u8{255} ** (64 * 64 * 4);
+    const pixels = @as([(64 * 64 * 4)]u8, @splat(255));
     const large = try antfly_image.png.encodeRgba(alloc, 64, 64, &pixels);
     defer alloc.free(large);
     var output: [48]f32 = undefined;
@@ -1827,7 +1827,7 @@ const SharedPreprocessBudget = struct {
     /// old slab before allocating its replacement so physical backing never
     /// exceeds max_bytes, even transiently. On backing failure the request is
     /// terminal, but the empty budget remains valid for deferred destruction.
-    fn ensureCapacity(self: *@This(), requested_bytes: usize) !void {
+    pub fn ensureCapacity(self: *@This(), requested_bytes: usize) !void {
         std.debug.assert(self.live_bytes.load(.acquire) == 0);
         const target = @min(requested_bytes, self.max_bytes);
         if (target <= self.slab.len) return;
@@ -1852,7 +1852,7 @@ const SharedPreprocessBudget = struct {
         return true;
     }
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         std.debug.assert(self.live_bytes.load(.acquire) == 0);
         if (self.slab.len > 0) self.backing.free(self.slab);
         self.* = undefined;

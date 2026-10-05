@@ -356,7 +356,7 @@ pub const ModelOutput = struct {
             return if (token) |token_id| @intCast(token_id) else null;
         }
 
-        fn deinit(self: *PreparedTail) void {
+        pub fn deinit(self: *PreparedTail) void {
             self.backend.free(self.final_hidden);
             self.* = undefined;
         }
@@ -518,7 +518,7 @@ pub const ForwardRequest = union(enum) {
 const SamplingPenaltyState = struct {
     counts: std.AutoHashMapUnmanaged(u32, u32) = .empty,
 
-    fn deinit(self: *SamplingPenaltyState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *SamplingPenaltyState, allocator: std.mem.Allocator) void {
         self.counts.deinit(allocator);
         self.* = .{};
     }

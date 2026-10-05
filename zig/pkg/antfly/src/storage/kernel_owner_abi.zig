@@ -18,7 +18,7 @@
 const failure_abi = @import("runtime_failure_abi");
 
 // Storage layouts evolve independently of the shared failure envelope.
-pub const abi_version: u32 = 72;
+pub const abi_version: u32 = 75;
 pub const Status = failure_abi.Status;
 pub const FailureBoundary = failure_abi.FailureBoundary;
 pub const FailureIdentity = failure_abi.FailureIdentity;
@@ -413,6 +413,39 @@ pub const ContextMetricsResult = extern struct {
     lsm_run_table_index: ContextCacheKindStats = .{},
     lsm_run_table_block: ContextCacheKindStats = .{},
     lsm_run_table_physical_block: ContextCacheKindStats = .{},
+    /// The context's ResourceManager is the ledger storage owners charge.
+    /// Slices are indexed by the manager's slice ordinal.
+    resource_memory: ContextResourceBudgetStats = .{},
+    resource_slice_count: u32 = 0,
+    resource_slices: [context_resource_slice_capacity]ContextResourceBudgetStats = @splat(ContextResourceBudgetStats{}),
+};
+
+pub const context_resource_slice_capacity: usize = 64;
+
+pub const ContextResourceBudgetStats = extern struct {
+    used_bytes: u64 = 0,
+    peak_bytes: u64 = 0,
+    soft_limit_bytes: u64 = 0,
+    hard_limit_bytes: u64 = 0,
+    soft_limit_events: u64 = 0,
+    hard_limit_rejections: u64 = 0,
+    oversized_single_grants: u64 = 0,
+    accounting_errors: u64 = 0,
+
+    /// Project aggregate or slice counters without importing the storage
+    /// implementation across this ABI. Inapplicable counters remain zero.
+    pub fn fromResourceStats(stats: anytype) ContextResourceBudgetStats {
+        return .{
+            .used_bytes = stats.used_bytes,
+            .peak_bytes = stats.peak_bytes,
+            .soft_limit_bytes = stats.soft_limit_bytes,
+            .hard_limit_bytes = stats.hard_limit_bytes,
+            .soft_limit_events = stats.soft_limit_events,
+            .hard_limit_rejections = stats.hard_limit_rejections,
+            .oversized_single_grants = if (@hasField(@TypeOf(stats), "oversized_single_grants")) stats.oversized_single_grants else 0,
+            .accounting_errors = if (@hasField(@TypeOf(stats), "accounting_errors")) stats.accounting_errors else 0,
+        };
+    }
 };
 
 /// Process-owned data-Raft apply/projection store. Requests are deliberately
@@ -1311,7 +1344,7 @@ pub const MaintenanceAction = enum(u32) {
 
 pub const MaintenanceRequest = extern struct {
     version: u32 = abi_version,
-    action: u32 = @intFromEnum(MaintenanceAction.inspect),
+    action: u32 = @backingInt(MaintenanceAction.inspect),
     table_name: BorrowedBytes = .{},
     deadline_ns: u64 = 0,
     snapshot_token: BorrowedBytes = .{},
@@ -1399,7 +1432,7 @@ pub const SyncRequest = extern struct {
     cancellation_ctx: ?*anyopaque = null,
     cancellation_fn: ?CancellationCheckFn = null,
     version: u32 = abi_version,
-    sync_level: u32 = @intFromEnum(SyncLevel.write),
+    sync_level: u32 = @backingInt(SyncLevel.write),
     table_name: BorrowedBytes = .{},
 };
 
@@ -1434,7 +1467,7 @@ pub const BackupFormat = enum(u32) {
 /// all byte slices are borrowed only for this synchronous operation.
 pub const BackupRequest = extern struct {
     version: u32 = abi_version,
-    format: u32 = @intFromEnum(BackupFormat.native),
+    format: u32 = @backingInt(BackupFormat.native),
     table_name: BorrowedBytes = .{},
     backup_root: BorrowedBytes = .{},
     backup_id: BorrowedBytes = .{},
@@ -1590,7 +1623,7 @@ pub const CancellationCheckFn = *const fn (?*anyopaque) callconv(.c) u8;
 /// Cancellation is borrowed for the synchronous call and is never retained.
 pub const ArtifactOperationRequest = extern struct {
     version: u32 = abi_version,
-    operation: u32 = @intFromEnum(ArtifactOperation.reprocess_document),
+    operation: u32 = @backingInt(ArtifactOperation.reprocess_document),
     table_name: BorrowedBytes = .{},
     request_json: BorrowedBytes = .{},
     cancellation_ctx: ?*anyopaque = null,

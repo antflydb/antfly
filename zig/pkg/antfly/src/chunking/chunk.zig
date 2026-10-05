@@ -151,7 +151,10 @@ pub fn artifactTextAlloc(
     payload: []const u8,
     source_field: []const u8,
 ) !?[]u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, payload, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
     defer parsed.deinit();
     if (parsed.value != .object) return null;
 

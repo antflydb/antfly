@@ -657,7 +657,7 @@ test "fuzzy highlights respect prefixes and long tokens" {
     try std.testing.expectEqual(@as(usize, 1), prefixed[0].highlights.len);
     try std.testing.expectEqualStrings("cat", prefixed[0].text[prefixed[0].highlights[0].start..prefixed[0].highlights[0].end]);
 
-    const query = [_]u8{'a'} ** 65;
+    const query = @as([65]u8, @splat('a'));
     var source = query;
     source[64] = 'b';
     const long = try highlightMatchers(alloc, &source, &.{.{ .fuzzy = .{ .term = &query, .max_edits = 1 } }}, &analysis_mod.simple_analyzer, 1, 100);

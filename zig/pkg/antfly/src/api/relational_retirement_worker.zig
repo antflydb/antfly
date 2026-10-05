@@ -344,7 +344,7 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
         .generations = job.generations,
     };
     if (!std.mem.eql(u8, &progress.job_id, &job.id) or !std.mem.eql(u8, &progress.owner, &state.value.owner)) return error.ConstraintRetirementChanged;
-    if (state.value.progress == null or @intFromEnum(progress.phase) < @intFromEnum(expected_phase)) {
+    if (state.value.progress == null or @backingInt(progress.phase) < @backingInt(expected_phase)) {
         if (state.value.progress == null and expected_phase != .fenced) return error.ConstraintRetirementChanged;
         progress.phase = expected_phase;
         const command: native.Command = .{ .routing_key = owner_start, .expected = state.value.progress, .next = try progress.encode(owned) };
@@ -373,7 +373,7 @@ fn runPageAttempt(alloc: Allocator, reader: reads.TableReadSource, writer: write
             !std.mem.eql(u8, &proof.owner, &peer.value.owner) or proof.schema_version != catalog.schema_version or
             !std.mem.eql(u8, &proof.target_schema_digest, &job.target_schema_digest) or
             !std.mem.eql(u8, std.mem.sliceAsBytes(proof.generations), std.mem.sliceAsBytes(job.generations)) or
-            (job.phase != .fencing and @intFromEnum(proof.phase) <= @intFromEnum(expected_phase)))
+            (job.phase != .fencing and @backingInt(proof.phase) <= @backingInt(expected_phase)))
         {
             arena.deinit();
             return null;

@@ -71,7 +71,7 @@ const DatasetRecord = struct {
     lsm_sorted_ingest_bytes: u64,
     lsm_write_pressure_compactions: u64,
 
-    fn deinit(self: *DatasetRecord, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *DatasetRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.case_name);
         alloc.free(self.algebraic_backend);
         alloc.free(self.algebraic_profile);
@@ -88,7 +88,7 @@ const QueryRecord = struct {
     avg_ms: f64,
     checksum: u64,
 
-    fn deinit(self: *QueryRecord, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *QueryRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.case_name);
         alloc.free(self.algebraic_backend);
         alloc.free(self.algebraic_profile);
@@ -104,7 +104,7 @@ const CorrectnessRecord = struct {
     expected_equal: bool,
     all_match: bool,
 
-    fn deinit(self: *CorrectnessRecord, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *CorrectnessRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.case_name);
         alloc.free(self.query);
         self.* = undefined;
@@ -128,7 +128,7 @@ const ChurnRecord = struct {
     adaptive_maintenance_cached_spec_count: u64,
     adaptive_maintenance_disabled_count: u64,
 
-    fn deinit(self: *ChurnRecord, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ChurnRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.case_name);
         alloc.free(self.algebraic_backend);
         alloc.free(self.algebraic_profile);
@@ -152,7 +152,7 @@ const ChurnRowFamilyRecord = struct {
     bytes_after: u64,
     bytes_delta: i64,
 
-    fn deinit(self: *ChurnRowFamilyRecord, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *ChurnRowFamilyRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.case_name);
         alloc.free(self.family);
         self.* = undefined;
@@ -177,7 +177,7 @@ const WarmupRecord = struct {
     adaptive_recommendation_count: u64,
     observed_query_shape_count: u64,
 
-    fn deinit(self: *WarmupRecord, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *WarmupRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.case_name);
         alloc.free(self.algebraic_backend);
         alloc.free(self.algebraic_profile);
@@ -203,7 +203,7 @@ const GraphTraversalRecord = struct {
     fallback: u64,
     result_nodes: u64,
 
-    fn deinit(self: *GraphTraversalRecord, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *GraphTraversalRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.case_name);
         alloc.free(self.mode);
         self.* = undefined;
@@ -244,7 +244,7 @@ const PublicQueryRecord = struct {
     reranked_vectors_avg: f64,
     returned_hits_avg: f64,
 
-    fn deinit(self: *PublicQueryRecord, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *PublicQueryRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.mode);
         alloc.free(self.server);
         alloc.free(self.query_shape);
