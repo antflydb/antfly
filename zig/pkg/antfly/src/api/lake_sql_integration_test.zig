@@ -113,8 +113,11 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         var fixture: Fixture = .{ .lake_schema = encoded };
         var backend_runtime = try @import("../storage/background_runtime.zig").BackendRuntimeHandle.init(alloc, .{ .backend = .io_threaded });
         defer backend_runtime.deinit();
-        var server = server_mod.ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr() }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog, .supports_query_definitions = true } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fixture.openNative } }, null);
-        defer server.deinit();
+        const cache_root = try std.fmt.allocPrint(alloc, "{s}/cache-{s}", .{ directory.path(), format });
+        defer alloc.free(cache_root);
+        var server = server_mod.ApiHttpServer.init(alloc, .{ .backend_runtime = backend_runtime.ptr(), .lake_cache_root = cache_root }, .{ .ptr = &fixture, .vtable = &.{ .status = undefined, .system_catalog = Fixture.catalog, .supports_query_definitions = true } }, .{ .ptr = &fixture, .vtable = &.{ .lookup = undefined, .scan = undefined, .query = undefined, .open_relational_statement = Fixture.openNative } }, null);
+        var server_live = true;
+        defer if (server_live) server.deinit();
         // Exercise the shared creation hook before SQL sees the durable schema.
         _ = schema_json.value.object.swapRemove("document_schemas");
         _ = source.value.object.swapRemove("schema_fingerprint");
@@ -192,6 +195,25 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
         try std.testing.expectEqualStrings("", bounded);
         resumed_request.to = "invalid";
         try std.testing.expectError(error.ExternalLakeSnapshotMismatch, @import("lake_table_reads.zig").query(alloc, &adapter, .{ .database = "default", .namespace = "public", .table = "events" }, 7, resumed_request));
+        try std.testing.expect(server.lake_read_cache.persistent != null);
+        const cfg = server.cfg;
+        const status_source = server.source;
+        const table_reads = server.table_reads;
+        server.deinit();
+        server_live = false;
+        var restarted = server_mod.ApiHttpServer.init(alloc, cfg, status_source, table_reads, null);
+        defer restarted.deinit();
+        var restarted_adapter: Adapter = .{ .server = &restarted, .identity = &identity, .context = .{} };
+        var restart_query = try @import("../sql/compiler.zig").compile(alloc, "SELECT SUM(amount) FROM events", .{});
+        defer restart_query.deinit();
+        var restart_result = try @import("../sql/runtime.zig").execute(alloc, restarted_adapter.backend(), &restart_query, &.{}, .{});
+        defer restart_result.deinit();
+        try std.testing.expectEqualStrings("15", restart_result.output.rows[0][0].string);
+        const stats = restarted.requestStats();
+        try std.testing.expect(stats.lake_range_cache.disk_hits > 0);
+        try std.testing.expect(stats.lake_range_cache.disk_bytes > 0);
+        try std.testing.expectEqual(@as(u64, 0), stats.lake_range_cache.provider_reads);
+        try std.testing.expect(stats.lake_disk_cache.?.read_hits > 0);
     }
 }
 

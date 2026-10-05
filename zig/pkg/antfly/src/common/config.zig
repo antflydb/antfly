@@ -79,6 +79,7 @@ pub const Config = struct {
     backup: BackupConfig = .{},
     metadata: MetadataConfig = .{},
     storage: StorageConfig = .{},
+    lake_cache: LakeCacheConfig = .{},
     transaction_sessions: TransactionSessionConfig = .{},
     ha: ?HotStandbyConfig = null,
     inference: InferenceConfig = .{},
@@ -164,6 +165,17 @@ pub const Config = struct {
     pub fn validateServerTlsConfig(tls: ?TlsConfig) !void {
         if (tls != null) return error.ServerTlsUnsupported;
     }
+
+    pub const LakeCacheConfig = struct {
+        enabled: bool = true,
+        root: ?[]u8 = null,
+        max_memory_bytes: usize = 64 * 1024 * 1024,
+        max_disk_bytes: usize = 10 * 1024 * 1024 * 1024,
+        max_entries: usize = 16_384,
+        max_write_queue_bytes: usize = 32 * 1024 * 1024,
+        max_write_queue_entries: usize = 16,
+        protected_bytes: usize = 256 * 1024 * 1024,
+    };
 
     pub const StorageConfig = struct {
         engine: common_openapi.StorageEngine = .local,
@@ -812,6 +824,8 @@ pub const Config = struct {
 
         const deployment_mode = try deploymentModeFromObject(root, expected_deployment);
         try validateStorageFromOpenApi(deployment_mode, root, validated.value.storage);
+        const lake_cache = try parseLakeCacheConfig(alloc, root.get("lake_cache"));
+        errdefer if (lake_cache.root) |path| alloc.free(path);
         var storage_config = try storageFromOpenApi(alloc, validated.value.storage, root.get("storage"));
         errdefer storage_config.deinit(alloc);
         var connections = try parseConnectionsConfig(alloc, root.get("connections"));
@@ -922,6 +936,7 @@ pub const Config = struct {
                 if (validated.value.metadata) |metadata| metadata.orchestration_urls else null,
             ),
             .storage = storage_config,
+            .lake_cache = lake_cache,
             .transaction_sessions = try transactionSessionConfigFromOpenApi(validated.value.transaction_sessions),
             // `hot_standby` is the current config key; `ha` is accepted for one
             // minor release as a deprecated alias. If both are set, `hot_standby`
@@ -1157,6 +1172,7 @@ pub const Config = struct {
         if (self.cors) |*cors| cors.deinit(self.registry.allocator);
         self.metadata.deinit(self.registry.allocator);
         self.storage.deinit(self.registry.allocator);
+        if (self.lake_cache.root) |path| self.registry.allocator.free(path);
         self.inference.deinit(self.registry.allocator);
         if (self.ha) |*ha| ha.deinit(self.registry.allocator);
         self.transcribers.deinit();
@@ -3780,4 +3796,47 @@ test "common config bootstraps named secret sources before resolving credentials
     defer alloc.free(resolved);
     try std.testing.expectEqualStrings("credential", resolved);
     try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(alloc, "{\"secrets\":{\"environment\":\"false\"}}"));
+}
+
+fn parseLakeCacheConfig(a: std.mem.Allocator, value: ?std.json.Value) !Config.LakeCacheConfig {
+    var config: Config.LakeCacheConfig = .{};
+    const input = value orelse return config;
+    if (input != .object) return error.InvalidConfig;
+    var fields = input.object.iterator();
+    while (fields.next()) |field| {
+        var known = false;
+        inline for (@typeInfo(Config.LakeCacheConfig).@"struct".field_names) |name| {
+            if (std.mem.eql(u8, field.key_ptr.*, name)) known = true;
+        }
+        if (!known) return error.InvalidConfig;
+    }
+    config.enabled = try optionalBoolField(input.object, "enabled") orelse config.enabled;
+    inline for (.{ "max_memory_bytes", "max_disk_bytes", "max_entries", "max_write_queue_bytes", "max_write_queue_entries", "protected_bytes" }) |name| {
+        const number = try optionalU64Field(input.object, name) orelse @field(config, name);
+        if (number == 0 and !std.mem.eql(u8, name, "protected_bytes")) return error.InvalidConfig;
+        @field(config, name) = std.math.cast(usize, number) orelse return error.InvalidConfig;
+    }
+    config.root = try optionalStringFieldDup(a, input.object, "root");
+    errdefer if (config.root) |path| a.free(path);
+    if (config.root) |path| if (path.len == 0) return error.InvalidConfig;
+    return config;
+}
+
+test "common config persistent lake cache defaults overrides and bounds" {
+    const a = std.testing.allocator;
+    var defaults = try Config.parseFromSlice(a, "{}");
+    defer defaults.deinit();
+    try std.testing.expectEqual(@as(usize, 32 * 1024 * 1024), defaults.lake_cache.max_write_queue_bytes);
+    var configured = try Config.parseFromSlice(a, "{\"lake_cache\":{\"enabled\":false,\"root\":\"/tmp/lake-cache\",\"max_disk_bytes\":10737418240,\"max_entries\":256,\"protected_bytes\":0}}");
+    defer configured.deinit();
+    try std.testing.expect(!configured.lake_cache.enabled);
+    try std.testing.expectEqualStrings("/tmp/lake-cache", configured.lake_cache.root.?);
+    try std.testing.expectEqual(@as(usize, 256), configured.lake_cache.max_entries);
+    try std.testing.expectEqual(@as(usize, 0), configured.lake_cache.protected_bytes);
+    for ([_][]const u8{
+        "{\"lake_cache\":{\"max_disk_bytes\":0}}",
+        "{\"lake_cache\":{\"max_entries\":-1}}",
+        "{\"lake_cache\":{\"root\":\"\"}}",
+        "{\"lake_cache\":{\"unknown\":1}}",
+    }) |invalid| try std.testing.expectError(error.InvalidConfig, Config.parseFromSlice(a, invalid));
 }

@@ -241,6 +241,10 @@ pub const PersistentObjectRangeCachePolicy = struct {
     max_write_queue_entries: usize = 64,
     max_cache_key_bytes: usize = 64 * 1024,
     durability: PersistentObjectRangeCacheDurability = .cache_only,
+    /// Reserve up to this much disk for metadata/sidecars, capped at a quarter
+    /// of total capacity. Broad scans can use free space but cannot displace
+    /// the protected working set; zero disables the reservation.
+    protected_bytes: usize = 256 * 1024 * 1024,
 
     pub fn validate(self: PersistentObjectRangeCachePolicy) !void {
         if (self.max_total_bytes == 0 or self.max_entries == 0 or
@@ -257,6 +261,7 @@ pub const PersistentObjectRangeCacheStats = struct {
     read_misses: usize = 0,
     read_errors: usize = 0,
     stored_bytes: usize = 0,
+    protected_stored_bytes: usize = 0,
     entries: usize = 0,
     evicted_bytes: usize = 0,
     evicted_entries: usize = 0,
@@ -334,6 +339,7 @@ pub const PersistentObjectRangeCache = struct {
             .io = io,
             .resource_manager = resources.resource_manager,
         };
+        errdefer if (state.owner_lock) |file| file.close(io);
         try state.initializeInventory();
         errdefer state.deinitInventory();
         state.worker = try io.concurrent(persistentObjectRangeWorkerMain, .{state});
@@ -351,6 +357,7 @@ pub const PersistentObjectRangeCache = struct {
         state.deinitInventory();
         state.pending.deinit(state.alloc);
         state.queue.deinit(state.alloc);
+        if (state.owner_lock) |file| file.close(io);
         state.alloc.free(state.root_dir);
         const internal_alloc = state.alloc;
         internal_alloc.destroy(state);
@@ -442,6 +449,7 @@ const PersistentObjectRangeCacheEntry = struct {
     filename: []u8,
     disk_bytes: usize,
     modified_ns: i128,
+    protected: bool = false,
     pin_count: usize = 0,
     removing: bool = false,
     lru_node: std.DoublyLinkedList.Node = .{},
@@ -487,18 +495,43 @@ const PersistentObjectRangeCacheState = struct {
     pending: std.StringHashMapUnmanaged(void) = .empty,
     pending_bytes: usize = 0,
     pending_count: usize = 0,
+    owner_lock: ?std.Io.File = null,
     entries: std.StringHashMapUnmanaged(*PersistentObjectRangeCacheEntry) = .empty,
     lru: std.DoublyLinkedList = .{},
     stats: PersistentObjectRangeCacheStats = .{},
 
     fn initializeInventory(self: *PersistentObjectRangeCacheState) !void {
         const io = self.io;
-        try fs_paths.createDirPathPortable(io, self.root_dir);
+        // Create a private leaf without changing permissions on an existing
+        // configured directory (which can belong to other local tooling).
+        const leaf = std.mem.trimEnd(u8, self.root_dir, "/\\");
+        if (leaf.len == 0) return error.BadPathName;
+        try fs_paths.createDirPathPortable(io, std.fs.path.dirname(leaf) orelse ".");
+        if (std.fs.path.isAbsolute(leaf)) {
+            std.Io.Dir.createDirAbsolute(io, leaf, @fromBackingInt(@intCast(0o700))) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        } else {
+            std.Io.Dir.cwd().createDir(io, leaf, @fromBackingInt(@intCast(0o700))) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => return err,
+            };
+        }
         var dir = if (std.fs.path.isAbsolute(self.root_dir))
             try std.Io.Dir.openDirAbsolute(io, self.root_dir, .{ .iterate = true })
         else
             try std.Io.Dir.cwd().openDir(io, self.root_dir, .{ .iterate = true });
         defer dir.close(io);
+        // Coordinate inventory cleanup/eviction across API owners/processes.
+        // Contention disables the optional serving tier instead of blocking a
+        // request or mutating another owner's pinned entries.
+        self.owner_lock = try dir.createFile(io, "OWNER.lock", .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+            .permissions = @fromBackingInt(@intCast(0o600)),
+        });
 
         var discovered = std.PriorityQueue(
             *PersistentObjectRangeCacheEntry,
@@ -563,6 +596,7 @@ const PersistentObjectRangeCacheState = struct {
                 .filename = filename,
                 .disk_bytes = disk_bytes,
                 .modified_ns = stat.mtime.toNanoseconds(),
+                .protected = persistentCachedKeyProtected(io, self.alloc, dir, filename, self.policy.max_cache_key_bytes) catch false,
             };
             discovered.push(self.alloc, owned) catch |err| {
                 self.freeEntry(owned);
@@ -594,6 +628,7 @@ const PersistentObjectRangeCacheState = struct {
             try self.entries.put(self.alloc, entry.filename, entry);
             self.lru.append(&entry.lru_node);
             self.stats.stored_bytes +|= entry.disk_bytes;
+            if (entry.protected) self.stats.protected_stored_bytes +|= entry.disk_bytes;
             self.stats.entries +|= 1;
             registered += 1;
         }
@@ -607,6 +642,7 @@ const PersistentObjectRangeCacheState = struct {
             _ = self.entries.remove(victim.filename);
             self.lru.remove(victim_node);
             decrementSaturating(&self.stats.stored_bytes, victim.disk_bytes);
+            if (victim.protected) decrementSaturating(&self.stats.protected_stored_bytes, victim.disk_bytes);
             decrementSaturating(&self.stats.entries, 1);
             self.stats.evicted_bytes +|= victim.disk_bytes;
             self.stats.evicted_entries += 1;
@@ -823,6 +859,7 @@ const PersistentObjectRangeCacheState = struct {
         _ = self.entries.remove(entry.filename);
         self.lru.remove(&entry.lru_node);
         decrementSaturating(&self.stats.stored_bytes, entry.disk_bytes);
+        if (entry.protected) decrementSaturating(&self.stats.protected_stored_bytes, entry.disk_bytes);
         decrementSaturating(&self.stats.entries, 1);
         if (corrupt) self.stats.corrupt_entries_removed += 1;
         self.condition.broadcast(io);
@@ -830,37 +867,48 @@ const PersistentObjectRangeCacheState = struct {
         self.freeEntry(entry);
     }
 
-    fn evictOne(self: *PersistentObjectRangeCacheState) bool {
+    fn evictOne(self: *PersistentObjectRangeCacheState, incoming_protected: bool) bool {
         const io = self.io;
         self.mutex.lockUncancelable(io);
-        var node = self.lru.first;
-        const victim = while (node) |candidate_node| : (node = candidate_node.next) {
-            const candidate: *PersistentObjectRangeCacheEntry = @alignCast(@fieldParentPtr("lru_node", candidate_node));
-            if (candidate.pin_count == 0 and !candidate.removing) {
-                candidate.removing = true;
-                break candidate;
+        // Prefer ordinary ranges regardless of insertion order. The reserved
+        // pool protects hot footers/indexes against one-off broad scans.
+        const reservation = @min(self.policy.protected_bytes, self.policy.max_total_bytes / 4);
+        var victim: ?*PersistentObjectRangeCacheEntry = null;
+        for (0..2) |pass| {
+            var node = self.lru.first;
+            while (node) |candidate_node| : (node = candidate_node.next) {
+                const candidate: *PersistentObjectRangeCacheEntry = @alignCast(@fieldParentPtr("lru_node", candidate_node));
+                if (candidate.pin_count != 0 or candidate.removing) continue;
+                if (pass == 0 and candidate.protected) continue;
+                if (candidate.protected and !incoming_protected and self.stats.protected_stored_bytes <= reservation) continue;
+                victim = candidate;
+                break;
             }
-        } else {
+            if (victim != null) break;
+        }
+        const selected = victim orelse {
             self.mutex.unlock(io);
             return false;
         };
+        selected.removing = true;
         self.mutex.unlock(io);
 
-        const deleted = self.deleteCacheFile(victim.filename) catch false;
+        const deleted = self.deleteCacheFile(selected.filename) catch false;
         self.mutex.lockUncancelable(io);
         if (!deleted) {
-            victim.removing = false;
+            selected.removing = false;
             self.mutex.unlock(io);
             return false;
         }
-        _ = self.entries.remove(victim.filename);
-        self.lru.remove(&victim.lru_node);
-        decrementSaturating(&self.stats.stored_bytes, victim.disk_bytes);
+        _ = self.entries.remove(selected.filename);
+        self.lru.remove(&selected.lru_node);
+        decrementSaturating(&self.stats.stored_bytes, selected.disk_bytes);
+        if (selected.protected) decrementSaturating(&self.stats.protected_stored_bytes, selected.disk_bytes);
         decrementSaturating(&self.stats.entries, 1);
-        self.stats.evicted_bytes += victim.disk_bytes;
+        self.stats.evicted_bytes += selected.disk_bytes;
         self.stats.evicted_entries += 1;
         self.mutex.unlock(io);
-        self.freeEntry(victim);
+        self.freeEntry(selected);
         return true;
     }
 
@@ -873,10 +921,10 @@ const PersistentObjectRangeCacheState = struct {
             disk_bytes <= self.policy.max_total_bytes - self.stats.stored_bytes;
     }
 
-    fn makeCapacityFor(self: *PersistentObjectRangeCacheState, disk_bytes: usize) bool {
+    fn makeCapacityFor(self: *PersistentObjectRangeCacheState, disk_bytes: usize, protected: bool) bool {
         if (disk_bytes > self.policy.max_total_bytes) return false;
         while (!self.hasCapacityFor(disk_bytes)) {
-            if (!self.evictOne()) return false;
+            if (!self.evictOne(protected)) return false;
         }
         return true;
     }
@@ -918,7 +966,7 @@ const PersistentObjectRangeCacheState = struct {
             return .already_present;
         }
         self.mutex.unlock(io);
-        if (!self.makeCapacityFor(task.disk_bytes)) return .capacity_unavailable;
+        if (!self.makeCapacityFor(task.disk_bytes, cacheKeyProtected(task.cache_key))) return .capacity_unavailable;
         var capacity_reservation = self.reserveWriteCapacity(task.disk_bytes) catch |err| switch (err) {
             error.PersistentObjectRangeCacheCapacityUnavailable => return .capacity_unavailable,
             else => return err,
@@ -935,6 +983,7 @@ const PersistentObjectRangeCacheState = struct {
             .filename = owned_filename,
             .disk_bytes = task.disk_bytes,
             .modified_ns = 0,
+            .protected = cacheKeyProtected(task.cache_key),
         };
         self.mutex.lockUncancelable(io);
         self.entries.ensureUnusedCapacity(self.alloc, 1) catch |err| {
@@ -955,6 +1004,7 @@ const PersistentObjectRangeCacheState = struct {
         self.entries.putAssumeCapacityNoClobber(entry.filename, entry);
         self.lru.append(&entry.lru_node);
         self.stats.stored_bytes +|= entry.disk_bytes;
+        if (entry.protected) self.stats.protected_stored_bytes +|= entry.disk_bytes;
         self.stats.entries +|= 1;
         self.mutex.unlock(io);
         return .written;
@@ -1408,9 +1458,9 @@ fn persistentObjectRangeWriteFilePartsAtomicallyWithIo(
         std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
     {
         var file = if (std.fs.path.isAbsolute(tmp_path))
-            try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true })
+            try std.Io.Dir.createFileAbsolute(io, tmp_path, .{ .truncate = true, .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) })
         else
-            try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true });
+            try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true, .exclusive = true, .permissions = @fromBackingInt(@intCast(0o600)) });
         defer file.close(io);
         var buf: [4096]u8 = undefined;
         var writer = file.writer(io, &buf);
@@ -1436,7 +1486,7 @@ fn decrementSaturating(value: *usize, amount: usize) void {
     value.* = if (value.* >= amount) value.* - amount else 0;
 }
 
-fn cacheLaneFromObjectRangeCacheKey(cache_key: []const u8) ?range_io.CacheLane {
+pub fn cacheLaneFromObjectRangeCacheKey(cache_key: []const u8) ?range_io.CacheLane {
     const marker = ":purpose=";
     const marker_index = std.mem.indexOf(u8, cache_key, marker) orelse return null;
     const purpose_start = marker_index + marker.len;
@@ -9643,4 +9693,89 @@ test "external lake speculative page prefetch defers errors and preserves reques
         try std.testing.expectEqual(@as(usize, 1), cursor.pages_decoded);
         try std.testing.expectError(if (mode == .provider) error.ProviderUnavailable else error.ParquetPageTooLarge, cursor.next());
     }
+}
+
+fn cacheKeyProtected(key: []const u8) bool {
+    const lane = cacheLaneFromObjectRangeCacheKey(key) orelse return false;
+    return lane == .metadata or lane == .serving_sidecar;
+}
+
+/// Recover only bounded key provenance for eviction priority. Payload
+/// integrity is still verified by readAlloc before bytes can serve a query.
+fn persistentCachedKeyProtected(io: std.Io, a: Allocator, dir: std.Io.Dir, filename: []const u8, maximum: usize) !bool {
+    var file = try dir.openFile(io, filename, .{});
+    defer file.close(io);
+    var prefix: [persistent_object_range_cache_magic.len + 4]u8 = undefined;
+    if (try file.readPositionalAll(io, &prefix, 0) != prefix.len) return false;
+    if (!std.mem.eql(u8, prefix[0..persistent_object_range_cache_magic.len], persistent_object_range_cache_magic)) return false;
+    const length = std.mem.readInt(u32, prefix[persistent_object_range_cache_magic.len..][0..4], .little);
+    if (length > maximum) return false;
+    const key = try a.alloc(u8, length);
+    defer a.free(key);
+    if (try file.readPositionalAll(io, key, prefix.len) != length) return false;
+    const digest = try objectRangeCacheKeyDigestHexAlloc(a, key);
+    defer a.free(digest);
+    if (!std.mem.eql(u8, digest, filename)) return false;
+    return cacheKeyProtected(key);
+}
+
+test "lake persistent cache protects metadata through scan pressure and restart" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/protected-cache", .{tmp.sub_path});
+    defer a.free(root);
+    const policy: PersistentObjectRangeCachePolicy = .{ .max_entries = 2, .max_total_bytes = 8192 };
+    const footer = "lake-range:v2:purpose=parquet_footer:identity=metadata";
+    {
+        var disk = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer disk.deinit();
+        try std.testing.expectEqual(PersistentObjectRangeCacheEnqueueResult.enqueued, disk.enqueueWrite(footer, "meta"));
+        disk.flush();
+        _ = disk.enqueueWrite("scan-1", "data");
+        disk.flush();
+        _ = disk.enqueueWrite("scan-2", "more");
+        disk.flush();
+        const bytes = (try disk.readAlloc(a, footer, 4)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("meta", bytes);
+        try std.testing.expect((try disk.readAlloc(a, "scan-1", 4)) == null);
+        try std.testing.expect(disk.statsSnapshot().protected_stored_bytes > 0);
+    }
+    {
+        var disk = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer disk.deinit();
+        try std.testing.expect(disk.statsSnapshot().protected_stored_bytes > 0);
+        _ = disk.enqueueWrite("scan-3", "next");
+        disk.flush();
+        const bytes = (try disk.readAlloc(a, footer, 4)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("meta", bytes);
+        try std.testing.expectEqual(@as(usize, 2), disk.statsSnapshot().entries);
+    }
+}
+
+test "lake persistent cache holds one root owner until shutdown" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/owned-cache", .{tmp.sub_path});
+    defer a.free(root);
+    {
+        var owner = try PersistentObjectRangeCache.init(io, root);
+        defer owner.deinit();
+        try std.testing.expectError(error.WouldBlock, PersistentObjectRangeCache.init(io, root));
+        _ = owner.enqueueWrite("key", "bytes");
+    }
+    var successor = try PersistentObjectRangeCache.init(io, root);
+    defer successor.deinit();
+    const bytes = (try successor.readAlloc(a, "key", 5)).?;
+    defer a.free(bytes);
+    try std.testing.expectEqualStrings("bytes", bytes);
 }

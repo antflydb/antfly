@@ -297,6 +297,7 @@ pub const Config = struct {
     backup: ?BackupConfig = null,
     secrets: ?SecretsConfig = null,
     storage: ?StorageConfig = null,
+    lake_cache: ?LakeCacheConfig = null,
     transaction_sessions: ?TransactionSessionConfig = null,
     /// DEPRECATED: use hot_standby
     ha: ?HotStandbyConfig = null,
@@ -360,6 +361,7 @@ pub const Config = struct {
         .{ "backup", "backup", true },
         .{ "secrets", "secrets", true },
         .{ "storage", "storage", true },
+        .{ "lake_cache", "lake_cache", true },
         .{ "transaction_sessions", "transaction_sessions", true },
         .{ "ha", "ha", true },
         .{ "hot_standby", "hot_standby", true },
@@ -445,6 +447,10 @@ pub const Config = struct {
         }
         if (self.storage) |value| {
             try jw.objectField("storage");
+            try jw.write(value);
+        }
+        if (self.lake_cache) |value| {
+            try jw.objectField("lake_cache");
             try jw.write(value);
         }
         if (self.transaction_sessions) |value| {
@@ -1663,6 +1669,77 @@ pub const InferenceConnectionVariant = struct {
         try jw.write(self.capabilities);
         try jw.objectField("inference");
         try jw.write(self.inference);
+        try jw.endObject();
+    }
+};
+
+/// Disposable node-local cache for versioned Parquet and Iceberg reads.
+pub const LakeCacheConfig = struct {
+    enabled: ?bool = null,
+    /// Defaults to cache/lake-ranges beneath local storage, or the Lite file directory.
+    root: ?[]const u8 = null,
+    max_memory_bytes: ?i64 = null,
+    max_disk_bytes: ?i64 = null,
+    max_entries: ?i64 = null,
+    max_write_queue_bytes: ?i64 = null,
+    max_write_queue_entries: ?i64 = null,
+    /// Metadata/sidecar reservation, capped at one quarter of disk capacity; zero disables it.
+    protected_bytes: ?i64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "enabled", "enabled", true },
+        .{ "root", "root", true },
+        .{ "max_memory_bytes", "max_memory_bytes", true },
+        .{ "max_disk_bytes", "max_disk_bytes", true },
+        .{ "max_entries", "max_entries", true },
+        .{ "max_write_queue_bytes", "max_write_queue_bytes", true },
+        .{ "max_write_queue_entries", "max_write_queue_entries", true },
+        .{ "protected_bytes", "protected_bytes", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.enabled) |value| {
+            try jw.objectField("enabled");
+            try jw.write(value);
+        }
+        if (self.root) |value| {
+            try jw.objectField("root");
+            try jw.write(value);
+        }
+        if (self.max_memory_bytes) |value| {
+            try jw.objectField("max_memory_bytes");
+            try jw.write(value);
+        }
+        if (self.max_disk_bytes) |value| {
+            try jw.objectField("max_disk_bytes");
+            try jw.write(value);
+        }
+        if (self.max_entries) |value| {
+            try jw.objectField("max_entries");
+            try jw.write(value);
+        }
+        if (self.max_write_queue_bytes) |value| {
+            try jw.objectField("max_write_queue_bytes");
+            try jw.write(value);
+        }
+        if (self.max_write_queue_entries) |value| {
+            try jw.objectField("max_write_queue_entries");
+            try jw.write(value);
+        }
+        if (self.protected_bytes) |value| {
+            try jw.objectField("protected_bytes");
+            try jw.write(value);
+        }
         try jw.endObject();
     }
 };

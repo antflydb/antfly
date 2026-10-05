@@ -1714,6 +1714,11 @@ pub const ApiHttpServerConfig = struct {
     /// Loaded node config, used by /connections to enumerate configured
     /// providers and object stores. Must outlive the server.
     node_config: ?*const common_config.Config = null,
+    /// Optional persistent lake cache root. By default use the node's local
+    /// storage directory; null without local storage keeps memory-only reads.
+    lake_cache_root: ?[]const u8 = null,
+    lake_cache_enabled: ?bool = null,
+    lake_cache_policy: ?@import("../serverless/query/lake_parquet_rowgroup.zig").PersistentObjectRangeCachePolicy = null,
     user_manager: ?*usermgr.UserManager = null,
     session_router: ?table_router.HostedGroupRouter = null,
     /// A scheduling hint only; durable activation/retirement still fences
@@ -3912,6 +3917,8 @@ pub const ApiHttpServer = struct {
         first_request_started_at_ns: u64 = 0,
         first_request_elapsed_ms: u64 = 0,
         query_embedding_cache: query_embedding_cache.Stats = .{},
+        lake_range_cache: @import("../serverless/query/lake_serving_cache.zig").Cache.Stats = .{},
+        lake_disk_cache: ?@import("../serverless/query/lake_parquet_rowgroup.zig").PersistentObjectRangeCacheStats = null,
         incoming_graph_routes: distributed_graph.IncomingSourceGroupCache.Stats = .{},
         inference_cache_budget: cache_budget.CacheBudget.Stats = .{
             .max_bytes = 0,
@@ -4111,7 +4118,7 @@ pub const ApiHttpServer = struct {
             .query_embedding_cache = query_embedding_cache.QueryEmbeddingCache.init(owner_alloc, api_io, effective_query_embedding_cache),
             .sql_plan_cache = sql_plan_cache.Cache.init(owner_alloc, .{}),
             .sql_schema_cache = sql_schema_cache.Cache.init(owner_alloc),
-            .lake_read_cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(owner_alloc),
+            .lake_read_cache = @import("../serverless/query/lake_serving_cache.zig").Cache.initWithMemoryLimit(owner_alloc, if (cfg.node_config) |config| config.lake_cache.max_memory_bytes else 64 * 1024 * 1024),
             .embedding_provider_runtime = managed_embedder.ProviderRuntime.init(owner_alloc, api_io),
             .mcp_sessions = mcp.InMemorySessionStore.initWithOptions(owner_alloc, api_io, .{
                 .now_ns_fn = protocolStoreNowNs,
@@ -4205,6 +4212,8 @@ pub const ApiHttpServer = struct {
             else
                 @intCast(@divTrunc(first_request_started_at_ns - self.created_at_ns, std.time.ns_per_ms)),
             .query_embedding_cache = self.query_embedding_cache.stats(self.inferenceCacheBudget()),
+            .lake_range_cache = self.lake_read_cache.snapshot(),
+            .lake_disk_cache = self.lake_read_cache.persistentStats(),
             .incoming_graph_routes = self.incoming_graph_routes.stats(),
             .inference_cache_budget = self.inferenceCacheBudget().stats(),
         };
@@ -12619,6 +12628,31 @@ pub const ApiHttpServer = struct {
         else
             try std.Io.Dir.cwd().createDir(io, path, .default_dir);
         return path;
+    }
+
+    /// Called after authorization and before any lake reader is opened.
+    /// All aliases and public transports share this server-owned cache.
+    pub fn prepareLakeCache(self: *ApiHttpServer) !void {
+        const config = if (self.cfg.node_config) |node| node.lake_cache else common_config.Config.LakeCacheConfig{};
+        if (!(self.cfg.lake_cache_enabled orelse config.enabled)) return;
+        const policy = self.cfg.lake_cache_policy orelse @import("../serverless/query/lake_parquet_rowgroup.zig").PersistentObjectRangeCachePolicy{
+            .max_total_bytes = config.max_disk_bytes,
+            .max_entries = config.max_entries,
+            .max_write_queue_bytes = config.max_write_queue_bytes,
+            .max_write_queue_entries = config.max_write_queue_entries,
+            .protected_bytes = config.protected_bytes,
+        };
+        if (self.cfg.lake_cache_root orelse config.root) |root| {
+            try self.lake_read_cache.ensurePersistent(self.embedding_provider_runtime.io, root, policy, .{ .resource_manager = self.cfg.resource_manager });
+        } else {
+            const node = self.cfg.node_config orelse return;
+            const base = node.storage.local_base_dir orelse
+                (if (node.storage.lite_path) |path| std.fs.path.dirname(path) orelse "." else return);
+            const path = try std.fs.path.join(self.alloc, &.{ base, "cache", "lake-ranges" });
+            defer self.alloc.free(path);
+            try self.lake_read_cache.ensurePersistent(self.embedding_provider_runtime.io, path, policy, .{ .resource_manager = self.cfg.resource_manager });
+            return;
+        }
     }
 
     pub fn catalogStorageNameAlloc(self: *ApiHttpServer, alloc: std.mem.Allocator) ![]u8 {

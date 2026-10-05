@@ -786,6 +786,7 @@ pub const Adapter = struct {
     pub fn openLakeScan(self: *Adapter, alloc: std.mem.Allocator, table: catalog.Table, request: catalog.Scan) !catalog.Cursor {
         try self.verify(alloc, table);
         try self.checkLakeRead(alloc, table);
+        try self.server.prepareLakeCache();
         const cursor = try @import("lake_sql_cursor.zig").openWithCache(alloc, table, request, self.context, .{ .node_config = self.server.cfg.node_config, .secret_store = self.server.cfg.secret_store }, &self.server.lake_read_cache, self.server.embedding_provider_runtime.io);
         errdefer cursor.close(cursor.ptr);
         try self.verify(alloc, table);
@@ -850,6 +851,7 @@ pub const Adapter = struct {
             if (request.table.external_base_source != null) {
                 try self.verify(scratch.allocator(), request.table);
                 try self.checkLakeRead(scratch.allocator(), request.table);
+                try self.server.prepareLakeCache();
                 if (owner.sources.contains(request.table.id)) continue;
                 const source = try alloc.create(@import("../serverless/query/lake_serving.zig").ServingSource);
                 errdefer alloc.destroy(source);

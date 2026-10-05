@@ -1,5 +1,8 @@
 # Lake Query Mode
 
+The remote index lifecycle, persistent cache tiers, SQL materialization matching,
+and public status/explain contract are specified in [REMOTE_TABLE_SERVING.md](REMOTE_TABLE_SERVING.md).
+
 Antfly relational mode makes typed rows first-class while keeping JSON as a
 document-backed column type. Lake query mode extends that contract to files
 owned by users in object storage: Parquet datasets, Iceberg tables, and later

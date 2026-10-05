@@ -30,6 +30,40 @@ pub const Cache = struct {
     max_entries: usize = 4096,
     stats: Stats = .{},
     tick: u64 = 0,
+    persistent: ?parquet.PersistentObjectRangeCache = null,
+    persistent_mutex: std.Io.Mutex = .init,
+    persistent_attempted: bool = false,
+    persistent_ready: std.atomic.Value(bool) = .init(false),
+
+    /// Configure once before reads. The server owns the worker and drains it
+    /// after cursors are quiescent; a request never owns cache I/O state.
+    pub fn ensurePersistent(self: *Cache, io: std.Io, root: []const u8, policy: parquet.PersistentObjectRangeCachePolicy, resources: parquet.PersistentObjectRangeCacheResources) !void {
+        try self.persistent_mutex.lock(io);
+        defer self.persistent_mutex.unlock(io);
+        try policy.validate();
+        if (root.len == 0) return error.InvalidPersistentObjectRangeCachePolicy;
+        if (self.persistent_attempted) return;
+        self.persistent = parquet.PersistentObjectRangeCache.initWithPolicyAndResources(io, root, policy, resources) catch |err| {
+            if (err == error.Canceled) return err;
+            // Local cache availability is never source/readiness authority.
+            // Report the reason once and continue serving through RAM/source.
+            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+            self.stats.disk_unavailable = @errorName(err);
+            self.mutex.unlock();
+            self.persistent_attempted = true;
+            return;
+        };
+        self.persistent_attempted = true;
+        self.persistent_ready.store(true, .release);
+    }
+
+    pub fn persistentStats(self: *Cache) ?parquet.PersistentObjectRangeCacheStats {
+        // Status must not wait for startup inventory I/O. Once published, the
+        // disk owner is immutable until server readers/status calls quiesce.
+        if (!self.persistent_ready.load(.acquire)) return null;
+        return self.persistent.?.statsSnapshot();
+    }
+
     const Flight = struct { key: []u8, event: std.Io.Event = .unset, refs: usize = 1 };
     const Claim = struct { flight: *Flight, leader: bool };
     fn begin(self: *Cache, key: []const u8) !?Claim {
@@ -64,12 +98,38 @@ pub const Cache = struct {
         }
         self.releaseFlight(claim.flight);
     }
-    const Entry = struct { cache: *Cache, bytes: []u8, touched: u64, refs: usize = 0 };
-    pub const Stats = struct { hits: u64 = 0, misses: u64 = 0, stored_bytes: usize = 0, evictions: u64 = 0 };
+    const Entry = struct { cache: *Cache, bytes: []u8, touched: u64, protected: bool = false, refs: usize = 0 };
+    pub const Stats = struct {
+        hits: u64 = 0,
+        misses: u64 = 0,
+        stored_bytes: usize = 0,
+        protected_stored_bytes: usize = 0,
+        evictions: u64 = 0,
+        disk_unavailable: ?[]const u8 = null,
+        disk_hits: u64 = 0,
+        disk_bytes: u64 = 0,
+        provider_reads: u64 = 0,
+        provider_bytes: u64 = 0,
+    };
+    fn recordRead(self: *Cache, disk: bool, bytes: usize) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        if (disk) {
+            self.stats.disk_hits +|= 1;
+            self.stats.disk_bytes +|= bytes;
+        } else {
+            self.stats.provider_reads +|= 1;
+            self.stats.provider_bytes +|= bytes;
+        }
+    }
     pub fn init(alloc: Allocator) Cache {
-        return .{ .alloc = alloc, .decoded = .{ .a = alloc } };
+        return initWithMemoryLimit(alloc, 64 * 1024 * 1024);
+    }
+    pub fn initWithMemoryLimit(alloc: Allocator, maximum: usize) Cache {
+        return .{ .alloc = alloc, .decoded = .{ .a = alloc }, .max_bytes = maximum };
     }
     pub fn deinit(self: *Cache) void {
+        if (self.persistent) |*disk| disk.deinit();
         self.decoded.deinit();
         std.debug.assert(self.flights.count() == 0);
         self.flights.deinit(self.alloc);
@@ -126,16 +186,28 @@ pub const Cache = struct {
         defer self.mutex.unlock();
         // Concurrent misses may fetch the same immutable object range.
         if (self.entries.contains(key)) return;
+        const lane = parquet.cacheLaneFromObjectRangeCacheKey(key);
+        const protected = lane == .metadata or lane == .serving_sidecar;
         while (self.entries.count() != 0 and (self.stats.stored_bytes > self.max_bytes - bytes.len or self.entries.count() >= self.max_entries)) {
             var oldest: ?[]const u8 = null;
             var touched: u64 = std.math.maxInt(u64);
-            var iter = self.entries.iterator();
-            while (iter.next()) |entry| if (entry.value_ptr.*.refs == 0 and (oldest == null or entry.value_ptr.*.touched < touched)) {
-                oldest = entry.key_ptr.*;
-                touched = entry.value_ptr.*.touched;
-            };
+            for (0..2) |pass| {
+                var iter = self.entries.iterator();
+                while (iter.next()) |entry| {
+                    const candidate = entry.value_ptr.*;
+                    if (candidate.refs != 0) continue;
+                    if (pass == 0 and candidate.protected) continue;
+                    if (candidate.protected and !protected and self.stats.protected_stored_bytes <= self.max_bytes / 4) continue;
+                    if (oldest == null or candidate.touched < touched) {
+                        oldest = entry.key_ptr.*;
+                        touched = candidate.touched;
+                    }
+                }
+                if (oldest != null) break;
+            }
             const removed = self.entries.fetchRemove(oldest orelse return).?;
             self.stats.stored_bytes -= removed.value.bytes.len;
+            if (removed.value.protected) self.stats.protected_stored_bytes -= removed.value.bytes.len;
             self.stats.evictions += 1;
             self.alloc.free(removed.key);
             self.alloc.free(removed.value.bytes);
@@ -144,10 +216,11 @@ pub const Cache = struct {
         const map_key = try self.alloc.dupe(u8, owned_key);
         errdefer self.alloc.free(map_key);
         self.tick +%= 1;
-        item.* = .{ .cache = self, .bytes = owned_bytes, .touched = self.tick };
+        item.* = .{ .cache = self, .bytes = owned_bytes, .touched = self.tick, .protected = protected };
         try self.entries.put(self.alloc, map_key, item);
         admitted = true;
         self.stats.stored_bytes += bytes.len;
+        if (protected) self.stats.protected_stored_bytes += bytes.len;
     }
 };
 pub const Reader = struct {
@@ -266,8 +339,7 @@ pub const Reader = struct {
         const self: *Reader = @ptrCast(@alignCast(raw));
         try self.context.ensureActive();
         try read.validate();
-        // Unversioned reads must always reach the provider.
-        if (read.object.version.etag.len == 0 and read.object.version.version_id.len == 0) return self.base.parquetReader().readPlannedLease(alloc, read);
+        // Planned reads require immutable version evidence before cache lookup.
         const range_key = try read.cacheKeyAlloc(alloc);
         defer alloc.free(range_key);
         const key = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ std.fmt.bytesToHex(self.scope, .lower), range_key });
@@ -303,11 +375,19 @@ pub const Reader = struct {
         defer if (claim) |active| self.cache.finish(active, self.context.io.?);
         // Close the lookup/claim race without issuing a duplicate read.
         if (claim != null) if (self.cache.pin(key)) |bytes| return bytes;
-        const bytes = try self.base.parquetReader().readPlannedAlloc(alloc, read);
+        // The credential-scoped, versioned key is identical in both tiers.
+        // Disk corruption/missing entries are misses inside the persistent
+        // cache; an allocation failure still belongs to this request.
+        const disk_bytes = if (self.cache.persistent) |*disk| try disk.readAlloc(alloc, key, read.range.len) else null;
+        const bytes = disk_bytes orelse try self.base.parquetReader().readPlannedAlloc(alloc, read);
+        self.cache.recordRead(disk_bytes != null, bytes.len);
         errdefer alloc.free(bytes);
         try self.context.ensureActive();
         // Cache admission is optional and never turns a successful read into
         // an allocation failure in a long-lived shared owner.
+        if (disk_bytes == null) if (self.cache.persistent) |*disk| {
+            _ = disk.enqueueWrite(key, bytes);
+        };
         self.cache.store(key, bytes) catch {};
         if (self.cache.pin(key)) |lease| {
             alloc.free(bytes);
@@ -449,4 +529,120 @@ fn rangeAdmissionAllocationScenario(a: Allocator) !void {
 }
 test "external lake range admission unwinds every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, rangeAdmissionAllocationScenario, .{});
+}
+
+test "external lake serving persistent tier survives restart and isolates credentials and versions" {
+    const storage = @import("../../storage/object_storage.zig");
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/serving-cache", .{tmp.sub_path});
+    defer a.free(root);
+    var memory = storage.MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", "abcdefgh", .{});
+    defer put.deinit(a);
+    const Provider = struct {
+        base: storage.ObjectStorage,
+        calls: usize = 0,
+        fail: bool = false,
+        vtable: storage.ObjectStorage.VTable,
+        fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.fail) return error.ProviderUnavailable;
+            var base = self.base;
+            base.allocator = alloc;
+            return base.getObject(bucket, key, options);
+        }
+    };
+    var provider: Provider = .{ .base = client, .vtable = client.vtable.* };
+    provider.vtable.get_object = Provider.get;
+    const base = ObjectReader.init(.{ .allocator = a, .ptr = &provider, .vtable = &provider.vtable });
+    const read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = 8, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 2, .len = 4 }, .purpose = .parquet_column_chunk };
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io } };
+        const bytes = try reader.reader().readPlannedAlloc(a, read);
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("cdef", bytes);
+        try std.testing.expectEqual(@as(usize, 1), provider.calls);
+        // deinit drains the accepted write before destroying the worker.
+    }
+    provider.fail = true;
+    {
+        var cache = Cache.init(a);
+        defer cache.deinit();
+        try cache.ensurePersistent(io, root, .{}, .{});
+        // Exercise disk leases even when RAM admission is disabled.
+        cache.max_bytes = 0;
+        var reader: Reader = .{ .cache = &cache, .base = base, .scope = @splat(1), .context = .{ .io = io } };
+        const bytes = try reader.reader().readPlannedLease(a, read);
+        defer bytes.release();
+        try std.testing.expectEqualStrings("cdef", bytes.bytes);
+        try std.testing.expectEqual(@as(usize, 1), provider.calls);
+        try std.testing.expectEqual(@as(usize, 1), cache.persistentStats().?.read_hits);
+        reader.scope = @splat(2);
+        try std.testing.expectError(error.ProviderUnavailable, reader.reader().readPlannedAlloc(a, read));
+        reader.scope = @splat(1);
+        var changed = read;
+        changed.object.version.etag = "changed-version";
+        try std.testing.expectError(error.ProviderUnavailable, reader.reader().readPlannedAlloc(a, changed));
+        changed.object.version = .{};
+        try std.testing.expectError(error.InvalidLakeRangeRead, reader.reader().readPlannedAlloc(a, changed));
+        try std.testing.expectEqual(@as(usize, 3), provider.calls);
+    }
+}
+
+test "external lake serving RAM protects metadata under broad scan pressure" {
+    const a = std.testing.allocator;
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    cache.max_bytes = 12;
+    try cache.store("lake-range:v2:purpose=parquet_footer:identity=footer", "abc");
+    try cache.store("scan-1", "def");
+    try cache.store("scan-2", "ghi");
+    try cache.store("scan-3", "jkl");
+    try cache.store("scan-4", "mno");
+    const footer = cache.pin("lake-range:v2:purpose=parquet_footer:identity=footer").?;
+    defer footer.release();
+    try std.testing.expectEqualStrings("abc", footer.bytes);
+    try std.testing.expectEqual(@as(usize, 3), cache.snapshot().protected_stored_bytes);
+    try std.testing.expectEqual(@as(usize, 12), cache.snapshot().stored_bytes);
+}
+
+test "external lake disk cache initialization failure preserves source reads" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(a, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "not-a-directory", .data = "file" });
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/not-a-directory/cache", .{tmp.sub_path});
+    defer a.free(root);
+    var cache = Cache.init(a);
+    defer cache.deinit();
+    try cache.ensurePersistent(io, root, .{}, .{});
+    try std.testing.expect(cache.persistent == null);
+    try std.testing.expect(cache.snapshot().disk_unavailable != null);
+    var memory = @import("../../storage/object_storage.zig").MemoryObjectStorage.init(a);
+    defer memory.deinit();
+    var client = memory.client();
+    try client.makeBucket("bucket");
+    var put = try client.putObject("bucket", "data", "data", .{});
+    defer put.deinit(a);
+    var reader: Reader = .{ .cache = &cache, .base = ObjectReader.init(client), .scope = @splat(0), .context = .{ .io = io } };
+    const read: ranges.RangeRead = .{ .object = .{ .bucket = "bucket", .key = "data", .byte_len = 4, .version = .{ .etag = put.etag.? } }, .range = .{ .offset = 0, .len = 4 }, .purpose = .parquet_column_chunk };
+    const lease = try reader.reader().readPlannedLease(a, read);
+    defer lease.release();
+    try std.testing.expectEqualStrings("data", lease.bytes);
+    try std.testing.expectEqual(@as(u64, 1), cache.snapshot().provider_reads);
 }
