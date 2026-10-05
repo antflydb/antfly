@@ -865,14 +865,7 @@ pub const ExtractEnrichmentsResult = struct {
         for (self.sparse_embeddings) |*embedding| embedding.deinit(alloc);
         if (self.sparse_embeddings.len > 0) alloc.free(self.sparse_embeddings);
 
-        for (self.graph_writes) |*write| {
-            alloc.free(@constCast(write.index_name));
-            alloc.free(@constCast(write.source));
-            alloc.free(@constCast(write.target));
-            alloc.free(@constCast(write.edge_type));
-            if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-            if (write.owner.len > 0) alloc.free(@constCast(write.owner));
-        }
+        for (self.graph_writes) |*write| write.deinit(alloc);
         if (self.graph_writes.len > 0) alloc.free(self.graph_writes);
 
         self.* = undefined;

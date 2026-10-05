@@ -13,6 +13,9 @@
 // limitations.
 
 const document_collectors = @import("document_collectors.zig");
+const materialized_sources = @import("materialized_sources.zig");
+const graph_restore_materialization = @import("graph_restore_materialization.zig");
+const status_projection = @import("status_projection.zig");
 const result_collectors = @import("result_collectors.zig");
 const independent_maintenance = @import("independent_maintenance.zig");
 const portable_activation_recovery = @import("portable_activation_recovery.zig");
@@ -1597,10 +1600,8 @@ const LocalMutationExecution = struct {
     sparse_compaction_runtime: ?*sparse_compaction_runtime_mod.SparseCompactionRuntime,
     last_run_until_idle_no_progress: ?DB.NoProgressDiagnostic = null,
     shadow: ?*ShadowState,
-    bulk_ingest_identity_all_new: bool = false,
-    bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
+    bulk_identity: @import("bulk_ingest_session.zig").IdentityScratch = .{},
     embedding_activity: @import("embedding_activity_cache.zig").Owner = .{},
-    bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     active_index_repairs: std.StringHashMapUnmanaged(bool) = .{},
     graph_restore_parse_cache: ?GraphRestoreParseCache = null,
 
@@ -1622,7 +1623,6 @@ const LocalMutationExecution = struct {
     const GeneratedWriteReadSnapshot = DB.GeneratedWriteReadSnapshot;
     const clearActiveIndexRepairsLocked = DB.clearActiveIndexRepairsLocked;
     const clearBulkIngestIdentityAllNewLocked = DB.clearBulkIngestIdentityAllNewLocked;
-    const clearBulkIngestSeenDocKeysLocked = DB.clearBulkIngestSeenDocKeysLocked;
     const clearDurableReplicationOutbox = DB.clearDurableReplicationOutbox;
     const clearLiveDocSetCache = DB.clearLiveDocSetCache;
     const clearNonVisibleDocSetCache = DB.clearNonVisibleDocSetCache;
@@ -1696,8 +1696,7 @@ const LocalMutationExecution = struct {
         self.embedding_activity.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
-        self.bulk_ingest_identity_state.deinit(self.alloc);
-        self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
+        self.bulk_identity.deinit(self.alloc);
     }
 
     comptime {
@@ -4541,20 +4540,7 @@ const ShadowState = struct {
 /// durable page commits makes recovery linear in the artifact size during a
 /// normal run; after a crash the current artifact is parsed once again and
 /// resumes directly at its ordinal cursor.
-const GraphRestoreParseCache = struct {
-    artifact_key: []u8,
-    index_name: []u8,
-    artifact: std.json.Parsed(std.json.Value),
-    document: ?std.json.Parsed(std.json.Value),
-
-    fn deinit(self: *@This(), alloc: Allocator) void {
-        self.artifact.deinit();
-        if (self.document) |*document| document.deinit();
-        alloc.free(self.artifact_key);
-        alloc.free(self.index_name);
-        self.* = undefined;
-    }
-};
+const GraphRestoreParseCache = graph_restore_materialization.Cache;
 
 /// Mutable admission and publication state shared by foreground mutations and
 /// recovery. This owner has one lifetime and one set of locks; a borrowed
@@ -4752,15 +4738,13 @@ pub const DB = struct {
     last_run_until_idle_no_progress: ?NoProgressDiagnostic = null,
     shadow: ?*ShadowState,
     bulk_ingest_session: @import("bulk_ingest_session.zig").State = .{},
-    bulk_ingest_identity_all_new: bool = false,
-    bulk_ingest_identity_state: doc_identity.AllNewTrustedState = .{},
+    bulk_identity: @import("bulk_ingest_session.zig").IdentityScratch = .{},
     // Status snapshots are reconstructed from durable state on every poll, so
     // volatile worker observations need an independently owned cache. Keeping
     // it on the resident DB (rather than inside a returned DBStats value) lets
     // a contended lifecycle sample retain the last exact-incarnation activity
     // without turning that retained sample into a fresh cross-node heartbeat.
     embedding_activity: @import("embedding_activity_cache.zig").Owner = .{},
-    bulk_ingest_seen_doc_keys: std.StringHashMapUnmanaged(void) = .{},
     // Managed admission is a durable outbox. Requested/completed generations
     // prevent a drain from erasing work committed while its marker snapshot is
     // in flight; the mutex makes concurrent drainers a single-flight loop.
@@ -7656,10 +7640,7 @@ pub const DB = struct {
         self.embedding_activity.deinit(self.alloc);
         if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
         self.graph_restore_parse_cache = null;
-        self.bulk_ingest_identity_state.deinit(self.alloc);
-        self.bulk_ingest_identity_all_new = false;
-        self.clearBulkIngestSeenDocKeysLocked();
-        self.bulk_ingest_seen_doc_keys.deinit(self.alloc);
+        self.bulk_identity.deinit(self.alloc);
         self.clearActiveIndexRepairsLocked();
         self.active_index_repairs.deinit(self.alloc);
         self.closeShadowIndexManagerLocked() catch {};
@@ -11897,13 +11878,13 @@ pub const DB = struct {
             active_profile.identity_delete_keys += @intCast(effective_req.deletes.len);
         }
         const identity_capacity_start_ns = monotonicTimeNs();
-        if (!self.bulk_ingest_identity_all_new or effective_req.deletes.len != 0) {
+        if (!self.bulk_identity.enabled or effective_req.deletes.len != 0) {
             try self.failIfIdentityOrdinalExhaustedForNewUpserts(identity_upsert_keys.items);
         }
         if (profile) |active_profile| recordProfileNs(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
         var assume_all_new_identity_upserts = false;
-        if (self.bulk_ingest_identity_all_new and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
+        if (self.bulk_identity.enabled and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
             assume_all_new_identity_upserts = try self.rememberBulkIngestAllNewIdentityUpserts(identity_upsert_keys.items);
             if (!assume_all_new_identity_upserts) self.clearBulkIngestIdentityAllNewLocked();
         }
@@ -12437,7 +12418,7 @@ pub const DB = struct {
         if (effective_req.deletes.len != 0) {
             self.clearBulkIngestIdentityAllNewLocked();
         }
-        if (self.bulk_ingest_identity_all_new and
+        if (self.bulk_identity.enabled and
             effective_req.deletes.len == 0 and
             identity_upsert_keys.items.len > 0 and
             (assume_all_new_identity_upserts or identityUpsertStoreWritesAreNew(identity_upsert_write_indexes.items, overwritten_flags)))
@@ -12449,7 +12430,7 @@ pub const DB = struct {
                 &identity_writes,
                 &identity_visibility_deletes,
                 identity_upsert_keys.items,
-                &self.bulk_ingest_identity_state,
+                &self.bulk_identity.trusted,
             );
             if (!used_trusted_identity_path) self.clearBulkIngestIdentityAllNewLocked();
         }
@@ -13287,24 +13268,16 @@ pub const DB = struct {
         self.clearBulkIngestIdentityAllNewLocked();
         if (!try self.primaryUserNamespaceIsEmptyLocked()) return;
         if (try doc_identity.loadAllNewTrustedStateForNamespace(self.core.store, self.core.identity_namespace)) |state| {
-            self.bulk_ingest_identity_state = state;
+            self.bulk_identity.trusted = state;
             self.core.identity_visibility.summary = state.visibility_summary;
             self.clearLiveDocSetCache();
             self.clearNonVisibleDocSetCache();
-            self.bulk_ingest_identity_all_new = true;
+            self.bulk_identity.enabled = true;
         }
     }
 
     fn clearBulkIngestIdentityAllNewLocked(self: anytype) void {
-        self.bulk_ingest_identity_all_new = false;
-        self.bulk_ingest_identity_state.deinit(self.alloc);
-        self.clearBulkIngestSeenDocKeysLocked();
-    }
-
-    fn clearBulkIngestSeenDocKeysLocked(self: anytype) void {
-        var it = self.bulk_ingest_seen_doc_keys.keyIterator();
-        while (it.next()) |key_ptr| self.alloc.free(@constCast(key_ptr.*));
-        self.bulk_ingest_seen_doc_keys.clearRetainingCapacity();
+        self.bulk_identity.reset(self.alloc);
     }
 
     fn clearActiveIndexRepairsLocked(self: anytype) void {
@@ -14017,20 +13990,7 @@ pub const DB = struct {
     }
 
     fn rememberBulkIngestAllNewIdentityUpserts(self: anytype, doc_ids: []const []const u8) !bool {
-        var batch_seen = std.StringHashMapUnmanaged(void).empty;
-        defer batch_seen.deinit(self.alloc);
-        for (doc_ids) |doc_id| {
-            if (self.bulk_ingest_seen_doc_keys.contains(doc_id)) return false;
-            if (batch_seen.contains(doc_id)) return false;
-            try batch_seen.put(self.alloc, doc_id, {});
-        }
-
-        for (doc_ids) |doc_id| {
-            const owned = try self.alloc.dupe(u8, doc_id);
-            errdefer self.alloc.free(owned);
-            try self.bulk_ingest_seen_doc_keys.put(self.alloc, owned, {});
-        }
-        return true;
+        return self.bulk_identity.remember(self.alloc, doc_ids);
     }
 
     fn identityUpsertStoreWritesAreNew(write_indexes: []const usize, overwritten_flags: []const bool) bool {
@@ -34363,89 +34323,15 @@ pub const DB = struct {
         try self.lockApplySharedForPortableRuntime();
         defer self.core.unlockApplyShared();
 
-        var cleaned_writes = std.ArrayListUnmanaged(types.BatchWrite).empty;
-        errdefer {
-            for (cleaned_writes.items) |write| {
-                alloc.free(@constCast(write.key));
-                alloc.free(@constCast(write.value));
-            }
-            cleaned_writes.deinit(alloc);
-        }
-        var dense_embeddings = std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite).empty;
-        errdefer {
-            for (dense_embeddings.items) |*embedding| embedding.deinit(alloc);
-            dense_embeddings.deinit(alloc);
-        }
-        var sparse_embeddings = std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite).empty;
-        errdefer {
-            for (sparse_embeddings.items) |*embedding| embedding.deinit(alloc);
-            sparse_embeddings.deinit(alloc);
-        }
-        var graph_writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-        errdefer {
-            for (graph_writes.items) |*write| {
-                alloc.free(@constCast(write.index_name));
-                alloc.free(@constCast(write.source));
-                alloc.free(@constCast(write.target));
-                alloc.free(@constCast(write.edge_type));
-                if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
-                if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
-                if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-                if (write.owner.len > 0) alloc.free(@constCast(write.owner));
-            }
-            graph_writes.deinit(alloc);
-        }
-
+        var collector: result_collectors.Extraction = .{ .alloc = alloc };
+        defer collector.deinit();
         for (writes) |write| {
             var extracted = try mapper.extractWrite(alloc, write.key, write.value);
             defer extracted.deinit(alloc);
             try augmentExtractedWriteWithGraphFieldEdges(self, alloc, write.key, write.value, &extracted);
-
-            if (extracted.cleaned_value) |cleaned| {
-                try cleaned_writes.append(alloc, .{
-                    .key = try alloc.dupe(u8, write.key),
-                    .value = try alloc.dupe(u8, cleaned),
-                });
-            }
-            for (extracted.dense_embeddings) |embedding| {
-                const public_artifact = if (embedding.artifact_key) |artifact_key|
-                    try artifact_ids.resolvePublicArtifactIdentityAlloc(alloc, artifact_key)
-                else
-                    null;
-                defer if (public_artifact) |identity| {
-                    var owned = identity;
-                    owned.deinit(alloc);
-                };
-
-                try dense_embeddings.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, embedding.index_name),
-                    .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                    .artifact_id = if (public_artifact) |identity| try alloc.dupe(u8, identity.id) else null,
-                    .artifact_ref = if (public_artifact) |identity| try identity.artifact_ref.?.clone(alloc) else null,
-                    .vector = try alloc.dupe(f32, embedding.vector),
-                });
-            }
-            for (extracted.sparse_embeddings) |embedding| {
-                try sparse_embeddings.append(alloc, .{
-                    .index_name = try alloc.dupe(u8, embedding.index_name),
-                    .doc_key = try alloc.dupe(u8, embedding.doc_key),
-                    .indices = try alloc.dupe(u32, embedding.indices),
-                    .values = try alloc.dupe(f32, embedding.values),
-                });
-            }
-            for (extracted.graph_writes) |graph_write| {
-                var owned = try graph_write.cloneAlloc(alloc);
-                errdefer owned.deinit(alloc);
-                try graph_writes.append(alloc, owned);
-            }
+            try collector.append(write.key, extracted);
         }
-
-        return .{
-            .cleaned_writes = try cleaned_writes.toOwnedSlice(alloc),
-            .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
-            .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
-            .graph_writes = try graph_writes.toOwnedSlice(alloc),
-        };
+        return collector.finish();
     }
 
     pub fn computeEnrichments(self: *DB, alloc: Allocator, writes: []const types.BatchWrite) !types.ComputeEnrichmentsResult {
@@ -39421,67 +39307,11 @@ pub const DB = struct {
         };
     }
 
-    fn dbHbcCacheKindStats(cache_stats: anytype) types.HbcCacheKindStats {
-        return .{
-            .used_bytes = cache_stats.used_bytes,
-            .peak_bytes = cache_stats.peak_bytes,
-            .hits = cache_stats.hits,
-            .misses = cache_stats.misses,
-            .insertions = cache_stats.insertions,
-            .replacements = cache_stats.replacements,
-            .sampled_admissions = cache_stats.sampled_admissions,
-            .admission_skips = cache_stats.admission_skips,
-            .evictions = cache_stats.evictions,
-        };
-    }
+    const dbHbcCacheStats = status_projection.dbHbcCacheStats;
 
-    fn dbHbcCacheStats(cache_stats: anytype) types.HbcCacheStats {
-        return .{
-            .total_bytes = cache_stats.total_bytes,
-            .accounted_bytes = cache_stats.accounted_bytes,
-            .pinned_bytes = cache_stats.pinned_bytes,
-            .node = dbHbcCacheKindStats(cache_stats.node),
-            .quantized = dbHbcCacheKindStats(cache_stats.quantized),
-            .vector = dbHbcCacheKindStats(cache_stats.vector),
-            .metadata = dbHbcCacheKindStats(cache_stats.metadata),
-        };
-    }
+    const dbHbcPostingStats = status_projection.dbHbcPostingStats;
 
-    fn dbHbcPostingStats(backlog: hbc_mod.PostingBacklogStats, profile: hbc_mod.WriteProfile) types.HbcPostingStats {
-        return .{
-            .scanned_nodes = backlog.scanned_nodes,
-            .scanned_postings = backlog.scanned_postings,
-            .dirty_postings = backlog.dirty_postings,
-            .centroid_dirty_postings = backlog.centroid_dirty_postings,
-            .payload_dirty_postings = backlog.payload_dirty_postings,
-            .max_centroid_version_lag = backlog.max_centroid_version_lag,
-            .max_payload_version_lag = backlog.max_payload_version_lag,
-            .max_mutation_version = backlog.max_mutation_version,
-            .skipped_missing = backlog.skipped_missing,
-            .maintenance_scanned_nodes = profile.posting_maintenance_scanned_nodes,
-            .maintenance_scanned_postings = profile.posting_maintenance_scanned_postings,
-            .maintenance_dirty_postings = profile.posting_maintenance_dirty_postings,
-            .maintenance_repaired_postings = profile.posting_maintenance_repaired_postings,
-            .maintenance_centroid_refreshed = profile.posting_maintenance_centroid_refreshed,
-            .maintenance_payload_refreshed = profile.posting_maintenance_payload_refreshed,
-            .maintenance_ancestor_refresh_roots = profile.posting_maintenance_ancestor_refresh_roots,
-            .maintenance_split_postings = profile.posting_maintenance_split_postings,
-            .maintenance_merged_postings = profile.posting_maintenance_merged_postings,
-            .maintenance_boundary_reassigned_vectors = profile.posting_maintenance_boundary_reassigned_vectors,
-            .lazy_centroid_deferrals = profile.posting_lazy_centroid_deferrals,
-            .lazy_payload_deferrals = profile.posting_lazy_payload_deferrals,
-            .lazy_ancestor_deferrals = profile.posting_lazy_ancestor_deferrals,
-        };
-    }
-
-    fn projectionCheckpointStatusName(status: apply_state.ProjectionStatus) []const u8 {
-        return switch (status) {
-            .clean => "clean",
-            .rebuilding => "rebuilding",
-            .degraded => "degraded",
-            .repair_required => "repair_required",
-        };
-    }
+    const projectionCheckpointStatusName = status_projection.projectionCheckpointStatusName;
 
     fn artifactSourceTargetSequence(self: *DB, alloc: Allocator, artifact_name: []const u8, published_sequence: u64, aggregate_target_sequence: u64) !u64 {
         const key = try internal_keys.artifactSourceRevisionKeyAlloc(alloc, artifact_name);
@@ -39813,29 +39643,7 @@ pub const DB = struct {
         if (active_generation_complete) item.repair_degraded = false;
     }
 
-    fn durableGenerationBuildActive(item: *const types.DBIndexStats) bool {
-        // A retained status snapshot may predate durable repair-state
-        // materialization. The checkpoint is itself durable proof that a
-        // non-replay generation build is active and must not be erased by a
-        // live replay-counter overlay.
-        if (std.mem.eql(u8, item.projection_checkpoint_status, "rebuilding")) return true;
-        if (item.index_repair_id != null and
-            !std.mem.eql(u8, item.index_repair_phase, @tagName(index_repair_state.Phase.terminal)) and
-            !std.mem.eql(u8, item.index_repair_automation, "paused"))
-        {
-            return true;
-        }
-        const generation_build = std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_rebuild)) or
-            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_baseline_adoption)) or
-            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.storage_format_migration)) or
-            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.operator_generation_validation)) or
-            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_coverage_mismatch)) or
-            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.artifact_counter_missing)) or
-            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.replay_artifact_unavailable)) or
-            std.mem.eql(u8, item.index_repair_trigger, @tagName(index_repair_state.Trigger.projection_generation_invalid));
-        return generation_build and
-            !std.mem.eql(u8, item.index_repair_phase, @tagName(index_repair_state.Phase.terminal));
-    }
+    const durableGenerationBuildActive = status_projection.durableGenerationBuildActive;
 
     fn loadIndexRepairStateForStats(self: *const DB, alloc: Allocator) !?index_repair_state.State {
         if (comptime builtin.os.tag == .freestanding) {
@@ -39848,254 +39656,21 @@ pub const DB = struct {
         }
     }
 
-    fn freeDBIndexStatsItem(alloc: Allocator, item: types.DBIndexStats) void {
-        alloc.free(item.name);
-        for (item.source_replay) |source| alloc.free(source.artifact_name);
-        if (item.source_replay.len > 0) alloc.free(item.source_replay);
-        if (item.load_error) |value| alloc.free(value);
-        if (item.index_repair_last_error) |value| alloc.free(value);
-        if (item.algebraic_last_error_doc_key) |value| alloc.free(value);
-        if (item.algebraic_last_error_reason) |value| alloc.free(value);
-        if (item.algebraic_capability_fingerprint) |value| alloc.free(value);
-        if (item.algebraic_capability_lifecycle_status) |value| alloc.free(value);
-        if (item.algebraic_planner_last_decision) |value| alloc.free(value);
-        if (item.algebraic_planner_last_fallback_reason) |value| alloc.free(value);
-        if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
-        if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
-        if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
-        types.freeGraphMetricStatuses(alloc, @constCast(item.graph_metric_status));
-        if (item.algebraic_top_candidate) |candidate| {
-            alloc.free(candidate.recommendation);
-            alloc.free(candidate.materialization_id);
-            alloc.free(candidate.lifecycle);
-            alloc.free(candidate.decision);
-        }
-        if (item.algebraic_active_progress) |progress| {
-            alloc.free(progress.recommendation);
-            alloc.free(progress.materialization_id);
-            alloc.free(progress.lifecycle);
-        }
-        for (item.algebraic_candidates) |candidate| {
-            alloc.free(candidate.recommendation);
-            alloc.free(candidate.materialization_id);
-            alloc.free(candidate.lifecycle);
-            alloc.free(candidate.decision);
-        }
-        if (item.algebraic_candidates.len > 0) alloc.free(item.algebraic_candidates);
-        for (item.algebraic_candidate_decision_history) |entry| {
-            alloc.free(entry.recommendation);
-            alloc.free(entry.materialization_id);
-            alloc.free(entry.lifecycle);
-            alloc.free(entry.previous_decision);
-            alloc.free(entry.decision);
-        }
-        if (item.algebraic_candidate_decision_history.len > 0) alloc.free(item.algebraic_candidate_decision_history);
-        for (item.algebraic_progress) |progress| {
-            alloc.free(progress.recommendation);
-            alloc.free(progress.materialization_id);
-            alloc.free(progress.lifecycle);
-        }
-        if (item.algebraic_progress.len > 0) alloc.free(item.algebraic_progress);
-    }
+    const freeDBIndexStatsItem = status_projection.freeDBIndexStatsItem;
 
-    fn cloneAlgebraicCandidateStatusAlloc(
-        alloc: Allocator,
-        recommendation: []const u8,
-        materialization_id: []const u8,
-        lifecycle: []const u8,
-        decision: []const u8,
-        observation_count: u64,
-        estimated_scan_rows_saved: u64,
-        estimated_write_cost: u64,
-        estimated_tensor_rows: u64,
-        estimated_storage_bytes: u64,
-        estimated_write_amplification: u64,
-        score: i128,
-        idle_miss_count: u64,
-        generation: u64,
-    ) !types.AlgebraicCandidateStatus {
-        const owned_recommendation = try alloc.dupe(u8, recommendation);
-        errdefer alloc.free(owned_recommendation);
-        const owned_materialization_id = try alloc.dupe(u8, materialization_id);
-        errdefer alloc.free(owned_materialization_id);
-        const owned_lifecycle = try alloc.dupe(u8, lifecycle);
-        errdefer alloc.free(owned_lifecycle);
-        const owned_decision = try alloc.dupe(u8, decision);
-        errdefer alloc.free(owned_decision);
-        return .{
-            .recommendation = owned_recommendation,
-            .materialization_id = owned_materialization_id,
-            .lifecycle = owned_lifecycle,
-            .decision = owned_decision,
-            .observation_count = observation_count,
-            .estimated_scan_rows_saved = estimated_scan_rows_saved,
-            .estimated_write_cost = estimated_write_cost,
-            .estimated_tensor_rows = estimated_tensor_rows,
-            .estimated_storage_bytes = estimated_storage_bytes,
-            .estimated_write_amplification = estimated_write_amplification,
-            .score = score,
-            .idle_miss_count = idle_miss_count,
-            .generation = generation,
-        };
-    }
+    const cloneAlgebraicCandidateStatusAlloc = status_projection.cloneAlgebraicCandidateStatusAlloc;
 
-    fn cloneAlgebraicCandidateDecisionStatusAlloc(
-        alloc: Allocator,
-        recommendation: []const u8,
-        materialization_id: []const u8,
-        lifecycle: []const u8,
-        previous_decision: []const u8,
-        decision: []const u8,
-        observation_count: u64,
-        estimated_scan_rows_saved: u64,
-        estimated_write_cost: u64,
-        score: i128,
-        score_delta: i128,
-        idle_miss_count: u64,
-        generation: u64,
-    ) !types.AlgebraicCandidateDecisionStatus {
-        const owned_recommendation = try alloc.dupe(u8, recommendation);
-        errdefer alloc.free(owned_recommendation);
-        const owned_materialization_id = try alloc.dupe(u8, materialization_id);
-        errdefer alloc.free(owned_materialization_id);
-        const owned_lifecycle = try alloc.dupe(u8, lifecycle);
-        errdefer alloc.free(owned_lifecycle);
-        const owned_previous_decision = try alloc.dupe(u8, previous_decision);
-        errdefer alloc.free(owned_previous_decision);
-        const owned_decision = try alloc.dupe(u8, decision);
-        errdefer alloc.free(owned_decision);
-        return .{
-            .recommendation = owned_recommendation,
-            .materialization_id = owned_materialization_id,
-            .lifecycle = owned_lifecycle,
-            .previous_decision = owned_previous_decision,
-            .decision = owned_decision,
-            .observation_count = observation_count,
-            .estimated_scan_rows_saved = estimated_scan_rows_saved,
-            .estimated_write_cost = estimated_write_cost,
-            .score = score,
-            .score_delta = score_delta,
-            .idle_miss_count = idle_miss_count,
-            .generation = generation,
-        };
-    }
+    const cloneAlgebraicCandidateDecisionStatusAlloc = status_projection.cloneAlgebraicCandidateDecisionStatusAlloc;
 
-    fn cloneAlgebraicProgressStatusAlloc(
-        alloc: Allocator,
-        recommendation: []const u8,
-        materialization_id: []const u8,
-        lifecycle: []const u8,
-        target_sequence: u64,
-        applied_sequence: u64,
-        rows_processed: u64,
-        target_rows: u64,
-    ) !types.AlgebraicProgressStatus {
-        const owned_recommendation = try alloc.dupe(u8, recommendation);
-        errdefer alloc.free(owned_recommendation);
-        const owned_materialization_id = try alloc.dupe(u8, materialization_id);
-        errdefer alloc.free(owned_materialization_id);
-        const owned_lifecycle = try alloc.dupe(u8, lifecycle);
-        errdefer alloc.free(owned_lifecycle);
-        return .{
-            .recommendation = owned_recommendation,
-            .materialization_id = owned_materialization_id,
-            .lifecycle = owned_lifecycle,
-            .target_sequence = target_sequence,
-            .applied_sequence = applied_sequence,
-            .rows_processed = rows_processed,
-            .target_rows = target_rows,
-        };
-    }
+    const cloneAlgebraicProgressStatusAlloc = status_projection.cloneAlgebraicProgressStatusAlloc;
 
-    const IndexStatusSnapshot = struct {
-        kind: types.IndexKind,
-        doc_count: u64 = 0,
-        term_count: u64 = 0,
-        edge_count: u64 = 0,
-        graph_counts_pending: bool = false,
-        node_count: u64 = 0,
-        root_node: u64 = 0,
-        updated_at_ns: u64 = 0,
-    };
+    const IndexStatusSnapshot = status_projection.IndexStatusSnapshot;
+    const index_status_magic_v1 = status_projection.index_status_magic_v1;
+    const index_status_encoded_len = status_projection.index_status_encoded_len;
 
-    const index_status_prefix = "\x00\x00__metadata__:index_status:";
-    const index_status_magic_v1: u64 = 0x3153544154584449; // "IDXTATS1" little-endian
-    const index_status_magic: u64 = 0x3253544154584449; // "IDXTATS2" little-endian
-    const index_status_encoded_len = 9 * 8;
-    const index_load_failure_prefix = "\x00\x00__metadata__:index_load_failure:";
-
-    fn indexStatusKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}{s}", .{ index_status_prefix, index_name });
-    }
-
-    fn encodeIndexStatusSnapshot(status_snapshot: IndexStatusSnapshot, out: *[index_status_encoded_len]u8) void {
-        var offset: usize = 0;
-        inline for (.{
-            index_status_magic,
-            @as(u64, @intFromEnum(status_snapshot.kind)),
-            status_snapshot.doc_count,
-            status_snapshot.term_count,
-            status_snapshot.edge_count,
-            status_snapshot.node_count,
-            status_snapshot.root_node,
-            status_snapshot.updated_at_ns,
-            @as(u64, @intFromBool(status_snapshot.graph_counts_pending)),
-        }) |value| {
-            std.mem.writeInt(u64, out[offset..][0..8], value, .little);
-            offset += 8;
-        }
-    }
-
-    fn decodeIndexStatusSnapshot(raw: []const u8) !IndexStatusSnapshot {
-        if (raw.len != index_status_encoded_len and raw.len != 64) return error.InvalidIndexStatusSnapshot;
-        var offset: usize = 0;
-        const magic = std.mem.readInt(u64, raw[offset..][0..8], .little);
-        offset += 8;
-        if (!((magic == index_status_magic and raw.len == index_status_encoded_len) or
-            (magic == index_status_magic_v1 and raw.len == 64))) return error.InvalidIndexStatusSnapshot;
-        const counts_pending = if (raw.len == 64) 0 else std.mem.readInt(u64, raw[64..72], .little);
-        if (counts_pending > 1) return error.InvalidIndexStatusSnapshot;
-        const kind_raw = std.mem.readInt(u64, raw[offset..][0..8], .little);
-        offset += 8;
-        const kind: types.IndexKind = switch (kind_raw) {
-            @intFromEnum(types.IndexKind.full_text) => .full_text,
-            @intFromEnum(types.IndexKind.dense_vector) => .dense_vector,
-            @intFromEnum(types.IndexKind.sparse_vector) => .sparse_vector,
-            @intFromEnum(types.IndexKind.graph) => .graph,
-            @intFromEnum(types.IndexKind.algebraic) => .algebraic,
-            else => return error.InvalidIndexStatusSnapshot,
-        };
-        return .{
-            .kind = kind,
-            .graph_counts_pending = counts_pending != 0,
-            .doc_count = blk: {
-                const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-                offset += 8;
-                break :blk value;
-            },
-            .term_count = blk: {
-                const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-                offset += 8;
-                break :blk value;
-            },
-            .edge_count = blk: {
-                const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-                offset += 8;
-                break :blk value;
-            },
-            .node_count = blk: {
-                const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-                offset += 8;
-                break :blk value;
-            },
-            .root_node = blk: {
-                const value = std.mem.readInt(u64, raw[offset..][0..8], .little);
-                offset += 8;
-                break :blk value;
-            },
-            .updated_at_ns = std.mem.readInt(u64, raw[offset..][0..8], .little),
-        };
-    }
+    const indexStatusKeyAlloc = status_projection.indexStatusKeyAlloc;
+    const encodeIndexStatusSnapshot = status_projection.encodeIndexStatusSnapshot;
+    const decodeIndexStatusSnapshot = status_projection.decodeIndexStatusSnapshot;
 
     const DenseServingCounts = struct { doc_count: u64, node_count: u64, root_node: u64, revision: u64 };
 
@@ -40247,19 +39822,9 @@ pub const DB = struct {
         return decodeIndexStatusSnapshot(raw) catch null;
     }
 
-    fn applyIndexStatusSnapshot(item: *types.DBIndexStats, status_snapshot: IndexStatusSnapshot) void {
-        if (status_snapshot.kind != item.kind) return;
-        item.doc_count = status_snapshot.doc_count;
-        item.term_count = status_snapshot.term_count;
-        item.edge_count = status_snapshot.edge_count;
-        item.graph_counts_pending = status_snapshot.graph_counts_pending;
-        item.node_count = status_snapshot.node_count;
-        item.root_node = status_snapshot.root_node;
-    }
+    const applyIndexStatusSnapshot = status_projection.applyIndexStatusSnapshot;
 
-    fn indexLoadFailureKeyAlloc(alloc: Allocator, index_name: []const u8) ![]u8 {
-        return try std.fmt.allocPrint(alloc, "{s}{s}", .{ index_load_failure_prefix, index_name });
-    }
+    const indexLoadFailureKeyAlloc = status_projection.indexLoadFailureKeyAlloc;
 
     fn loadPersistedIndexLoadFailure(self: *DB, alloc: Allocator, index_name: []const u8) !?[]u8 {
         const key = try indexLoadFailureKeyAlloc(alloc, index_name);
@@ -40298,12 +39863,7 @@ pub const DB = struct {
         if (wrote) try failure_batch.commit() else failure_batch.abort();
     }
 
-    fn applyTerminalLoadFailureStatus(item: *types.DBIndexStats) void {
-        item.replay_catch_up_required = false;
-        item.catch_up_active = false;
-        item.backfill_active = false;
-        item.repair_degraded = true;
-    }
+    const applyTerminalLoadFailureStatus = status_projection.applyTerminalLoadFailureStatus;
 
     fn markDenseCoverageRegressionIfNeeded(self: *DB, alloc: Allocator, index_name: []const u8, item: *types.DBIndexStats) !void {
         const status_snapshot = (try self.loadIndexStatusSnapshot(alloc, index_name)) orelse return;
@@ -40313,96 +39873,9 @@ pub const DB = struct {
         item.repair_issue_count +|= 1;
     }
 
-    fn applyGraphAlgebraicRuntimeStats(item: *types.DBIndexStats, graph_index: *const graph_mod.GraphIndex) void {
-        const algebraic_graph = graph_index.algebraicTraversalRuntimeStats();
-        item.algebraic_graph_traversal_attempt_count = algebraic_graph.attempt_count;
-        item.algebraic_graph_traversal_proven_count = algebraic_graph.proven_count;
-        item.algebraic_graph_traversal_rejected_count = algebraic_graph.rejected_count;
-        item.algebraic_graph_traversal_fallback_count = algebraic_graph.fallback_count;
-        item.algebraic_graph_traversal_result_node_count = algebraic_graph.result_node_count;
-    }
+    const applyGraphAlgebraicRuntimeStats = status_projection.applyGraphAlgebraicRuntimeStats;
 
-    fn cloneGraphMetricBuildPageStatusesFromGraph(
-        alloc: Allocator,
-        source: []const graph_mod.GraphIndex.GraphMetricBuildPageStatus,
-    ) ![]types.GraphMetricBuildPageStatus {
-        if (source.len == 0) return &.{};
-        const out = try alloc.alloc(types.GraphMetricBuildPageStatus, source.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |*page| page.deinit(alloc);
-            alloc.free(out);
-        }
-        for (source, 0..) |page, i| {
-            const worker_id = if (page.worker_id.len > 0) try alloc.dupe(u8, page.worker_id) else "";
-            errdefer if (worker_id.len > 0) alloc.free(worker_id);
-            const cursor = if (page.cursor.len > 0) try alloc.dupe(u8, page.cursor) else "";
-            errdefer if (cursor.len > 0) alloc.free(cursor);
-            const last_error = if (page.last_error.len > 0) try alloc.dupe(u8, page.last_error) else "";
-            errdefer if (last_error.len > 0) alloc.free(last_error);
-            out[i] = .{
-                .phase = page.phase,
-                .iteration = page.iteration,
-                .page_id = page.page_id,
-                .state = page.state,
-                .range_kind = page.range_kind,
-                .worker_id = worker_id,
-                .lease_expires_at_ms = page.lease_expires_at_ms,
-                .attempt = page.attempt,
-                .cursor = cursor,
-                .completed_units = page.completed_units,
-                .total_units = page.total_units,
-                .last_error = last_error,
-            };
-            initialized += 1;
-        }
-        return out;
-    }
-
-    fn cloneGraphMetricStatusFromGraph(
-        alloc: Allocator,
-        source: graph_mod.GraphIndex.GraphMetricStatus,
-    ) !types.GraphMetricStatus {
-        var out = types.GraphMetricStatus{
-            .name = try alloc.dupe(u8, source.name),
-            .state = source.state,
-            .phase = source.phase,
-            .metadata_version = source.metadata_version,
-            .config_fingerprint = source.config_fingerprint,
-            .maintenance_paused = source.maintenance_paused,
-            .build_queued = source.build_queued,
-            .published_generation = source.published_edge_generation,
-            .edge_generation = source.edge_generation,
-            .target_edge_generation = source.target_edge_generation,
-            .queued_generation = source.queued_generation,
-            .building_generation = source.building_generation,
-            .build_job_id = source.build_job_id,
-            .build_started_at_ms = source.build_started_at_ms,
-            .build_iteration = source.build_iteration,
-            .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
-            .build_completed_units = source.build_completed_units,
-            .build_total_units = source.build_total_units,
-            .build_pages_truncated = source.build_pages_truncated,
-            .retry_count = source.retry_count,
-            .progress = source.progress,
-            .converged = source.converged,
-            .iterations_completed = source.iterations_completed,
-            .delta = source.delta,
-            .computed_at_ms = source.computed_at_ms,
-            .last_event = source.last_event,
-        };
-        errdefer out.deinit(alloc);
-        out.edge_filter = try source.edge_filter.cloneAlloc(alloc);
-        out.build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
-        out.build_cursor = if (source.build_cursor.len > 0) try alloc.dupe(u8, source.build_cursor) else "";
-        out.last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
-        out.recent_events = if (source.recent_events.len > 0)
-            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
-        else
-            &.{};
-        out.build_pages = try cloneGraphMetricBuildPageStatusesFromGraph(alloc, source.build_pages);
-        return out;
-    }
+    const cloneGraphMetricStatusFromGraph = status_projection.cloneGraphMetricStatusFromGraph;
 
     fn populateGraphMetricStatusStats(alloc: Allocator, item: *types.DBIndexStats, graph_index: *graph_mod.GraphIndex) !void {
         if (graph_index.metric_configs.len == 0) return;
@@ -58248,30 +57721,13 @@ const GraphArtifactClear = struct {
     }
 };
 
-const ChunkEmbeddingSource = struct {
-    key: []u8,
-    text: []const u8,
-};
+const ChunkEmbeddingSource = materialized_sources.ChunkEmbeddingSource;
 
-fn freeChunkEmbeddingSources(alloc: Allocator, sources: []const ChunkEmbeddingSource) void {
-    for (sources) |source| {
-        alloc.free(source.key);
-        alloc.free(source.text);
-    }
-    if (sources.len > 0) alloc.free(sources);
-}
+const freeChunkEmbeddingSources = materialized_sources.freeChunkEmbeddingSources;
 
-fn clearChunkEmbeddingSourceList(alloc: Allocator, sources: *std.ArrayListUnmanaged(ChunkEmbeddingSource)) void {
-    for (sources.items) |source| {
-        alloc.free(source.key);
-        alloc.free(source.text);
-    }
-    sources.clearRetainingCapacity();
-}
+const clearChunkEmbeddingSourceList = materialized_sources.clearChunkEmbeddingSourceList;
 
-fn chunkPayloadTextAlloc(alloc: Allocator, payload: []const u8, source_field: []const u8) !?[]u8 {
-    return try chunk_artifact_mod.artifactTextAlloc(alloc, payload, source_field);
-}
+const chunkPayloadTextAlloc = materialized_sources.chunkPayloadTextAlloc;
 
 fn keyAfterAlloc(alloc: Allocator, key: []const u8) ![]u8 {
     const out = try alloc.alloc(u8, key.len + 1);
@@ -58280,65 +57736,9 @@ fn keyAfterAlloc(alloc: Allocator, key: []const u8) ![]u8 {
     return out;
 }
 
-fn collectChunkEmbeddingSourcesFromWrites(
-    alloc: Allocator,
-    out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
-    seen: *std.StringHashMapUnmanaged(void),
-    writes: []const types.BatchWrite,
-    doc_key: []const u8,
-    artifact_name: []const u8,
-    source_field: []const u8,
-) !void {
-    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name);
-    defer alloc.free(prefix);
-    for (writes) |write| {
-        if (!std.mem.startsWith(u8, write.key, prefix) or
-            !internal_keys.matchesChunkArtifactName(write.key, artifact_name)) continue;
-        if (seen.contains(write.key)) continue;
-        const text = (try chunkPayloadTextAlloc(alloc, write.value, source_field)) orelse continue;
-        var text_owned = true;
-        errdefer if (text_owned) alloc.free(text);
-        try out.append(alloc, .{
-            .key = try alloc.dupe(u8, write.key),
-            .text = text,
-        });
-        text_owned = false;
-        try seen.put(alloc, out.items[out.items.len - 1].key, {});
-    }
-}
+const collectChunkEmbeddingSourcesFromWrites = materialized_sources.collectChunkEmbeddingSourcesFromWrites;
 
-fn collectChunkEmbeddingSourcesFromStore(
-    alloc: Allocator,
-    db: anytype,
-    out: *std.ArrayListUnmanaged(ChunkEmbeddingSource),
-    seen: *std.StringHashMapUnmanaged(void),
-    doc_key: []const u8,
-    artifact_name: []const u8,
-    source_field: []const u8,
-    pending_writes: *const PendingArtifactWriteIndex,
-    pending_deletes: *const std.StringHashMapUnmanaged(void),
-) !void {
-    const prefix = try internal_keys.artifactNamedPrefixAlloc(alloc, doc_key, "chunk", artifact_name);
-    defer alloc.free(prefix);
-    const existing = try db.core.store.scanPrefix(alloc, prefix);
-    defer docstore_mod.DocStore.freeResults(alloc, existing);
-
-    for (existing) |entry| {
-        if (!internal_keys.isChunkArtifactRecordKey(entry.key)) continue;
-        if (seen.contains(entry.key)) continue;
-        if (pending_writes.get(entry.key) != null) continue;
-        if (pending_deletes.contains(entry.key)) continue;
-        const text = (try chunkPayloadTextAlloc(alloc, entry.value, source_field)) orelse continue;
-        var text_owned = true;
-        errdefer if (text_owned) alloc.free(text);
-        try out.append(alloc, .{
-            .key = try alloc.dupe(u8, entry.key),
-            .text = text,
-        });
-        text_owned = false;
-        try seen.put(alloc, out.items[out.items.len - 1].key, {});
-    }
-}
+const collectChunkEmbeddingSourcesFromStore = materialized_sources.collectChunkEmbeddingSourcesFromStore;
 
 test "materialized preserved sources dedupe pending chunk keys" {
     const alloc = std.testing.allocator;
@@ -58368,6 +57768,50 @@ test "materialized preserved sources dedupe pending chunk keys" {
     try std.testing.expectEqual(@as(usize, 128), sources.items.len);
     try std.testing.expectEqual(@as(usize, 128), seen.count());
     try std.testing.expectEqualStrings("first", sources.items[0].text);
+}
+
+test "materialized preserved sources release writes and store rows across allocation failures" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("materialized-sources");
+    defer directory.cleanup();
+    var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+    defer db.close();
+    var writes: std.ArrayListUnmanaged(types.BatchWrite) = .empty;
+    defer {
+        for (writes.items) |write| alloc.free(@constCast(write.key));
+        writes.deinit(alloc);
+    }
+    for (0..16) |i| {
+        try writes.ensureUnusedCapacity(alloc, 1);
+        const key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "chunks", @intCast(i));
+        writes.appendAssumeCapacity(.{ .key = key, .value = "{\"text\":\"pending\"}" });
+        try db.core.store.put(key, "{\"text\":\"stored\"}");
+    }
+    const Failure = struct {
+        fn run(failure_alloc: Allocator, store: *docstore_mod.DocStore, pending: []const types.BatchWrite) !void {
+            var sources: std.ArrayListUnmanaged(ChunkEmbeddingSource) = .empty;
+            defer {
+                clearChunkEmbeddingSourceList(failure_alloc, &sources);
+                sources.deinit(failure_alloc);
+            }
+            var seen: std.StringHashMapUnmanaged(void) = .empty;
+            defer seen.deinit(failure_alloc);
+            var pending_keys: std.StringHashMapUnmanaged(void) = .empty;
+            defer pending_keys.deinit(failure_alloc);
+            var deletes: std.StringHashMapUnmanaged(void) = .empty;
+            defer deletes.deinit(failure_alloc);
+            try pending_keys.put(failure_alloc, pending[0].key, {});
+            try deletes.put(failure_alloc, pending[1].key, {});
+            // Pending rows win; deletions and unmaterializable pending writes
+            // must suppress the corresponding stored row.
+            try collectChunkEmbeddingSourcesFromWrites(failure_alloc, &sources, &seen, pending[2..3], "doc:a", "chunks", "text");
+            try collectChunkEmbeddingSourcesFromStore(failure_alloc, store, &sources, &seen, "doc:a", "chunks", "text", &pending_keys, &deletes);
+            try std.testing.expectEqual(@as(usize, 14), sources.items.len);
+            try std.testing.expectEqualStrings("pending", sources.items[0].text);
+            try std.testing.expectEqualStrings("stored", sources.items[1].text);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Failure.run, .{ db.core.store, writes.items });
 }
 
 fn chunkEmbeddingSourcesForRequest(
@@ -58783,7 +58227,7 @@ fn preparePreservedEmbeddingSources(
             var seen = std.StringHashMapUnmanaged(void).empty;
             defer seen.deinit(alloc);
             try collectChunkEmbeddingSourcesFromWrites(alloc, &sources, &seen, pending_writes.chunkWritesForDoc(request.doc_key), request.doc_key, requestArtifactName(request), request.source_field);
-            try collectChunkEmbeddingSourcesFromStore(alloc, db, &sources, &seen, request.doc_key, requestArtifactName(request), request.source_field, pending_writes, pending_deletes);
+            try collectChunkEmbeddingSourcesFromStore(alloc, db.core.store, &sources, &seen, request.doc_key, requestArtifactName(request), request.source_field, &pending_writes.values, pending_deletes);
         } else {
             var chunks_created: usize = 0;
             sources = .fromOwnedSlice(try chunkEmbeddingSourcesForRequest(alloc, db, doc_value, request, cache, &chunks_created));
@@ -60667,8 +60111,6 @@ fn applyGraphUnion(alloc: Allocator, result: *types.SearchResult) !void {
 fn externalizeSearchResultArtifactIds(alloc: Allocator, result: *types.SearchResult) !void {
     try db_query_result_shape.externalizeSearchResultArtifactIds(alloc, result);
 }
-
-const externalizeArtifactWritesAlloc = result_collectors.externalizeArtifactWritesAlloc;
 
 fn dedupeSearchHitsById(alloc: Allocator, result: *types.SearchResult) !void {
     try db_query_result_shape.dedupeSearchHitsById(alloc, result);
@@ -69675,10 +69117,6 @@ fn managedIndexRecordApplicability(
     }
 }
 
-const OwnedBatchWrites = document_collectors.OwnedBatchWrites;
-
-const CollectDocumentWritesProfile = document_collectors.CollectDocumentWritesProfile;
-
 const CollectSparseFieldWritesProfile = struct {
     scan_ns: u64 = 0,
     sort_ns: u64 = 0,
@@ -69813,8 +69251,6 @@ const OwnedSparseEmbeddingWrites = struct {
         self.* = undefined;
     }
 };
-
-const CollectTextDocumentWritesOptions = document_collectors.CollectTextDocumentWritesOptions;
 
 const CollectDocumentWritesOptions = document_collectors.CollectDocumentWritesOptions;
 
@@ -70019,7 +69455,6 @@ const collectDocumentWrites = document_collectors.collectDocumentWrites;
 
 // Count contiguous store hits first. Inline fallbacks require inspecting
 // pending metadata only when that metadata actually contains inline values.
-const availableDocumentValueCount = document_collectors.availableDocumentValueCount;
 
 const collectDocumentWritesProfiled = document_collectors.collectDocumentWritesProfiled;
 
@@ -70137,10 +69572,6 @@ fn attachPreparedUpsertDocumentProjections(
         }
     }
 }
-
-const CollectedTextDocumentWrites = document_collectors.CollectedTextDocumentWrites;
-
-const ordinaryTextDocument = document_collectors.ordinaryTextDocument;
 
 const collectTextDocumentWritesForIndex = document_collectors.collectTextDocumentWritesForIndex;
 
@@ -71367,7 +70798,7 @@ fn materializeGraphSourceArtifactRestorePage(
     };
 
     const cache_matches = if (self.graph_restore_parse_cache) |cache|
-        std.mem.eql(u8, cache.artifact_key, artifact_key) and std.mem.eql(u8, cache.index_name, index_name)
+        cache.matches(artifact_key, index_name)
     else
         false;
     if (!cache_matches) {
@@ -71382,34 +70813,10 @@ fn materializeGraphSourceArtifactRestorePage(
             relationalColumns(self) != null,
         );
         defer if (raw_doc) |value| alloc.free(value);
+        const replacement = try GraphRestoreParseCache.init(self.alloc, artifact_key, index_name, raw, raw_doc);
         if (self.graph_restore_parse_cache) |*cache| cache.deinit(self.alloc);
-        self.graph_restore_parse_cache = null;
-        var parsed_artifact = try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{ .parse_numbers = false });
-        var artifact_owned = true;
-        errdefer if (artifact_owned) parsed_artifact.deinit();
-        var parsed_document = if (raw_doc) |value|
-            try std.json.parseFromSlice(std.json.Value, self.alloc, value, .{ .parse_numbers = false })
-        else
-            null;
-        var document_owned = parsed_document != null;
-        errdefer if (document_owned) if (parsed_document) |*parsed| parsed.deinit();
-        const artifact_key_owned = try self.alloc.dupe(u8, artifact_key);
-        var artifact_key_owned_live = true;
-        errdefer if (artifact_key_owned_live) self.alloc.free(artifact_key_owned);
-        const index_name_owned = try self.alloc.dupe(u8, index_name);
-        var index_name_owned_live = true;
-        errdefer if (index_name_owned_live) self.alloc.free(index_name_owned);
-        self.graph_restore_parse_cache = .{
-            .artifact_key = artifact_key_owned,
-            .index_name = index_name_owned,
-            .artifact = parsed_artifact,
-            .document = parsed_document,
-        };
+        self.graph_restore_parse_cache = replacement;
         if (builtin.is_test) self.graph_restore_parse_count_for_test += 1;
-        artifact_owned = false;
-        document_owned = false;
-        artifact_key_owned_live = false;
-        index_name_owned_live = false;
     }
     const cache = &self.graph_restore_parse_cache.?;
     const page = graphWritesFromArtifactParsedPageAlloc(
@@ -71777,16 +71184,7 @@ fn freeGraphWrites(alloc: Allocator, writes: []types.GraphEdgeWrite) void {
     if (writes.len > 0) alloc.free(writes);
 }
 
-fn freeGraphWriteFields(alloc: Allocator, write: types.GraphEdgeWrite) void {
-    alloc.free(@constCast(write.index_name));
-    alloc.free(@constCast(write.source));
-    alloc.free(@constCast(write.target));
-    alloc.free(@constCast(write.edge_type));
-    if (write.edge_id.len > 0) alloc.free(@constCast(write.edge_id));
-    if (write.owner_document.len > 0) alloc.free(@constCast(write.owner_document));
-    if (write.metadata_json.len > 0) alloc.free(@constCast(write.metadata_json));
-    if (write.owner.len > 0) alloc.free(@constCast(write.owner));
-}
+const freeGraphWriteFields = graph_restore_materialization.freeGraphWriteFields;
 
 fn resolverConfigForResolution(
     index_manager: *index_manager_mod.IndexManager,
@@ -72178,128 +71576,10 @@ fn graphWritesFromArtifactValueAlloc(
     return try writes.toOwnedSlice(alloc);
 }
 
-const GraphArtifactWritePage = struct {
-    writes: []types.GraphEdgeWrite,
-    next_item_offset: ?usize,
-    item_count: usize,
-};
-
 /// Restore parsing is bounded by raw relation items as well as materialized
 /// bytes. The cursor is an ordinal in the selected relation arrays, so retrying
 /// a page after a crash deterministically rewrites the same segment.
-fn graphWritesFromArtifactParsedPageAlloc(
-    alloc: Allocator,
-    index_name: []const u8,
-    doc_key: []const u8,
-    artifact_value: std.json.Value,
-    source: index_manager_mod.GraphArtifactSource,
-    artifact_content_type: []const u8,
-    doc_value: ?std.json.Value,
-    item_offset: usize,
-    item_limit: usize,
-    output_byte_limit: usize,
-    relation_limit: usize,
-) !GraphArtifactWritePage {
-    var values: [2]std.json.Value = undefined;
-    var value_count: usize = 0;
-    switch (source.format) {
-        .extraction_relation => {
-            if (source.path.len == 0 or std.mem.eql(u8, source.path, "$")) {
-                values[0] = artifact_value;
-                value_count = 1;
-            } else if (selectGraphArtifactPath(artifact_value, source.path)) |selected| {
-                values[0] = selected;
-                value_count = 1;
-            }
-        },
-        .extraction_graph => {
-            if (source.path.len > 0) {
-                if (selectGraphArtifactPath(artifact_value, source.path)) |selected| {
-                    values[0] = selected;
-                    value_count = 1;
-                }
-            } else if (artifact_value == .object) {
-                if (artifact_value.object.get("relations")) |relations| {
-                    values[value_count] = relations;
-                    value_count += 1;
-                }
-                if (artifact_value.object.get("edges")) |edges| {
-                    values[value_count] = edges;
-                    value_count += 1;
-                }
-            }
-        },
-    }
-
-    var item_count: usize = 0;
-    for (values[0..value_count]) |value| {
-        item_count = std.math.add(usize, item_count, if (value == .array) value.array.items.len else 1) catch
-            return error.ResourceLimitExceeded;
-        if (item_count > relation_limit) return error.ResourceLimitExceeded;
-    }
-    if (item_offset > item_count) return error.InvalidRestoreState;
-
-    var writes = std.ArrayListUnmanaged(types.GraphEdgeWrite).empty;
-    errdefer {
-        for (writes.items) |write| freeGraphWriteFields(alloc, write);
-        writes.deinit(alloc);
-    }
-    var value_base: usize = 0;
-    var processed_until = item_offset;
-    var output_bytes: usize = 0;
-    outer: for (values[0..value_count]) |value| {
-        const items = if (value == .array) value.array.items else @as([]const std.json.Value, &.{value});
-        const value_end = std.math.add(usize, value_base, items.len) catch return error.ResourceLimitExceeded;
-        if (item_offset >= value_end) {
-            value_base = value_end;
-            continue;
-        }
-        const local_start = if (item_offset > value_base) item_offset - value_base else 0;
-        for (items[local_start..], local_start..) |item, local_ordinal| {
-            if (processed_until - item_offset >= item_limit) break :outer;
-            const ordinal = value_base + local_ordinal;
-
-            const before = writes.items.len;
-            try appendRelationItem(
-                alloc,
-                &writes,
-                index_name,
-                doc_key,
-                doc_value,
-                item,
-                ordinal,
-                source.mapping,
-                source.artifact_name,
-                artifact_content_type,
-                artifact_value,
-                relation_limit,
-            );
-            if (writes.items.len > before) {
-                const write = writes.items[writes.items.len - 1];
-                const write_bytes = write.retainedBytes();
-                if (writes.items.len > 1 and output_bytes +| write_bytes > output_byte_limit) {
-                    const removed = writes.pop().?;
-                    freeGraphWriteFields(alloc, removed);
-                    break :outer;
-                }
-                output_bytes +|= write_bytes;
-            }
-            processed_until = ordinal + 1;
-        }
-        value_base = value_end;
-    }
-
-    // A zero-output run still consumes raw relation items. This is essential
-    // for malformed/filtered arrays to make deterministic cursor progress.
-    if (processed_until == item_offset and item_offset < item_count) {
-        processed_until = @min(item_count, item_offset + item_limit);
-    }
-    return .{
-        .writes = try writes.toOwnedSlice(alloc),
-        .next_item_offset = if (processed_until < item_count) processed_until else null,
-        .item_count = item_count,
-    };
-}
+const graphWritesFromArtifactParsedPageAlloc = graph_restore_materialization.graphWritesFromArtifactParsedPageAlloc;
 
 fn appendRelationItemsFromPath(
     alloc: Allocator,
@@ -72320,21 +71600,7 @@ fn appendRelationItemsFromPath(
     try appendRelationValueItems(alloc, writes, index_name, doc_key, doc_value, selected, mapping, artifact_name, artifact_content_type, artifact_value, edge_limit);
 }
 
-fn selectGraphArtifactPath(root: std.json.Value, path: []const u8) ?std.json.Value {
-    var trimmed = path;
-    if (std.mem.startsWith(u8, trimmed, "$.")) trimmed = trimmed[2..];
-    if (std.mem.endsWith(u8, trimmed, "[*]")) trimmed = trimmed[0 .. trimmed.len - 3];
-    if (trimmed.len == 0) return root;
-
-    var current = root;
-    var parts = std.mem.splitScalar(u8, trimmed, '.');
-    while (parts.next()) |part| {
-        if (part.len == 0) return null;
-        if (current != .object) return null;
-        current = current.object.get(part) orelse return null;
-    }
-    return current;
-}
+const selectGraphArtifactPath = graph_restore_materialization.selectGraphArtifactPath;
 
 fn appendRelationValueItems(
     alloc: Allocator,
@@ -72356,370 +71622,9 @@ fn appendRelationValueItems(
     }
 }
 
-fn appendRelationItem(
-    alloc: Allocator,
-    writes: *std.ArrayListUnmanaged(types.GraphEdgeWrite),
-    index_name: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    mapping: index_manager_mod.GraphArtifactMapping,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-    edge_limit: usize,
-) !void {
-    if (item != .object) return;
-    const mapped_edge_type = if (mapping.edge_type_template.len > 0)
-        try renderGraphArtifactTemplateAlloc(alloc, mapping.edge_type_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_edge_type) |value| alloc.free(value);
-    const edge_type = if (mapped_edge_type) |value|
-        std.mem.trim(u8, value, &std.ascii.whitespace)
-    else
-        jsonStringField(item, "type") orelse jsonStringField(item, "edge_type") orelse jsonStringField(item, "relation") orelse return;
-    if (edge_type.len == 0) return;
+const appendRelationItem = graph_restore_materialization.appendRelationItem;
 
-    const mapped_source = if (mapping.source_template.len > 0)
-        try renderGraphArtifactTemplateAlloc(alloc, mapping.source_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_source) |value| alloc.free(value);
-    // Materialized edges are routed and retired with their OWNING document —
-    // always the producer. The topological source may differ: a relation
-    // whose source endpoint canonically resolves (an extraction entity with a
-    // resolver-minted key, via the injected "_entities" map) starts from that
-    // canonical node, giving true entity->entity / entity->event topology
-    // (zig/AUTOSCHEMA.md). GraphEdgeWrite.owner carries the producer for
-    // artifact-key routing when the two diverge. A source referencing an
-    // extraction entity that has no canonical identity yet is dropped, like
-    // the matching target rule, when a resolver targets this artifact (the
-    // caller injected an "_entities" map, possibly empty): the resolution
-    // replay re-renders it. With no resolver configured no canonical key
-    // will ever arrive, so the source keeps the owning document instead of
-    // losing the edge (zig/GRAPH.md's V1 extractor-only graph). A source
-    // that matches no extraction entity keeps the legacy document source.
-    var source_table: ?[]const u8 = null;
-    const source_doc = blk: {
-        if (mapped_source) |value| break :blk value;
-        const source_value = item.object.get("source") orelse break :blk doc_key;
-        if (resolveGraphEndpointEntity(source_value, artifact_value)) |entity| {
-            const canonical = canonicalEntityDocumentId(entity) orelse {
-                if (artifact_value == .object and artifact_value.object.get("_entities") != null) return;
-                break :blk doc_key;
-            };
-            // The resolved SOURCE endpoint's home table must survive into
-            // edge metadata like the target's: a backward traversal from
-            // the target otherwise assigns the source an unqualified
-            // identity and hydrates it against the wrong table.
-            source_table = canonicalEntityTable(entity);
-            break :blk canonical;
-        }
-        // A plain-string source matching no extraction entity is an external
-        // node id; any other unresolvable shape (e.g. legacy inline endpoint
-        // objects) keeps the owning document as the source, the historical
-        // contract.
-        break :blk switch (source_value) {
-            .string => |external| if (external.len > 0) external else doc_key,
-            else => doc_key,
-        };
-    };
-    if (source_doc.len == 0) return error.InvalidGraphEdges;
-    const mapped_id = if (mapping.edge_id_template.len > 0)
-        try renderGraphArtifactTemplateAlloc(alloc, mapping.edge_id_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_id) |value| alloc.free(value);
-    const edge_id = mapped_id orelse "";
-    if (mapped_id != null and edge_id.len == 0) return error.InvalidGraphEdges;
-
-    const mapped_target = if (mapping.target_template.len > 0)
-        try renderGraphArtifactTemplateAlloc(alloc, mapping.target_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)
-    else
-        null;
-    defer if (mapped_target) |value| alloc.free(value);
-    const target_doc = if (mapped_target) |value| blk: {
-        const trimmed = std.mem.trim(u8, value, &std.ascii.whitespace);
-        if (trimmed.len == 0) return;
-        break :blk trimmed;
-    } else blk: {
-        const target_value = item.object.get("target") orelse return;
-        break :blk jsonEndpointDocumentIdResolved(target_value, artifact_value) orelse return;
-    };
-    const target_table: ?[]const u8 = if (mapped_target != null) null else blk: {
-        const target_value = item.object.get("target") orelse break :blk null;
-        const entity = resolveGraphEndpointEntity(target_value, artifact_value) orelse break :blk null;
-        break :blk canonicalEntityTable(entity);
-    };
-    if (writes.items.len >= edge_limit) return error.ResourceLimitExceeded;
-
-    const weight = if (mapping.weight_template.len > 0) blk: {
-        const rendered = try renderGraphArtifactTemplateAlloc(alloc, mapping.weight_template, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        defer alloc.free(rendered);
-        const trimmed = std.mem.trim(u8, rendered, &std.ascii.whitespace);
-        break :blk if (trimmed.len > 0) try std.fmt.parseFloat(f64, trimmed) else 1.0;
-    } else jsonFloatField(item, "weight") orelse jsonFloatField(item, "confidence") orelse 1.0;
-    graph_mod.validateEdgeWeight(weight) catch return error.InvalidGraphEdges;
-    const metadata_json = if (mapping.metadata_template_json.len > 0) blk: {
-        const rendered = try renderGraphArtifactMetadataTemplateAlloc(alloc, mapping.metadata_template_json, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        // A custom metadata template must not silently strip the resolved
-        // endpoint's home-table tag: without it the node looks same-table to
-        // traversal identity, admission, routing, and hydration. An explicit
-        // target_table in the template wins.
-        const table = target_table orelse break :blk rendered;
-        defer alloc.free(rendered);
-        break :blk try prependTargetTableToMetadataJsonAlloc(alloc, table, rendered);
-    } else if (target_table) |table|
-        // The same cross-table endpoint tag mention edges carry: traversal
-        // and node admission route the resolved target to its home table.
-        try prependTargetTableToItemMetadataAlloc(alloc, table, item)
-    else
-        try std.json.Stringify.valueAlloc(alloc, item, .{});
-    var owned_metadata = metadata_json;
-    errdefer alloc.free(owned_metadata);
-    if (source_table) |table| {
-        const tagged = try graph_metadata_tables.withTableAlloc(alloc, "source_table", table, owned_metadata, mapping.metadata_template_json.len > 0);
-        alloc.free(owned_metadata);
-        owned_metadata = tagged;
-    }
-
-    const owned_index_name = try alloc.dupe(u8, index_name);
-    errdefer alloc.free(owned_index_name);
-    const owned_source = try alloc.dupe(u8, source_doc);
-    errdefer alloc.free(owned_source);
-    const owned_target = try alloc.dupe(u8, target_doc);
-    errdefer alloc.free(owned_target);
-    const owned_edge_type = try alloc.dupe(u8, edge_type);
-    errdefer alloc.free(owned_edge_type);
-    const owned_id = try alloc.dupe(u8, edge_id);
-    errdefer alloc.free(owned_id);
-    const owner_document = if (edge_id.len > 0 and !std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
-    errdefer if (owner_document.len > 0) alloc.free(owner_document);
-    const owned_owner = if (edge_id.len == 0 and !std.mem.eql(u8, source_doc, doc_key)) try alloc.dupe(u8, doc_key) else "";
-    errdefer if (owned_owner.len > 0) alloc.free(@constCast(owned_owner));
-    try writes.append(alloc, .{
-        .edge_id = owned_id,
-        .owner_document = owner_document,
-        .index_name = owned_index_name,
-        .source = owned_source,
-        .target = owned_target,
-        .edge_type = owned_edge_type,
-        .weight = weight,
-        .created_at = 0,
-        .updated_at = 0,
-        .metadata_json = owned_metadata,
-        .owner = owned_owner,
-    });
-}
-
-fn renderGraphArtifactTemplateAlloc(
-    alloc: Allocator,
-    template_source: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    var pos: usize = 0;
-    while (pos < template_source.len) {
-        const start = std.mem.indexOfPos(u8, template_source, pos, "{{") orelse {
-            try out.appendSlice(alloc, template_source[pos..]);
-            break;
-        };
-        try out.appendSlice(alloc, template_source[pos..start]);
-        const body_start = start + 2;
-        const end = std.mem.indexOfPos(u8, template_source, body_start, "}}") orelse {
-            try out.appendSlice(alloc, template_source[start..]);
-            break;
-        };
-        const expr = std.mem.trim(u8, template_source[body_start..end], &std.ascii.whitespace);
-        const rendered = try renderGraphArtifactExpressionAlloc(alloc, expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        defer alloc.free(rendered);
-        try out.appendSlice(alloc, rendered);
-        pos = end + 2;
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
-fn renderGraphArtifactExpressionAlloc(
-    alloc: Allocator,
-    expr: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    if (std.mem.startsWith(u8, expr, "default ")) {
-        var parts = std.mem.tokenizeAny(u8, expr["default ".len..], &std.ascii.whitespace);
-        const path = parts.next() orelse return try alloc.dupe(u8, "");
-        const fallback = parts.next() orelse "";
-        const value = graphTemplateValue(path, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-        const text = if (value) |found| try graphJsonValueTextAlloc(alloc, found) else try alloc.dupe(u8, fallback);
-        if (std.mem.trim(u8, text, &std.ascii.whitespace).len == 0 and fallback.len > 0) {
-            alloc.free(text);
-            return try alloc.dupe(u8, fallback);
-        }
-        return text;
-    }
-    if (graphTemplateValue(expr, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value)) |value| {
-        return try graphJsonValueTextAlloc(alloc, value);
-    }
-    return try alloc.dupe(u8, "");
-}
-
-fn graphTemplateValue(
-    path: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ?std.json.Value {
-    if (std.mem.eql(u8, path, "_doc.key")) return .{ .string = doc_key };
-    if (std.mem.startsWith(u8, path, "_doc.value.")) {
-        const doc = doc_value orelse return null;
-        return selectJsonDotPath(doc, path["_doc.value.".len..]);
-    }
-    if (std.mem.eql(u8, path, "_artifact.name")) return .{ .string = artifact_name };
-    if (std.mem.eql(u8, path, "_artifact.content_type")) return .{ .string = artifact_content_type };
-    if (std.mem.eql(u8, path, "_artifact.value")) return artifact_value;
-    if (std.mem.startsWith(u8, path, "_artifact.value.")) return selectJsonDotPath(artifact_value, path["_artifact.value.".len..]);
-    if (std.mem.eql(u8, path, "_item_index")) return .{ .integer = @intCast(item_index) };
-    if (std.mem.eql(u8, path, "_item")) return item;
-    if (std.mem.startsWith(u8, path, "_item.")) return selectGraphItemDotPath(item, path["_item.".len..], artifact_value);
-    return null;
-}
-
-fn selectGraphItemDotPath(item: std.json.Value, path: []const u8, artifact_value: std.json.Value) ?std.json.Value {
-    if (std.mem.eql(u8, path, "source") or std.mem.startsWith(u8, path, "source.")) {
-        if (item != .object) return null;
-        const endpoint = item.object.get("source") orelse return null;
-        const selected = resolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
-        if (std.mem.eql(u8, path, "source")) return selected;
-        return selectJsonDotPath(selected, path["source.".len..]);
-    }
-    if (std.mem.eql(u8, path, "target") or std.mem.startsWith(u8, path, "target.")) {
-        if (item != .object) return null;
-        const endpoint = item.object.get("target") orelse return null;
-        const selected = resolveGraphEndpointEntity(endpoint, artifact_value) orelse endpoint;
-        if (std.mem.eql(u8, path, "target")) return selected;
-        return selectJsonDotPath(selected, path["target.".len..]);
-    }
-    return selectJsonDotPath(item, path);
-}
-
-fn selectJsonDotPath(root: std.json.Value, path: []const u8) ?std.json.Value {
-    var current = root;
-    var parts = std.mem.splitScalar(u8, path, '.');
-    while (parts.next()) |part| {
-        if (part.len == 0) return null;
-        if (current != .object) return null;
-        current = current.object.get(part) orelse return null;
-    }
-    return current;
-}
-
-fn graphJsonValueTextAlloc(alloc: Allocator, value: std.json.Value) ![]u8 {
-    return switch (value) {
-        .null => try alloc.dupe(u8, ""),
-        .bool => |b| try alloc.dupe(u8, if (b) "true" else "false"),
-        .integer => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
-        .float => |n| try std.fmt.allocPrint(alloc, "{d}", .{n}),
-        .number_string => |s| try alloc.dupe(u8, s),
-        .string => |s| try alloc.dupe(u8, s),
-        .array, .object => try std.json.Stringify.valueAlloc(alloc, value, .{}),
-    };
-}
-
-fn renderGraphArtifactMetadataTemplateAlloc(
-    alloc: Allocator,
-    metadata_template_json: []const u8,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) ![]u8 {
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, metadata_template_json, .{ .parse_numbers = false });
-    defer parsed.deinit();
-    var rendered = try renderGraphArtifactMetadataValueAlloc(alloc, parsed.value, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value);
-    defer freeGraphRenderedJsonValue(alloc, &rendered);
-    return try std.json.Stringify.valueAlloc(alloc, rendered, .{});
-}
-
-fn renderGraphArtifactMetadataValueAlloc(
-    alloc: Allocator,
-    value: std.json.Value,
-    doc_key: []const u8,
-    doc_value: ?std.json.Value,
-    item: std.json.Value,
-    item_index: usize,
-    artifact_name: []const u8,
-    artifact_content_type: []const u8,
-    artifact_value: std.json.Value,
-) !std.json.Value {
-    return switch (value) {
-        .string => |text| .{ .string = try renderGraphArtifactTemplateAlloc(alloc, text, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value) },
-        .array => |array| blk: {
-            var out = std.json.Array.init(alloc);
-            errdefer out.deinit();
-            for (array.items) |child| try out.append(try renderGraphArtifactMetadataValueAlloc(alloc, child, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
-            break :blk .{ .array = out };
-        },
-        .object => |object| blk: {
-            var out = std.json.ObjectMap.empty;
-            errdefer out.deinit(alloc);
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                try out.put(alloc, try alloc.dupe(u8, entry.key_ptr.*), try renderGraphArtifactMetadataValueAlloc(alloc, entry.value_ptr.*, doc_key, doc_value, item, item_index, artifact_name, artifact_content_type, artifact_value));
-            }
-            break :blk .{ .object = out };
-        },
-        else => value,
-    };
-}
-
-fn freeGraphRenderedJsonValue(alloc: Allocator, value: *std.json.Value) void {
-    switch (value.*) {
-        .string => |text| alloc.free(@constCast(text)),
-        .array => |*array| {
-            for (array.items) |*item| freeGraphRenderedJsonValue(alloc, item);
-            array.deinit();
-        },
-        .object => |*object| {
-            var it = object.iterator();
-            while (it.next()) |entry| {
-                alloc.free(@constCast(entry.key_ptr.*));
-                freeGraphRenderedJsonValue(alloc, entry.value_ptr);
-            }
-            object.deinit(alloc);
-        },
-        else => {},
-    }
-    value.* = .null;
-}
-
-fn jsonEndpointDocumentId(value: std.json.Value) ?[]const u8 {
-    return switch (value) {
-        .string => value.string,
-        .object => jsonStringField(value, "document_id") orelse jsonStringField(value, "doc_key") orelse jsonStringField(value, "key") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse if (value.object.get("doc_ref")) |doc_ref| jsonEndpointDocumentId(doc_ref) else null,
-        else => null,
-    };
-}
+const jsonEndpointDocumentId = graph_restore_materialization.jsonEndpointDocumentId;
 
 /// The asset artifact key of the extraction artifact whose resolver owns the
 /// given resolution artifact key, or null when no resolver owns it (the
@@ -72820,154 +71725,20 @@ fn injectGraphEndpointResolutions(parsed: *std.json.Parsed(std.json.Value), reso
     try parsed.value.object.put(a, "_entities", res);
 }
 
-fn jsonEndpointDocumentIdResolved(value: std.json.Value, artifact_value: std.json.Value) ?[]const u8 {
-    // A relation endpoint referencing an extraction entity (a plain string
-    // like "e0" matching the artifact's entities, or {entity_id}/
-    // {entity_index}) renders the entity's canonical identity — fields on
-    // the entity entry itself or an injected "_entities" resolution map (see
-    // injectGraphEndpointResolutions) — or nothing at all: before resolution
-    // there is no durable node for a local mention, and rendering the local
-    // id would strand an orphan edge that no later replay retires. The
-    // resolution-artifact replay re-renders the artifact once canonical keys
-    // exist. Endpoints matching no extraction entity keep the legacy
-    // string-passthrough external-node behavior.
-    if (resolveGraphEndpointEntity(value, artifact_value)) |entity| {
-        return canonicalEntityDocumentId(entity);
-    }
-    return jsonEndpointDocumentId(value);
-}
-
 /// Canonical document identity of an extraction entity: unlike
 /// jsonEndpointDocumentId this never falls back to the entity's local
 /// id/local_id, which identifies a mention within one artifact, not a node.
-fn canonicalEntityDocumentId(entity: std.json.Value) ?[]const u8 {
-    if (entity != .object) return null;
-    if (jsonStringField(entity, "document_id") orelse jsonStringField(entity, "doc_key") orelse jsonStringField(entity, "key")) |id| return id;
-    if (entity.object.get("doc_ref")) |doc_ref| return jsonEndpointDocumentId(doc_ref);
-    return null;
-}
-
 /// Home table of a canonically resolved extraction entity (from the injected
 /// resolution map or a doc_ref), for the `target_table` cross-table endpoint
 /// tag traversal and node admission honor (see graph/traversal.zig
 /// edgeTargetTable and the mention-edge materializer precedent).
-fn canonicalEntityTable(entity: std.json.Value) ?[]const u8 {
-    if (entity != .object) return null;
-    if (jsonStringField(entity, "table")) |table| return table;
-    if (entity.object.get("doc_ref")) |doc_ref| return jsonStringField(doc_ref, "table");
-    return null;
-}
-
 /// Prepend a cross-table endpoint tag to an already-rendered metadata JSON
 /// object, preserving an explicit tag the template rendered itself.
 /// Non-object metadata passes through untouched (the tag has nowhere
 /// coherent to live, so retain its original representation).
-fn prependTableTagToMetadataJsonAlloc(alloc: Allocator, comptime tag: []const u8, table: []const u8, metadata_json: []const u8) ![]u8 {
-    return graph_metadata_tables.withTableAlloc(alloc, tag, table, metadata_json, true);
-}
+const findGraphArtifactEntity = graph_restore_materialization.findGraphArtifactEntity;
 
-fn prependTargetTableToMetadataJsonAlloc(alloc: Allocator, target_table: []const u8, metadata_json: []const u8) ![]u8 {
-    return try prependTableTagToMetadataJsonAlloc(alloc, "target_table", target_table, metadata_json);
-}
-
-fn prependTargetTableToItemMetadataAlloc(alloc: Allocator, target_table: []const u8, item: std.json.Value) ![]u8 {
-    const item_json = try std.json.Stringify.valueAlloc(alloc, item, .{});
-    defer alloc.free(item_json);
-    return graph_metadata_tables.withTableAlloc(alloc, "target_table", target_table, item_json, false);
-}
-
-fn resolveGraphEndpointEntity(value: std.json.Value, artifact_value: std.json.Value) ?std.json.Value {
-    switch (value) {
-        .string => return findGraphArtifactEntity(artifact_value, value.string),
-        .object => {
-            if (jsonIntegerField(value, "entity_index")) |entity_index| return graphArtifactEntityAtIndex(artifact_value, entity_index);
-            const entity_id = jsonStringField(value, "entity_id") orelse jsonStringField(value, "id") orelse jsonStringField(value, "local_id") orelse return null;
-            return findGraphArtifactEntity(artifact_value, entity_id);
-        },
-        else => return null,
-    }
-}
-
-fn findGraphArtifactEntity(artifact_value: std.json.Value, entity_id: []const u8) ?std.json.Value {
-    if (artifact_value != .object) return null;
-    // The injected "_entities" resolution map wins, but a mention it does not
-    // cover (partial resolution) still matches the artifact's own entities so
-    // the canonical-only endpoint rule can drop it instead of leaking its
-    // local id as a node.
-    if (artifact_value.object.get("_entities")) |resolved| {
-        if (findGraphArtifactEntityIn(resolved, entity_id)) |entity| return entity;
-    }
-    const entities = artifact_value.object.get("entities") orelse return null;
-    return findGraphArtifactEntityIn(entities, entity_id);
-}
-
-fn findGraphArtifactEntityIn(entities: std.json.Value, entity_id: []const u8) ?std.json.Value {
-    return switch (entities) {
-        .array => |array| blk: {
-            for (array.items) |entity| {
-                const id = jsonStringField(entity, "id") orelse jsonStringField(entity, "local_id") orelse continue;
-                if (std.mem.eql(u8, id, entity_id)) break :blk entity;
-            }
-            break :blk null;
-        },
-        .object => entities.object.get(entity_id),
-        else => null,
-    };
-}
-
-fn graphArtifactEntityAtIndex(artifact_value: std.json.Value, entity_index: i64) ?std.json.Value {
-    if (entity_index < 0 or artifact_value != .object) return null;
-    const index: usize = @intCast(entity_index);
-    const raw_entity: ?std.json.Value = blk: {
-        const entities = artifact_value.object.get("entities") orelse break :blk null;
-        if (entities != .array or index >= entities.array.items.len) break :blk null;
-        break :blk entities.array.items[index];
-    };
-    if (artifact_value.object.get("_entities")) |resolved| {
-        // The injected resolution map is keyed by mention local id. An
-        // id-less extraction entity (GLiNER2.5's positional payloads) was
-        // resolved under its decimal array position — the same identity
-        // lib/resolver's parseExtractionEntities assigns it.
-        var buf: [20]u8 = undefined;
-        const positional_id = std.fmt.bufPrint(&buf, "{d}", .{index}) catch unreachable;
-        const local_id = if (raw_entity) |entity|
-            jsonStringField(entity, "id") orelse jsonStringField(entity, "local_id") orelse positional_id
-        else
-            positional_id;
-        if (findGraphArtifactEntityIn(resolved, local_id)) |entity| return entity;
-        if (resolved == .array and index < resolved.array.items.len) return resolved.array.items[index];
-    }
-    // The raw positional entity carries no canonical identity; the
-    // canonical-only endpoint rule downstream drops it until resolution lands.
-    return raw_entity;
-}
-
-fn jsonStringField(value: std.json.Value, field: []const u8) ?[]const u8 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return if (found == .string) found.string else null;
-}
-
-fn jsonIntegerField(value: std.json.Value, field: []const u8) ?i64 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return switch (found) {
-        .integer => found.integer,
-        .number_string => |text| std.fmt.parseInt(i64, text, 10) catch null,
-        else => null,
-    };
-}
-
-fn jsonFloatField(value: std.json.Value, field: []const u8) ?f64 {
-    if (value != .object) return null;
-    const found = value.object.get(field) orelse return null;
-    return switch (found) {
-        .float => found.float,
-        .integer => @floatFromInt(found.integer),
-        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
-        else => null,
-    };
-}
+const jsonStringField = graph_restore_materialization.jsonStringField;
 
 const OwnedGraphMutations = struct {
     alloc: Allocator,
@@ -106031,7 +104802,7 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     var result = try db.extractEnrichments(alloc, &.{
         .{
             .key = "doc:a",
-            .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"weight\":2.0}]}}}",
+            .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"edge_id\":\"relationship-1\",\"metadata\":{\"source\":\"fixture\"},\"weight\":2.0}]}}}",
         },
     });
     defer result.deinit(alloc);
@@ -106054,6 +104825,24 @@ test "db extractEnrichments exposes cleaned writes and special fields" {
     try std.testing.expectEqual(@as(usize, 1), result.graph_writes.len);
     try std.testing.expectEqualStrings("graph_v1", result.graph_writes[0].index_name);
     try std.testing.expectEqualStrings("doc:b", result.graph_writes[0].target);
+    try std.testing.expectEqualStrings("relationship-1", result.graph_writes[0].edge_id);
+
+    const Failure = struct {
+        fn run(failure_alloc: Allocator, target: *DB) !void {
+            var extracted = try target.extractEnrichments(failure_alloc, &.{
+                .{
+                    .key = "doc:a",
+                    .value = "{\"title\":\"alpha\",\"_embeddings\":{\"dense_idx\":[1,2,3],\"sparse_idx\":{\"indices\":[1,5],\"values\":[0.5,0.75]}},\"_edges\":{\"graph_v1\":{\"cites\":[{\"target\":\"doc:b\",\"edge_id\":\"relationship-1\",\"metadata\":{\"source\":\"fixture\"},\"weight\":2.0}]}}}",
+                },
+            });
+            defer extracted.deinit(failure_alloc);
+            try std.testing.expectEqual(@as(usize, 1), extracted.graph_writes.len);
+            var packed_result = try target.extractEnrichments(failure_alloc, &.{.{ .key = "packed", .value = "{\"title\":\"packed\",\"_embeddings\":{\"dense_idx\":\"AACAPw==\"}}" }});
+            defer packed_result.deinit(failure_alloc);
+            try std.testing.expectEqual(@as(f32, 1), packed_result.dense_embeddings[0].vector[0]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, Failure.run, .{&db});
 }
 
 test "db extractEnrichments rejects unsupported legacy summaries field" {
@@ -154541,8 +153330,6 @@ fn jsonOutputAllocationBenchmark(case_name: []const u8, count: usize, batch: usi
         if (sample != 0) std.debug.print("document_lookup_bench {{\"case\":\"{s}\",\"documents\":{d},\"batch\":{d},\"measurement\":\"{s}\",\"elapsed_ns\":{d},\"allocations\":{d},\"resize_calls\":{d},\"remap_calls\":{d},\"moving_remaps\":{d},\"moved_bytes\":{d},\"allocated_bytes\":{d},\"peak_live_bytes\":{d},\"checksum\":{d}}}\n", .{ case_name, count, batch, if (measurement == 0) "counted" else "timing", elapsed, counter.calls, counter.resize_calls, counter.remap_calls, counter.moving_remaps, counter.moved_bytes, counter.bytes, counter.peak, checksum });
     };
 }
-
-const documentCollectorFailureSweep = document_collectors.documentCollectorFailureSweep;
 
 fn textCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, manager: *index_manager_mod.IndexManager, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
     var result = try collectTextDocumentWritesForIndex(alloc, store, manager, documents, "text", false, .{ .start = "", .end = "" }, .{ .prefer_inline_when_store_tip_matches_sequence = if (inline_values) 0 else null });

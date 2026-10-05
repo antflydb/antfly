@@ -228,3 +228,95 @@ test "result collectors adopt enrichment arrays atomically across every allocati
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
 }
+
+/// Owns every partially constructed extraction and every transferred array.
+pub const Extraction = struct {
+    alloc: Allocator,
+    cleaned: std.ArrayListUnmanaged(types.BatchWrite) = .empty,
+    dense: std.ArrayListUnmanaged(types.EnrichmentDenseEmbeddingWrite) = .empty,
+    sparse: std.ArrayListUnmanaged(types.EnrichmentSparseEmbeddingWrite) = .empty,
+    graph: std.ArrayListUnmanaged(types.GraphEdgeWrite) = .empty,
+    pub fn deinit(self: *Extraction) void {
+        for (self.cleaned.items) |write| {
+            self.alloc.free(@constCast(write.key));
+            self.alloc.free(@constCast(write.value));
+        }
+        self.cleaned.deinit(self.alloc);
+        for (self.dense.items) |*write| write.deinit(self.alloc);
+        self.dense.deinit(self.alloc);
+        for (self.sparse.items) |*write| write.deinit(self.alloc);
+        self.sparse.deinit(self.alloc);
+        for (self.graph.items) |*write| write.deinit(self.alloc);
+        self.graph.deinit(self.alloc);
+    }
+    pub fn append(self: *Extraction, key: []const u8, extracted: anytype) !void {
+        const alloc = self.alloc;
+        if (extracted.cleaned_value) |value| try appendArtifact(alloc, &self.cleaned, key, value);
+        for (extracted.dense_embeddings) |embedding| {
+            try self.dense.ensureUnusedCapacity(alloc, 1);
+            var identity = if (embedding.artifact_key) |artifact_key| try artifact_ids.resolvePublicArtifactIdentityAlloc(alloc, artifact_key) else null;
+            defer if (identity) |*owned| owned.deinit(alloc);
+            const name = try alloc.dupe(u8, embedding.index_name);
+            errdefer alloc.free(name);
+            const doc = try alloc.dupe(u8, embedding.doc_key);
+            errdefer alloc.free(doc);
+            const id = if (identity) |owned| try alloc.dupe(u8, owned.id) else null;
+            errdefer if (id) |owned| alloc.free(owned);
+            var ref = if (identity) |owned| try owned.artifact_ref.?.clone(alloc) else null;
+            errdefer if (ref) |*owned| owned.deinit(alloc);
+            const vector = try alloc.dupe(f32, embedding.vector);
+            self.dense.appendAssumeCapacity(.{ .index_name = name, .doc_key = doc, .artifact_id = id, .artifact_ref = ref, .vector = vector });
+        }
+        for (extracted.sparse_embeddings) |embedding| {
+            try self.sparse.ensureUnusedCapacity(alloc, 1);
+            const name = try alloc.dupe(u8, embedding.index_name);
+            errdefer alloc.free(name);
+            const doc = try alloc.dupe(u8, embedding.doc_key);
+            errdefer alloc.free(doc);
+            const indices = try alloc.dupe(u32, embedding.indices);
+            errdefer alloc.free(indices);
+            const values = try alloc.dupe(f32, embedding.values);
+            self.sparse.appendAssumeCapacity(.{ .index_name = name, .doc_key = doc, .indices = indices, .values = values });
+        }
+        for (extracted.graph_writes) |write| {
+            try self.graph.ensureUnusedCapacity(alloc, 1);
+            self.graph.appendAssumeCapacity(try write.cloneAlloc(alloc));
+        }
+    }
+    pub fn finish(self: *Extraction) !types.ExtractEnrichmentsResult {
+        var result: types.ExtractEnrichmentsResult = .{};
+        errdefer result.deinit(self.alloc);
+        result.cleaned_writes = try self.cleaned.toOwnedSlice(self.alloc);
+        result.dense_embeddings = try self.dense.toOwnedSlice(self.alloc);
+        result.sparse_embeddings = try self.sparse.toOwnedSlice(self.alloc);
+        result.graph_writes = try self.graph.toOwnedSlice(self.alloc);
+        return result;
+    }
+};
+
+test "result collectors release complete graph identity and extraction transfers on OOM" {
+    const F = struct {
+        fn run(alloc: Allocator) !void {
+            var collector: Extraction = .{ .alloc = alloc };
+            defer collector.deinit();
+            const mapper = @import("document_mapper.zig");
+            var extracted: mapper.ExtractedWrite = .{ .cleaned_value = null, .graph_writes = &.{}, .mentioned_graph_indexes = &.{}, .dense_embeddings = &.{}, .sparse_embeddings = &.{} };
+            const artifact_key = try @import("../internal_keys.zig").artifactNamedPrefixAlloc(alloc, "doc", "asset", "embedding");
+            defer alloc.free(artifact_key);
+            const dense = [_]mapper.DenseEmbeddingWrite{.{ .index_name = @constCast("dense"), .doc_key = @constCast("doc"), .artifact_key = artifact_key, .vector = @constCast(&[_]f32{ 1, 2 }) }};
+            const sparse = [_]mapper.SparseEmbeddingWrite{.{ .index_name = @constCast("sparse"), .doc_key = @constCast("doc"), .indices = @constCast(&[_]u32{1}), .values = @constCast(&[_]f32{2}) }};
+            const graph = [_]types.GraphEdgeWrite{.{ .index_name = "graph", .source = "a", .target = "b", .edge_type = "rel", .edge_id = "identity", .owner_document = "producer", .owner = "legacy", .metadata_json = "{}" }};
+            extracted.cleaned_value = @constCast("{}");
+            extracted.dense_embeddings = @constCast(&dense);
+            extracted.sparse_embeddings = @constCast(&sparse);
+            extracted.graph_writes = @constCast(&graph);
+            for (0..3) |_| try collector.append("doc", extracted);
+            var result = try collector.finish();
+            defer result.deinit(alloc);
+            try std.testing.expectEqualStrings("identity", result.graph_writes[0].edge_id);
+            try std.testing.expectEqualStrings("producer", result.graph_writes[0].owner_document);
+            try std.testing.expectEqualStrings("embedding", result.dense_embeddings[0].artifact_ref.?.name);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, F.run, .{});
+}

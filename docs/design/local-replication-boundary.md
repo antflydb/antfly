@@ -409,3 +409,37 @@ chunk-cache adoption and public artifact conversion each unwind their own
 partial allocations; only complete values transfer into the result collector.
 Allocation-failure sweeps cover both these owners and the real
 `DB.computeEnrichments` chunk/dense-provider path.
+
+`storage/db/result_collectors.zig` also owns public extraction arrays. Mapper
+outputs are cloned only after capacity is reserved, and final transfer adopts
+one array at a time into an unwindable result. Graph mutations use their
+canonical destructor, including edge IDs and producing-document identities.
+The mapper applies the same ownership rules before handing outputs to DB.
+
+`storage/db/materialized_sources.zig` collects chunk inputs over a borrowed
+store and pending-key indexes. Its deduplication map borrows keys owned by the
+source list. Both list and map capacity are reserved before adoption; pending
+writes and deletions suppress older stored rows. Invalid JSON remains an absent
+source, while allocation failure propagates instead of silently dropping it.
+
+`bulk_ingest_session.IdentityScratch` owns trusted identity proof state and
+seen document keys for both resident DB and borrowed mutation execution. Reset
+releases keys and proof state; failed batch adoption invalidates the proof.
+DB retains namespace eligibility, apply fencing and durable visibility summary
+publication. Direct bulk writes and legacy status fields retain their behavior.
+
+`storage/db/graph_restore_materialization.zig` owns parsed artifact/document
+caches and deterministic relation-page planning, including nested metadata
+rendering. A fully built replacement cache is adopted before the prior one is
+released. DB retains source acquisition, graph generation validation, contender
+reconciliation and durable segment/manifest/cursor publication.
+
+`storage/db/status_projection.zig` owns status clones, destruction and persisted
+snapshot codecs. The existing v1/v2 formats and public fields are unchanged.
+DB retains locks, live snapshot acquisition, bounded runtime sampling and store
+reads/writes; retained telemetry cannot manufacture readiness authority.
+
+Allocation-failure regressions cover the real public extraction path, complete
+graph identities, pending and stored chunk sources, bulk proof scratch, graph
+page/cache ownership and status clones. Source and module boundary checks cover
+the extracted owners before their later physical package move.

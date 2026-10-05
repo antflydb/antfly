@@ -90,6 +90,13 @@ class EmbeddedBoundaryTest(unittest.TestCase):
                 "storage/db/query_visibility.zig",
                 "storage/db/source_pin_cleanup_owner.zig",
                 "storage/db/applied_sequence_coalescer.zig",
+                "storage/db/document_collectors.zig",
+                "storage/db/result_collectors.zig",
+                "storage/db/materialized_sources.zig",
+                "storage/db/graph_restore_materialization.zig",
+                "storage/db/status_projection.zig",
+                "storage/db/managed_admission_owner.zig",
+                "storage/db/publication_recovery_owner.zig",
             ):
                 with (
                     self.subTest(token=token, path=path),

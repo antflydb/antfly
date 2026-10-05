@@ -550,7 +550,7 @@ pub fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), valu
     writer.writer.print("{f}", .{std.json.fmt(value, .{})}) catch return error.OutOfMemory;
 }
 
-pub fn documentCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
+fn documentCollectorFailureSweep(alloc: Allocator, store: *docstore_mod.DocStore, documents: []const derived_types.DerivedDocument, inline_values: bool) !void {
     var writes = try collectDocumentWritesProfiled(alloc, store, null, documents, .{ .start = "", .end = "" }, .{ .prefer_available_inline_values = inline_values }, null);
     defer writes.deinit();
     try std.testing.expectEqual(documents.len, writes.items.len);

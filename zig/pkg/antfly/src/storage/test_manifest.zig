@@ -23,6 +23,10 @@
 comptime {
     _ = @import("db/managed_admission_owner.zig");
     _ = @import("db/result_collectors.zig");
+    _ = @import("db/materialized_sources.zig");
+    _ = @import("db/graph_restore_materialization.zig");
+    _ = @import("db/status_projection.zig");
+
     _ = @import("db/document_collectors.zig");
     _ = @import("db/publication_recovery_owner.zig");
 
