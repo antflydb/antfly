@@ -231,7 +231,10 @@ order and simple COUNT retain their native fast paths.
 Lake execution requests up to 1,024 typed rows independently of delivery page
 size. Projected batches remain pending across bounded delivery pages. Semantic
 vector failures recover the successful row prefix and defer the terminal error
-until that prefix drains; failed vector workspaces are released before recovery. Joins
+until that prefix drains; failed vector workspaces are released before recovery.
+The pgwire authorization wrapper preserves native columns, count metadata,
+dynamic filters and scan splitting. Every operation, including split child
+reads, revalidates read authority before touching its provider. Joins
 batch key expression evaluation and probe admission, while preserving input
 order and delaying later-lane errors until consumed. Grouped reductions resolve
 group IDs once per batch and update state by aggregate column; global COUNT,
