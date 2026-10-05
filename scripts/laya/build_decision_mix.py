@@ -15,7 +15,7 @@
 
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pyarrow>=15"]
+# dependencies = ["pyarrow>=15", "tokenizers>=0.19"]
 # ///
 """Build a large typed-decision training mix from permissively licensed data.
 
@@ -560,6 +560,31 @@ BUILDERS: dict[str, tuple[Callable[[Mix, int], None], int]] = {
 }
 
 
+def fits(
+    records: list[dict[str, Any]], tokenizer_path: Path, max_len: int
+) -> list[dict[str, Any]]:
+    """Records whose unpacked Laya sequence surely fits `max_len`: state,
+    question and every option run (`[MASK]` plus at most 48 tokens), plus
+    the four special tokens and a small margin for the type prefix."""
+    from tokenizers import Tokenizer
+
+    tok = Tokenizer.from_file(str(tokenizer_path))
+    count = lambda text: len(tok.encode(text, add_special_tokens=False).ids)
+    state_tokens: dict[str, int] = {}
+    kept = []
+    for record in records:
+        text = record["text"]
+        if text not in state_tokens:
+            state_tokens[text] = count(text)
+        options = sum(
+            1 + min(48, count(f" {label}: {desc}" if desc else f" {label}"))
+            for label, desc in zip(record["labels"], record["descriptions"])
+        )
+        if state_tokens[text] + count(record["instruction"]) + options + 12 <= max_len:
+            kept.append(record)
+    return kept
+
+
 def exclusions(paths: list[Path]) -> set[str]:
     texts = set()
     for path in paths:
@@ -596,6 +621,12 @@ def main() -> None:
     parser.add_argument("--smoothing", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=20261004)
     parser.add_argument("--print-pins", action="store_true")
+    parser.add_argument(
+        "--tokenizer",
+        type=Path,
+        help="student tokenizer.json; drops records that would not fit --max-len",
+    )
+    parser.add_argument("--max-len", type=int, default=512)
     args = parser.parse_args()
     if args.print_pins:
         for name in SOURCES:
@@ -610,6 +641,12 @@ def main() -> None:
         build, cap = BUILDERS[name]
         build(mix, int(cap * args.scale))
         print(f"{name}: {mix.counts[name]} decisions", file=sys.stderr)
+    dropped = 0
+    if args.tokenizer:
+        kept = fits(mix.records, args.tokenizer, args.max_len)
+        dropped = len(mix.records) - len(kept)
+        mix.records = kept
+        mix.counts = Counter(r["group_id"].split("/", 1)[0] for r in kept)
     mix.rng.shuffle(mix.records)
     with args.output.open("x") as out:
         for record in mix.records:
@@ -624,6 +661,8 @@ def main() -> None:
         "smoothing": args.smoothing,
         "sources": {name: url for name, (url, _) in SOURCES.items()},
         "excluded_texts": len(mix.exclude),
+        "dropped_overlong": dropped,
+        "max_len": args.max_len if args.tokenizer else None,
     }
     args.output.with_suffix(".json").write_text(json.dumps(meta, indent=2) + "\n")
     print(json.dumps(meta, indent=2), file=sys.stderr)
