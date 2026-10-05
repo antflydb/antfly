@@ -49,6 +49,9 @@ If you run `cargo pgrx test` directly, set `RUSTFLAGS` first.
 ## Quick Start
 
 ```bash
+# From the repository root
+cd rs/crates/postgres
+
 # Build and install
 cargo pgrx install
 
@@ -90,7 +93,7 @@ The `@@@` operator delegates search to Antfly. On `CREATE INDEX`, the table is a
 
 ### Query Builders
 
-antfly_postgres provides ParadeDB-style query builder functions in the `antfly_postgres` schema. These return JSON strings that the `@@@` operator sends as structured queries to Antfly.
+`antfly-postgres` provides ParadeDB-style query builder functions in the `antfly_postgres` schema. These return JSON strings that the `@@@` operator sends as structured queries to Antfly.
 
 **Full-text search:**
 
@@ -181,7 +184,7 @@ rs/
     ├── sdk/            # Generated async SDK (types shared with antfly_postgres)
     │   ├── build.rs    # Progenitor codegen + OpenAPI preprocessing
     │   └── src/lib.rs
-    └── postgres/           # This extension
+    └── postgres/       # antfly-postgres extension
 ```
 
 ## Project Structure

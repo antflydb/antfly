@@ -23,8 +23,8 @@ ts/
 py/packages/sdk/     Python SDK
 py/packages/embedded/  Python embedded binding (antfly-embedded)
 rs/
-  crates/postgres/   PostgreSQL extension (Rust/pgrx)
-  crates/sdk/        Generated Rust SDK (shared types with antfly_postgres)
+  crates/postgres/      PostgreSQL extension (antfly-postgres, Rust/pgrx)
+  crates/sdk/           Generated Rust SDK (shared types with antfly-postgres)
   crates/embedded/      Rust embedded binding (antfly-embedded)
   crates/embedded-sys/  Raw libantfly C ABI declarations (antfly-embedded-sys)
 configs/             Example configuration files

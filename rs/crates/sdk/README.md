@@ -53,6 +53,6 @@ completed result or a pending commit decode into `MutationOutcome<T>`
 
 ## Used by
 
-[`rs/crates/postgres`](../postgres) depends on `antfly-sdk` for its generated types
+[`antfly-postgres`](../postgres) depends on `antfly-sdk` for its generated types
 (e.g. `QueryResponses`, `QueryHit`) while keeping its own blocking HTTP
 client, since Postgres extensions cannot run an async runtime.

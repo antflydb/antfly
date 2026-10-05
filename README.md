@@ -108,13 +108,15 @@ Prefer not to run it yourself? [Antfly Cloud](https://antfly.io/cloud) is the ho
 | Python | `antfly-sdk` (import `antfly`) | [`py/packages/sdk`](py/packages/sdk) |
 | Rust | `antfly-sdk` | [`rs/crates/sdk`](rs/crates/sdk) |
 | React | `@antfly/components` | [`ts/packages/components`](ts/packages/components) |
-| PostgreSQL | `antfly_postgres` extension | [`rs/crates/postgres`](rs/crates/postgres) |
+| PostgreSQL | `antfly-postgres` (SQL: `antfly_postgres`) | [`rs/crates/postgres`](rs/crates/postgres) |
 
 ### antfly-postgres — PostgreSQL Extension
 
-[antfly-postgres](rs/crates/postgres) brings Antfly search into Postgres. Create an index, use the `@@@` operator, and you're done:
+[antfly-postgres](rs/crates/postgres) brings Antfly search into Postgres. The Cargo package is `antfly-postgres`; the PostgreSQL extension and query-builder schema are `antfly_postgres`. Enable the extension, create an index, and use the `@@@` operator:
 
 ```sql
+CREATE EXTENSION antfly_postgres;
+
 CREATE INDEX idx_content ON docs USING antfly (content)
   WITH (url = 'http://localhost:8080/db/v1/', collection = 'my_docs');
 

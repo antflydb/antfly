@@ -1,8 +1,8 @@
-# antfly_postgres Custom Index Access Method
+# antfly-postgres Custom Index Access Method
 
 ## Context
 
-antfly_postgres already has SQL functions (`antfly_search()`) and triggers (`antfly_sync_trigger()`) for integrating Antfly with PostgreSQL. The index AM is the third piece: it makes the PostgreSQL planner aware of Antfly so queries like `SELECT * FROM docs WHERE content @@@ 'fix my computer'` use the index automatically, without explicit `antfly_search()` calls.
+`antfly-postgres` already has SQL functions (`antfly_search()`) and triggers (`antfly_sync_trigger()`) for integrating Antfly with PostgreSQL. The index AM is the third piece: it makes the PostgreSQL planner aware of Antfly so queries like `SELECT * FROM docs WHERE content @@@ 'fix my computer'` use the index automatically, without explicit `antfly_search()` calls.
 
 This is a **remote index** (like ZomboDB → Elasticsearch). No index data is stored locally in PostgreSQL pages — all indexing and search is delegated to a remote Antfly server via HTTP.
 
