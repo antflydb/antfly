@@ -569,7 +569,10 @@ def fits(
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(str(tokenizer_path))
-    count = lambda text: len(tok.encode(text, add_special_tokens=False).ids)
+
+    def count(text: str) -> int:
+        return len(tok.encode(text, add_special_tokens=False).ids)
+
     state_tokens: dict[str, int] = {}
     kept = []
     for record in records:
