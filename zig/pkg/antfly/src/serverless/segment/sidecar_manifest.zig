@@ -21,8 +21,8 @@
 
 const std = @import("std");
 const artifact_ref = @import("../manifest/artifact_ref.zig");
-const base_source = @import("../manifest/base_source.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 const source_binding = @import("source_binding.zig");
 
 pub const DeclaredArtifact = struct {

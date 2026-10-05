@@ -16,11 +16,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const catalog_binding = @import("../external_source/catalog_binding.zig");
-const external_source = @import("../external_source/types.zig");
+const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
+const external_source = @import("antfly_local_sources").serverless_external_source_types;
 const manifest_compatibility = @import("../manifest/compatibility.zig");
 const manifest_artifact = @import("../manifest/artifact_ref.zig");
-const manifest_base_source = @import("../manifest/base_source.zig");
+const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
 pub const PublishedArtifact = struct {
     artifact_id: []const u8,

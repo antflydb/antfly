@@ -38,6 +38,13 @@ Backup artifact decoding and local restore staging are local operations;
 coordinated snapshot publication and cluster restore remain server operations.
 Table-drop cleanup fences are shared local contracts. Metadata protocol activation,
 membership barriers, and reallocation requests remain server coordination.
+Native SQL owns its pull stream, typed execution batches, parallel scheduling,
+spill operators, and result cursors in `src/local/sql`. Row-source value/identity
+contracts and external-table schema bindings are shared local contracts because
+the SQL catalog and persisted DB schema use them. Lake discovery, credential
+resolution, Parquet/Iceberg serving, HTTP integration, and concrete row-source
+adapters remain server-owned. The SQL refinement benchmark follows the local
+execution owner; Lake benchmarks follow server serving.
 Existing shared contracts and generated OpenAPI ownership remain in their existing
 embedded/shared-library/server-API packages. Authored YAML remains in `specs/openapi`.
 

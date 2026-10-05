@@ -21,10 +21,10 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const algebraic_segment = @import("../algebraic_segment/mod.zig");
 const aggregate_math = algebraic_segment.aggregate_math;
-const base_source = @import("../manifest/base_source.zig");
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const source_binding = @import("../segment/source_binding.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
 
 pub const GroupByRequest = struct {
@@ -167,7 +167,7 @@ pub const ExpressionAggregateResult = struct {
     }
 };
 
-pub const CellValue = union(rowsource.ColumnKind) {
+pub const CellValue = union(enum) {
     bytes: []u8,
     json: []u8,
     i64: i64,
@@ -808,6 +808,7 @@ fn predicateMatches(predicate: Predicate, column: rowsource.ColumnVector, row_id
     return switch (predicate.op) {
         .eq_bytes => switch (column.values) {
             .bytes => |items| std.mem.eql(u8, items[row_idx], predicate.bytes_value),
+            .dictionary_bytes => |items| std.mem.eql(u8, items.at(row_idx), predicate.bytes_value),
             .json => |items| std.mem.eql(u8, items[row_idx], predicate.bytes_value),
             else => error.UnsupportedLakeRowsPredicateColumnKind,
         },
@@ -1217,6 +1218,7 @@ fn projectedRowAllocatedBytes(
         if (column.nulls.isNull(row_idx)) continue;
         const payload_bytes = switch (column.values) {
             .bytes, .json => |items| items[row_idx].len,
+            .dictionary_bytes => |items| items.at(row_idx).len,
             .vector_f32 => |items| std.math.mul(usize, items[row_idx].len, @sizeOf(f32)) catch return std.math.maxInt(usize),
             .i64, .f64, .bool => 0,
         };
@@ -1244,6 +1246,7 @@ fn cloneCellValueAlloc(
 ) !CellValue {
     return switch (values) {
         .bytes => |items| .{ .bytes = try alloc.dupe(u8, items[row_idx]) },
+        .dictionary_bytes => |items| .{ .bytes = try alloc.dupe(u8, items.at(row_idx)) },
         .json => |items| .{ .json = try alloc.dupe(u8, items[row_idx]) },
         .i64 => |items| .{ .i64 = items[row_idx] },
         .f64 => |items| .{ .f64 = items[row_idx] },

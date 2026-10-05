@@ -28,7 +28,7 @@ const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const source_binding = @import("../segment/source_binding.zig");
 const text_segment = @import("../text_segment/mod.zig");
 const external_rowsource = @import("../../storage/rowsource/external.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 const lake_build_limits = @import("lake_build_limits.zig");
 
 pub const TextSidecarBuildOptions = struct {

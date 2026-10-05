@@ -12,7 +12,7 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const types = @import("types.zig");
+pub const types = @import("antfly_local_sources").storage_rowsource_types;
 pub const local = @import("local.zig");
 pub const external = @import("external.zig");
 

@@ -1188,7 +1188,7 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
         if (value != .null) {
             const encoded_schema = try stringifyJsonValue(alloc, value);
             defer alloc.free(encoded_schema);
-            const validated_schema = parseSchemaUpdateRequest(alloc, encoded_schema) catch |err| switch (err) {
+            const validated_schema = @import("antfly_local_sources").schema_table_schema_impl.parseCreateSchemaRequest(alloc, encoded_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
             };
@@ -1200,7 +1200,13 @@ fn parseCreateTableRequestWithOptions(alloc: std.mem.Allocator, body: []const u8
             };
             var normalized_schema_owned = true;
             errdefer if (normalized_schema_owned) alloc.free(normalized_schema);
-            validateRuntimeDerivableSchemaJson(alloc, normalized_schema) catch |err| switch (err) {
+            // Unpublished inference drafts are resolved at public creation
+            // ingress before strict metadata/catalog admission.
+            var draft = try std.json.parseFromSlice(std.json.Value, alloc, normalized_schema, .{});
+            defer draft.deinit();
+            const docs = draft.value.object.get("document_schemas");
+            const pending = draft.value.object.get("base_source") != null and (docs == null or docs.? == .null or (docs.? == .object and docs.?.object.count() == 0));
+            if (!pending) validateRuntimeDerivableSchemaJson(alloc, normalized_schema) catch |err| switch (err) {
                 error.InvalidSchemaUpdateRequest => return error.InvalidCreateTableRequest,
                 else => return err,
             };

@@ -21,7 +21,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const external_source = @import("types.zig");
+const external_source = @import("antfly_local_sources").serverless_external_source_types;
 const iceberg_avro = @import("iceberg_avro.zig");
 const iceberg_metadata = @import("iceberg_metadata.zig");
 
@@ -120,6 +120,10 @@ pub fn planInventoryFromDataFilesAlloc(
             for (partition_values) |*partition| partition.deinit(alloc);
             if (partition_values.len > 0) alloc.free(partition_values);
         }
+        const lower_bounds = try external_source.FieldMetric.cloneAll(alloc, data_file.lower_bounds);
+        errdefer external_source.FieldMetric.freeAll(alloc, lower_bounds);
+        const upper_bounds = try external_source.FieldMetric.cloneAll(alloc, data_file.upper_bounds);
+        errdefer external_source.FieldMetric.freeAll(alloc, upper_bounds);
         files[out_idx] = .{
             .file_id = file_id,
             .object_uri = object_uri,
@@ -133,6 +137,8 @@ pub fn planInventoryFromDataFilesAlloc(
             else
                 @intCast(data_file.partition_values.len),
             .partition_values = partition_values,
+            .lower_bounds = lower_bounds,
+            .upper_bounds = upper_bounds,
             .row_groups = &.{},
         };
         initialized += 1;

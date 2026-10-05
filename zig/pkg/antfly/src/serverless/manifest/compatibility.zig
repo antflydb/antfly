@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const artifact_ref = @import("artifact_ref.zig");
-const base_source = @import("base_source.zig");
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
 pub const Policy = struct {
     require_row_fragment_stats: bool = true,

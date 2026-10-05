@@ -15,6 +15,7 @@ const Entry = struct {
     arena: std.heap.ArenaAllocator,
     version: u32 = 0,
     storage_mode: @FieldType(catalog.Table, "storage_mode") = .relational,
+    external_base_source: ?@import("antfly_local_sources").serverless_external_source_schema_binding.OwnedExternalTableBinding = null,
     columns: []const catalog.Column = &.{},
     indexes: []const catalog.Index = &.{},
     refs: usize = 0,
@@ -70,7 +71,7 @@ pub const Cache = struct {
             for (index.columns, names) |name, *copy| copy.* = try alloc.dupe(u8, name);
             out.* = .{ .name = try alloc.dupe(u8, index.name), .columns = names };
         }
-        return .{ .id = id, .physical_name = physical_name, .schema_version = entry.version, .storage_mode = entry.storage_mode, .columns = columns, .indexes = indexes };
+        return .{ .external_base_source = if (entry.external_base_source) |source| try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(alloc, source) else null, .id = id, .physical_name = physical_name, .schema_version = entry.version, .storage_mode = entry.storage_mode, .columns = columns, .indexes = indexes };
     }
     fn acquire(self: *Cache, io: std.Io, json: []const u8) !*Entry {
         var digest: [32]u8 = undefined;
@@ -183,6 +184,11 @@ fn derive(entry: *Entry, json: []const u8) !void {
         }),
     };
     entry.columns = columns;
+    if (native.external_base_source) |source| {
+        entry.external_base_source = try @import("antfly_local_sources").serverless_external_source_schema_binding.cloneAlloc(owned, source);
+        entry.version = native.version;
+        return;
+    }
     var indexes: std.ArrayList(catalog.Index) = .empty;
     if (parsed.relational_indexes) |declarations| for (declarations.value) |index| {
         if (index.where != null or index.keys.len == 0 or index.keys.len > 32) continue;

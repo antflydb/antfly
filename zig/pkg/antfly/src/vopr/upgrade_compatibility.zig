@@ -13,7 +13,7 @@ const fs_paths = @import("antfly_runtime_fs").fs_paths;
 const storage_hot_standby = @import("../storage/hot_standby/mod.zig");
 const head_coordination = @import("../serverless/head_coordination.zig");
 const external_codec = @import("../serverless/external_source/codec.zig");
-const external_types = @import("../serverless/external_source/types.zig");
+const external_types = @import("antfly_local_sources").serverless_external_source_types;
 const manifest_codec = @import("../serverless/manifest/codec.zig");
 const manifest_types = @import("../serverless/manifest/types.zig");
 

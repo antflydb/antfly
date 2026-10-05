@@ -382,6 +382,10 @@ fn storedDestinationAllowed(identity: ?AuthenticatedIdentity, table_name: []cons
 fn witnessDDLError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
     const jsonErrorResponse = AntflyApiHandler.jsonErrorResponse;
     return switch (err) {
+        error.UnsupportedExternalLakeSchemaType => jsonErrorResponse(ctx, 400, "automatic lake schema detection requires supported flat scalar columns; unsupported nested or binary types need a compatible source"),
+        error.ExternalLakeSchemaMismatch => jsonErrorResponse(ctx, 409, "lake files have incompatible column types or the supplied schema fingerprint does not match the detected schema"),
+        error.ExternalLakeSchemaUnavailable => jsonErrorResponse(ctx, 400, "lake schema metadata is unavailable; Parquet inference requires at least one file with a schema"),
+        error.ExternalLakeSchemaTooLarge => jsonErrorResponse(ctx, 400, "detected lake schema exceeds the 1024-column limit"),
         error.ReservedForeignKeySupportIndex => jsonErrorResponse(ctx, 400, "__fk_partial_ indexes are server-owned foreign-key support; edit or retire the foreign key instead"),
         error.ForeignKeyPartialSupportIndexConflict => jsonErrorResponse(ctx, 409, "foreign-key support index name conflicts with an existing definition"),
         error.ForeignKeyPartialSupportIndexRequired, error.RelationalIndexNotReady => jsonErrorResponse(ctx, 409, "foreign-key support changed or is still building; refresh the schema and retry"),
@@ -7926,7 +7930,29 @@ pub const AntflyApiHandler = struct {
         };
         defer scan_req.deinit(alloc);
 
+        const operation_id = if (relational) "queryRelationalRows" else "scanKeys";
+        if (try self.acquirePublicOperation(ctx, operation_id)) |response| return response;
+        defer self.releasePublicOperation(operation_id);
         const request = operationContext(ctx, authenticated_identity);
+        if (relational) if (binding.logical) |logical| {
+            var lake_adapter: @import("sql_execution.zig").Adapter = .{ .server = self.api_server, .identity = &authenticated_identity, .context = request };
+            const lake_result = @import("lake_table_reads.zig").query(alloc, &lake_adapter, try system_catalog.Target.parse(logical), binding.table_id orelse return error.CatalogGenerationChanged, scan_req) catch |err| return switch (err) {
+                error.Forbidden => jsonErrorResponse(ctx, 403, "forbidden"),
+                error.TableNotFound => jsonErrorResponse(ctx, 404, "not found"),
+                error.CatalogGenerationChanged, error.ExternalLakeSnapshotMismatch => jsonErrorResponse(ctx, 409, "external table snapshot changed"),
+                error.InvalidQueryRequest, error.InvalidSqlDateTime, error.SqlTypeMismatch, error.UndefinedColumn, error.SqlUnknownColumn, error.RowPolicyUnsupported, error.UnsupportedRowsQuery, error.UnsupportedSqlExecution => jsonErrorResponse(ctx, 400, "external table does not support this read"),
+                error.Canceled, error.Cancelled => error.Canceled,
+                error.Timeout, error.DeadlineExceeded => jsonErrorResponse(ctx, 504, "request deadline exceeded"),
+                else => jsonErrorResponse(ctx, 503, "external table read unavailable"),
+            };
+            if (lake_result) |ndjson| {
+                defer alloc.free(ndjson);
+                var writer = try ctx.streamResponseWithContentType(200, "application/x-ndjson");
+                try writer.write(ndjson);
+                try writer.close();
+                return ctx.response.build();
+            }
+        };
         scan_req.opts.execution_deadline_ns = request.deadline_ns;
         if (request.cancellation.ptr != null and request.cancellation.is_cancelled_fn != null)
             scan_req.opts.cancellation = request.cancellation;
@@ -7957,9 +7983,6 @@ pub const AntflyApiHandler = struct {
         defer if (row_filter_json) |value| alloc.free(value);
         if (row_filter_json) |value| try http_server_mod.injectRowFilterIntoScanRequest(alloc, &scan_req, value);
 
-        const operation_id = if (relational) "queryRelationalRows" else "scanKeys";
-        if (try self.acquirePublicOperation(ctx, operation_id)) |response| return response;
-        defer self.releasePublicOperation(operation_id);
         const source = self.api_server.table_reads orelse {
             if (relational) return jsonErrorResponse(ctx, 404, "not found");
             _ = ctx.status(404);
@@ -13737,8 +13760,8 @@ test "httpx SQL executes one relational page with exact integer parameters" {
     }
     {
         // sql-0048/sql-0050 storage half: the cursor's blocking ORDER BY query
-        // falls back from pull streaming to a bounded native result. Its
-        // pgwire DECLARE/FETCH lifecycle is checked in protocol_test.zig.
+        // uses the bounded native spool. Verify pull ownership and ordering
+        // before exercising the pgwire DECLARE/FETCH lifecycle below.
         var user_store = usermgr.MemoryStore.init(alloc);
         defer user_store.deinit();
         var policies = casbin.MemoryAdapter.init(alloc);
@@ -13765,7 +13788,23 @@ test "httpx SQL executes one relational page with exact integer parameters" {
             .deadline = .{ .clock = .awake, .raw = .{ .nanoseconds = std.Io.Clock.awake.now(std.testing.io).nanoseconds + 60 * std.time.ns_per_s } },
             .cancel_requested = &canceled,
         };
-        try std.testing.expect((try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) == null);
+        {
+            const stream = (try wire_backend.vtable.open_stream.?(wire_backend.context, alloc, credential, request)) orelse return error.ExpectedReadStream;
+            defer stream.close(stream.context);
+            const expected = [_][]const u8{ "2", "3", "4", "5", "6", "7", "8", "9", "9007199254740993" };
+            var offset: usize = 0;
+            while (true) {
+                var page = try stream.next(stream.context, alloc, request, 2);
+                defer page.result.deinit();
+                for (page.result.rows) |row| {
+                    try std.testing.expect(offset < expected.len);
+                    try std.testing.expectEqual(try std.fmt.parseInt(i64, expected[offset], 10), row[0].integer);
+                    offset += 1;
+                }
+                if (page.exhausted) break;
+            }
+            try std.testing.expectEqual(expected.len, offset);
+        }
         var result_arena = std.heap.ArenaAllocator.init(alloc);
         defer result_arena.deinit();
         var result = try wire_backend.vtable.execute(wire_backend.context, result_arena.allocator(), credential, request);

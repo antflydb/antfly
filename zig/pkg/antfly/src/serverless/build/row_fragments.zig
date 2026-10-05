@@ -17,7 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const row_fragment = @import("../row_fragment/mod.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const BuildOptions = struct {
     schema_fingerprint: []const u8,
@@ -103,7 +103,7 @@ fn appendColumnFromVector(
 
 fn fragmentColumnKind(kind: rowsource.ColumnKind) !row_fragment.ColumnKind {
     return switch (kind) {
-        .bytes => .bytes,
+        .bytes, .dictionary_bytes => .bytes,
         .json => .json,
         .i64 => .i64,
         .f64 => .f64,
@@ -115,6 +115,7 @@ fn fragmentColumnKind(kind: rowsource.ColumnKind) !row_fragment.ColumnKind {
 fn cellFromColumnValue(values: rowsource.ColumnValues, idx: usize) !row_fragment.CellValue {
     return switch (values) {
         .bytes => |items| .{ .bytes = @constCast(items[idx]) },
+        .dictionary_bytes => |items| .{ .bytes = @constCast(items.at(idx)) },
         .json => |items| .{ .json = @constCast(items[idx]) },
         .i64 => |items| .{ .i64 = items[idx] },
         .f64 => |items| .{ .f64 = items[idx] },

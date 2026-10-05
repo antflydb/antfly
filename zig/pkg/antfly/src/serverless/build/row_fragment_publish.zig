@@ -21,7 +21,7 @@ const Allocator = std.mem.Allocator;
 const artifact_store = @import("../artifacts/store.zig");
 const row_fragment_manifest = @import("row_fragment_manifest.zig");
 const row_fragments = @import("row_fragments.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const PublishOptions = struct {
     schema_fingerprint: []const u8,

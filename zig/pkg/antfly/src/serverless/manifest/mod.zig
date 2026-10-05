@@ -18,7 +18,7 @@ pub const store = @import("store.zig");
 pub const fs_store = @import("fs_store.zig");
 pub const remote_store = @import("remote_store.zig");
 pub const artifact_ref = @import("artifact_ref.zig");
-pub const base_source = @import("base_source.zig");
+pub const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 pub const compatibility = @import("compatibility.zig");
 pub const read_lease = @import("read_lease.zig");
 

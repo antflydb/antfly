@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const artifact_ref = @import("../manifest/artifact_ref.zig");
-const base_source = @import("../manifest/base_source.zig");
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 const lake_promotion = @import("../build/lake_promotion.zig");
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const lake_cache = @import("lake_cache.zig");
@@ -28,7 +28,7 @@ const lake_rows = @import("lake_rows.zig");
 const lake_parquet_rowgroup = @import("lake_parquet_rowgroup.zig");
 const lake_range_io = @import("lake_range_io.zig");
 const lake_sidecar_selection = @import("lake_sidecar_selection.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 const source_binding = @import("../segment/source_binding.zig");
 
 pub const Operation = enum {

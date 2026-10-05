@@ -77,3 +77,10 @@ test "system catalog routing and transport discovery" {
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+test {
+    _ = @import("api/lake_sql_cursor.zig");
+}
+
+test {
+    _ = @import("api/lake_sql_integration_test.zig");
+}

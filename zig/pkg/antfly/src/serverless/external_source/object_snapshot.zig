@@ -22,7 +22,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
-const external_source = @import("types.zig");
+const external_source = @import("antfly_local_sources").serverless_external_source_types;
 const object_storage = @import("antfly_local_sources").storage_object_storage;
 
 pub const default_max_listing_pages: u32 = 10_000;

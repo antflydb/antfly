@@ -115,6 +115,7 @@ pub fn validate(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, pro
 
 pub fn evaluateBatch(a: std.mem.Allocator, provider: ?decisions.DecisionProvider, program: *const scalar.Program, rows: []const []const scalar.Datum, parameters: []const std.json.Value) ![]const scalar.Datum {
     if (!hasExternal(program)) {
+        if (try @import("vector_eval.zig").evaluate(a, program, rows, parameters)) |output| return output;
         const output = try a.alloc(scalar.Datum, rows.len);
         for (rows, output) |cells, *value| value.* = try program.evaluate(a, cells, parameters, .{});
         return output;
@@ -359,12 +360,11 @@ pub const SortedProjection = struct {
         for (values, keys, ordinals) |row, key, ordinal| try top.add(.{ .values = row, .keys = key, .ordinal = ordinal });
     }
     pub fn finish(self: @This(), context: anytype, top: *@import("operators.zig").TopK, offset: usize, limit: usize, implicit_limit: bool) !@import("runtime.zig").Output {
-        const ordered = try top.finish(context.arena);
-        const remaining = ordered.len -| offset;
+        const ordered = try top.finishPage(context.arena, offset, limit + @intFromBool(implicit_limit));
+        const remaining = ordered.len;
         if (implicit_limit and remaining > limit) return error.SqlResultTooLarge;
-        const start = @min(offset, ordered.len);
-        for (0..start) |index| top.releaseFinishedRow(index);
-        const selected = ordered[start..][0..@min(remaining, limit)];
+        const start = top.released;
+        const selected = ordered[0..@min(remaining, limit)];
         const rows = try context.arena.alloc([]const std.json.Value, selected.len);
         const flags = try context.arena.alloc([]const bool, selected.len);
         var first: usize = 0;

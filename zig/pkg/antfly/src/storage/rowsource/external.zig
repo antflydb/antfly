@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const rowsource = @import("types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const Format = enum(u8) {
     parquet = 1,

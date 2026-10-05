@@ -217,3 +217,37 @@ test "SQL window calls cannot be evaluated in pre-window clauses" {
         try std.testing.expectError(error.SqlGroupingError, @import("antfly_local_sources").sql_describe.describe(std.testing.allocator, backend.backend(), &compiled, &.{}));
     }
 }
+
+test "SQL prefix window reuse preserves weak peers and navigation tie order" {
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT x,y,rank() OVER (ORDER BY x),rank() OVER (ORDER BY x,y),sum(y) OVER (ORDER BY x),lag(y) OVER (ORDER BY x) FROM (SELECT 1 AS x,3 AS y UNION ALL SELECT 1,1 UNION ALL SELECT 2,2) t ORDER BY x,y", .{});
+    defer compiled.deinit();
+    var result = try runtime.execute(std.testing.allocator, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    const expected = [_][5]i64{ .{ 1, 1, 1, 1, 4 }, .{ 1, 3, 1, 2, 4 }, .{ 2, 2, 3, 3, 6 } };
+    for (result.output.rows, expected) |row, want| for (row[0..5], want) |value, number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, value.string, 10));
+    // LAG still uses arrival order within the x=1 peers, not stronger y order.
+    try std.testing.expectEqualStrings("3", result.output.rows[0][5].string);
+    try std.testing.expect(result.output.sql_nulls.?[1][5]);
+    try std.testing.expectEqualStrings("1", result.output.rows[2][5].string);
+}
+
+test "SQL compatible window prefixes share one actual permutation and preserve peer aggregates" {
+    const a = std.testing.allocator;
+    var backend: Backend = .{};
+    var compiled = try compiler.compile(a, "SELECT x,y,rank() OVER (ORDER BY x),rank() OVER (ORDER BY x,y),sum(y) OVER (ORDER BY x) FROM (SELECT 1 AS x,3 AS y UNION ALL SELECT 1,1 UNION ALL SELECT 2,2) t ORDER BY x,y", .{});
+    defer compiled.deinit();
+    var description = try @import("antfly_local_sources").sql_describe.describe(a, backend.backend(), &compiled, &.{});
+    defer description.deinit();
+    const bound = description.binding.window.?;
+    try std.testing.expectEqual(@as(usize, 2), bound.sorts.len);
+    const roots = try @import("antfly_local_sources").sql_ordering_reuse.plan(a, bound);
+    defer a.free(roots);
+    var permutations: usize = 0;
+    for (roots, 0..) |root, index| permutations += @intFromBool(root == index);
+    try std.testing.expectEqual(@as(usize, 1), permutations);
+    var result = try runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+    defer result.deinit();
+    const expected = [_][5]i64{ .{ 1, 1, 1, 1, 4 }, .{ 1, 3, 1, 2, 4 }, .{ 2, 2, 3, 3, 6 } };
+    for (result.output.rows, expected) |row, want| for (row, want) |value, number| try std.testing.expectEqual(number, try std.fmt.parseInt(i64, value.string, 10));
+}

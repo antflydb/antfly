@@ -17,7 +17,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const catalog_binding = @import("../external_source/catalog_binding.zig");
+const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 const external_source_manifest = @import("external_source_manifest.zig");
 
 pub const ResolveRequest = struct {

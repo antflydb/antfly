@@ -15,7 +15,7 @@
 //! Source binding metadata for serverless sidecar segments built over RowSource.
 
 const std = @import("std");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 const CancellationToken = @import("antfly_cancellation").CancellationToken;
 
 pub const SidecarKind = enum(u8) {

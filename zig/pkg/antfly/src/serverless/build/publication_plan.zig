@@ -18,30 +18,12 @@ const catalog_types = @import("../catalog/types.zig");
 const builder_mod = @import("builder.zig");
 const search_sources = @import("../search_sources.zig");
 const full_text_indexes = @import("antfly_local_sources").api_full_text_indexes;
-const external_binding = @import("../external_source/catalog_binding.zig");
+const external_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 const external_source_manifest = @import("external_source_manifest.zig");
 const external_source_plan_resolver_api = @import("external_source_plan_resolver_api.zig");
-const manifest_base_source = @import("../manifest/base_source.zig");
+const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 
-pub const OwnedExternalTableBinding = struct {
-    binding: external_binding.Binding,
-    table_id: []u8,
-    source_uri: []u8,
-    credential_ref_id: ?[]u8 = null,
-    credential_scope: ?[]u8 = null,
-    snapshot_value: ?[]u8 = null,
-    schema_fingerprint: []u8,
-
-    pub fn deinit(self: *OwnedExternalTableBinding, alloc: Allocator) void {
-        alloc.free(self.table_id);
-        alloc.free(self.source_uri);
-        if (self.credential_ref_id) |value| alloc.free(value);
-        if (self.credential_scope) |value| alloc.free(value);
-        if (self.snapshot_value) |value| alloc.free(value);
-        alloc.free(self.schema_fingerprint);
-        self.* = undefined;
-    }
-};
+pub const OwnedExternalTableBinding = @import("antfly_local_sources").serverless_external_source_schema_binding.OwnedExternalTableBinding;
 
 pub const ExternalSourcePlanResolveRequest = external_source_plan_resolver_api.ResolveRequest;
 pub const ExternalSourcePlanResolver = external_source_plan_resolver_api.Resolver;
@@ -267,132 +249,7 @@ pub fn pinnedExternalBaseSourceFromSchemaJsonAlloc(
     return try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor);
 }
 
-pub fn externalBindingFromSchemaJsonAlloc(
-    alloc: Allocator,
-    schema_json: []const u8,
-) !?OwnedExternalTableBinding {
-    if (schema_json.len == 0) return null;
-
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{}) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.InvalidExternalTableBinding,
-    };
-    defer parsed.deinit();
-    const root = switch (parsed.value) {
-        .object => |object| object,
-        else => return error.InvalidExternalTableBinding,
-    };
-    const source_value = root.get("base_source") orelse return null;
-    const source = switch (source_value) {
-        .object => |object| object,
-        else => return error.InvalidExternalTableBinding,
-    };
-    const kind = try requiredJsonString(source, "kind");
-    if (!std.mem.eql(u8, kind, "external")) return null;
-
-    const table_id = try alloc.dupe(u8, try requiredJsonString(source, "table_id"));
-    errdefer alloc.free(table_id);
-    const source_uri = try alloc.dupe(u8, try requiredJsonString(source, "uri"));
-    errdefer alloc.free(source_uri);
-    const format: @import("../external_source/types.zig").Format = blk: {
-        const value = try requiredJsonString(source, "format");
-        if (std.mem.eql(u8, value, "parquet")) break :blk .parquet;
-        if (std.mem.eql(u8, value, "iceberg")) break :blk .iceberg;
-        if (std.mem.eql(u8, value, "lance")) break :blk .lance;
-        return error.InvalidExternalTableBinding;
-    };
-
-    const credentials = if (source.get("credentials")) |value| switch (value) {
-        .object => |object| object,
-        .null => null,
-        else => return error.InvalidExternalTableBinding,
-    } else null;
-    const credential_ref_id = if (credentials) |value|
-        try alloc.dupe(u8, try requiredJsonString(value, "ref"))
-    else
-        null;
-    errdefer if (credential_ref_id) |value| alloc.free(value);
-    const credential_scope = if (credentials) |value|
-        if (value.get("scope")) |scope| switch (scope) {
-            .string => |string| try alloc.dupe(u8, string),
-            else => return error.InvalidExternalTableBinding,
-        } else try alloc.dupe(u8, "")
-    else
-        null;
-    errdefer if (credential_scope) |value| alloc.free(value);
-
-    var snapshot_tag: enum { current, snapshot_id, object_version_digest } = .current;
-    var snapshot_borrowed: ?[]const u8 = null;
-    if (source.get("snapshot")) |snapshot| switch (snapshot) {
-        .string => |value| {
-            if (!std.mem.eql(u8, value, "current")) return error.InvalidExternalTableBinding;
-        },
-        .object => |object| {
-            const mode = try requiredJsonString(object, "mode");
-            if (std.mem.eql(u8, mode, "snapshot_id")) {
-                snapshot_tag = .snapshot_id;
-                snapshot_borrowed = try requiredJsonString(object, "id");
-            } else if (std.mem.eql(u8, mode, "object_version_digest")) {
-                snapshot_tag = .object_version_digest;
-                snapshot_borrowed = try requiredJsonString(object, "digest");
-            } else if (!std.mem.eql(u8, mode, "current")) {
-                return error.InvalidExternalTableBinding;
-            }
-        },
-        else => return error.InvalidExternalTableBinding,
-    };
-    const snapshot_value = if (snapshot_borrowed) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (snapshot_value) |value| alloc.free(value);
-    const schema_fingerprint = try alloc.dupe(u8, try requiredJsonString(source, "schema_fingerprint"));
-    errdefer alloc.free(schema_fingerprint);
-    const write_policy: external_binding.WritePolicy = if (source.get("write_policy")) |value| blk: {
-        const string = switch (value) {
-            .string => |item| item,
-            else => return error.InvalidExternalTableBinding,
-        };
-        if (std.mem.eql(u8, string, "read_only")) break :blk .read_only;
-        if (std.mem.eql(u8, string, "materialized_overlay")) break :blk .materialized_overlay;
-        if (std.mem.eql(u8, string, "iceberg_writer")) break :blk .iceberg_writer;
-        if (std.mem.eql(u8, string, "lake_native_relational")) break :blk .lake_native_relational;
-        return error.InvalidExternalTableBinding;
-    } else .read_only;
-
-    const binding = external_binding.Binding{
-        .table_id = table_id,
-        .format = format,
-        .source_uri = source_uri,
-        .credential_ref = if (credential_ref_id) |ref_id| .{
-            .ref_id = ref_id,
-            .scope = credential_scope orelse &.{},
-        } else null,
-        .snapshot_mode = switch (snapshot_tag) {
-            .current => .current,
-            .snapshot_id => .{ .snapshot_id = snapshot_value orelse return error.InvalidExternalTableBinding },
-            .object_version_digest => .{ .object_version_digest = snapshot_value.? },
-        },
-        .schema_fingerprint = schema_fingerprint,
-        .write_policy = write_policy,
-    };
-    try binding.validateReadOnlyMvp();
-
-    return .{
-        .binding = binding,
-        .table_id = table_id,
-        .source_uri = source_uri,
-        .credential_ref_id = credential_ref_id,
-        .credential_scope = credential_scope,
-        .snapshot_value = snapshot_value,
-        .schema_fingerprint = schema_fingerprint,
-    };
-}
-
-fn requiredJsonString(object: anytype, name: []const u8) ![]const u8 {
-    const value = object.get(name) orelse return error.InvalidExternalTableBinding;
-    return switch (value) {
-        .string => |string| string,
-        else => error.InvalidExternalTableBinding,
-    };
-}
+pub const externalBindingFromSchemaJsonAlloc = @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc;
 
 test "metadata republish reasons report when any flag is set" {
     try std.testing.expect(!(MetadataRepublishReasons{}).any());

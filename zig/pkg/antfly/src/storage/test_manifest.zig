@@ -400,7 +400,7 @@ comptime {
     _ = @import("rowsource/external.zig");
     _ = @import("rowsource/local.zig");
     _ = @import("rowsource/mod.zig");
-    _ = @import("rowsource/types.zig");
+    _ = @import("antfly_local_sources").storage_rowsource_types;
     _ = @import("antfly_local_sources").storage_schema;
     _ = @import("antfly_local_sources").storage_shard;
     _ = @import("antfly_local_sources").storage_sim_runtime;

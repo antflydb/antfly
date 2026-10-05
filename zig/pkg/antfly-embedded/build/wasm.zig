@@ -152,6 +152,14 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         wasm_handlebars_mod,
     };
 
+    // SQL catalog filters share coercion and compiler contracts even when
+    // the browser does not execute a native SQL cursor. Keep this dependency
+    // in the browser profile rather than borrowing the native module.
+    const wasm_sql_parser_mod = b.createModule(.{
+        .root_source_file = b.path("lib/sql/root.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+    });
     const embedded_support_wasm_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly-embedded/src/local/embedded_root.zig"),
         .target = wasm_target,
@@ -159,6 +167,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     });
     const wasm_storage_boundary = @import("storage_boundary.zig").create(b, wasm_target, optimize);
     @call(.auto, configureEmbeddedModule, .{ b, wasm_storage_boundary, embedded_support_wasm_mod } ++ embedded_wasm_deps ++ .{addSnowballModule});
+    embedded_support_wasm_mod.addImport("sql_parser", wasm_sql_parser_mod);
     const wasm_cancellation_mod = b.createModule(.{
         .root_source_file = b.path("lib/runtime/src/cancellation.zig"),
         .target = wasm_target,

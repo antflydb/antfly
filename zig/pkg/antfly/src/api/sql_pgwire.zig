@@ -278,7 +278,7 @@ pub const Adapter = struct {
     }
 };
 
-const Pull = @import("../sql/read_stream.zig");
+const Pull = @import("antfly_local_sources").sql_read_stream;
 
 fn cloneSettingOverlay(alloc: std.mem.Allocator, entries: []const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry) ![]const @import("antfly_local_sources").sql_setting_catalog.OverlayEntry {
     const result = try alloc.alloc(@import("antfly_local_sources").sql_setting_catalog.OverlayEntry, entries.len);
@@ -1007,6 +1007,62 @@ const GuardedCatalog = struct {
             try self.guard.checkRead(self.table);
             return self.inner.next(self.inner.ptr, alloc, limit);
         }
+        fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, limit: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.guard.checkRead(self.table);
+            return self.inner.next_columns.?(self.inner.ptr, alloc, limit);
+        }
+        fn countRows(raw: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.guard.checkRead(self.table);
+            return self.inner.count_rows.?(self.inner.ptr);
+        }
+        fn setDynamicFilter(raw: *anyopaque, filter: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.guard.checkRead(self.table);
+            return self.inner.set_dynamic_filter.?(self.inner.ptr, filter);
+        }
+        fn splitScan(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize) !?[]catalog.Cursor {
+            return splitImpl(raw, alloc, workers, false);
+        }
+        fn splitOrdered(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize) !?[]catalog.Cursor {
+            return splitImpl(raw, alloc, workers, true);
+        }
+        fn splitImpl(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize, ordered: bool) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.guard.checkRead(self.table);
+            const split = if (ordered) self.inner.split_ordered.? else self.inner.split_scan.?;
+            const children = (try split(self.inner.ptr, alloc, workers)) orelse return null;
+            defer alloc.free(children);
+            var wrapped: usize = 0;
+            errdefer for (children[wrapped..]) |child| child.close(child.ptr);
+            const cursors = try alloc.alloc(catalog.Cursor, children.len);
+            errdefer alloc.free(cursors);
+            errdefer for (cursors[0..wrapped]) |child| child.close(child.ptr);
+            for (children, cursors) |child, *out| {
+                const name = try alloc.dupe(u8, self.table);
+                errdefer alloc.free(name);
+                const owner = try alloc.create(ReadCursor);
+                owner.* = .{ .alloc = alloc, .guard = self.guard, .table = name, .inner = child };
+                out.* = owner.cursor(close);
+                wrapped += 1;
+            }
+            return cursors;
+        }
+        fn cursor(self: *@This(), release: *const fn (*anyopaque) void) catalog.Cursor {
+            return .{
+                .estimated_rows = self.inner.estimated_rows,
+                .estimated_bytes = self.inner.estimated_bytes,
+                .ptr = self,
+                .next = next,
+                .close = release,
+                .next_columns = if (self.inner.next_columns != null) nextColumns else null,
+                .count_rows = if (self.inner.count_rows != null) countRows else null,
+                .set_dynamic_filter = if (self.inner.set_dynamic_filter != null) setDynamicFilter else null,
+                .split_scan = if (self.inner.split_scan != null) splitScan else null,
+                .split_ordered = if (self.inner.split_ordered != null) splitOrdered else null,
+            };
+        }
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.inner.close(self.inner.ptr);
@@ -1026,7 +1082,7 @@ const GuardedCatalog = struct {
         cursor.* = .{ .alloc = alloc, .guard = self, .table = name, .inner = inner };
         // Materialized execution closes before returning; streaming execution
         // retains the heap-owned guard and authority in its OwnedRead capsule.
-        return .{ .ptr = cursor, .next = ReadCursor.next, .close = ReadCursor.close };
+        return cursor.cursor(ReadCursor.close);
     }
     fn mutate(raw: *anyopaque, alloc: std.mem.Allocator, table: catalog.Table, input: []const catalog.Mutation) !catalog.MutationOutcome {
         const self: *GuardedCatalog = @ptrCast(@alignCast(raw));
@@ -1085,7 +1141,7 @@ const GuardedCatalog = struct {
         for (scans, inner.cursors, wrappers, cursors) |scan_request, cursor, *wrapper, *out| {
             wrapper.* = .{ .alloc = alloc, .guard = self, .table = try alloc.dupe(u8, scan_request.table.physical_name), .inner = cursor };
             count += 1;
-            out.* = .{ .ptr = wrapper, .next = ReadCursor.next, .close = StatementRead.borrowedClose };
+            out.* = wrapper.cursor(StatementRead.borrowedClose);
         }
         owner.* = .{ .alloc = alloc, .inner = inner, .wrappers = wrappers, .cursors = cursors };
         return .{ .ptr = owner, .cursors = cursors, .close = StatementRead.close };
@@ -1265,14 +1321,43 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     }
     const NativeCursor = struct {
         pages: usize = 0,
+        columns: usize = 0,
+        filters: usize = 0,
+        counts: usize = 0,
+        splits: usize = 0,
         closes: usize = 0,
         fn open(ptr: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
-            return .{ .ptr = ptr, .next = next, .close = close };
+            return cursor(ptr);
+        }
+        fn cursor(ptr: *anyopaque) catalog.Cursor {
+            return .{ .estimated_rows = 99, .estimated_bytes = 1024, .ptr = ptr, .next = next, .next_columns = nextColumns, .count_rows = countRows, .set_dynamic_filter = setFilter, .split_scan = split, .split_ordered = split, .close = close };
         }
         fn next(ptr: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.Page {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.pages += 1;
             return .{ .rows = &.{}, .after = "next" };
+        }
+        fn nextColumns(ptr: *anyopaque, _: std.mem.Allocator, _: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.columns += 1;
+            return .{ .batch = .{ .snapshot = .{ .table_id = "docs", .snapshot_id = "v1" }, .row_refs = &.{}, .columns = &.{} }, .selection = &.{} };
+        }
+        fn countRows(ptr: *anyopaque) !?u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.counts += 1;
+            return 99;
+        }
+        fn setFilter(ptr: *anyopaque, _: *const @import("antfly_local_sources").sql_dynamic_filter.Filter) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.filters += 1;
+            return true;
+        }
+        fn split(ptr: *anyopaque, a: std.mem.Allocator, _: usize) !?[]catalog.Cursor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const children = try a.alloc(catalog.Cursor, 2);
+            @memset(children, cursor(ptr));
+            self.splits += 1;
+            return children;
         }
         fn close(ptr: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -1304,6 +1389,36 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
     const page = try cursor.next(cursor.ptr, alloc, 1);
     page.deinit();
     try std.testing.expectEqual(@as(usize, 1), native_cursor.pages);
+    try std.testing.expectEqual(@as(?u64, 99), cursor.estimated_rows);
+    try std.testing.expectEqual(@as(?u64, 1024), cursor.estimated_bytes);
+    _ = try cursor.next_columns.?(cursor.ptr, alloc, 1);
+    try std.testing.expectEqual(@as(?u64, 99), try cursor.count_rows.?(cursor.ptr));
+    const filter = try @import("antfly_local_sources").sql_dynamic_filter.Filter.create(alloc, &.{}, 128);
+    defer filter.close();
+    try std.testing.expect(try cursor.set_dynamic_filter.?(cursor.ptr, filter));
+    const children = (try cursor.split_scan.?(cursor.ptr, alloc, 2)).?;
+    defer alloc.free(children);
+    var children_closed = false;
+    defer if (!children_closed) for (children) |child| child.close(child.ptr);
+    for (children) |child| {
+        _ = try child.next_columns.?(child.ptr, alloc, 1);
+        try std.testing.expectEqual(@as(?u64, 99), try child.count_rows.?(child.ptr));
+    }
+    const SplitSweep = struct {
+        fn run(a: std.mem.Allocator, parent: catalog.Cursor, fixture: *NativeCursor, ordered: bool) !void {
+            const before_splits = fixture.splits;
+            const before_closes = fixture.closes;
+            defer std.debug.assert(fixture.closes - before_closes == 2 * (fixture.splits - before_splits));
+            const split = if (ordered) parent.split_ordered.? else parent.split_scan.?;
+            const parts = (try split(parent.ptr, a, 2)).?;
+            defer a.free(parts);
+            defer for (parts) |part| part.close(part.ptr);
+            for (parts) |part| try std.testing.expectEqual(@as(?u64, 99), part.estimated_rows);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(alloc, SplitSweep.run, .{ cursor, &native_cursor, false });
+    try std.testing.checkAllAllocationFailures(alloc, SplitSweep.run, .{ cursor, &native_cursor, true });
+    const closes_before_revoke = native_cursor.closes;
     try manager.removePermissionFromUser("alice", "docs", .table);
     {
         var current = try credential.identity(alloc);
@@ -1311,10 +1426,24 @@ test "SQL pgwire credential snapshot observes policy revocation and password rot
         try std.testing.expectError(error.Forbidden, OwnedRead.validatePolicies(alloc, &current, projected, &retained_policies));
     }
     try std.testing.expectError(error.Forbidden, cursor.next(cursor.ptr, alloc, 1));
+    try std.testing.expectError(error.Forbidden, cursor.next_columns.?(cursor.ptr, alloc, 1));
+    try std.testing.expectError(error.Forbidden, cursor.count_rows.?(cursor.ptr));
+    try std.testing.expectError(error.Forbidden, cursor.set_dynamic_filter.?(cursor.ptr, filter));
+    try std.testing.expectError(error.Forbidden, cursor.split_scan.?(cursor.ptr, alloc, 2));
+    try std.testing.expectError(error.Forbidden, cursor.split_ordered.?(cursor.ptr, alloc, 2));
+    for (children) |child| {
+        try std.testing.expectError(error.Forbidden, child.next_columns.?(child.ptr, alloc, 1));
+        try std.testing.expectError(error.Forbidden, child.count_rows.?(child.ptr));
+        child.close(child.ptr);
+    }
+    children_closed = true;
     try std.testing.expectEqual(@as(usize, 1), native_cursor.pages);
+    try std.testing.expectEqual(@as(usize, 3), native_cursor.columns);
+    try std.testing.expectEqual(@as(usize, 3), native_cursor.counts);
+    try std.testing.expectEqual(@as(usize, 1), native_cursor.filters);
     cursor.close(cursor.ptr);
     cursor_closed = true;
-    try std.testing.expectEqual(@as(usize, 1), native_cursor.closes);
+    try std.testing.expectEqual(closes_before_revoke + 3, native_cursor.closes);
     try std.testing.expect(!(try http.tablePermissionCurrentlyAllowed(admitted, "docs", .read)));
     var fresh = try credential.identity(alloc);
     defer fresh.deinit(alloc);

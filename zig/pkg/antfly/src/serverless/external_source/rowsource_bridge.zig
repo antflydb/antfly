@@ -16,9 +16,9 @@
 //! RowSource bindings and row references.
 
 const std = @import("std");
-const external_source = @import("types.zig");
+const external_source = @import("antfly_local_sources").serverless_external_source_types;
 const rowsource_external = @import("../../storage/rowsource/external.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub fn bindingFromInventory(inventory: external_source.Inventory) !rowsource_external.Binding {
     try inventory.validate();

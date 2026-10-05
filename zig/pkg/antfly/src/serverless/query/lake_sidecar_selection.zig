@@ -19,10 +19,10 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const base_source = @import("../manifest/base_source.zig");
+const base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 const sidecar_manifest = @import("../segment/sidecar_manifest.zig");
 const source_binding = @import("../segment/source_binding.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const StalePolicy = enum {
     reject,

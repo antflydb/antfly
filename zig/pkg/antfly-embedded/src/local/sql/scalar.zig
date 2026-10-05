@@ -12,7 +12,14 @@ const json_order = @import("json_order.zig");
 const setting_catalog = @import("setting_catalog.zig");
 const Allocator = std.mem.Allocator;
 const Json = std.json.Value;
+pub const PatternSet = struct {
+    ptr: *anyopaque,
+    count: usize,
+    next: *const fn (*anyopaque, Allocator, *u64) anyerror!?Datum,
+    close: *const fn (*anyopaque) void,
+};
 pub const Datum = struct {
+    patterns: ?*PatternSet = null,
     value: Json = .null,
     sql_null: bool = true,
 
@@ -83,6 +90,13 @@ pub const Program = struct {
         return result;
     }
 };
+
+/// Shared result-boundary validation. Intermediates are deliberately not
+/// validated: a large or invalid input can be discarded by a lazy expression.
+pub fn validateResult(result: Datum, limits: EvalLimits) !void {
+    var context: Evaluator = .{ .program = undefined, .alloc = undefined, .cells = &.{}, .parameters = &.{}, .limits = limits };
+    _ = try context.validateJson(result.value, 0);
+}
 
 pub fn bind(alloc: Allocator, expression: *const ast.Scalar, columns: []const Column, parameter_hints: []const ?ast.ColumnType, limits: BindLimits) !Program {
     return bindExpected(alloc, expression, columns, parameter_hints, null, limits);
@@ -804,13 +818,35 @@ const Evaluator = struct {
     fn invokeFunction(self: *Evaluator, function: Function, args: []const u32, depth: usize) anyerror!Json {
         if (function == .@"$pattern_quantified") {
             const operand = try self.run(args[0], depth + 1);
-            const set = try self.run(args[1], depth + 1);
+            const set_datum = try self.runDatum(args[1], depth + 1);
+            const set = set_datum.value;
             const all = try self.run(args[2], depth + 1);
             const insensitive = try self.run(args[3], depth + 1);
             const negated = try self.run(args[4], depth + 1);
             if (all != .bool or insensitive != .bool or negated != .bool) return error.SqlTypeMismatch;
             if (set != .null and set != .array) return error.SqlTypeMismatch;
             const patterns: []const Json = if (set == .null) &.{} else set.array.items;
+            if (set_datum.patterns) |source| {
+                if (source.count == 0) return .{ .bool = all.bool };
+                if (operand == .null) return .null;
+                var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                defer scratch.deinit();
+                var offset: u64 = 0;
+                var saw_null = false;
+                while (true) {
+                    _ = scratch.reset(.free_all);
+                    const pattern = (try source.next(source.ptr, scratch.allocator(), &offset)) orelse break;
+                    if (self.steps >= self.limits.steps) return error.SqlProgramLimitExceeded;
+                    self.steps += 1;
+                    if (pattern.sql_null) {
+                        saw_null = true;
+                        continue;
+                    }
+                    const matches = (try self.like(operand, pattern.value, insensitive.bool)) != negated.bool;
+                    if (matches != all.bool) return .{ .bool = matches };
+                }
+                return if (saw_null) .null else .{ .bool = all.bool };
+            }
             if (patterns.len == 0) return .{ .bool = all.bool };
             if (operand == .null) return .null;
             var saw_null = false;
@@ -1038,7 +1074,7 @@ fn asFloat(value: Json) !f64 {
         else => error.SqlTypeMismatch,
     };
 }
-fn arithmetic(op: ast.Scalar.Binary, left: Json, right: Json) !Json {
+pub fn arithmetic(op: ast.Scalar.Binary, left: Json, right: Json) !Json {
     if (left == .integer and right == .integer) {
         const a = left.integer;
         const b = right.integer;
@@ -1095,7 +1131,7 @@ pub fn semanticHash(value: Json) !u64 {
     var budget: json_order.Budget = .{};
     return json_order.hash(value, &budget, 0);
 }
-fn comparison(op: ast.Scalar.Binary, order: std.math.Order) Json {
+pub fn comparison(op: ast.Scalar.Binary, order: std.math.Order) Json {
     return .{ .bool = switch (op) {
         .eq => order == .eq,
         .neq => order != .eq,

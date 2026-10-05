@@ -17,7 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const row_fragment = @import("types.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const FragmentSource = struct {
     snapshot: rowsource.SnapshotRef,
@@ -74,6 +74,10 @@ pub const MaterializedBatch = struct {
             if (column.nulls.bytes.len != 0) alloc.free(column.nulls.bytes);
             switch (column.values) {
                 .bytes => |values| alloc.free(values),
+                .dictionary_bytes => |values| {
+                    alloc.free(values.values);
+                    alloc.free(values.indices);
+                },
                 .json => |values| alloc.free(values),
                 .i64 => |values| alloc.free(values),
                 .f64 => |values| alloc.free(values),
@@ -238,9 +242,13 @@ fn freeColumnValues(alloc: Allocator, column: rowsource.ColumnVector) void {
     freeColumnValuesOnly(alloc, column.values);
 }
 
-fn freeColumnValuesOnly(alloc: Allocator, values: rowsource.ColumnValues) void {
-    switch (values) {
+fn freeColumnValuesOnly(alloc: Allocator, column_values: rowsource.ColumnValues) void {
+    switch (column_values) {
         .bytes => |slice| alloc.free(slice),
+        .dictionary_bytes => |values| {
+            alloc.free(values.values);
+            alloc.free(values.indices);
+        },
         .json => |slice| alloc.free(slice),
         .i64 => |slice| alloc.free(slice),
         .f64 => |slice| alloc.free(slice),

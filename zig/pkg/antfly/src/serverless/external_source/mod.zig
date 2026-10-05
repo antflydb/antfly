@@ -12,10 +12,10 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-pub const types = @import("types.zig");
+pub const types = @import("antfly_local_sources").serverless_external_source_types;
 pub const codec = @import("codec.zig");
 pub const rowsource_bridge = @import("rowsource_bridge.zig");
-pub const catalog_binding = @import("catalog_binding.zig");
+pub const catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 pub const object_snapshot = @import("object_snapshot.zig");
 pub const iceberg_metadata = @import("iceberg_metadata.zig");
 pub const iceberg_avro = @import("iceberg_avro.zig");

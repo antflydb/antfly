@@ -28,7 +28,7 @@ test {
     _ = @import("conflict_test.zig");
     _ = @import("antfly_local_sources").sql_catalog;
     _ = @import("antfly_local_sources").sql_document_row;
-    _ = @import("read_stream.zig");
+    _ = @import("antfly_local_sources").sql_read_stream;
     _ = @import("antfly_local_sources").sql_operators;
     _ = @import("plan_cache.zig");
     _ = @import("antfly_local_sources").sql_session;

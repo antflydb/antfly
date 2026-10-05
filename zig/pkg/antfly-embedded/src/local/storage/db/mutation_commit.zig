@@ -1136,6 +1136,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             else
                 null;
             defer if (apply_schema_view) |*view| view.release();
+            if (apply_schema_view) |view| if (view.tableSchema().external_base_source != null and
+                (effective_req.writes.len != 0 or effective_req.deletes.len != 0 or effective_req.graph_writes.len != 0 or effective_req.graph_deletes.len != 0)) return error.ExternalLakeReadOnly;
             if (relationalColumns(self) == null) for (effective_req.writes) |write| if (write.json_null_fields.len != 0) return error.InvalidBatchRequest;
             if (!use_preprepared_rows and relationalColumns(self) != null and apply_schema_view == null)
                 return error.InvalidSchemaUpdateRequest;

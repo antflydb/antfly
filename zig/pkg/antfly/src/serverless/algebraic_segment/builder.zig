@@ -19,7 +19,7 @@ const Allocator = std.mem.Allocator;
 const algebraic_segment = @import("types.zig");
 const aggregate_math = @import("aggregate_math.zig");
 const codec = @import("codec.zig");
-const rowsource = @import("../../storage/rowsource/types.zig");
+const rowsource = @import("antfly_local_sources").storage_rowsource_types;
 
 pub const BuildOptions = struct {
     source_kind: algebraic_segment.SourceKind,

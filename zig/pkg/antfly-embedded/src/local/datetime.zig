@@ -62,11 +62,22 @@ pub fn parseDateTimeToNs(text: []const u8) ?u64 {
     return parseRfc3339ToNs(text) orelse parseDateToNs(text);
 }
 
+pub fn parseDateTimeToSignedNs(text: []const u8) ?i128 {
+    if (parseRfc3339ToSignedNs(text)) |ns| return ns;
+    if (text.len != 10 or text[4] != '-' or text[7] != '-' or !digits(text[0..4]) or !digits(text[5..7]) or !digits(text[8..10])) return null;
+    return civilDateTimeToSignedNs(std.fmt.parseInt(i64, text[0..4], 10) catch return null, std.fmt.parseInt(i64, text[5..7], 10) catch return null, std.fmt.parseInt(i64, text[8..10], 10) catch return null, 0, 0, 0, 0);
+}
+
 pub fn formatDateTimeNsAlloc(alloc: Allocator, ns: u64) ![]u8 {
-    const seconds = ns / std.time.ns_per_s;
-    const nanos = ns % std.time.ns_per_s;
-    const days: i64 = @intCast(seconds / 86_400);
-    const seconds_of_day = seconds % 86_400;
+    return formatDateTimeSignedNsAlloc(alloc, ns);
+}
+
+pub fn formatDateTimeSignedNsAlloc(alloc: Allocator, ns: i128) ![]u8 {
+    if (ns < @as(i128, daysFromCivil(0, 1, 1)) * std.time.ns_per_day or ns >= @as(i128, daysFromCivil(10000, 1, 1)) * std.time.ns_per_day) return error.InvalidDateTime;
+    const seconds = @divFloor(ns, std.time.ns_per_s);
+    const nanos: u64 = @intCast(@mod(ns, std.time.ns_per_s));
+    const days: i64 = @intCast(@divFloor(seconds, 86_400));
+    const seconds_of_day: u64 = @intCast(@mod(seconds, 86_400));
     const civil = civilFromDays(days);
     if (civil.year < 0 or civil.year > 9999) return error.InvalidDateTime;
     return try std.fmt.allocPrint(alloc, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}.{d:0>9}Z", .{

@@ -32,7 +32,7 @@ pub const lake_promotion = @import("serverless/build/lake_promotion.zig");
 pub const lake_rebuild = @import("serverless/build/lake_rebuild.zig");
 pub const algebraic_segment = @import("serverless/algebraic_segment/mod.zig");
 pub const external_source = @import("serverless/external_source/mod.zig");
-pub const external_source_catalog_binding = @import("serverless/external_source/catalog_binding.zig");
+pub const external_source_catalog_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
 pub const external_source_object_snapshot = @import("serverless/external_source/object_snapshot.zig");
 pub const external_source_iceberg_metadata = @import("serverless/external_source/iceberg_metadata.zig");
 pub const lake_rows_query = @import("serverless/query/lake_rows.zig");
@@ -50,7 +50,7 @@ pub const lake_iceberg_deletes = @import("serverless/query/lake_iceberg_deletes.
 pub const sidecar_source_binding = @import("serverless/segment/source_binding.zig");
 pub const sidecar_manifest = @import("serverless/segment/sidecar_manifest.zig");
 pub const manifest_artifact_ref = @import("serverless/manifest/artifact_ref.zig");
-pub const manifest_base_source = @import("serverless/manifest/base_source.zig");
+pub const manifest_base_source = @import("antfly_local_sources").serverless_manifest_base_source;
 pub const manifest_compatibility = @import("serverless/manifest/compatibility.zig");
 
 test {
@@ -99,3 +99,7 @@ pub const antfly_sources = @import("source_owner_physical.zig");
 
 /// Server fixtures retain this compilation root's source and type identity.
 pub const local_test_sources = if (@import("builtin").is_test) @import("local_test_sources.zig") else struct {};
+test {
+    _ = @import("serverless/query/lake_serving.zig");
+    _ = @import("antfly_local_sources").serverless_external_source_schema_binding;
+}

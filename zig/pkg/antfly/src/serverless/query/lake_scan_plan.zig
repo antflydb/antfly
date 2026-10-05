@@ -16,8 +16,8 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const external_binding = @import("../external_source/catalog_binding.zig");
-const external_source = @import("../external_source/types.zig");
+const external_binding = @import("antfly_local_sources").serverless_external_source_catalog_binding;
+const external_source = @import("antfly_local_sources").serverless_external_source_types;
 const range_io = @import("lake_range_io.zig");
 
 pub const Request = struct {

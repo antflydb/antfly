@@ -702,6 +702,25 @@ pub const Detail = enum(c_int) {
     graph_generation_mismatch,
     generation_publication_changed,
     initial_child_provision_already_committed,
+    // Append-only external query details preserve identity across runtime archives.
+    external_lake_read_only,
+    external_lake_snapshot_mismatch,
+    external_lake_schema_mismatch,
+    external_lake_schema_unavailable,
+    external_lake_field_identity_changed,
+    external_lake_object_changed,
+    empty_external_source_snapshot,
+    unsupported_external_lake_schema_type,
+    invalid_parquet_metadata,
+    invalid_parquet_footer,
+    invalid_parquet_footer_magic,
+    invalid_parquet_page,
+    unsupported_parquet_page,
+    parquet_page_too_large,
+    parquet_column_not_found,
+    unsupported_iceberg_schema_evolution,
+    unsupported_iceberg_delete_file,
+    invalid_sql_spill,
 };
 
 pub const Status = extern struct {
@@ -719,6 +738,25 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.ExternalLakeReadOnly => status(.forbidden, .external_lake_read_only),
+        error.ExternalLakeSnapshotMismatch => status(.conflict, .external_lake_snapshot_mismatch),
+        error.ExternalLakeSchemaMismatch => status(.conflict, .external_lake_schema_mismatch),
+        error.ExternalLakeSchemaUnavailable => status(.unavailable, .external_lake_schema_unavailable),
+        error.ExternalLakeFieldIdentityChanged => status(.conflict, .external_lake_field_identity_changed),
+        error.ExternalLakeObjectChanged => status(.conflict, .external_lake_object_changed),
+        error.EmptyExternalSourceSnapshot => status(.invalid_argument, .empty_external_source_snapshot),
+        error.UnsupportedExternalLakeSchemaType => status(.unsupported, .unsupported_external_lake_schema_type),
+        error.InvalidParquetMetadata => status(.corrupt, .invalid_parquet_metadata),
+        error.InvalidParquetFooter => status(.corrupt, .invalid_parquet_footer),
+        error.InvalidParquetFooterMagic => status(.corrupt, .invalid_parquet_footer_magic),
+        error.InvalidParquetPage => status(.corrupt, .invalid_parquet_page),
+        error.UnsupportedParquetPage => status(.unsupported, .unsupported_parquet_page),
+        error.ParquetPageTooLarge => status(.invalid_argument, .parquet_page_too_large),
+        error.ParquetColumnNotFound => status(.not_found, .parquet_column_not_found),
+        error.UnsupportedIcebergSchemaEvolution => status(.unsupported, .unsupported_iceberg_schema_evolution),
+        error.UnsupportedIcebergDeleteFile => status(.unsupported, .unsupported_iceberg_delete_file),
+        error.InvalidSqlSpill => status(.corrupt, .invalid_sql_spill),
+
         error.SettingAuthorityUnavailable => status(.unavailable, .setting_authority_unavailable),
         error.InvalidGenerationPublication => status(.invalid_argument, .invalid_generation_publication),
         error.GenerationPublicationChanged => status(.conflict, .generation_publication_changed),
@@ -1393,6 +1431,25 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .external_lake_read_only => "ExternalLakeReadOnly",
+        .external_lake_snapshot_mismatch => "ExternalLakeSnapshotMismatch",
+        .external_lake_schema_mismatch => "ExternalLakeSchemaMismatch",
+        .external_lake_schema_unavailable => "ExternalLakeSchemaUnavailable",
+        .external_lake_field_identity_changed => "ExternalLakeFieldIdentityChanged",
+        .external_lake_object_changed => "ExternalLakeObjectChanged",
+        .empty_external_source_snapshot => "EmptyExternalSourceSnapshot",
+        .unsupported_external_lake_schema_type => "UnsupportedExternalLakeSchemaType",
+        .invalid_parquet_metadata => "InvalidParquetMetadata",
+        .invalid_parquet_footer => "InvalidParquetFooter",
+        .invalid_parquet_footer_magic => "InvalidParquetFooterMagic",
+        .invalid_parquet_page => "InvalidParquetPage",
+        .unsupported_parquet_page => "UnsupportedParquetPage",
+        .parquet_page_too_large => "ParquetPageTooLarge",
+        .parquet_column_not_found => "ParquetColumnNotFound",
+        .unsupported_iceberg_schema_evolution => "UnsupportedIcebergSchemaEvolution",
+        .unsupported_iceberg_delete_file => "UnsupportedIcebergDeleteFile",
+        .invalid_sql_spill => "InvalidSqlSpill",
+
         .generation_publication_changed => "GenerationPublicationChanged",
         .initial_child_provision_already_committed => "InitialChildProvisionAlreadyCommitted",
         .initial_child_publication_changed => "InitialChildPublicationChanged",
@@ -2219,6 +2276,7 @@ test "storage owner contention retains retryability and exact identity" {
 }
 
 test "released main Detail identifiers retain their exact names and numeric values" {
+    @setEvalBranchQuota(2000);
     const std_test = @import("std");
     var fingerprint: u64 = 14695981039346656037;
     var count: usize = 0;
@@ -2260,4 +2318,30 @@ test "ordered receipt corruption preserves the released runtime status" {
     const renamed = statusFromError(error.CorruptOrderedApplyReceipt);
     try std.testing.expectEqual(old, renamed);
     try std.testing.expectEqual(error.CorruptRaftAppliedEntry, errorFromStatus(renamed));
+}
+
+test "external lake and spill errors retain exact identity across runtime archives" {
+    for ([_]anyerror{
+        error.ExternalLakeReadOnly,
+        error.ExternalLakeSnapshotMismatch,
+        error.ExternalLakeSchemaMismatch,
+        error.ExternalLakeSchemaUnavailable,
+        error.ExternalLakeFieldIdentityChanged,
+        error.ExternalLakeObjectChanged,
+        error.EmptyExternalSourceSnapshot,
+        error.UnsupportedExternalLakeSchemaType,
+        error.InvalidParquetMetadata,
+        error.InvalidParquetFooter,
+        error.InvalidParquetFooterMagic,
+        error.InvalidParquetPage,
+        error.UnsupportedParquetPage,
+        error.ParquetPageTooLarge,
+        error.ParquetColumnNotFound,
+        error.UnsupportedIcebergSchemaEvolution,
+        error.UnsupportedIcebergDeleteFile,
+        error.InvalidSqlSpill,
+    }) |err| {
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(statusFromError(err)));
+    }
 }
