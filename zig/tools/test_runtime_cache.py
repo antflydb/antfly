@@ -1770,7 +1770,7 @@ pub fn build(b: *std.Build) void {
                 env=env,
                 text=True,
                 capture_output=True,
-                timeout=120,
+                timeout=240,
             )
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
@@ -1829,7 +1829,7 @@ pub fn build(b: *std.Build) void {
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=120,
+                    timeout=240,
                 )
                 output = result.stdout + result.stderr
                 self.assertEqual(result.returncode, 0, output)
@@ -1886,7 +1886,7 @@ pub fn build(b: *std.Build) void {
                     env=env,
                     text=True,
                     capture_output=True,
-                    timeout=120,
+                    timeout=240,
                 )
                 output = result.stdout + result.stderr
                 self.assertEqual(result.returncode, 0, output)

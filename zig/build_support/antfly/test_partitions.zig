@@ -176,7 +176,12 @@ fn localNames(b: *std.Build, consumer: *std.Build.Module) []const []const u8 {
 
 fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Step.Compile {
     const tests = testObject(executable) orelse return null;
-    if (partitions.get(tests)) |existing| return existing;
+    const max_rss = if (tests.step.max_rss != 0) tests.step.max_rss else executable.step.max_rss;
+    const partition_max_rss = if (max_rss >= 12 * 1024 * 1024 * 1024 and max_rss < 14 * 1024 * 1024 * 1024) 14 * 1024 * 1024 * 1024 else max_rss;
+    if (partitions.get(tests)) |existing| {
+        if (existing.step.max_rss == 0) existing.step.max_rss = partition_max_rss;
+        return existing;
+    }
     const local = source_owner.localFor(tests.root_module) orelse return null;
     const names = localNames(b, tests.root_module);
     if (names.len == 0) return null;
@@ -200,7 +205,7 @@ fn partition(b: *std.Build, executable: *std.Build.Step.Compile) ?*std.Build.Ste
         .name = b.fmt("{s}-local", .{tests.name}),
         .root_module = root,
         .filters = tests.filters,
-        .max_rss = if (tests.step.max_rss >= 12 * 1024 * 1024 * 1024 and tests.step.max_rss < 14 * 1024 * 1024 * 1024) 14 * 1024 * 1024 * 1024 else tests.step.max_rss,
+        .max_rss = partition_max_rss,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     partitions.put(b.allocator, tests, artifact) catch @panic("OOM");
@@ -250,6 +255,7 @@ fn allowEmpty(run: *std.Build.Step.Run) void {
 
 fn inventory(b: *std.Build, artifact: *std.Build.Step.Compile, original: *std.Build.Step.Run) *std.Build.Step.Run {
     const run = b.addRunArtifact(artifact);
+    run.step.max_rss = original.step.max_rss;
     run.addArgs(&.{ "--list-tests", "--allow-empty-test-filter" });
     var i: usize = 0;
     while (i + 1 < original.argv.items.len) : (i += 1) {
@@ -299,6 +305,7 @@ pub fn add(b: *std.Build) void {
         if (hasPartition(run, local)) continue;
         const allow_empty = hasArg(run, "--allow-empty-test-filter");
         const child = if (run.producer == null) partitionRun(b, local, run) else b.addRunArtifact(local);
+        child.step.max_rss = run.step.max_rss;
         child.environ_map = run.environ_map;
         child.cwd = run.cwd;
         support.configureTestRun(child);
@@ -314,6 +321,7 @@ pub fn add(b: *std.Build) void {
         const tests = testObject(executable).?;
         if (tests.test_runner != null and tests.test_runner.?.mode == .simple) {
             const audit = b.addSystemCommand(&.{"python3"});
+            audit.step.max_rss = run.step.max_rss;
             expanded_audits.put(b.allocator, audit, {}) catch @panic("OOM");
             audit.addFileArg(b.path("tools/audit_test_selection.py"));
             if (allow_empty) audit.addArg("--allow-empty");
