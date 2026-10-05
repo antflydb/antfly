@@ -595,3 +595,46 @@ test "native refinements benchmark column-addressable window keys" {
         std.debug.print("native_refinement {{\"case\":\"column_window_keys\",\"rows\":512,\"payload_bytes\":8192,\"sample\":{d},\"row_ns\":{d},\"column_ns\":{d},\"row_read_bytes\":{d},\"column_read_bytes\":{d}}}\n", .{ sample, baseline.ns, refined.ns, baseline.read_bytes, refined.read_bytes });
     }
 }
+
+fn wideColumnCache(full: bool) !struct { ns: i96, decodes: usize, checksum: i64 } {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows = try disk.Rows.init(a, &manager, 8);
+    defer rows.deinit();
+    try rows.enableColumns();
+    var values: [8]Datum = undefined;
+    for (0..1024) |index| {
+        for (&values, 0..) |*value, column| value.* = Datum.json(.{ .integer = @intCast(index * 8 + column) });
+        try rows.append(.{ .values = &values, .keys = &.{}, .ordinal = index });
+    }
+    try rows.columnar.?.flush();
+    const entries = rows.columnar.?.cache;
+    if (!full) rows.columnar.?.cache = entries[0..4];
+    defer rows.columnar.?.cache = entries;
+    const start = now();
+    var checksum: i64 = 0;
+    for (0..1024) |index| for ((try rows.row(index)).values) |value| {
+        checksum += value.value.integer;
+    };
+    return .{ .ns = now() - start, .decodes = rows.columnar.?.decodes, .checksum = checksum };
+}
+test "native pipeline refinements benchmark wide active column cache" {
+    for (0..3) |sample| {
+        const first = try wideColumnCache(sample % 2 != 0);
+        const second = try wideColumnCache(sample % 2 == 0);
+        const bounded = if (sample % 2 == 0) first else second;
+        const active = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(bounded.checksum, active.checksum);
+        try std.testing.expect(active.decodes < bounded.decodes);
+        std.debug.print("native_refinement {{\"case\":\"wide_column_cache\",\"rows\":1024,\"width\":8,\"sample\":{d},\"four_entry_ns\":{d},\"active_ns\":{d},\"four_entry_decodes\":{d},\"active_decodes\":{d}}}\n", .{ sample, bounded.ns, active.ns, bounded.decodes, active.decodes });
+    }
+}
+
+test {
+    _ = @import("read_stream.zig");
+}

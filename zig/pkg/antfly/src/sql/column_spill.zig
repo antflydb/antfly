@@ -17,10 +17,11 @@ pub const Store = struct {
     pending: std.ArrayList(operators.Row) = .empty,
     arena: std.heap.ArenaAllocator,
     bytes: usize = 0,
-    cache: [4]Entry,
+    cache: []Entry,
+    cached_bytes: usize = 0,
     tick: u64 = 0,
     decodes: usize = 0,
-    const Entry = struct { arena: std.heap.ArenaAllocator, offset: ?usize = null, values: []const Datum = &.{}, touched: u64 = 0 };
+    const Entry = struct { arena: std.heap.ArenaAllocator, offset: ?usize = null, values: []const Datum = &.{}, touched: u64 = 0, bytes: usize = 0 };
     pub fn init(a: A, manager: *spill.Manager, width: usize) !Store {
         var file = try manager.create();
         errdefer file.close();
@@ -28,13 +29,19 @@ pub const Store = struct {
         errdefer directory.deinit();
         var locations = try disk.Integers.init(manager);
         errdefer locations.deinit();
-        const ordinals = try disk.Integers.init(manager);
-        var self: Store = .{ .a = a, .file = file, .directory = directory, .locations = locations, .ordinals = ordinals, .width = width, .arena = .init(a), .cache = undefined };
-        for (&self.cache) |*entry| entry.* = .{ .arena = .init(a) };
+        var ordinals = try disk.Integers.init(manager);
+        errdefer ordinals.deinit();
+        // Keep both sides of a comparison and one complete active column
+        // set hot. Actual payload retention also obeys a byte quota below.
+        const slots = @min(@max(4, @min(2048, width *| 2)), @max(4, manager.max_record_bytes / (4 * @sizeOf(Entry))));
+        const cache = try a.alloc(Entry, slots);
+        const self: Store = .{ .a = a, .file = file, .directory = directory, .locations = locations, .ordinals = ordinals, .width = width, .arena = .init(a), .cache = cache };
+        for (self.cache) |*entry| entry.* = .{ .arena = .init(a) };
         return self;
     }
     pub fn deinit(self: *Store) void {
-        for (&self.cache) |*entry| entry.arena.deinit();
+        for (self.cache) |*entry| entry.arena.deinit();
+        self.a.free(self.cache);
         self.pending.deinit(self.a);
         self.arena.deinit();
         self.ordinals.deinit();
@@ -80,7 +87,7 @@ pub const Store = struct {
         const offset = try self.directory.at(base + column);
         self.tick +%= 1;
         var oldest = &self.cache[0];
-        for (&self.cache) |*entry| {
+        for (self.cache) |*entry| {
             if (entry.offset == offset) {
                 entry.touched = self.tick;
                 if (lane >= entry.values.len) return error.InvalidSqlSpill;
@@ -89,12 +96,35 @@ pub const Store = struct {
             if (entry.offset == null or entry.touched < oldest.touched) oldest = entry;
         }
         oldest.offset = null;
+        self.cached_bytes -= oldest.bytes;
+        oldest.bytes = 0;
         _ = oldest.arena.reset(.free_all);
         const decoded = try self.file.read(oldest.arena.allocator(), offset);
         if (decoded.row.ordinal != base or lane >= decoded.row.values.len) return error.InvalidSqlSpill;
         oldest.values = decoded.row.values;
         oldest.offset = offset;
         oldest.touched = self.tick;
+        var bytes = decoded.row.values.len * @sizeOf(Datum);
+        for (decoded.row.values) |value| bytes +|= try operators.datumBytes(value);
+        oldest.bytes = bytes;
+        self.cached_bytes +|= bytes;
+        const budget = @max(1024, self.file.manager.max_record_bytes / 4);
+        while (self.cached_bytes > budget) {
+            var victim: ?*Entry = null;
+            for (self.cache) |*entry| {
+                // Cell comparisons borrow their two most recently accessed
+                // records. Never evict the first operand while loading the
+                // second, including when either admitted record is oversized.
+                if (entry == oldest or entry.offset == null or entry.touched == self.tick -% 1) continue;
+                if (victim == null or entry.touched < victim.?.touched) victim = entry;
+            }
+            const entry = victim orelse break; // One admitted oversized cell.
+            self.cached_bytes -= entry.bytes;
+            entry.bytes = 0;
+            entry.offset = null;
+            entry.values = &.{};
+            _ = entry.arena.reset(.free_all);
+        }
         self.decodes += 1;
         return oldest.values[lane];
     }

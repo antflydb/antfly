@@ -870,9 +870,13 @@ test "lake SQL typed stream applies Iceberg equality and position deletes before
     const cursor = try openPinned(alloc, lake.table, .{ .fields = &.{"amount"}, .limit = 1 }, .{}, &lake.source);
     defer cursor.close(cursor.ptr);
     try std.testing.expectEqual(@as(?u64, null), try cursor.count_rows.?(cursor.ptr));
+    const owner: *Owner = @ptrCast(@alignCast(cursor.ptr));
     for ([_]i64{ 1, 3, 5 }) |expected| {
         const page = try cursor.next(cursor.ptr, alloc, 1);
         defer page.deinit();
+        // Footer offsets live only in the current request/file plan; the
+        // cached immutable deletion index never grows a prefix directory.
+        try std.testing.expectEqualSlices(u64, &.{0}, owner.stream.position_starts);
         try std.testing.expectEqual(@as(usize, 1), page.rows.len);
         try std.testing.expectEqual(expected, page.rows[0].value.object.get("amount").?.integer);
     }

@@ -132,6 +132,24 @@ builds ahead of probing. Small budgets retain inline paths. Parallel operators
 share synchronized statement allocation, disk quotas and task admission, and join
 workers before releasing their buffers or snapshots.
 
+Ordered parallel scans transfer reference-counted projected column blocks to
+consumers without a row queue or a second retained copy. Delivery pages borrow
+bounded spans of those blocks. Consumer admission counts scan rows/pages in
+source order, including filtered and OFFSET rows; speculative later ranges do
+not spend the quota needed to satisfy LIMIT. Projection failures on skipped
+rows or beyond LIMIT remain unobserved, while predicate failures and required
+projection failures retain their successful prefixes. Small LIMITs and memory
+budgets continue to use the serial path.
+
+Numeric join/group keys hash finite integers and floats through their exact
+normalized dyadic representation, avoiding wide decimal conversion in the hot
+path. Exact JSON decimal tokens retain equality with primitive keys only when
+their values are equal without rounding. Window column caches admit an active
+column set under bounded metadata and payload budgets, avoiding repeated block
+decoding during wide row projection. Iceberg position-delete offsets are built
+once per request/file plan and shared by that plan's scan workers; cached delete
+membership remains immutable.
+
 ## Relationship To Arrow, Parquet, Iceberg, And Lance
 
 These are related, but they are not one layer:

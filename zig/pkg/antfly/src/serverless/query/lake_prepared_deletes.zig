@@ -115,10 +115,13 @@ pub const Prepared = struct {
         a.destroy(self);
     }
     pub fn matches(self: *Prepared, a: A, file: @import("../external_source/types.zig").FileEntry, batch: types.ColumnBatch, index: usize) !bool {
+        return self.matchesPositions(a, file, batch, index, &.{});
+    }
+    pub fn matchesPositions(self: *Prepared, a: A, file: @import("../external_source/types.zig").FileEntry, batch: types.ColumnBatch, index: usize, starts: []const u64) !bool {
         const ref = batch.row_refs[index];
         const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
         if (self.positions.count() != 0) {
-            const ordinal = try std.math.add(u64, ref.external.row_ordinal, try positionPrefix(file, ref.external.row_group_ordinal));
+            const ordinal = try std.math.add(u64, ref.external.row_ordinal, try positionPrefix(file, ref.external.row_group_ordinal, starts));
             if (self.positions.contains(.{ .file = info.index, .ordinal = ordinal })) return true;
         }
         for (info.equality) |equality_index| {
@@ -133,6 +136,9 @@ pub const Prepared = struct {
     /// Build one deletion mask per physical batch. Bind field sets once and
     /// cache dictionary key parts; reuse the canonical key buffer for lanes.
     pub fn mask(self: *Prepared, a: A, file: @import("../external_source/types.zig").FileEntry, batch: types.ColumnBatch, selected: []bool) !void {
+        return self.maskPositions(a, file, batch, selected, &.{});
+    }
+    pub fn maskPositions(self: *Prepared, a: A, file: @import("../external_source/types.zig").FileEntry, batch: types.ColumnBatch, selected: []bool, starts: []const u64) !void {
         if (selected.len != batch.rowCount()) return error.InvalidParquetRowGroupBatch;
         try batch.validate();
         const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
@@ -142,7 +148,7 @@ pub const Prepared = struct {
             for (batch.row_refs, selected) |ref, *keep| {
                 if (!keep.*) continue;
                 if (group != ref.external.row_group_ordinal) {
-                    prefix = try positionPrefix(file, ref.external.row_group_ordinal);
+                    prefix = try positionPrefix(file, ref.external.row_group_ordinal, starts);
                     group = ref.external.row_group_ordinal;
                 }
                 const ordinal = try std.math.add(u64, ref.external.row_ordinal, prefix);
@@ -208,14 +214,49 @@ pub const Prepared = struct {
     pub fn bindFile(self: *Prepared, file: @import("../external_source/types.zig").FileEntry) !void {
         if (self.positions.count() == 0) return;
         if (!self.files.contains(file.file_id)) return error.ExternalSourceFileNotFound;
-        if (file.row_groups.len != 0) _ = try positionPrefix(file, @intCast(file.row_groups.len - 1));
+        if (file.row_groups.len != 0) _ = try positionPrefix(file, @intCast(file.row_groups.len - 1), &.{});
     }
     // Footer-derived offsets belong to the request's file plan. The cached
     // membership index remains immutable and its retained size cannot grow.
-    fn positionPrefix(file: @import("../external_source/types.zig").FileEntry, ordinal: u32) !u64 {
+    fn positionPrefix(file: @import("../external_source/types.zig").FileEntry, ordinal: u32, starts: []const u64) !u64 {
         if (ordinal >= file.row_groups.len) return error.InvalidParquetRowGroupBatch;
+        if (starts.len != 0) {
+            if (starts.len != file.row_groups.len) return error.InvalidParquetRowGroupBatch;
+            return starts[ordinal];
+        }
         var total: u64 = 0;
         for (file.row_groups[0..ordinal]) |group| total = try std.math.add(u64, total, group.row_count);
         return total;
     }
 };
+
+test "external lake request position offsets preserve empty groups and cached membership" {
+    const a = std.testing.allocator;
+    var prepared: Prepared = .{ .arena = .init(a), .delete_files = &.{}, .equality = &.{}, .columns = &.{} };
+    defer prepared.arena.deinit();
+    const owned = prepared.arena.allocator();
+    try prepared.files.put(owned, "f", .{ .index = 0 });
+    try prepared.positions.put(owned, .{ .file = 0, .ordinal = 8 }, {});
+    var groups = [_]@import("../external_source/types.zig").RowGroup{
+        .{ .ordinal = 0, .row_count = 3 },
+        .{ .ordinal = 1, .row_count = 0 },
+        .{ .ordinal = 2, .row_count = 5 },
+        .{ .ordinal = 3, .row_count = 2 },
+    };
+    const file: @import("../external_source/types.zig").FileEntry = .{ .file_id = @constCast("f"), .object_uri = @constCast("object://b/f"), .byte_len = 1, .row_count = 10, .row_groups = &groups };
+    const batch: types.ColumnBatch = .{
+        .snapshot = .{ .table_id = "t", .snapshot_id = "s" },
+        .row_refs = &.{
+            .{ .external = .{ .source_id = "t", .snapshot_id = "s", .file_id = "f", .row_group_ordinal = 3, .row_ordinal = 0 } },
+            .{ .external = .{ .source_id = "t", .snapshot_id = "s", .file_id = "f", .row_group_ordinal = 3, .row_ordinal = 1 } },
+        },
+        .columns = &.{},
+    };
+    var selected = [_]bool{ true, true };
+    try prepared.maskPositions(a, file, batch, &selected, &.{ 0, 3, 3, 8 });
+    try std.testing.expectEqualSlices(bool, &.{ false, true }, &selected);
+    try std.testing.expect(try prepared.matches(a, file, batch, 0));
+    try std.testing.expect(!try prepared.matchesPositions(a, file, batch, 1, &.{ 0, 3, 3, 8 }));
+    try std.testing.expectError(error.InvalidParquetRowGroupBatch, prepared.matchesPositions(a, file, batch, 0, &.{0}));
+    try std.testing.expectEqual(@as(usize, 1), prepared.positions.count());
+}

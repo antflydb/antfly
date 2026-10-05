@@ -201,64 +201,136 @@ const Spool = @import("result_cursor.zig").Cursor;
 /// only for the delivery page; smaller fetch sizes do not clone an execution
 /// batch into a second pending row representation.
 const PendingColumns = struct {
-    backing: std.mem.Allocator,
-    arena: std.heap.ArenaAllocator,
-    values: @import("typed_store.zig").Store,
+    /// One projected block per producer. Credit follows the final delivery
+    /// span, and can outlive the joined worker without borrowing its address.
+    const Credit = struct {
+        a: std.mem.Allocator,
+        io: std.Io,
+        ready: std.Io.Event = .unset,
+        stopped: std.atomic.Value(bool) = .init(false),
+        refs: std.atomic.Value(usize) = .init(1),
+        fn create(a: std.mem.Allocator, io: std.Io) !*Credit {
+            const self = try a.create(Credit);
+            self.* = .{ .a = a, .io = io };
+            self.ready.set(io);
+            return self;
+        }
+        fn acquire(self: *Credit) !bool {
+            try self.ready.wait(self.io);
+            self.ready.reset();
+            return !self.stopped.load(.acquire);
+        }
+        fn stop(self: *Credit) void {
+            self.stopped.store(true, .release);
+            self.ready.set(self.io);
+        }
+        fn release(self: *Credit) void {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) self.a.destroy(self);
+        }
+    };
+    const Owner = struct {
+        a: std.mem.Allocator,
+        arena: std.heap.ArenaAllocator,
+        values: @import("typed_store.zig").Store,
+        positions: std.ArrayList(usize) = .empty,
+        errors: std.ArrayList(?anyerror) = .empty,
+        refs: std.atomic.Value(usize) = .init(1),
+        credit: ?*Credit = null,
+    };
+    owner: *Owner,
+    values: *@import("typed_store.zig").Store,
+    begin: usize = 0,
+    end: ?usize = null,
+    scan_rows: usize = 0,
     exhausted: bool = false,
     terminal_error: ?anyerror = null,
     fn create(a: std.mem.Allocator) !*PendingColumns {
+        const owner = try a.create(Owner);
+        errdefer a.destroy(owner);
         const self = try a.create(PendingColumns);
-        self.* = .{ .backing = a, .arena = .init(a), .values = undefined };
-        self.values = .init(self.arena.allocator());
+        owner.* = .{ .a = a, .arena = .init(a), .values = undefined };
+        owner.values = .init(owner.arena.allocator());
+        self.* = .{ .owner = owner, .values = &owner.values };
         return self;
     }
+    fn len(self: *const PendingColumns) usize {
+        return (self.end orelse self.values.len) - self.begin;
+    }
+    fn view(self: *PendingColumns, begin: usize, end: usize) !*PendingColumns {
+        const part = try self.owner.a.create(PendingColumns);
+        _ = self.owner.refs.fetchAdd(1, .monotonic);
+        part.* = .{ .owner = self.owner, .values = self.values, .begin = self.begin + begin, .end = self.begin + end };
+        return part;
+    }
+    fn cell(self: *const PendingColumns, a: std.mem.Allocator, row: usize, column: usize) !@import("scalar.zig").Datum {
+        return self.values.cell(a, self.begin + row, column);
+    }
+    fn record(self: *PendingColumns, position: usize, failure: ?anyerror) !void {
+        const a = self.owner.arena.allocator();
+        try self.owner.positions.append(a, position);
+        try self.owner.errors.append(a, failure);
+    }
+    fn credit(self: *PendingColumns, control: *Credit) void {
+        std.debug.assert(self.owner.credit == null);
+        _ = control.refs.fetchAdd(1, .monotonic);
+        self.owner.credit = control;
+    }
     fn deinit(self: *PendingColumns) void {
-        const a = self.backing;
-        self.values.deinit();
-        self.arena.deinit();
+        const owner = self.owner;
+        const a = owner.a;
         a.destroy(self);
+        if (owner.refs.fetchSub(1, .acq_rel) == 1) {
+            const control = owner.credit;
+            owner.values.deinit();
+            owner.arena.deinit();
+            a.destroy(owner);
+            // Free the payload before allowing its producer to allocate again.
+            if (control) |lease| {
+                lease.ready.set(lease.io);
+                lease.release();
+            }
+        }
     }
 };
 
-// Each lane owns a complete scan/filter/project pipeline. Ordered ranges and
-// bounded queues preserve LIMIT/OFFSET and defer later-lane errors until read.
+// Workers publish owned column blocks. Only the ordered consumer admits scan
+// progress, applies OFFSET/LIMIT and exposes deferred expression failures.
 const ParallelScan = struct {
     a: std.mem.Allocator,
-    manager: @import("spill.zig").Manager,
+    io: std.Io,
     lanes: []Lane,
     storage: []Lane = &.{},
     lane: usize = 0,
-    visited: std.atomic.Value(usize) = .init(0),
-    pages: std.atomic.Value(usize) = .init(0),
     const Lane = struct {
-        parent: *ParallelScan,
         stream: Stream,
-        pipe: *@import("parallel_output.zig").Pipe,
+        credit: *PendingColumns.Credit,
+        slots: [2]*PendingColumns = undefined,
+        queue: std.Io.Queue(*PendingColumns) = undefined,
+        current: ?*PendingColumns = null,
+        index: usize = 0,
+        consumed_scan: usize = 0,
+        failure: ?anyerror = null,
         task: ?@import("parallel_scheduler.zig").Task(anyerror!void) = null,
         fn run(self: *Lane) anyerror!void {
-            var failure: ?anyerror = null;
             self.produce() catch |err| {
-                failure = err;
+                self.failure = err;
             };
-            self.pipe.finish(failure);
+            self.queue.close(self.stream.context.backend.execution_io.?);
         }
         fn produce(self: *Lane) !void {
+            const io = self.stream.context.backend.execution_io.?;
             while (!self.stream.exhausted) {
+                if (!try self.credit.acquire()) return;
                 const before = self.stream.visited;
-                const before_pages = self.stream.pages;
                 const pending = try self.stream.executeColumns(self.stream.context.limits.executionRows());
-                defer pending.deinit();
-                const scanned = self.stream.visited - before;
-                if (scanned > self.stream.context.limits.scan_rows -| self.parent.visited.fetchAdd(scanned, .monotonic)) return error.SqlProgramLimitExceeded;
-                const pages = self.stream.pages - before_pages;
-                if (pages > self.stream.context.limits.scan_pages -| self.parent.pages.fetchAdd(pages, .monotonic)) return error.SqlProgramLimitExceeded;
-                var arena = std.heap.ArenaAllocator.init(self.stream.budget.allocator());
-                defer arena.deinit();
-                for (0..pending.values.len) |index| {
-                    _ = arena.reset(.retain_capacity);
-                    try self.pipe.append(.{ .values = try pending.values.row(arena.allocator(), index), .keys = &.{}, .ordinal = 0 });
-                }
-                if (pending.terminal_error) |err| return err;
+                pending.credit(self.credit);
+                var owned = true;
+                defer if (owned) pending.deinit();
+                pending.scan_rows = self.stream.visited - before;
+                const terminal = pending.terminal_error != null;
+                _ = try self.queue.put(io, &.{pending}, 1);
+                owned = false;
+                if (terminal) break;
             }
         }
     };
@@ -266,12 +338,7 @@ const ParallelScan = struct {
         const cursor = source.cursor orelse return null;
         const split = cursor.split_ordered orelse return null;
         const io = source.context.backend.execution_io orelse return null;
-        // A bounded LIMIT must not spend its scan quota on speculative later
-        // ranges. Keep it serial until ordered progress can be admitted by
-        // the consumer independently of worker lookahead.
-        if (source.remaining != std.math.maxInt(usize)) return null;
-        if (cursor.estimated_rows) |rows| if (rows > source.context.limits.scan_rows) return null;
-        if (source.skip != 0 or source.context.limits.retained_bytes < 16 * 1024 * 1024 or source.remaining < 8192) return null;
+        if (source.context.limits.retained_bytes < 16 * 1024 * 1024 or source.remaining < 8192) return null;
         if ((cursor.estimated_rows orelse 0) < 8192 and (cursor.estimated_bytes orelse 0) < 2 * 1024 * 1024) return null;
         const a = source.budget.allocator();
         const children = (try split(cursor.ptr, a, 2)) orelse return null;
@@ -283,13 +350,13 @@ const ParallelScan = struct {
         var moved: usize = 0;
         errdefer for (children[moved..]) |child| child.close(child.ptr);
         const self = try a.create(ParallelScan);
-        self.* = .{ .a = a, .manager = .{ .alloc = a, .io = io, .context = source.context.backend.ptr, .checkpoint = source.context.backend.vtable.checkpoint }, .lanes = &.{} };
+        self.* = .{ .a = a, .io = io, .lanes = &.{} };
         errdefer self.close();
         const lanes = try a.alloc(Lane, children.len);
         self.storage = lanes;
         for (children, lanes) |child, *lane| {
-            const pipe = try @import("parallel_output.zig").Pipe.create(&self.manager, 8192);
-            lane.* = .{ .parent = self, .pipe = pipe, .stream = .{
+            const credit = try PendingColumns.Credit.create(a, io);
+            lane.* = .{ .credit = credit, .stream = .{
                 .budget = .{ .backing = a, .limit = source.context.limits.retained_bytes / (children.len * 2) },
                 .arena = undefined,
                 .context = source.context,
@@ -299,7 +366,10 @@ const ParallelScan = struct {
                 .skip = 0,
                 .remaining = std.math.maxInt(usize),
                 .parallel_checked = true,
+                .projected_alloc = a,
+                .one_scan_page = true,
             } };
+            lane.queue = .init(&lane.slots);
             lane.stream.arena = .init(lane.stream.budget.allocator());
             lane.stream.context.alloc = lane.stream.budget.allocator();
             lane.stream.context.arena = lane.stream.arena.allocator();
@@ -307,7 +377,7 @@ const ParallelScan = struct {
             moved += 1;
             self.lanes = lanes[0..moved];
         }
-        // No inline producer: queue backpressure needs a concurrent consumer.
+        // A producer needs a concurrent consumer for bounded backpressure.
         for (self.lanes) |*lane| {
             lane.task = @import("parallel_scheduler.zig").global().submit(io, lane.stream.budget.limit, Lane.run, .{lane});
             if (lane.task == null) {
@@ -318,48 +388,97 @@ const ParallelScan = struct {
         return self;
     }
     fn close(self: *ParallelScan) void {
-        for (self.lanes) |*lane| lane.pipe.stop();
         for (self.lanes) |*lane| {
-            if (lane.task) |*task| task.cancel(self.manager.io) catch {};
-            lane.pipe.close();
+            lane.credit.stop();
+            lane.queue.close(self.io);
+        }
+        for (self.lanes) |*lane| {
+            if (lane.task) |*task| task.cancel(self.io) catch {};
+            if (lane.current) |page| page.deinit();
+            while (true) {
+                var page: [1]*PendingColumns = undefined;
+                const count = lane.queue.getUncancelable(self.io, &page, 0) catch break;
+                if (count == 0) break;
+                page[0].deinit();
+            }
             if (lane.stream.cursor) |cursor| cursor.close(cursor.ptr);
+            lane.credit.release();
             lane.stream.arena.deinit();
             std.debug.assert(lane.stream.budget.live == 0);
         }
         self.a.free(self.storage);
-        self.manager.deinit();
         self.a.destroy(self);
     }
+    fn advanceScan(source: *Stream, lane: *Lane, position: usize) !void {
+        const delta = position - lane.consumed_scan;
+        if (delta > source.context.limits.scan_rows -| source.visited) return error.SqlProgramLimitExceeded;
+        source.visited += delta;
+        lane.consumed_scan = position;
+    }
     fn pull(self: *ParallelScan, source: *Stream, max_rows: u32) !*PendingColumns {
-        const pending = try PendingColumns.create(source.budget.allocator());
-        errdefer pending.deinit();
-        var arena = std.heap.ArenaAllocator.init(source.budget.allocator());
-        defer arena.deinit();
-        while (self.lane < self.lanes.len and pending.values.len < max_rows and source.remaining != 0) {
-            _ = arena.reset(.retain_capacity);
+        while (self.lane < self.lanes.len and source.remaining != 0) {
             const lane = &self.lanes[self.lane];
-            const row = (try lane.pipe.next(arena.allocator())) orelse {
-                if (lane.task) |*task| {
-                    try task.await(self.manager.io);
-                    lane.task = null;
-                }
-                if (lane.pipe.terminal_error) |err| {
-                    if (pending.values.len == 0) return err;
-                    pending.terminal_error = err;
+            if (lane.current == null) {
+                var item: [1]*PendingColumns = undefined;
+                _ = lane.queue.get(self.io, &item, 1) catch |err| switch (err) {
+                    error.Closed => {
+                        if (lane.task) |*task| {
+                            const result = task.await(self.io);
+                            lane.task = null;
+                            try result;
+                        }
+                        if (lane.failure) |failure| return failure;
+                        self.lane += 1;
+                        continue;
+                    },
+                    else => return err,
+                };
+                lane.current = item[0];
+                lane.index = 0;
+                lane.consumed_scan = 0;
+                source.pages += 1;
+                if (source.pages > source.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
+            }
+            const current = lane.current.?;
+            var failure: ?anyerror = null;
+            while (source.skip != 0 and lane.index < current.len()) {
+                try advanceScan(source, lane, current.owner.positions.items[current.begin + lane.index]);
+                lane.index += 1;
+                source.skip -= 1;
+            }
+            const begin = lane.index;
+            const end = @min(current.len(), begin + @min(max_rows, source.remaining));
+            while (lane.index < end) {
+                advanceScan(source, lane, current.owner.positions.items[current.begin + lane.index]) catch |err| {
+                    failure = err;
+                    break;
+                };
+                if (current.owner.errors.items[current.begin + lane.index]) |err| {
+                    failure = err;
                     break;
                 }
-                self.lane += 1;
-                continue;
-            };
-            if (source.skip != 0) {
-                source.skip -= 1;
-                continue;
+                lane.index += 1;
             }
-            _ = try pending.values.append(row.values);
-            source.remaining -= 1;
+            const part = try current.view(begin, lane.index);
+            source.remaining -= part.len();
+            source.emitted += part.len();
+            if (source.remaining != 0 and failure == null and lane.index == current.len()) {
+                advanceScan(source, lane, current.scan_rows) catch |err| {
+                    failure = err;
+                };
+                failure = failure orelse current.terminal_error;
+                current.deinit();
+                lane.current = null;
+            }
+            part.terminal_error = failure;
+            part.exhausted = failure == null and source.remaining == 0;
+            if (part.len() != 0 or part.exhausted) return part;
+            part.deinit();
+            if (failure) |err| return err;
         }
-        pending.exhausted = pending.terminal_error == null and (self.lane == self.lanes.len or source.remaining == 0);
-        return pending;
+        const empty = try PendingColumns.create(self.a);
+        empty.exhausted = true;
+        return empty;
     }
 };
 
@@ -385,6 +504,8 @@ pub const Stream = struct {
     delivery_error: ?anyerror = null,
     parallel: ?*ParallelScan = null,
     parallel_checked: bool = false,
+    projected_alloc: ?std.mem.Allocator = null,
+    one_scan_page: bool = false,
 
     /// Caller retains the compiled plan and backend until close. A null result
     /// selects the bounded materializing executor for unsupported shapes or
@@ -411,6 +532,8 @@ pub const Stream = struct {
         self.delivery_error = null;
         self.parallel = null;
         self.parallel_checked = false;
+        self.projected_alloc = null;
+        self.one_scan_page = false;
         self.settings = null;
         errdefer if (self.settings) |view| view.deinit();
         const arena = self.arena.allocator();
@@ -613,10 +736,10 @@ pub const Stream = struct {
             }
             return pending;
         }
-        const pending = try PendingColumns.create(self.budget.allocator());
+        const pending = try PendingColumns.create(self.projected_alloc orelse self.budget.allocator());
         errdefer pending.deinit();
         self.fillColumns(pending, max_rows) catch |err| {
-            if (pending.values.failed or pending.values.len == 0) return err;
+            if (pending.values.failed or pending.len() == 0) return err;
             pending.terminal_error = err;
         };
         if (self.exhausted or pending.terminal_error != null) {
@@ -628,27 +751,27 @@ pub const Stream = struct {
     }
     fn fillColumns(self: *Stream, pending: *PendingColumns, max_rows: u32) !void {
         var output_bytes: usize = 0;
-        while (!self.exhausted and pending.values.len < max_rows) {
+        while (!self.exhausted and pending.len() < max_rows) {
             try self.context.checkpoint();
             self.pages += 1;
             if (self.pages > self.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
             defer scratch.deinit();
             const a = scratch.allocator();
-            const wanted: u32 = @intCast(@min(@min(self.context.limits.executionRows(), @max(@as(usize, 1), self.context.limits.retained_bytes / (16 * 1024 + self.fields.len * @sizeOf(@import("scalar.zig").Datum) * 16))), @min(self.remaining, max_rows - pending.values.len) +| self.skip));
+            const wanted: u32 = @intCast(@min(@min(self.context.limits.executionRows(), @max(@as(usize, 1), self.context.limits.retained_bytes / (16 * 1024 + self.fields.len * @sizeOf(@import("scalar.zig").Datum) * 16))), @min(self.remaining, max_rows - pending.len()) +| self.skip));
             const cursor = self.cursor.?;
             const page = try cursor.next_columns.?(cursor.ptr, a, wanted);
             if (page.selection.len > wanted or page.selection.len > self.context.limits.scan_rows -| self.visited) return error.SqlProgramLimitExceeded;
             self.visited += page.selection.len;
-            const before = pending.values.len;
+            const before = pending.len();
             const bytes = self.appendColumnPage(pending, a, page) catch |err| switch (err) {
-                error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlProgramLimitExceeded, error.InvalidSqlDateTime, error.SqlCardinalityViolation => if (pending.values.len == before) try self.appendScalarColumnPage(pending, a, page) else return err,
+                error.SqlDivisionByZero, error.SqlNumericOutOfRange, error.SqlTypeMismatch, error.SqlProgramLimitExceeded, error.InvalidSqlDateTime, error.SqlCardinalityViolation => if (pending.len() == before) try self.appendScalarColumnPage(pending, a, page) else return err,
                 else => return err,
             };
             output_bytes +|= bytes;
             self.exhausted = self.remaining == 0 or page.after == null;
 
-            if (output_bytes >= @min(self.context.limits.page_bytes, @max(@as(usize, 1024), self.context.limits.retained_bytes / 16))) break;
+            if (self.one_scan_page or output_bytes >= @min(self.context.limits.page_bytes, @max(@as(usize, 1024), self.context.limits.retained_bytes / 16))) break;
         }
     }
     fn appendColumnPage(self: *Stream, pending: *PendingColumns, backing: std.mem.Allocator, page: catalog.ColumnPage) !usize {
@@ -659,6 +782,7 @@ pub const Stream = struct {
         var output_bytes: usize = 0;
         const predicates = if (self.context.binding.scalars.predicate) |*program| try self.columnProgram(a, program, page) else null;
         var selection: std.ArrayList(usize) = .empty;
+        var positions: std.ArrayList(usize) = .empty;
         for (page.selection, 0..) |physical, index| {
             if (predicates) |values| {
                 if (values[index].sql_null) continue;
@@ -670,6 +794,7 @@ pub const Stream = struct {
                 continue;
             }
             try selection.append(a, physical);
+            if (self.one_scan_page) try positions.append(a, index + 1);
         }
         const selected: catalog.ColumnPage = .{ .batch = page.batch, .selection = selection.items };
         const projections = try a.alloc(?[]const @import("scalar.zig").Datum, self.fields.len);
@@ -684,15 +809,21 @@ pub const Stream = struct {
         for (evaluated, programs.items, slots.items) |values, program, index| projections[index] = values orelse try self.columnProgram(a, program, selected);
         for (0..selection.items.len) |index| {
             const row = try a.alloc(@import("scalar.zig").Datum, self.fields.len);
+            var projection_error: ?anyerror = null;
             for (self.fields, self.context.binding.columns, row, 0..) |field, column, *value, ordinal| {
                 const cell = if (projections[ordinal]) |values| values[index] else blk: {
                     const raw = try selected.cell(a, index, field);
                     break :blk @import("scalar.zig").Datum{ .value = raw.value, .sql_null = raw.sql_null };
                 };
-                value.* = .{ .value = try describe.coerceAlloc(a, cell.value, column.type), .sql_null = cell.sql_null };
+                value.* = .{ .value = describe.coerceAlloc(a, cell.value, column.type) catch |err| blk: {
+                    if (!self.one_scan_page or err == error.OutOfMemory) return err;
+                    projection_error = projection_error orelse err;
+                    break :blk Json.null;
+                }, .sql_null = cell.sql_null };
                 output_bytes +|= try @import("operators.zig").datumBytes(value.*);
             }
             _ = try pending.values.append(row);
+            if (self.one_scan_page) try pending.record(positions.items[index], projection_error);
             self.remaining -= 1;
             self.emitted += 1;
         }
@@ -721,18 +852,28 @@ pub const Stream = struct {
             }
             if (self.remaining == 0) break;
             const one: catalog.ColumnPage = .{ .batch = page.batch, .selection = &.{physical} };
+            var projection_error: ?anyerror = null;
             const row = try a.alloc(@import("scalar.zig").Datum, self.fields.len);
             for (self.fields, self.context.binding.columns, row, 0..) |field, column, *value, ordinal| {
                 const cell = if (self.context.binding.scalars.projections[ordinal]) |program|
-                    try self.context.evaluate(a, program, cells)
+                    self.context.evaluate(a, program, cells) catch |err| blk: {
+                        if (!self.one_scan_page or err == error.OutOfMemory or err == error.QueryCanceled or err == error.DeadlineExceeded) return err;
+                        projection_error = projection_error orelse err;
+                        break :blk @import("scalar.zig").Datum{};
+                    }
                 else blk: {
                     const raw = try one.cell(a, 0, field);
                     break :blk @import("scalar.zig").Datum{ .value = raw.value, .sql_null = raw.sql_null };
                 };
-                value.* = .{ .value = try describe.coerceAlloc(a, cell.value, column.type), .sql_null = cell.sql_null };
+                value.* = .{ .value = describe.coerceAlloc(a, cell.value, column.type) catch |err| blk: {
+                    if (!self.one_scan_page or err == error.OutOfMemory) return err;
+                    projection_error = projection_error orelse err;
+                    break :blk Json.null;
+                }, .sql_null = cell.sql_null };
                 output_bytes +|= try @import("operators.zig").datumBytes(value.*);
             }
             _ = try pending.values.append(row);
+            if (self.one_scan_page) try pending.record(index + 1, projection_error);
             self.remaining -= 1;
             self.emitted += 1;
         }
@@ -767,16 +908,16 @@ pub const Stream = struct {
                 self.exhausted = false;
             }
             const pending = self.pending_columns.?;
-            if (self.pending_index == pending.values.len) if (pending.terminal_error) |err| {
+            if (self.pending_index == pending.len()) if (pending.terminal_error) |err| {
                 if (rows.items.len != 0) break;
                 return err;
             };
-            while (self.pending_index < pending.values.len and rows.items.len < max_rows) {
+            while (self.pending_index < pending.len() and rows.items.len < max_rows) {
                 const index = self.pending_index;
                 const row = try a.alloc(Json, self.context.binding.columns.len);
                 const nulls = try a.alloc(bool, self.context.binding.columns.len);
                 for (row, nulls, 0..) |*out, *sql_null, column| {
-                    const datum = try pending.values.cell(a, index, column);
+                    const datum = try pending.cell(a, index, column);
                     sql_null.* = datum.sql_null;
                     out.* = (try @import("operators.zig").cloneDatum(a, datum)).value;
                     bytes +|= try @import("operators.zig").datumBytes(datum);
@@ -786,7 +927,7 @@ pub const Stream = struct {
                 self.pending_index += 1;
                 if (bytes >= self.context.limits.page_bytes) break;
             }
-            if (self.pending_index == pending.values.len and pending.terminal_error == null) {
+            if (self.pending_index == pending.len() and pending.terminal_error == null) {
                 self.exhausted = pending.exhausted;
                 pending.deinit();
                 self.pending_columns = null;
@@ -1227,7 +1368,7 @@ test "SQL ordered parallel scan evaluates complete pipelines with bounded delive
     }
 }
 
-test "SQL ordered parallel scan declines bounded limit before spending scan quota" {
+test "SQL ordered parallel scan admits bounded limits without charging speculative ranges" {
     const a = std.testing.allocator;
     var fixture: OrderedColumns = .{};
     var backend = Fixture.backend(undefined);
@@ -1243,6 +1384,126 @@ test "SQL ordered parallel scan declines bounded limit before spending scan quot
     defer compiled.deinit();
     const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_rows = 8192 })).?;
     defer stream.close();
-    try std.testing.expectEqual(null, try ParallelScan.start(stream));
-    try std.testing.expectEqual(@as(usize, 0), fixture.splits);
+    var count: usize = 0;
+    while (true) {
+        var page = try stream.next(137);
+        defer page.deinit();
+        for (page.output.rows) |row| {
+            try std.testing.expectEqual(@as(i64, @intCast(count)), row[0].integer);
+            count += 1;
+        }
+        if (page.exhausted) break;
+    }
+    try std.testing.expectEqual(@as(usize, 8192), count);
+    try std.testing.expectEqual(@as(usize, 8192), stream.visited);
+    try std.testing.expectEqual(@as(usize, 1), fixture.splits);
+}
+
+test "SQL ordered block admission preserves offsets filtered progress and deferred failures" {
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, count: usize, scan_rows: usize, failure: ?anyerror = null };
+    for ([_]Case{
+        .{ .sql = "SELECT n FROM docs LIMIT 8192 OFFSET 1000", .count = 8192, .scan_rows = 9192 },
+        .{ .sql = "SELECT 1 / (n - 1) FROM docs LIMIT 8192 OFFSET 2", .count = 8192, .scan_rows = 8194 },
+        .{ .sql = "SELECT 1 / (9500 - n) FROM docs LIMIT 8192 OFFSET 1000", .count = 8192, .scan_rows = 9192 },
+        .{ .sql = "SELECT 1 / (9000 - n) FROM docs LIMIT 8192 OFFSET 1000", .count = 8000, .scan_rows = 10000, .failure = error.SqlDivisionByZero },
+        .{ .sql = "SELECT n FROM docs WHERE n % 10000 >= 5000 LIMIT 8192 OFFSET 2", .count = 4998, .scan_rows = 10000 },
+        .{ .sql = "SELECT n FROM docs WHERE n % 2 = 0 LIMIT 8192", .count = 4500, .scan_rows = 9000, .failure = error.SqlProgramLimitExceeded },
+        .{ .sql = "SELECT n FROM docs WHERE 1 / (1 - n) > 0 LIMIT 8192 OFFSET 2", .count = 0, .scan_rows = 10000, .failure = error.SqlDivisionByZero },
+    }) |case| {
+        var fixture: OrderedColumns = .{};
+        var backend = Fixture.backend(undefined);
+        var vtable = backend.vtable.*;
+        vtable.open_scan = OrderedColumns.open;
+        vtable.checkpoint = struct {
+            fn check(_: *anyopaque) !void {}
+        }.check;
+        backend.ptr = &fixture;
+        backend.vtable = &vtable;
+        backend.execution_io = std.testing.io;
+        var compiled = try compiler.compile(a, case.sql, .{});
+        defer compiled.deinit();
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .scan_rows = case.scan_rows })).?;
+        defer stream.close();
+        var count: usize = 0;
+        var failure: ?anyerror = null;
+        while (true) {
+            var page = stream.next(137) catch |err| {
+                failure = err;
+                break;
+            };
+            defer page.deinit();
+            if (std.mem.eql(u8, case.sql, "SELECT n FROM docs LIMIT 8192 OFFSET 1000")) for (page.output.rows, count..) |row, index| try std.testing.expectEqual(@as(i64, @intCast(index + 1000)), row[0].integer);
+            count += page.output.rows.len;
+            if (page.exhausted) break;
+        }
+        try std.testing.expectEqual(case.failure, failure);
+        try std.testing.expectEqual(case.count, count);
+        try std.testing.expect(stream.visited <= case.scan_rows);
+        try std.testing.expectEqual(@as(usize, 1), fixture.splits);
+    }
+}
+
+fn ownedBlockScenario(a: std.mem.Allocator) !void {
+    const root = try PendingColumns.create(a);
+    var root_owned = true;
+    defer if (root_owned) root.deinit();
+    const credit = try PendingColumns.Credit.create(a, std.testing.io);
+    root.credit(credit);
+    // Joining/stopping a producer releases its reference before delivery.
+    credit.stop();
+    credit.release();
+    _ = try root.values.append(&.{@import("scalar.zig").Datum.json(.{ .string = "retained after producer exit" })});
+    _ = try root.values.append(&.{@import("scalar.zig").Datum.json(.{ .integer = 9007199254740993 })});
+    const first = try root.view(0, 1);
+    defer first.deinit();
+    const second = try root.view(1, 2);
+    defer second.deinit();
+    root.deinit();
+    root_owned = false;
+    try std.testing.expectEqualStrings("retained after producer exit", (try first.cell(a, 0, 0)).value.string);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try second.cell(a, 0, 0)).value.integer);
+}
+test "SQL transferred column views survive producer teardown and allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ownedBlockScenario, .{});
+}
+
+fn transferBenchmark(copy: bool, root: *PendingColumns) !struct { ns: i96, checksum: i64 } {
+    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    var checksum: i64 = 0;
+    for (0..16) |_| {
+        const page = if (copy) blk: {
+            const result = try PendingColumns.create(std.testing.allocator);
+            errdefer result.deinit();
+            var scratch = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer scratch.deinit();
+            for (0..root.len()) |row| {
+                _ = scratch.reset(.retain_capacity);
+                _ = try result.values.append(try root.values.row(scratch.allocator(), row));
+            }
+            break :blk result;
+        } else try root.view(0, root.len());
+        defer page.deinit();
+        for (0..page.len()) |row| checksum += (try page.cell(std.testing.allocator, row, 0)).value.integer;
+    }
+    return .{ .ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start, .checksum = checksum };
+}
+test "native pipeline refinements benchmark owned column transfer" {
+    if (@import("builtin").mode == .Debug) return error.SkipZigTest;
+    const root = try PendingColumns.create(std.testing.allocator);
+    defer root.deinit();
+    var values: [8]@import("scalar.zig").Datum = undefined;
+    @memset(values[1..], @import("scalar.zig").Datum.json(.{ .string = "shared projected payload" ** 16 }));
+    for (0..4096) |index| {
+        values[0] = @import("scalar.zig").Datum.json(.{ .integer = @intCast(index) });
+        _ = try root.values.append(&values);
+    }
+    for (0..3) |sample| {
+        const first = try transferBenchmark(sample % 2 != 0, root);
+        const second = try transferBenchmark(sample % 2 == 0, root);
+        const copied = if (sample % 2 == 0) second else first;
+        const transferred = if (sample % 2 == 0) first else second;
+        try std.testing.expectEqual(copied.checksum, transferred.checksum);
+        std.debug.print("native_refinement {{\"case\":\"owned_column_transfer\",\"rows\":4096,\"width\":8,\"repeats\":16,\"sample\":{d},\"copy_ns\":{d},\"transfer_ns\":{d}}}\n", .{ sample, copied.ns, transferred.ns });
+    }
 }

@@ -54,7 +54,9 @@ pub const ScanWork = struct {
         columns: []const []const u8,
         logical_names: []const []const u8,
         predicates: []const Predicate,
+        position_starts: []const u64,
         fn deinit(self: *FilePlan, a: Allocator) void {
+            a.free(self.position_starts);
             self.discovered.deinit(a);
             for (self.columns) |name| a.free(name);
             a.free(self.columns);
@@ -92,6 +94,7 @@ pub const Stream = struct {
     partition_count: usize = 1,
     discovered: ?parquet.DiscoveredObjectRangeRowGroupPlan = null,
     group_index: usize = 0,
+    position_starts: []const u64 = &.{},
     current: ?parquet.OwnedBatch = null,
     page_cursor: ?@import("lake_parquet_cursor.zig").Cursor = null,
     deleted: []types.RowRef = &.{},
@@ -280,8 +283,9 @@ pub const Stream = struct {
                 if (group.row_count == 0 or !groupMayMatch(group, self.groupPredicates())) continue;
                 try units.append(self.alloc, .{ .file = index, .ordinal = input.row_group_ordinal, .group_index = group_index, .bytes = group.total_byte_len });
             }
-            plans[index] = .{ .discovered = plan, .columns = self.file_columns, .logical_names = self.file_logical_names, .predicates = self.file_predicates };
+            plans[index] = .{ .discovered = plan, .columns = self.file_columns, .logical_names = self.file_logical_names, .predicates = self.file_predicates, .position_starts = self.position_starts };
             self.discovered = null;
+            self.position_starts = &.{};
             self.file_columns = &.{};
             self.file_logical_names = &.{};
             self.file_predicates = &.{};
@@ -324,12 +328,14 @@ pub const Stream = struct {
         if (self.deleted.len != 0) self.alloc.free(self.deleted);
         self.deleted = &.{};
         if (!self.borrowed_plan) {
+            self.alloc.free(self.position_starts);
             if (self.discovered) |*plan| plan.deinit(self.alloc);
             for (self.file_columns) |name| self.alloc.free(name);
             self.alloc.free(self.file_columns);
             self.alloc.free(self.file_logical_names);
             self.alloc.free(self.file_predicates);
         }
+        self.position_starts = &.{};
         self.borrowed_plan = false;
         self.discovered = null;
         self.file_columns = &.{};
@@ -424,6 +430,7 @@ pub const Stream = struct {
                 const plan = self.work.?.plans[unit.file].?;
                 self.work_ordinal = unit.ordinal;
                 self.discovered = plan.discovered;
+                self.position_starts = plan.position_starts;
                 self.file_columns = plan.columns;
                 self.file_logical_names = plan.logical_names;
                 self.file_predicates = plan.predicates;
@@ -641,6 +648,21 @@ pub const Stream = struct {
                 } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.create(self.source.alloc, request);
             }
         }
+        try self.bindPositions();
+    }
+    fn bindPositions(self: *Stream) !void {
+        if (self.position_starts.len != 0) return;
+        const prepared = self.source.prepared_deletes orelse return;
+        if (prepared.positions.count() == 0) return;
+        const file = self.discovered.?.inventory.files[0];
+        const starts = try self.alloc.alloc(u64, file.row_groups.len);
+        errdefer self.alloc.free(starts);
+        var total: u64 = 0;
+        for (file.row_groups, starts) |group, *start| {
+            start.* = total;
+            total = try std.math.add(u64, total, group.row_count);
+        }
+        self.position_starts = starts;
     }
     pub fn countAll(self: *Stream) !?u64 {
         if (self.file_index != 0 or self.predicates.len != 0) return null;
@@ -659,12 +681,12 @@ pub const Stream = struct {
             keep.* = false;
         };
         if (self.source.prepared_deletes) |prepared|
-            try prepared.mask(a, self.discovered.?.inventory.files[0], batch, selected);
+            try prepared.maskPositions(a, self.discovered.?.inventory.files[0], batch, selected, self.position_starts);
     }
     pub fn isDeletedBatch(self: Stream, a: Allocator, batch: types.ColumnBatch, index: usize) !bool {
         if (self.isDeleted(batch.row_refs[index])) return true;
         if (self.source.prepared_deletes) |prepared|
-            return prepared.matches(a, self.discovered.?.inventory.files[0], batch, index);
+            return prepared.matchesPositions(a, self.discovered.?.inventory.files[0], batch, index, self.position_starts);
         return false;
     }
     pub fn isDeleted(self: Stream, ref: types.RowRef) bool {

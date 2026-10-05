@@ -402,3 +402,29 @@ fn columnAllocationScenario(a: A) !void {
 test "SQL window column blocks unwind every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, columnAllocationScenario, .{});
 }
+
+test "SQL wide column rows retain a full active block set without repeated decoding" {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows = try Rows.init(a, &manager, 8);
+    defer rows.deinit();
+    try rows.enableColumns();
+    for (0..128) |index| {
+        var values: [8]Datum = undefined;
+        for (&values, 0..) |*value, column| value.* = Datum.json(.{ .integer = @intCast(index * 8 + column) });
+        try rows.append(.{ .values = &values, .keys = &.{}, .ordinal = index });
+    }
+    try rows.columnar.?.flush();
+    for (0..128) |index| {
+        const row = try rows.row(index);
+        for (row.values, 0..) |value, column| try std.testing.expectEqual(@as(i64, @intCast(index * 8 + column)), value.value.integer);
+    }
+    // Each record should be decoded once, regardless of the bounded block
+    // size. The four-entry implementation decoded 1024 records here.
+    try std.testing.expectEqual(rows.columnar.?.directory.len, rows.columnar.?.decodes);
+}
