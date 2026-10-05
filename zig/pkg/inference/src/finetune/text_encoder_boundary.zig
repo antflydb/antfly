@@ -50,7 +50,7 @@ const EncoderRuntime = struct {
     compute_backend: ComputeBackend,
     arch_config: session_factory.GenericEncoderArchConfig,
 
-    fn deinit(self: *EncoderRuntime) void {
+    pub fn deinit(self: *EncoderRuntime) void {
         self.compute_backend.deinit();
         self.session.close();
         self.hf_tok.deinitSelf();

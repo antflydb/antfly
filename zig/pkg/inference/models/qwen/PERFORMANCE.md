@@ -23,7 +23,7 @@ measured base Apple M4 shapes; other devices and shapes remain explicit-only.
 
 Use ReleaseFast for both sides of new performance comparisons and for PR
 metrics. From `zig/pkg/inference`, build the focused server with
-`zig build bench-server -j1 -Doptimize=ReleaseFast -Dmetal=true`. It uses the
+`zig build bench-server -j1 -Doptimize=fast -Dmetal=true`. It uses the
 production parser, supervisor, model manager, admission controls, and HTTP
 routes. The historical ReleaseSafe results require remeasurement before
 making ReleaseFast claims.

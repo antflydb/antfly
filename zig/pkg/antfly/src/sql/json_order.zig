@@ -334,7 +334,7 @@ test "primitive numeric hashes preserve exact mixed integer float and decimal eq
 }
 
 test "native pipeline refinements benchmark primitive numeric hashing" {
-    if (@import("builtin").mode == .Debug) return error.SkipZigTest;
+    if (@import("builtin").mode == .debug) return error.SkipZigTest;
     const count = 100_000;
     var values: [1024]Json = undefined;
     for (&values, 0..) |*value, index| value.* = if (index % 2 == 0) .{ .integer = @intCast(index * 1009) } else .{ .float = @as(f64, @floatFromInt(index)) + 0.1 };
@@ -344,7 +344,7 @@ test "native pipeline refinements benchmark primitive numeric hashing" {
         for (0..2) |pass| {
             const fast = (sample + pass) % 2 != 0;
             const slot = @intFromBool(fast);
-            const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+            const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
             var checksum: u64 = 0;
             for (0..count) |index| {
                 var budget: Budget = .{};
@@ -358,7 +358,7 @@ test "native pipeline refinements benchmark primitive numeric hashing" {
                     checksum ^= (try decimal(value, &buffer, &budget)).hash();
                 }
             }
-            elapsed[slot] = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start;
+            elapsed[slot] = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start;
             if (prior_checksums[slot]) |prior| try std.testing.expectEqual(prior, checksum) else prior_checksums[slot] = checksum;
         }
         std.debug.print("native_refinement {{\"case\":\"primitive_numeric_hash\",\"rows\":{d},\"sample\":{d},\"decimal_ns\":{d},\"primitive_ns\":{d}}}\n", .{ count, sample, elapsed[0], elapsed[1] });

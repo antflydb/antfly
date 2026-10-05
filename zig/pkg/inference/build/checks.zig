@@ -30,16 +30,12 @@ pub fn createCodegen(ctx: Context) CreateCodegenResult {
         .root_module = b.createModule(.{
             .root_source_file = ctx.path("src/quant_kernel_codegen_main.zig"),
             .target = b.graph.host,
-            .optimize = .ReleaseSafe,
+            .optimize = .safe,
             .link_libc = true,
         }),
     });
     const quant_kernel_codegen_check = ctx.addRunArtifact(quant_kernel_codegen_exe);
-    if (ctx.args) |args| {
-        quant_kernel_codegen_check.addArgs(args);
-    } else {
-        quant_kernel_codegen_check.addArg("--check");
-    }
+    quant_kernel_codegen_check.addPassthruArgs();
     const quant_kernel_codegen_test_check = ctx.addRunArtifact(quant_kernel_codegen_exe);
     quant_kernel_codegen_test_check.addArg("--check");
     return .{

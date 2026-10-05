@@ -800,7 +800,7 @@ test "relational index catalog rejects corruption noncanonical bytes and unbound
     var alternate = prepared.head;
     alternate.blob_digest = digest(spaced);
     try std.testing.expectError(error.NoncanonicalRelationalIndexCatalog, decode(alloc, alternate, spaced));
-    try std.testing.expectError(error.RelationalIndexCatalogLimitExceeded, preflight(alloc, "[" ** 65 ++ "]" ** 65));
+    try std.testing.expectError(error.RelationalIndexCatalogLimitExceeded, preflight(alloc, z17RepeatString("[", 65) ++ z17RepeatString("]", 65)));
     try std.testing.expectError(error.DuplicateOrUnorderedRelationalIndex, Prepared.init(alloc, view, null, &.{ test_definitions[0], test_definitions[0] }));
     const encoded_head = prepared.head.encode();
     try std.testing.expect(prepared.head.eql(try Head.decode(&encoded_head)));
@@ -976,7 +976,7 @@ test "relational index catalog physical identities survive name ordering and rej
     var aliases = [_]Entry{ original.entries()[0], original.entries()[1] };
     aliases[1].slot = aliases[0].slot;
     try std.testing.expectError(error.DuplicateRelationalIndexId, validateEntries(alloc, &aliases, original.head.revision));
-    try std.testing.expectError(error.InvalidRelationalIndexId, native.RelationalIndexId.decode(&([_]u8{0} ** 12)));
+    try std.testing.expectError(error.InvalidRelationalIndexId, native.RelationalIndexId.decode(&(@as([12]u8, @splat(0)))));
 }
 
 test "relational index catalog reuses only unchanged comparison dependencies across schema epochs" {
@@ -1177,4 +1177,15 @@ test "relational index catalog survives LSM reopen and rejects incomplete durabl
         try txn.put(&key, "corrupt");
         try std.testing.expectError(error.ImmutableRelationalIndexDefinitionConflict, prepared.stage(&txn));
     }
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

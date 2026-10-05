@@ -226,7 +226,7 @@ class SoakTests(unittest.TestCase):
                 self.assertFalse(
                     any(re.fullmatch(r"-j(?:[0-9]+)?", arg) for arg in args)
                 )
-                self.assertIn("-Doptimize=ReleaseSafe", args)
+                self.assertIn("-Doptimize=safe", args)
                 self.assertEqual(
                     args[-4:],
                     [

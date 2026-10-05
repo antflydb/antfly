@@ -308,7 +308,7 @@ test "object storage range reader validates returned planned object metadata" {
             };
         }
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
@@ -412,7 +412,7 @@ test "lake object storage range reader validates full object checksums" {
             };
         }
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
@@ -584,7 +584,7 @@ test "object storage range reader retries transient planned reads only" {
             };
         }
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }
@@ -681,7 +681,7 @@ test "object storage range reader does not retry stale object identity" {
             };
         }
 
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn bucketExists(_: *anyopaque, _: []const u8, _: object_storage.BucketOptions) !bool {
             return true;
         }

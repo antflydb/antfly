@@ -21,7 +21,7 @@ validation=${4:-exact}
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 zig_dir=$(cd -- "${script_dir}/.." && pwd)
 
-(cd "${zig_dir}" && zig build -Doptimize=ReleaseFast bench-tokenizer)
+(cd "${zig_dir}" && zig build -Doptimize=fast bench-tokenizer)
 
 run_benchmark() {
   (

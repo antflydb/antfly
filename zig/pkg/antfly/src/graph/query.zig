@@ -291,14 +291,14 @@ test "graph public operation names and edge filters stay unambiguous and bounded
     try std.testing.expect(!isValidIdentifier("author\u{202e}name"));
     try std.testing.expect(!isValidIdentifier("*"));
     try std.testing.expect(!isValidIdentifier("$query_results"));
-    try std.testing.expect(!isValidIdentifier("a" ** (max_identifier_bytes + 1)));
+    try std.testing.expect(!isValidIdentifier(&@as([max_identifier_bytes + 1]u8, @splat('a'))));
 
     try validateEdgeTypes(&.{ "cites", "related" });
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{""}));
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&.{ "cites", "cites" }));
-    const too_many = [_][]const u8{"edge"} ** (max_edge_types + 1);
+    const too_many = @as([max_edge_types + 1][]const u8, @splat("edge"));
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&too_many));
-    const too_large = [_][]const u8{"x" ** (max_edge_type_bytes + 1)};
+    const too_large = [_][]const u8{&@as([max_edge_type_bytes + 1]u8, @splat('x'))};
     try std.testing.expectError(error.InvalidArgument, validateEdgeTypes(&too_large));
 
     try std.testing.expectEqual(@as(usize, 101), resultCollectionLimit(100));
@@ -2768,7 +2768,7 @@ const AlgebraicReachabilityEdges = struct {
     /// The algebraic tensor representation is key-scoped. Cross-table graph
     /// identities therefore require the table-aware traversal implementation.
     has_cross_table_edges: bool = false,
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items) |edge| {
             alloc.free(edge.from);
             alloc.free(edge.to);
@@ -3004,7 +3004,7 @@ const TestCtx = struct {
     sp: [*:0]const u8,
     rp: [*:0]const u8,
 
-    fn deinit(self: *TestCtx) void {
+    pub fn deinit(self: *TestCtx) void {
         self.graph.close();
         self.store.close();
         cleanupTmp(self.sp);
@@ -5064,8 +5064,8 @@ test "graph algebraic provenance traversal and shortest path return textual expl
         ctx.deinit();
         alloc.destroy(ctx);
     }
-    const source = [_]u8{'a'} ** 128;
-    const id = [_]u8{'i'} ** 128;
+    const source = @as([128]u8, @splat('a'));
+    const id = @as([128]u8, @splat('i'));
     try ctx.graph.batchApply(&.{.{ .source = &source, .target = "b", .edge_type = "R", .edge_id = &id, .owner_document = "fact" }}, &.{});
     var engine = GraphQueryEngine{ .alloc = alloc };
     const start_keys: []const []const u8 = &.{&source};

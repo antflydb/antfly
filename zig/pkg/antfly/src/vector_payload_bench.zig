@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     }
     const started = time.monotonicNs();
     var budgets = @import("storage/resource_manager.zig").Options.defaultBudgets();
-    budgets[@intFromEnum(@import("storage/resource_manager.zig").Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 320 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 };
+    budgets[@backingInt(@import("storage/resource_manager.zig").Slice.dense_source_payload_state)] = .{ .soft_limit_bytes = 320 * 1024 * 1024, .hard_limit_bytes = 384 * 1024 * 1024 };
     var manager = @import("storage/resource_manager.zig").ResourceManager.init(.{ .budgets = budgets });
     defer manager.deinit(alloc);
     var store = try source.Store.openManaged(alloc, &manager, storage, root, !writing);

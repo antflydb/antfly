@@ -74,7 +74,7 @@ pub const Proof = struct {
         hash.update(&self.namespace);
         hashNumber(&hash, self.authority_epoch);
         hash.update(&self.catalog_digest);
-        hashNumber(&hash, @intFromEnum(self.producer_kind));
+        hashNumber(&hash, @backingInt(self.producer_kind));
         hashBytes(&hash, self.producer_name);
         hashNumber(&hash, self.producer_generation);
         hashBytes(&hash, self.producer_artifact_name);
@@ -82,7 +82,7 @@ pub const Proof = struct {
         hash.update(&self.input_digest);
         hashNumber(&hash, self.effects.len);
         for (self.effects) |effect| {
-            hashNumber(&hash, @intFromEnum(effect.family));
+            hashNumber(&hash, @backingInt(effect.family));
             hashBytes(&hash, effect.key);
             hashNumber(&hash, effect.source_index);
             hash.update(&.{@intFromBool(effect.value_digest != null)});
@@ -126,7 +126,7 @@ pub const Proof = struct {
                 std.mem.allEqual(u8, &origin.source_pin, 0) or std.mem.allEqual(u8, &origin.binding.digest, 0) or
                 std.mem.allEqual(u8, &origin.proof_checksum, 0) or self.mutation_preconditions.len != 0 or
                 origin.selected_bitmap.len != (self.sources.len + 7) / 8) return error.ArtifactCatalogCorrupt;
-            var outputs = std.StaticBitSet(publication.max_source_documents).initEmpty();
+            var outputs = std.StaticBitSet(publication.max_source_documents).empty;
             for (self.effects) |effect| {
                 if (origin.selected_bitmap[effect.source_index / 8] & (@as(u8, 1) << @intCast(effect.source_index % 8)) == 0)
                     return error.ArtifactCatalogCorrupt;
@@ -350,7 +350,7 @@ pub fn encodeAlloc(alloc: std.mem.Allocator, proof: Proof) ![]u8 {
     var writer: ProofWriter = .{ .bytes = result };
     writer.write(proof_magic);
     writer.byte(proof.version);
-    writer.byte(@intFromEnum(proof.producer_kind));
+    writer.byte(@backingInt(proof.producer_kind));
     writer.write(&proof.namespace);
     writer.writeU64(proof.authority_epoch);
     writer.write(&proof.catalog_digest);
@@ -392,7 +392,7 @@ pub fn encodeAlloc(alloc: std.mem.Allocator, proof: Proof) ![]u8 {
         writer.writeU32(source.source_index);
     };
     for (proof.effects) |effect| {
-        writer.byte(@intFromEnum(effect.family));
+        writer.byte(@backingInt(effect.family));
         writer.blob(effect.key);
         writer.writeU32(effect.source_index);
         writer.byte(@intFromBool(effect.value_digest != null));
@@ -618,7 +618,7 @@ pub fn prepareDocumentReferences(alloc: std.mem.Allocator, command: publication.
 
 fn selectedOwners(proof: Proof) !std.StaticBitSet(publication.max_source_documents) {
     if (proof.origin == null) return error.ArtifactCatalogCorrupt;
-    var owners = std.StaticBitSet(publication.max_source_documents).initEmpty();
+    var owners = std.StaticBitSet(publication.max_source_documents).empty;
     for (proof.effects) |effect| {
         if (effect.source_index >= proof.sources.len) return error.ArtifactCatalogCorrupt;
         owners.set(effect.source_index);
@@ -773,7 +773,7 @@ pub fn selectedSourceBitmapAlloc(
     try proof.validate();
     if (!std.mem.eql(u8, &proof.namespace, &active.namespace) or proof.authority_epoch != active.epoch or
         !std.mem.eql(u8, &proof.catalog_digest, &active.catalog_digest)) return null;
-    var owners = std.StaticBitSet(publication.max_source_documents).initEmpty();
+    var owners = std.StaticBitSet(publication.max_source_documents).empty;
     for (proof.effects) |effect| owners.set(effect.source_index);
     var bitmap: [publication.max_source_documents / 8]u8 = @splat(0);
     var found = false;
@@ -937,7 +937,7 @@ const Projection = struct {
     owned: Owned,
     effects: std.StringHashMapUnmanaged(Effect),
 
-    fn deinit(self: *Projection) void {
+    pub fn deinit(self: *Projection) void {
         self.effects.deinit(self.alloc);
         self.owned.deinit();
     }
@@ -1392,7 +1392,7 @@ test "ordered artifact inventory adopted proof stages only selected receipts and
             std.testing.allocator.free(entry.key);
             std.testing.allocator.free(entry.value);
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var iter = self.values.iterator();
             while (iter.next()) |entry| {
                 std.testing.allocator.free(entry.key_ptr.*);
@@ -1493,7 +1493,7 @@ test "ordered artifact inventory document proof index tracks absence replacement
             std.testing.allocator.free(entry.key);
             std.testing.allocator.free(entry.value);
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var it = self.values.iterator();
             while (it.next()) |entry| {
                 std.testing.allocator.free(entry.key_ptr.*);
@@ -1675,11 +1675,11 @@ test "ordered artifact inventory document proof pages seek binary ranges and rej
             try std.testing.expectEqual(@as(usize, 2), page.entries.len);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned, active, range });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, AllocationCheck.run, .{ &pinned, active, range });
     {
         var writer = try db.core.store.beginWriteTxn();
         errdefer writer.abort();
-        try writer.put(tamper_key.?, &([_]u8{9} ** 32));
+        try writer.put(tamper_key.?, &(@as([32]u8, @splat(9))));
         try writer.commit();
     }
     var changed = try db.core.store.beginReadTxn();
@@ -1709,7 +1709,7 @@ test "ordered artifact inventory provenance shares receipts and reclaims superse
             std.testing.allocator.free(entry.key);
             std.testing.allocator.free(entry.value);
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var it = self.values.iterator();
             while (it.next()) |entry| {
                 std.testing.allocator.free(entry.key_ptr.*);
@@ -1803,7 +1803,7 @@ test "ordered artifact inventory provenance preserves complete binary read set w
 
 test "ordered artifact inventory compact proof keeps binary keys bounded and rejects forged fields" {
     const alloc = std.testing.allocator;
-    const document = [_]u8{0} ** (32 * 1024);
+    const document = @as([(32 * 1024)]u8, @splat(0));
     const source = publication.Source{ .document_key = &document, .content_digest = @splat(1), .timestamp = 1, .input_position = null };
     const effect = Effect{ .family = .document_artifact, .key = "effect", .source_index = 0, .value_digest = null, .value_bytes = 0 };
     var proof: Proof = .{ .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_kind = .index, .producer_name = "index", .producer_generation = 1, .producer_artifact_name = "asset", .publication_digest = @splat(3), .input_digest = undefined, .sources = (&source)[0..1], .artifact_sources = &.{}, .effects = (&effect)[0..1] };

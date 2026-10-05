@@ -41,7 +41,7 @@ const CountingAllocator = struct {
     }
 };
 fn now() i96 {
-    return std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    return std.Io.Clock.awake.now(std.testing.io).nanoseconds;
 }
 fn expression(vector: bool, program: *const scalar.Program, rows: []const []const Datum, count: usize) !struct { ns: i96, peak: usize, checksum: f64 } {
     var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 1024 * 1024 };
@@ -87,7 +87,7 @@ fn windows(overlay: bool, count: usize) !struct { ns: i96, bytes: u64 } {
     defer manager.deinit();
     var rows = try disk.Rows.init(a, &manager, 3);
     defer rows.deinit();
-    const text = [_]u8{'x'} ** 8192;
+    const text: [8192]u8 = @splat('x');
     for (0..count) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .string = &text }), .{}, .{} }, .keys = &.{}, .ordinal = index });
     const before = manager.written_bytes;
     const start = now();
@@ -115,7 +115,7 @@ fn sorting(buffer_bytes: usize, count: usize) !struct { ns: i96, first_ns: i96, 
     defer manager.deinit();
     var sort = spill.Sort.init(a, &manager, &.{.{}}, 32768);
     defer sort.deinit();
-    const text = [_]u8{'x'} ** 256;
+    const text: [256]u8 = @splat('x');
     const started = now();
     for (0..count) |i| try sort.add(.{ .values = &.{Datum.json(.{ .string = &text })}, .keys = &.{Datum.json(.{ .integer = @intCast(count - i) })}, .ordinal = i });
     var arena = std.heap.ArenaAllocator.init(a);
@@ -344,9 +344,15 @@ fn nativeJoinBatch(batched: bool, count: usize) !struct { ns: i96, allocations: 
     const selection = try f.alloc(usize, count);
     const keys = try f.alloc([]const Datum, count);
     const cells = try f.alloc(Datum, count);
+    const repeated_payload = comptime block: {
+        const part = "wide repeated projected payload";
+        var payload: [part.len * 8]u8 = undefined;
+        for (0..8) |repetition| @memcpy(payload[repetition * part.len ..][0..part.len], part);
+        break :block payload;
+    };
     for (integers, strings, refs, selection, keys, cells, 0..) |*integer, *string, *ref, *index, *key, *cell, i| {
         integer.* = @intCast(i);
-        string.* = "wide repeated projected payload" ** 8;
+        string.* = &repeated_payload;
         ref.* = .{ .relational_key = "id" };
         index.* = i;
         cell.* = Datum.json(.{ .integer = @intCast(i) });
@@ -480,7 +486,7 @@ test "native pipeline refinements benchmark" {
         }
         const pointers = [_]*const scalar.Program{ &programs[0], &programs[1], &programs[2] };
         const types = @import("../storage/rowsource/types.zig");
-        const refs = [_]types.RowRef{.{ .relational_key = "r" }} ** 512;
+        const refs: [512]types.RowRef = @splat(.{ .relational_key = "r" });
         var values: [512]i64 = undefined;
         var selection: [512]usize = undefined;
         for (&values, &selection, 0..) |*value, *index, row| {

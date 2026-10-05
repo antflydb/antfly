@@ -741,7 +741,7 @@ fn allocationLifecycle(a: Allocator) !void {
     try std.testing.expectEqual(@as(usize, 2), targets.samples[0].records.len);
 }
 test "boundary training targets release all allocations on every failure" {
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, allocationLifecycle, .{});
 }
 
 test "boundary training target admission and cancellation fail atomically" {

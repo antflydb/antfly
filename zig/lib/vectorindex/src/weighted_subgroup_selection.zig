@@ -115,7 +115,7 @@ test "weighted partition matches stable sorted prefix including ties and fallbac
         var total: u64 = 0;
         for (sorted[0..count]) |entry| total += entry.weight;
         for ([_]u64{ 0, 1, total / 4, total / 2, total - 1, total }) |budget| {
-            var expected = [_]bool{false} ** source.len;
+            var expected = @as([source.len]bool, @splat(false));
             var weight: u64 = 0;
             var end: usize = 0;
             while (weight < budget) : (end += 1) {

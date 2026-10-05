@@ -228,7 +228,7 @@ const LineScanner = struct {
         };
     }
 
-    fn deinit(self: *LineScanner) void {
+    pub fn deinit(self: *LineScanner) void {
         self.pending.deinit(self.alloc);
     }
 
@@ -371,7 +371,7 @@ const BatchBuilder = struct {
         };
     }
 
-    fn deinit(self: *BatchBuilder) void {
+    pub fn deinit(self: *BatchBuilder) void {
         self.arena.deinit();
     }
 
@@ -444,7 +444,7 @@ const LoadProcessor = struct {
         return processor;
     }
 
-    fn deinit(self: *LoadProcessor) void {
+    pub fn deinit(self: *LoadProcessor) void {
         if (self.id_template) |*template| template.deinit();
         self.line_arena.deinit();
         self.batch.deinit();
@@ -737,7 +737,7 @@ fn takeLoadOptionValue(args: *std.process.Args.Iterator, flag: []const u8) union
 fn parseLoadOptionsIterator(iterator: std.process.Args.Iterator) LoadParseResult {
     var args = iterator;
     var values: LoadOptionValues = .{};
-    var seen = std.EnumSet(LoadOption).initEmpty();
+    var seen = std.EnumSet(LoadOption).empty;
 
     while (args.next()) |arg| {
         const option = loadOption(arg) orelse return .{ .issue = .{ .unknown = arg } };
@@ -1145,7 +1145,7 @@ test "line scanner handles split lines crlf final line and long lines" {
         lines: std.ArrayListUnmanaged([]u8) = .empty,
         too_long: u64 = 0,
 
-        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
             for (self.lines.items) |line| allocator.free(line);
             self.lines.deinit(allocator);
         }

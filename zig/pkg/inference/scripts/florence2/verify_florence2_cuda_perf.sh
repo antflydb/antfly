@@ -37,7 +37,7 @@ warmup_iters="${ANTFLY_FLORENCE2_WARMUP_ITERS:-2}"
 measure_iters="${ANTFLY_FLORENCE2_MEASURE_ITERS:-5}"
 command_timeout="${ANTFLY_FLORENCE2_COMMAND_TIMEOUT:-900}"
 json_file="${ANTFLY_FLORENCE2_JSON_TIMING:-${TMPDIR:-/tmp}/florence2-cuda-read.json}"
-optimize="${ANTFLY_FLORENCE2_OPTIMIZE:-ReleaseSafe}"
+optimize="${ANTFLY_FLORENCE2_OPTIMIZE:-safe}"
 cuda_artifacts="${ANTFLY_CUDA_ARTIFACTS:-fatbin}"
 cuda_libraries="${ANTFLY_CUDA_LIBS:-auto}"
 zig_global_cache_dir="${ZIG_GLOBAL_CACHE_DIR:-${TMPDIR:-/tmp}/antfly-zig-global-cache}"
@@ -47,8 +47,8 @@ resolve_zig() {
     printf '%s\n' "$ZIG"
   elif command -v zig >/dev/null 2>&1; then
     command -v zig
-  elif [[ -x "$repo_root/.tools/zig-x86_64-linux-0.16.0/zig" ]]; then
-    printf '%s\n' "$repo_root/.tools/zig-x86_64-linux-0.16.0/zig"
+  elif [[ -x "$repo_root/.tools/zig-x86_64-linux-0.17.0/zig" ]]; then
+    printf '%s\n' "$repo_root/.tools/zig-x86_64-linux-0.17.0/zig"
   else
     echo "zig not found; set ZIG=/path/to/zig" >&2
     return 1

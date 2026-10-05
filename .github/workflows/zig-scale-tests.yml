@@ -59,7 +59,7 @@ jobs:
     runs-on: arc-antfly-heavy
     timeout-minutes: 60
     env:
-      ANTFLY_CI_ZIG_OPTIMIZE: ReleaseSafe
+      ANTFLY_CI_ZIG_OPTIMIZE: safe
       ANTFLY_CI_ZIG_STRIP: "true"
       ANTFLY_ARTIFACT_FULL_TEXT_SCALE: "1"
       ANTFLY_BIN: ./zig-out/bin/antfly

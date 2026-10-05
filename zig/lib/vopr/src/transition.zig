@@ -47,7 +47,7 @@ pub const Transition = struct {
         const actors = ids.derive("transition.payload.actors", self.actor_id orelse 0, self.resource_id orelse 0);
         const base = ids.derive("transition.payload", actors, @bitCast(self.parameter));
         const phased = if (self.fault_phase) |phase|
-            ids.derive("transition.payload.fault-phase", base, @as(u64, @intFromEnum(phase)) + 1)
+            ids.derive("transition.payload.fault-phase", base, @as(u64, @backingInt(phase)) + 1)
         else
             base;
         return if (self.semantic_digest == 0)

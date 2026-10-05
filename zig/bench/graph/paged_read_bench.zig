@@ -22,7 +22,7 @@ const Memory = struct {
     payload: []const u8,
     calls: usize = 0,
     bytes: usize = 0,
-    fn deinit(_: Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: Allocator, _: *anyopaque) void {}
     fn put(_: *anyopaque, _: Allocator, _: []const u8) !artifacts.ArtifactMetadata {
         return error.Unsupported;
     }

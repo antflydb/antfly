@@ -39,7 +39,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Antf
     cli.fatal("unknown database subcommand: {s}", .{subcommand});
 }
 
-fn listDatabases(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
+pub fn listDatabases(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient) !void {
     var resp = try client.inner.listDatabases();
     defer resp.deinit();
     if (resp.status_code < 200 or resp.status_code >= 300) cli.fatal("catalog request failed with HTTP {d}", .{resp.status_code});
@@ -48,7 +48,7 @@ fn listDatabases(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clien
     }
 }
 
-fn getDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn getDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const database_name = nextNameArg(args, "database name is required");
     var resp = try client.inner.getDatabase(database_name);
     defer resp.deinit();
@@ -58,7 +58,7 @@ fn getDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.
     }
 }
 
-fn createDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn createDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const database_name = nextNameArg(args, "database name is required");
     var resp = try client.inner.createDatabase(database_name);
     defer resp.deinit();
@@ -68,7 +68,7 @@ fn createDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_clie
     }
 }
 
-fn dropDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn dropDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const database_name = nextNameArg(args, "database name is required");
     var resp = try client.inner.dropDatabase(database_name);
     defer resp.deinit();
@@ -78,7 +78,7 @@ fn dropDatabase(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client
     }
 }
 
-fn setDatabaseTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn setDatabaseTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const parsed = parseTablespaceBindingArgs(args);
     var resp = try client.inner.setDatabaseTablespace(parsed.database_name, .{ .tablespace_name = parsed.tablespace_name });
     defer resp.deinit();
@@ -88,7 +88,7 @@ fn setDatabaseTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antf
     }
 }
 
-fn clearDatabaseTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
+pub fn clearDatabaseTablespace(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     const database_name = nextNameArg(args, "database name is required");
     var resp = try client.inner.clearDatabaseTablespace(database_name);
     defer resp.deinit();

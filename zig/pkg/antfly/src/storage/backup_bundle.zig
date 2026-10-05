@@ -287,7 +287,7 @@ pub fn encodeBlobHeaderAlloc(alloc: std.mem.Allocator, header: BlobHeader) ![]u8
     pos += 8;
     std.mem.writeInt(u64, out[pos..][0..8], header.stored_size_bytes, .little);
     pos += 8;
-    out[pos] = @intFromEnum(header.compression);
+    out[pos] = @backingInt(header.compression);
     pos += 1;
     @memcpy(out[pos..][0..header.sha256.len], &header.sha256);
     return out;

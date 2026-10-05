@@ -24,6 +24,7 @@ const graph_exec = @import("graph_exec.zig");
 
 pub const VisibleHitEvaluator = struct {
     ctx: ?*anyopaque,
+    filter_many_ctx: ?*anyopaque = null,
     func: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -145,6 +146,7 @@ pub const StoredPatternFilterExecutor = struct {
 
 pub const SearchResultPostprocessor = struct {
     ctx: ?*anyopaque,
+    filter_visible_many_ctx: ?*anyopaque = null,
     is_visible: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -386,7 +388,7 @@ pub fn filterVisibleSearchResult(
     errdefer owned.deinit();
 
     const keep_mask = if (evaluator.filter_many) |filter_many|
-        try filter_many(evaluator.ctx, alloc, owned.hits)
+        try filter_many(evaluator.filter_many_ctx orelse evaluator.ctx, alloc, owned.hits)
     else
         null;
     defer if (keep_mask) |mask| alloc.free(mask);
@@ -572,7 +574,7 @@ const ChunkUnitIdentity = struct {
     key: []u8,
     fingerprint: ?[]u8 = null,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.key);
         if (self.fingerprint) |fingerprint| alloc.free(fingerprint);
         self.* = undefined;
@@ -890,7 +892,7 @@ const ChunkAncestorInfo = struct {
     parent_doc_key: []u8,
     unit_key: ?[]u8 = null,
 
-    fn deinit(self: *ChunkAncestorInfo, alloc: Allocator) void {
+    pub fn deinit(self: *ChunkAncestorInfo, alloc: Allocator) void {
         alloc.free(self.parent_doc_key);
         if (self.unit_key) |key| alloc.free(key);
         self.* = undefined;
@@ -1269,7 +1271,7 @@ const ResolvedPatternDocIds = struct {
     all: bool = false,
     owned: bool = false,
 
-    fn deinit(self: *ResolvedPatternDocIds, alloc: Allocator) void {
+    pub fn deinit(self: *ResolvedPatternDocIds, alloc: Allocator) void {
         if (self.ordinal_set) |*set| set.deinit(alloc);
         if (self.owned) freeResolvedDocIds(alloc, self.ids);
         self.* = .{};
@@ -1659,6 +1661,7 @@ pub fn postprocessTextSearchResult(
         .ctx = processor.ctx,
         .func = processor.is_visible,
         .filter_many = processor.filter_visible_many,
+        .filter_many_ctx = processor.filter_visible_many_ctx,
     });
     errdefer filtered.deinit();
     filtered = try applyStoredSearchPatternFilters(alloc, req, filtered, .{
@@ -1712,6 +1715,7 @@ pub fn postprocessVectorSearchResult(
         .ctx = processor.ctx,
         .func = processor.is_visible,
         .filter_many = processor.filter_visible_many,
+        .filter_many_ctx = processor.filter_visible_many_ctx,
     });
     errdefer filtered.deinit();
     // Preserve complete member identity before hierarchy grouping. Raw modes

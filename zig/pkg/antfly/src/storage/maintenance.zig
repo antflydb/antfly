@@ -121,7 +121,7 @@ pub const Coordinator = struct {
         error_name: ?[]const u8 = null,
         cancel: CancelToken = .{},
 
-        fn deinit(self: *Job, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *Job, allocator: std.mem.Allocator) void {
             if (self.idempotency_key) |key| allocator.free(key);
             allocator.destroy(self);
         }
@@ -147,7 +147,7 @@ pub const Coordinator = struct {
             execution.coordinator.runJob(execution.job);
         }
 
-        fn deinit(ptr: *anyopaque) void {
+        pub fn deinit(ptr: *anyopaque) void {
             const execution: *JobExecution = @ptrCast(@alignCast(ptr));
             execution.coordinator.allocator.destroy(execution);
         }

@@ -771,7 +771,7 @@ fn nsToMs(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        "usage: zig build bench-bge-m3-e2e -Doptimize=ReleaseFast -- --model-dir <bge-m3.gguf|dir> [--model-sha SHA256] [--fixture src/bench/testdata/bge_m3_tokens.json] [--backend metal|cuda|native] [--batch N] [--seq-len 16|128|200|256] [--warmup-iters N] [--measure-iters N] [--validate-specialized-attention] [--tune-generated-kernels] [--print-embeddings] [--managed-only] [--texts-json PATH] [--text-offset N] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir PATH]\n",
+        "usage: zig build bench-bge-m3-e2e -Doptimize=fast -- --model-dir <bge-m3.gguf|dir> [--model-sha SHA256] [--fixture src/bench/testdata/bge_m3_tokens.json] [--backend metal|cuda|native] [--batch N] [--seq-len 16|128|200|256] [--warmup-iters N] [--measure-iters N] [--validate-specialized-attention] [--tune-generated-kernels] [--print-embeddings] [--managed-only] [--texts-json PATH] [--text-offset N] [--kernel-jit-mode off|shadow|on|required] [--kernel-jit-cache-dir PATH]\n",
         .{},
     );
 }

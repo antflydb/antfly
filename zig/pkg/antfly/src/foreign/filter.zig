@@ -409,7 +409,7 @@ const QueryStringTerm = struct {
     value: []u8,
     kind: QueryStringKind,
 
-    fn deinit(self: *QueryStringTerm, alloc: Allocator) void {
+    pub fn deinit(self: *QueryStringTerm, alloc: Allocator) void {
         alloc.free(self.field);
         alloc.free(self.value);
         self.* = undefined;

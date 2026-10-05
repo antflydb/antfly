@@ -134,7 +134,7 @@ pub const max_mime_essence_bytes: usize = 63;
 
 const StoredMimeEssence = struct {
     len: u8 = 0,
-    bytes: [max_mime_essence_bytes]u8 = [_]u8{0} ** max_mime_essence_bytes,
+    bytes: [max_mime_essence_bytes]u8 = @as([max_mime_essence_bytes]u8, @splat(0)),
 
     fn init(essence: []const u8) !StoredMimeEssence {
         if (essence.len == 0 or essence.len > max_mime_essence_bytes)
@@ -170,7 +170,7 @@ pub const MimeTypes = struct {
     audio_caf: bool = false,
     audio_basic: bool = false,
     additional_count: u8 = 0,
-    additional: [max_additional_mime_types]StoredMimeEssence = [_]StoredMimeEssence{.{}} ** max_additional_mime_types,
+    additional: [max_additional_mime_types]StoredMimeEssence = @as([max_additional_mime_types]StoredMimeEssence, @splat(.{})),
 
     pub fn add(self: *MimeTypes, content_type: []const u8) !void {
         const parsed = data_uri.parseMediaType(content_type) catch
@@ -436,7 +436,7 @@ pub fn encodedImagePixels(content_type: []const u8, bytes: []const u8) !u64 {
 }
 
 test "inference capabilities measure physical image pixels and MIME" {
-    var png = [_]u8{0} ** 24;
+    var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
     std.mem.writeInt(u32, png[16..20], 7, .big);
     std.mem.writeInt(u32, png[20..24], 5, .big);
@@ -456,8 +456,8 @@ pub const TaskResourceLimits = struct {
     max_schema_bytes: ?usize = null,
 
     pub fn validate(self: TaskResourceLimits) !void {
-        inline for (std.meta.fields(TaskResourceLimits)) |field| {
-            if (@field(self, field.name)) |value| if (value == 0)
+        inline for (comptime std.meta.fieldNames(TaskResourceLimits)) |reflected_name| {
+            if (@field(self, reflected_name)) |value| if (value == 0)
                 return error.InvalidInferenceCapabilities;
         }
     }

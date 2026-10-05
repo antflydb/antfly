@@ -211,7 +211,7 @@ fn encodeForVersion(
     try appendInt(alloc, &out, u64, config_hash);
     try appendInt(alloc, &out, u64, sequence);
     if (record_version >= version) {
-        try appendInt(alloc, &out, u16, @intFromEnum(physical_format));
+        try appendInt(alloc, &out, u16, @backingInt(physical_format));
     }
     try appendInt(alloc, &out, u32, @intCast(index_name.len));
     try out.appendSlice(alloc, index_name);
@@ -238,8 +238,8 @@ fn decode(alloc: Allocator, raw: []const u8) !Manifest {
         &pos,
         u16,
     )) {
-        @intFromEnum(PhysicalFormat.legacy_lsm) => .legacy_lsm,
-        @intFromEnum(PhysicalFormat.dense_native_v2) => .dense_native_v2,
+        @backingInt(PhysicalFormat.legacy_lsm) => .legacy_lsm,
+        @backingInt(PhysicalFormat.dense_native_v2) => .dense_native_v2,
         else => return error.InvalidIndexGenerationManifest,
     } else .legacy_lsm;
     const name_len = try readInt(raw[0..payload_end], &pos, u32);

@@ -739,11 +739,11 @@ pub fn encodePreparedAlloc(alloc: Allocator, segment: types.Segment, cancellatio
     var pos: usize = 0;
     putBytes(data, &pos, wire_magic);
     putInt(u16, data, &pos, wire_version);
-    data[pos] = @intFromEnum(segment.kind);
+    data[pos] = @backingInt(segment.kind);
     pos += 1;
-    data[pos] = @intFromEnum(segment.materialization_state);
+    data[pos] = @backingInt(segment.materialization_state);
     pos += 1;
-    data[pos] = @intFromEnum(segment.rejection_reason);
+    data[pos] = @backingInt(segment.rejection_reason);
     pos += 1;
     data[pos] = @intFromBool(segment.converged);
     pos += 1;

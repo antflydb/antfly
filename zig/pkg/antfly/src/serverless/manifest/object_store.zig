@@ -375,7 +375,7 @@ const ConditionalCreateRaceClient = struct {
         return client_impl;
     }
 
-    fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
+    pub fn deinit(_: std.mem.Allocator, _: *anyopaque) void {}
 
     fn bucketExists(ptr: *anyopaque, bucket: []const u8, opts: object_storage.BucketOptions) !bool {
         const self: *@This() = @ptrCast(@alignCast(ptr));

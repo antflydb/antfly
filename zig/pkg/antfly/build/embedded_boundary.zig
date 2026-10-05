@@ -18,22 +18,22 @@ const std = @import("std");
 fn dependencyOwned(b: *std.Build, source: std.Build.LazyPath) bool {
     const owner = switch (source) {
         .src_path => |path| path.owner,
-        .generated => |path| path.file.step.owner,
+        .generated => |path| b.graph.generated_files.items[@backingInt(path.index)].owner,
         .dependency => |path| path.dependency.builder,
         // Host paths have no dependency provenance; audit them conservatively.
-        .cwd_relative => return false,
+        .cwd_relative, .relative => return false,
     };
-    const project_root = b.build_root.path orelse return false;
-    const owner_root = owner.build_root.path orelse return false;
+    const project_root = b.root.subPathOpt() orelse return false;
+    const owner_root = owner.root.subPathOpt() orelse return false;
     const relative = std.fs.path.relative(b.allocator, project_root, null, project_root, owner_root) catch @panic("OOM");
     return std.fs.path.isAbsolute(relative) or std.mem.eql(u8, relative, "..") or std.mem.startsWith(u8, relative, "../") or std.mem.startsWith(u8, relative, "..\\");
 }
 
 pub fn add(b: *std.Build, module: *std.Build.Module) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{"python3"});
-    run.addFileArg(b.path("tools/audit_embedded_source_boundary.py"));
+    run.addFileArg2(b.path("tools/audit_embedded_source_boundary.py"), .{ .make_absolute = true });
     run.addArg("--project");
-    run.addDirectoryArg(b.path("."));
+    run.addDirectoryArg2(b.path("."), .{ .make_absolute = true });
     run.addArgs(&.{ "--entry-module", "M0", "--target-os", @tagName(module.resolved_target.?.result.os.tag) });
     var modules: std.ArrayList(*std.Build.Module) = .empty;
     var ids = std.AutoHashMap(*std.Build.Module, usize).init(b.allocator);
@@ -49,8 +49,9 @@ pub fn add(b: *std.Build, module: *std.Build.Module) *std.Build.Step.Run {
         // Authored roots can be absent in a staged tree when their declared
         // module is unused. Resolve them only if the source audit reaches them.
         switch (source) {
-            .src_path, .cwd_relative => run.addArg(source.getPath(b)),
-            else => run.addFileArg(source),
+            .src_path => |path| run.addArg(path.owner.root.joinString(b.allocator, path.sub_path) catch @panic("OOM")),
+            .cwd_relative => |path| run.addArg(path),
+            else => run.addFileArg2(source, .{ .make_absolute = true }),
         }
         var imports = current.import_table.iterator();
         while (imports.next()) |import| {

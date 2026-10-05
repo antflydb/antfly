@@ -78,7 +78,7 @@ fn encodeSplitStateAlloc(alloc: Allocator, state: *const SplitState) ![]u8 {
     const buf = try alloc.alloc(u8, encoded_len);
     errdefer alloc.free(buf);
     var pos: usize = 0;
-    buf[pos] = @intFromEnum(state.phase);
+    buf[pos] = @backingInt(state.phase);
     pos += 1;
 
     const sk_len: u32 = @intCast(state.split_key.len);
@@ -873,7 +873,7 @@ const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.owned) self.store.deinit();
     }
 };

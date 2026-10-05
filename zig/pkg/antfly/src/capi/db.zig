@@ -925,7 +925,7 @@ pub const JsonSplitState = struct {
 
     pub fn init(alloc: Allocator, state: db_mod.types.SplitState) !JsonSplitState {
         return .{
-            .phase = @intFromEnum(state.phase),
+            .phase = @backingInt(state.phase),
             .split_key_b64 = try dupBase64(alloc, state.split_key),
             .new_shard_id = state.new_shard_id,
             .started_at = state.started_at,
@@ -2187,8 +2187,8 @@ pub fn optionFieldType(comptime Options: type, comptime field_name: []const u8) 
 }
 
 pub fn optionHasField(comptime Options: type, comptime field_name: []const u8) bool {
-    inline for (std.meta.fields(Options)) |field| {
-        if (std.mem.eql(u8, field.name, field_name)) return true;
+    inline for (comptime std.meta.fieldNames(Options)) |reflected_name| {
+        if (std.mem.eql(u8, reflected_name, field_name)) return true;
     }
     return false;
 }
@@ -3449,7 +3449,7 @@ pub fn encodeResolvedDenseWireResponse(
     cursor += 4;
     std.mem.writeInt(u16, out[cursor..][0..2], search_wire.version, .little);
     cursor += 2;
-    std.mem.writeInt(u16, out[cursor..][0..2], @intFromEnum(search_wire.Op.dense_search), .little);
+    std.mem.writeInt(u16, out[cursor..][0..2], @backingInt(search_wire.Op.dense_search), .little);
     cursor += 2;
     std.mem.writeInt(u32, out[cursor..][0..4], resolved.total_hits, .little);
     cursor += 4;
@@ -4032,7 +4032,7 @@ pub export fn antfly_db_get_transaction_status(
     const handle = guard.handle;
     const txn_id = txn_id_ptr orelse return .invalid_argument;
     const status = handle.db.getTransactionStatus(txn_id.*) catch |err| return capi.mapError(err);
-    out.* = @intFromEnum(status);
+    out.* = @backingInt(status);
     return .ok;
 }
 

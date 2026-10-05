@@ -114,7 +114,7 @@ const VisibilityChunkEntry = struct {
 const VisibilityChunk = struct {
     entries: std.AutoHashMapUnmanaged(u16, OrdinalState) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.entries.deinit(alloc);
         self.* = .{};
     }
@@ -639,8 +639,9 @@ pub fn lookupOrdinalsTxnAlloc(alloc: Allocator, txn: anytype, doc_ids: []const [
 
     var keys = @import("lookup_key_scratch.zig").Scratch.init(alloc, doc_ids.len);
     defer keys.deinit();
-    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
-    const descriptor_alloc = descriptor_buffer.get();
+    var descriptor_buffer_storage: [4096]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var descriptor_buffer: std.heap.BufferFirstAllocator = .init(&descriptor_buffer_storage, alloc);
+    const descriptor_alloc = descriptor_buffer.allocator();
     var pending = try descriptor_alloc.alloc(PendingOrdinalLookup, doc_ids.len);
     defer descriptor_alloc.free(pending);
     for (doc_ids, 0..) |doc_id, i| {
@@ -1303,7 +1304,7 @@ fn validateVisibilityChunksAlloc(alloc: Allocator, store: *docstore_mod.DocStore
         seen_chunks: std.AutoHashMapUnmanaged(u32, void) = .empty,
         chunk_count: u64 = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.seen_ordinals.deinit(self.alloc);
             self.seen_chunks.deinit(self.alloc);
         }
@@ -1728,7 +1729,7 @@ const DocOrdinalRow = struct {
 const DocOrdinalRows = struct {
     items: std.ArrayListUnmanaged(DocOrdinalRow) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items.items) |row| alloc.free(row.doc_id);
         self.items.deinit(alloc);
         self.* = .{};
@@ -1743,7 +1744,7 @@ const OrdinalDocRow = struct {
 const OrdinalDocRows = struct {
     items: std.ArrayListUnmanaged(OrdinalDocRow) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items.items) |row| alloc.free(row.doc_id);
         self.items.deinit(alloc);
         self.* = .{};
@@ -1758,7 +1759,7 @@ const CanonicalOrdinalRow = struct {
 const CanonicalOrdinalRows = struct {
     items: std.ArrayListUnmanaged(CanonicalOrdinalRow) = .empty,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         self.items.deinit(alloc);
         self.* = .{};
     }
@@ -4096,7 +4097,7 @@ test "ordinal batch lookup scalar uses inline escaped keys and falls back for lo
     txn.missing = false;
     txn.raw = "bad";
     try std.testing.expectError(error.InvalidDocIdentity, lookupOrdinalTxn(failing.allocator(), &txn, "a\x00b"));
-    const long = [_]u8{0} ** 512;
+    const long = @as([512]u8, @splat(0));
     const expected = try internal_keys.identityDocToOrdinalKeyAlloc(alloc, &long);
     defer alloc.free(expected);
     txn = .{ .expected = expected };

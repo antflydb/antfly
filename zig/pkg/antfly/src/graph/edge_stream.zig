@@ -77,7 +77,7 @@ pub const Stream = struct {
             fn nextPage(_: *@This(), _: A, _: usize, _: usize) !?[]graph.Edge {
                 return null;
             }
-            fn deinit(_: *@This(), _: A) void {}
+            pub fn deinit(_: *@This(), _: A) void {}
         }{});
     }
 
@@ -90,7 +90,7 @@ pub const Stream = struct {
                 self.edges = null;
                 return out;
             }
-            fn deinit(self: *@This(), a: A) void {
+            pub fn deinit(self: *@This(), a: A) void {
                 if (self.edges) |items| self.reader.freeEdges(a, items);
             }
         }{ .reader = reader, .edges = edges });
@@ -106,7 +106,7 @@ test "graph maintenance edge streams preserve source admission diagnostics" {
             self.budget.retainStateBytes(self.budget.max_retained_state_bytes + 1) catch {};
             return error.QueryCandidateBudgetExceeded;
         }
-        fn deinit(_: *@This(), _: A) void {}
+        pub fn deinit(_: *@This(), _: A) void {}
     }{ .budget = &budget });
     defer stream.deinit();
     try std.testing.expectError(error.GraphWorkBudgetExceeded, stream.nextBudget(&budget, 1));

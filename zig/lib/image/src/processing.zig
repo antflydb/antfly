@@ -40,7 +40,7 @@ pub const ImageU8 = struct {
     row_stride_bytes: usize = 0,
 
     pub fn channels(self: ImageU8) usize {
-        return @intFromEnum(self.format);
+        return @backingInt(self.format);
     }
 
     pub fn rowStride(self: ImageU8) !usize {
@@ -644,7 +644,7 @@ const BicubicAxis = struct {
     offsets: []usize,
     weights: []i32,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.allocator.free(self.starts);
         self.allocator.free(self.offsets);
         self.allocator.free(self.weights);

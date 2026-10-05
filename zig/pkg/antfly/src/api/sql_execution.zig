@@ -167,12 +167,16 @@ pub const Adapter = struct {
     }
 
     pub fn execute(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("../sql/compiler.zig").Compiled, parameters: []const std.json.Value, limits: @import("../sql/runtime.zig").Limits, guarded_backend: ?catalog.Backend) !@import("../sql/runtime.zig").Result {
+        var zig017_return_error: ?anyerror = null;
         var decision_runtime: ?@import("../functions/runtime.zig").Runtime = null;
         const previous_provider = self.decision_provider;
         defer self.decision_provider = previous_provider;
         decision_runtime = try self.decisionRuntime();
         if (decision_runtime) |*active| self.decision_provider = active.provider();
-        if (self.policy_proofs != null) return error.InvalidSqlBackendResponse;
+        if (self.policy_proofs != null) return zig017_failure: {
+            zig017_return_error = error.InvalidSqlBackendResponse;
+            break :zig017_failure error.InvalidSqlBackendResponse;
+        };
         self.policy_proofs = .empty;
         defer {
             var proofs = &self.policy_proofs.?;
@@ -194,19 +198,43 @@ pub const Adapter = struct {
             if (inherited) |*state| state.deinit(self.server.alloc);
         }
         if (self.session_id) |encoded| {
-            const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return error.SqlTransactionNotActive;
-            if (try self.server.txn_sessions.principalAccess(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*)) != .allowed) return error.SqlTransactionNotActive;
-            inherited = (try self.server.txn_sessions.getSqlState(self.server.alloc, id)) orelse return error.SqlTransactionNotActive;
-            if (!std.meta.eql(inherited.?.connection_id, self.connection_id)) return error.SqlConnectionNotFound;
+            const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
+                zig017_return_error = error.SqlTransactionNotActive;
+                break :zig017_failure error.SqlTransactionNotActive;
+            };
+            if ((self.server.txn_sessions.principalAccess(self.server.alloc, id, http_server.transactionPrincipal(self.identity.*)) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            }) != .allowed) return zig017_failure: {
+                zig017_return_error = error.SqlTransactionNotActive;
+                break :zig017_failure error.SqlTransactionNotActive;
+            };
+            inherited = ((self.server.txn_sessions.getSqlState(self.server.alloc, id) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            })) orelse return zig017_failure: {
+                zig017_return_error = error.SqlTransactionNotActive;
+                break :zig017_failure error.SqlTransactionNotActive;
+            };
+            if (!std.meta.eql(inherited.?.connection_id, self.connection_id)) return zig017_failure: {
+                zig017_return_error = error.SqlConnectionNotFound;
+                break :zig017_failure error.SqlConnectionNotFound;
+            };
             if (self.inherit_session_database) self.database = inherited.?.metadata.database;
             if (self.inherit_session_namespace) self.namespace = inherited.?.metadata.namespace;
-            self.setting_overlay = try attachedSettingOverlay(self.setting_overlay_source, self.setting_overlay, inherited.?.setting_active.items);
+            self.setting_overlay = (attachedSettingOverlay(self.setting_overlay_source, self.setting_overlay, inherited.?.setting_active.items) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
         var coordinator = session_api.Coordinator{ .server = self.server, .identity = self.identity, .context = self.context };
         var owner = session_api.Adapter{ .alloc = self.server.alloc, .registry = &self.server.txn_sessions, .node_id = self.server.localSessionNodeId(), .commit_context = &coordinator, .commit_fn = session_api.Coordinator.commit, .supports_range_guards = supportsRangeGuards(self.server), .connection_id = self.connection_id, .connection_revision = self.connection_revision, .connection_overlay = self.setting_overlay };
         var session = sessions.Session{ .owner = owner.owner(), .scope = .{ .principal = http_server.transactionPrincipal(self.identity.*) orelse "", .database = self.database, .namespace = self.session_namespace orelse self.namespace } };
         if (self.session_id) |encoded| {
-            const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return error.SqlTransactionNotActive;
+            const id = @import("distributed_txn.zig").parseTxnIdHex(encoded) catch return zig017_failure: {
+                zig017_return_error = error.SqlTransactionNotActive;
+                break :zig017_failure error.SqlTransactionNotActive;
+            };
             session.attach(id) catch |err| {
                 if (err == error.SessionLeaseLost) self.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
                 return err;
@@ -218,14 +246,26 @@ pub const Adapter = struct {
             self.transaction_status = session.status() catch .failed;
             self.result_session_id = if (session.transaction_id) |id| std.fmt.bytesToHex(id, .lower) else null;
         }
-        errdefer |err| if (err != error.SqlWriteCapacityUnavailable) session.statementFailed() catch {};
+        errdefer if (zig017_return_error) |err| if (err != error.SqlWriteCapacityUnavailable) session.statementFailed() catch {};
         if (compiled.statement == .set_constraints) {
-            if (parameters.len != 0) return error.InvalidSqlParameters;
-            const id = session.transaction_id orelse return error.SqlTransactionNotActive;
-            var result = try @import("../sql/runtime.zig").Result.empty(alloc, "SET CONSTRAINTS");
+            if (parameters.len != 0) return zig017_failure: {
+                zig017_return_error = error.InvalidSqlParameters;
+                break :zig017_failure error.InvalidSqlParameters;
+            };
+            const id = session.transaction_id orelse return zig017_failure: {
+                zig017_return_error = error.SqlTransactionNotActive;
+                break :zig017_failure error.SqlTransactionNotActive;
+            };
+            var result = (@import("../sql/runtime.zig").Result.empty(alloc, "SET CONSTRAINTS") catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             errdefer result.deinit();
             const timing = compiled.statement.set_constraints;
-            try @import("sql_constraint_timing.zig").set(self.server, alloc, self.identity.*, self.context, session.scope, self.namespace, id, timing.names, timing.deferred);
+            (@import("sql_constraint_timing.zig").set(self.server, alloc, self.identity.*, self.context, session.scope, self.namespace, id, timing.names, timing.deferred) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             return result;
         }
         const control: ?sessions.Control = switch (compiled.statement) {
@@ -238,9 +278,15 @@ pub const Adapter = struct {
             else => null,
         };
         if (control) |command| {
-            if (parameters.len != 0) return error.InvalidSqlParameters;
+            if (parameters.len != 0) return zig017_failure: {
+                zig017_return_error = error.InvalidSqlParameters;
+                break :zig017_failure error.InvalidSqlParameters;
+            };
             const control_lease = if (session.transaction_id != null and command != .commit)
-                self.server.txn_sessions.tryAcquireCommitExecution(session.transaction_id.?) orelse return error.SqlWriteCapacityUnavailable
+                self.server.txn_sessions.tryAcquireCommitExecution(session.transaction_id.?) orelse return zig017_failure: {
+                    zig017_return_error = error.SqlWriteCapacityUnavailable;
+                    break :zig017_failure error.SqlWriteCapacityUnavailable;
+                }
             else
                 null;
             defer if (control_lease) |held| held.release();
@@ -252,14 +298,29 @@ pub const Adapter = struct {
                 .release => "RELEASE",
             };
             // Allocate the acknowledgement before mutating durable state.
-            var result = try @import("../sql/runtime.zig").Result.empty(alloc, tag);
+            var result = (@import("../sql/runtime.zig").Result.empty(alloc, tag) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             errdefer result.deinit();
-            const already_failed = command == .commit and (try session.status()) == .failed;
-            const outcome = try session.execute(command);
+            const already_failed = command == .commit and ((session.status() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            })) == .failed;
+            const outcome = (session.execute(command) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             if (outcome.commit) |commit| {
                 self.outcome_transaction_id = std.fmt.bytesToHex(commit.reconciliation_id, .lower);
-                if (commit.outcome == .unknown) return error.SqlTransactionOutcomeUnknown;
-                if (commit.outcome == .aborted and !already_failed) return error.SqlWriteConflict;
+                if (commit.outcome == .unknown) return zig017_failure: {
+                    zig017_return_error = error.SqlTransactionOutcomeUnknown;
+                    break :zig017_failure error.SqlTransactionOutcomeUnknown;
+                };
+                if (commit.outcome == .aborted and !already_failed) return zig017_failure: {
+                    zig017_return_error = error.SqlWriteConflict;
+                    break :zig017_failure error.SqlWriteConflict;
+                };
                 if (commit.outcome == .aborted) result.output.command_tag = "ROLLBACK";
                 result.output.mutation_outcome = switch (commit.outcome) {
                     .committed => .committed,
@@ -274,24 +335,42 @@ pub const Adapter = struct {
         const deferred_conflict = compiled.statement == .insert and compiled.statement.insert.conflict != null and compiled.statement.insert.conflict.?.deferred_count != 0;
         const implicit_guarded = (compiled.statement == .merge or captured_conflict or deferred_conflict) and session.transaction_id == null;
         if (implicit_guarded) {
-            if (!supportsRangeGuards(self.server)) return error.SqlRangeTrackingRequired;
-            _ = try session.execute(.{ .begin = .{} });
+            if (!supportsRangeGuards(self.server)) return zig017_failure: {
+                zig017_return_error = error.SqlRangeTrackingRequired;
+                break :zig017_failure error.SqlRangeTrackingRequired;
+            };
+            _ = (session.execute(.{ .begin = .{} }) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
         var implicit_decided = false;
         errdefer if (implicit_guarded and !implicit_decided) {
             _ = session.execute(.rollback) catch session.deinit();
         };
         if (session.transaction_id != null) {
-            const transaction = try session.statement(switch (compiled.statement) {
+            const transaction = (session.statement(switch (compiled.statement) {
                 .select, .explain => false,
                 else => true,
+            }) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
             });
-            if ((compiled.statement == .merge or captured_conflict or deferred_conflict) and transaction.isolation == .read_committed) return error.SqlRangeTrackingRequired;
+            if ((compiled.statement == .merge or captured_conflict or deferred_conflict) and transaction.isolation == .read_committed) return zig017_failure: {
+                zig017_return_error = error.SqlRangeTrackingRequired;
+                break :zig017_failure error.SqlRangeTrackingRequired;
+            };
             // DDL cannot bypass the native transaction's atomicity boundary.
-            try rejectTransactionalDdl(compiled.statement);
+            (rejectTransactionalDdl(compiled.statement) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             const id = session.transaction_id.?;
             var result = statement: {
-                const execution_lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return error.SqlWriteCapacityUnavailable;
+                const execution_lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return zig017_failure: {
+                    zig017_return_error = error.SqlWriteCapacityUnavailable;
+                    break :zig017_failure error.SqlWriteCapacityUnavailable;
+                };
                 defer execution_lease.release();
                 // A concurrent HTTP SET/RESET may have committed after the
                 // initial session attachment but before this statement's
@@ -300,13 +379,22 @@ pub const Adapter = struct {
                 var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
                 defer if (leased_settings) |*state| state.deinit(self.server.alloc);
                 if (self.session_id != null and compiled.uses_current_setting) {
-                    self.setting_overlay = try refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings);
+                    self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    });
                 }
-                _ = try session.statement(switch (compiled.statement) {
+                _ = (session.statement(switch (compiled.statement) {
                     .select, .explain => false,
                     else => true,
+                }) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
                 });
-                var staged = try self.server.txn_sessions.cloneSqlStaged(alloc, id);
+                var staged = (self.server.txn_sessions.cloneSqlStaged(alloc, id) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
                 defer staged.deinit(alloc);
                 var read_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
                 defer read_guards.deinit(self.server.alloc);
@@ -335,14 +423,32 @@ pub const Adapter = struct {
                 var dynamic_scratch = std.heap.ArenaAllocator.init(alloc);
                 defer dynamic_scratch.deinit();
                 if (deferred_conflict) {
-                    const table = try resolve(self, dynamic_scratch.allocator(), compiled.statement.insert.table, .read_write);
-                    if (table.storage_mode != .relational) return error.UnsupportedSqlExecution;
-                    const reads = self.server.table_reads orelse return error.SqlStatementSnapshotRequired;
+                    const table = (resolve(self, dynamic_scratch.allocator(), compiled.statement.insert.table, .read_write) catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    });
+                    if (table.storage_mode != .relational) return zig017_failure: {
+                        zig017_return_error = error.UnsupportedSqlExecution;
+                        break :zig017_failure error.UnsupportedSqlExecution;
+                    };
+                    const reads = self.server.table_reads orelse return zig017_failure: {
+                        zig017_return_error = error.SqlStatementSnapshotRequired;
+                        break :zig017_failure error.SqlStatementSnapshotRequired;
+                    };
                     // The immutable cut is captured before INSERT-source and
                     // conflict-owner reads. Unsupported distributed ownership
                     // refuses this capability rather than mixing snapshots.
-                    dynamic = try reads.openRelationalStatementSnapshot(alloc, table.physical_name, table.schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns);
-                    if (dynamic.?.vtable.open_guarded == null) return error.SqlRangeTrackingRequired;
+                    dynamic = (reads.openRelationalStatementSnapshot(alloc, table.physical_name, table.schema_version, .read_index, self.context.cancellation, ((self.context.platformDeadline() catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    })).deadline_ns) catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    });
+                    if (dynamic.?.vtable.open_guarded == null) return zig017_failure: {
+                        zig017_return_error = error.SqlRangeTrackingRequired;
+                        break :zig017_failure error.SqlRangeTrackingRequired;
+                    };
                     self.dynamic_snapshot = &dynamic.?;
                     self.dynamic_table = table.physical_name;
                 }
@@ -355,10 +461,19 @@ pub const Adapter = struct {
                     active_backend.coordinated_index_reads = self.range_reads != null and staged.tables.len == 0;
                     active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null;
                 }
-                var output = try @import("../sql/runtime.zig").execute(alloc, active_backend, compiled, parameters, limits);
+                var output = (@import("../sql/runtime.zig").execute(alloc, active_backend, compiled, parameters, limits) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
                 errdefer output.deinit();
                 if (!self.ranges_staged and read_guards.tables.len != 0) {
-                    _ = (try self.server.txn_sessions.stage(self.server.alloc, id, &read_guards)) orelse return error.SqlTransactionNotActive;
+                    _ = ((self.server.txn_sessions.stage(self.server.alloc, id, &read_guards) catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    })) orelse return zig017_failure: {
+                        zig017_return_error = error.SqlTransactionNotActive;
+                        break :zig017_failure error.SqlTransactionNotActive;
+                    };
                 }
                 output.output.mutation_outcome = null;
                 break :statement output;
@@ -367,16 +482,28 @@ pub const Adapter = struct {
             if (implicit_guarded) {
                 // The statement lease and borrowed read view are gone before
                 // commit admission. A decided/unknown outcome is never retried.
-                const decision = try session.execute(.commit);
-                const commit = decision.commit orelse return error.InvalidSqlBackendResponse;
+                const decision = (session.execute(.commit) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
+                const commit = decision.commit orelse return zig017_failure: {
+                    zig017_return_error = error.InvalidSqlBackendResponse;
+                    break :zig017_failure error.InvalidSqlBackendResponse;
+                };
                 implicit_decided = true;
                 self.outcome_transaction_id = std.fmt.bytesToHex(commit.reconciliation_id, .lower);
                 result.output.mutation_outcome = switch (commit.outcome) {
                     .committed => .committed,
                     .committed_pending => .committed_pending,
                     .committed_repair_required => .committed_repair_required,
-                    .aborted => return error.SqlWriteConflict,
-                    .unknown => return error.SqlTransactionOutcomeUnknown,
+                    .aborted => return zig017_failure: {
+                        zig017_return_error = error.SqlWriteConflict;
+                        break :zig017_failure error.SqlWriteConflict;
+                    },
+                    .unknown => return zig017_failure: {
+                        zig017_return_error = error.SqlTransactionOutcomeUnknown;
+                        break :zig017_failure error.SqlTransactionOutcomeUnknown;
+                    },
                 };
             }
             return result;
@@ -384,7 +511,10 @@ pub const Adapter = struct {
         var statement_backend = guarded_backend orelse self.backend();
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
-        return @import("../sql/runtime.zig").execute(alloc, statement_backend, compiled, parameters, limits);
+        return @import("../sql/runtime.zig").execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        };
     }
 
     pub fn backend(self: *Adapter) catalog.Backend {
@@ -1104,11 +1234,11 @@ pub const Adapter = struct {
             } else writes.items;
             const scope = table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);
-            var tables = [_]txn.TableCommitRequest{.{ .table_name = @constCast(logical), .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .batch = .{ .writes = normalized, .deletes = deletes.items }, .predicates = .{ .items = predicates, .capacity = predicates.len } }};
+            var tables = [_]txn.TableCommitRequest{.{ .table_name = @constCast(logical), .schema_version = if (table.storage_mode == .document) table.schema_version else null, .relational_schema_version = if (table.storage_mode == .relational) table.schema_version else null, .batch = .{ .writes = normalized, .deletes = deletes.items }, .predicates = .{ .items = predicates, .capacity = predicates.len, .pointer_stability = .{} } }};
             defer if (tables[0].conflict_guards) |*owned| owned.deinit();
             if (guards) |value| try tables[0].mergeConflictGuards(alloc, value);
             var bindings = [_]txn.CatalogBinding{.{ .logical = logical, .physical = table.physical_name }};
-            const statement = txn.OwnedTransactionCommitRequest{ .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1 } };
+            const statement = txn.OwnedTransactionCommitRequest{ .tables = &tables, .catalog_bindings = .{ .items = &bindings, .capacity = 1, .pointer_stability = .{} } };
             if (!(try self.server.transactionRequestAuthorized(self.identity.*, statement))) return error.Forbidden;
             _ = (try self.server.txn_sessions.stageValidated(self.server.alloc, id, &statement, .{ .ptr = self, .validate = validateStaged })) orelse return error.SqlTransactionNotActive;
             self.ranges_staged = true;
@@ -2726,7 +2856,7 @@ test "SQL direct conflict scalar uses one guarded native cut through owner and c
                 return null;
             }
             try std.testing.expectEqualStrings("{\"mode\":\"status\"}", opts.relational_activation_json);
-            const coverage = .{ .schema_version = @as(u32, 1), .schema_digest = self.digest, .generation_set = self.generation_set, .owner = [_]u8{1} ** 32, .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = true, .state = activation.State.validating, .phase = activation.Phase.foreign_key, .rows_scanned = @as(u64, 1), .failure = @as([]const u8, "") };
+            const coverage = .{ .schema_version = @as(u32, 1), .schema_digest = self.digest, .generation_set = self.generation_set, .owner = @as([32]u8, @splat(1)), .range_start = @as([]const u8, ""), .range_end = @as([]const u8, ""), .unique_covered = true, .state = activation.State.validating, .phase = activation.Phase.foreign_key, .rows_scanned = @as(u64, 1), .failure = @as([]const u8, "") };
             try std.testing.expectEqualStrings("", key);
             return .{ .json = try std.json.Stringify.valueAlloc(allocator, coverage, .{}), .version = 0 };
         }

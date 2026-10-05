@@ -125,7 +125,7 @@ pub const Program = struct {
             return error.ResourceLimitExceeded;
         for (targets) |target| if (target >= source_count) return error.InvalidResidentProgramTarget;
         var view = source.*;
-        view.outputs = .{ .items = @constCast(targets), .capacity = targets.len };
+        view.outputs = .{ .items = @constCast(targets), .capacity = targets.len, .pointer_stability = .{} };
         var lowered = try ml.lower.lower(a, &view);
         errdefer lowered.deinit();
         const graph = &lowered.graph;

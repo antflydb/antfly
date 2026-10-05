@@ -39,7 +39,7 @@ const KeySet = struct {
     artifacts: [][]u8,
     docs: [][]u8,
 
-    fn deinit(self: *KeySet, alloc: Allocator) void {
+    pub fn deinit(self: *KeySet, alloc: Allocator) void {
         for (self.metadata) |key| alloc.free(key);
         for (self.artifacts) |key| alloc.free(key);
         for (self.docs) |key| alloc.free(key);
@@ -66,7 +66,7 @@ const QuerySet = struct {
         return self.artifact_flat[start..][0..self.candidates];
     }
 
-    fn deinit(self: *QuerySet, alloc: Allocator) void {
+    pub fn deinit(self: *QuerySet, alloc: Allocator) void {
         alloc.free(self.metadata_flat);
         alloc.free(self.artifact_flat);
         self.* = undefined;

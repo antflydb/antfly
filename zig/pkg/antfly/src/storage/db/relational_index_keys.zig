@@ -78,7 +78,7 @@ const CompiledExpression = struct {
         return result;
     }
 
-    fn deinit(self: *CompiledExpression, alloc: Allocator) void {
+    pub fn deinit(self: *CompiledExpression, alloc: Allocator) void {
         self.plan.deinit();
         alloc.free(self.json);
         alloc.destroy(self);
@@ -189,7 +189,7 @@ pub const TuplePlan = struct {
             hasher.update(&size);
             hasher.update(name);
             if (key.expression) |expression| hasher.update(&expression.fingerprint);
-            hasher.update(&.{ @intFromEnum(key.column_type), @intFromBool(key.descending), @intFromBool(key.nulls_first), @intFromBool(key.fold_ascii) });
+            hasher.update(&.{ @backingInt(key.column_type), @intFromBool(key.descending), @intFromBool(key.nulls_first), @intFromBool(key.fold_ascii) });
         }
         var fingerprint: [std.crypto.hash.Blake3.digest_length]u8 = undefined;
         hasher.final(&fingerprint);

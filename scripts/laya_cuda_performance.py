@@ -108,11 +108,8 @@ def parse_native(output, variant, samples, warmups):
         )
     if "Laya qualification backend=cuda " not in output:
         raise ValueError("Benchmark did not select CUDA")
-    if (
-        "Laya benchmark build mode=ReleaseSafe cpu=x86_64_v3 artifacts=fatbin"
-        not in output
-    ):
-        raise ValueError("Benchmark requires ReleaseSafe x86_64_v3 fatbin")
+    if "Laya benchmark build mode=safe cpu=x86_64_v3 artifacts=fatbin" not in output:
+        raise ValueError("Benchmark requires safe x86_64_v3 fatbin")
     rows = [
         json.loads(line.removeprefix("Laya benchmark "))
         for line in output.splitlines()

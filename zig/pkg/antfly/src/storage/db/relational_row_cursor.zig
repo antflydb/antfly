@@ -54,14 +54,14 @@ pub fn decode(alloc: std.mem.Allocator, encoded: []const u8, expected: [identity
 
 test "relational row query cursors preserve binary order and fence logical index comparison and schema" {
     const alloc = std.testing.allocator;
-    const header = identity(7, "by_id", .{3} ** 32);
+    const header = identity(7, "by_id", @splat(3));
     const encoded = try encode(alloc, header, "\x00\xff\x80");
     defer alloc.free(encoded);
     const decoded = try decode(alloc, encoded, header);
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("\x00\xff\x80", decoded);
-    try std.testing.expectError(error.PreparedGenerationChanged, decode(alloc, encoded, identity(8, "by_id", .{3} ** 32)));
-    try std.testing.expectError(error.PreparedGenerationChanged, decode(alloc, encoded, identity(7, "by_other_id", .{3} ** 32)));
-    try std.testing.expectError(error.PreparedGenerationChanged, decode(alloc, encoded, identity(7, "by_id", .{4} ** 32)));
+    try std.testing.expectError(error.PreparedGenerationChanged, decode(alloc, encoded, identity(8, "by_id", @splat(3))));
+    try std.testing.expectError(error.PreparedGenerationChanged, decode(alloc, encoded, identity(7, "by_other_id", @splat(3))));
+    try std.testing.expectError(error.PreparedGenerationChanged, decode(alloc, encoded, identity(7, "by_id", @splat(4))));
     try std.testing.expectError(error.InvalidRelationalRowsRequest, validate("not-a-cursor"));
 }

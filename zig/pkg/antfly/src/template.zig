@@ -1010,7 +1010,7 @@ test "transcribeAudio helper uses active transcribing runtime" {
             };
         }
 
-        fn deinit(_: *anyopaque) void {}
+        pub fn deinit(_: *anyopaque) void {}
     };
 
     var runtime = transcribing.Runtime.init(alloc);

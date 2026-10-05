@@ -20,7 +20,7 @@ const CancellationToken = @import("antfly_cancellation").CancellationToken;
 const inference_request_context = @import("antfly_inference_execution_context");
 const RequestContext = inference_request_context.RequestContext;
 const utf8_text = @import("utf8_text.zig");
-const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("../template_stub.zig")
 else
     @import("../../../template.zig");
@@ -673,7 +673,7 @@ const SanitizedTextBatch = struct {
         return self.sanitized orelse self.original;
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.owned) |owned| {
             for (owned) |maybe_text| {
                 if (maybe_text) |text| alloc.free(text);
@@ -694,7 +694,7 @@ const SanitizedContentParts = struct {
         return self.parts orelse self.original;
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.owned_texts) |owned_texts| {
             for (owned_texts) |maybe_text| {
                 if (maybe_text) |text| alloc.free(text);

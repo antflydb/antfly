@@ -72,7 +72,7 @@ pub const ComputeRuntime = struct {
     io: ?std.Io = null,
     max_parallelism: usize = 1,
 
-    fn validate(self: ComputeRuntime) !void {
+    pub fn validate(self: ComputeRuntime) !void {
         if (self.max_parallelism == 0 or self.max_parallelism > max_compute_parallelism) return error.InvalidGraphMetricBuildOptions;
         if (self.io == null and self.max_parallelism != 1) return error.InvalidGraphMetricBuildOptions;
     }
@@ -975,7 +975,7 @@ const PriorInventory = struct {
     budget: *graph_metric_policy.Budget,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
 
-    fn deinit(self: *PriorInventory, alloc: Allocator) void {
+    pub fn deinit(self: *PriorInventory, alloc: Allocator) void {
         for (self.entries.items) |entry| if (entry.prefix) |prefix| alloc.free(prefix);
         self.entries.deinit(alloc);
     }
@@ -1019,8 +1019,8 @@ const PriorInventory = struct {
                     if (decoded.version != metric_segment.wire_version or decoded.kind != request.config.kind or
                         decoded.config_fingerprint != configFingerprint(request.config) or
                         decoded.materializer_fingerprint != materializerFingerprint(limits) or
-                        @intFromEnum(decoded.materialization_state) != @intFromEnum(state) or
-                        @intFromEnum(decoded.rejection_reason) != @intFromEnum(prior.graph_metric_rejection_reason) or
+                        @backingInt(decoded.materialization_state) != @backingInt(state) or
+                        @backingInt(decoded.rejection_reason) != @backingInt(prior.graph_metric_rejection_reason) or
                         !metricSourceMatches(decoded, request.source_graph, prior)) continue;
                     return prior;
                 }
@@ -1467,7 +1467,7 @@ const Projection = struct {
     node_id_bytes: usize = 0,
     decoded_retained_bytes: usize = 0,
 
-    fn deinit(self: *Projection, alloc: Allocator) void {
+    pub fn deinit(self: *Projection, alloc: Allocator) void {
         self.ordinals.deinit(alloc);
         self.node_ids.deinit(alloc);
         if (self.topology) |*topology| topology.deinit(alloc);
@@ -1495,7 +1495,7 @@ const EdgeFilterIndex = struct {
         return self;
     }
 
-    fn deinit(self: *EdgeFilterIndex, alloc: Allocator) void {
+    pub fn deinit(self: *EdgeFilterIndex, alloc: Allocator) void {
         self.types.deinit(alloc);
         self.* = undefined;
     }
@@ -1692,7 +1692,7 @@ pub fn benchmarkRejectedOutput(alloc: Allocator, payload: []const u8, reference:
     var options = BuildOptions{
         .graph_index_name = "bench",
         .config = .{ .name = "rank", .kind = .pagerank, .max_iterations = 3 },
-        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "a" ** 64, .byte_len = payload.len },
+        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = z17RepeatString("a", 64), .byte_len = payload.len },
     };
     var projection = try buildProjectionFromTopologyAlloc(alloc, topology, 0, options);
     defer projection.deinit(alloc);
@@ -2770,8 +2770,8 @@ fn populateGraphMetricIntegrity(ref: *artifact_ref.ArtifactRef, segment: metric_
     ref.graph_metric_topology_checksum = segment.topology_checksum;
     ref.graph_metric_source_checksum = artifact_store.sha256DigestFromChecksum(segment.source_graph_checksum) catch
         return error.ArtifactIntegrityMismatch;
-    ref.graph_metric_materialization_state = @enumFromInt(@intFromEnum(segment.materialization_state));
-    ref.graph_metric_rejection_reason = @enumFromInt(@intFromEnum(segment.rejection_reason));
+    ref.graph_metric_materialization_state = @fromBackingInt(@backingInt(segment.materialization_state));
+    ref.graph_metric_rejection_reason = @fromBackingInt(@backingInt(segment.rejection_reason));
 }
 
 /// Maps the last published node-sorted vector onto the current canonical node
@@ -2829,7 +2829,7 @@ const SeedReader = struct {
     cancellation: CancellationToken,
     budget: *graph_metric_policy.Budget,
 
-    fn read(self: @This(), offset: u64, len: usize, checksum: ?[32]u8) ![]u8 {
+    pub fn read(self: @This(), offset: u64, len: usize, checksum: ?[32]u8) ![]u8 {
         var remaining = @min(
             self.budget.limits.max_total_seed_payload_bytes -| self.budget.seed_payload_bytes,
             self.budget.limits.max_total_seed_work_items -| self.budget.seed_work_items,
@@ -3050,11 +3050,11 @@ fn lessScore(_: void, a: metric_segment.Score, b: metric_segment.Score) bool {
 
 pub fn configFingerprint(config: graph_mod.GraphMetricConfig) u64 {
     var hasher = std.hash.Wyhash.init(0);
-    hashU64(&hasher, @intFromEnum(config.kind));
+    hashU64(&hasher, @backingInt(config.kind));
     hashU64(&hasher, @bitCast(config.damping));
     hashU64(&hasher, @bitCast(config.tolerance));
     hashU64(&hasher, config.max_iterations);
-    hashU64(&hasher, @intFromEnum(config.edge_filter.mode));
+    hashU64(&hasher, @backingInt(config.edge_filter.mode));
     hashU64(&hasher, config.edge_filter.types.len);
     const sorted = config.edge_filter.types;
     // The storage fingerprint is order-independent. Avoid allocating by
@@ -3185,7 +3185,7 @@ test "serverless graph metric impossible payload is rejected before artifact IO"
             self.calls += 1;
             return error.UnexpectedArtifactIO;
         }
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn put(ptr: *anyopaque, _: Allocator, _: []const u8) !artifact_store.ArtifactMetadata {
             return fail(ptr);
         }
@@ -3215,8 +3215,8 @@ test "serverless graph metric impossible payload is rejected before artifact IO"
     for ([_]u64{ 1024, 1025 }) |bytes| {
         try std.testing.expectError(error.GraphMetricBuildBudgetExceeded, prepareGraphArtifactOracleAlloc(failing.allocator(), &store, .{
             .kind = .graph_segment,
-            .artifact_id = "sha256:" ++ "0" ** 64,
-            .checksum = "0" ** 64,
+            .artifact_id = "sha256:" ++ z17RepeatString("0", 64),
+            .checksum = z17RepeatString("0", 64),
             .byte_len = bytes,
         }, .none, .{ .max_graph_payload_bytes = 2048, .max_peak_memory_bytes = 1024 }));
     }
@@ -3681,7 +3681,7 @@ test "serverless graph metric warm starts read bounded sparse and dense primary 
     var fs = try fs_artifact_store.FsStore.init(alloc, root_path);
     var artifacts = fs.artifactStore();
     defer artifacts.deinit();
-    const checksum = "a" ** 64;
+    const checksum = z17RepeatString("a", 64);
     const config = graph_mod.GraphMetricConfig{ .name = "rank" };
     var segment = metric_segment.Segment{
         .kind = .pagerank,
@@ -3969,7 +3969,7 @@ test "serverless graph metric output admission rejects before kernels and reserv
     var options = BuildOptions{
         .graph_index_name = "graph",
         .config = .{ .name = "authority", .kind = .hits_authority },
-        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = "a" ** 64, .byte_len = 1 },
+        .source_graph = .{ .kind = .graph_segment, .artifact_id = "fixture", .checksum = z17RepeatString("a", 64), .byte_len = 1 },
         .batch_budget = &budget,
     };
     var projection = try buildProjectionFromTopologyAlloc(alloc, topology, 0, options);
@@ -4294,7 +4294,7 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
             self.writes += 1;
             return self.inner.vtable.put(self.inner.ptr, allocator, bytes);
         }
-        fn deinit(_: Allocator, _: *anyopaque) void {}
+        pub fn deinit(_: Allocator, _: *anyopaque) void {}
         fn range(ptr: *anyopaque, allocator: Allocator, id: []const u8, offset: u64, len: usize) ![]u8 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.range_reads += 1;
@@ -4472,4 +4472,15 @@ test "serverless lake graph metrics reject work beyond the aggregate publication
     var strict_decoded = try metric_segment.decodeAlloc(alloc, strict_payload);
     defer strict_decoded.deinit(alloc);
     try std.testing.expectEqual(metric_segment.MaterializationState.rejected, strict_decoded.materialization_state);
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

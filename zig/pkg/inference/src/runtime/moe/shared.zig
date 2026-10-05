@@ -19,7 +19,7 @@ const LayerState = struct {
     touch_counts: []u64 = &.{},
     coactivation: []u32 = &.{},
 
-    fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
+    pub fn deinit(self: *LayerState, allocator: std.mem.Allocator) void {
         allocator.free(self.touch_counts);
         allocator.free(self.coactivation);
         self.* = .{};

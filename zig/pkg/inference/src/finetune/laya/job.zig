@@ -213,7 +213,7 @@ const Cache = struct {
         self.program.?.frozen = self.frozen;
         return &self.program.?;
     }
-    fn deinit(self: *Cache) void {
+    pub fn deinit(self: *Cache) void {
         if (self.program) |*p| p.deinit();
     }
 };
@@ -252,7 +252,7 @@ fn metrics(preds: []const Prediction, temperatures: [3]f32) !Metrics {
         var gold: usize = 0;
         for (p.logits, p.target, 0..) |z, t, k| {
             if (!std.math.isFinite(z)) return error.NonFiniteLayaLogits;
-            max = @max(max, z / temperatures[@intFromEnum(p.kind)]);
+            max = @max(max, z / temperatures[@backingInt(p.kind)]);
             if (z > p.logits[winner]) winner = k;
             if (t > p.target[gold]) gold = k;
         }
@@ -260,13 +260,13 @@ fn metrics(preds: []const Prediction, temperatures: [3]f32) !Metrics {
         var sum: f64 = 0;
         var probs: [model.max_packed_options]f64 = undefined;
         for (p.logits, 0..) |z, k| {
-            probs[k] = @exp(z / temperatures[@intFromEnum(p.kind)] - max);
+            probs[k] = @exp(z / temperatures[@backingInt(p.kind)] - max);
             sum += probs[k];
         }
         var expected: f64 = 0;
         var target_expected: f64 = 0;
         for (p.logits, p.target, 0..) |z, t, k| {
-            ce -= t * (z / temperatures[@intFromEnum(p.kind)] - max - @log(sum));
+            ce -= t * (z / temperatures[@backingInt(p.kind)] - max - @log(sum));
             expected += @as(f64, @floatFromInt(k)) * probs[k] / sum;
             target_expected += @as(f64, @floatFromInt(k)) * t;
         }
@@ -283,7 +283,7 @@ fn metricsByKind(a: std.mem.Allocator, preds: []const Prediction, temperatures: 
     for (0..3) |kind| {
         var subset: std.ArrayListUnmanaged(Prediction) = .empty;
         defer subset.deinit(a);
-        for (preds) |p| if (@intFromEnum(p.kind) == kind) try subset.append(a, p);
+        for (preds) |p| if (@backingInt(p.kind) == kind) try subset.append(a, p);
         if (subset.items.len > 0) result[kind] = try metrics(subset.items, temperatures);
     }
     return result;
@@ -293,7 +293,7 @@ fn calibrate(a: std.mem.Allocator, preds: []const Prediction) ![3]f32 {
     for (0..3) |kind| {
         var subset: std.ArrayListUnmanaged(Prediction) = .empty;
         defer subset.deinit(a);
-        for (preds) |p| if (@intFromEnum(p.kind) == kind) try subset.append(a, p);
+        for (preds) |p| if (@backingInt(p.kind) == kind) try subset.append(a, p);
         if (subset.items.len < 10) continue;
         var best = (try metrics(subset.items, temperatures)).soft_ce;
         // Bounded deterministic log-temperature search. Unit temperature is
@@ -537,7 +537,7 @@ const Cursor = struct {
     epochs: u64,
     accumulation: u64,
     stop: ?u64 = null,
-    fn validate(raw: ?*const anyopaque, identity: training.controller.Identity, accumulated: u32) !void {
+    pub fn validate(raw: ?*const anyopaque, identity: training.controller.Identity, accumulated: u32) !void {
         const self: *const Cursor = @ptrCast(@alignCast(raw.?));
         const completed = identity.microbatch_step;
         if (completed > self.batches * self.epochs) return error.InvalidLayaResumePosition;
@@ -915,7 +915,7 @@ test "laya resume cursor accounts for partial windows and epoch flushes" {
 
 test "laya admission checks late long sequences and token vocabulary before training" {
     const cfg = modern.Config{ .laya = .{ .max_len = 2048 }, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
-    const ids = [_]i64{0} ** 2048;
+    const ids = @as([2048]i64, @splat(0));
     const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
     var long = short;
     long.ids = &ids;
@@ -971,7 +971,7 @@ test "laya backend estimate covers weights, activations, and the fixed overhead 
 
 test "laya admission drops the quadratic bound when fused segment attention is selected" {
     const cfg = modern.Config{ .laya = .{ .max_len = 2048 }, .checkpoint_layout = .huggingface_fused_qkv_no_bias, .rope_interleaved = false };
-    const ids = [_]i64{0} ** 2048;
+    const ids = @as([2048]i64, @splat(0));
     const short = training.Example{ .ids = ids[0..2], .markers = &.{ 0, 1 }, .kind = .noul, .target = &.{ 1, 0 } };
     var long = short;
     long.ids = &ids;

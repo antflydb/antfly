@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const AtomicU64 = @import("antfly_platform").atomic.Value(u64);
 const resource_manager_mod = @import("../../resource_manager.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const derived_worker = @import("derived_worker.zig");
@@ -459,7 +460,7 @@ test "dense replay working-set factor scales the estimate and the unbudgeted win
     // A real slice limit is physical memory: the scaled ceiling cannot lift
     // the window above it.
     var options = resource_manager_mod.Options{};
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 };
+    options.budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{ .soft_limit_bytes = 48 * 1024 * 1024, .hard_limit_bytes = 64 * 1024 * 1024 };
     var manager = resource_manager_mod.ResourceManager.init(options);
     defer manager.deinit(std.testing.allocator);
     const budgeted = denseReplayWindowLimits(&manager, 8, null);
@@ -484,9 +485,9 @@ test "dense replay explicit estimates preserve the original work ceiling" {
 
 test "dense replay adapts work independently from working-set units" {
     var options = resource_manager_mod.Options{};
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)] = .{};
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = .{};
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.dense_routing_working_set)] = .{};
+    options.budgets[@backingInt(resource_manager_mod.Slice.derived_replay_window)] = .{};
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)] = .{};
+    options.budgets[@backingInt(resource_manager_mod.Slice.dense_routing_working_set)] = .{};
     var manager = resource_manager_mod.ResourceManager.init(options);
     defer manager.deinit(std.testing.allocator);
     const native = denseReplayWindowLimits(&manager, 1, null);

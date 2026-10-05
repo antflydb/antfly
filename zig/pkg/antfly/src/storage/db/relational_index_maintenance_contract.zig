@@ -78,7 +78,7 @@ pub const Command = struct {
     pub fn fingerprint(self: Command) [32]u8 {
         var state = std.crypto.hash.Blake3.init(.{});
         state.update("antfly relational index maintenance command v1");
-        for ([_]u64{ @intFromEnum(self.action), self.table_id, self.owner_group_id, self.schema_version, self.generation, self.slot, self.expected_maintenance_epoch, self.index_name.len }) |value| {
+        for ([_]u64{ @backingInt(self.action), self.table_id, self.owner_group_id, self.schema_version, self.generation, self.slot, self.expected_maintenance_epoch, self.index_name.len }) |value| {
             var encoded: [8]u8 = undefined;
             std.mem.writeInt(u64, &encoded, value, .little);
             state.update(&encoded);

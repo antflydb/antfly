@@ -367,7 +367,7 @@ test "registerParam creates AdamW8BitState and bumps resident bytes" {
     var mgr = QuantizedOptimizerManager.init(testing.allocator, &coord, .{});
     defer mgr.deinit();
 
-    var weights = [_]f32{0} ** 64;
+    var weights = @as([64]f32, @splat(0));
     const id = ParamId{ .layer_idx = 0, .module_idx = 0 };
     try mgr.registerParam(id, &weights, @sizeOf(f32) * weights.len, null);
 
@@ -388,11 +388,11 @@ test "step runs an AdamW8Bit update and increments total_steps" {
     var mgr = QuantizedOptimizerManager.init(testing.allocator, &coord, .{});
     defer mgr.deinit();
 
-    var weights = [_]f32{0.5} ** 32;
+    var weights = @as([32]f32, @splat(0.5));
     const id = ParamId{ .layer_idx = 0, .module_idx = 0 };
     try mgr.registerParam(id, &weights, @sizeOf(f32) * weights.len, optimizers_ext.AdamW8BitConfig{ .block_size = 32, .weight_decay = 0.0 });
 
-    const grad = [_]f32{0.1} ** 32;
+    const grad = @as([32]f32, @splat(0.1));
     try mgr.step(id, &grad, 0.01);
 
     try testing.expectEqual(@as(u64, 1), mgr.total_steps);
@@ -409,7 +409,7 @@ test "step on an unknown id returns UnknownParam" {
     var mgr = QuantizedOptimizerManager.init(testing.allocator, &coord, .{});
     defer mgr.deinit();
 
-    const grad = [_]f32{0} ** 4;
+    const grad = @as([4]f32, @splat(0));
     const missing = ParamId{ .layer_idx = 99, .module_idx = 99 };
     try testing.expectError(
         QuantizedOptimizerManagerError.UnknownParam,
@@ -426,7 +426,7 @@ test "spillOptimizerState writes to NVMe and drops resident bytes" {
     var mgr = QuantizedOptimizerManager.init(testing.allocator, &coord, .{});
     defer mgr.deinit();
 
-    var weights = [_]f32{0} ** 64;
+    var weights = @as([64]f32, @splat(0));
     const id = ParamId{ .layer_idx = 1, .module_idx = 0 };
     try mgr.registerParam(id, &weights, @sizeOf(f32) * weights.len, optimizers_ext.AdamW8BitConfig{ .block_size = 32 });
 
@@ -449,15 +449,15 @@ test "step after spill rehydrates transparently; weights match unspilled ref" {
     defer mgr.deinit();
 
     // Two params with identical init, same grad, same cfg.
-    var wA = [_]f32{0.25} ** 32;
-    var wB = [_]f32{0.25} ** 32;
+    var wA = @as([32]f32, @splat(0.25));
+    var wB = @as([32]f32, @splat(0.25));
     const idA = ParamId{ .layer_idx = 0, .module_idx = 0 };
     const idB = ParamId{ .layer_idx = 0, .module_idx = 1 };
     const cfg = optimizers_ext.AdamW8BitConfig{ .block_size = 32, .weight_decay = 0.0 };
     try mgr.registerParam(idA, &wA, @sizeOf(f32) * wA.len, cfg);
     try mgr.registerParam(idB, &wB, @sizeOf(f32) * wB.len, cfg);
 
-    const grad = [_]f32{0.2} ** 32;
+    const grad = @as([32]f32, @splat(0.2));
     // First step on both so the quantized state has nonzero values worth
     // preserving through a spill round-trip.
     try mgr.step(idA, &grad, 0.01);
@@ -489,7 +489,7 @@ test "spillOptimizerState on a pinned block returns NotSpillable" {
     var mgr = QuantizedOptimizerManager.init(testing.allocator, &coord, .{});
     defer mgr.deinit();
 
-    var weights = [_]f32{0} ** 32;
+    var weights = @as([32]f32, @splat(0));
     const id = ParamId{ .layer_idx = 2, .module_idx = 2 };
     try mgr.registerParam(id, &weights, @sizeOf(f32) * weights.len, optimizers_ext.AdamW8BitConfig{ .block_size = 32 });
 
@@ -512,8 +512,8 @@ test "spillColdOptimizerStates spills only cold params" {
     var mgr = QuantizedOptimizerManager.init(testing.allocator, &coord, .{});
     defer mgr.deinit();
 
-    var w_hot = [_]f32{0} ** 32;
-    var w_cold = [_]f32{0} ** 32;
+    var w_hot = @as([32]f32, @splat(0));
+    var w_cold = @as([32]f32, @splat(0));
     const hot = ParamId{ .layer_idx = 0, .module_idx = 0 };
     const cold = ParamId{ .layer_idx = 0, .module_idx = 1 };
     const cfg = optimizers_ext.AdamW8BitConfig{ .block_size = 32 };
@@ -543,8 +543,8 @@ test "deinit frees spilled slots and in-RAM state" {
     var mgr = QuantizedOptimizerManager.init(testing.allocator, &coord, .{});
     // No explicit defer — we test deinit manually.
 
-    var w0 = [_]f32{0} ** 32;
-    var w1 = [_]f32{0} ** 32;
+    var w0 = @as([32]f32, @splat(0));
+    var w1 = @as([32]f32, @splat(0));
     const id0 = ParamId{ .layer_idx = 0, .module_idx = 0 };
     const id1 = ParamId{ .layer_idx = 0, .module_idx = 1 };
     const cfg = optimizers_ext.AdamW8BitConfig{ .block_size = 32 };

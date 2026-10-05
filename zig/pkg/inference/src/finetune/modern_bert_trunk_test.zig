@@ -18,7 +18,7 @@ const Run = struct {
     gradients: [][]f32,
     names: [][]const u8,
 
-    fn deinit(self: *Run, a: Allocator) void {
+    pub fn deinit(self: *Run, a: Allocator) void {
         a.free(self.hidden);
         for (self.gradients) |g| a.free(g);
         a.free(self.gradients);

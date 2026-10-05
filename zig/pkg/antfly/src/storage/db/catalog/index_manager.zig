@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const is_hostless = builtin.os.tag == .freestanding or builtin.os.tag == .wasi;
 const storage_build_options = @import("build_options");
 const platform = @import("antfly_platform");
 const platform_clock = platform.clock;
@@ -160,7 +161,7 @@ const FreshDenseNativeGeneration = struct {
     relative_index_path: []u8,
     generation_id: u128,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         self.alloc.free(self.shadow_root);
         self.alloc.free(self.index_path);
         self.alloc.free(self.relative_index_path);
@@ -486,7 +487,7 @@ const TextMergeBudgetAllocator = struct {
         };
     }
 
-    fn deinit(self: *TextMergeBudgetAllocator) void {
+    pub fn deinit(self: *TextMergeBudgetAllocator) void {
         std.debug.assert(self.live_bytes.load(.acquire) == 0);
         std.debug.assert(self.task_live_bytes.load(.acquire) == 0);
         if (self.reservation) |*reservation| reservation.release();
@@ -774,7 +775,7 @@ const TextMergeScheduler = struct {
         segment_ids: []u64,
         task_token: *const anyopaque,
 
-        fn deinit(self: *InFlightMerge, alloc: Allocator) void {
+        pub fn deinit(self: *InFlightMerge, alloc: Allocator) void {
             alloc.free(self.index_name);
             alloc.free(self.segment_ids);
             self.* = undefined;
@@ -789,7 +790,7 @@ const TextMergeScheduler = struct {
         quarantined_at_ns: u64,
         retry_after_ns: u64,
 
-        fn deinit(self: *QuarantinedMerge, alloc: Allocator) void {
+        pub fn deinit(self: *QuarantinedMerge, alloc: Allocator) void {
             alloc.free(self.index_name);
             alloc.free(self.segment_ids);
             alloc.free(self.error_name);
@@ -818,7 +819,7 @@ const TextMergeScheduler = struct {
     deferred_for_pressure: u64 = 0,
     forced_drains: u64 = 0,
 
-    fn deinit(self: *TextMergeScheduler, alloc: Allocator) void {
+    pub fn deinit(self: *TextMergeScheduler, alloc: Allocator) void {
         for (self.in_flight.items) |*merge| merge.deinit(alloc);
         self.in_flight.deinit(alloc);
         for (self.quarantined.items) |*merge| merge.deinit(alloc);
@@ -1479,8 +1480,8 @@ pub const IndexManager = struct {
     /// Action-partitioned discovery rings. Automatic reconstruction never
     /// spends its bounded inspection budget walking retry-only or manual debt,
     /// while exact queue lengths make wake/terminal classification O(1).
-    failed_index_load_action_queues: [std.meta.fields(IndexLoadRecoveryAction).len]FailedIndexLoadActionQueue =
-        [_]FailedIndexLoadActionQueue{.{}} ** std.meta.fields(IndexLoadRecoveryAction).len,
+    failed_index_load_action_queues: [@typeInfo(IndexLoadRecoveryAction).@"enum".field_names.len]FailedIndexLoadActionQueue =
+        @as([@typeInfo(IndexLoadRecoveryAction).@"enum".field_names.len]FailedIndexLoadActionQueue, @splat(.{})),
     // Durable repair intents gate service independently of load failures. A
     // replacement may load successfully after pointer activation while its
     // intent is still in activating/validating; queries must remain closed
@@ -1622,7 +1623,7 @@ pub const IndexManager = struct {
             return .{ .bitmap = roaring.RoaringBitmap.init(alloc) };
         }
 
-        fn deinit(self: *TextMergeDeletionDelta) void {
+        pub fn deinit(self: *TextMergeDeletionDelta) void {
             self.bitmap.deinit();
             self.* = undefined;
         }
@@ -1825,7 +1826,7 @@ pub const IndexManager = struct {
             };
         }
 
-        fn deinit(self: *OwnedFieldAnalyzer, alloc: Allocator) void {
+        pub fn deinit(self: *OwnedFieldAnalyzer, alloc: Allocator) void {
             alloc.free(self.field);
             alloc.free(self.char_filters);
             alloc.free(self.filters);
@@ -1872,7 +1873,7 @@ pub const IndexManager = struct {
         deleted: ?roaring.RoaringBitmap = null,
         deleted_count: u32 = 0,
 
-        fn deinit(self: *TextMergeSourceSegment, alloc: Allocator) void {
+        pub fn deinit(self: *TextMergeSourceSegment, alloc: Allocator) void {
             _ = alloc;
             if (self.deleted) |*deleted| deleted.deinit();
             self.* = undefined;
@@ -2108,7 +2109,7 @@ pub const IndexManager = struct {
         source_current: bool,
         bitmaps: []?roaring.RoaringBitmap,
 
-        fn deinit(self: *TextMergePublicationDeletes, alloc: Allocator) void {
+        pub fn deinit(self: *TextMergePublicationDeletes, alloc: Allocator) void {
             for (self.bitmaps) |*maybe_deleted| {
                 if (maybe_deleted.*) |*deleted| deleted.deinit();
             }
@@ -2268,7 +2269,7 @@ pub const IndexManager = struct {
         manager: *IndexManager,
         index_name: []u8,
 
-        fn deinit(self: *DenseVectorLoadContext, alloc: Allocator) void {
+        pub fn deinit(self: *DenseVectorLoadContext, alloc: Allocator) void {
             alloc.free(self.index_name);
             alloc.destroy(self);
         }
@@ -2345,7 +2346,7 @@ pub const IndexManager = struct {
         const DefaultRawReadLimitBytes: u64 = 32 * 1024 * 1024;
         const MaxRawReadLimitBytes: u64 = 64 * 1024 * 1024;
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (benchMetricsEnabled() and (self.matrix_generation_attempts != 0 or self.matrix_captured_vectors != 0)) {
                 const batch = self.source_batch_reads;
                 std.log.info("antfly_bench_dense_matrix_load index={s} generation_attempts={d} generation_rejections={d} generation_vectors={d} fallback_vectors={d} source_batches={d} source_vectors={d} source_bytes={d} source_lock_wait_ns={d} source_locked_ns={d} scratch_fallbacks={d} primary_lookup_ns={d} payload_consume_ns={d} positional_batches={d} positional_bytes={d} lease_fallbacks={d} captured_vectors={d}", .{
@@ -2638,7 +2639,7 @@ pub const IndexManager = struct {
             return value;
         }
 
-        fn getManySorted(self: *@This(), store: *docstore_mod.DocStore, keys: []const []const u8, values: []?[]const u8) !void {
+        pub fn getManySorted(self: *@This(), store: *docstore_mod.DocStore, keys: []const []const u8, values: []?[]const u8) !void {
             if (keys.len != values.len) return error.InvalidArgument;
             @memset(values, null);
             if (keys.len == 0) return;
@@ -2746,7 +2747,7 @@ pub const IndexManager = struct {
         reverse_values: std.AutoHashMapUnmanaged(u64, bool) = .empty,
         reverse_metadata: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             var it = self.metadata.valueIterator();
             while (it.next()) |value| alloc.free(value.*);
             var reverse_it = self.reverse_metadata.valueIterator();
@@ -2843,7 +2844,7 @@ pub const IndexManager = struct {
             return err;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.arena) |*arena| arena.deinit();
             if (self.budget) |*budget| budget.deinit();
             self.* = .{};
@@ -2864,7 +2865,7 @@ pub const IndexManager = struct {
         physical_reads: u64 = 0,
         physical_bytes: u64 = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.scratch.deinit();
             if (self.cold_reader) |*reader| reader.deinit();
             self.generation.release();
@@ -2952,7 +2953,7 @@ pub const IndexManager = struct {
         graph: GraphIndex,
         algebraic: AlgebraicIndex,
 
-        fn deinit(self: *OpenedIndex, manager: *IndexManager) void {
+        pub fn deinit(self: *OpenedIndex, manager: *IndexManager) void {
             switch (self.*) {
                 .full_text => |*entry| manager.freeTextIndexEntry(entry),
                 .dense_vector => |*entry| manager.freeDenseIndexEntry(entry),
@@ -2973,7 +2974,7 @@ pub const IndexManager = struct {
         opened: ?OpenedIndex = null,
         err: ?anyerror = null,
 
-        fn deinit(self: *OpenResult, manager: *IndexManager) void {
+        pub fn deinit(self: *OpenResult, manager: *IndexManager) void {
             if (self.opened) |*opened| opened.deinit(manager);
             self.* = .{};
         }
@@ -6541,7 +6542,7 @@ pub const IndexManager = struct {
     }
 
     fn reopenDenseIndexStorage(self: *IndexManager, entry: *DenseIndex, path: []const u8) !void {
-        const zpath = try self.alloc.dupeZ(u8, path);
+        const zpath = try self.alloc.dupeSentinel(u8, path, 0);
         defer self.alloc.free(zpath);
 
         const dense_cfg = try parseDenseConfig(self.alloc, entry.config.config_json);
@@ -6669,7 +6670,7 @@ pub const IndexManager = struct {
         entry.index.close();
         deleteIndexDirIfPresent(path);
 
-        const zpath = try self.alloc.dupeZ(u8, path);
+        const zpath = try self.alloc.dupeSentinel(u8, path, 0);
         defer self.alloc.free(zpath);
         entry.index = try sparse_mod.SparseIndex.open(self.alloc, zpath, .{
             .no_sync = self.relaxed_split_durability,
@@ -7112,11 +7113,11 @@ pub const IndexManager = struct {
     }
 
     fn failedIndexLoadActionQueue(self: *IndexManager, action: IndexLoadRecoveryAction) *FailedIndexLoadActionQueue {
-        return &self.failed_index_load_action_queues[@intFromEnum(action)];
+        return &self.failed_index_load_action_queues[@backingInt(action)];
     }
 
     fn failedIndexLoadActionQueueConst(self: *const IndexManager, action: IndexLoadRecoveryAction) *const FailedIndexLoadActionQueue {
-        return &self.failed_index_load_action_queues[@intFromEnum(action)];
+        return &self.failed_index_load_action_queues[@backingInt(action)];
     }
 
     pub fn hasLoadFailures(self: *IndexManager) bool {
@@ -7847,7 +7848,7 @@ pub const IndexManager = struct {
         err_name: []const u8,
         repair_claim_owner_id: u128,
 
-        fn deinit(self: *@This(), manager: *IndexManager) void {
+        pub fn deinit(self: *@This(), manager: *IndexManager) void {
             if (self.name_key) |name| manager.alloc.free(name);
             if (self.status_config) |*cfg| cfg.deinit(manager.alloc);
             if (self.failure_config) |*cfg| cfg.deinit(manager.alloc);
@@ -8125,7 +8126,7 @@ pub const IndexManager = struct {
             token: FailedIndexLoadToken,
             authority: FailedIndexLoadRetryAuthority,
 
-            fn deinit(task: *@This(), alloc: Allocator) void {
+            pub fn deinit(task: *@This(), alloc: Allocator) void {
                 alloc.free(task.name);
                 task.cfg.deinit(alloc);
                 task.* = undefined;
@@ -9302,7 +9303,7 @@ pub const IndexManager = struct {
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         try entry.index.saveProjectionCheckpointMetadata(.{
             .applied_sequence = checkpoint.applied_sequence,
-            .status = @intFromEnum(checkpoint.status),
+            .status = @backingInt(checkpoint.status),
             .generation = checkpoint.generation,
             .config_hash = checkpoint.config_hash,
         });
@@ -9329,10 +9330,10 @@ pub const IndexManager = struct {
         return .{
             .applied_sequence = applied_sequence,
             .status = switch (checkpoint.status) {
-                @intFromEnum(apply_state.ProjectionStatus.clean) => .clean,
-                @intFromEnum(apply_state.ProjectionStatus.rebuilding) => .rebuilding,
-                @intFromEnum(apply_state.ProjectionStatus.degraded) => .degraded,
-                @intFromEnum(apply_state.ProjectionStatus.repair_required) => .repair_required,
+                @backingInt(apply_state.ProjectionStatus.clean) => .clean,
+                @backingInt(apply_state.ProjectionStatus.rebuilding) => .rebuilding,
+                @backingInt(apply_state.ProjectionStatus.degraded) => .degraded,
+                @backingInt(apply_state.ProjectionStatus.repair_required) => .repair_required,
                 else => .repair_required,
             },
             .generation = checkpoint.generation,
@@ -9486,18 +9487,18 @@ pub const IndexManager = struct {
             const resource_stats = manager.snapshot();
             cache_reclaim_requests = resource_stats.reclaim_requests;
             cache_reclaimed_bytes = resource_stats.reclaimed_bytes;
-            const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
-            const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
-            const ft_residency = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_segment_residency)];
-            const text_merge = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)];
-            const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
-            const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
-            const lsm_table_builder = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)];
-            const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
-            const lsm_wal_write = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)];
-            const lsm_wal_retention = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)];
-            const lsm_recovery = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_recovery_working_set)];
-            const derived_backlog = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)];
+            const ft_pending = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)];
+            const ft_build = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)];
+            const ft_residency = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_segment_residency)];
+            const text_merge = resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)];
+            const lsm_cache = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)];
+            const lsm_compaction = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)];
+            const lsm_table_builder = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)];
+            const lsm_state = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)];
+            const lsm_wal_write = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_wal_write_working_set)];
+            const lsm_wal_retention = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_wal_retention)];
+            const lsm_recovery = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_recovery_working_set)];
+            const derived_backlog = resource_stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)];
             ft_pending_used = ft_pending.used_bytes;
             ft_pending_peak = ft_pending.peak_bytes;
             ft_build_used = ft_build.used_bytes;
@@ -9652,12 +9653,12 @@ pub const IndexManager = struct {
                 lsm_stats.read_snapshot_mutable_rotations,
                 lsm_stats.read_snapshot_mutable_rotation_bytes_total,
                 lsm_stats.read_snapshot_mutable_rotation_peak_bytes,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].calls,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].bytes_total,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].calls,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].bytes_total,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.other)].calls,
-                lsm_stats.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.other)].bytes_total,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.bound_read_txn)].bytes_total,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.namespace_read_txn)].bytes_total,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.other)].calls,
+                lsm_stats.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.other)].bytes_total,
             },
         );
         std.log.info(
@@ -9963,7 +9964,7 @@ pub const IndexManager = struct {
         entries: []GraphMetricWorkerSnapshotEntry,
         names: []u8,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.manager.alloc.free(self.names);
             self.manager.alloc.free(self.entries);
             if (self.manager.io) |io| {
@@ -11764,7 +11765,7 @@ pub const IndexManager = struct {
         key: ?[]u8 = null,
         value: ?[]u8 = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.key) |key| self.alloc.free(key);
             if (self.value) |value| self.alloc.free(value);
             self.* = undefined;
@@ -12308,7 +12309,7 @@ pub const IndexManager = struct {
         const total_len = std.math.add(usize, generated_artifact_cleanup_header_len, payload_len) catch return error.InvalidArgument;
         const out = try self.alloc.alloc(u8, total_len);
         std.mem.writeInt(u64, out[0..8], generated_artifact_cleanup_magic, .little);
-        std.mem.writeInt(u32, out[8..12], @intFromEnum(phase), .little);
+        std.mem.writeInt(u32, out[8..12], @backingInt(phase), .little);
         std.mem.writeInt(u32, out[12..16], chunk_len, .little);
         std.mem.writeInt(u32, out[16..20], embedding_len, .little);
         std.mem.writeInt(u32, out[20..24], embedding_name_count, .little);
@@ -12351,7 +12352,7 @@ pub const IndexManager = struct {
         const total_len = std.math.add(usize, generated_artifact_cleanup_header_len, payload_len) catch return error.InvalidArgument;
         const out = try self.alloc.alloc(u8, total_len);
         std.mem.writeInt(u64, out[0..8], generated_artifact_cleanup_magic, .little);
-        std.mem.writeInt(u32, out[8..12], @intFromEnum(phase), .little);
+        std.mem.writeInt(u32, out[8..12], @backingInt(phase), .little);
         std.mem.writeInt(u32, out[12..16], chunk_len, .little);
         std.mem.writeInt(u32, out[16..20], embedding_len, .little);
         std.mem.writeInt(u32, out[20..24], record.embedding_name_count, .little);
@@ -12590,7 +12591,7 @@ pub const IndexManager = struct {
             scanned: usize = 0,
             stopped: bool = false,
 
-            fn deinit(state: *@This()) void {
+            pub fn deinit(state: *@This()) void {
                 for (state.deletes.items) |delete_key| state.manager.alloc.free(delete_key);
                 state.deletes.deinit(state.manager.alloc);
                 if (state.last_key) |last_key| state.manager.alloc.free(last_key);
@@ -15349,7 +15350,7 @@ pub const IndexManager = struct {
         embedding_name: ?[]u8 = null,
         embedding_names: [][]u8 = &.{},
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.chunk_name) |value| alloc.free(value);
             for (self.source_artifact_names) |value| alloc.free(value);
             if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
@@ -18701,7 +18702,7 @@ pub const IndexManager = struct {
             return self.arena_owner.?.allocator();
         }
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.arena_owner) |*arena| arena.deinit();
             for (self.owned_vectors.items) |vector| alloc.free(vector);
             for (self.owned_metadata.items) |metadata| alloc.free(metadata);
@@ -19997,7 +19998,7 @@ pub const IndexManager = struct {
         };
         try entry.index.saveProjectionCheckpointMetadata(.{
             .applied_sequence = projection_checkpoint.applied_sequence,
-            .status = @intFromEnum(projection_checkpoint.status),
+            .status = @backingInt(projection_checkpoint.status),
             .generation = projection_checkpoint.generation,
             .config_hash = projection_checkpoint.config_hash,
         });
@@ -20079,7 +20080,7 @@ pub const IndexManager = struct {
     }
 
     fn deleteIndexDirUsingIoIfPresentFallible(self: *const IndexManager, path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         if (self.io) |io| {
             try std.Io.Dir.cwd().deleteTree(io, path);
             return;
@@ -20094,7 +20095,7 @@ pub const IndexManager = struct {
     }
 
     pub fn writeRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -20110,7 +20111,7 @@ pub const IndexManager = struct {
     }
 
     pub fn clearRepairShadowInProgressMarker(alloc: Allocator, shadow_root_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -20249,7 +20250,7 @@ pub const IndexManager = struct {
     }
 
     fn writeActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8, relative_active_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         if (!validRelativeRepairIndexRoot(std.fs.path.basename(canonical_path), relative_active_path)) return error.InvalidIndexRootPointer;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
@@ -20267,7 +20268,7 @@ pub const IndexManager = struct {
     }
 
     fn clearActiveIndexRootPointer(self: *const IndexManager, canonical_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         const marker_path = try self.activeIndexRootPointerPath(canonical_path);
         defer self.alloc.free(marker_path);
 
@@ -20314,7 +20315,7 @@ pub const IndexManager = struct {
         }
         const path = try self.activeIndexPath(name);
         defer self.alloc.free(path);
-        if (builtin.os.tag == .freestanding) return 0;
+        if (is_hostless) return 0;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -20557,7 +20558,7 @@ pub const IndexManager = struct {
     }
 
     fn pruneCanonicalIndexRootAfterPointerInstall(canonical_path: []const u8) !void {
-        if (builtin.os.tag == .freestanding) return;
+        if (is_hostless) return;
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         const io = io_impl.io();
@@ -20830,7 +20831,7 @@ pub const IndexManager = struct {
                 const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 const persistent_opts = persistent_mod.PersistentIndexOptions{
@@ -21048,7 +21049,7 @@ pub const IndexManager = struct {
                 defer self.alloc.free(path);
                 const native_physical_v2 = try self.activeIndexRootPointerUsesNativeV2(cfg.name);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 const index = try self.alloc.create(hbc_mod.HBCIndex);
@@ -21325,7 +21326,7 @@ pub const IndexManager = struct {
                 const path = try self.activeIndexPathForConfig(cfg);
                 defer self.alloc.free(path);
 
-                const zpath = try self.alloc.dupeZ(u8, path);
+                const zpath = try self.alloc.dupeSentinel(u8, path, 0);
                 defer self.alloc.free(zpath);
 
                 var index = try sparse_mod.SparseIndex.open(self.alloc, zpath, .{
@@ -21440,9 +21441,9 @@ pub const IndexManager = struct {
                     reverse_dir.close(io_impl.io());
                     break :blk false;
                 };
-                const zforward = try self.alloc.dupeZ(u8, forward_path);
+                const zforward = try self.alloc.dupeSentinel(u8, forward_path, 0);
                 defer self.alloc.free(zforward);
-                const zreverse = try self.alloc.dupeZ(u8, reverse_path);
+                const zreverse = try self.alloc.dupeSentinel(u8, reverse_path, 0);
                 defer self.alloc.free(zreverse);
 
                 var cloned_cfg = try types.IndexConfig.clone(self.alloc, cfg);
@@ -24665,16 +24666,16 @@ pub const IndexManager = struct {
             );
             if (self.resource_manager) |manager| {
                 const resource_stats = manager.snapshot();
-                const ft_pending = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)];
-                const ft_build = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)];
-                const lsm_cache = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
-                const lsm_compaction = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_compaction_work)];
-                const lsm_table_builder = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_table_builder_working_set)];
-                const lsm_state = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_in_memory_state)];
-                const lsm_wal_write = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_write_working_set)];
-                const lsm_wal_retention = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)];
-                const lsm_recovery = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_recovery_working_set)];
-                const derived_backlog = resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_backlog)];
+                const ft_pending = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)];
+                const ft_build = resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)];
+                const lsm_cache = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)];
+                const lsm_compaction = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_compaction_work)];
+                const lsm_table_builder = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_table_builder_working_set)];
+                const lsm_state = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_in_memory_state)];
+                const lsm_wal_write = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_wal_write_working_set)];
+                const lsm_wal_retention = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_wal_retention)];
+                const lsm_recovery = resource_stats.slices[@backingInt(resource_manager_mod.Slice.lsm_recovery_working_set)];
+                const derived_backlog = resource_stats.slices[@backingInt(resource_manager_mod.Slice.derived_backlog)];
                 const lsm_stats = self.snapshotLsmMaintenanceStats();
                 const lsm_cache_stats: lsm_backend_mod.cache.Stats = if (self.lsm_cache) |cache| cache.snapshotStats() else .{};
                 const lsm_resource_used = lsm_cache.used_bytes +| lsm_compaction.used_bytes +| lsm_table_builder.used_bytes +| lsm_state.used_bytes +| lsm_wal_write.used_bytes +| lsm_recovery.used_bytes;
@@ -30432,7 +30433,7 @@ fn coverageIdentityForConfig(cfg: types.IndexConfig) IndexManager.CoverageIdenti
 
 fn appendCatalogConfig(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, cfg: types.IndexConfig) !void {
     try appendStr(out, alloc, cfg.name);
-    try out.append(alloc, @intFromEnum(cfg.kind));
+    try out.append(alloc, @backingInt(cfg.kind));
     try appendStr(out, alloc, cfg.config_json);
     try appendU64(out, alloc, coverageGenerationForConfig(cfg));
 }
@@ -30530,11 +30531,11 @@ pub fn deserializeCatalog(alloc: Allocator, data: []const u8) ![]types.IndexConf
         const kind_value = data[pos];
         pos += 1;
         const kind: types.IndexKind = switch (kind_value) {
-            @intFromEnum(types.IndexKind.full_text) => .full_text,
-            @intFromEnum(types.IndexKind.dense_vector) => .dense_vector,
-            @intFromEnum(types.IndexKind.sparse_vector) => .sparse_vector,
-            @intFromEnum(types.IndexKind.graph) => .graph,
-            @intFromEnum(types.IndexKind.algebraic) => .algebraic,
+            @backingInt(types.IndexKind.full_text) => .full_text,
+            @backingInt(types.IndexKind.dense_vector) => .dense_vector,
+            @backingInt(types.IndexKind.sparse_vector) => .sparse_vector,
+            @backingInt(types.IndexKind.graph) => .graph,
+            @backingInt(types.IndexKind.algebraic) => .algebraic,
             else => return error.InvalidIndexCatalog,
         };
 
@@ -30653,7 +30654,7 @@ test "index catalog preserves coverage generation and migrates legacy generation
     try appendU32(&legacy, alloc, 1);
     try appendU32(&legacy, alloc, 1);
     try appendStr(&legacy, alloc, "semantic_idx");
-    try legacy.append(alloc, @intFromEnum(types.IndexKind.dense_vector));
+    try legacy.append(alloc, @backingInt(types.IndexKind.dense_vector));
     try appendStr(&legacy, alloc, config_json);
 
     const legacy_decoded = try deserializeCatalog(alloc, legacy.items);
@@ -30670,7 +30671,7 @@ test "index create preserves authoritative coverage generation" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -30738,7 +30739,7 @@ test "index catalog preserves malformed vector config for quarantine" {
     try appendU32(&encoded, alloc, 2);
     try appendU32(&encoded, alloc, 1);
     try appendStr(&encoded, alloc, "bad_dense");
-    try encoded.append(alloc, @intFromEnum(types.IndexKind.dense_vector));
+    try encoded.append(alloc, @backingInt(types.IndexKind.dense_vector));
     try appendStr(&encoded, alloc, "{");
     try appendU64(&encoded, alloc, 42);
 
@@ -30775,7 +30776,7 @@ const DenseConfig = struct {
     flat_centroid_block_size: usize = 8192,
     flat_centroid_probe_count: usize = 0,
 
-    fn deinit(self: *const DenseConfig, alloc: Allocator) void {
+    pub fn deinit(self: *const DenseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
         if (self.embedding_name) |embedding_name| alloc.free(embedding_name);
         for (self.embedding_names) |embedding_name| alloc.free(embedding_name);
@@ -30995,7 +30996,7 @@ const TextConfig = struct {
     source_selected_fields: []?[]u8 = &.{},
     selected_field: ?[]u8 = null,
 
-    fn deinit(self: *const TextConfig, alloc: Allocator) void {
+    pub fn deinit(self: *const TextConfig, alloc: Allocator) void {
         if (self.source_artifact_name) |source_artifact_name| alloc.free(source_artifact_name);
         for (self.source_artifact_names) |name| alloc.free(name);
         if (self.source_artifact_names.len > 0) alloc.free(self.source_artifact_names);
@@ -31041,7 +31042,7 @@ const OwnedTextIndexConfig = struct {
         };
     }
 
-    fn deinit(self: *OwnedTextIndexConfig, alloc: Allocator) void {
+    pub fn deinit(self: *OwnedTextIndexConfig, alloc: Allocator) void {
         self.config.deinit(alloc);
         if (self.chunk_name) |name| alloc.free(name);
         for (self.source_artifact_names) |name| alloc.free(name);
@@ -31074,7 +31075,7 @@ const GeneratorConfig = struct {
     full_text_index: bool = false,
     embedding_input: enrichment_types.EmbeddingInput = .text,
 
-    fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
+    pub fn deinit(self: *const GeneratorConfig, alloc: Allocator) void {
         alloc.free(self.source_field);
         if (self.source_template.len > 0) alloc.free(self.source_template);
         alloc.free(self.artifact_name);
@@ -31091,7 +31092,7 @@ const SparseConfig = struct {
     embedding_name: ?[]u8 = null,
     embedding_names: [][]u8 = &.{},
 
-    fn deinit(self: *const SparseConfig, alloc: Allocator) void {
+    pub fn deinit(self: *const SparseConfig, alloc: Allocator) void {
         alloc.free(self.field_name);
         if (self.embedding_name) |name| alloc.free(name);
         for (self.embedding_names) |name| alloc.free(name);
@@ -31372,7 +31373,7 @@ const ParsedTextArtifactSources = struct {
     names: [][]u8 = &.{},
     selected_fields: []?[]u8 = &.{},
 
-    fn deinit(self: *const ParsedTextArtifactSources, alloc: Allocator) void {
+    pub fn deinit(self: *const ParsedTextArtifactSources, alloc: Allocator) void {
         for (self.names) |name| alloc.free(name);
         if (self.names.len > 0) alloc.free(self.names);
         freeOptionalOwnedStrings(alloc, self.selected_fields);
@@ -33284,7 +33285,7 @@ fn ensureIndexDir(alloc: Allocator, base_path: []const u8, path: []const u8) !vo
     const parent_path = try std.fmt.allocPrint(alloc, "{s}/indexes", .{base_path});
     defer alloc.free(parent_path);
 
-    if (builtin.os.tag != .freestanding) {
+    if (!is_hostless) {
         var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
         defer io_impl.deinit();
         try fs_paths.createDirPathPortable(io_impl.io(), parent_path);
@@ -33301,7 +33302,7 @@ fn ensureIndexDirDurable(
     base_path: []const u8,
     path: []const u8,
 ) !void {
-    if (builtin.os.tag == .freestanding) return;
+    if (is_hostless) return;
 
     if (shared_io) |io| {
         return ensureIndexDirDurableWithIo(alloc, io, base_path, path);
@@ -33329,7 +33330,7 @@ fn ensureIndexDirDurableWithIo(
 }
 
 fn deleteIndexDirIfPresent(path: []const u8) void {
-    if (builtin.os.tag == .freestanding) return;
+    if (is_hostless) return;
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33337,7 +33338,7 @@ fn deleteIndexDirIfPresent(path: []const u8) void {
 }
 
 fn repairShadowRootInProgress(path: []const u8) bool {
-    if (builtin.os.tag == .freestanding) return false;
+    if (is_hostless) return false;
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -33473,7 +33474,7 @@ test "repair shadow cleanup isolates malformed pointer ownership" {
     defer tmp.cleanup();
     var base_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const base_path = try std.fmt.bufPrint(&base_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const base_path_z = try alloc.dupeZ(u8, base_path);
+    const base_path_z = try alloc.dupeSentinel(u8, base_path, 0);
     defer alloc.free(base_path_z);
     var store = try docstore_mod.DocStore.open(alloc, base_path_z, .{});
     defer store.close();
@@ -33572,7 +33573,7 @@ test "dense native migration policy is fail closed when provisioned" {
     const Gate = struct {
         permitted: bool = false,
 
-        fn read(ptr: *const anyopaque) bool {
+        pub fn read(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             return self.permitted;
         }
@@ -33583,7 +33584,7 @@ test "dense native migration policy is fail closed when provisioned" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33619,7 +33620,7 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     const Gate = struct {
         permitted: bool,
 
-        fn read(ptr: *const anyopaque) bool {
+        pub fn read(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             return self.permitted;
         }
@@ -33630,7 +33631,7 @@ test "fresh dense admission publishes native v2 before the logical catalog" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33799,7 +33800,7 @@ test "native pointer validation reads authority through configured storage" {
 
 test "fresh dense admission remains legacy before the native capability floor" {
     const Gate = struct {
-        fn read(_: *const anyopaque) bool {
+        pub fn read(_: *const anyopaque) bool {
             return false;
         }
     };
@@ -33809,7 +33810,7 @@ test "fresh dense admission remains legacy before the native capability floor" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33844,7 +33845,7 @@ test "fresh dense admission reclaims a broken orphan construction pointer" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33888,7 +33889,7 @@ test "fresh dense admission reclaims a certified generation orphaned before cata
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33939,7 +33940,7 @@ test "fresh native dense backfill certifies one pinned source snapshot" {
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -33996,7 +33997,7 @@ test "fresh native dense backfill extends a shared vector generation without a s
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -34046,7 +34047,7 @@ test "standalone dense native migration still requires an explicit physical gene
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buffer, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -34385,7 +34386,7 @@ test "dense metadata lookups read legacy textual rows" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -34704,12 +34705,12 @@ fn serializeObservedTextFieldAnalyzers(alloc: Allocator, observed: []const mappe
     for (observed) |item| {
         try appendStr(&out, alloc, item.field_name);
         try appendStr(&out, alloc, item.analyzer_name);
-        try out.append(alloc, @intFromEnum(item.field_type));
+        try out.append(alloc, @backingInt(item.field_type));
         try out.append(alloc, if (item.do_index) 1 else 0);
         try out.append(alloc, if (item.store) 1 else 0);
         try out.append(alloc, if (item.doc_values) 1 else 0);
         try out.append(alloc, if (item.sortable) 1 else 0);
-        try out.append(alloc, @intFromEnum(item.missing_null_policy));
+        try out.append(alloc, @backingInt(item.missing_null_policy));
         try out.append(alloc, if (item.include_in_all) 1 else 0);
     }
 
@@ -34745,7 +34746,7 @@ fn deserializeObservedTextFieldAnalyzers(alloc: Allocator, data: []const u8) ![]
             const mapping = if (version >= 2) mapping_blk: {
                 const mapping_len: usize = if (version >= 3) 7 else 6;
                 if (pos + mapping_len > data.len) return error.InvalidIndexCatalog;
-                const field_type: schema_mod.AntflyType = @enumFromInt(data[pos]);
+                const field_type: schema_mod.AntflyType = @fromBackingInt(@intCast(data[pos]));
                 pos += 1;
                 const do_index = data[pos] != 0;
                 pos += 1;
@@ -34814,7 +34815,7 @@ const RuntimeStoreHandle = struct {
     store: backend_erased.Store,
     owned: bool,
 
-    fn deinit(self: *@This()) void {
+    pub fn deinit(self: *@This()) void {
         if (self.owned) self.store.deinit();
     }
 };
@@ -34901,7 +34902,7 @@ const IndexManagerOwnedWrite = struct {
     value: []u8,
     term: IndexManagerTerm,
 
-    fn deinit(self: *IndexManagerOwnedWrite, alloc: Allocator) void {
+    pub fn deinit(self: *IndexManagerOwnedWrite, alloc: Allocator) void {
         alloc.free(self.key);
         alloc.free(self.value);
         self.* = undefined;
@@ -34984,7 +34985,7 @@ const IndexManagerSimRuntime = struct {
         return runtime;
     }
 
-    fn deinit(self: *IndexManagerSimRuntime) void {
+    pub fn deinit(self: *IndexManagerSimRuntime) void {
         if (self.source_manager_open) {
             self.source_manager.deinit();
             self.source_manager_open = false;
@@ -35502,7 +35503,7 @@ fn reportReducedIndexManagerSchedule(
 }
 
 fn randomIndexManagerWriteSpec(random: std.Random) IndexManagerSimDocSpec {
-    return @enumFromInt(random.uintLessThan(u8, 4));
+    return @fromBackingInt(@intCast(random.uintLessThan(u8, 4)));
 }
 
 fn runIndexManagerReplayCase(
@@ -36010,7 +36011,7 @@ test "dense cache policy comes from resource manager instead of index config" {
     defer cleanupIndexManagerDir(path);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = 2048,
         .hard_limit_bytes = 4096,
     };
@@ -36095,7 +36096,7 @@ test "dense index unions multiple embedding artifact sources without overwriting
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -36339,7 +36340,7 @@ test "sparse multi-source requests carry semantic producer identity" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -36434,7 +36435,7 @@ test "sparse single-source embedding name drives generation replay and search" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -36906,7 +36907,7 @@ test "full text single artifact name accepts textual asset source" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -37062,7 +37063,7 @@ test "dense vector id uses deterministic key hash with legacy mapping fallback" 
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37108,7 +37109,7 @@ test "production exact dense scorer cancels during bounded vector work" {
     defer alloc.free(root);
     const hbc_path = try std.fs.path.join(alloc, &.{ root, "exact-cancellation-hbc" });
     defer alloc.free(hbc_path);
-    const hbc_path_z = try alloc.dupeZ(u8, hbc_path);
+    const hbc_path_z = try alloc.dupeSentinel(u8, hbc_path, 0);
     defer alloc.free(hbc_path_z);
 
     var manager = try IndexManager.init(alloc, root);
@@ -37190,7 +37191,7 @@ test "dense vector id ignores ordinal metadata for a different doc" {
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37281,7 +37282,7 @@ test "dense vector id allocator spills preferred-id collisions without aliasing 
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37378,7 +37379,7 @@ test "dense metadata prefetch includes legacy ordinal vector ids" {
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37514,7 +37515,7 @@ test "dense index manager accepts explicit embedding writes after addAllNoBackfi
     defer alloc.free(cwd);
     const absolute_path = try std.fs.path.resolve(alloc, &.{ cwd, path });
     defer alloc.free(absolute_path);
-    const path_z = try alloc.dupeZ(u8, absolute_path);
+    const path_z = try alloc.dupeSentinel(u8, absolute_path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37632,7 +37633,7 @@ test "index manager advertises typed tensor access paths for vector and graph in
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37822,7 +37823,7 @@ test "full text dictionary publication rejects duplicate semantic owners" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37871,7 +37872,7 @@ test "observed full text analyzers publish shared dictionary ownership" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -37948,7 +37949,7 @@ test "observed analyzer publication leaves runtime and metadata unchanged on reg
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38007,7 +38008,7 @@ test "observed analyzer publication waits for active analysis readers" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38077,7 +38078,7 @@ test "text query lease retains snapshot and analyzer across catalog removal" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38114,7 +38115,7 @@ test "text publication planning rejects a same-name catalog replacement" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38159,7 +38160,7 @@ test "text publication admission refreshes a projection revision change" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38247,7 +38248,7 @@ test "observed dynamic sortable field capability reports covered queryable state
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38315,7 +38316,7 @@ test "dynamic field observation keeps status cached and validates only selected 
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38404,7 +38405,7 @@ test "declared runtime sortable field capability reports covered queryable state
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38477,7 +38478,7 @@ test "declared runtime geo field capability reports covered filterable state" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38552,7 +38553,7 @@ test "declared runtime sortable field capability is queryable for empty index" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38605,7 +38606,7 @@ test "empty text index refreshes schema committed after index provisioning" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38652,7 +38653,7 @@ test "fresh text generation persists provenance before its first segment" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -38694,7 +38695,7 @@ test "non-empty text generation accepts deployed v11 schema provenance" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -38751,7 +38752,7 @@ test "empty generation adopts schema provenance after schema-only crash boundary
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -38800,7 +38801,7 @@ test "non-empty schema-less text generation fails closed when a schema appears" 
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38853,7 +38854,7 @@ test "non-empty text generation without provenance fails closed" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38890,7 +38891,7 @@ test "deleted-only text generation cannot adopt different schema provenance" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -38947,7 +38948,7 @@ test "shadow text generation owns provenance without mutating active generation"
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const shadow_path = try std.fmt.allocPrint(alloc, "{s}/shadow", .{path});
     defer alloc.free(shadow_path);
@@ -39020,7 +39021,7 @@ test "observed dynamic sortable field capability stays declared for sparse doc v
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39078,10 +39079,10 @@ test "observed dynamic sortable field capability stays declared for sparse doc v
 fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
     var chunk = std.ArrayListUnmanaged(u8).empty;
     defer chunk.deinit(alloc);
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 3))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 0))));
-    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 3))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 0))));
+    try chunk.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
     try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 10.0))));
     try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 11.0))));
     try chunk.appendSlice(alloc, &@as([8]u8, @bitCast(@as(f64, 20.0))));
@@ -39091,10 +39092,10 @@ fn buildDuplicateF64DocValuesSectionAlloc(alloc: Allocator) ![]u8 {
 
     var data = std.ArrayListUnmanaged(u8).empty;
     defer data.deinit(alloc);
-    try data.append(alloc, @intFromEnum(typed_dv.ValueType.f64_val));
-    try data.appendSlice(alloc, &@as([4]u8, @bitCast(std.mem.nativeToLittle(u32, 1))));
+    try data.append(alloc, @backingInt(typed_dv.ValueType.f64_val));
+    try data.appendSlice(alloc, &@as([4]u8, @bitCast(@as(u32, 1))));
     const chunk_end: u64 = @intCast(5 + 8 + compressed.len);
-    try data.appendSlice(alloc, &@as([8]u8, @bitCast(std.mem.nativeToLittle(u64, chunk_end))));
+    try data.appendSlice(alloc, &@as([8]u8, @bitCast(@as(u64, chunk_end))));
     try data.appendSlice(alloc, compressed);
     return try data.toOwnedSlice(alloc);
 }
@@ -39106,7 +39107,7 @@ test "observed dynamic sortable field capability stays declared for duplicate do
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39260,7 +39261,7 @@ test "dense bulk-ingest uses recursive bulk build for large empty index batch" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39324,7 +39325,7 @@ test "dense bulk-ingest populates primary ordinal vector cache before first look
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39419,7 +39420,7 @@ test "dense embedding writes prefer inline vectors over artifact reloads" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39512,7 +39513,7 @@ test "loadConfiguredIndexesParallel quarantines worker errors on borrowed std Io
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39569,7 +39570,7 @@ test "dense apply resource manager accounts working bytes and releases them" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39610,7 +39611,7 @@ test "dense apply resource manager accounts working bytes and releases them" {
     };
     try manager.applyDenseEmbeddingWritesByName(&store, "dv_v1", &writes);
 
-    const stats = resource_manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)];
+    const stats = resource_manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)];
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
     try std.testing.expect(stats.peak_bytes >= (@as(u64, 3 * @sizeOf(f32)) + @as(u64, "doc:tracked".len)));
 }
@@ -39622,7 +39623,7 @@ test "dense replay-shaped bulk apply skips identical and replaces changed vector
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -39865,7 +39866,7 @@ test "dense vector load session switches to retained LSM ownership before reserv
     const dims: usize = 4;
     const vector_bytes = hbc_mod.estimateDecodedVectorResidencyBytes(dims);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes,
         .hard_limit_bytes = vector_bytes,
     };
@@ -39891,7 +39892,7 @@ test "dense vector load session switches to retained LSM ownership before reserv
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/residency-fallback", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var index = try hbc_mod.HBCIndex.open(alloc, path_z, .{ .dims = dims, .max_cached_vectors = 8 });
     defer index.close();
@@ -39915,7 +39916,7 @@ test "production external vector session evolves a saturated decoded resident se
     const dims: usize = 2;
     const vector_bytes = hbc_mod.estimateDecodedVectorResidencyBytes(dims);
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = vector_bytes * 2,
         .hard_limit_bytes = vector_bytes * 2,
     };
@@ -39983,7 +39984,7 @@ test "dense vector load session is bounded by the shared apply working-set budge
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)] = .{
         .soft_limit_bytes = 8,
         .hard_limit_bytes = 16,
     };
@@ -40009,7 +40010,7 @@ test "dense vector load session is bounded by the shared apply working-set budge
     try std.testing.expectEqual(@as(usize, 1), budget_session.vector_cache.count());
     budget_session.deinit();
 
-    const stats = resource_manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)];
+    const stats = resource_manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)];
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
     try std.testing.expect(stats.hard_limit_rejections > 0);
 }
@@ -40363,7 +40364,7 @@ test "generated artifact cleanup upgrades v2 debt without losing its cursor or o
     const raw = try alloc.alloc(u8, raw_len);
     defer alloc.free(raw);
     std.mem.writeInt(u64, raw[0..8], IndexManager.generated_artifact_cleanup_v2_magic, .little);
-    std.mem.writeInt(u32, raw[8..12], @intFromEnum(IndexManager.GeneratedArtifactCleanupPhase.generated_artifacts), .little);
+    std.mem.writeInt(u32, raw[8..12], @backingInt(IndexManager.GeneratedArtifactCleanupPhase.generated_artifacts), .little);
     std.mem.writeInt(u32, raw[12..16], @intCast(chunk_name.len), .little);
     std.mem.writeInt(u32, raw[16..20], @intCast(embedding_name.len), .little);
     std.mem.writeInt(u32, raw[20..24], @intCast(cursor.len), .little);
@@ -41500,7 +41501,7 @@ test "dense artifact preload session reuses cached raw values across calls" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -41596,7 +41597,7 @@ test "dense mapping commit failure rolls back inserted HBC vectors" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -41833,7 +41834,7 @@ test "dense index manager accepts external embedding indexes without enrichments
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -41889,7 +41890,7 @@ test "production external scorers use bounded cache-first artifact batches" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42219,7 +42220,7 @@ test "external dense embedding writes persist deterministic vector mappings" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42275,7 +42276,7 @@ test "external dense embedding writes use stable vector ids and ordinal member r
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42405,7 +42406,7 @@ test "primary dense stable vector ids survive identity namespace reassignment" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42498,7 +42499,7 @@ test "external dense embedding writes keep search working after incremental repl
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42723,7 +42724,7 @@ test "dense index manager stress applies explicit embedding writes on lsm backen
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42829,7 +42830,7 @@ test "dense HBC batchInsertWithMetadata works after addAllNoBackfill" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42867,7 +42868,7 @@ test "dense HBC batchInsertWithMetadata works after text batch setup" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -42953,12 +42954,12 @@ test "text merge task carries concurrent deletes into publication" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 64 * 1024 * 1024,
         .hard_limit_bytes = 64 * 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
@@ -42969,7 +42970,7 @@ test "text merge task carries concurrent deletes into publication" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43126,7 +43127,7 @@ test "text merge publication keeps every chunk member sharing one parent ordinal
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43307,7 +43308,7 @@ test "text merge deletion states synchronize recording with per-index detach" {
 
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 128 * 1024,
         .hard_limit_bytes = 256 * 1024,
     };
@@ -43379,7 +43380,7 @@ test "text merge deletion states synchronize recording with per-index detach" {
 test "text merge deletion deltas share the admitted task byte ceiling" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 256,
         .hard_limit_bytes = 512,
     };
@@ -43420,7 +43421,7 @@ test "text merge persistent publication charges share the admitted task byte cei
     const alloc = std.testing.allocator;
     const hard_limit = 4096;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = hard_limit,
         .hard_limit_bytes = hard_limit,
     };
@@ -43454,12 +43455,12 @@ test "heap-backed text merge reservation covers output and publication working s
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 64 * 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
@@ -43472,7 +43473,7 @@ test "heap-backed text merge reservation covers output and publication working s
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43551,7 +43552,7 @@ test "text merge task retires all-deleted file-backed inputs" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -43917,7 +43918,7 @@ test "vector mutation revision certification batches sorted keys without reorder
         missing: bool = false,
         fail: bool = false,
 
-        fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
+        pub fn getManySorted(self: *@This(), keys: []const []const u8, values: []?[]const u8) !void {
             self.calls += 1;
             try std.testing.expect(keys.len <= 256);
             if (self.fail) return error.Corrupted;
@@ -43960,7 +43961,7 @@ test "vector mutation revision certification batches sorted keys without reorder
 test "native projection build scratch reuses bounded memory and releases on failure" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_vector_block_build_working_set)] = .{
         .soft_limit_bytes = 4096,
         .hard_limit_bytes = 4096,
     };
@@ -44041,7 +44042,7 @@ test "native read scratch pool participates in hard-budget reclamation" {
 fn testNativeReadScratchReclamation(cross_pool: bool) !void {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .soft_limit_bytes = 8192,
         .hard_limit_bytes = 8192,
     };
@@ -44115,7 +44116,7 @@ test "native residual scratch reuses capacity and releases its bounded reservati
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_search_working_set)] = .{
         .soft_limit_bytes = 4096,
         .hard_limit_bytes = 4096,
     };
@@ -44155,7 +44156,7 @@ test "force text compaction supersedes in-flight scheduled merge" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44224,7 +44225,7 @@ test "text merge task records input and output bytes" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44297,7 +44298,7 @@ test "text delete clears handed-off stale docs outside current range" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44348,7 +44349,7 @@ test "text merge failure quarantines source segments" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44423,20 +44424,20 @@ test "text merge resource manager accounts pending bytes and active buffers" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
@@ -44444,7 +44445,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44486,9 +44487,9 @@ test "text merge resource manager accounts pending bytes and active buffers" {
     try std.testing.expect(merge_stats.pending_bytes > 0);
     try std.testing.expectEqual(merge_stats.pending_bytes, merge_stats.pending_heap_bytes + merge_stats.pending_mmap_bytes);
     var resource_stats = resource_manager.snapshot();
-    try std.testing.expectEqual(merge_stats.pending_heap_bytes, resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes);
+    try std.testing.expectEqual(merge_stats.pending_heap_bytes, resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes);
     if (merge_stats.pending_heap_bytes > 1) {
-        try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].soft_limit_events > 0);
+        try std.testing.expect(resource_stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)].soft_limit_events > 0);
     }
 
     var wide_source_count: usize = 0;
@@ -44498,22 +44499,22 @@ test "text merge resource manager accounts pending bytes and active buffers" {
         defer task.deinit(alloc);
 
         resource_stats = resource_manager.snapshot();
-        try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes > 0);
-        try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0);
+        try std.testing.expect(resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].used_bytes > 0);
+        try std.testing.expect(resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0);
         wide_source_count = task.source.len;
         wide_reservation_bytes = task.bufferReservationBytes() orelse return error.MissingWideMergeReservation;
         manager.cancelTextMergeTask(&task);
     }
 
     resource_stats = resource_manager.snapshot();
-    try std.testing.expectEqual(@as(u64, 0), resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes);
+    try std.testing.expectEqual(@as(u64, 0), resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].used_bytes);
 
     // Reconfigure the same manager address so the policy-selected wide task
     // is above the normal hard limit but within the bounded 2x allowance. It
     // should remain wide rather than degrading to pairwise compaction.
     try std.testing.expect(wide_reservation_bytes > 1);
     var bounded_budgets = budgets;
-    bounded_budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes =
+    bounded_budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes =
         (wide_reservation_bytes + 1) / 2;
     resource_manager = resource_manager_mod.ResourceManager.init(.{
         .budgets = bounded_budgets,
@@ -44528,7 +44529,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
     resource_stats = resource_manager.snapshot();
     try std.testing.expectEqual(
         @as(u64, 1),
-        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].oversized_single_grants,
+        resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].oversized_single_grants,
     );
 
     // Restore the original budget for the concurrent-pressure case below.
@@ -44541,7 +44542,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
     // Even one byte of concurrent usage must reject another merge rather than
     // multiplying the bounded allocator cap.
     try std.testing.expect(wide_source_count > 2);
-    const hard_limit = budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes;
+    const hard_limit = budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_bytes;
     try std.testing.expect(wide_reservation_bytes <= hard_limit * 2);
     var tracked_merge_usage: u64 = 0;
     resource_manager.observeUsage(.text_merge_buffers, &tracked_merge_usage, 1);
@@ -44549,7 +44550,7 @@ test "text merge resource manager accounts pending bytes and active buffers" {
 
     try std.testing.expect((try manager.beginTextMergeTask()) == null);
     resource_stats = resource_manager.snapshot();
-    try std.testing.expect(resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0);
+    try std.testing.expect(resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0);
 }
 
 test "text merge resource pressure defers background merges" {
@@ -44558,11 +44559,11 @@ test "text merge resource pressure defers background merges" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
@@ -44570,7 +44571,7 @@ test "text merge resource pressure defers background merges" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44640,7 +44641,7 @@ test "force compact skips clean text indexes" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44692,7 +44693,7 @@ test "force compact accounts text merge buffers via resource manager" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         // File-backed merges reserve an 8 MiB baseline plus measured segment
         // working set. Keep the hard limit above that baseline so this test
@@ -44700,7 +44701,7 @@ test "force compact accounts text merge buffers via resource manager" {
         .hard_limit_bytes = 64 * 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .report,
         .hard_action = .report,
     };
@@ -44708,7 +44709,7 @@ test "force compact accounts text merge buffers via resource manager" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44749,10 +44750,10 @@ test "force compact accounts text merge buffers via resource manager" {
     const resource_stats = resource_manager.snapshot();
     try std.testing.expectEqual(
         @as(u64, 0),
-        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].used_bytes,
+        resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].used_bytes,
     );
     try std.testing.expect(
-        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0,
+        resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].soft_limit_events > 0,
     );
 }
 
@@ -44762,12 +44763,12 @@ test "best effort force compact defers under text merge pressure" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .defer_background_work,
     };
@@ -44778,7 +44779,7 @@ test "best effort force compact defers under text merge pressure" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44830,12 +44831,12 @@ test "best effort force compact stops on resource budget rejection" {
     defer tmp.cleanup();
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .reject_work,
     };
@@ -44843,7 +44844,7 @@ test "best effort force compact stops on resource budget rejection" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -44887,7 +44888,7 @@ test "best effort force compact stops on resource budget rejection" {
 
     const resource_stats = resource_manager.snapshot();
     try std.testing.expect(
-        resource_stats.slices[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0,
+        resource_stats.slices[@backingInt(resource_manager_mod.Slice.text_merge_buffers)].hard_limit_rejections > 0,
     );
 }
 
@@ -44905,12 +44906,12 @@ test "best effort force compact resumes after modeled reopen under relaxed press
     try modeled_storage.syncParentAbsolute(".zig-cache/tmp");
 
     var pressured_budgets = resource_manager_mod.Options.defaultBudgets();
-    pressured_budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    pressured_budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
     var pressured_policies = resource_manager_mod.Options.defaultPolicies();
-    pressured_policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    pressured_policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .defer_background_work,
     };
@@ -44930,7 +44931,7 @@ test "best effort force compact resumes after modeled reopen under relaxed press
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     {
@@ -45047,7 +45048,7 @@ test "authoritative posting capture starts inside an existing replay session" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -45160,7 +45161,7 @@ test "completed native publication defers to capture ownership without starting 
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -45262,7 +45263,7 @@ test "stable native finalization certifies an empty dense index" {
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -45294,7 +45295,7 @@ test "quiescent vector finalization defers to another index owner without losing
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();
@@ -45380,7 +45381,7 @@ test "retired LSM owner clone counters survive index generations" {
         .mutable_snapshot_clone_peak_bytes = 3072,
         .bulk_ingest_current_scan_clone_peak_active_bytes = 2048,
     };
-    first.mutable_snapshot_clone_by_reason[@intFromEnum(lsm_backend_mod.MutableSnapshotReason.bulk_current_scan)] = .{
+    first.mutable_snapshot_clone_by_reason[@backingInt(lsm_backend_mod.MutableSnapshotReason.bulk_current_scan)] = .{
         .calls = 2,
         .bytes_total = 4096,
         .peak_bytes = 3072,
@@ -45724,7 +45725,7 @@ test "replay matrix reads exact native base plus captured updates and fences del
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer primary.close();
@@ -45866,7 +45867,7 @@ test "source checkpoint leaves ANN capture admission open after pinning the nati
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer primary.close();
@@ -45930,7 +45931,7 @@ test "native member bindings preserve updates deletes old readers and restart" {
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer primary.close();
@@ -46081,7 +46082,7 @@ test "dense query bundle pins primary metadata and exact source through replacem
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var primary = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer primary.close();
@@ -46159,7 +46160,7 @@ fn testPublicDenseSnapshot(native_only: bool) !void {
     defer tmp.cleanup();
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     const DB = @import("antfly_source_root").antfly_sources.physical_db.DB;
     var resources = resource_manager_mod.ResourceManager.init(.{});
@@ -46425,7 +46426,7 @@ test "text force drain schedules policy misses above the tier target" {
     defer setBenchmarkTextMergePolicyOverride(null);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();

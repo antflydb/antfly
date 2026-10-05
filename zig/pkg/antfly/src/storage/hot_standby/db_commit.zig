@@ -72,8 +72,8 @@ fn noteFailure(binding: ReplicationAsyncEffectMirror) void {
 fn equalCapture(a: ReplicationAsyncEffectMirror, b: ReplicationAsyncEffectMirror) bool {
     const left = options(a);
     const right = options(b);
-    inline for (std.meta.fields(Options)) |field| {
-        if (comptime std.mem.eql(u8, field.name, "sync_policy")) {
+    inline for (@typeInfo(Options).@"struct".field_names) |field_name| {
+        if (comptime std.mem.eql(u8, field_name, "sync_policy")) {
             const x = left.sync_policy;
             const y = right.sync_policy;
             if (x.mode != y.mode or x.selection != y.selection or x.required != y.required or
@@ -82,7 +82,7 @@ fn equalCapture(a: ReplicationAsyncEffectMirror, b: ReplicationAsyncEffectMirror
                 if (!std.mem.eql(u8, xn, yn)) return false;
             }
         } else {
-            if (@field(left, field.name) != @field(right, field.name)) return false;
+            if (@field(left, field_name) != @field(right, field_name)) return false;
         }
     }
     return true;
@@ -179,7 +179,7 @@ pub fn evaluateReplicationMirrorCommitGate(mirror: ReplicationAsyncEffectMirror,
 
 pub fn recordHotStandbyMirrorGate(mirror: ReplicationAsyncEffectMirror, gate: hot_standby_commit_gate_mod.GateResult) void {
     if (options(mirror).last_gate_lsn) |last_lsn| last_lsn.store(gate.target_lsn, .release);
-    if (options(mirror).last_gate_action) |last_action| last_action.store(@intFromEnum(gate.action), .release);
+    if (options(mirror).last_gate_action) |last_action| last_action.store(@backingInt(gate.action), .release);
     switch (gate.action) {
         .acknowledge => {},
         .acknowledge_degraded => {

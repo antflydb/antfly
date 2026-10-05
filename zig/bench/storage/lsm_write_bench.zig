@@ -93,7 +93,7 @@ const WorkloadSet = enum {
 const KeySet = struct {
     keys: [][]u8,
 
-    fn deinit(self: *const KeySet, allocator: Allocator) void {
+    pub fn deinit(self: *const KeySet, allocator: Allocator) void {
         for (self.keys) |key| allocator.free(key);
         allocator.free(self.keys);
     }
@@ -156,7 +156,7 @@ const ReadStats = struct {
     errors: u64 = 0,
     total_ns: u64 = 0,
     max_ns: u64 = 0,
-    buckets: [read_latency_bucket_count]u64 = [_]u64{0} ** read_latency_bucket_count,
+    buckets: [read_latency_bucket_count]u64 = @as([read_latency_bucket_count]u64, @splat(0)),
 
     fn record(self: *ReadStats, ns: u64, result: ReadResult) void {
         self.ops += 1;
@@ -340,7 +340,7 @@ const StorageHarness = struct {
         return harness;
     }
 
-    fn deinit(self: *StorageHarness) void {
+    pub fn deinit(self: *StorageHarness) void {
         if (self.counting_ctx) |counting_ctx| self.allocator.destroy(counting_ctx);
         if (self.native_backing) |backing| {
             backing.deinit();
@@ -453,7 +453,7 @@ const Scenario = struct {
         };
     }
 
-    fn deinit(self: *Scenario) void {
+    pub fn deinit(self: *Scenario) void {
         self.backend.close();
         self.storage_harness.storage().deleteTree(self.root_dir) catch {};
         self.storage_harness.deinit();

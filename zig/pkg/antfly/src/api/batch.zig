@@ -2441,7 +2441,7 @@ fn consumerTests() type {
             const command: integrity_mod.Command = .{ .address = address, .operation = .{ .release = .{ .parent_table = "parent", .parent_key = "key\x00\xff" } } };
             const encoded = try encodeBatchRequest(alloc, .{
                 .relational_schema_version = 17,
-                .relational_integrity_generation_set = [_]u8{5} ** 32,
+                .relational_integrity_generation_set = @as([32]u8, @splat(5)),
                 .integrity_commands = &.{command},
                 .transaction = .{ .prepare = .{ .txn_id = @splat(4), .topology_epoch = 1 } },
             });
@@ -2450,7 +2450,7 @@ fn consumerTests() type {
             var parsed = try parseInternalBatchRequest(alloc, encoded);
             defer parsed.deinit(alloc);
             try std.testing.expectEqual(@as(?u32, 17), parsed.req.relational_schema_version);
-            try std.testing.expectEqual(@as(?[32]u8, [_]u8{5} ** 32), parsed.req.relational_integrity_generation_set);
+            try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(5))), parsed.req.relational_integrity_generation_set);
             try std.testing.expectEqualSlices(u8, &address.routing, &parsed.req.integrity_commands[0].address.routing);
             try std.testing.expectEqualStrings("key\x00\xff", parsed.req.integrity_commands[0].operation.release.parent_key);
         }
@@ -2504,14 +2504,14 @@ fn consumerTests() type {
         test "distributed txn public batch rejects isolated coordinator generation evidence spoof" {
             try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(std.testing.allocator, "{\"_relational_repair\":true}"));
             const alloc = std.testing.allocator;
-            const encoded = try @import("relational_integrity_wire.zig").encodeGenerationSet(alloc, [_]u8{7} ** 32);
+            const encoded = try @import("relational_integrity_wire.zig").encodeGenerationSet(alloc, @as([32]u8, @splat(7)));
             defer alloc.free(encoded);
             const body = try std.fmt.allocPrint(alloc, "{{\"_relational_integrity_generation_set\":{s}}}", .{encoded});
             defer alloc.free(body);
             try std.testing.expectError(error.InvalidBatchRequest, parseBatchRequest(alloc, body));
             var internal = try parseInternalBatchRequest(alloc, body);
             defer internal.deinit(alloc);
-            try std.testing.expectEqual(@as(?[32]u8, [_]u8{7} ** 32), internal.req.relational_integrity_generation_set);
+            try std.testing.expectEqual(@as(?[32]u8, @as([32]u8, @splat(7))), internal.req.relational_integrity_generation_set);
         }
 
         test "internal batch graph endpoint cleanup command cannot enter public or mixed batches" {
@@ -2583,7 +2583,7 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 7), prepare.topology_epoch);
             try std.testing.expectEqual(@as(usize, 1), decoded.req.writes.len);
             try std.testing.expectEqual(@as(u64, 41), decoded.req.predicates[0].expected_version);
-            try std.testing.expectEqual([_]u8{7} ** 32, decoded.req.predicates[0].expected_content_digest.?);
+            try std.testing.expectEqual(@as([32]u8, @splat(7)), decoded.req.predicates[0].expected_content_digest.?);
 
             const begin_encoded = try encodeBatchRequest(alloc, .{
                 .transaction = .{ .begin = .{

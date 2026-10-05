@@ -403,18 +403,18 @@ assume one device-independent ceiling.
 ## Focused verification
 
 ```sh
-zig build test-gliner2-data -Doptimize=ReleaseSafe
-zig build test-gliner2-recipe -Doptimize=ReleaseSafe
-zig build test-gliner2-e2e -Doptimize=ReleaseSafe
-zig build test-gliner2-autodiff-trainer -Doptimize=ReleaseSafe -Dmetal=true
-zig build test-gliner2-run-validation -Doptimize=ReleaseSafe
-zig build test-gliner2-graph-cache -Doptimize=ReleaseSafe -Dmetal=true
-zig build test-gliner2-native-eval -Doptimize=ReleaseSafe
+zig build test-gliner2-data -Doptimize=safe
+zig build test-gliner2-recipe -Doptimize=safe
+zig build test-gliner2-e2e -Doptimize=safe
+zig build test-gliner2-autodiff-trainer -Doptimize=safe -Dmetal=true
+zig build test-gliner2-run-validation -Doptimize=safe
+zig build test-gliner2-graph-cache -Doptimize=safe -Dmetal=true
+zig build test-gliner2-native-eval -Doptimize=safe
 TERMITE_REQUIRE_METAL_TESTS=1 zig build \
-  test-gliner2-backend-grad-parity -Dmetal=true -Doptimize=ReleaseSafe
+  test-gliner2-backend-grad-parity -Dmetal=true -Doptimize=safe
 TERMITE_REQUIRE_CUDA_TESTS=1 zig build \
   test-gliner2-backend-grad-parity -Dcuda=true \
-  -Dcuda-artifacts=sm89 -Doptimize=ReleaseFast
+  -Dcuda-artifacts=sm89 -Doptimize=fast
 
 cd scripts
 python3.12 -m unittest \

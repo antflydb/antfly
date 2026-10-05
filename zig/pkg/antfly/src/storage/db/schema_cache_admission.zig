@@ -18,7 +18,7 @@
 const std = @import("std");
 
 pub const Admission = struct {
-    counters: [4][256]u8 = .{.{0} ** 256} ** 4,
+    counters: [4][256]u8 = @splat(@splat(0)),
     samples: u16 = 0,
 
     fn hash(version: u32, lane: usize) usize {

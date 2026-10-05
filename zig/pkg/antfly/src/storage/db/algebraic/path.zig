@@ -99,7 +99,7 @@ const Pending = struct {
     provenance: []u8,
     depth: u32,
 
-    fn deinit(self: *Pending, alloc: Allocator) void {
+    pub fn deinit(self: *Pending, alloc: Allocator) void {
         alloc.free(self.provenance);
         self.* = undefined;
     }

@@ -309,7 +309,7 @@ test "SQL window cell updates preserve wide rows without rewriting input payload
     defer manager.deinit();
     var rows = try Rows.init(a, &manager, 3);
     defer rows.deinit();
-    const text = [_]u8{'x'} ** 8192;
+    const text: [8192]u8 = @splat('x');
     for (0..64) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .string = &text }), .{}, .{} }, .keys = &.{}, .ordinal = index + 100 });
     const original_bytes = rows.file.size;
     try rows.enableColumnUpdates(1);

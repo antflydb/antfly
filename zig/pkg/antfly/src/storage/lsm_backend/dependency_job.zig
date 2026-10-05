@@ -113,7 +113,7 @@ test "dependency certificate rebases newer writes and rejects changed inputs or 
 }
 
 test "dependency certificate delta scaling benchmark" {
-    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    if (@import("builtin").mode != .fast) return error.SkipZigTest;
     const Fixture = struct {
         allocator: std.mem.Allocator,
         pub fn retainRunSnapshotRef(_: *@This(), _: *@import("repository.zig").Run) !void {}

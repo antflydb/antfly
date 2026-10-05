@@ -277,7 +277,7 @@ fn consumerTests() type {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     self.snapshots_closed += 1;
                 }
-                fn validate(ptr: *anyopaque) !void {
+                pub fn validate(ptr: *anyopaque) !void {
                     const self: *@This() = @ptrCast(@alignCast(ptr));
                     try self.capture_token.check();
                 }

@@ -14,7 +14,7 @@ fi
 case "$1" in
   audit)
     exec python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build \
-      vopr-determinism-audit -Doptimize=ReleaseSafe --summary all \
+      vopr-determinism-audit -Doptimize=safe --summary all \
       --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
     ;;
   runtime)
@@ -26,7 +26,7 @@ case "$1" in
       python3 tools/run_bounded_zig_build.py --max-rss-cap 23622320128 -- build \
       antfly-raft-transport-test standby-vopr-test vopr-runtime-test \
       restore-admission-vopr-test secrets-vopr-test \
-      -Doptimize=ReleaseSafe --summary all \
+      -Doptimize=safe --summary all \
       --cache-dir "$VOPR_LOCAL_CACHE_DIR" --global-cache-dir "$VOPR_GLOBAL_CACHE_DIR"
     ;;
   *)

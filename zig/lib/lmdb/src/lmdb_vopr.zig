@@ -57,7 +57,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             reader_snapshots: u64 = 0,
             finished: bool = false,
 
-            fn deinit(self: *State) void {
+            pub fn deinit(self: *State) void {
                 self.actions.deinit(self.allocator);
                 self.crash_prelude.deinit(self.allocator);
                 self.faults.deinit();
@@ -103,11 +103,11 @@ pub fn Scenario(comptime action_budget: u64) type {
             for (std.enums.values(CommitPhase)) |phase| {
                 const spec = crashSpec(phase);
                 if ((try state.faults.admission(spec)).isAllowed()) try list.append(allocator, .{
-                    .id = vopr.id.derive("storage.lmdb.crash-transition", crash_base, @intFromEnum(phase)),
+                    .id = vopr.id.derive("storage.lmdb.crash-transition", crash_base, @backingInt(phase)),
                     .name = "storage.lmdb.crash_publish_phase",
                     .kind = .fault,
                     .resource_id = spec.resource_id,
-                    .parameter = @intFromEnum(phase),
+                    .parameter = @backingInt(phase),
                 });
             }
         }
@@ -126,7 +126,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             }
 
             if (std.mem.eql(u8, selected.name, "storage.lmdb.crash_publish_phase")) {
-                const phase: CommitPhase = @enumFromInt(selected.parameter);
+                const phase: CommitPhase = @fromBackingInt(selected.parameter);
                 const spec = crashSpec(phase);
                 try state.faults.start(spec, events, allocator);
                 const step: u16 = @intCast(state.actions.items.len);
@@ -135,10 +135,10 @@ pub fn Scenario(comptime action_budget: u64) type {
                     if (!isOracleMismatch(err)) return err;
                     state.crash_outcome_allowed = false;
                     _ = try state.faults.consumeOneShot(.storage, spec.resource_id, events, allocator);
-                    return vopr.outcome.TransitionOutcome.propertyViolation(crash_outcome_id, "storage.lmdb.crash_snapshot_mismatch", @intFromEnum(phase));
+                    return vopr.outcome.TransitionOutcome.propertyViolation(crash_outcome_id, "storage.lmdb.crash_snapshot_mismatch", @backingInt(phase));
                 };
                 _ = try state.faults.consumeOneShot(.storage, spec.resource_id, events, allocator);
-                try events.emitNamed(allocator, .state_change, "storage.lmdb.crash_reopened", @intFromEnum(state.crash_outcome.?));
+                try events.emitNamed(allocator, .state_change, "storage.lmdb.crash_reopened", @backingInt(state.crash_outcome.?));
                 return vopr.outcome.TransitionOutcome.applied();
             }
 
@@ -173,7 +173,7 @@ pub fn Scenario(comptime action_budget: u64) type {
             try builder.addNamed(allocator, "storage.lmdb.nested_commits", @intCast(state.nested_commits));
             try builder.addNamed(allocator, "storage.lmdb.nested_aborts", @intCast(state.nested_aborts));
             try builder.addNamed(allocator, "storage.lmdb.reader_snapshots", @intCast(state.reader_snapshots));
-            try builder.addNamed(allocator, "storage.lmdb.crash_phase", if (state.crash_outcome) |value| @intFromEnum(value) + 1 else 0);
+            try builder.addNamed(allocator, "storage.lmdb.crash_phase", if (state.crash_outcome) |value| @backingInt(value) + 1 else 0);
             try builder.addNamed(allocator, "storage.lmdb.finished", @intFromBool(state.finished));
         }
 
@@ -218,7 +218,7 @@ fn keyedTransition(base: u64, name: []const u8, kind: vopr.transition.Kind, key:
 }
 
 fn directTransition(kind: DirectKind, key: u8) vopr.transition.Transition {
-    const encoded = (@as(u64, @intFromEnum(kind)) << 8) | key;
+    const encoded = (@as(u64, @backingInt(kind)) << 8) | key;
     return .{
         .id = vopr.id.derive("storage.lmdb.direct-transition", direct_base, encoded),
         .name = "storage.lmdb.direct",
@@ -230,7 +230,7 @@ fn directTransition(kind: DirectKind, key: u8) vopr.transition.Transition {
 fn actionForTransition(selected: vopr.transition.Transition, step: u16) ?ScheduledAction {
     if (std.mem.eql(u8, selected.name, "storage.lmdb.direct")) {
         const encoded: u64 = @bitCast(selected.parameter);
-        const kind: DirectKind = @enumFromInt(encoded >> 8);
+        const kind: DirectKind = @fromBackingInt(encoded >> 8);
         const key: u8 = @truncate(encoded);
         if (selected.id != directTransition(kind, key).id) return null;
         return .{ .direct = differentialAction(kind, key, valueFor(step, key)) };
@@ -277,9 +277,9 @@ fn appendCrashPrelude(state: anytype, action: ScheduledAction) !void {
 }
 
 fn crashSpec(phase: CommitPhase) vopr.fault.Spec {
-    const resource = vopr.id.derive("storage.lmdb.commit-publication", vopr.id.stable("resource", "storage.lmdb.commit"), @intFromEnum(phase));
+    const resource = vopr.id.derive("storage.lmdb.commit-publication", vopr.id.stable("resource", "storage.lmdb.commit"), @backingInt(phase));
     return .{
-        .id = vopr.id.derive("storage.lmdb.crash-fault", vopr.id.stable("fault", "storage.lmdb.crash"), @intFromEnum(phase)),
+        .id = vopr.id.derive("storage.lmdb.crash-fault", vopr.id.stable("fault", "storage.lmdb.crash"), @backingInt(phase)),
         .name = "storage.lmdb.crash_publish_phase",
         .kind = .storage,
         .lifecycle = .one_shot,
@@ -333,7 +333,7 @@ test "LMDB VOPR replays every modeled crash publication phase" {
         fn choose(ptr: *anyopaque, request: vopr.choice.Request) !u64 {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             const wanted = if (self.step == 0) directTransition(.put_main, 0).id else if (self.step == 1)
-                vopr.id.derive("storage.lmdb.crash-transition", crash_base, @intFromEnum(self.phase))
+                vopr.id.derive("storage.lmdb.crash-transition", crash_base, @backingInt(self.phase))
             else
                 finish_id;
             for (request.enabled) |candidate| if (candidate.id == wanted) {

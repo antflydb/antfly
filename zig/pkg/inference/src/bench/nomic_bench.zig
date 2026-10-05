@@ -381,7 +381,7 @@ fn nsToMs(ns: u64) f64 {
 
 fn printUsage() void {
     std.debug.print(
-        "usage: zig build bench-nomic-e2e -Doptimize=ReleaseFast -- --model-dir <nomic-dir> --model-sha <sha256> [--fixture src/bench/testdata/nomic_v15_tokens.json] [--backend metal|native] [--batch 1|2|4] [--seq-len 16|128] [--warmup-iters 3] [--measure-iters 10] [--print-embeddings]\n",
+        "usage: zig build bench-nomic-e2e -Doptimize=fast -- --model-dir <nomic-dir> --model-sha <sha256> [--fixture src/bench/testdata/nomic_v15_tokens.json] [--backend metal|native] [--batch 1|2|4] [--seq-len 16|128] [--warmup-iters 3] [--measure-iters 10] [--print-embeddings]\n",
         .{},
     );
 }

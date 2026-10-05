@@ -123,7 +123,9 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             empty_path = tmp_path / f"empty-{row_group}.parquet"
             empty_schema = pa.schema([("amount", pa.int64())])
             if row_group:
-                pq.write_table(pa.table({"amount": pa.array([], type=pa.int64())}), empty_path)
+                pq.write_table(
+                    pa.table({"amount": pa.array([], type=pa.int64())}), empty_path
+                )
             else:
                 with pq.ParquetWriter(empty_path, empty_schema):
                     pass
@@ -135,22 +137,29 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             )
             (empty_objects / "part.parquet").write_bytes(empty_envelope + empty)
             name = f"empty_lake_{int(row_group)}"
-            request("POST", f"/tables/{name}", {
-                "num_shards": 1,
-                "schema": {
-                    "storage_mode": "relational",
-                    "base_source": {
-                        "kind": "external", "table_id": name,
-                        "format": "parquet", "uri": empty_root.as_uri(),
+            request(
+                "POST",
+                f"/tables/{name}",
+                {
+                    "num_shards": 1,
+                    "schema": {
+                        "storage_mode": "relational",
+                        "base_source": {
+                            "kind": "external",
+                            "table_id": name,
+                            "format": "parquet",
+                            "uri": empty_root.as_uri(),
+                        },
                     },
                 },
-            })
+            )
             deadline = time.monotonic() + 30
             while True:
                 response = requests.post(
                     server.api_url + "/sql",
                     json={"statement": f"SELECT SUM(amount), COUNT(*) FROM {name}"},
-                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60,
+                    auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                    timeout=60,
                 )
                 if response.ok:
                     assert response.json()["rows"] == [[None, "0"]]
@@ -158,7 +167,12 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 assert response.status_code in (404, 409, 503), response.text
                 assert time.monotonic() < deadline, response.text
                 time.sleep(0.1)
-            assert request("POST", "/sql", {"statement": f"SELECT amount FROM {name}"})["rows"] == []
+            assert (
+                request("POST", "/sql", {"statement": f"SELECT amount FROM {name}"})[
+                    "rows"
+                ]
+                == []
+            )
         # A wide physical file crosses ordered-parallel admission even when
         # SQL projects only its narrow integer column. Use an independent
         # writer and verify OFFSET skips a projection error in the prefix.
@@ -168,36 +182,56 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
         large_path = tmp_path / "large.parquet"
         large_count = 10_000
         pq.write_table(
-            pa.table({
-                "amount": pa.array(range(large_count), type=pa.int64()),
-                "payload": [
-                    "".join(hashlib.sha256(f"{i}:{j}".encode()).hexdigest() for j in range(4))
-                    for i in range(large_count)
-                ],
-            }),
+            pa.table(
+                {
+                    "amount": pa.array(range(large_count), type=pa.int64()),
+                    "payload": [
+                        "".join(
+                            hashlib.sha256(f"{i}:{j}".encode()).hexdigest()
+                            for j in range(4)
+                        )
+                        for i in range(large_count)
+                    ],
+                }
+            ),
             large_path,
-            compression="snappy", use_dictionary=dictionary,
-            row_group_size=173, write_page_index=True, data_page_version="2.0",
+            compression="snappy",
+            use_dictionary=dictionary,
+            row_group_size=173,
+            write_page_index=True,
+            data_page_version="2.0",
         )
         large = large_path.read_bytes()
         assert len(large) >= 2 * 1024 * 1024
         (large_objects / "part.parquet").write_bytes(
-            b"AFOBJ001" + struct.pack("<QI", len(large), 0)
-            + hashlib.sha256(large).hexdigest().encode() + large
+            b"AFOBJ001"
+            + struct.pack("<QI", len(large), 0)
+            + hashlib.sha256(large).hexdigest().encode()
+            + large
         )
-        request("POST", "/tables/lake_large", {
-            "num_shards": 1,
-            "schema": {"storage_mode": "relational", "base_source": {
-                "kind": "external", "table_id": "lake-large", "format": "parquet",
-                "uri": large_root.as_uri(),
-            }},
-        })
+        request(
+            "POST",
+            "/tables/lake_large",
+            {
+                "num_shards": 1,
+                "schema": {
+                    "storage_mode": "relational",
+                    "base_source": {
+                        "kind": "external",
+                        "table_id": "lake-large",
+                        "format": "parquet",
+                        "uri": large_root.as_uri(),
+                    },
+                },
+            },
+        )
         deadline = time.monotonic() + 30
         while True:
             response = requests.post(
                 server.api_url + "/sql",
                 json={"statement": "SELECT COUNT(*) FROM lake_large"},
-                auth=("admin", AUTH_BOOTSTRAP_PASSWORD), timeout=60,
+                auth=("admin", AUTH_BOOTSTRAP_PASSWORD),
+                timeout=60,
             )
             if response.ok:
                 assert response.json()["rows"] == [[str(large_count)]]
@@ -297,13 +331,20 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
             ):
                 # Streaming delivery can return an explicit larger LIMIT
                 # while keeping each wire response page bounded.
-                large_seen = [row[0] for row in cursor.stream(
-                    "SELECT amount FROM lake_large LIMIT 8192 OFFSET 1000", size=137
-                )]
+                large_seen = [
+                    row[0]
+                    for row in cursor.stream(
+                        "SELECT amount FROM lake_large LIMIT 8192 OFFSET 1000", size=137
+                    )
+                ]
                 assert large_seen == list(range(1000, 9192))
-                projected = [row[0] for row in cursor.stream(
-                    "SELECT 1 / (amount - 1) FROM lake_large LIMIT 8192 OFFSET 2", size=137
-                )]
+                projected = [
+                    row[0]
+                    for row in cursor.stream(
+                        "SELECT 1 / (amount - 1) FROM lake_large LIMIT 8192 OFFSET 2",
+                        size=137,
+                    )
+                ]
                 assert len(projected) == 8192
                 assert projected[0] == 1 and projected[-1] == 0
                 seen = [
@@ -316,9 +357,7 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                 assert seen == list(reversed(range(count)))
                 # Native execution may evaluate ahead of wire delivery. A later
                 # bad lane must follow the valid prefix, including after restart.
-                rows = cursor.stream(
-                    "SELECT 1 / (1 - amount) FROM lake_events", size=1
-                )
+                rows = cursor.stream("SELECT 1 / (1 - amount) FROM lake_events", size=1)
                 assert next(rows) == (1,)
                 with pytest.raises(psycopg.errors.DivisionByZero):
                     next(rows)

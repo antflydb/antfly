@@ -1,5 +1,5 @@
 {
-  "base_commit": "add424bd36230592c94159de42bd08f5c0f315c5",
+  "base_commit": "e4d707de5634a8d758c606b4432037e1a1682052",
   "build": "zig build sql-native-pipeline-bench -Doptimize=ReleaseFast -j2",
   "scope": "Local native microbenchmarks with alternating execution order and three samples. These are individual operation comparisons, not end-to-end or remote-I/O speedup claims.",
   "comparisons": {
@@ -9,19 +9,19 @@
   },
   "medians": {
     "wide_column_cache": {
-      "four_entry_ns": 89513875,
-      "active_ns": 6118459,
-      "ratio": 14.630133992889386
+      "four_entry_ns": 34975208,
+      "active_ns": 1289375,
+      "ratio": 27.125706640814347
     },
     "owned_column_transfer": {
-      "copy_ns": 15996583,
-      "transfer_ns": 95125,
-      "ratio": 168.16381603153746
+      "copy_ns": 14592667,
+      "transfer_ns": 43166,
+      "ratio": 338.05928276884583
     },
     "primitive_numeric_hash": {
-      "decimal_ns": 9116836209,
-      "primitive_ns": 394875,
-      "ratio": 23087.904296296296
+      "decimal_ns": 9642383875,
+      "primitive_ns": 297542,
+      "ratio": 32406.799292200765
     }
   },
   "samples": [
@@ -30,8 +30,8 @@
       "rows": 1024,
       "width": 8,
       "sample": 0,
-      "four_entry_ns": 90718333,
-      "active_ns": 6124875,
+      "four_entry_ns": 85543500,
+      "active_ns": 1542333,
       "four_entry_decodes": 8192,
       "active_decodes": 144
     },
@@ -40,8 +40,8 @@
       "rows": 1024,
       "width": 8,
       "sample": 1,
-      "four_entry_ns": 89513875,
-      "active_ns": 6118459,
+      "four_entry_ns": 34975208,
+      "active_ns": 1289375,
       "four_entry_decodes": 8192,
       "active_decodes": 144
     },
@@ -50,8 +50,8 @@
       "rows": 1024,
       "width": 8,
       "sample": 2,
-      "four_entry_ns": 88037000,
-      "active_ns": 5886042,
+      "four_entry_ns": 33608500,
+      "active_ns": 1142417,
       "four_entry_decodes": 8192,
       "active_decodes": 144
     },
@@ -61,8 +61,8 @@
       "width": 8,
       "repeats": 16,
       "sample": 0,
-      "copy_ns": 15893750,
-      "transfer_ns": 116958
+      "copy_ns": 14592667,
+      "transfer_ns": 43166
     },
     {
       "case": "owned_column_transfer",
@@ -70,8 +70,8 @@
       "width": 8,
       "repeats": 16,
       "sample": 1,
-      "copy_ns": 15996583,
-      "transfer_ns": 88333
+      "copy_ns": 14582125,
+      "transfer_ns": 43666
     },
     {
       "case": "owned_column_transfer",
@@ -79,29 +79,30 @@
       "width": 8,
       "repeats": 16,
       "sample": 2,
-      "copy_ns": 16156750,
-      "transfer_ns": 95125
+      "copy_ns": 14694375,
+      "transfer_ns": 40875
     },
     {
       "case": "primitive_numeric_hash",
       "rows": 100000,
       "sample": 0,
-      "decimal_ns": 9116836209,
-      "primitive_ns": 394875
+      "decimal_ns": 10184635833,
+      "primitive_ns": 297542
     },
     {
       "case": "primitive_numeric_hash",
       "rows": 100000,
       "sample": 1,
-      "decimal_ns": 9100483750,
-      "primitive_ns": 349000
+      "decimal_ns": 9628208666,
+      "primitive_ns": 297125
     },
     {
       "case": "primitive_numeric_hash",
       "rows": 100000,
       "sample": 2,
-      "decimal_ns": 9164406333,
-      "primitive_ns": 455417
+      "decimal_ns": 9642383875,
+      "primitive_ns": 376375
     }
-  ]
+  ],
+  "zig_version": "0.17.0"
 }

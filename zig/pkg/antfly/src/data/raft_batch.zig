@@ -542,7 +542,7 @@ fn consumerTests() type {
         }
 
         test "raft batch round trips deterministic transaction begin" {
-            const txn_id: db_mod.types.TxnId = .{1} ** 16;
+            const txn_id: db_mod.types.TxnId = @splat(1);
             const encoded = try encode(std.testing.allocator, "docs", .{
                 .transaction = .{ .begin = .{
                     .txn_id = txn_id,
@@ -564,33 +564,33 @@ fn consumerTests() type {
             try std.testing.expectEqual(@as(u64, 200), begin.created_at_ns);
             try std.testing.expectEqualStrings("table2:4:docs:group:7", begin.participants[0]);
         }
+
+        test "raft batch round trips guarded graph owner replay afterimages" {
+            const alloc = std.testing.allocator;
+            const contract = @import("../storage/graph_cleanup_contract.zig");
+            const key = try contract.ownerJobKeyAlloc(alloc, "owner\x00\xff");
+            defer alloc.free(key);
+            const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7 });
+            defer alloc.free(old);
+            const next = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7, .phase = .inputs });
+            defer alloc.free(next);
+            const req: db_mod.types.BatchRequest = .{
+                .graph_endpoint_cleanup = true,
+                .graph_endpoint_cleanup_planned = true,
+                .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "owner\x00\xff", .generation = 7, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(old) }},
+                .merge_artifacts = &.{.{ .key = key, .value = next }},
+            };
+            const bytes = try encode(alloc, "docs", req);
+            defer alloc.free(bytes);
+            var decoded = try decode(alloc, bytes);
+            defer decoded.deinit(alloc);
+            try std.testing.expectEqualSlices(u8, next, decoded.batch.req.merge_artifacts[0].value);
+            try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
+            try db_mod.types.validateGraphEndpointCleanupCommand(decoded.batch.req);
+        }
     };
     return Suite;
 }
 comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
-}
-
-test "raft batch round trips guarded graph owner replay afterimages" {
-    const alloc = std.testing.allocator;
-    const contract = @import("../storage/graph_cleanup_contract.zig");
-    const key = try contract.ownerJobKeyAlloc(alloc, "owner\x00\xff");
-    defer alloc.free(key);
-    const old = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7 });
-    defer alloc.free(old);
-    const next = try contract.encodeOwnerJobAlloc(alloc, .{ .owner = "owner\x00\xff", .generation = 7, .phase = .inputs });
-    defer alloc.free(next);
-    const req: db_mod.types.BatchRequest = .{
-        .graph_endpoint_cleanup = true,
-        .graph_endpoint_cleanup_planned = true,
-        .graph_endpoint_cleanup_guards = &.{.{ .endpoint = "owner\x00\xff", .generation = 7, .kind = .owner_replay, .checkpoint_digest = contract.checkpointDigest(old) }},
-        .merge_artifacts = &.{.{ .key = key, .value = next }},
-    };
-    const bytes = try encode(alloc, "docs", req);
-    defer alloc.free(bytes);
-    var decoded = try decode(alloc, bytes);
-    defer decoded.deinit(alloc);
-    try std.testing.expectEqualSlices(u8, next, decoded.batch.req.merge_artifacts[0].value);
-    try std.testing.expectEqualSlices(u8, key, decoded.batch.req.merge_artifacts[0].key);
-    try db_mod.types.validateGraphEndpointCleanupCommand(decoded.batch.req);
 }

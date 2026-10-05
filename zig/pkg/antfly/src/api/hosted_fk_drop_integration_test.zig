@@ -118,7 +118,7 @@ const ParentRoute = struct {
     group_id: u64,
     table_name: []u8,
 
-    fn deinit(self: ParentRoute, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: ParentRoute, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
     }
 };
@@ -459,9 +459,12 @@ fn mountedHostedExternalParent(mode: MountedMode) !void {
     }
     const parent_id = try awaitTable(alloc, io, transport, &headers, base, "parents");
     const child_id = try awaitTable(alloc, io, transport, &headers, base, "children");
+    try recovery_fixture.awaitIntegrityCatalog(alloc, io, &metadata, &data, parent_id);
+    try recovery_fixture.awaitIntegrityCatalog(alloc, io, &metadata, &data, child_id);
     var parent_insert = try batch(alloc, transport, &headers, base, "parents", "{\"inserts\":{\"parent-row\":{\"id\":1}},\"sync_level\":\"full_text\"}", 3_000);
     defer parent_insert.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 201), parent_insert.status);
+    try recovery_fixture.awaitMetadataRead(io, &metadata);
     var add = try sql(alloc, transport, &headers, metadata_uri, "ALTER TABLE children ADD CONSTRAINT child_parent FOREIGN KEY (parent_id) REFERENCES parents(id)");
     defer add.deinit(alloc);
     if (add.status != 202) std.debug.print("hosted FK ADD status={d}\n", .{add.status});

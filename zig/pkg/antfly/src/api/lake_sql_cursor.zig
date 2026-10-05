@@ -113,10 +113,12 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
     const after = if (request.after) |v| try owned.dupe(u8, v) else null;
     const before = if (request.before) |v| try owned.dupe(u8, v) else null;
     const primary_key = if (request.primary_key) |v| try owned.dupe(u8, v) else null;
-    owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key, .mask_arena = .init(alloc) };
     var filter_columns: std.ArrayList([]const u8) = .empty;
     for (conditions) |condition| try appendColumn(owned, &filter_columns, table, condition.column);
     if (source.scanner.iceberg_delete_plan) |plan| for (plan.files) |file| for (file.equality_columns) |name| try filter_columns.append(owned, name);
+    // Transfer the arena only after its final allocation. Growing it through
+    // the local allocator after copying would leave new buffers unowned.
+    owner.* = .{ .alloc = alloc, .arena = arena, .stream = stream, .table = table, .context = context, .conditions = conditions, .after = after, .before = before, .primary_key = primary_key, .mask_arena = .init(alloc) };
     owner.stream.filter_columns = filter_columns.items;
     if (source.scanner.iceberg_delete_plan != null or conditions.len != 0 or after != null or before != null or primary_key != null)
         owner.stream.filter = .{ .ptr = owner, .any_match = Owner.anyMatch };

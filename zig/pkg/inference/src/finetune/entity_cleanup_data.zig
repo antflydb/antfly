@@ -71,10 +71,11 @@ pub fn loadExamples(allocator: std.mem.Allocator, path: []const u8, split: ?[]co
     if (examples.items.len == 0) return error.NoExamples;
     try validateDataset(arena_alloc, examples.items);
 
+    const owned_result_examples = try examples.toOwnedSlice(arena_alloc);
     return .{
         .arena = arena,
         .dataset_root = dataset_root,
-        .examples = try examples.toOwnedSlice(arena_alloc),
+        .examples = owned_result_examples,
     };
 }
 
@@ -105,7 +106,7 @@ fn loadExamplesFromFile(
     split_filter: ?[]const u8,
     out: *std.ArrayListUnmanaged(Example),
 ) !void {
-    const file_data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(64 * 1024 * 1024));
     var lines = std.mem.tokenizeScalar(u8, file_data, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");

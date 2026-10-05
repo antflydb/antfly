@@ -261,7 +261,7 @@ pub const StateIndex = struct {
     const Name = struct { kind: Kind, parent: u64, name: []const u8 };
     const NameContext = struct {
         pub fn hash(_: @This(), key: Name) u64 {
-            var h = std.hash.Wyhash.init(@intFromEnum(key.kind));
+            var h = std.hash.Wyhash.init(@backingInt(key.kind));
             h.update(std.mem.asBytes(&key.parent));
             h.update(key.name);
             return h.final();

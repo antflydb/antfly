@@ -1469,7 +1469,7 @@ test "SQL transferred column views survive producer teardown and allocation fail
 }
 
 fn transferBenchmark(copy: bool, root: *PendingColumns) !struct { ns: i96, checksum: i64 } {
-    const start = std.Io.Clock.now(.awake, std.testing.io).nanoseconds;
+    const start = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
     var checksum: i64 = 0;
     for (0..16) |_| {
         const page = if (copy) blk: {
@@ -1486,14 +1486,15 @@ fn transferBenchmark(copy: bool, root: *PendingColumns) !struct { ns: i96, check
         defer page.deinit();
         for (0..page.len()) |row| checksum += (try page.cell(std.testing.allocator, row, 0)).value.integer;
     }
-    return .{ .ns = std.Io.Clock.now(.awake, std.testing.io).nanoseconds - start, .checksum = checksum };
+    return .{ .ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds - start, .checksum = checksum };
 }
 test "native pipeline refinements benchmark owned column transfer" {
-    if (@import("builtin").mode == .Debug) return error.SkipZigTest;
+    if (@import("builtin").mode == .debug) return error.SkipZigTest;
     const root = try PendingColumns.create(std.testing.allocator);
     defer root.deinit();
     var values: [8]@import("scalar.zig").Datum = undefined;
-    @memset(values[1..], @import("scalar.zig").Datum.json(.{ .string = "shared projected payload" ** 16 }));
+    const payload: [384]u8 = @splat('x');
+    @memset(values[1..], @import("scalar.zig").Datum.json(.{ .string = &payload }));
     for (0..4096) |index| {
         values[0] = @import("scalar.zig").Datum.json(.{ .integer = @intCast(index) });
         _ = try root.values.append(&values);

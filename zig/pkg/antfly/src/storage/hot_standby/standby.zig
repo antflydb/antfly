@@ -190,10 +190,10 @@ pub const Standby = struct {
     ) !Standby {
         try validateIdentity(identity);
 
-        const owned_receive_log_path = try alloc.dupeZ(u8, std.mem.span(receive_log_path));
+        const owned_receive_log_path = try alloc.dupeSentinel(u8, std.mem.span(receive_log_path), 0);
         var receive_path_owned_locally = true;
         errdefer if (receive_path_owned_locally) alloc.free(owned_receive_log_path);
-        const owned_progress_wal_path = try alloc.dupeZ(u8, std.mem.span(progress_wal_path));
+        const owned_progress_wal_path = try alloc.dupeSentinel(u8, std.mem.span(progress_wal_path), 0);
         var progress_path_owned_locally = true;
         errdefer if (progress_path_owned_locally) alloc.free(owned_progress_wal_path);
         var receive_log = try replication_log.ReplicationLog.open(owned_receive_log_path.ptr, options.receive_log_options);
@@ -981,7 +981,7 @@ const TestPaths = struct {
     receive_log: [:0]u8,
     progress_wal: [:0]u8,
 
-    fn deinit(self: TestPaths, alloc: Allocator) void {
+    pub fn deinit(self: TestPaths, alloc: Allocator) void {
         alloc.free(self.receive_log);
         alloc.free(self.progress_wal);
     }
@@ -1008,8 +1008,8 @@ fn testPaths(alloc: Allocator, comptime name: []const u8) !TestPaths {
     std.Io.Dir.cwd().deleteTree(io_impl.io(), progress_raw) catch {};
 
     return .{
-        .receive_log = try alloc.dupeZ(u8, receive_raw),
-        .progress_wal = try alloc.dupeZ(u8, progress_raw),
+        .receive_log = try alloc.dupeSentinel(u8, receive_raw, 0),
+        .progress_wal = try alloc.dupeSentinel(u8, progress_raw, 0),
     };
 }
 
@@ -1018,7 +1018,7 @@ const ApplyCapture = struct {
     payloads: std.ArrayListUnmanaged([]u8) = .empty,
     fail_at_lsn: u64 = 0,
 
-    fn deinit(self: *ApplyCapture) void {
+    pub fn deinit(self: *ApplyCapture) void {
         for (self.payloads.items) |payload| self.alloc.free(payload);
         self.payloads.deinit(self.alloc);
         self.* = undefined;

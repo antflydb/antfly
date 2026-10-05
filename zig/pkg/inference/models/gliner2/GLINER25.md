@@ -95,7 +95,7 @@ These are the exact digests compiled into `gliner_boundary_qualification.zig`'s
 
 ### 2. Correctness
 
-`zig build inference-test -Doptimize=ReleaseFast -- --test-filter "gliner boundary"`
+`zig build inference-test -Doptimize=fast -- --test-filter "gliner boundary"`
 now runs (rather than skips) every test pinned to `ANTFLY_GLINER25_BASE_MODEL_DIR`,
 including:
 
@@ -163,7 +163,7 @@ recorded separately.
 
 ### 5. End to end
 
-With the runtime rebuilt (`zig build -Doptimize=ReleaseFast`, or `zig build
+With the runtime rebuilt (`zig build -Doptimize=fast`, or `zig build
 antfly` for just the CLI) and re-pulled (`antfly inference pull
 fastino/gliner2.5-base-v1`, now producing `"tasks":["extract"]` and
 `"capabilities":["extraction","classification","relations","records"]` in
@@ -408,7 +408,7 @@ the two real call sites of `extractWithAdmission` from section 8):
   the same assertions through `Node.extractDirect`, the entry point the
   in-process/embedded worker actually calls.
 
-Both passed on native and Metal (`zig build inference-test -Doptimize=ReleaseFast
+Both passed on native and Metal (`zig build inference-test -Doptimize=fast
 -- --test-filter "gliner boundary"`, `152` -> `156` selected as these tests
 were added, `134` passed / `22` skipped -- the 22 skips are unrelated pinned
 `small`-backbone tests gated on `ANTFLY_GLINER25_SMALL_MODEL_DIR`, not set
@@ -452,7 +452,7 @@ documents in one encoded forward pass) is not part of this qualification's
 measured `request_items=[1,1]` contract.
 
 **End-to-end verification.** With the runtime rebuilt
-(`zig build antfly -Doptimize=ReleaseFast`) and `antfly inference run
+(`zig build antfly -Doptimize=fast`) and `antfly inference run
 --port 8098 --host-budget-mb 16384 --backend-budget-mb 16384
 --scratch-budget-mb 16384 --combined-budget-mb 32768 --kv-budget-mb 4096`
 running, a 6,144-byte real excerpt starting at `zig/VOPR.md`'s "## Purpose"
@@ -653,7 +653,7 @@ bound dispatch, compounding with the batching work above) and is a
 reasonable next follow-up, but adding a new production row for it needs
 the same reviewed rigor as sections 1-6, which this pass did not attempt.
 
-**Verification.** `zig build inference-test -Doptimize=ReleaseFast --
+**Verification.** `zig build inference-test -Doptimize=fast --
 --test-filter "gliner boundary"` (native + Metal; `156` selected, `134`
 passed, `22` skipped -- unrelated `small`-backbone tests gated on an unset
 env var --, `0` failed) after every change in this section, including the
@@ -791,7 +791,7 @@ not reproduce and needs an embedded-worker repro with `sample`/`lldb`) both
 live in `zig/pkg/antfly/**`, outside this file's ownership -- documented in
 `gliner25-retry-and-spin-handoff.md` (scratchpad).
 
-**Verification.** `zig build inference-test -Doptimize=ReleaseFast --
+**Verification.** `zig build inference-test -Doptimize=fast --
 --test-filter "gliner boundary"` (native + Metal; `160` selected, `138`
 passed, `22` skipped, `0` failed) and `--test-filter "extraction"` (`100`
 selected, `99` passed, `1` skipped, `0` failed) after every change in this
@@ -799,7 +799,7 @@ section. A live `antfly inference run --port 8098` server (same budget
 flags as section 9) served the real 99,631-byte corpus-maximum request
 (`zig/PDF.md`'s "Review findings and required fixes") end to end: HTTP 200,
 279 entities and 13 relations, ~6-7s, both before and after a full
-`zig build -Doptimize=ReleaseFast` rebuild with every change in this
+`zig build -Doptimize=fast` rebuild with every change in this
 section applied.
 
 ### 12. Follow-up: fp16-encoder qualification attempt -- real-pipeline parity measured, does not yet clear the bar
@@ -969,7 +969,7 @@ functional. There is currently no way to select this precision through the
 extractor producer config that actually executes, because it is not
 qualified -- this is intentional, not a missing feature.
 
-**Verification.** `zig build inference-test -Doptimize=ReleaseFast --
+**Verification.** `zig build inference-test -Doptimize=fast --
 --test-filter "gliner boundary"` with `ANTFLY_GLINER25_BASE_MODEL_DIR` and
 `ANTFLY_GLINER25_BASE_FP16_MODEL_DIR` both set: first run 162 selected, 139
 passed, 22 skipped, 1 failed (`ResourceTemporarilyUnavailable` from Metal
@@ -1095,7 +1095,7 @@ the boundary.
 **Verification.** `antfly inference run --port 8098` was stopped after the
 HTTP measurement (`pkill`). The provider-path test:
 `ANTFLY_GLINER25_THROUGHPUT_CORPUS=<path> zig build inference-test
--Doptimize=ReleaseFast -- --test-filter "provider extractDirect throughput
+-Doptimize=fast -- --test-filter "provider extractDirect throughput
 on a real corpus"` -- 1 selected, 1 passed, 0 skipped, 0 failed. Log paths
 (scratchpad): `http_throughput.py`, `http-throughput-out.log`,
 `http-throughput-err.log`, `make_sections.py`, `bench40.json`,
@@ -1370,7 +1370,7 @@ of which code path this harness exercises, not a property of fp16 itself --
 see the long-document follow-up below, which measures the real corpus-shaped
 workload through the actual production entry point and finds the opposite.
 
-**Verification.** `zig build inference-test -Doptimize=ReleaseFast --
+**Verification.** `zig build inference-test -Doptimize=fast --
 --test-filter "gliner boundary" --test-filter "registry" --test-filter
 "manifest" --test-filter "capabilities"` with both
 `ANTFLY_GLINER25_BASE_MODEL_DIR` and `ANTFLY_GLINER25_BASE_FP16_MODEL_DIR`
@@ -1466,7 +1466,7 @@ backend where it costs nothing), not because it is faster.
    `scripts/gliner25/oracle_manifest.json` (extend that manifest first if it
    is a new revision or variant `oracle.py` does not yet know about).
 2. Set `ANTFLY_GLINER25_<VARIANT>_MODEL_DIR` to the pulled directory and run
-   `zig build inference-test -Doptimize=ReleaseFast -- --test-filter "gliner
+   `zig build inference-test -Doptimize=fast -- --test-filter "gliner
    boundary"`. Every previously-skipped pinned test for that variant must
    pass.
 3. Add or extend a geometry-measuring test like the one in

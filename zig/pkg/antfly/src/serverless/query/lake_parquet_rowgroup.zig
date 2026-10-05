@@ -147,7 +147,7 @@ pub const ObjectRangeReader = struct {
     }
 };
 
-const object_range_cache_lane_count = std.meta.fields(range_io.CacheLane).len;
+const object_range_cache_lane_count = @typeInfo(range_io.CacheLane).@"enum".field_names.len;
 
 pub const ObjectRangeCacheLaneStats = struct {
     hits: usize = 0,
@@ -163,17 +163,17 @@ pub const ObjectRangeCacheStats = struct {
     stored_bytes: usize = 0,
     evicted_bytes: usize = 0,
     rejected_bytes: usize = 0,
-    lanes: [object_range_cache_lane_count]ObjectRangeCacheLaneStats = [_]ObjectRangeCacheLaneStats{.{}} ** object_range_cache_lane_count,
+    lanes: [object_range_cache_lane_count]ObjectRangeCacheLaneStats = @as([object_range_cache_lane_count]ObjectRangeCacheLaneStats, @splat(.{})),
 
     pub fn lane(self: ObjectRangeCacheStats, cache_lane: range_io.CacheLane) ObjectRangeCacheLaneStats {
-        return self.lanes[@intFromEnum(cache_lane)];
+        return self.lanes[@backingInt(cache_lane)];
     }
 };
 
 pub const ObjectRangeCachePolicy = struct {
     max_total_bytes: ?usize = null,
-    max_bytes_by_lane: [object_range_cache_lane_count]?usize = [_]?usize{null} ** object_range_cache_lane_count,
-    protected_lanes: [object_range_cache_lane_count]bool = [_]bool{false} ** object_range_cache_lane_count,
+    max_bytes_by_lane: [object_range_cache_lane_count]?usize = @as([object_range_cache_lane_count]?usize, @splat(null)),
+    protected_lanes: [object_range_cache_lane_count]bool = @as([object_range_cache_lane_count]bool, @splat(false)),
     max_fetch_bytes: usize = range_io.max_physical_range_read_bytes,
 
     pub fn lakeServingDefaults(max_total_bytes: usize) ObjectRangeCachePolicy {
@@ -187,12 +187,12 @@ pub const ObjectRangeCachePolicy = struct {
 
     pub fn withLaneLimit(cache_lane: range_io.CacheLane, max_bytes: usize) ObjectRangeCachePolicy {
         var policy = ObjectRangeCachePolicy{};
-        policy.max_bytes_by_lane[@intFromEnum(cache_lane)] = max_bytes;
+        policy.max_bytes_by_lane[@backingInt(cache_lane)] = max_bytes;
         return policy;
     }
 
     pub fn setLaneLimit(self: *ObjectRangeCachePolicy, cache_lane: range_io.CacheLane, max_bytes: usize) void {
-        self.max_bytes_by_lane[@intFromEnum(cache_lane)] = max_bytes;
+        self.max_bytes_by_lane[@backingInt(cache_lane)] = max_bytes;
     }
 
     pub fn setTotalLimit(self: *ObjectRangeCachePolicy, max_bytes: usize) void {
@@ -204,15 +204,15 @@ pub const ObjectRangeCachePolicy = struct {
     }
 
     pub fn protectLane(self: *ObjectRangeCachePolicy, cache_lane: range_io.CacheLane) void {
-        self.protected_lanes[@intFromEnum(cache_lane)] = true;
+        self.protected_lanes[@backingInt(cache_lane)] = true;
     }
 
     pub fn laneLimit(self: ObjectRangeCachePolicy, cache_lane: range_io.CacheLane) ?usize {
-        return self.max_bytes_by_lane[@intFromEnum(cache_lane)];
+        return self.max_bytes_by_lane[@backingInt(cache_lane)];
     }
 
     pub fn isProtected(self: ObjectRangeCachePolicy, cache_lane: range_io.CacheLane) bool {
-        return self.protected_lanes[@intFromEnum(cache_lane)];
+        return self.protected_lanes[@backingInt(cache_lane)];
     }
 };
 
@@ -1106,9 +1106,9 @@ pub const ObjectRangeCache = struct {
             alloc.free(key);
             alloc.free(value.bytes);
             decrementSaturating(&self.stats.stored_bytes, byte_len);
-            decrementSaturating(&self.stats.lanes[@intFromEnum(cache_lane)].stored_bytes, byte_len);
+            decrementSaturating(&self.stats.lanes[@backingInt(cache_lane)].stored_bytes, byte_len);
             self.stats.evicted_bytes += byte_len;
-            self.stats.lanes[@intFromEnum(cache_lane)].evicted_bytes += byte_len;
+            self.stats.lanes[@backingInt(cache_lane)].evicted_bytes += byte_len;
             return true;
         }
         return false;
@@ -1146,9 +1146,9 @@ pub const ObjectRangeCache = struct {
         alloc.free(key);
         alloc.free(value.bytes);
         decrementSaturating(&self.stats.stored_bytes, byte_len);
-        decrementSaturating(&self.stats.lanes[@intFromEnum(cache_lane)].stored_bytes, byte_len);
+        decrementSaturating(&self.stats.lanes[@backingInt(cache_lane)].stored_bytes, byte_len);
         self.stats.evicted_bytes += byte_len;
-        self.stats.lanes[@intFromEnum(cache_lane)].evicted_bytes += byte_len;
+        self.stats.lanes[@backingInt(cache_lane)].evicted_bytes += byte_len;
         return true;
     }
 
@@ -1174,7 +1174,7 @@ pub const ObjectRangeCache = struct {
                 return error.InvalidLakeRangeRead;
             }
             self.stats.hits += 1;
-            self.stats.lanes[@intFromEnum(cache_lane)].hits += 1;
+            self.stats.lanes[@backingInt(cache_lane)].hits += 1;
             return try alloc.dupe(u8, cached.bytes);
         }
 
@@ -1182,14 +1182,14 @@ pub const ObjectRangeCache = struct {
             if (try persistent.readAlloc(alloc, cache_key, read_len)) |bytes| {
                 errdefer alloc.free(bytes);
                 self.stats.hits += 1;
-                self.stats.lanes[@intFromEnum(cache_lane)].hits += 1;
+                self.stats.lanes[@backingInt(cache_lane)].hits += 1;
                 try self.storeFetchedBytes(alloc, cache_key, cache_lane, bytes, false);
                 return bytes;
             }
         }
 
         self.stats.misses += 1;
-        self.stats.lanes[@intFromEnum(cache_lane)].misses += 1;
+        self.stats.lanes[@backingInt(cache_lane)].misses += 1;
         const bytes = try readObjectRangeAlloc(alloc, reader, read);
         errdefer alloc.free(bytes);
         try self.storeFetchedBytes(alloc, cache_key, cache_lane, bytes, true);
@@ -1211,7 +1211,7 @@ pub const ObjectRangeCache = struct {
         self.ensureTotalCapacity(alloc, cache_lane, bytes.len);
         if (!self.admitsLaneBytes(cache_lane, bytes.len) or !self.admitsTotalBytes(bytes.len)) {
             self.stats.rejected_bytes += bytes.len;
-            self.stats.lanes[@intFromEnum(cache_lane)].rejected_bytes += bytes.len;
+            self.stats.lanes[@backingInt(cache_lane)].rejected_bytes += bytes.len;
             return;
         }
         const stored = try alloc.dupe(u8, bytes);
@@ -1224,7 +1224,7 @@ pub const ObjectRangeCache = struct {
         errdefer alloc.free(owned_key);
         try self.entries.put(alloc, owned_key, entry);
         self.stats.stored_bytes += stored.len;
-        self.stats.lanes[@intFromEnum(cache_lane)].stored_bytes += stored.len;
+        self.stats.lanes[@backingInt(cache_lane)].stored_bytes += stored.len;
     }
 };
 
@@ -1539,7 +1539,7 @@ const DecodedColumn = union(enum) {
     dictionary_bytes: rowsource.DictionaryBytes,
     borrowed_dictionary_bytes: rowsource.DictionaryBytes,
 
-    fn deinit(self: *DecodedColumn, alloc: Allocator) void {
+    pub fn deinit(self: *DecodedColumn, alloc: Allocator) void {
         switch (self.*) {
             .i64 => |values| alloc.free(values),
             .f64 => |values| alloc.free(values),
@@ -3364,9 +3364,9 @@ fn appendField(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, previous: *i1
 }) !void {
     const delta = id - previous.*;
     if (delta > 0 and delta <= 15) {
-        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @as(u8, @intFromEnum(field_type)));
+        try out.append(alloc, (@as(u8, @intCast(delta)) << 4) | @as(u8, @backingInt(field_type)));
     } else {
-        try out.append(alloc, @intFromEnum(field_type));
+        try out.append(alloc, @backingInt(field_type));
         try appendI16(out, alloc, id);
     }
     previous.* = id;
@@ -3390,7 +3390,7 @@ fn appendI64(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: i64) !vo
 
 fn appendZigzag(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, value: anytype) !void {
     const Int = @TypeOf(value);
-    const Unsigned = std.meta.Int(.unsigned, @bitSizeOf(Int));
+    const Unsigned = @Int(.unsigned, @bitSizeOf(Int));
     const encoded: Unsigned = @bitCast((value << 1) ^ (value >> (@bitSizeOf(Int) - 1)));
     try appendVarint(out, alloc, encoded);
 }
@@ -3420,9 +3420,9 @@ fn appendListHeader(out: *std.ArrayListUnmanaged(u8), alloc: Allocator, elem_typ
     struct_ = 12,
 }, len: usize) !void {
     if (len < 15) {
-        try out.append(alloc, (@as(u8, @intCast(len)) << 4) | @as(u8, @intFromEnum(elem_type)));
+        try out.append(alloc, (@as(u8, @intCast(len)) << 4) | @as(u8, @backingInt(elem_type)));
     } else {
-        try out.append(alloc, 0xf0 | @as(u8, @intFromEnum(elem_type)));
+        try out.append(alloc, 0xf0 | @as(u8, @backingInt(elem_type)));
         try appendVarint(out, alloc, len);
     }
 }

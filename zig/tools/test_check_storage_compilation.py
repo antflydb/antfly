@@ -170,10 +170,10 @@ class BuildFailureEvidence(unittest.TestCase):
                     if label in {"cold", "storage contract cold"} or name in rebuilt
                     else "cached"
                 )
-                output.append(f"compile {kind} {name} Debug native {status}")
+                output.append(f"compile {kind} {name} debug native {status}")
             if label in {"physical DB", "physical local query"}:
                 output.extend(
-                    f"compile exe {name} Debug native success"
+                    f"compile exe {name} debug native success"
                     for name in measurement.CONSUMERS
                 )
             seen.append(label)
@@ -274,7 +274,7 @@ pub fn create(b: *std.Build) ?void {
     }) |name| {
         if (omit == null or !std.mem.eql(u8, omit.?, name)) {
             const exe = b.addExecutable(.{ .name = name, .root_module = b.createModule(.{
-                .root_source_file = root, .target = target, .optimize = .Debug,
+                .root_source_file = root, .target = target, .optimize = .debug,
             }) });
             b.step(name, name).dependOn(&exe.step);
         }
@@ -284,7 +284,7 @@ pub fn create(b: *std.Build) ?void {
         .name = "storage-owner-handoff-reopen-tests",
         .root_module = b.createModule(.{
             .root_source_file = files.add("unrelated.zig", "comptime { @compileError(\"unrelated owner fixture compiled\"); }"),
-            .target = target, .optimize = .Debug,
+            .target = target, .optimize = .debug,
         }),
     });
     b.step("unrelated", "unrelated").dependOn(&unrelated.step);

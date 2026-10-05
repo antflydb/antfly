@@ -120,7 +120,7 @@ pub const DecisionHead = enum { scorer, pointer };
 pub const Format = enum { laya, opendecider };
 
 pub const Config = struct {
-    mask_token: [128]u8 = "[MASK]".* ++ ([_]u8{0} ** 122),
+    mask_token: [128]u8 = "[MASK]".* ++ (@as([122]u8, @splat(0))),
     mask_token_len: usize = 6,
     head_layers: usize = 2,
     max_len: usize = 512,
@@ -153,7 +153,7 @@ pub const Config = struct {
 
     pub fn scale(self: Config, kind: QuestionType, count: usize) f32 {
         const bucket: usize = if (count <= 2) 0 else if (count <= 5) 1 else if (count <= 10) 2 else 3;
-        return @max(0.001, self.buckets[@intFromEnum(kind)][bucket] orelse self.temperature[@intFromEnum(kind)]);
+        return @max(0.001, self.buckets[@backingInt(kind)][bucket] orelse self.temperature[@backingInt(kind)]);
     }
 
     pub fn maxOptions(self: Config) usize {

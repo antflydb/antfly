@@ -80,7 +80,7 @@ const Dataset = struct {
     doc_json_bytes: usize,
     derived_json_bytes: usize,
 
-    fn deinit(self: *Dataset, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Dataset, alloc: std.mem.Allocator) void {
         for (self.hits) |hit| {
             alloc.free(hit.id);
             if (hit.stored_data) |stored| alloc.free(stored);
@@ -120,7 +120,7 @@ const SidecarStats = struct {
     value_bytes: usize = 0,
     kinds: []SidecarKindStats = &.{},
 
-    fn deinit(self: *SidecarStats, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *SidecarStats, alloc: std.mem.Allocator) void {
         for (self.kinds) |kind| alloc.free(kind.kind);
         if (self.kinds.len > 0) alloc.free(self.kinds);
         self.* = undefined;

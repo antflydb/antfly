@@ -282,7 +282,7 @@ fn counterDelta(before: u64, after: u64) u64 {
 test "quant kernel compiler metal generated quant stats total covers every generated provider counter" {
     var provider = ops.NativeQuantTimingStats{};
     for (quant_matmul.generated_quant_counter_names) |counter| {
-        provider.metal_runtime_antfly_generated_dispatch_counts[@intFromEnum(counter.format)][@intFromEnum(counter.epilogue)] = 1;
+        provider.metal_runtime_antfly_generated_dispatch_counts[@backingInt(counter.format)][@backingInt(counter.epilogue)] = 1;
     }
     provider.metal_runtime_jit_exact_q4_0_hits = 7;
     provider.metal_runtime_jit_exact_q4_k_hits = 9;

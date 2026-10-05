@@ -106,7 +106,7 @@ const TermsBucketAccum = struct {
     count: i64,
     child_folds: []AlgebraicMetricFold,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.key);
         for (self.child_folds) |*fold| fold.deinit(alloc);
         if (self.child_folds.len > 0) alloc.free(self.child_folds);
@@ -118,7 +118,7 @@ const CompositeTermsCandidate = struct {
     key_json: []u8,
     bucket: *TermsBucketAccum,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.key_json);
         self.* = undefined;
     }
@@ -128,7 +128,7 @@ const TermsCardinalityBucketAccum = struct {
     key: []u8,
     count: i64,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.key);
         self.* = undefined;
     }
@@ -139,7 +139,7 @@ const DateBucketAccum = struct {
     count: i64,
     child_folds: []AlgebraicMetricFold,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.bucket_start);
         for (self.child_folds) |*fold| fold.deinit(alloc);
         if (self.child_folds.len > 0) alloc.free(self.child_folds);
@@ -152,7 +152,7 @@ const HistogramBucketAccum = struct {
     count: i64,
     child_folds: []AlgebraicMetricFold,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.child_folds) |*fold| fold.deinit(alloc);
         if (self.child_folds.len > 0) alloc.free(self.child_folds);
         self.* = undefined;
@@ -1125,7 +1125,7 @@ fn algebraicStatsValueJsonAlloc(
 const AlgebraicMetricRead = struct {
     raw: ?[]u8 = null,
 
-    fn deinit(self: *AlgebraicMetricRead, alloc: Allocator) void {
+    pub fn deinit(self: *AlgebraicMetricRead, alloc: Allocator) void {
         if (self.raw) |bytes| alloc.free(bytes);
         self.* = undefined;
     }
@@ -1577,7 +1577,7 @@ const AlgebraicMetricFold = struct {
         return .{ .op = op };
     }
 
-    fn deinit(self: *AlgebraicMetricFold, alloc: Allocator) void {
+    pub fn deinit(self: *AlgebraicMetricFold, alloc: Allocator) void {
         if (self.raw_value) |bytes| alloc.free(bytes);
         self.* = undefined;
     }
@@ -3372,7 +3372,7 @@ const OwnedPathFactTermsAxis = struct {
     kind: algebraic_mod.pathfact.Kind,
     value: []u8,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.value);
         self.* = undefined;
     }
@@ -4715,7 +4715,7 @@ const HistogramCardinalityBucketAccum = struct {
     axis: []u8,
     count: i64 = 0,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.axis);
         self.* = undefined;
     }
@@ -4808,7 +4808,7 @@ const AdaptiveTermsParentCandidate = struct {
     group_key: []u8,
     count: i64,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.bucket_key);
         alloc.free(self.group_key);
         self.* = undefined;
@@ -4818,7 +4818,7 @@ const AdaptiveTermsParentCandidate = struct {
 const AdaptiveTermsParentCandidates = struct {
     items: []AdaptiveTermsParentCandidate,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         for (self.items) |*item| item.deinit(alloc);
         if (self.items.len > 0) alloc.free(self.items);
         self.* = undefined;
@@ -5198,7 +5198,7 @@ const AdaptiveChildMetricPlans = struct {
     recommendations: [][]u8,
     ops: []algebraic_mod.algebra.Op,
 
-    fn deinit(self: AdaptiveChildMetricPlans, alloc: Allocator, index_alloc: Allocator) void {
+    pub fn deinit(self: AdaptiveChildMetricPlans, alloc: Allocator, index_alloc: Allocator) void {
         for (self.materialization_ids) |materialization_id| index_alloc.free(materialization_id);
         for (self.recommendations) |recommendation| alloc.free(recommendation);
         if (self.materialization_ids.len > 0) alloc.free(self.materialization_ids);
@@ -5318,7 +5318,7 @@ const AdaptiveChildEntrySets = struct {
     entries: [][]algebraic_mod.index.FoldEntry,
     maps: []std.StringHashMapUnmanaged([]const u8),
 
-    fn deinit(self: AdaptiveChildEntrySets, alloc: Allocator, index_alloc: Allocator) void {
+    pub fn deinit(self: AdaptiveChildEntrySets, alloc: Allocator, index_alloc: Allocator) void {
         for (self.maps) |*map| map.deinit(alloc);
         if (self.maps.len > 0) alloc.free(self.maps);
         for (self.entries) |entries| {
@@ -6966,7 +6966,7 @@ fn computeTermsAggregation(
 const CompositeTermComponents = struct {
     items: [][]u8,
 
-    fn deinit(self: *CompositeTermComponents, alloc: Allocator) void {
+    pub fn deinit(self: *CompositeTermComponents, alloc: Allocator) void {
         for (self.items) |item| alloc.free(item);
         if (self.items.len > 0) alloc.free(self.items);
         self.* = undefined;
@@ -7841,7 +7841,7 @@ const SplitAggregationRequests = struct {
     primary: []SearchAggregationRequest,
     pipeline: []SearchAggregationRequest,
 
-    fn deinit(self: SplitAggregationRequests, alloc: Allocator) void {
+    pub fn deinit(self: SplitAggregationRequests, alloc: Allocator) void {
         if (self.primary.len > 0) alloc.free(self.primary);
         if (self.pipeline.len > 0) alloc.free(self.pipeline);
     }
@@ -8565,7 +8565,7 @@ test "significant_terms local background stats use postings without stored index
     defer alloc.free(cwd);
     const path = try std.fs.path.resolve(alloc, &.{ cwd, relative_path });
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
 
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
@@ -8636,7 +8636,7 @@ test "significant_terms uses the configured field analyzer for foreground and ba
 
     const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/configured-analyzer", .{tmp.sub_path});
     defer alloc.free(path);
-    const path_z = try alloc.dupeZ(u8, path);
+    const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
     var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
     defer store.close();

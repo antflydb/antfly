@@ -421,7 +421,7 @@ test "ordered artifact inventory authored retirement resumes past live prefixes 
     defer tmp.cleanup();
     var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
     const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-    const path = try alloc.dupeZ(u8, path_buffer[0..path_len]);
+    const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
     defer alloc.free(path);
     var store = try docstore.DocStore.open(alloc, path, .{});
     defer store.close();
@@ -573,7 +573,7 @@ test "ordered artifact inventory authored retirement cache binds owner clock epo
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-        const path = try alloc.dupeZ(u8, path_buffer[0..path_len]);
+        const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
         defer alloc.free(path);
         var store = try docstore.DocStore.open(alloc, path, .{});
         defer store.close();
@@ -646,7 +646,7 @@ test "ordered artifact inventory authored acceptance requires exact physical wri
         defer tmp.cleanup();
         var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
         const path_len = try tmp.dir.realPath(std.testing.io, &path_buffer);
-        const path = try alloc.dupeZ(u8, path_buffer[0..path_len]);
+        const path = try alloc.dupeSentinel(u8, path_buffer[0..path_len], 0);
         defer alloc.free(path);
         var store = try docstore.DocStore.open(alloc, path, .{});
         defer store.close();

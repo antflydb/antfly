@@ -22,7 +22,7 @@ pub const RegexAutomaton = automaton.RegexAutomaton;
 pub const compile = automaton.compile;
 
 const CharClass = struct {
-    bytes: [256]bool = [_]bool{false} ** 256,
+    bytes: [256]bool = @as([256]bool, @splat(false)),
     negated: bool = false,
 
     fn matches(self: *const CharClass, b: u8) bool {
@@ -762,7 +762,7 @@ test "prepared program matches reference semantics across anchors empty branches
 }
 
 test "prepared program scratch is independent of haystack length" {
-    const text = [_]u8{'a'} ** (64 * 1024);
+    const text = @as([(64 * 1024)]u8, @splat('a'));
     inline for (.{ "^[a-z]+$", "a*a*a*b" }) |pattern| {
         var prepared = try PreparedPattern.init(std.testing.allocator, pattern);
         defer prepared.deinit();
@@ -776,7 +776,7 @@ test "prepared program bounds compilation and cleans up allocation failures" {
     try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, "a{4097}"));
     try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, "(a{64}){64}"));
     try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, "((){4096}){4096}"));
-    try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, "(" ** 129 ++ "a" ++ ")" ** 129));
+    try std.testing.expectError(error.InvalidRegex, PreparedPattern.init(std.testing.allocator, z17RepeatString("(", 129) ++ "a" ++ z17RepeatString(")", 129)));
     const Check = struct {
         fn run(alloc: Allocator) !void {
             var prepared = try PreparedPattern.init(alloc, "^(ab|cd){2,4}$");
@@ -904,4 +904,15 @@ test "compiled regex substring helper handles dense shared-start prefixes" {
     try std.testing.expect(matchesCompiled("car|cat|cap|can", &regex, "xxcapzz"));
     try std.testing.expect(matchesCompiled("car|cat|cap|can", &regex, "xxcanzz"));
     try std.testing.expect(!matchesCompiled("car|cat|cap|can", &regex, "xxcazzz"));
+}
+
+fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *const [bytes.len * repetitions:0]u8 {
+    const result = comptime blk: {
+        @setEvalBranchQuota(@intCast(@min(std.math.maxInt(u32), 100000 +| (repetitions *| 16))));
+        var repeated: [bytes.len * repetitions:0]u8 = undefined;
+        for (0..repetitions) |i| @memcpy(repeated[i * bytes.len ..][0..bytes.len], bytes);
+        repeated[bytes.len * repetitions] = 0;
+        break :blk repeated;
+    };
+    return &result;
 }

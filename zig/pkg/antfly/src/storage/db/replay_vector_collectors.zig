@@ -203,8 +203,9 @@ pub fn collectSparseFieldWritesProfiled(
     var lookup_keys = lookup_key_scratch.Scratch.init(alloc, documents.len);
     defer lookup_keys.deinit();
     // Temporary descriptors cannot escape the synchronous read/apply below.
-    var descriptor_buffer = std.heap.stackFallback(4096, alloc);
-    const descriptor_alloc = descriptor_buffer.get();
+    var descriptor_buffer_storage: [4096]u8 align(@alignOf(std.c.max_align_t)) = undefined;
+    var descriptor_buffer: std.heap.BufferFirstAllocator = .init(&descriptor_buffer_storage, alloc);
+    const descriptor_alloc = descriptor_buffer.allocator();
     var pending = std.ArrayListUnmanaged(PendingDocumentWrite).empty;
     defer {
         pending.deinit(descriptor_alloc);

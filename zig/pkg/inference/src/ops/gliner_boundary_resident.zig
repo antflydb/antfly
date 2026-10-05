@@ -547,7 +547,7 @@ fn WorkspaceWithDevice(comptime Device: type) type {
                 !std.meta.eql(permit.amounts, amounts))
                 return error.InvalidGlinerBoundaryWorkspaceAdmission;
             for (permit.amounts_by_backend, 0..) |backend_amounts, index| {
-                const expected: memory.AdmissionAmounts = if (index == @intFromEnum(memory.BackendClass.gpu)) amounts else .{};
+                const expected: memory.AdmissionAmounts = if (index == @backingInt(memory.BackendClass.gpu)) amounts else .{};
                 if (!std.meta.eql(backend_amounts, expected)) return error.InvalidGlinerBoundaryWorkspaceAdmission;
             }
             const dims = [_]i32{@intCast(capacity_bytes / 4)};

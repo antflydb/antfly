@@ -231,7 +231,7 @@ fn strictTypes(comptime T: type, value: std.json.Value) !void {
         .optional => |info| if (value != .null) try strictTypes(info.child, value),
         .@"struct" => |info| {
             if (value != .object) return error.InvalidTrainedExecutionFixture;
-            inline for (info.fields) |field| try strictTypes(field.type, value.object.get(field.name) orelse return error.InvalidTrainedExecutionFixture);
+            inline for (info.field_names, info.field_types) |reflected_name, field_type| try strictTypes(field_type, value.object.get(reflected_name) orelse return error.InvalidTrainedExecutionFixture);
         },
         .array => |info| {
             if (info.child == u8 and value == .string) return;
@@ -366,7 +366,7 @@ fn verifyTree(io: std.Io, directory: []const u8, control: ?Control) !void {
     const root = try std.Io.Dir.cwd().openDir(io, directory, .{ .iterate = true, .follow_symlinks = false });
     defer root.close(io);
     const names = [_][]const u8{ "model.safetensors", "config.json", "tokenizer.json", "tokenizer_config.json", receipt_name, "encoder_config" };
-    var seen = [_]bool{false} ** names.len;
+    var seen = @as([names.len]bool, @splat(false));
     var iterator = root.iterate();
     while (try iterator.next(io)) |entry| {
         if (control) |active| try active.check();
@@ -429,7 +429,7 @@ fn testInputs(a: Allocator) ![]u8 {
     return files.read(a, std.testing.io, .cwd(), "testdata/gliner25/trained_execution_inputs_v1.json", @intCast(input_pin.size_bytes), null);
 }
 fn testReceipt(weight: bundle.Digest, sidecars: [4]bundle.Digest) Receipt {
-    return .{ .family = "gliner_boundary_merge/v1", .version = 1, .architecture_version = 1, .config_version = 3, .tensor_policy_version = 1, .math_policy = "f32_lora_delta_f64_dora_row_norm_v1", .source = .{ .backbone = .small, .precision = .fp32, .weight = bundle.Digest.of("source weights"), .sidecars = sidecars }, .provenance = .{ .configuration = bundle.Digest.of("job bytes"), .schema_sha256 = [_]u8{5} ** 32, .adapter_files = .{ .config = bundle.Digest.of("adapter config"), .weights = bundle.Digest.of("adapter weights"), .receipt = bundle.Digest.of("adapter receipt") } }, .target_sha256 = [_]u8{6} ** 32, .parameter_sha256 = [_]u8{7} ** 32, .merged = .{ .backbone = .small, .precision = .fp32, .weight = weight, .sidecars = sidecars }, .tensor_count = 334, .merged_tensor_count = 131 };
+    return .{ .family = "gliner_boundary_merge/v1", .version = 1, .architecture_version = 1, .config_version = 3, .tensor_policy_version = 1, .math_policy = "f32_lora_delta_f64_dora_row_norm_v1", .source = .{ .backbone = .small, .precision = .fp32, .weight = bundle.Digest.of("source weights"), .sidecars = sidecars }, .provenance = .{ .configuration = bundle.Digest.of("job bytes"), .schema_sha256 = @as([32]u8, @splat(5)), .adapter_files = .{ .config = bundle.Digest.of("adapter config"), .weights = bundle.Digest.of("adapter weights"), .receipt = bundle.Digest.of("adapter receipt") } }, .target_sha256 = @as([32]u8, @splat(6)), .parameter_sha256 = @as([32]u8, @splat(7)), .merged = .{ .backbone = .small, .precision = .fp32, .weight = weight, .sidecars = sidecars }, .tensor_count = 334, .merged_tensor_count = 131 };
 }
 fn testEnvelope(receipt: Receipt, raw: []const u8) Envelope {
     return .{ .version = 1, .scope = scope, .qualification = false, .backend = .native, .inputs = input_pin, .oracle_report = bundle.Digest.of("completed independently verified Python report"), .merge_receipt = bundle.Digest.of(raw), .merge = receipt, .limits = default_limits };
@@ -507,7 +507,7 @@ test "trained execution rejects changed source receipt inputs malformed and trun
 }
 
 test "trained execution admission distinguishes borrowed CPU and owned Metal weight copies" {
-    const receipt = testReceipt(.{ .size_bytes = 295567748, .sha256 = [_]u8{'0'} ** 64 }, testSidecarPins());
+    const receipt = testReceipt(.{ .size_bytes = 295567748, .sha256 = @as([64]u8, @splat('0')) }, testSidecarPins());
     var envelope = testEnvelope(receipt, "receipt");
     const cpu = try admission(envelope);
     try std.testing.expectEqual(@as(usize, 0), cpu.request_weight_copy_bytes);
@@ -524,9 +524,9 @@ test "trained execution admission distinguishes borrowed CPU and owned Metal wei
     envelope.limits.request_scratch_bytes = std.math.maxInt(usize);
     try std.testing.expectError(error.InvalidTrainedExecutionLimits, admission(envelope));
     try std.testing.expectError(error.TrainedExecutionLimitExceeded, add(std.math.maxInt(usize), 1));
-    inline for (std.meta.fields(Limits)) |field| {
+    inline for (comptime std.meta.fieldNames(Limits)) |reflected_name| {
         var changed = default_limits;
-        @field(changed, field.name) = 0;
+        @field(changed, reflected_name) = 0;
         try std.testing.expectError(error.InvalidTrainedExecutionLimits, changed.validate());
     }
 }

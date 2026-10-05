@@ -108,15 +108,15 @@ test "generated cross-package reference (NonQuantizedVectorSet)" {
     try testing.expectEqualSlices(f32, float_buf[0..], decoded.vectors.data);
 }
 
-test "generated enum default matches @enumFromInt(0)" {
+test "generated enum default matches @fromBackingInt(0)" {
     const vector = generated.antfly_lib_vector;
 
     // RotAlgorithm.None == 0
-    const none: vector.RotAlgorithm = @enumFromInt(0);
+    const none: vector.RotAlgorithm = @fromBackingInt(0);
     try testing.expectEqual(vector.RotAlgorithm.None, none);
 
     // DistanceMetric.L2Squared == 0
-    const l2: vector.DistanceMetric = @enumFromInt(0);
+    const l2: vector.DistanceMetric = @fromBackingInt(0);
     try testing.expectEqual(vector.DistanceMetric.L2Squared, l2);
 }
 

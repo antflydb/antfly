@@ -82,10 +82,11 @@ pub fn loadExamples(allocator: std.mem.Allocator, path: []const u8, split: ?[]co
     }
     if (examples.items.len == 0) return error.NoExamples;
 
+    const owned_result_examples = try examples.toOwnedSlice(arena_alloc);
     return .{
         .arena = arena,
         .dataset_root = dataset_root,
-        .examples = try examples.toOwnedSlice(arena_alloc),
+        .examples = owned_result_examples,
     };
 }
 
@@ -96,7 +97,7 @@ fn loadExamplesFromFile(
     out: *std.ArrayListUnmanaged(Example),
 ) !void {
     const source_root = try deriveDatasetRoot(allocator, path);
-    const file_data = try compat.cwd().readFileAlloc(compat.io(), path, allocator, .limited(64 * 1024 * 1024));
+    const file_data = try std.Io.Dir.cwd().readFileAlloc(compat.testingIo(), path, allocator, .limited(64 * 1024 * 1024));
     var lines = std.mem.tokenizeScalar(u8, file_data, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
@@ -374,7 +375,7 @@ fn optionalString(value: ?std.json.Value) ?[]const u8 {
 }
 
 fn deriveDatasetRoot(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
-    const stat = try compat.cwd().statFile(compat.io(), path, .{});
+    const stat = try std.Io.Dir.cwd().statFile(compat.testingIo(), path, .{});
     if (stat.kind == .directory) return allocator.dupe(u8, path);
     const dir = std.fs.path.dirname(path) orelse ".";
     return allocator.dupe(u8, dir);
@@ -484,6 +485,6 @@ fn tmpPathAlloc(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir, sub_path
     const relative = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], sub_path });
     defer allocator.free(relative);
     var buffer: [std.fs.max_path_bytes]u8 = undefined;
-    const len = try compat.cwd().realPathFile(compat.io(), relative, &buffer);
+    const len = try std.Io.Dir.cwd().realPathFile(compat.testingIo(), relative, &buffer);
     return allocator.dupe(u8, buffer[0..len]);
 }

@@ -78,11 +78,11 @@ const sparse_mod = if (builtin.os.tag == .freestanding)
 else
     @import("../../sparse/sparse.zig");
 const std = @import("std");
-const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_stub.zig")
 else
     @import("../../template.zig");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_remote_stub.zig")
 else
     @import("../../template_remote.zig");
@@ -2873,11 +2873,11 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         continue;
                     }
                     if (existing_outcome) |previous| {
-                        const previous_index = @intFromEnum(previous);
+                        const previous_index = @backingInt(previous);
                         if (counter_counts[previous_index] == 0) return error.InvalidDerivedCoverageCounter;
                         counter_counts[previous_index] -= 1;
                     }
-                    counter_counts[@intFromEnum(target)] +|= 1;
+                    counter_counts[@backingInt(target)] +|= 1;
                     try owned_keys.append(alloc, marker_key);
                     try writes.append(alloc, .{ .key = marker_key, .value = @tagName(target) });
                     changed = true;
@@ -7053,7 +7053,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer unique_deletes.deinit(alloc);
 
             const outcomes = std.meta.tags(DerivedCoverageOutcome);
-            var removed_counts = [_]u64{0} ** outcomes.len;
+            var removed_counts = @as([outcomes.len]u64, @splat(0));
             for (doc_keys) |doc_key| {
                 const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, doc_key);
                 errdefer alloc.free(marker_key);
@@ -7068,7 +7068,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (existing) |value| {
                     defer alloc.free(value);
                     const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse return error.InvalidDerivedCoverageOutcome;
-                    removed_counts[@intFromEnum(outcome)] +|= 1;
+                    removed_counts[@backingInt(outcome)] +|= 1;
                 }
                 try deletes.append(alloc, marker_key);
                 errdefer _ = deletes.pop();
@@ -7083,7 +7083,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 return;
             }
 
-            var counter_keys: [outcomes.len]?[]u8 = .{null} ** outcomes.len;
+            var counter_keys: [outcomes.len]?[]u8 = @splat(null);
             defer for (counter_keys) |key| if (key) |value| alloc.free(value);
             var counter_values: [outcomes.len][8]u8 = undefined;
             var counter_writes: [outcomes.len]docstore_mod.KVPair = undefined;
@@ -11715,7 +11715,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
 
             var counter_counts: [tags.len]u64 = undefined;
             var counter_keys: [tags.len][]u8 = undefined;
-            var counter_missing = [_]bool{false} ** tags.len;
+            var counter_missing = @as([tags.len]bool, @splat(false));
             var initialized_counters: usize = 0;
             defer for (counter_keys[0..initialized_counters]) |key| alloc.free(key);
 
@@ -11767,7 +11767,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 for (outcomes) |transition| {
                     if (seen.contains(transition.doc_key)) continue;
                     try seen.put(alloc, transition.doc_key, {});
-                    const target_index = @intFromEnum(transition.outcome);
+                    const target_index = @backingInt(transition.outcome);
                     const marker_key = try internal_keys.derivedCoverageOutcomeKeyAlloc(alloc, index_name, generation, transition.doc_key);
                     owned_marker_keys.append(alloc, marker_key) catch |err| {
                         alloc.free(marker_key);
@@ -11783,7 +11783,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         null;
                     if (existing_outcome == null or existing_outcome.? != transition.outcome) {
                         if (existing_outcome) |previous| {
-                            const previous_index = @intFromEnum(previous);
+                            const previous_index = @backingInt(previous);
                             if (counter_counts[previous_index] == 0) return error.InvalidDerivedCoverageCounter;
                             counter_counts[previous_index] -= 1;
                         }

@@ -26,7 +26,7 @@ const Builder = struct {
     indexes: std.ArrayListUnmanaged([]u8) = .empty,
     adopted: bool = false,
 
-    fn deinit(self: *Builder) void {
+    pub fn deinit(self: *Builder) void {
         if (!self.adopted) {
             for (self.writes.items) |*write| write.deinit(self.alloc);
             for (self.indexes.items) |name| self.alloc.free(name);

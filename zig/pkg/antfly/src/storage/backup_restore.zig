@@ -69,7 +69,7 @@ const RestoreIoScope = struct {
         return .{ .alloc = alloc, .io_value = owned.io(), .owned = owned };
     }
 
-    fn deinit(self: *RestoreIoScope) void {
+    pub fn deinit(self: *RestoreIoScope) void {
         if (self.owned) |owned| {
             owned.deinit();
             self.alloc.destroy(owned);

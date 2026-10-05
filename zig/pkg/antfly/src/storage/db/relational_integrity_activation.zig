@@ -27,7 +27,7 @@ const Allocator = std.mem.Allocator;
 pub const key = @import("relational_integrity_activation_contract.zig").key;
 const header_len = @import("relational_integrity_activation_contract.zig").header_len;
 const max_cursor_bytes = @import("relational_integrity_activation_contract.zig").max_cursor_bytes;
-const full_range = [_]u8{0} ** 8;
+const full_range = @as([8]u8, @splat(0));
 
 const digest = @import("relational_integrity_activation_contract.zig").digest;
 

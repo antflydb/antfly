@@ -2,7 +2,7 @@
 
 Run these commands from `zig/`. Artifact targets build and install into `zig-out`; execute the installed binary to run a benchmark or tool. Build flags belong to `zig build`, and runtime arguments belong to the binary.
 
-Benchmarks that share Antfly or inference runtime modules honor `-Doptimize` throughout their imports, with Debug as the default. Use `zig build <target> -Doptimize=ReleaseFast` for timing runs. The DB and sort query matrix scripts select ReleaseFast explicitly. Isolated library benchmarks can retain their own profile; their imported modules use the same profile as the executable.
+Benchmarks that share Antfly or inference runtime modules honor `-Doptimize` throughout their imports, with Debug as the default. Use `zig build <target> -Doptimize=fast` for timing runs. The DB and sort query matrix scripts select ReleaseFast explicitly. Isolated library benchmarks can retain their own profile; their imported modules use the same profile as the executable.
 
 `inference-bench-training` and `inference-bench-paged-attention` run native CPU
 workloads. Their shared constructor honors optimization and system BLAS settings;
@@ -75,7 +75,7 @@ The commands below preserve the former workload defaults. Replace the arguments 
 
 ## DB lifecycle workloads
 
-Build once with `zig build antfly-storage-bench -Doptimize=ReleaseFast`, then run
+Build once with `zig build antfly-storage-bench -Doptimize=fast`, then run
 `batch_bench`, `open_bench`, `replay_bench`, or `artifact_rebuild_bench`. These commands keep
 their previous flags, defaults, and output record names. Batch and replay now use
 the production storage dependencies; generated workloads still explicitly supply
@@ -102,7 +102,7 @@ background warmup and cleanup in addition to the DB workloads.
 ### Build measurements
 
 On an Apple M4 host with Zig 0.16.0 and
-`-Doptimize=ReleaseFast -Dmetal=false -Dsystem-blas=false`, a batch default-value
+`-Doptimize=fast -Dmetal=false -Dsystem-blas=false`, a batch default-value
 edit took 194 seconds in a standalone artifact and 349 seconds after folding it
 into `storage_bench`. The combined driver rebuilt in 0.7 seconds when cached, but
 its slower focused rebuild triggered the decision to retain separate artifacts

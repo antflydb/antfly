@@ -287,7 +287,7 @@ pub const RaftApplyStore = struct {
         return self.projectionWithAllocator(bool, alloc, .{ .kind = .restore_staging_authority_allowed, .group_id = group_id, .key = .fromSlice(&id), .arg0 = node_id, .arg1 = owner_group orelse 0 });
     }
     pub fn loadRestoreStagingReceipt(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, id: restore_staging.Id, state: restore_staging.State, owner_group: u64) !?[]u8 {
-        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_staging_receipt, .group_id = group_id, .key = .fromSlice(&id), .arg0 = @intFromEnum(state), .arg1 = owner_group });
+        return self.projectionWithAllocator(?[]u8, alloc, .{ .kind = .restore_staging_receipt, .group_id = group_id, .key = .fromSlice(&id), .arg0 = @backingInt(state), .arg1 = owner_group });
     }
     pub fn captureProvisioningCatalog(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) !restore_staging.ProvisioningProjection {
         return self.projectionWithAllocator(restore_staging.ProvisioningProjection, alloc, .{ .kind = .provisioning_catalog, .group_id = group_id });

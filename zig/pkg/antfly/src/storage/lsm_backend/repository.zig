@@ -1808,7 +1808,7 @@ const BufferedAtomicTableSink = struct {
         };
     }
 
-    fn deinit(self: *BufferedAtomicTableSink) void {
+    pub fn deinit(self: *BufferedAtomicTableSink) void {
         self.allocator.free(self.buffer);
         self.* = undefined;
     }

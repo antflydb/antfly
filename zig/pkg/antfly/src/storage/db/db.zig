@@ -290,11 +290,11 @@ fn standaloneResourceManagerOptionsForTotal(alloc: Allocator, total: u64) resour
         @min(@max(@as(u64, 8 * 1024 * 1024), raw_lsm), 8 * gib)
     else
         std.math.clamp(raw_lsm, 64 * 1024 * 1024, 8 * gib);
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
+    options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)] = .{
         .soft_limit_bytes = lsm_hard * 7 / 8,
         .hard_limit_bytes = lsm_hard,
     };
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
+    options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] = .{
         .soft_limit_bytes = hbc_hard * 7 / 8,
         .hard_limit_bytes = hbc_hard,
     };
@@ -308,8 +308,8 @@ pub fn standaloneResourceManagerOptions(alloc: Allocator) resource_manager_mod.O
 test "standalone resource manager derives elastic storage cache envelopes" {
     const gib: u64 = 1024 * 1024 * 1024;
     const options = standaloneResourceManagerOptionsForTotal(std.testing.allocator, 12 * gib);
-    const lsm = options.budgets[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)];
-    const hbc = options.budgets[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)];
+    const lsm = options.budgets[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)];
+    const hbc = options.budgets[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)];
     try std.testing.expectEqual(@as(u64, 6 * gib), options.memory_budget.hard_limit_bytes);
     try std.testing.expectEqual(@as(u64, 3 * gib), lsm.hard_limit_bytes);
     try std.testing.expectEqual(lsm.hard_limit_bytes * 7 / 8, lsm.soft_limit_bytes);
@@ -333,15 +333,15 @@ const public_table_schema = @import("../../schema/mod.zig");
 const ttl_mod = @import("../ttl.zig");
 const transactions_mod = @import("../transactions.zig");
 const lease_mod = @import("lease.zig");
-const template_mod = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_stub.zig")
 else
     @import("../../template.zig");
-const template_remote = if (builtin.os.tag == .freestanding or builtin.is_test or build_options.bench_minimal_deps)
+const template_remote = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
     @import("template_remote_stub.zig")
 else
     @import("../../template_remote.zig");
-const scraping = if (builtin.os.tag == .freestanding or build_options.bench_minimal_deps)
+const scraping = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or build_options.bench_minimal_deps)
     @import("scraping_stub.zig")
 else
     @import("antfly_scraping");
@@ -1804,7 +1804,7 @@ fn clearPortableImportTargetBounded(alloc: Allocator, store: *docstore_mod.DocSt
             keys: std.ArrayListUnmanaged([]u8) = .empty,
             bytes: usize = 0,
 
-            fn deinit(self: *@This()) void {
+            pub fn deinit(self: *@This()) void {
                 for (self.keys.items) |key| self.alloc.free(key);
                 self.keys.deinit(self.alloc);
             }
@@ -1845,7 +1845,7 @@ fn encodePortableImportIdentityBaseline(alloc: Allocator, store: *docstore_mod.D
         entries: std.ArrayListUnmanaged(backup_codec.KeyValueEntry) = .empty,
         bytes: usize = 0,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.entries.items) |entry| {
                 self.alloc.free(entry.key);
                 self.alloc.free(entry.value);
@@ -1975,7 +1975,7 @@ const PortableImportStage = struct {
         };
     }
 
-    fn deinit(self: *PortableImportStage) void {
+    pub fn deinit(self: *PortableImportStage) void {
         self.store.close();
         self.runtime_store.deinit();
         self.backend.close();
@@ -2071,7 +2071,7 @@ const PortableImportStage = struct {
                 state.bytes = 0;
             }
 
-            fn deinit(state: *@This()) void {
+            pub fn deinit(state: *@This()) void {
                 state.clear();
                 state.writes.deinit(state.alloc);
             }
@@ -2297,7 +2297,7 @@ const RestoreImportState = struct {
     snapshot_root: []u8,
     identity: RestoreState,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.snapshot_root);
         self.identity.deinit(alloc);
         self.* = undefined;
@@ -2516,7 +2516,7 @@ const atomicMaxU64 = execution_resources.atomicMaxU64;
 
 fn setDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
     ctx.stats.dense_catch_up.active.store(if (progress.active) 1 else 0, .monotonic);
-    ctx.stats.dense_catch_up.phase.store(@intFromEnum(if (progress.active) types.DenseCatchUpStats.Phase.replay else types.DenseCatchUpStats.Phase.idle), .monotonic);
+    ctx.stats.dense_catch_up.phase.store(@backingInt(if (progress.active) types.DenseCatchUpStats.Phase.replay else types.DenseCatchUpStats.Phase.idle), .monotonic);
     ctx.stats.dense_catch_up.current_sequence.store(progress.sequence, .monotonic);
     ctx.stats.dense_catch_up.current_target_sequence.store(progress.target_sequence, .monotonic);
     ctx.stats.dense_catch_up.current_scanned_entries.store(progress.scanned_entries, .monotonic);
@@ -2527,7 +2527,7 @@ fn setDenseCatchUpProgress(ctx: *AsyncContext, progress: ReplayProgress) void {
 }
 
 fn setDenseCatchUpPhase(ctx: *AsyncContext, phase: types.DenseCatchUpStats.Phase) void {
-    ctx.stats.dense_catch_up.phase.store(@intFromEnum(phase), .monotonic);
+    ctx.stats.dense_catch_up.phase.store(@backingInt(phase), .monotonic);
     _ = ctx.stats.dense_catch_up.progress_updates.fetchAdd(1, .monotonic);
 }
 
@@ -2539,7 +2539,7 @@ fn noteDenseBulkFinishProgress(ctx_ptr: *anyopaque, progress: backend_types.Bulk
         .publish => .bulk_publish,
         .complete => .bulk_finish,
     };
-    ctx.stats.dense_catch_up.phase.store(@intFromEnum(phase), .monotonic);
+    ctx.stats.dense_catch_up.phase.store(@backingInt(phase), .monotonic);
     ctx.stats.dense_catch_up.bulk_finish_current_window.store(progress.publish_window, .monotonic);
     ctx.stats.dense_catch_up.bulk_finish_current_window_split_steps.store(progress.split_steps, .monotonic);
     ctx.stats.dense_catch_up.bulk_finish_deferred_leaf_splits.store(progress.deferred_leaf_splits, .monotonic);
@@ -2767,9 +2767,10 @@ fn denseLsmWriteStatsSnapshot(ctx: *AsyncContext, index_name: []const u8) ?hbc_m
 
 fn denseLsmWriteStatsDelta(after: hbc_mod.LsmWriteStats, before: hbc_mod.LsmWriteStats) hbc_mod.LsmWriteStats {
     var delta = after;
-    inline for (std.meta.fields(hbc_mod.LsmWriteStats)) |field| {
-        if (field.type == u64) {
-            @field(delta, field.name) = @field(after, field.name) -| @field(before, field.name);
+    const info = @typeInfo(hbc_mod.LsmWriteStats).@"struct";
+    inline for (info.field_names, info.field_types) |reflected_name, Field| {
+        if (Field == u64) {
+            @field(delta, reflected_name) = @field(after, reflected_name) -| @field(before, reflected_name);
         }
     }
     return delta;
@@ -4492,45 +4493,94 @@ pub const DB = struct {
     }
 
     pub fn advanceVectorMigration(self: *DB, job_id: []const u8) anyerror!void {
+        var zig017_return_error: ?anyerror = null;
         // Staging pins index/catalog lifetime but never holds table apply over
         // corpus-sized ANN work. Completion is checked again under apply.
-        const status = try self.vectorMigrationStatus(self.alloc) orelse return error.VectorMigrationNotFound;
+        const status = (self.vectorMigrationStatus(self.alloc) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        }) orelse return zig017_failure: {
+            zig017_return_error = error.VectorMigrationNotFound;
+            break :zig017_failure error.VectorMigrationNotFound;
+        };
         defer self.alloc.free(status);
-        var observed = try std.json.parseFromSlice(vector_migration.contract.Job, self.alloc, status, .{});
+        var observed = (std.json.parseFromSlice(vector_migration.contract.Job, self.alloc, status, .{}) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer observed.deinit();
-        if (!std.mem.eql(u8, observed.value.job_id, job_id)) return error.VectorMigrationIdempotencyConflict;
+        if (!std.mem.eql(u8, observed.value.job_id, job_id)) return zig017_failure: {
+            zig017_return_error = error.VectorMigrationIdempotencyConflict;
+            break :zig017_failure error.VectorMigrationIdempotencyConflict;
+        };
         if (observed.value.phase == .serving) {
             const legacy = blk: {
                 var lease = self.tryAcquireIndexCatalogReadLease() orelse return;
                 defer lease.release();
                 for (self.core.index_manager.dense_indexes.items) |entry| {
-                    if (try self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name))
-                        break :blk try self.alloc.dupe(u8, entry.config.name);
+                    if ((self.core.index_manager.denseNativePhysicalMigrationRequired(entry.config.name) catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    }))
+                        break :blk (self.alloc.dupe(u8, entry.config.name) catch |zig017_err| {
+                            zig017_return_error = zig017_err;
+                            return zig017_err;
+                        });
                 }
                 break :blk null;
             };
             if (legacy) |name| {
                 defer self.alloc.free(name);
-                var repair = try self.repairArtifactIssuesWithRequest(self.alloc, .{ .target = .index, .index_name = name, .limit = 1 });
+                var repair = (self.repairArtifactIssuesWithRequest(self.alloc, .{ .target = .index, .index_name = name, .limit = 1 }) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
                 defer repair.deinit(self.alloc);
             }
-            _ = try self.publishVectorBlockBasesOnlineReported(.{ .require_quiescence = false, .require_storage_encoding = true });
+            _ = (self.publishVectorBlockBasesOnlineReported(.{ .require_quiescence = false, .require_storage_encoding = true }) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
         if (observed.value.phase == .reclaiming and observed.value.primary_reclamation_requested) {
             // Offline operators have no maintenance worker. Online execution
             // uses the same bounded scheduler without holding the table apply
             // lock over streaming compaction I/O.
-            _ = try self.core.primary_store_owner.lsm.handle.backend.runValueReclamationStep();
+            _ = (self.core.primary_store_owner.lsm.handle.backend.runValueReclamationStep() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         }
-        try self.lockApplyForPortableRuntime();
+        (self.lockApplyForPortableRuntime() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
         defer self.core.unlockApply();
-        var job = (try vector_migration.load(self.alloc, self.core.store)) orelse return error.VectorMigrationNotFound;
+        var job = ((vector_migration.load(self.alloc, self.core.store) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        })) orelse return zig017_failure: {
+            zig017_return_error = error.VectorMigrationNotFound;
+            break :zig017_failure error.VectorMigrationNotFound;
+        };
         defer job.deinit();
-        if (!std.mem.eql(u8, job.value.job_id, job_id)) return error.VectorMigrationIdempotencyConflict;
-        try self.validateVectorMigrationIdentity(job.value);
-        if (job.value.configuration_hash != try self.vectorMigrationConfigurationHash()) return error.VectorMigrationConfigurationChanged;
+        if (!std.mem.eql(u8, job.value.job_id, job_id)) return zig017_failure: {
+            zig017_return_error = error.VectorMigrationIdempotencyConflict;
+            break :zig017_failure error.VectorMigrationIdempotencyConflict;
+        };
+        (self.validateVectorMigrationIdentity(job.value) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        });
+        if (job.value.configuration_hash != (self.vectorMigrationConfigurationHash() catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        })) return zig017_failure: {
+            zig017_return_error = error.VectorMigrationConfigurationChanged;
+            break :zig017_failure error.VectorMigrationConfigurationChanged;
+        };
         if (!job.value.active() or job.value.phase == .ready) return;
-        errdefer |err| switch (@as(anyerror, err)) {
+        errdefer if (zig017_return_error) |err| switch (@as(anyerror, err)) {
             error.VectorMigrationTemporaryBudgetExceeded, error.VectorMigrationDiskReserve, error.VectorMigrationRowExceedsBudget => {},
             else => self.requireVectorMigrationRecovery(),
         };
@@ -4541,54 +4591,112 @@ pub const DB = struct {
                 // deletes before requesting the old overlap closures. Persist
                 // the manifest request before its primary receipt. A crash
                 // between them safely repeats the request after reopening.
-                try self.core.store.runtime_store.sync(true);
-                try backend.requestValueReclamation();
-                try vector_migration.boundary(.reclamation_request);
+                (self.core.store.runtime_store.sync(true) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
+                (backend.requestValueReclamation() catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
+                (vector_migration.boundary(.reclamation_request) catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
                 job.value.primary_reclamation_requested = true;
             } else {
-                if (try backend.hasValueReclamationRequests()) return;
+                if ((backend.hasValueReclamationRequests() catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                })) return;
                 // Fence the manifest that discharged the last request before
                 // reporting completion. Pinned readers may retain old files.
-                try backend.persistManifest();
+                (backend.persistManifest() catch |zig017_err| {
+                    zig017_return_error = zig017_err;
+                    return zig017_err;
+                });
                 job.value.phase = .complete;
             }
-            var txn = try self.core.store.runtime_store.beginWrite();
+            var txn = (self.core.store.runtime_store.beginWrite() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             var committed = false;
             defer if (!committed) txn.abort();
-            try vector_migration.save(self.alloc, &txn, job.value);
-            try txn.commit();
+            (vector_migration.save(self.alloc, &txn, job.value) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            (txn.commit() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             committed = true;
-            try self.core.store.runtime_store.syncReplayState();
-            try vector_migration.boundary(.reclamation_receipt);
+            (self.core.store.runtime_store.syncReplayState() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            (vector_migration.boundary(.reclamation_receipt) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         } else if (job.value.phase == .serving) {
             if (!self.core.index_manager.sourceMigrationServingComplete()) return;
             job.value.phase = .cleanup;
-            var txn = try self.core.store.runtime_store.beginWrite();
+            var txn = (self.core.store.runtime_store.beginWrite() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             var committed = false;
             defer if (!committed) txn.abort();
-            try vector_migration.save(self.alloc, &txn, job.value);
-            try txn.commit();
+            (vector_migration.save(self.alloc, &txn, job.value) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
+            (txn.commit() catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
             committed = true;
-            try self.core.store.runtime_store.sync(true);
+            (self.core.store.runtime_store.sync(true) catch |zig017_err| {
+                zig017_return_error = zig017_err;
+                return zig017_err;
+            });
         } else vector_migration.advance(self.alloc, self.core.store, self.local_execution.source_vectors.load(.acquire).?.interface(), job.value) catch |err| {
             switch (err) {
                 error.VectorMigrationTemporaryBudgetExceeded, error.VectorMigrationDiskReserve, error.VectorMigrationRowExceedsBudget => {
                     // Known pre-preparation admission failure: preserve progress
                     // and expose the reason without requiring a DB restart.
                     job.value.last_error = @errorName(err);
-                    var txn = try self.core.store.runtime_store.beginWrite();
+                    var txn = (self.core.store.runtime_store.beginWrite() catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    });
                     var committed = false;
                     defer if (!committed) txn.abort();
-                    try vector_migration.save(self.alloc, &txn, job.value);
-                    try txn.commit();
+                    (vector_migration.save(self.alloc, &txn, job.value) catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    });
+                    (txn.commit() catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    });
                     committed = true;
-                    try self.core.store.runtime_store.sync(true);
+                    (self.core.store.runtime_store.sync(true) catch |zig017_err| {
+                        zig017_return_error = zig017_err;
+                        return zig017_err;
+                    });
                 },
                 else => {},
             }
-            return @as(anyerror!void, err);
+            zig017_return_error = err;
+            return err;
         };
-        var next = (try vector_migration.load(self.alloc, self.core.store)).?;
+        var next = ((vector_migration.load(self.alloc, self.core.store) catch |zig017_err| {
+            zig017_return_error = zig017_err;
+            return zig017_err;
+        })).?;
         defer next.deinit();
         self.installVectorMigrationRuntime(next.value);
     }
@@ -7012,12 +7120,12 @@ pub const DB = struct {
         };
         // This boundary accepts a control only, never a mixed user mutation.
         const defaults: types.BatchRequest = .{};
-        inline for (@typeInfo(types.BatchRequest).@"struct".fields) |field| {
-            if (comptime !std.mem.eql(u8, field.name, "relational_topology") and !std.mem.eql(u8, field.name, "sync_level")) {
-                const value = @field(req, field.name);
-                if (comptime @typeInfo(field.type) == .pointer and @typeInfo(field.type).pointer.size == .slice) {
+        inline for (@typeInfo(types.BatchRequest).@"struct".field_names, @typeInfo(types.BatchRequest).@"struct".field_types) |reflected_name, field_type| {
+            if (comptime !std.mem.eql(u8, reflected_name, "relational_topology") and !std.mem.eql(u8, reflected_name, "sync_level")) {
+                const value = @field(req, reflected_name);
+                if (comptime @typeInfo(field_type) == .pointer and @typeInfo(field_type).pointer.size == .slice) {
                     if (value.len != 0) return error.InvalidBatchRequest;
-                } else if (!std.meta.eql(value, @field(defaults, field.name))) return error.InvalidBatchRequest;
+                } else if (!std.meta.eql(value, @field(defaults, reflected_name))) return error.InvalidBatchRequest;
             }
         }
         if (command.transfer != null or command.parent_retirement != null or command.parent_activation != null or
@@ -8444,7 +8552,7 @@ pub const DB = struct {
             self.active = false;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.release();
         }
     };
@@ -8464,7 +8572,7 @@ pub const DB = struct {
             self.active = false;
         }
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.release();
         }
     };
@@ -9567,7 +9675,7 @@ pub const DB = struct {
         counts: std.StringHashMapUnmanaged(u64) = .empty,
         loaded: bool = false,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             var it = self.counts.iterator();
             while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
             self.counts.deinit(self.alloc);
@@ -10030,7 +10138,7 @@ pub const DB = struct {
             rows: usize = 0,
             last_key: ?[]u8 = null,
 
-            fn deinit(state: *@This()) void {
+            pub fn deinit(state: *@This()) void {
                 var it = state.per_index.iterator();
                 while (it.next()) |entry| state.alloc.free(entry.key_ptr.*);
                 state.per_index.deinit(state.alloc);
@@ -10323,7 +10431,7 @@ pub const DB = struct {
             rows: usize = 0,
             last_key: ?[]u8 = null,
 
-            fn deinit(state: *@This()) void {
+            pub fn deinit(state: *@This()) void {
                 if (state.last_key) |key| state.alloc.free(key);
             }
 
@@ -13109,7 +13217,7 @@ pub const DB = struct {
         txn: docstore_mod.DocStore.Txn,
         attempt_id: u128,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             self.txn.abort();
             self.* = undefined;
         }
@@ -15260,7 +15368,7 @@ pub const DB = struct {
         remaining: usize = 0,
         next_retry_at_ms: u64 = 0,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.repairs.deinit(alloc);
             self.* = undefined;
         }
@@ -17516,7 +17624,7 @@ pub const DB = struct {
         try @import("online_integrity_shadow.zig").requireServing(&read, self.core.byteRange(), routing);
         var prefix: [integrity.namespace.len + 1 + 32]u8 = undefined;
         @memcpy(prefix[0..integrity.namespace.len], integrity.namespace);
-        prefix[integrity.namespace.len] = @intFromEnum(integrity.Kind.job);
+        prefix[integrity.namespace.len] = @backingInt(integrity.Kind.job);
         @memcpy(prefix[integrity.namespace.len + 1 ..], routing);
         var cursor = try read.openCursor();
         defer cursor.close();
@@ -17581,7 +17689,7 @@ pub const DB = struct {
         var read = try integrity.CurrentView.init(self.core.store);
         defer read.deinit();
         const range = try @import("online_integrity_shadow.zig").servingRange(&read, self.core.byteRange());
-        const prefix = integrity.namespace ++ &[_]u8{@intFromEnum(integrity.Kind.job)};
+        const prefix = integrity.namespace ++ &[_]u8{@backingInt(integrity.Kind.job)};
         const lower = try std.mem.concat(owned, u8, &.{ prefix, range.start });
         const start = if (after) |key| if (std.mem.order(u8, key, lower) == .gt) key else lower else lower;
         var cursor = try read.openCursor();
@@ -21377,7 +21485,7 @@ pub const DB = struct {
         next_cursor: ?[]u8 = null,
         complete: bool = false,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.next_cursor) |cursor| alloc.free(cursor);
             self.* = undefined;
         }
@@ -22905,7 +23013,7 @@ pub const DB = struct {
         defer preparation_alloc.free(index_range_keys);
         const range_values = try preparation_alloc.alloc([8]u8, req.range_guards.len);
         defer preparation_alloc.free(range_values);
-        var observed_buckets = std.StaticBitSet(tracking.bucket_count).initEmpty();
+        var observed_buckets = std.StaticBitSet(tracking.bucket_count).empty;
         for (req.range_guards, 0..) |guard, i| {
             tracking.validateProof(guard) catch return error.InvalidBatchRequest;
             const key: []const u8 = if (guard.index) |span| blk: {
@@ -25029,7 +25137,7 @@ pub const DB = struct {
             proof: []const u8,
             document_references: *const @import("artifact_producer_provenance.zig").PreparedDocumentReferences,
             upload: ?@import("artifact_publication_transport.zig").Finalization,
-            fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
+            pub fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
                 const guard: *@This() = @ptrCast(@alignCast(ptr));
                 try publication.validateSources(alloc, txn, guard.command.namespace, guard.command.sources);
                 try publication.validateArtifactSources(alloc, txn, guard.command.namespace, guard.command.sources, guard.command.artifact_sources);
@@ -26309,7 +26417,7 @@ pub const DB = struct {
             };
         }
 
-        fn deinit(self: *PatternNodeFilterContext) void {
+        pub fn deinit(self: *PatternNodeFilterContext) void {
             self.cache.deinit();
             self.* = undefined;
         }
@@ -26459,7 +26567,7 @@ pub const DB = struct {
         std.mem.writeInt(u64, out[16..24], marker.source_doc_count, .little);
         std.mem.writeInt(u64, out[24..32], marker.identity_generation, .little);
         std.mem.writeInt(u64, out[32..40], marker.replay_target_sequence, .little);
-        std.mem.writeInt(u64, out[40..48], @intFromEnum(marker.disposition), .little);
+        std.mem.writeInt(u64, out[40..48], @backingInt(marker.disposition), .little);
         return out;
     }
 
@@ -26979,7 +27087,7 @@ pub const DB = struct {
         resolution: ?*std.atomic.Mutex,
         promotion: ?*std.atomic.Mutex,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.promotion) |mutex| mutex.unlock();
             if (self.resolution) |mutex| mutex.unlock();
         }
@@ -30982,7 +31090,7 @@ pub const DB = struct {
         resume_state_current: bool = false,
         artifact_target_count: u64 = 0,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.resume_from) |buf| alloc.free(buf);
             self.* = .{
                 .dense_index_idx = 0,
@@ -31002,7 +31110,7 @@ pub const DB = struct {
         rebuild_state_cleanups: []usize = &.{},
         target_sequence: u64 = 0,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.targets) |*target| target.deinit(alloc);
             if (self.targets.len > 0) alloc.free(self.targets);
             if (self.generation_repairs.len > 0) alloc.free(self.generation_repairs);
@@ -31033,7 +31141,7 @@ pub const DB = struct {
         authoritative_targets: std.AutoHashMapUnmanaged(usize, void) = .empty,
         total_target_artifacts: u64 = 0,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             self.per_target_index.deinit(alloc);
             self.authoritative_targets.deinit(alloc);
             self.* = .{};
@@ -31064,7 +31172,7 @@ pub const DB = struct {
     const DenseArtifactTargetLookup = struct {
         by_artifact: std.HashMapUnmanaged(DenseArtifactTargetKey, std.ArrayListUnmanaged(usize), DenseArtifactTargetKeyContext, 80) = .empty,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             var values = self.by_artifact.valueIterator();
             while (values.next()) |indices| indices.deinit(alloc);
             self.by_artifact.deinit(alloc);
@@ -31293,7 +31401,7 @@ pub const DB = struct {
             fallback_target_count: u64 = 0,
             invalid_generation_error: ?[]const u8 = null,
 
-            fn deinit(candidate: *@This(), local_alloc: Allocator) void {
+            pub fn deinit(candidate: *@This(), local_alloc: Allocator) void {
                 if (candidate.persisted_resume) |buf| local_alloc.free(buf);
                 candidate.* = .{
                     .dense_index_idx = 0,
@@ -32144,7 +32252,7 @@ pub const DB = struct {
             last_matching_key: ?[]u8 = null,
             last_flushed_key: ?[]u8 = null,
 
-            fn deinit(state: *@This()) void {
+            pub fn deinit(state: *@This()) void {
                 freeDenseArtifactRebuildWrites(state.alloc, &state.writes);
                 state.writes.deinit(state.alloc);
                 state.rebuild_target_lookup.deinit(state.alloc);
@@ -32535,7 +32643,7 @@ pub const DB = struct {
         extracted: []mapper.ExtractedWrite = &.{},
         next_lower: ?[]u8 = null,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             for (self.writes) |write| {
                 alloc.free(@constCast(write.key));
                 alloc.free(@constCast(write.value));
@@ -32627,7 +32735,7 @@ pub const DB = struct {
         next_resume_key: ?[]u8 = null,
         complete: bool = false,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             if (self.next_resume_key) |key| alloc.free(key);
             self.* = .{};
         }
@@ -33014,11 +33122,11 @@ pub const DB = struct {
         // complete durable lifecycle bundle, including the no-intent case.
         if (item.index_repair_last_error) |value| alloc.free(value);
         const defaults = types.DBIndexStats{ .name = item.name, .kind = item.kind };
-        inline for (@typeInfo(types.DBIndexStats).@"struct".fields) |field| {
-            if (comptime std.mem.startsWith(u8, field.name, "index_repair_") or
-                std.mem.eql(u8, field.name, "index_lifecycle_work_class"))
+        inline for (comptime std.meta.fieldNames(types.DBIndexStats)) |reflected_name| {
+            if (comptime std.mem.startsWith(u8, reflected_name, "index_repair_") or
+                std.mem.eql(u8, reflected_name, "index_lifecycle_work_class"))
             {
-                @field(item, field.name) = @field(defaults, field.name);
+                @field(item, reflected_name) = @field(defaults, reflected_name);
             }
         }
         if (repair_state_corrupt) {
@@ -34829,7 +34937,7 @@ pub const DB = struct {
             if (try range_cardinality.loadFromTxn(&txn)) |count| {
                 if (count != 0) return error.RestoreStagingTargetNotEmpty;
             } else {
-                const zero = [_]u8{0} ** 8;
+                const zero = @as([8]u8, @splat(0));
                 try txn.put(&internal_keys.range_document_count_key, &zero);
             }
         }
@@ -36995,7 +37103,7 @@ pub const DB = struct {
             bound: ?db_query_graph.PreparedOrdinalPatternFilter = null,
             version: ?u32 = null,
 
-            fn deinit(filter: *@This()) void {
+            pub fn deinit(filter: *@This()) void {
                 if (filter.bound) |*bound| bound.deinit();
                 if (filter.source) |*source| source.deinit();
                 if (filter.policy) |policy| policy.deinit();
@@ -37217,7 +37325,7 @@ pub const DB = struct {
                 filter: ?db_query_graph.PreparedOrdinalPatternFilter = null,
                 projection: ?RelationalProjectionPlan = null,
 
-                fn deinit(plan: *@This()) void {
+                pub fn deinit(plan: *@This()) void {
                     if (plan.filter) |*filter| filter.deinit();
                     if (plan.projection) |*projection| projection.deinit();
                     plan.view.release();
@@ -37249,7 +37357,7 @@ pub const DB = struct {
             count: u32 = 0,
             resume_after_key: ?[]const u8 = null,
 
-            fn deinit(state: *@This()) void {
+            pub fn deinit(state: *@This()) void {
                 if (state.transient_schema_plan) |*plan| plan.deinit();
                 state.ttl_key_scratch.deinit(state.alloc);
                 state.document_key_scratch.deinit(state.alloc);
@@ -38674,7 +38782,7 @@ pub const DB = struct {
         filter_query_json: ?[]u8 = null,
         exclusion_query_json: ?[]u8 = null,
 
-        fn deinit(self: *ChunkBoolFilterLowering, alloc: Allocator) void {
+        pub fn deinit(self: *ChunkBoolFilterLowering, alloc: Allocator) void {
             if (self.filter_query_json) |owned| alloc.free(owned);
             if (self.exclusion_query_json) |owned| alloc.free(owned);
         }
@@ -40011,7 +40119,7 @@ pub const DB = struct {
         resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
         alloc: ?Allocator = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.resolved_doc_filter) |filter| {
                 const alloc = self.alloc.?;
                 filter.deinit(alloc);
@@ -40092,7 +40200,7 @@ pub const DB = struct {
         resolved_doc_filter: ?*doc_set.ResolvedDocFilter = null,
         resolved_doc_filter_alloc: ?Allocator = null,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             if (self.index) |index| {
                 index.freeDocIds(self.filter_doc_ids);
                 index.freeDocIds(self.exclude_doc_ids);
@@ -40670,11 +40778,11 @@ pub const DB = struct {
         }
         // Empty slices from a decoded wire envelope need not share the
         // static default's address. std.meta.eql compares slice pointers.
-        inline for (std.meta.fields(types.SearchRequest)) |field| {
-            switch (@typeInfo(field.type)) {
+        inline for (@typeInfo(types.SearchRequest).@"struct".field_names, @typeInfo(types.SearchRequest).@"struct".field_types) |reflected_name, field_type| {
+            switch (@typeInfo(field_type)) {
                 .pointer => |pointer| if (pointer.size == .slice) {
-                    if (@field(remaining, field.name).len == 0 and @field(defaults, field.name).len == 0)
-                        @field(remaining, field.name) = @field(defaults, field.name);
+                    if (@field(remaining, reflected_name).len == 0 and @field(defaults, reflected_name).len == 0)
+                        @field(remaining, reflected_name) = @field(defaults, reflected_name);
                 },
                 else => {},
             }
@@ -40751,9 +40859,9 @@ pub const DB = struct {
         if (!snapshotDenseRequestEligible(req)) {
             if (benchQueryProfileEnabled()) {
                 const defaults: types.SearchRequest = .{};
-                inline for (std.meta.fields(types.SearchRequest)) |field| {
-                    if (!std.meta.eql(@field(req, field.name), @field(defaults, field.name)))
-                        std.log.info("antfly_bench_db_snapshot nondefault_field={s}", .{field.name});
+                inline for (comptime std.meta.fieldNames(types.SearchRequest)) |reflected_name| {
+                    if (!std.meta.eql(@field(req, reflected_name), @field(defaults, reflected_name)))
+                        std.log.info("antfly_bench_db_snapshot nondefault_field={s}", .{reflected_name});
                 }
             }
             return declineDenseSnapshot("request");
@@ -41044,41 +41152,37 @@ pub const DB = struct {
         chunk_backed: bool,
     ) anyerror!types.SearchResult {
         const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-        // Managed chunkers may omit stored chunk payloads. Their vector
-        // member is backed by the embedding artifact, not that optional row.
-        // Keep this probe identity separate from the public source identity.
-        const embedding_name: ?[]const u8 = if (!chunk_backed) null else if (self.core.index_manager.denseIndex(req.index_name)) |entry|
-            if (entry.embedding_names.len == 0) entry.embedding_name orelse entry.config.name else null
-        else if (self.core.index_manager.sparseIndex(req.index_name)) |entry|
-            if (entry.embedding_names.len == 0) entry.embedding_name orelse entry.config.name else null
-        else
-            null;
-        const Presence = struct {
-            db: *DB,
-            name: []const u8,
-            fn keepOne(context: ?*anyopaque, a: Allocator, hit: types.SearchHit) anyerror!bool {
-                const mask = try keep(context, a, &.{hit});
-                defer a.free(mask);
-                return mask[0];
-            }
-            fn keep(context: ?*anyopaque, a: Allocator, hits: []const types.SearchHit) anyerror![]bool {
-                const active: *@This() = @ptrCast(@alignCast(context.?));
-                return filterPresentSearchHitsManyWithEmbedding(active.db, a, hits, active.name);
-            }
+        var presence = VectorSearchPresenceContext{ .db = self };
+        var preparing = true;
+        errdefer if (preparing) {
+            var owned = raw;
+            owned.deinit();
         };
-        var presence = Presence{ .db = self, .name = embedding_name orelse "" };
-        const present = if (embedding_name != null)
-            try db_query_result_shape.filterVisibleSearchResult(alloc, raw, .{
-                .ctx = &presence,
-                .func = Presence.keepOne,
-                .filter_many = Presence.keep,
-            })
-        else
-            raw;
-        return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, present, chunk_backed, .{
+        // Only explicitly ephemeral chunk streams use the embedding row as
+        // their presence authority. Keep the public chunk identity unchanged
+        // so full-text/dense fusion still deduplicates the same member.
+        inline for (.{ self.core.index_manager.denseIndex(req.index_name), self.core.index_manager.sparseIndex(req.index_name) }) |selected| {
+            if (selected) |entry| {
+                if (chunk_backed and entry.embedding_names.len == 0) {
+                    if (entry.chunk_name) |chunk_name| {
+                        if (self.core.index_manager.getEnrichment(.chunk, chunk_name)) |cfg| {
+                            if (cfg.source_artifact_name.len == 0 and !cfg.full_text_index and cfg.chunker_json.len > 0 and
+                                !(try chunking_types_mod.parseHasFullTextIndexFromSlice(alloc, cfg.chunker_json)) and
+                                !(try chunking_types_mod.parseStoreChunksFromSlice(alloc, cfg.chunker_json)))
+                            {
+                                presence.ephemeral_embedding_name = entry.embedding_name orelse entry.config.name;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        preparing = false;
+        return try db_query_result_shape.postprocessVectorSearchResult(alloc, req, raw, chunk_backed, .{
             .ctx = self,
             .is_visible = if (chunk_backed) isVisibleSearchHitCallback else isVisibleNonChunkSearchHitCallback,
-            .filter_visible_many = if (embedding_name != null) filterVisibleSearchHitsManyCallback else filterStoredSearchCandidatesManyCallback,
+            .filter_visible_many = filterVectorSearchCandidatesManyCallback,
+            .filter_visible_many_ctx = &presence,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -41637,7 +41741,7 @@ pub const DB = struct {
         ordinals: []?doc_set.DocOrdinal,
         stored_data: ?[]?[]u8 = null,
 
-        fn deinit(self: *@This(), alloc: Allocator) void {
+        pub fn deinit(self: *@This(), alloc: Allocator) void {
             alloc.free(self.allowed);
             alloc.free(self.ordinals);
             if (self.stored_data) |items| freeOptionalOwnedBytes(alloc, items);
@@ -41789,7 +41893,7 @@ pub const DB = struct {
             };
         }
 
-        fn deinit(self: *GraphNodeAdmissionCache) void {
+        pub fn deinit(self: *GraphNodeAdmissionCache) void {
             var it = self.decisions.keyIterator();
             while (it.next()) |key| self.alloc.free(key.*);
             self.decisions.deinit(self.alloc);
@@ -42622,7 +42726,7 @@ fn loadStoredSearchDocumentsMany(
             view: schema_registry_mod.SchemaView,
             projection: ?RelationalProjectionPlan,
 
-            fn deinit(plan: *@This()) void {
+            pub fn deinit(plan: *@This()) void {
                 if (plan.projection) |*projection| projection.deinit();
                 plan.view.release();
                 plan.* = undefined;
@@ -42640,7 +42744,7 @@ fn loadStoredSearchDocumentsMany(
         admission: SchemaCacheAdmission = .{},
         transient: ?HistoricalPlan = null,
 
-        fn deinit(plans: *@This()) void {
+        pub fn deinit(plans: *@This()) void {
             if (plans.transient) |*plan| plan.deinit();
             if (plans.pinned_projection) |*projection| projection.deinit();
             for (plans.historical.items) |*plan| plan.deinit();
@@ -43846,7 +43950,7 @@ const ParsedGeneratedUnitText = struct {
     spans: []document_extraction_mod.TranscriptSpan = &.{},
     warning: ?[]u8 = null,
 
-    fn deinit(self: *ParsedGeneratedUnitText, alloc: Allocator) void {
+    pub fn deinit(self: *ParsedGeneratedUnitText, alloc: Allocator) void {
         if (self.text.len > 0) alloc.free(self.text);
         if (self.warning) |value| alloc.free(value);
         if (self.spans.len > 0) alloc.free(self.spans);
@@ -45604,11 +45708,7 @@ fn loadDocumentTimestampsMany(self: *DB, alloc: Allocator, keys: []const []const
     return timestamps;
 }
 
-fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
-    return filterPresentSearchHitsManyWithEmbedding(self, alloc, hits, null);
-}
-
-fn filterPresentSearchHitsManyWithEmbedding(self: *DB, alloc: Allocator, hits: []const types.SearchHit, embedding_name: ?[]const u8) ![]bool {
+fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit, ephemeral_embedding_name: ?[]const u8) ![]bool {
     const keep = try alloc.alloc(bool, hits.len);
     errdefer alloc.free(keep);
     @memset(keep, true);
@@ -45625,10 +45725,10 @@ fn filterPresentSearchHitsManyWithEmbedding(self: *DB, alloc: Allocator, hits: [
         // Named vector members resolve their public hit id to the source
         // document/chunk, which may be shared by several embeddings. The
         // artifact reference retains the member's authoritative stored key.
-        const key = if (hit.artifact_ref) |artifact_ref|
+        const key = if (ephemeral_embedding_name != null and internal_keys.isChunkArtifactRecordKey(hit.id))
+            try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, ephemeral_embedding_name.?)
+        else if (hit.artifact_ref) |artifact_ref|
             try artifact_ids.internalKeyForArtifactRefAlloc(scratch, artifact_ref)
-        else if (embedding_name) |name|
-            try internal_keys.derivedEmbeddingArtifactKeyAlloc(scratch, hit.id, name)
         else
             try encodeStoreLookupKeyAlloc(self, scratch, hit.id);
         try pending.append(scratch, .{ .key = key, .hit_index = i });
@@ -45764,10 +45864,30 @@ fn filterStoredSearchCandidatesManyCallback(
     hits: []const types.SearchHit,
 ) anyerror![]bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    const present = try filterPresentSearchHitsMany(self, alloc, hits);
+    const present = try filterPresentSearchHitsMany(self, alloc, hits, null);
     errdefer alloc.free(present);
     if (ttlDurationNs(self) == 0) return present;
     const visible = try filterVisibleSearchHitsMany(self, alloc, hits);
+    defer alloc.free(visible);
+    for (present, visible) |*keep, live| keep.* = keep.* and live;
+    return present;
+}
+
+const VectorSearchPresenceContext = struct {
+    db: *DB,
+    ephemeral_embedding_name: ?[]const u8 = null,
+};
+
+fn filterVectorSearchCandidatesManyCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+) anyerror![]bool {
+    const presence: *const VectorSearchPresenceContext = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
+    const present = try filterPresentSearchHitsMany(presence.db, alloc, hits, presence.ephemeral_embedding_name);
+    errdefer alloc.free(present);
+    if (ttlDurationNs(presence.db) == 0) return present;
+    const visible = try filterVisibleSearchHitsMany(presence.db, alloc, hits);
     defer alloc.free(visible);
     for (present, visible) |*keep, live| keep.* = keep.* and live;
     return present;
@@ -45820,7 +45940,7 @@ const HierarchyNavigationArtifact = struct {
     /// readable until their next extraction rewrites the state in indexed form.
     legacy_units: ?[]DocumentExtractionUnitDescriptor = null,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.name);
         alloc.free(self.digest);
         if (self.legacy_units) |units| freeDocumentExtractionUnitDescriptors(alloc, units);
@@ -46392,7 +46512,7 @@ const GraphDirectTtlCommitGuard = struct {
     grace_ns: u64,
     clock: platform_clock.Clock,
 
-    fn validate(ptr: *anyopaque, _: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
+    pub fn validate(ptr: *anyopaque, _: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const artifact = txn.get(self.artifact_key) catch |err| switch (err) {
             error.NotFound => return error.GraphTtlCandidateChanged,
@@ -46445,7 +46565,7 @@ const GraphTtlCommitGuard = struct {
         return if (expected) |value| std.mem.eql(u8, raw, value) else false;
     }
 
-    fn validate(ptr: *anyopaque, _: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
+    pub fn validate(ptr: *anyopaque, _: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         const raw = txn.get(self.contender_key) catch |err| switch (err) {
             error.NotFound => return error.GraphTtlCandidateChanged,
@@ -46511,7 +46631,7 @@ const PrimaryReplicationEffect = struct {
         return .{ .payload = payload, .key = key, .value = value };
     }
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.payload) |bytes| alloc.free(bytes);
         if (self.key) |bytes| alloc.free(bytes);
         if (self.value) |bytes| alloc.free(bytes);
@@ -47495,9 +47615,9 @@ const RequiredUnitProducerDispatch = struct {
 fn requireProducerRequestsOnly(batch: derived_types.DerivedBatch) !void {
     const requests_only: derived_types.DerivedBatch = .{ .generated_enrichment_refs = batch.generated_enrichment_refs };
     if (batch.generated_enrichment_refs.len == 0) return error.InvalidBatchRequest;
-    inline for (std.meta.fields(derived_types.DerivedBatch)) |field| {
-        if (comptime !std.mem.eql(u8, field.name, "generated_enrichment_refs")) {
-            if (!std.meta.eql(@field(batch, field.name), @field(requests_only, field.name))) return error.InvalidBatchRequest;
+    inline for (comptime std.meta.fieldNames(derived_types.DerivedBatch)) |reflected_name| {
+        if (comptime !std.mem.eql(u8, reflected_name, "generated_enrichment_refs")) {
+            if (!std.meta.eql(@field(batch, reflected_name), @field(requests_only, reflected_name))) return error.InvalidBatchRequest;
         }
     }
 }
@@ -47532,7 +47652,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
         const Guard = struct {
             required: RequiredProducerDispatch,
             sequence: u64,
-            fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
+            pub fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 const accepted = if (self.required.retry_round) |round|
                     try @import("artifact_producer_obligations.zig").stageRetry(alloc, txn, self.required.authority, self.required.item, round, self.sequence, self.required.page)
@@ -47551,7 +47671,7 @@ fn appendDerivedBatchRecordContextWithAdmissions(ctx: *const BatchExecutionConte
     } else if (unit_work) |required| {
         const Guard = struct {
             required: RequiredUnitProducerDispatch,
-            fn validate(ptr: *anyopaque, _: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
+            pub fn validate(ptr: *anyopaque, _: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) !void {
                 const self: *@This() = @ptrCast(@alignCast(ptr));
                 _ = try self.required.admission.stage(txn, self.required.root);
             }
@@ -48111,7 +48231,7 @@ fn beginDenseCatchUpSessionTracked(ctx: *AsyncContext, index_name: []const u8) !
     try ctx.dense_admission.beginReplayLocked();
     ctx.text_merge_deferred.store(true, .release);
     ctx.stats.dense_catch_up.active.store(1, .monotonic);
-    ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.replay), .monotonic);
+    ctx.stats.dense_catch_up.phase.store(@backingInt(types.DenseCatchUpStats.Phase.replay), .monotonic);
     if (ctx.resource_manager) |manager| manager.beginLatencySensitiveDerivedReplay();
 }
 
@@ -48123,7 +48243,7 @@ fn finishDenseCatchUpSessionLocked(ctx: *AsyncContext, index_name: []const u8) b
     if (ctx.resource_manager) |manager| manager.finishLatencySensitiveDerivedReplay();
     if (remaining == 0) {
         ctx.stats.dense_catch_up.active.store(0, .monotonic);
-        ctx.stats.dense_catch_up.phase.store(@intFromEnum(types.DenseCatchUpStats.Phase.idle), .monotonic);
+        ctx.stats.dense_catch_up.phase.store(@backingInt(types.DenseCatchUpStats.Phase.idle), .monotonic);
         ctx.stats.dense_catch_up.bulk_finish_current_window.store(0, .monotonic);
         ctx.stats.dense_catch_up.bulk_finish_current_window_split_steps.store(0, .monotonic);
         ctx.stats.dense_catch_up.bulk_finish_deferred_leaf_splits.store(0, .monotonic);
@@ -49307,7 +49427,7 @@ fn enrichmentRequestFailureRangePending(
             issue_key: []u8,
             generation: u64,
 
-            fn deinit(self: *@This(), alloc: Allocator) void {
+            pub fn deinit(self: *@This(), alloc: Allocator) void {
                 alloc.free(self.sequence_key);
                 alloc.free(self.issue_key);
             }
@@ -49316,7 +49436,7 @@ fn enrichmentRequestFailureRangePending(
         alloc: Allocator,
         candidates: std.ArrayListUnmanaged(Candidate) = .empty,
 
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.candidates.items) |*candidate| candidate.deinit(self.alloc);
             self.candidates.deinit(self.alloc);
         }
@@ -49762,7 +49882,7 @@ fn appendGeneratedBatchFromEnrichment(
             }
         }
 
-        fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
+        pub fn validate(ptr: *anyopaque, alloc: Allocator, txn: *docstore_mod.DocStore.Batch.BatchTxn) anyerror!void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             try self.validateLease(alloc, txn);
             for (self.source_guards) |guard| {
@@ -50245,8 +50365,8 @@ fn replayPendingDerivedBatches(
             const resource_snapshot = if (manager) |value| value.snapshot() else null;
             const hbc_policy: resource_manager_mod.HbcCachePolicy = if (manager) |value| value.hbcCachePolicy() else .{};
             const retry_stats: resource_manager_mod.DerivedRecoverableRetryStats = if (manager) |value| value.derivedRecoverableRetryStats() else .{};
-            const hbc_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.hbc_node_metadata_cache)] else .{ .name = "hbc_node_metadata_cache" };
-            const dense_apply_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_apply_working_set)] else .{ .name = "dense_apply_working_set" };
+            const hbc_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.hbc_node_metadata_cache)] else .{ .name = "hbc_node_metadata_cache" };
+            const dense_apply_slice: resource_manager_mod.SliceStats = if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.dense_apply_working_set)] else .{ .name = "dense_apply_working_set" };
 
             const common_progress_args = .{
                 replay.index_name,
@@ -50295,13 +50415,13 @@ fn replayPendingDerivedBatches(
                     hbc_cache.vector.peak_bytes,
                     hbc_cache.vector.evictions,
                     hbc_cache.metadata.used_bytes,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes else 0,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.dense_search_working_set)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.lsm_block_table_cache)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.dense_search_working_set)].used_bytes else 0,
                     dense_apply_slice.used_bytes,
                     dense_apply_slice.peak_bytes,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.derived_replay_window)].used_bytes else 0,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes else 0,
-                    if (resource_snapshot) |stats| stats.slices[@intFromEnum(resource_manager_mod.Slice.full_text_build_working_set)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.derived_replay_window)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.full_text_pending_segments)].used_bytes else 0,
+                    if (resource_snapshot) |stats| stats.slices[@backingInt(resource_manager_mod.Slice.full_text_build_working_set)].used_bytes else 0,
                     retry_stats.total,
                     retry_stats.not_found,
                     profile.insert_find_leaf_ns,
@@ -50590,7 +50710,7 @@ fn loadCoveragePointSet(alloc: Allocator, store: *docstore_mod.DocStore, index_n
     var lease = try store.readManyConsistent(&keys, &values);
     errdefer lease.abort();
     var artifact_invalid = false;
-    var decoded = [_]?u64{null} ** 5;
+    var decoded = @as([5]?u64, @splat(null));
     var observed_authority: ?publication.Authority = null;
     for (order, values) |index, raw| if (index == 5) {
         if (raw) |value| observed_authority = try publication.decodeAuthority(value);
@@ -50628,7 +50748,7 @@ fn loadCoveragePointSet(alloc: Allocator, store: *docstore_mod.DocStore, index_n
 test "db derived coverage snapshot stays coherent across atomic creation and transitions" {
     // Debug retains leak instrumentation; optimized timing uses the server's
     // allocator rather than measuring testing-allocator bookkeeping.
-    const alloc = if (builtin.mode == .ReleaseFast) std.heap.smp_allocator else std.testing.allocator;
+    const alloc = if (builtin.mode == .fast) std.heap.smp_allocator else std.testing.allocator;
     inline for (.{ mem_backend_mod.Backend, lsm_backend_mod.Backend }) |Backend| {
         var backend = Backend.init(alloc, if (Backend == mem_backend_mod.Backend) .{} else .{ .wal_enabled = false });
         defer backend.close();
@@ -50679,7 +50799,7 @@ test "db derived coverage snapshot stays coherent across atomic creation and tra
         try std.testing.expectEqual(@as(?u64, 2), next.skipped);
         try std.testing.expectEqual(@as(?u64, 2), try range_cardinality.loadFromTxn(&current));
 
-        if (builtin.mode == .ReleaseFast) {
+        if (builtin.mode == .fast) {
             const iterations = 10_000;
             var independent_sum: u64 = 0;
             const independent_start = std.Io.Clock.awake.now(std.testing.io);
@@ -51197,7 +51317,7 @@ fn rollbackGraphSourceArtifactRestoreStatePage(
         value: ?[]u8 = null,
         has_more: bool = false,
 
-        fn deinit(state: *@This()) void {
+        pub fn deinit(state: *@This()) void {
             if (state.key) |key| state.alloc.free(key);
             if (state.value) |value| state.alloc.free(value);
             state.* = undefined;
@@ -52141,7 +52261,7 @@ fn copyDerivedCoverageMetadataToStore(
         writes: std.ArrayListUnmanaged(docstore_mod.KVPair) = .empty,
         owned: std.ArrayListUnmanaged(docstore_mod.OwnedKVPair) = .empty,
 
-        fn deinit(state: *@This()) void {
+        pub fn deinit(state: *@This()) void {
             state.freeOwned();
             state.writes.deinit(state.alloc);
             state.owned.deinit(state.alloc);
@@ -52236,7 +52356,7 @@ fn rebaseRangeCoverageMetadata(
                 generation: u64,
                 byte_range: types.ByteRange,
                 counts: [std.meta.tags(DerivedCoverageOutcome).len]u64 =
-                    [_]u64{0} ** std.meta.tags(DerivedCoverageOutcome).len,
+                    @as([std.meta.tags(DerivedCoverageOutcome).len]u64, @splat(0)),
 
                 fn scanEntry(ctx: ?*anyopaque, key: []const u8, value: []const u8) anyerror!docstore_mod.DocStore.ScanAction {
                     const state: *@This() = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
@@ -52250,7 +52370,7 @@ fn rebaseRangeCoverageMetadata(
                     if (!state.byte_range.contains(doc_key)) return .@"continue";
                     const outcome = std.meta.stringToEnum(DerivedCoverageOutcome, value) orelse
                         return error.InvalidDerivedCoverageOutcome;
-                    const outcome_index = @intFromEnum(outcome);
+                    const outcome_index = @backingInt(outcome);
                     state.counts[outcome_index] = std.math.add(u64, state.counts[outcome_index], 1) catch
                         return error.InvalidDerivedCoverageCounter;
                     return .@"continue";
@@ -52463,7 +52583,7 @@ fn rebuildGraphTtlDueIndexInRange(
             for (self.keys.items) |key| self.alloc.free(key);
             self.keys.clearRetainingCapacity();
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.keys.items) |key| self.alloc.free(key);
             self.keys.deinit(self.alloc);
         }
@@ -52510,7 +52630,7 @@ fn rebuildGraphTtlDueIndexInRange(
             }
             self.writes.clearRetainingCapacity();
         }
-        fn deinit(self: *@This()) void {
+        pub fn deinit(self: *@This()) void {
             for (self.writes.items) |write| {
                 self.alloc.free(@constCast(write.key));
                 self.alloc.free(@constCast(write.value));
@@ -53183,7 +53303,7 @@ fn applySplitGraphArtifactsStreaming(
             buffer.writes.clearRetainingCapacity();
         }
 
-        fn deinit(buffer: *@This(), buffer_alloc: Allocator) void {
+        pub fn deinit(buffer: *@This(), buffer_alloc: Allocator) void {
             buffer.freeWrites(buffer_alloc);
             buffer.writes.deinit(buffer_alloc);
         }
@@ -53210,7 +53330,7 @@ fn applySplitGraphArtifactsStreaming(
             }
         }
 
-        fn deinit(state: *@This()) void {
+        pub fn deinit(state: *@This()) void {
             for (state.buffers[0..state.initialized_buffers]) |*buffer| buffer.deinit(state.alloc);
             if (state.buffers.len > 0) state.alloc.free(state.buffers);
             state.indexes_by_name.deinit(state.alloc);
@@ -53354,7 +53474,7 @@ fn applySplitGraphArtifactsForIndexStreamingContext(
             state.generation_bindings.clearRetainingCapacity();
         }
 
-        fn deinit(state: *@This()) void {
+        pub fn deinit(state: *@This()) void {
             state.freeWrites();
             state.writes.deinit(state.ctx.alloc);
             state.freeGenerationBindings();
@@ -54544,7 +54664,7 @@ fn storeHasReplayRecordForHintAfter(
 
     var ctx = Context{};
     const stats = store.forEachReplayLaneFrom(
-        @intCast(@intFromEnum(hint)),
+        @intCast(@backingInt(hint)),
         from_sequence + 1,
         1,
         &ctx,
@@ -54590,7 +54710,7 @@ fn replayRangeHasManagedIndexApplicableRecord(
         .target_sequence = target_sequence,
     };
     _ = ctx.store.forEachReplayLaneFrom(
-        @intCast(@intFromEnum(managedIndexReplayHint(index_ref.kind))),
+        @intCast(@backingInt(managedIndexReplayHint(index_ref.kind))),
         from_sequence + 1,
         0,
         &scan_ctx,
@@ -54862,7 +54982,7 @@ const AlgebraicRebuildSliceResult = struct {
     rebuilt: usize = 0,
     resume_key: ?[]u8 = null,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.resume_key) |key| alloc.free(key);
         self.* = undefined;
     }
@@ -54895,7 +55015,7 @@ fn rebuildAlgebraicIndexFromSnapshotSliceContext(
             documents: std.ArrayListUnmanaged(derived_types.DerivedDocument) = .empty,
             resume_key: ?[]u8 = null,
 
-            fn deinit(state: *@This()) void {
+            pub fn deinit(state: *@This()) void {
                 for (state.documents.items) |doc| derived_types.deinitDerivedDocument(state.alloc, doc);
                 state.documents.deinit(state.alloc);
                 if (state.resume_key) |key| state.alloc.free(key);
@@ -54988,7 +55108,7 @@ const DenseRebuildSliceResult = struct {
     /// resume strictly after this key.
     resume_key: ?[]u8 = null,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         if (self.resume_key) |key| alloc.free(key);
         self.* = undefined;
     }
@@ -55066,7 +55186,7 @@ fn rebuildDenseIndexFromPrimaryVectorsSliceContext(
         scanned_since_yield_check: usize = 0,
         resume_key: ?[]u8 = null,
 
-        fn deinit(state: *@This()) void {
+        pub fn deinit(state: *@This()) void {
             freePrimaryVectorRebuildWrites(state.ctx.alloc, &state.writes);
             state.writes.deinit(state.ctx.alloc);
             DB.freeDenseArtifactRebuildWrites(state.ctx.alloc, &state.artifact_writes);
@@ -55260,7 +55380,7 @@ fn rebuildDenseIndexFromStoredEmbeddingArtifactsSliceContext(
         scanned_since_yield_check: usize = 0,
         resume_key: ?[]u8 = null,
 
-        fn deinit(state: *@This()) void {
+        pub fn deinit(state: *@This()) void {
             DB.freeDenseArtifactRebuildWrites(state.ctx.alloc, &state.writes);
             state.writes.deinit(state.ctx.alloc);
             if (state.resume_key) |key| state.ctx.alloc.free(key);
@@ -55446,7 +55566,7 @@ fn rebuildSparseIndexFromStoredEmbeddingArtifactsSliceContext(ctx: *AsyncContext
         scanned: usize = 0,
         resume_key: ?[]u8 = null,
 
-        fn deinit(state: *@This()) void {
+        pub fn deinit(state: *@This()) void {
             DB.freeSparseArtifactRebuildWrites(state.ctx.alloc, &state.writes);
             state.writes.deinit(state.ctx.alloc);
             if (state.resume_key) |key| state.ctx.alloc.free(key);
@@ -57385,7 +57505,7 @@ const DbSplitOwnedWrite = struct {
     value: []u8,
     term: DbSplitTerm,
 
-    fn deinit(self: *DbSplitOwnedWrite, alloc: Allocator) void {
+    pub fn deinit(self: *DbSplitOwnedWrite, alloc: Allocator) void {
         alloc.free(self.key);
         alloc.free(self.value);
         self.* = undefined;
@@ -57431,7 +57551,7 @@ const DbSplitSimRuntime = struct {
         return runtime;
     }
 
-    fn deinit(self: *DbSplitSimRuntime) void {
+    pub fn deinit(self: *DbSplitSimRuntime) void {
         if (self.dest_db) |*db| {
             db.close();
             self.dest_db = null;
@@ -57918,7 +58038,7 @@ fn reportReducedDbSplitSchedule(
 }
 
 fn randomDbSplitWriteSpec(random: std.Random) DbSplitSimDocSpec {
-    return @enumFromInt(random.uintLessThan(u8, 4));
+    return @fromBackingInt(@intCast(random.uintLessThan(u8, 4)));
 }
 
 fn buildDbSplitReplayActions(
@@ -58863,7 +58983,7 @@ test "db close retires runtime owners for memory primary backend" {
 
     const Fns = struct {
         fn run(_: *anyopaque) !void {}
-        fn deinit(_: *anyopaque) void {}
+        pub fn deinit(_: *anyopaque) void {}
     };
     var ctx: u8 = 0;
     try std.testing.expectError(error.BackgroundOwnerClosed, runtime.ptr().durable_jobs.submit(.{
@@ -59881,7 +60001,7 @@ test "relational rows snapshot streams flushed companion families without point 
         for ([_][]const u8{ "orphan", "z-orphan" }) |id| {
             const key = try internal_keys.ttlKeyAlloc(alloc, id);
             defer alloc.free(key);
-            const timestamp = [_]u8{0} ** 8;
+            const timestamp = @as([8]u8, @splat(0));
             try db.core.store.put(key, &timestamp);
         }
     }
@@ -60799,7 +60919,7 @@ test "relational prepared intents reject physical overflow before voting and per
 test "relational cumulative prepares remain committable within the preparation envelope" {
     const alloc = std.testing.allocator;
     var options = resource_manager_mod.Options{ .identity_allocator = alloc };
-    options.budgets[@intFromEnum(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 2 * 1024 * 1024 };
+    options.budgets[@backingInt(resource_manager_mod.Slice.relational_preparation_working_set)] = .{ .hard_limit_bytes = 2 * 1024 * 1024 };
     var resources = resource_manager_mod.ResourceManager.init(options);
     defer resources.deinit(alloc);
     var path_tmp = try TestDirectory.init("db");
@@ -61076,7 +61196,7 @@ test "generated embedding memo releases failed insertion allocations" {
         fn run(alloc: Allocator) !void {
             var memo = GeneratedEmbeddingMemo.init(alloc);
             defer memo.deinit();
-            const key = [_]u8{1} ** 32;
+            const key = @as([32]u8, @splat(1));
             try memo.putDenseCopy(key, &.{ 1, 2, 3 });
             try memo.putDenseCopy(key, &.{ 1, 2, 3 });
             try memo.putSparseCopy(key, .{ .indices = @constCast(&[_]u32{1}), .values = @constCast(&[_]f32{2}) });
@@ -61097,7 +61217,7 @@ test "prepared relational batch uses bounded parallel workers safely" {
         .storage_mode = .relational,
         .relational_columns = &columns,
     };
-    const payload = [_]u8{'x'} ** (8 * 1024);
+    const payload = @as([(8 * 1024)]u8, @splat('x'));
     var writes: [64]types.BatchWrite = undefined;
     for (&writes, 0..) |*write, i| {
         write.* = .{
@@ -62783,7 +62903,7 @@ test "relational columnar prepared ownership aggregates and aborts atomically" {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const scratch = arena.allocator();
-        const digest = [_]u8{9} ** 32;
+        const digest = @as([32]u8, @splat(9));
         var encoded: [8]u8 = @splat(0);
         std.mem.writeInt(u32, encoded[4..8], std.hash.Crc32.hash(encoded[0..4]), .little);
         var deltas: [300]payloads.Delta = @splat(.{ .digest = digest, .bytes = encoded.len, .retains = 1 });
@@ -69967,9 +70087,9 @@ test "db generated downstream indexes are exact convergence targets at source co
     try std.testing.expectEqual(@as(usize, 0), replay_targets.all_indexes.len);
     try std.testing.expect(replay_targets.target_scope_known);
     try std.testing.expectEqual(@as(usize, 2), replay_targets.target_identities.len);
+    // Producer reruns can retire generated members, even when the source
+    // commit itself adds a document.
     for (replay_targets.target_identities) |target|
-        // Generated producers can replace or remove prior artifacts even
-        // when the originating source operation only adds a document.
         try std.testing.expectEqual(IndexTargetVisibility.ServingSetEffect.may_reduce, target.serving_set_effect);
 
     var materialized_targets = try collectManagedSyncTargets(alloc, db.core.index_manager, .{
@@ -71515,7 +71635,7 @@ const FakePromotionSink = struct {
     mutex: std.atomic.Mutex = .unlocked,
     upserts: std.ArrayListUnmanaged(Upsert) = .empty,
 
-    fn deinit(self: *FakePromotionSink) void {
+    pub fn deinit(self: *FakePromotionSink) void {
         for (self.upserts.items) |u| {
             self.alloc.free(u.table);
             self.alloc.free(u.key);
@@ -77314,7 +77434,7 @@ test "db async document extraction accounts resource manager working set" {
     defer alloc.free(manifest);
     try std.testing.expect(std.mem.indexOf(u8, manifest, "\"status\":\"converged\"") != null);
 
-    const stats = resource_manager.snapshot().slices[@intFromEnum(resource_manager_mod.Slice.document_extraction_working_set)];
+    const stats = resource_manager.snapshot().slices[@backingInt(resource_manager_mod.Slice.document_extraction_working_set)];
     try std.testing.expect(stats.peak_bytes > 0);
     try std.testing.expectEqual(@as(u64, 0), stats.used_bytes);
 }
@@ -78824,7 +78944,7 @@ test "db dispatches generated document child range artifacts to remote owner" {
         first_key: ?[]u8 = null,
         first_value: ?[]u8 = null,
 
-        fn deinit(self: *@This(), allocator: Allocator) void {
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
             if (self.first_key) |key| allocator.free(key);
             if (self.first_value) |value| allocator.free(value);
         }
@@ -79074,7 +79194,7 @@ test "db retries remote document child range dispatch from durable outbox" {
         artifact_writes: usize = 0,
         first_key: ?[]u8 = null,
 
-        fn deinit(self: *@This(), allocator: Allocator) void {
+        pub fn deinit(self: *@This(), allocator: Allocator) void {
             if (self.first_key) |key| allocator.free(key);
         }
 
@@ -82315,12 +82435,12 @@ test "db query drops full text hits whose stored document row was deleted direct
                 .{ .id = remote_key },
                 .{ .id = @constCast("doc:off-shard"), .artifact_ref = embedding_ref },
                 .{ .id = @constCast("doc:b"), .artifact_ref = .{ .document_id = @constCast("doc:b"), .name = @constCast("absent_embedding"), .kind = .embedding } },
-            });
+            }, null);
             defer test_alloc.free(keep);
             try std.testing.expectEqualSlices(bool, &.{ false, true, true, true, false }, keep);
             // A single managed vector source uses chunk metadata even when
             // store_chunks is false. Its embedding is the persisted member.
-            const single = try filterPresentSearchHitsManyWithEmbedding(active_db, test_alloc, &.{
+            const single = try filterPresentSearchHitsMany(active_db, test_alloc, &.{
                 .{ .id = remote_key },
                 .{ .id = source_key },
             }, "remote_dense");
@@ -93388,7 +93508,7 @@ test "db catch-up advances vacuous derived replay target gap" {
         try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
         var latest_raw: [8]u8 = undefined;
         std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
-        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@backingInt(change_journal_mod.TargetHint.dense_vector)));
         var batch = try db.core.store.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(latest_key[0..], latest_raw[0..]);
@@ -93449,7 +93569,7 @@ test "db stats report projection checkpoint replay tail per index hint" {
         try db.core.store.ensureReplayNextSequenceAtLeast(dense_target_sequence + 1);
         var latest_raw: [8]u8 = undefined;
         std.mem.writeInt(u64, &latest_raw, dense_target_sequence, .little);
-        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+        const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@backingInt(change_journal_mod.TargetHint.dense_vector)));
         var batch = try db.core.store.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(latest_key[0..], latest_raw[0..]);
@@ -93708,7 +93828,7 @@ test "db catch-up defers artifact dense target advance without durable counter" 
     try db.core.store.ensureReplayNextSequenceAtLeast(target_sequence + 1);
     var latest_raw: [8]u8 = undefined;
     std.mem.writeInt(u64, &latest_raw, target_sequence, .little);
-    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@intFromEnum(change_journal_mod.TargetHint.dense_vector)));
+    const latest_key = internal_keys.replayLatestSequenceKey(@intCast(@backingInt(change_journal_mod.TargetHint.dense_vector)));
     var batch = try db.core.store.beginWriteBatch();
     errdefer batch.abort();
     try batch.put(latest_key[0..], latest_raw[0..]);
@@ -93781,7 +93901,7 @@ test "managed dense physical migration is online and uses durable repair intent"
     const Gate = struct {
         permitted: bool = false,
 
-        fn read(ptr: *const anyopaque) bool {
+        pub fn read(ptr: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(ptr));
             return self.permitted;
         }
@@ -97350,7 +97470,7 @@ test "db document _edges reconcile graph state and preserve base document with d
 }
 
 const PagedGraphMergeTest = struct {
-    fn accept(db: *DB) !void {
+    pub fn accept(db: *DB) !void {
         try db.updateRange(.{ .start = "doc:m", .end = "" });
         try db.batch(.{ .merge_checkpoint = .{
             .kind = .accept,
@@ -98932,7 +99052,7 @@ test "db automatic dense repair bootstraps missing coverage metadata" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -99004,7 +99124,7 @@ test "db quarantined dense bootstrap tracks concurrent insert update and delete"
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ std.mem.span(path), cfg.name });
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -99177,7 +99297,7 @@ test "db index repair rebuilds dense index with missing native publication" {
 
     const dense_index_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_index_path);
-    const dense_index_path_z = try alloc.dupeZ(u8, dense_index_path);
+    const dense_index_path_z = try alloc.dupeSentinel(u8, dense_index_path, 0);
     defer alloc.free(dense_index_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_index_path_z, .{
@@ -99368,7 +99488,7 @@ test "quarantine binding reconciliation serializes with terminal transition" {
         dense_path = try db.core.index_manager.activeIndexPath("dense_idx");
     }
 
-    const dense_path_z = try alloc.dupeZ(u8, dense_path.?);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path.?, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -99481,7 +99601,7 @@ test "db restart reconciles activated dense repair without rebuilding" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -99668,7 +99788,7 @@ test "db root generation rollover preserves activated repair debt fail closed" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -99811,7 +99931,7 @@ test "db durable root incarnation follows the physical root rather than visibili
     defer transition.deinit();
     var staged = try transition.beginStaging();
     defer staged.deinit();
-    const retired_path = try alloc.dupeZ(u8, staged.path());
+    const retired_path = try alloc.dupeSentinel(u8, staged.path(), 0);
     defer {
         cleanupTempDir(retired_path);
         alloc.free(retired_path);
@@ -99935,7 +100055,7 @@ test "db paused dense repair resumes its durable candidate after restart" {
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -100062,7 +100182,7 @@ test "db dense repair durably yields and resumes a reopenable building candidate
 
     const active_path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ std.mem.span(path), cfg.name });
     defer alloc.free(active_path);
-    const active_path_z = try alloc.dupeZ(u8, active_path);
+    const active_path_z = try alloc.dupeSentinel(u8, active_path, 0);
     defer alloc.free(active_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, active_path_z, .{
@@ -100130,7 +100250,7 @@ test "db dense repair durably yields and resumes a reopenable building candidate
 
     // A yielded building candidate has no incomplete-publication marker and is
     // independently reopenable before the next process resumes its cursor.
-    const candidate_path_z = try alloc.dupeZ(u8, candidate_path);
+    const candidate_path_z = try alloc.dupeSentinel(u8, candidate_path, 0);
     defer alloc.free(candidate_path_z);
     {
         var candidate = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, candidate_path_z, .{
@@ -100748,7 +100868,7 @@ test "db managed repair scheduler defers canonical worker until shadow activatio
 
 test "index repair inspection window is bounded and rotates fairly" {
     const candidate_count = 257;
-    var seen = [_]bool{false} ** candidate_count;
+    var seen = @as([candidate_count]bool, @splat(false));
     var cursor: u64 = 0;
     var pass: usize = 0;
     while (pass < 33) : (pass += 1) {
@@ -103683,7 +103803,7 @@ test "db dense repair defers before candidate creation when node admission is ex
 
     const dense_path = try std.fmt.allocPrint(alloc, "{s}/indexes/dense_idx", .{std.mem.span(path)});
     defer alloc.free(dense_path);
-    const dense_path_z = try alloc.dupeZ(u8, dense_path);
+    const dense_path_z = try alloc.dupeSentinel(u8, dense_path, 0);
     defer alloc.free(dense_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, dense_path_z, .{
@@ -103695,7 +103815,7 @@ test "db dense repair defers before candidate creation when node admission is ex
     }
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_repair_working_set)] = .{
         .soft_limit_bytes = 2 * 1024 * 1024,
         .hard_limit_bytes = 4 * 1024 * 1024,
     };
@@ -104278,7 +104398,7 @@ test "db repair replay pin applies hard-pressure write backpressure" {
     defer cleanupTempDir(path);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.lsm_wal_retention)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.lsm_wal_retention)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
@@ -104312,7 +104432,7 @@ test "db rejects derived backlog exhaustion before primary commit" {
     defer cleanupTempDir(path);
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.derived_backlog)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.derived_backlog)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
@@ -104929,7 +105049,7 @@ const InterruptedActivatedDenseRepair = struct {
     repair_id: u128,
     candidate_relative_path: []u8,
 
-    fn deinit(self: *@This(), alloc: Allocator) void {
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.candidate_relative_path);
         self.* = undefined;
     }
@@ -105211,7 +105331,7 @@ test "db failed activated dense generation rolls back to retained predecessor" {
     // can therefore exercise the rollback/retry ownership handoff.
     const candidate_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ std.mem.span(path), candidate_relative_path.? });
     defer alloc.free(candidate_path);
-    const candidate_path_z = try alloc.dupeZ(u8, candidate_path);
+    const candidate_path_z = try alloc.dupeSentinel(u8, candidate_path, 0);
     defer alloc.free(candidate_path_z);
     {
         var hbc = try hbc_mod.HBCIndex.openWithLsmOptions(alloc, candidate_path_z, .{
@@ -105758,7 +105878,7 @@ test "db dense target reads atomic artifact and source coverage snapshot" {
             defer for (keys[0..initialized]) |key| ctx.alloc.free(key);
             var value: [8]u8 = undefined;
             std.mem.writeInt(u64, &value, count, .little);
-            const zero = [_]u8{0} ** 8;
+            const zero = @as([8]u8, @splat(0));
             var writes: [4]docstore_mod.KVPair = undefined;
             for (tags, 0..) |tag, i| {
                 keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(ctx.alloc, "dense_idx", 42, tag);
@@ -105829,7 +105949,7 @@ test "db dense target reads atomic outcome and source coverage snapshot" {
         .coverage_generation = 42,
     };
     try db.addIndex(config);
-    try db.core.store.put(&internal_keys.range_document_count_key, &([_]u8{0} ** 8));
+    try db.core.store.put(&internal_keys.range_document_count_key, &(@as([8]u8, @splat(0))));
     const Commit = struct {
         fn afterProduced(ctx: *AsyncContext) !void {
             test_dense_target_after_coverage_capture = null;
@@ -105839,7 +105959,7 @@ test "db dense target reads atomic outcome and source coverage snapshot" {
             defer for (keys[0..initialized]) |key| ctx.alloc.free(key);
             var one: [8]u8 = undefined;
             std.mem.writeInt(u64, &one, 1, .little);
-            const zero = [_]u8{0} ** 8;
+            const zero = @as([8]u8, @splat(0));
             var writes: [4]docstore_mod.KVPair = undefined;
             for (tags, 0..) |tag, i| {
                 keys[i] = try internal_keys.derivedCoverageOutcomeCountKeyAlloc(ctx.alloc, "dense_idx", 42, tag);
@@ -107143,7 +107263,7 @@ test "db malformed quarantined dense config does not block healthy artifact coun
 test "db dense repair working set scales batch to resource budget" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_repair_working_set)] = .{
         .soft_limit_bytes = 12 * 1024 * 1024,
         .hard_limit_bytes = 16 * 1024 * 1024,
     };
@@ -107166,7 +107286,7 @@ test "db dense repair working set scales batch to resource budget" {
 test "db dense counter bootstrap admission respects soft background budget" {
     const alloc = std.testing.allocator;
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.dense_repair_working_set)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.dense_repair_working_set)] = .{
         .soft_limit_bytes = 12 * 1024 * 1024,
         .hard_limit_bytes = 16 * 1024 * 1024,
     };
@@ -113773,12 +113893,12 @@ test "db best effort force compact leaves text merge debt under pressure" {
     const table_schema_api = @import("../../schema/mod.zig");
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1024 * 1024,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .defer_background_work,
     };
@@ -113866,12 +113986,12 @@ test "db runUntilIdle defers full text merge pressure without failing" {
     const alloc = std.testing.allocator;
 
     var budgets = resource_manager_mod.Options.defaultBudgets();
-    budgets[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    budgets[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_limit_bytes = 1,
         .hard_limit_bytes = 1,
     };
     var policies = resource_manager_mod.Options.defaultPolicies();
-    policies[@intFromEnum(resource_manager_mod.Slice.text_merge_buffers)] = .{
+    policies[@backingInt(resource_manager_mod.Slice.text_merge_buffers)] = .{
         .soft_action = .defer_background_work,
         .hard_action = .reject_work,
     };
@@ -118179,7 +118299,7 @@ fn printDenseStreamingQualificationDiagnostics(db: *DB, docs_written: usize, mem
             );
             for (stats.active_readers_by_kind, 0..) |count, kind_index| {
                 if (count == 0) continue;
-                const kind: lsm_backend_mod.ReaderPinKind = @enumFromInt(kind_index);
+                const kind: lsm_backend_mod.ReaderPinKind = @fromBackingInt(@intCast(kind_index));
                 std.debug.print(
                     "dense_streaming_qualification_lsm_reader owner={s} kind={s} count={d}\n",
                     .{ label, lsm_backend_mod.readerPinKindName(kind), count },
@@ -128201,7 +128321,7 @@ test "source vector migration converts legacy ANN generations in both modes" {
     const offline = @import("../vector_migration_offline.zig");
     const Gate = struct {
         permitted: bool = false,
-        fn read(ptr: *const anyopaque) bool {
+        pub fn read(ptr: *const anyopaque) bool {
             return (@as(*const @This(), @ptrCast(@alignCast(ptr)))).permitted;
         }
     };
@@ -128935,7 +129055,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectEqualStrings("generation-only", generated[0].object.get("body").?.string);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, Check.run, .{&db});
     var expected_nums: [2]u32 = undefined;
     for ([_]?[]const u8{ null, "z" }, &expected_nums) |unit, *expected| {
         const key = if (unit) |id|
@@ -128983,7 +129103,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expectError(error.InvalidBatchRequest, binary.seekAfter(tail));
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, ProjectionCheck.run, .{ &db, expected_nums });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, ProjectionCheck.run, .{ &db, expected_nums });
     // A selected empty unit and a shadowed root tail still have vector bytes
     // to retire. Reconciliation must enumerate them without exposing their
     // obsolete chunk payloads or confusing another embedding's outputs.
@@ -129024,7 +129144,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expect((try cursor.next()) == null);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, CandidateCheck.run, .{&db});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, CandidateCheck.run, .{&db});
     const PollCheck = struct {
         fn run(a: Allocator, owner: *DB, minimum_yields: usize, extra_outputs: usize) !void {
             const candidates = @import("artifact_chunk_vector_cursor.zig");
@@ -129101,7 +129221,7 @@ test "db ordered artifact inventory logical chunk projection merges generations 
             try std.testing.expect(yields >= minimum_yields);
         }
     };
-    try std.testing.checkAllAllocationFailures(alloc, PollCheck.run, .{ &db, 1, 0 });
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(alloc, PollCheck.run, .{ &db, 1, 0 });
     // Long obsolete tails are opaque here: malformed payloads and another
     // embedding's keys consume bounded scan work, never provider invocations.
     for (2..66) |ordinal| {
@@ -130283,8 +130403,8 @@ test "db graph endpoint cleanup pages progress through row policy phases without
             const job = try internal_keys.graphEndpointCleanupKeyAlloc(alloc, "hub");
             defer alloc.free(job);
             try db.core.store.put(job, "hub");
-            db.local_execution.row_policy_gate.phase.store(@intFromEnum(phase), .release);
-            defer db.local_execution.row_policy_gate.phase.store(@intFromEnum(table_catalog_mod.RowPolicyPhase.disabled), .release);
+            db.local_execution.row_policy_gate.phase.store(@backingInt(phase), .release);
+            defer db.local_execution.row_policy_gate.phase.store(@backingInt(table_catalog_mod.RowPolicyPhase.disabled), .release);
             // Maintenance must not acquire a user admission lease, including
             // during preparing. Invalid mixed commands never gain exemption.
             try std.testing.expectError(error.InvalidBatchRequest, db.batch(.{ .graph_endpoint_cleanup = true, .writes = &.{.{ .key = "user", .value = "{}" }} }));
@@ -132292,7 +132412,13 @@ test "db document lookup allocation benchmark" {
     }
     if (text_fixture) try db.?.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
     const asset_name = if (fixture == .text_asset_escaped) "cap\x00tion" else "caption";
-    const asset_raw: []const u8 = if (fixture == .text_asset_large) "quote\" newline\n null\x00 café 🚀" ** 128 else "projected value";
+    const large_asset_text = comptime blk: {
+        const pattern = "quote\" newline\n null\x00 café 🚀";
+        var text: [pattern.len * 128]u8 = undefined;
+        for (0..128) |i| @memcpy(text[i * pattern.len ..][0..pattern.len], pattern);
+        break :blk text;
+    };
+    const asset_raw: []const u8 = if (fixture == .text_asset_large) &large_asset_text else "projected value";
     const asset_projected = try std.fmt.allocPrint(alloc, "{{\"caption\":{f}}}", .{std.json.fmt(asset_raw, .{})});
     defer alloc.free(asset_projected);
     if (text_fixture) try db.?.addEnrichment(.{ .name = asset_name, .kind = .asset, .field = "caption", .content_type = "text/plain" });
@@ -132548,7 +132674,7 @@ test "document collectors asset projection borrows ordinary names and preserves 
     try std.testing.expectEqual(@as(?[]u8, null), try textualAssetFullTextProjectionAlloc(failing.allocator(), db.core.index_manager, ordinary, "{}"));
     const escaped = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc\x00id", "asset", "cap\x00tion");
     defer alloc.free(escaped);
-    var long_name = [_]u8{'x'} ** 512;
+    var long_name = @as([512]u8, @splat('x'));
     long_name[1] = 0;
     const long_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc", "asset", &long_name);
     defer alloc.free(long_key);
@@ -132583,7 +132709,7 @@ test "document collectors ordinary slab excludes projected assets" {
     defer alloc.free(second);
     try db.core.store.putBatch(&.{ .{ .key = empty, .value = "" }, .{ .key = second, .value = "{\"title\":\"second document\"}" } }, &.{});
     const targets = [_]derived_types.DerivedTargetRef{.{ .kind = .full_text, .index_name = "text" }};
-    var docs = [_]derived_types.DerivedDocument{.{ .key = asset, .action = .upsert, .targets = &targets }} ** 32;
+    var docs = @as([32]derived_types.DerivedDocument, @splat(.{ .key = asset, .action = .upsert, .targets = &targets }));
     docs[29].key = "normal";
     docs[30].key = "empty";
     docs[31].key = "second";
@@ -132620,7 +132746,7 @@ test "document collectors JSON string writing preserves escaping and output owne
             try std.testing.expectEqualStrings(expected, output.items[7..]);
         }
     };
-    const inputs = [_][]const u8{ "", "ordinary", "quote\" slash\\ newline\n null\x00", "café 🚀", &([_]u8{0} ** 512) };
+    const inputs = [_][]const u8{ "", "ordinary", "quote\" slash\\ newline\n null\x00", "café 🚀", &(@as([512]u8, @splat(0))) };
     for (inputs) |input| {
         const expected = try std.fmt.allocPrint(std.testing.allocator, "{f}", .{std.json.fmt(input, .{})});
         defer std.testing.allocator.free(expected);
