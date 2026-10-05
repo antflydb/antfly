@@ -403,9 +403,10 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
     const antfly_wasm = b.addExecutable(.{
         .name = "antfly_wasm",
         .root_module = antfly_wasm_mod,
-        // Keep full-suite memory admission from overlapping browser LLVM
-        // codegen with the large native engine archives.
-        .max_rss = 16 * 1024 * 1024 * 1024,
+        // Cold ReleaseSafe LLVM codegen measured 18.45 GB. Reserve 20 GiB
+        // with headroom so full-suite admission does not overlap it with
+        // the large native engine archives beyond the build memory budget.
+        .max_rss = 20 * 1024 * 1024 * 1024,
     });
     antfly_wasm.entry = .disabled;
     antfly_wasm.rdynamic = true;

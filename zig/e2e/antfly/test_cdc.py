@@ -426,6 +426,19 @@ def _metadata_table_id(stateful_api, table_name: str) -> int | None:
     for table in payload.get("tables", []):
         if isinstance(table, dict) and table.get("name") == table_name:
             return int(table["table_id"])
+    # Public creates have a logical catalog name and an opaque physical name.
+    # Join the public label by immutable ID, and require the physical record
+    # to exist in this snapshot rather than treating public visibility as proof.
+    public_tables = stateful_api._check(stateful_api._request("GET", "/tables"))
+    for public_table in public_tables:
+        if public_table.get("name") != table_name:
+            continue
+        table_id = int(public_table["table_id"])
+        if any(
+            isinstance(table, dict) and int(table["table_id"]) == table_id
+            for table in payload.get("tables", [])
+        ):
+            return table_id
     return None
 
 
@@ -1611,7 +1624,6 @@ def test_stateful_postgres_cdc_reseed_rotates_exact_cutover_authority(
     stateful_api, pg_cdc_source
 ):
     table_name = f"cdc_reseed_exact_cutover_docs_{time.time_ns()}"
-    _cleanup_reseed_artifacts_best_effort()
     _run_psql(
         f"create publication {pg_cdc_source['publication_name']} for table {pg_cdc_source['table_name']};"
     )

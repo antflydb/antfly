@@ -88,7 +88,7 @@ test "laya packed rows and decisions match the independent PyTorch oracle" {
                     // The oracle emits raw logits; compare calibrated probabilities.
                     const expected = try pipeline.decode(s, cfg, q, logits[0..q.labels.len], actions);
                     for (expected.probabilities, decision.probabilities) |want, got| worst = @max(worst, @abs(want - got));
-                    worst = @max(worst, @abs(expected.act_probability - decision.act_probability));
+                    worst = @max(worst, @abs(expected.act_probability.? - decision.act_probability.?));
                 }
             }
             const stats = factory.layaTrunkCacheStats(session).?;

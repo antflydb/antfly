@@ -14046,10 +14046,9 @@ pub const ApiHttpServer = struct {
         if (self.executeForeignPublicTableQueryIfAny(alloc, source, table_name, body, row_filter_json, authenticated_identity, request_deadline_ns, cancellation, bound_join, foreign_execution.context()) catch |err| switch (err) {
             error.InvalidQueryRequest => return error.InvalidQueryRequest,
             error.GraphMetricPersonalizationRequiresFresh, error.UnsupportedGraphMetric => return error.InvalidQueryRequest,
-            // Foreign-source capability validation is part of the public
-            // request contract. Keep its historical 400 classification;
-            // exact-sort rejection is already carried by its distinct error.
-            error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            // Valid requests outside the foreign source's capabilities use
+            // the same machine-readable 422 contract as native queries.
+            error.UnsupportedQueryRequest => return error.UnsupportedQueryRequest,
             error.UnsupportedHierarchyGrouping => return error.UnsupportedHierarchyGrouping,
             error.UnsupportedExactSort => return error.UnsupportedExactSort,
             error.GraphMetricGlobalMaterializationRequired => return error.GraphMetricGlobalMaterializationRequired,
@@ -54695,6 +54694,9 @@ test "api http server executes direct foreign table aggregations through registr
             _ = ptr;
             aggregate_saw_no_deadline = params.execution_deadline_ns == null;
             aggregate_saw_cancellation = params.cancellation != null;
+            for (params.aggregations) |aggregation| {
+                if (std.mem.eql(u8, aggregation.definition.type_name, "geohash_grid")) return error.UnsupportedAggregate;
+            }
             const results = try inner_alloc.alloc(foreign_mod.NamedValue, 2);
             results[0] = .{
                 .name = try inner_alloc.dupe(u8, "version_stats"),
@@ -54775,6 +54777,29 @@ test "api http server executes direct foreign table aggregations through registr
     try std.testing.expect(DummyForeign.query_saw_cancellation);
     try std.testing.expect(DummyForeign.aggregate_saw_no_deadline);
     try std.testing.expect(DummyForeign.aggregate_saw_cancellation);
+
+    const unsupported_body =
+        \\{"aggregations":{"geo":{"type":"geohash_grid","field":"tier"}},"foreign_sources":{"pg_customers":{"type":"postgres","dsn":"postgres://db","postgres_table":"customers"}}}
+    ;
+    try std.testing.expectError(error.UnsupportedQueryRequest, server.executePublicTableQueryDispatchWithIdentity(
+        alloc,
+        dummy_source,
+        "pg_customers",
+        unsupported_body,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+        null,
+    ));
+    var unsupported_response = try server.publicQueryOperationErrorResponse("pg_customers", unsupported_body, error.UnsupportedQueryRequest);
+    defer unsupported_response.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 422), unsupported_response.status);
+    var unsupported = try std.json.parseFromSlice(public_table_http.UnsupportedQueryError, alloc, unsupported_response.body, .{});
+    defer unsupported.deinit();
+    try std.testing.expectEqualStrings("unsupported_query_request", unsupported.value.@"error");
 }
 
 test "query builder dependency 503 responses preserve public retry contract" {

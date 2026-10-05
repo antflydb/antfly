@@ -16,6 +16,7 @@
 //! Distributed sources retain routing, admission, consistency, aggregation,
 //! and lifecycle; this source owns only coarse physical operations.
 
+const server_coordinated_ttl = @import("../storage/server_coordinated_ttl.zig");
 const std = @import("std");
 const request_operation = @import("antfly_local_sources").api_operation;
 const platform_sync = @import("antfly_platform").sync;
@@ -272,7 +273,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     restore_descriptor_recovery: ?RestoreDescriptorRecovery = null,
     document_child_range_dispatch_source: ?table_write_source.TableWriteSource = null,
     resolution_candidate_source: ?runtime_callbacks.CandidateSource = null,
-    coordinated_ttl: ?@import("antfly_local_sources").storage_coordinated_ttl.Port = null,
+    coordinated_ttl: ?server_coordinated_ttl.Port = null,
     artifact_publications: ?@import("../storage/artifact_publication_dispatch.zig").Port = null,
     entity_sink: ?runtime_callbacks.EntitySink = null,
     runtime_status_cache: ?*runtime_status.TableRuntimeSnapshotCache = null,
@@ -3213,7 +3214,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         };
     }
 
-    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: @import("antfly_local_sources").storage_coordinated_ttl.Port) *ProvisionedKernelOwnerSource {
+    pub fn withCoordinatedTtl(self: *ProvisionedKernelOwnerSource, port: server_coordinated_ttl.Port) *ProvisionedKernelOwnerSource {
         std.debug.assert(self.entries.items.len == 0);
         self.coordinated_ttl = port;
         return self;
@@ -3238,7 +3239,7 @@ pub const ProvisionedKernelOwnerSource = struct {
         const port = self.coordinated_ttl orelse return 1;
         if (request.candidate_count > abi.coordinated_ttl_page_capacity or
             (request.candidate_count != 0 and request.candidates == null)) return 1;
-        var candidates: [abi.coordinated_ttl_page_capacity]@import("antfly_local_sources").storage_coordinated_ttl.Candidate = undefined;
+        var candidates: [abi.coordinated_ttl_page_capacity]server_coordinated_ttl.Candidate = undefined;
         for (candidates[0..request.candidate_count], 0..) |*dest, index| {
             const source = request.candidates.?[index];
             if (source.key.len != 0 and source.key.ptr == null) return 1;
@@ -4214,7 +4215,7 @@ pub const ProvisionedKernelOwnerSource = struct {
     ) !client.QueryResponse {
         try table_reads.checkQueryDeadline(req);
         try self.prepareQueryRead(group_id, req, consistency);
-        const request_json = try table_reads.encodeStorageKernelQueryRequest(alloc, req);
+        const request_json = try @import("antfly_local_sources").api_local_query_contract.encodeStorageKernelQueryRequestForExecution(alloc, req, raw_search_result);
         defer alloc.free(request_json);
         var lease = try self.acquireWithControls(group_id, table_name, .from(req));
         defer lease.deinit();
@@ -6244,7 +6245,7 @@ pub const ProvisionedKernelOwnerSource = struct {
 };
 
 test "compiled owner coordinated ttl admission preserves exact observations and pressure" {
-    const ttl = @import("antfly_local_sources").storage_coordinated_ttl;
+    const ttl = @import("../storage/server_coordinated_ttl.zig");
     const Fake = struct {
         calls: usize = 0,
         pressure: bool = false,

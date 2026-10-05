@@ -929,6 +929,9 @@ const LocalStandaloneMetadata = struct {
         // have landed before the outage). A brand-new proposal starting now
         // never reaches the log, so its outcome is a known drop, not unknown.
         if (self.catalog_durability_failed) return error.ProposalDropped;
+        // A previous locally committed mutation may still be waiting for HA
+        // acknowledgement. This proposal has not reached its transaction.
+        if (self.lifecycle_store) |store| store.flushHotStandbyOutbox() catch return error.ProposalDropped;
         return .{ .previous_epoch = self.epoch };
     }
 
@@ -2817,7 +2820,9 @@ const LocalStandaloneMetadata = struct {
                 }
                 const delta = self.planCatalogTopologyLocked(a, command, dropping_table) catch |err| {
                     if (err == error.CatalogAlreadyExists or err == error.TableAlreadyExists) {
-                        if (self.hot_standby_catalog_server) |server| server.acknowledgeHotStandbyExistingCatalog() catch return error.MetadataMutationOutcomeUnknown;
+                        if (self.lifecycle_store) |store| {
+                            store.flushHotStandbyOutbox() catch return error.MetadataMutationOutcomeUnknown;
+                        } else if (self.hot_standby_catalog_server) |server| server.acknowledgeHotStandbyExistingCatalog() catch return error.MetadataMutationOutcomeUnknown;
                     }
                     return err;
                 };
@@ -4218,6 +4223,14 @@ const LocalStandaloneMetadata = struct {
             } else null,
         };
         self.lifecycle_store.?.updateStandaloneCatalog(group_ids.main_metadata_group_id, self.durable_revision, update) catch |err| {
+            if (err == error.MetadataReplicationPending) {
+                // The local transaction is durable. Retain its projection and
+                // revision while the outbox gates future proposals and retries.
+                mutation.committed = true;
+                self.durable_revision += 1;
+                self.epoch = self.durable_revision;
+                return error.MetadataMutationOutcomeUnknown;
+            }
             if (err == error.MetadataMutationOutcomeUnknown) {
                 mutation.committed = true;
                 self.durable_revision = 0;
@@ -4512,14 +4525,27 @@ pub fn runFromIterator(
     try ensureDirPath(setup_io.io(), resolved.auth_store_root_dir);
 
     const auth_enabled = resolveAuthEnabled(cli, if (loaded_config) |*cfg| cfg else null);
+    // The storage kernel sizes its ResourceManager when its context is
+    // created, so the operator's process envelope must be resolved first.
+    const process_memory_resolution = resolveProcessMemoryBudget(
+        cli,
+        init.environ_map,
+    ) catch |err| {
+        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
+        return err;
+    };
+    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
     var storage_kernel_context = kernel_owner_client.Context{};
     defer if (control_only_storage_sources) storage_kernel_context.deinit();
     if (comptime control_only_storage_sources) {
-        try storage_kernel_context.ensureWith(.{
-            .storage_kind = if (lite_path != null) .lite else .directory,
-            .no_sync = @intFromBool(!lite_fsync),
-            .storage_path = .fromSlice(lite_path orelse ""),
-            .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+        try storage_kernel_context.ensureWithRuntime(.{
+            .context = .{
+                .storage_kind = if (lite_path != null) .lite else .directory,
+                .no_sync = @intFromBool(!lite_fsync),
+                .storage_path = .fromSlice(lite_path orelse ""),
+                .auth_storage_path = .fromSlice(if (auth_enabled) resolved.auth_store_root_dir else ""),
+            },
+            .memory_limit_bytes = process_memory_limit_bytes,
         });
         const security_json = try antfly.common.config.remoteContentSecurityJsonAlloc(alloc, remote_content);
         defer alloc.free(security_json);
@@ -4632,14 +4658,6 @@ pub fn runFromIterator(
     // implementation is code-generated in the inference archive and reached
     // through an opaque internal ABI; the shipped artifact remains one binary.
     const loaded_cfg = if (loaded_config) |*cfg| cfg else null;
-    const process_memory_resolution = resolveProcessMemoryBudget(
-        cli,
-        init.environ_map,
-    ) catch |err| {
-        std.log.err("invalid process memory budget; expected a MiB value representable on this platform", .{});
-        return err;
-    };
-    const process_memory_limit_bytes = process_memory_resolution.limit_bytes;
     const configured_preload = if (loaded_cfg) |cfg| cfg.inference.preload else &.{};
     const loaded_preload = if (cli.inference_preload_models.items.len == 0 and configured_preload.len != 0) blk: {
         const out = try alloc.alloc(inference_bridge.WarmModel, configured_preload.len);
@@ -12538,14 +12556,18 @@ test "standalone catalog remote apply outage preserves committed creation and re
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("pending") != null);
     try std.testing.expect(try metadata.lifecycle_store.?.standaloneRevision() > before_revision);
-    try std.testing.expectEqual(@as(u64, 0), metadata.durable_revision);
+    try std.testing.expectEqual(before_revision + 1, metadata.durable_revision);
+    try std.testing.expect(!metadata.catalog_durability_failed);
+    var committed_snapshot = try LocalStandaloneMetadata.catalogAdminSnapshot(&metadata);
+    defer LocalStandaloneMetadata.catalogFreeAdminSnapshot(&metadata, &committed_snapshot);
+    try std.testing.expect(committed_snapshot.tables.len > 0);
     const committed_lsn = primary.lastLsn();
     try std.testing.expect(committed_lsn != 0);
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.createTable(&metadata, alloc, "pending", .{}));
     // "pending" is a retry of an already-attempted mutation (ambiguous: it
     // may have landed before the outage). "not_committed" is a brand-new
-    // proposal that never reaches the log once catalog_durability_failed is
-    // set, so beginCatalogMutationLocked reports it as a known drop.
+    // proposal that never reaches the log while the durable outbox is pending,
+    // so beginCatalogMutationLocked reports it as a known drop.
     try std.testing.expectError(error.ProposalDropped, LocalStandaloneMetadata.createTable(&metadata, alloc, "not_committed", .{}));
     try std.testing.expect(metadata.findTableByNameLocked("not_committed") == null);
     try std.testing.expectEqual(committed_lsn, primary.lastLsn());

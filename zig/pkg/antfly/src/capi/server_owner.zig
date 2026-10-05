@@ -13,6 +13,8 @@
 // limitations.
 
 //! Private server storage-provider operations, separate from public C exports.
+const server_group_metadata = @import("../storage/server_group_metadata.zig");
+const server_document_child_range = @import("../storage/server_document_child_range.zig");
 pub const storage_root = @import("antfly_source_root");
 pub const antfly = @import("../capi_root.zig");
 const handles = @import("antfly_local_sources").capi_handles;
@@ -486,7 +488,7 @@ pub const StorageOwnerRuntimeHooks = struct {
         }
         const wire = kernel_owner_abi.CoordinatedTtlRequest{
             .table_id = request.table_id,
-            .group_id = request.group_id,
+            .group_id = self.group_id,
             .schema_version = request.schema_version,
             .ttl_duration_ns = request.ttl_duration_ns,
             .ttl_field = .fromSlice(request.ttl_field),
@@ -513,10 +515,21 @@ pub const StorageOwnerRuntimeHooks = struct {
 
     config: kernel_owner_abi.RuntimeHooksConfig,
     group_id: u64,
+    artifact_upload_recovery: @import("../storage/artifact_upload_recovery.zig").Scheduler = .{},
 
     pub fn artifactPublicationDispatcher(self: *StorageOwnerRuntimeHooks) ?db_mod.ArtifactPublicationDispatcher {
         if (self.config.artifact_publication_enqueue_fn == null) return null;
-        return .{ .ptr = self, .enqueue = enqueueArtifactPublication };
+        return .{ .ptr = self, .enqueue = enqueueArtifactPublication, .upload_recovery = .{ .recover = recoverArtifactUploads, .should_poll = shouldRecoverArtifactUploads } };
+    }
+
+    fn shouldRecoverArtifactUploads(ptr: *anyopaque, tick: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryTick) bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        return self.artifact_upload_recovery.shouldPoll(tick);
+    }
+
+    fn recoverArtifactUploads(ptr: *anyopaque, invocation: @import("antfly_local_sources").storage_db_artifact_publication.UploadRecoveryInvocation) !bool {
+        const self: *StorageOwnerRuntimeHooks = @ptrCast(@alignCast(ptr));
+        return self.artifact_upload_recovery.advance(self.artifactPublicationDispatcher().?, invocation);
     }
 
     pub fn enqueueArtifactPublication(ptr: *anyopaque, namespace: [24]u8, command: []const u8) !void {
@@ -884,8 +897,11 @@ pub fn storageOwnerContextMetrics(
     context: ?*anyopaque,
     out_result: *kernel_owner_abi.ContextMetricsResult,
 ) callconv(.c) kernel_owner_abi.Status {
-    out_result.* = .{};
     const owner_context = asStorageOwnerContext(context) orelse return .invalid_argument;
+    // The result has grown across ABI versions. Read only the leading version
+    // word, which every revision shares, and reject a caller built against
+    // another layout before writing: it may have reserved a smaller struct.
+    if (out_result.version != kernel_owner_abi.abi_version) return .invalid_abi;
     const stats = owner_context.resources.lsm_cache.snapshotStats();
     out_result.* = .{
         .lsm_cache_used_bytes = @intCast(stats.used_bytes),
@@ -896,6 +912,14 @@ pub fn storageOwnerContextMetrics(
         .lsm_run_table_block = storageOwnerContextCacheKindStats(stats.run_table_block),
         .lsm_run_table_physical_block = storageOwnerContextCacheKindStats(stats.run_table_physical_block),
     };
+    const resources = owner_context.resources.resource_manager.snapshot();
+    out_result.resource_memory = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(resources.memory);
+    comptime std.debug.assert(@import("antfly_local_sources").storage_resource_manager.slice_count <= kernel_owner_abi.context_resource_slice_capacity);
+    const slice_count = resources.slices.len;
+    out_result.resource_slice_count = @intCast(slice_count);
+    for (resources.slices[0..slice_count], out_result.resource_slices[0..slice_count]) |slice, *out| {
+        out.* = kernel_owner_abi.ContextResourceBudgetStats.fromResourceStats(slice);
+    }
     return .ok;
 }
 
@@ -3057,13 +3081,12 @@ pub fn storageOwnerLocalTransition(
 
 pub fn storageOwnerTargetAdvanced(
     ptr: *anyopaque,
-    table_name: []const u8,
-    group_id: u64,
-    _: ?*db_mod.DB,
     event: db_mod.QueryVisibilityEvent,
 ) void {
     if (event.change != .target_advanced) return;
     const handle: *Handle = @ptrCast(@alignCast(ptr));
+    const table_name = handle.storage_owner_table_name orelse "";
+    const group_id = handle.storage_owner_group_id;
     const observer = handle.storage_owner_target_observer;
     const notify = observer.notify orelse return;
     const identities_json = if (event.target_scope_known)
@@ -3304,11 +3327,9 @@ pub fn storageOwnerOpen(
     handle.db.local_execution.row_policy_authority_secret = owned_policy_secret;
     handle.db.local_execution.row_policy_authority_issuer = owned_policy_issuer;
     handle.db.local_execution.row_policy_table_name = owned_table_name;
-    if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort(), request.group_id);
+    if (runtime_hooks) |hooks| handle.db.setCoordinatedTtl(hooks.coordinatedTtlPort());
     if (request.target_observer.notify != null) handle.db.setQueryVisibilityHook(.{
         .ptr = handle,
-        .table_name = owned_table_name,
-        .group_id = request.group_id,
         .on_change = storageOwnerTargetAdvanced,
     });
     // Configuration can start DB-owned workers. Publish their pointers only
@@ -3707,7 +3728,7 @@ pub const StorageOwnerDocumentChildRangeDispatch = struct {
     callback_fn: kernel_owner_abi.DocumentChildRangeDispatchFn,
 
     pub fn dispatcher(self: *@This()) db_mod.DocumentArtifactChildRangeDispatcher {
-        return .{ .ptr = self, .apply = apply };
+        return .{ .ptr = self, .select_destination = server_document_child_range.selectPersistedDestination, .apply = apply };
     }
 
     pub fn apply(
@@ -5653,7 +5674,8 @@ pub fn storageOwnerRuntimeStatusJson(
     var status = runtime_status.LocalTableRuntimeStatus{
         .group_id = handle.storage_owner_group_id,
         .source_vectors = handle.db.sourceVectorStats() catch |err| return storageOwnerStatusFromError(err),
-        .created_at_millis = (handle.db.getGroupCreatedAtMillis(
+        .created_at_millis = (server_group_metadata.getGroupCreatedAtMillis(
+            &handle.db,
             handle.alloc,
             handle.storage_owner_group_id,
         ) catch null) orelse 0,

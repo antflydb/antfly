@@ -2292,20 +2292,18 @@ fn extractWriteFromParsedPrepared(
                     }
                     errdefer if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
 
-                    try graph_writes.append(alloc, .{
-                        .index_name = try alloc.dupe(u8, index_name),
-                        .source = try alloc.dupe(u8, key),
-                        .target = try alloc.dupe(u8, target_value.string),
-                        .edge_type = try alloc.dupe(u8, edge_type),
-                        .edge_id = if (edge_id.len > 0) try alloc.dupe(u8, edge_id) else "",
-                        .weight = if (edge_item.object.get("weight")) |weight_value|
-                            try jsonNumberToF64(weight_value)
-                        else
-                            1.0,
-                        .created_at = 0,
-                        .updated_at = 0,
+                    const borrowed: types.GraphEdgeWrite = .{
+                        .index_name = index_name,
+                        .source = key,
+                        .target = target_value.string,
+                        .edge_type = edge_type,
+                        .edge_id = edge_id,
+                        .weight = if (edge_item.object.get("weight")) |weight_value| try jsonNumberToF64(weight_value) else 1.0,
                         .metadata_json = metadata_json,
-                    });
+                    };
+                    try graph_writes.ensureUnusedCapacity(alloc, 1);
+                    graph_writes.appendAssumeCapacity(try borrowed.cloneAlloc(alloc));
+                    if (metadata_json.len > 0) alloc.free(@constCast(metadata_json));
                 }
             }
         }
@@ -2322,9 +2320,14 @@ fn extractWriteFromParsedPrepared(
                 .array, .string => {
                     const vector = try parseDenseEmbeddingValue(alloc, emb_value);
                     errdefer alloc.free(vector);
-                    try dense_embeddings.append(alloc, .{
-                        .index_name = try alloc.dupe(u8, index_name),
-                        .doc_key = try alloc.dupe(u8, key),
+                    try dense_embeddings.ensureUnusedCapacity(alloc, 1);
+                    const owned_index = try alloc.dupe(u8, index_name);
+                    errdefer alloc.free(owned_index);
+                    const owned_key = try alloc.dupe(u8, key);
+                    errdefer alloc.free(owned_key);
+                    dense_embeddings.appendAssumeCapacity(.{
+                        .index_name = owned_index,
+                        .doc_key = owned_key,
                         .vector = vector,
                     });
                 },
@@ -2334,9 +2337,14 @@ fn extractWriteFromParsedPrepared(
                         alloc.free(sparse_vec.indices);
                         alloc.free(sparse_vec.values);
                     }
-                    try sparse_embeddings.append(alloc, .{
-                        .index_name = try alloc.dupe(u8, index_name),
-                        .doc_key = try alloc.dupe(u8, key),
+                    try sparse_embeddings.ensureUnusedCapacity(alloc, 1);
+                    const owned_index = try alloc.dupe(u8, index_name);
+                    errdefer alloc.free(owned_index);
+                    const owned_key = try alloc.dupe(u8, key);
+                    errdefer alloc.free(owned_key);
+                    sparse_embeddings.appendAssumeCapacity(.{
+                        .index_name = owned_index,
+                        .doc_key = owned_key,
                         .indices = sparse_vec.indices,
                         .values = sparse_vec.values,
                     });
@@ -2355,17 +2363,31 @@ fn extractWriteFromParsedPrepared(
         break :blk try stringifyWithoutSpecialFieldsAlloc(alloc, root.object);
     } else if (borrow_original_json) @constCast(original_json) else try alloc.dupe(u8, original_json);
 
-    return .{
+    var result: ExtractedWrite = .{
         .cleaned_value = cleaned_value,
         .cleaned_value_owned = has_special_fields or !borrow_original_json,
-        .graph_writes = try graph_writes.toOwnedSlice(alloc),
-        .mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc),
-        .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
-        .sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc),
+        .graph_writes = &.{},
+        .mentioned_graph_indexes = &.{},
+        .dense_embeddings = &.{},
+        .sparse_embeddings = &.{},
     };
+    errdefer result.deinit(alloc);
+    result.graph_writes = try graph_writes.toOwnedSlice(alloc);
+    result.mentioned_graph_indexes = try mentioned_indexes.toOwnedSlice(alloc);
+    result.dense_embeddings = try dense_embeddings.toOwnedSlice(alloc);
+    result.sparse_embeddings = try sparse_embeddings.toOwnedSlice(alloc);
+    return result;
 }
 
 fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: []const u8) !?ExtractedWrite {
+    // This writer owns an allocating buffer; WriteFailed means OOM.
+    return extractWriteFastDenseEmbeddingsOnlyImpl(alloc, key, data) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn extractWriteFastDenseEmbeddingsOnlyImpl(alloc: Allocator, key: []const u8, data: []const u8) !?ExtractedWrite {
     var scanner = std.json.Scanner.initCompleteInput(alloc, data);
     defer scanner.deinit();
 
@@ -2425,12 +2447,15 @@ fn extractWriteFastDenseEmbeddingsOnly(alloc: Allocator, key: []const u8, data: 
     if (try scanner.next() != .end_of_document) return error.SyntaxError;
     if (!saw_embeddings) return null;
 
+    const cleaned_value = if (has_non_special_fields) try alloc.dupe(u8, cleaned_writer.writer.buffered()) else null;
+    errdefer if (cleaned_value) |value| alloc.free(value);
+    const owned_dense = try dense_embeddings.toOwnedSlice(alloc);
     dense_owned = true;
     return .{
-        .cleaned_value = if (has_non_special_fields) try alloc.dupe(u8, cleaned_writer.writer.buffered()) else null,
+        .cleaned_value = cleaned_value,
         .graph_writes = &.{},
         .mentioned_graph_indexes = &.{},
-        .dense_embeddings = try dense_embeddings.toOwnedSlice(alloc),
+        .dense_embeddings = owned_dense,
         .sparse_embeddings = &.{},
     };
 }
@@ -2514,11 +2539,12 @@ fn extractFastDenseEmbeddingsField(
         };
         errdefer alloc.free(vector);
 
-        try dense_embeddings.append(alloc, .{
-            .index_name = try alloc.dupe(u8, index_name),
-            .doc_key = try alloc.dupe(u8, key),
-            .vector = vector,
-        });
+        try dense_embeddings.ensureUnusedCapacity(alloc, 1);
+        const owned_index = try alloc.dupe(u8, index_name);
+        errdefer alloc.free(owned_index);
+        const owned_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(owned_key);
+        dense_embeddings.appendAssumeCapacity(.{ .index_name = owned_index, .doc_key = owned_key, .vector = vector });
     }
 }
 
@@ -2526,7 +2552,10 @@ fn parseFastDenseEmbeddingString(alloc: Allocator, scanner: *std.json.Scanner) !
     const value_token = try scanner.nextAlloc(alloc, .alloc_if_needed);
     defer freeJsonAllocatedToken(alloc, value_token);
     const value = jsonTokenSlice(value_token) orelse return error.InvalidEmbeddingField;
-    return vector_codec.decodePackedF32Base64Alloc(alloc, value) catch return error.InvalidEmbeddingField;
+    return vector_codec.decodePackedF32Base64Alloc(alloc, value) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.InvalidEmbeddingField,
+    };
 }
 
 fn parseFastDenseEmbeddingArray(alloc: Allocator, scanner: *std.json.Scanner) ![]f32 {
@@ -3787,7 +3816,10 @@ fn parseDenseEmbeddingValue(alloc: Allocator, value: std.json.Value) ![]f32 {
             }
             break :blk vector;
         },
-        .string => vector_codec.decodePackedF32Base64Alloc(alloc, value.string) catch return error.InvalidEmbeddingField,
+        .string => vector_codec.decodePackedF32Base64Alloc(alloc, value.string) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidEmbeddingField,
+        },
         else => error.InvalidEmbeddingField,
     };
 }
@@ -4024,6 +4056,14 @@ fn cloneWithoutSpecialFields(alloc: Allocator, root: std.json.Value) !std.json.V
 }
 
 fn stringifyWithoutSpecialFieldsAlloc(alloc: Allocator, object: std.json.ObjectMap) ![]u8 {
+    // This writer owns an allocating buffer; WriteFailed means OOM.
+    return stringifyWithoutSpecialFieldsAllocImpl(alloc, object) catch |err| switch (err) {
+        error.WriteFailed => error.OutOfMemory,
+        else => err,
+    };
+}
+
+fn stringifyWithoutSpecialFieldsAllocImpl(alloc: Allocator, object: std.json.ObjectMap) ![]u8 {
     var writer: std.Io.Writer.Allocating = .init(alloc);
     errdefer writer.deinit();
     try writer.writer.writeByte('{');
@@ -4205,7 +4245,8 @@ fn appendUniqueString(alloc: Allocator, list: *std.ArrayListUnmanaged([]u8), val
     for (list.items) |existing| {
         if (std.mem.eql(u8, existing, value)) return;
     }
-    try list.append(alloc, try alloc.dupe(u8, value));
+    try list.ensureUnusedCapacity(alloc, 1);
+    list.appendAssumeCapacity(try alloc.dupe(u8, value));
 }
 
 pub fn buildRelationalRowValueForSchemaFromParsedAlloc(

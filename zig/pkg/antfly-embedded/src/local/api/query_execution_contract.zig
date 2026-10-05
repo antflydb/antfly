@@ -3236,7 +3236,7 @@ pub fn parseStorageKernelDocumentArtifactManifestsResponse(alloc: std.mem.Alloca
 }
 
 pub fn encodeQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
-    return try encodeQueryRequestWithGraphWireMode(alloc, req, false, false);
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, false, false, false);
 }
 
 pub fn encodeQueryRequestWithGraphWireMode(
@@ -3244,6 +3244,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     req: db_mod.types.SearchRequest,
     allow_legacy_graph: bool,
     include_aggregations: bool,
+    preserve_projection: bool,
 ) ![]u8 {
     if (searchRequestHasUnserializableResolvedDocFilter(req)) return error.UnsupportedQueryRequest;
     if (req.dense != null and req.dense_queries.len > 0) return error.UnsupportedQueryRequest;
@@ -3276,7 +3277,7 @@ pub fn encodeQueryRequestWithGraphWireMode(
     // these fields, so retain them rather than emitting an invalid envelope.
     const requires_hierarchy_fields = req.hierarchy_children != null or
         req.hierarchy_grouped_matches or req.hierarchy_group_level == .unit;
-    if (!req.include_all_fields and (requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
+    if (!req.include_all_fields and (preserve_projection or requires_hierarchy_fields or !(req.include_stored and req.defer_stored_projection))) {
         try appendJsonFieldNames(alloc, &out, &first, "fields", req.fields);
     }
     if (req.highlight) |highlight| {
@@ -3464,12 +3465,18 @@ pub fn encodeQueryRequestWithGraphWireMode(
 }
 
 pub fn encodeStorageKernelQueryRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest) ![]u8 {
+    return try encodeStorageKernelQueryRequestForExecution(alloc, req, false);
+}
+
+pub fn encodeStorageKernelQueryRequestForExecution(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, raw_search_result: bool) ![]u8 {
     // The compiled storage boundary remains in-process and must preserve the
     // deprecated public graph dialect for single-group compatibility. Generic
     // inter-node shard forwarding continues to reject that stateful dialect.
     // Complete physical queries also own aggregation. Raw shard calls retain
     // these search semantics and defer finalization through execution options.
-    return try encodeQueryRequestWithGraphWireMode(alloc, req, true, true);
+    // A complete physical query also encodes the final public response. Its
+    // projection cannot be omitted as it is for coordinator-owned retrieval.
+    return try encodeQueryRequestWithGraphWireMode(alloc, req, true, true, !raw_search_result);
 }
 
 pub const StorageKernelLookupWireRequest = struct {

@@ -17,7 +17,7 @@
 //! RESTRICT leaves expired rows visible; each root is independent so a blocked
 //! parent does not starve unrelated expiration in the same scan page.
 const std = @import("std");
-const expiry = @import("antfly_local_sources").storage_coordinated_ttl;
+const expiry = @import("../storage/server_coordinated_ttl.zig");
 const catalog = @import("table_catalog.zig");
 const reads = @import("antfly_local_sources").api_table_read_source;
 const writes = @import("antfly_local_sources").api_table_write_source;

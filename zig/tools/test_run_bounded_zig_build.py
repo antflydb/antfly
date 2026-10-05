@@ -65,20 +65,27 @@ class BoundedZigBuildTest(unittest.TestCase):
         # only composes owners; testing it would couple this contract to file
         # layout instead of the scheduler claim used by the storage artifact.
         runtime_build = SCRIPT.parents[1] / "pkg/antfly/build/runtime_memory.zig"
-        build = runtime_build.read_text(encoding="utf-8")
         workflow = (SCRIPT.parents[2] / ".github/workflows/zig-tests.yml").read_text(
             encoding="utf-8"
         )
-        claim = re.search(
-            r"\.storage_kernel => (?P<gib>\d+) \* 1024 \* 1024 \* 1024",
-            build,
-        )
-        self.assertIsNotNone(
-            claim, "update this contract when storage claims change shape"
+        claim = subprocess.run(
+            [
+                os.environ.get("ZIG", "zig"),
+                "run",
+                "--dep",
+                "runtime_memory",
+                "-Mroot=tools/runtime_storage_compile_claim.zig",
+                f"-Mruntime_memory={runtime_build}",
+            ],
+            cwd=SCRIPT.parents[1],
+            check=True,
+            capture_output=True,
+            text=True,
         )
         # Physical storage is its own archive. The distributed reservation no
         # longer includes DB codegen and cannot establish this admission check.
-        required = int(claim.group("gib")) * 1024**3
+        required = int(claim.stderr.strip())
+        self.assertGreater(required, 0)
         caps = re.findall(r"--max-rss-cap (\d+)", workflow)
         self.assertTrue(caps)
         for cap in caps:

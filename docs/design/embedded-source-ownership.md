@@ -22,6 +22,18 @@ implemented by adapters. The local ports contain borrowed or captured write admi
 generation pinning, commit requirements, and publication/completion callbacks.
 Policy, waits, and telemetry stay in the server adapters; copied captures retain
 configuration by value while their pointer and slice targets remain borrowed.
+The local `storage/db/execution_resources.zig` owns the canonical shared execution
+state and result types. `local_mutation.zig` composes request preparation,
+authoritative commit, and derived materialization without runtime dispatch.
+Foreground writes and synchronous recovery share those operations; recovery
+borrows stable resources and owns only invocation scratch. DB retains opening,
+closing, snapshot admission, durable commit ordering, and resident scheduling.
+
+Server upload retry policy lives in `storage/artifact_upload_recovery.zig`.
+`server_coordinated_ttl.zig`, `server_query_visibility.zig`,
+`server_document_child_range.zig`, and `server_group_metadata.zig` own routing,
+placement, and group coordination. Embedded owns their local observations,
+durable outboxes, and borrowed integration ports, without importing these adapters.
 Backup artifact decoding and local restore staging are local operations;
 coordinated snapshot publication and cluster restore remain server operations.
 Table-drop cleanup fences are shared local contracts. Metadata protocol activation,

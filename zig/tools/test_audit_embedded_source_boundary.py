@@ -74,11 +74,38 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             "raft_applied_entry_marker",
             "HAMirrorUnavailable",
             "primary_ha",
+            "getGroupCreatedAtMillis",
+            "ensureGroupCreatedAtMillis",
         ):
             for path in (
                 "storage/db/replication_contract.zig",
                 "storage/db/commit_integration.zig",
                 "storage/db/db.zig",
+                "storage/db/index_repair_scheduler.zig",
+                "storage/db/graph_cleanup_owner.zig",
+                "storage/db/native_projection_owner.zig",
+                "storage/db/runtime_restart_owner.zig",
+                "storage/db/cleanup_job_owner.zig",
+                "storage/db/query_visibility.zig",
+                "storage/db/source_pin_cleanup_owner.zig",
+                "storage/db/applied_sequence_coalescer.zig",
+                "storage/db/document_collectors.zig",
+                "storage/db/owned_keys.zig",
+                "storage/db/graph_field_plan.zig",
+                "storage/db/replay_vector_collectors.zig",
+                "storage/db/relational_read_session.zig",
+                "storage/db/read_projection.zig",
+                "storage/db/local_mutation.zig",
+                "storage/db/execution_resources.zig",
+                "storage/db/mutation_preparation.zig",
+                "storage/db/mutation_commit.zig",
+                "storage/db/mutation_materialization.zig",
+                "storage/db/result_collectors.zig",
+                "storage/db/materialized_sources.zig",
+                "storage/db/graph_restore_materialization.zig",
+                "storage/db/status_projection.zig",
+                "storage/db/managed_admission_owner.zig",
+                "storage/db/publication_recovery_owner.zig",
             ):
                 with (
                     self.subTest(token=token, path=path),
@@ -112,6 +139,84 @@ class EmbeddedBoundaryTest(unittest.TestCase):
             self.assertEqual(
                 1, audit_modules(project, {"local": contract}, {}, "local")
             )
+
+    def test_visibility_hook_keeps_server_identity_outside_local_storage(self):
+        for field in ("table_name: []const u8", "group_id: u64", "db: *DB"):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    ValueError, "server routing in local visibility hook"
+                ),
+            ):
+                check_replication_contract(
+                    "storage/db/db.zig",
+                    f"pub const QueryVisibilityHook = struct {{\n    {field},\n}};",
+                )
+        check_replication_contract(
+            "storage/db/db.zig",
+            "pub const QueryVisibilityHook = struct {\n    ptr: *anyopaque,\n};",
+        )
+
+    def test_extracted_visibility_hook_rejects_server_identity(self):
+        for field in ("table_name: []const u8", "group_id: u64", "db: *DB"):
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(
+                    ValueError, "server routing in local visibility hook"
+                ),
+            ):
+                check_replication_contract(
+                    "storage/db/query_visibility.zig",
+                    f"pub const QueryVisibilityHook = struct {{\n    {field},\n}};",
+                )
+        check_replication_contract(
+            "storage/db/db.zig",
+            'pub const QueryVisibilityHook = @import("query_visibility.zig").QueryVisibilityHook;',
+        )
+
+    def test_real_visibility_hook_cannot_regain_server_fields(self):
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "pkg/antfly-embedded/src/local/storage/db/query_visibility.zig"
+        )
+        source = source_path.read_text()
+        declaration = "pub const QueryVisibilityHook = struct {"
+        self.assertIn(declaration, source)
+        for field in (
+            "group_id: u64 = 0,",
+            'table_name: []const u8 = "",',
+            "owner: ?*DB = null,",
+        ):
+            changed = source.replace(declaration, declaration + "\n    " + field, 1)
+            with (
+                self.subTest(field=field),
+                self.assertRaisesRegex(ValueError, "server routing"),
+            ):
+                check_replication_contract("storage/db/query_visibility.zig", changed)
+
+    def test_local_child_range_planning_rejects_server_destination_policy(self):
+        path = "storage/db/document_child_range_effects.zig"
+        for source in (
+            "const status = range.route_status;",
+            'const status = "remote_committed";',
+        ):
+            with (
+                self.subTest(source=source),
+                self.assertRaisesRegex(
+                    ValueError, "server child-range destination policy"
+                ),
+            ):
+                check_replication_contract(path, source)
+        check_replication_contract(
+            path, 'test "fixture" { const status = "remote_committed"; }'
+        )
+        check_replication_contract(
+            path, "const destination = selector.select(ptr, range);"
+        )
+        check_replication_contract(
+            "storage/server_document_child_range.zig",
+            'const status = "remote_committed";',
+        )
 
     def test_dynamic_imports_fail_closed(self):
         with self.assertRaisesRegex(ValueError, "literal source owner"):

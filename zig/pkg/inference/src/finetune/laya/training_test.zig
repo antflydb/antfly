@@ -450,7 +450,7 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
             for (result.decisions, 0..) |decision, i| {
                 const index = if (mixed) (iteration * batch + i) % tasks.len else 0;
                 for (decision.probabilities, ref.probabilities[index]) |actual, expected| try std.testing.expectApproxEqAbs(expected, actual, 5e-5);
-                try std.testing.expectApproxEqAbs(ref.act_probabilities[index], decision.act_probability, 5e-5);
+                try std.testing.expectApproxEqAbs(ref.act_probabilities[index], decision.act_probability.?, 5e-5);
             }
         }
         const resident_after = factory.layaResidentStats(session);
@@ -481,7 +481,7 @@ test "laya finetuned export probabilities and tokenization match PyTorch" {
                     worst = @max(worst, @abs(want - got));
                     try std.testing.expectApproxEqAbs(want, got, 5e-5);
                 }
-                try std.testing.expectApproxEqAbs(act, actual.act_probability, 5e-5);
+                try std.testing.expectApproxEqAbs(act, actual.act_probability.?, 5e-5);
             }
         }
     }

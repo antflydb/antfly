@@ -21,11 +21,45 @@
 //! duplicate, stale, or multiply-owned entries before any shard is compiled.
 
 comptime {
+    _ = @import("antfly_local_sources").storage_db_replay_vector_collectors;
+    _ = @import("antfly_local_sources").storage_db_owned_keys;
+    _ = @import("antfly_local_sources").storage_db_read_projection;
+    _ = @import("antfly_local_sources").storage_db_graph_field_plan;
+    _ = @import("antfly_local_sources").storage_db_managed_admission_owner;
+    _ = @import("antfly_local_sources").storage_db_result_collectors;
+    _ = @import("antfly_local_sources").storage_db_materialized_sources;
+    _ = @import("antfly_local_sources").storage_db_graph_restore_materialization;
+    _ = @import("antfly_local_sources").storage_db_status_projection;
+
+    _ = @import("antfly_local_sources").storage_db_document_collectors;
+    _ = @import("antfly_local_sources").storage_db_publication_recovery_owner;
+
+    _ = @import("antfly_local_sources").storage_db_embedding_activity_cache;
+    _ = @import("antfly_local_sources").storage_db_coalesced_job_admission;
+    _ = @import("antfly_local_sources").storage_db_dense_publication_admission;
+    _ = @import("antfly_local_sources").storage_db_local_runtime_owner;
+
+    _ = @import("antfly_local_sources").storage_db_index_repair_scheduler;
+    _ = @import("antfly_local_sources").storage_db_graph_cleanup_owner;
+    _ = @import("antfly_local_sources").storage_db_native_projection_owner;
+    _ = @import("antfly_local_sources").storage_db_runtime_restart_owner;
+    _ = @import("antfly_local_sources").storage_db_cleanup_job_owner;
+    _ = @import("antfly_local_sources").storage_db_query_visibility;
+    _ = @import("antfly_local_sources").storage_db_source_pin_cleanup_owner;
+    _ = @import("antfly_local_sources").storage_db_applied_sequence_coalescer;
+    _ = @import("antfly_local_sources").storage_db_bulk_ingest_session;
+    _ = @import("antfly_local_sources").storage_db_target_advance_tracker;
+    _ = @import("antfly_local_sources").storage_db_schema_reconcile_owner;
+    _ = @import("antfly_local_sources").storage_db_dense_catch_up_session_owner;
+    _ = @import("antfly_local_sources").storage_db_enrichment_runtime_owner;
+
     _ = @import("antfly_local_sources").storage_document_mutation_revision;
     _ = @import("antfly_local_sources").storage_db_graph_edge_types;
+    _ = @import("antfly_local_sources").storage_source_authority;
     _ = @import("antfly_local_sources").storage_db_apply_receipts;
     _ = @import("antfly_local_sources").storage_db_durable_outbox;
     _ = @import("antfly_local_sources").storage_db_durable_outbox_store;
+    _ = @import("antfly_local_sources").storage_db_primary_effect;
     _ = @import("antfly_local_sources").storage_db_replication_contract;
     _ = @import("antfly_local_sources").storage_db_replication_ingress;
     _ = @import("antfly_local_sources").storage_db_replication_effects;
@@ -75,7 +109,6 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_relational_row_cursor;
     _ = @import("antfly_local_sources").storage_db_relational_predicate;
     _ = @import("antfly_local_sources").storage_admission_waiter;
-    _ = @import("antfly_local_sources").storage_coordinated_ttl;
     _ = @import("restore_owner.zig");
     _ = @import("antfly_local_sources").storage_restore_decoder_cache;
     _ = @import("antfly_local_sources").storage_artifact_payload;
@@ -128,6 +161,8 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_ids;
     _ = @import("antfly_local_sources").storage_db_backfill_state;
     _ = @import("antfly_local_sources").storage_db_batcher;
+    _ = @import("antfly_local_sources").storage_db_lookup_key_scratch;
+    _ = @import("antfly_local_sources").storage_db_document_read_scratch;
     _ = @import("antfly_local_sources").storage_db_catalog_enrichment_catalog;
     _ = @import("antfly_local_sources").storage_db_catalog_index_manager;
     _ = @import("antfly_local_sources").storage_db_catalog_resolver_catalog;
@@ -276,7 +311,6 @@ comptime {
     _ = @import("hot_standby/replication_api.zig");
     _ = @import("hot_standby/replication_log.zig");
     _ = @import("antfly_local_sources").storage_db_replication_record;
-    _ = @import("antfly_local_sources").storage_db_primary_effect;
     _ = @import("hot_standby/seed_activation.zig");
     _ = @import("hot_standby/seed_artifact.zig");
     _ = @import("hot_standby/seed_capture.zig");
@@ -414,6 +448,13 @@ comptime {
     _ = @import("antfly_local_sources").storage_db_artifact_publication_owner;
     _ = @import("antfly_local_sources").storage_db_artifact_publication_resolution;
     _ = @import("antfly_local_sources").storage_db_artifact_publication_transport;
+    _ = @import("antfly_local_sources").storage_db_artifact_producer_scheduler;
+    _ = @import("antfly_local_sources").storage_db_publication_outbox_recovery;
+    _ = @import("antfly_local_sources").storage_db_document_child_range_manifest;
+    _ = @import("antfly_local_sources").storage_db_document_child_range_effects;
+    _ = @import("antfly_local_sources").storage_db_document_child_range_outbox;
+    _ = @import("antfly_local_sources").storage_db_quarantine_recovery;
+    _ = @import("antfly_local_sources").storage_db_independent_maintenance;
     _ = @import("antfly_local_sources").storage_db_artifact_publication_transport_codec;
     _ = @import("antfly_local_sources").storage_db_artifact_publication_wire;
     _ = @import("antfly_local_sources").storage_db_artifact_reconcile;

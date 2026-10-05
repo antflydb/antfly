@@ -662,6 +662,12 @@ pub const DenseReplayWindowBudgetOptions = struct {
     default_bytes: u64,
     max_bytes: u64,
     min_bytes: u64 = dense_replay_window_min_bytes,
+    working_set_factor: u64 = 1,
+};
+
+pub const DenseReplayWindowLimits = struct {
+    work_bytes: u64,
+    working_set_bytes: u64,
 };
 
 pub const DenseReplayWindowResult = struct {
@@ -1127,6 +1133,7 @@ pub const ResourceManager = struct {
     dense_physically_ordered_batches: @import("antfly_platform").atomic.Value(u64) = .init(0),
     dense_physically_ordered_requests: @import("antfly_platform").atomic.Value(u64) = .init(0),
     slices: [slice_count]MutableSlice,
+    /// Adaptive window size in original work units, independent of storage estimates.
     dense_replay_window_budget_bytes: u64 = 0,
     dense_replay_last_finish_ns: u64 = 0,
     dense_replay_last_write_pressure_ns: u64 = 0,
@@ -3192,6 +3199,24 @@ pub const ResourceManager = struct {
         return sliceStatsFromState(slice, state);
     }
 
+    /// Advisory headroom for sizing a bounded unit of work. Admission still
+    /// checks both limits atomically; concurrent users can consume this space.
+    /// Unlike snapshot(), this avoids collecting unrelated slice statistics.
+    pub fn availableAdmissionBytes(self: *ResourceManager, slice: Slice) u64 {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const state = self.slices[sliceIndex(slice)];
+        const slice_available = if (state.budget.hard_limit_bytes == 0)
+            std.math.maxInt(u64)
+        else
+            state.budget.hard_limit_bytes -| state.used_bytes;
+        const memory_available = if (self.memory.budget.hard_limit_bytes == 0)
+            std.math.maxInt(u64)
+        else
+            self.memory.budget.hard_limit_bytes -| self.memory.used_bytes;
+        return @min(slice_available, memory_available);
+    }
+
     /// Stable capacity, not momentary free space: durable transaction admission
     /// must not turn unrelated concurrent requests into permanent size limits.
     /// Zero means neither the node nor this slice has a hard limit.
@@ -3441,6 +3466,12 @@ pub const ResourceManager = struct {
     }
 
     pub fn denseReplayWindowBudget(self: *ResourceManager, options: DenseReplayWindowBudgetOptions) u64 {
+        return self.denseReplayWindowLimits(options).working_set_bytes;
+    }
+
+    /// Adapt in original work units. Scale only the memory estimate, then
+    /// cap it against the same live slice headroom under this lock.
+    pub fn denseReplayWindowLimits(self: *ResourceManager, options: DenseReplayWindowBudgetOptions) DenseReplayWindowLimits {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
@@ -3464,7 +3495,14 @@ pub const ResourceManager = struct {
 
         current = clampU64(current, options.min_bytes, cap);
         self.dense_replay_window_budget_bytes = current;
-        return current;
+        const factor = @max(@as(u64, 1), options.working_set_factor);
+        if (factor == 1) return .{ .work_bytes = current, .working_set_bytes = current };
+        const memory_cap = self.denseReplayWindowHardCapLocked(.{
+            .default_bytes = options.default_bytes *| factor,
+            .max_bytes = options.max_bytes *| factor,
+            .min_bytes = options.min_bytes,
+        });
+        return .{ .work_bytes = current, .working_set_bytes = @min(current *| factor, memory_cap) };
     }
 
     pub fn noteDenseReplayWindowResult(self: *ResourceManager, result: DenseReplayWindowResult) void {
@@ -3800,6 +3838,40 @@ pub const BudgetedAllocator = struct {
         free(ctx, memory, alignment, ret_addr);
     }
 
+    /// Operation-local raw allocation failure receipt, captured under the allocator lock.
+    /// Resize/remap refusals are advisory; a failed fallback alloc records its cause.
+    /// Shared owners' failures cannot misclassify this operation's backing OOM
+    /// as admission pressure. Storage remains owned by the original allocator.
+    pub const FailureTrackingAllocator = struct {
+        owner: *BudgetedAllocator,
+        last_failure: ?@FieldType(AllocationFailure, "cause") = null,
+
+        pub fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = trackedAlloc, .resize = trackedResize, .remap = trackedRemap, .free = trackedFree } };
+        }
+
+        fn trackedAlloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            lockAtomic(&self.owner.allocator_mutex);
+            defer self.owner.allocator_mutex.unlock();
+            const result = alloc(self.owner, len, alignment, ra);
+            self.last_failure = if (result == null) self.owner.last_allocation_failure.?.cause else null;
+            return result;
+        }
+        fn trackedResize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return lockedResize(self.owner, memory, alignment, new_len, ra);
+        }
+        fn trackedRemap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return lockedRemap(self.owner, memory, alignment, new_len, ra);
+        }
+        fn trackedFree(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            lockedFree(self.owner, memory, alignment, ra);
+        }
+    };
+
     pub fn denied(self: *const BudgetedAllocator) bool {
         return self.budget_denied;
     }
@@ -3839,6 +3911,12 @@ pub const BudgetedAllocator = struct {
         const bytes = self.reservation.bytes -| @max(self.live_bytes, @max(self.pinned_bytes, self.reservation_floor));
         self.reservation.shrink(bytes);
         return bytes;
+    }
+
+    pub fn releaseUnusedCreditThreadSafe(self: *BudgetedAllocator) u64 {
+        lockAtomic(&self.allocator_mutex);
+        defer self.allocator_mutex.unlock();
+        return self.releaseUnusedCredit();
     }
 
     fn recordDenial(self: *BudgetedAllocator) void {
@@ -4140,7 +4218,7 @@ fn sliceIndex(slice: Slice) usize {
     return @intFromEnum(slice);
 }
 
-fn pressureFor(budget: Budget, used_bytes: u64) Pressure {
+pub fn pressureFor(budget: Budget, used_bytes: u64) Pressure {
     if (budget.hard_limit_bytes > 0 and used_bytes > budget.hard_limit_bytes) return .hard;
     if (budget.soft_limit_bytes > 0 and used_bytes > budget.soft_limit_bytes) return .soft;
     return .normal;
@@ -6169,4 +6247,31 @@ test "resource manager replay skip snapshots clean up every allocation failure" 
     for ([_]usize{ 0, 1, 17 }) |index_count| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{index_count});
     }
+}
+
+test "source vector payloads scoped allocator receipts distinguish admission and backing across shared failures" {
+    const alloc = std.testing.allocator;
+    var budgets = Options.defaultBudgets();
+    budgets[@intFromEnum(Slice.dense_source_payload_state)] = .{ .hard_limit_bytes = 64 };
+    var manager = ResourceManager.init(.{ .budgets = budgets });
+    defer manager.deinit(alloc);
+    var budget = BudgetedAllocator.init(&manager, .dense_source_payload_state, alloc, 1);
+    defer budget.deinit();
+    var first: BudgetedAllocator.FailureTrackingAllocator = .{ .owner = &budget };
+    var second: BudgetedAllocator.FailureTrackingAllocator = .{ .owner = &budget };
+    var held = try manager.reserve(.dense_source_payload_state, 64);
+    defer held.release();
+    try std.testing.expectError(error.OutOfMemory, first.allocator().alloc(u8, 1));
+    try std.testing.expect(first.last_failure == .admission);
+    held.release();
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
+    budget.backing = failing.allocator();
+    try std.testing.expectError(error.OutOfMemory, second.allocator().alloc(u8, 1));
+    try std.testing.expect(second.last_failure == .backing);
+    try std.testing.expect(first.last_failure == .admission);
+    budget.backing = alloc;
+    const memory = try first.allocator().alloc(u8, 1);
+    // Allocations and frees are interchangeable with the original allocator.
+    budget.threadSafeAllocator().free(memory);
+    try std.testing.expect(first.last_failure == null);
 }

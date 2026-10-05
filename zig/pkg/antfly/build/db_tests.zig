@@ -117,7 +117,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .dependOn(&addFilteredTestRunArtifact(b, retirement_tests).step);
     const ordered_artifact_tests = b.addTest(.{
         .root_module = antfly_test_mod,
-        .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
+        .filters = &.{ "ordered artifact inventory", "storage.db.derived.apply_state", "artifact footprint", "artifact publication upload", "artifact publication compact transport", "db derived coverage snapshot", "db dense target reads atomic outcome and source coverage snapshot", "db dense target reads atomic artifact and source coverage snapshot", "online admission facts are unbound", "native source admission", "api module compiles", "metadata module compiles", "db lookup includes chunk artifacts", "db search includes chunk artifacts", "db scan includes chunk artifacts", "db lookup does not load chunks", "db lookup loads chunks" },
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/local/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-ordered-artifact-test", "Run ordered artifact inventory, wire, and durable owner regressions")

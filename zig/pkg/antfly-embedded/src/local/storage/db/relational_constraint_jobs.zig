@@ -217,7 +217,7 @@ pub const Page = struct {
         return .{ .arena = arena, .view = view, .namespace_generation = namespace_generation, .expected = expected, .next = progress, .failed_hash = failed_hash, .records_examined = inspected };
     }
 
-    /// Caller holds apply-exclusive and snapshot/HA mutation admission.
+    /// Caller holds apply-exclusive and snapshot/hot-standby mutation admission.
     pub fn commit(self: *Page, core: anytype) !void {
         if (self.consumed) return error.ConstraintPageConsumed;
         self.consumed = true;
