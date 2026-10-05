@@ -261,6 +261,11 @@ class Mix:
         )
 
 
+def label_index(names: list[str], label: Any) -> int:
+    """Antenna's loaders give label names; parquet sources give indices."""
+    return names.index(label) if isinstance(label, str) else int(label)
+
+
 def take(rng: random.Random, rows: list[Any], cap: int) -> list[Any]:
     rows = list(rows)
     rng.shuffle(rows)
@@ -290,7 +295,7 @@ def intent_source(
                 what.replace(" ", "_"),
                 instructions,
                 names,
-                int(row["label"]),
+                label_index(names, row["label"]),
             )
 
 
@@ -315,9 +320,9 @@ def build_massive(mix: Mix, cap: int) -> None:
                 "Classify the user's intent.",
             ],
             names,
-            int(row["label"]),
+            label_index(names, row["label"]),
         )
-        scenario = names[int(row["label"])].split(" ")[0]
+        scenario = names[label_index(names, row["label"])].split(" ")[0]
         mix.choice(
             "massive",
             group,
