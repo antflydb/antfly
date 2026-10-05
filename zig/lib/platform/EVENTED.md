@@ -19,6 +19,9 @@ Both compatibility backends clear the completed group's awaiter state on normal
 await, canceled await, and explicit cancel, allowing the same group to be reused.
 Repeated group cancellation preserves an existing join, including a parent
 receiving cancellation while joining children with cancellation protection.
+Protected group waits encode that protection in their atomic wait state: child
+work continues, and parent cancellation remains pending until protection is
+removed. Explicit group cancellation uses the same protected join state.
 Group child completion leaves the fiber stack before freeing it and waking its
 awaiter. Backend teardown also drains completion callbacks when a group token
 was already empty at join time. Contended Dispatch mutexes wake the next owner
@@ -27,7 +30,8 @@ and release reservations held by canceled waiters.
 The strict `zig build evented-enrichment-test` gate covers backend identity,
 group bookkeeping, parent cancellation while awaiting `std.Io.Group` children,
 reuse of a group after normal await, canceled await, and explicit cancel,
-parent cancellation during an in-progress group cancel,
+parent cancellation during an in-progress group cancel, protected group awaits
+with requests arriving before and after registration,
 sleeping tasks, immediate and delayed cancellation, repeated
 concurrent completion, positional file read/write, and file synchronization.
 The macOS gate additionally exercises contended stderr locks with canceled

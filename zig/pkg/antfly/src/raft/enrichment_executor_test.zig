@@ -185,3 +185,40 @@ test "Evented parent cancellation preserves an in-progress group cancel join" {
         try std.testing.expect(finished.load(.acquire));
     }
 }
+
+test "Evented protected group await finishes children and retains cancellation" {
+    if ((builtin.os.tag != .macos and builtin.os.tag != .linux) or !std.Io.fiber.supported)
+        return error.SkipZigTest;
+    var ev: Evented = undefined;
+    try ev.init(std.testing.allocator, .{});
+    defer ev.deinit();
+    const io = ev.io();
+    const Work = struct {
+        fn child(task_io: std.Io, completed: *std.atomic.Value(bool)) void {
+            task_io.sleep(.fromMilliseconds(200), .awake) catch return;
+            completed.store(true, .release);
+        }
+        fn parent(task_io: std.Io, ready: *std.Io.Event, completed: *std.atomic.Value(bool), before_await: bool) std.Io.Cancelable!void {
+            const old = task_io.swapCancelProtection(.blocked);
+            var group: std.Io.Group = .init;
+            group.async(task_io, child, .{ task_io, completed });
+            ready.set(task_io);
+            // Exercise cancellation both before and after registering the join.
+            if (before_await) task_io.sleep(.fromMilliseconds(30), .awake) catch unreachable;
+            group.await(task_io) catch unreachable;
+            _ = task_io.swapCancelProtection(old);
+            // Blocking notification must preserve the request for later.
+            try task_io.checkCancel();
+        }
+    };
+    for ([_]bool{ false, true }) |before_await| {
+        var ready: std.Io.Event = .unset;
+        var completed: std.atomic.Value(bool) = .init(false);
+        var parent = try io.concurrent(Work.parent, .{ io, &ready, &completed, before_await });
+        defer parent.cancel(io) catch {};
+        ready.waitUncancelable(io);
+        try io.sleep(.fromMilliseconds(10), .awake);
+        try std.testing.expectError(error.Canceled, parent.cancel(io));
+        try std.testing.expect(completed.load(.acquire));
+    }
+}

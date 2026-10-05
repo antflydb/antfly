@@ -202,6 +202,7 @@ const Fiber = struct {
         const Awaiting = enum(u31) {
             nothing = std.math.maxInt(u31),
             group = std.math.maxInt(u31) - 1,
+            group_blocked = std.math.maxInt(u31) - 2,
             /// An io_uring fd.
             _,
 
@@ -212,14 +213,14 @@ const Fiber = struct {
             fn fromIoUringFd(fd: fd_t) Awaiting {
                 const awaiting: Awaiting = @fromBackingInt(@intCast(fd));
                 switch (awaiting) {
-                    .nothing, .group => unreachable,
+                    .nothing, .group, .group_blocked => unreachable,
                     _ => return awaiting,
                 }
             }
 
             fn toIoUringFd(awaiting: Awaiting) fd_t {
                 switch (awaiting) {
-                    .nothing, .group => unreachable,
+                    .nothing, .group, .group_blocked => unreachable,
                     _ => return @backingInt(awaiting),
                 }
             }
@@ -393,7 +394,9 @@ const Fiber = struct {
         );
         assert(!cancel_status.requested);
         switch (cancel_status.awaiting) {
-            .nothing => {},
+            // Protected joins retain the request for the next cancellation
+            // point after protection is removed; their children keep running.
+            .nothing, .group_blocked => {},
             .group => {
                 // The awaiter received a cancelation request while awaiting a group,
                 // so propagate the cancelation to the group.
@@ -1677,7 +1680,11 @@ const Group = struct {
                 .fibers = .pack(new_head),
             }, .monotonic);
         } else if (@atomicLoad(Awaiter, group.awaiterPtr(), .monotonic).awaiter.unpack()) |awaiter| {
-            if (!awaiter.cancel_status.changeAwaiting(.group, .nothing) or list.cancel_requested) {
+            const awaiting = @atomicLoad(Fiber.CancelStatus, &awaiter.cancel_status, .monotonic).awaiting;
+            assert(awaiting == .group or awaiting == .group_blocked);
+            if (!awaiter.cancel_status.changeAwaiting(awaiting, .nothing) or
+                awaiting == .group_blocked or list.cancel_requested)
+            {
                 @atomicStore(List, list_ptr, .{
                     .cancel_requested = false,
                     .awaiter_delayed = false,
@@ -1705,7 +1712,13 @@ const Group = struct {
         group.lock(ev);
         defer group.unlock(ev);
         if (@atomicLoad(List, group.listPtr(), .monotonic).fibers.unpack()) |_| {
-            if (group.registerAwaiter(awaiter) and awaiter.cancel_protection.check() == .unblocked) {
+            // Publish protection with the atomic wait state so cancellation
+            // cannot race with the awaiter resuming and changing protection.
+            const awaiting: Fiber.CancelStatus.Awaiting = if (awaiter.cancel_protection.check() == .blocked)
+                .group_blocked
+            else
+                .group;
+            if (group.registerAwaiter(awaiter, awaiting) and awaiting == .group) {
                 // The awaiter already had an unacknowledged cancelation request before
                 // attempting to await a group, so propagate the cancelation to the group.
                 assert(!group.cancelLocked(ev, null));
@@ -1741,7 +1754,7 @@ const Group = struct {
                 fiber.requestCancel(ev);
                 maybe_fiber = fiber.link.group.next;
             }
-            if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter);
+            if (maybe_awaiter) |awaiter| _ = group.registerAwaiter(awaiter, .group_blocked);
             return false;
         }
         @atomicStore(
@@ -1754,7 +1767,7 @@ const Group = struct {
     }
 
     /// Assumes the mutex is held.
-    fn registerAwaiter(group: Group, awaiter: *Fiber) bool {
+    fn registerAwaiter(group: Group, awaiter: *Fiber, awaiting: Fiber.CancelStatus.Awaiting) bool {
         assert(awaiter.status.queue_next == null);
         awaiter.status = .{ .awaiting_group = group };
         assert(@atomicRmw(
@@ -1764,7 +1777,7 @@ const Group = struct {
             .{ .locked = false, .contended = false, .awaiter = .pack(awaiter) },
             .monotonic,
         ).awaiter == .null);
-        return awaiter.cancel_status.changeAwaiting(.nothing, .group);
+        return awaiter.cancel_status.changeAwaiting(.nothing, awaiting);
     }
 
     const AsyncClosure = struct {
