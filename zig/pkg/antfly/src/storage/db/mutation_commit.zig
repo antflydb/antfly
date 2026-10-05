@@ -1747,7 +1747,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             }
 
             const cleanup_contract = @import("../graph_cleanup_contract.zig");
-            const graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
+            var graph_lifecycle_generation: u64 = if (effective_req.graph_endpoint_cleanup or effective_req.graph_deletes.len != 0 or effective_req.deletes.len != 0 or
                 (std.mem.indexOfScalar(bool, derived_changed_flags, true) != null))
                 try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values)
             else
@@ -2038,6 +2038,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &owned_delete_keys,
             );
             defer self.alloc.free(deleted_artifact_keys);
+            // Native transfer pages can delete relationship artifacts without a
+            // document or tuple delete. Classify their prepared effects too, so
+            // every retirement receives this commit's nonzero lifecycle stamp.
+            if (graph_lifecycle_generation == 0) for (deleted_artifact_keys) |artifact| {
+                if (internal_keys.graphInlineTargetComponent(artifact) == null) continue;
+                graph_lifecycle_generation = try appendGraphLifecycleGeneration(self.alloc, self.core.store, if (opts.ordered_apply_receipt) |entry| entry.index else 0, &store_writes, &owned_store_values);
+                break;
+            };
             try appendGraphEndpointRetirements(self.alloc, self.core.store, graph_lifecycle_generation, effective_req.deletes, self.core.index_manager.hasGraphIndexes(), deleted_artifact_keys, &store_writes, &owned_store_keys, &owned_store_values);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.delete_artifacts_ns, delete_artifacts_start_ns);
 
