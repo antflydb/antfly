@@ -540,6 +540,7 @@ test "empty chunk input short-circuits without provider or remote dispatch" {
     // An unreachable endpoint proves nothing was dispatched: a request
     // would fail, an empty input returns zero chunks instead.
     const cfg = chunking_types.Config{
+        .provider = .antfly,
         .model = "fixed",
         .api_url = "http://127.0.0.1:1/ai/v1/chunk",
     };

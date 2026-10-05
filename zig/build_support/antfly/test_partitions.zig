@@ -231,8 +231,8 @@ fn partitionRun(b: *std.Build, artifact: *std.Build.Step.Compile, original: *std
     const run = std.Build.Step.Run.create(b, b.fmt("local {s}", .{original.step.name}));
     for (original.argv.items) |arg| switch (arg) {
         .bytes => |bytes| run.addArg(bytes),
-        .artifact => |value| run.addPrefixedArtifactArg(value.prefix, artifact),
-        .lazy_path => |value| run.addPrefixedFileArg(value.prefix, value.lazy_path),
+        .artifact => |value| run.addArtifactArg2(artifact, .{ .prefix = value.prefix, .suffix = value.suffix, .make_absolute = value.make_absolute }),
+        .lazy_path => |value| run.addFileArg2(value.lazy_path, .{ .prefix = value.prefix, .suffix = value.suffix, .make_absolute = value.make_absolute }),
         .passthru => run.addPassthruArgs(),
         else => @panic("unsupported local test wrapper argument"),
     };
