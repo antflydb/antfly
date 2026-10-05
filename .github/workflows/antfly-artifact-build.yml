@@ -48,6 +48,8 @@ jobs:
       build_controller_commit: ${{ steps.controller.outputs.commit }}
       python_build: ${{ steps.toolchain.outputs.python_build }}
       zig_version: ${{ steps.toolchain.outputs.zig_version }}
+      zig_nix_attribute: ${{ steps.toolchain.outputs.zig_nix_attribute }}
+      zig_nixpkgs_revision: ${{ steps.toolchain.outputs.zig_nixpkgs_revision }}
       zig_x86_64_linux_sha256: ${{ steps.toolchain.outputs.zig_x86_64_linux_sha256 }}
       macos_cross_sdk_version: ${{ steps.toolchain.outputs.macos_cross_sdk_version }}
       macos_cross_sdk_sha256: ${{ steps.toolchain.outputs.macos_cross_sdk_sha256 }}
@@ -132,12 +134,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential clang lld curl xz-utils git perl python3 linux-libc-dev ca-certificates file
 
-      - name: Install official Zig release
+      - name: Install Nix
         if: ${{ matrix.os == 'linux' }}
-        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31
         with:
-          version: ${{ needs.release-plan.outputs.zig_version }}
-          use-cache: false
+          nix_path: nixpkgs=https://github.com/NixOS/nixpkgs/archive/${{ needs.release-plan.outputs.zig_nixpkgs_revision }}.tar.gz
+
+      - name: Install glibc-linked Zig
+        if: ${{ matrix.os == 'linux' }}
+        env:
+          ZIG_VERSION: ${{ needs.release-plan.outputs.zig_version }}
+          ZIG_NIX_ATTRIBUTE: ${{ needs.release-plan.outputs.zig_nix_attribute }}
+        run: |
+          zig_path="$(nix-build '<nixpkgs>' -A "$ZIG_NIX_ATTRIBUTE" --no-out-link)"
+          test "$("$zig_path/bin/zig" version)" = "$ZIG_VERSION"
+          compiler_description="$(file "$zig_path/bin/zig")"
+          echo "$compiler_description"
+          grep -q 'dynamically linked' <<<"$compiler_description"
+          echo "$zig_path/bin" >> "$GITHUB_PATH"
 
       - name: Install pinned macOS cross-compilation SDK
         if: ${{ matrix.macos_sdk == 'true' }}

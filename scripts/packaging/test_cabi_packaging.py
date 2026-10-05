@@ -124,8 +124,13 @@ class CAbiPackagingTests(unittest.TestCase):
         bootstrap = job.split("      - name: Render formula", 1)[0]
         self.assertIn("uses: actions/setup-python@", bootstrap)
         self.assertIn("steps.toolchain.outputs.python_build", bootstrap)
+        self.assertIn("uses: cachix/install-nix-action@", bootstrap)
+        self.assertIn("steps.toolchain.outputs.zig_nixpkgs_revision", bootstrap)
+        self.assertIn("steps.toolchain.outputs.zig_nix_attribute", bootstrap)
         self.assertIn("steps.toolchain.outputs.zig_version", bootstrap)
-        self.assertIn("uses: mlugg/setup-zig@", bootstrap)
+        self.assertIn("nix-build '<nixpkgs>' -A " + '"$ZIG_NIX_ATTRIBUTE"', bootstrap)
+        self.assertIn('echo "$zig_path/bin" >> "$GITHUB_PATH"', bootstrap)
+        self.assertIn("grep -q 'dynamically linked'", bootstrap)
 
     def test_linux_abi_release_contract_stays_consistent(self) -> None:
         installer = (REPO_ROOT / "scripts" / "install.sh").read_text()
