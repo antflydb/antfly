@@ -239,6 +239,7 @@ pub const Stream = struct {
     failed: bool = false,
     pending_columns: ?*PendingColumns = null,
     pending_index: usize = 0,
+    delivery_error: ?anyerror = null,
 
     /// Caller retains the compiled plan and backend until close. A null result
     /// selects the bounded materializing executor for unsupported shapes or
@@ -262,6 +263,7 @@ pub const Stream = struct {
         self.failed = false;
         self.pending_columns = null;
         self.pending_index = 0;
+        self.delivery_error = null;
         self.settings = null;
         errdefer if (self.settings) |view| view.deinit();
         const arena = self.arena.allocator();
@@ -573,6 +575,7 @@ pub const Stream = struct {
     /// The pending page owns projected values, so the scan can advance without
     /// exposing borrowed vectors to a portal or retaining an entire result.
     fn pullColumns(self: *Stream, max_rows: u32) !Page {
+        if (self.delivery_error) |err| return err;
         var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer arena.deinit();
         const a = arena.allocator();
@@ -581,7 +584,13 @@ pub const Stream = struct {
         var bytes: usize = 0;
         while (rows.items.len < max_rows and !self.exhausted) {
             if (self.pending_columns == null) {
-                self.pending_columns = try self.executeColumns(self.context.limits.execution_batch_rows);
+                self.pending_columns = self.executeColumns(self.context.limits.execution_batch_rows) catch |err| {
+                    if (rows.items.len == 0) return err;
+                    self.delivery_error = err;
+                    if (self.cursor) |cursor| cursor.close(cursor.ptr);
+                    self.cursor = null;
+                    break;
+                };
                 self.pending_index = 0;
                 // Execution may have reached EOF while delivery still has rows.
                 self.exhausted = false;
@@ -626,7 +635,7 @@ pub const Stream = struct {
     fn pull(self: *Stream, max_rows: u32) !Page {
         try self.context.checkpoint();
         if (self.spool) |spool| return self.pullSpool(spool, max_rows);
-        if (self.pending_columns != null or self.columnsEligible()) return self.pullColumns(max_rows);
+        if (self.delivery_error != null or self.pending_columns != null or self.columnsEligible()) return self.pullColumns(max_rows);
         var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer arena.deinit();
         const out = arena.allocator();
@@ -884,36 +893,37 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
     }
 }
 
+const NativeColumns = struct {
+    fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
+        const fixture: *Fixture = @ptrCast(@alignCast(raw));
+        fixture.opened += 1;
+        return .{ .ptr = raw, .next = Fixture.next, .next_columns = nextColumns, .close = Fixture.close };
+    }
+    fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, wanted: u32) !catalog.ColumnPage {
+        const fixture: *Fixture = @ptrCast(@alignCast(raw));
+        fixture.calls += 1;
+        const count = @min(wanted, fixture.count - fixture.offset);
+        const values = try alloc.alloc(i64, count);
+        const refs = try alloc.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
+        const selected = try alloc.alloc(usize, count);
+        for (values, refs, selected, 0..) |*value, *ref, *index, i| {
+            value.* = @intCast(fixture.offset + i);
+            ref.* = .{ .relational_key = "r" };
+            index.* = i;
+        }
+        const columns = try alloc.alloc(@import("../storage/rowsource/types.zig").ColumnVector, 1);
+        columns[0] = .{ .name = "n", .values = .{ .i64 = values } };
+        fixture.offset += count;
+        return .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = refs, .columns = columns }, .selection = selected, .after = if (fixture.offset < fixture.count) "more" else null };
+    }
+};
+
 test "SQL native execution batches drain small delivery pages without rescan" {
     const a = std.testing.allocator;
-    const Columns = struct {
-        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
-            const fixture: *Fixture = @ptrCast(@alignCast(raw));
-            fixture.opened += 1;
-            return .{ .ptr = raw, .next = Fixture.next, .next_columns = nextColumns, .close = Fixture.close };
-        }
-        fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, wanted: u32) !catalog.ColumnPage {
-            const fixture: *Fixture = @ptrCast(@alignCast(raw));
-            fixture.calls += 1;
-            const count = @min(wanted, fixture.count - fixture.offset);
-            const values = try alloc.alloc(i64, count);
-            const refs = try alloc.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
-            const selected = try alloc.alloc(usize, count);
-            for (values, refs, selected, 0..) |*value, *ref, *index, i| {
-                value.* = @intCast(fixture.offset + i);
-                ref.* = .{ .relational_key = "r" };
-                index.* = i;
-            }
-            const columns = try alloc.alloc(@import("../storage/rowsource/types.zig").ColumnVector, 1);
-            columns[0] = .{ .name = "n", .values = .{ .i64 = values } };
-            fixture.offset += count;
-            return .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = refs, .columns = columns }, .selection = selected, .after = if (fixture.offset < fixture.count) "more" else null };
-        }
-    };
     var fixture: Fixture = .{ .count = 1200 };
     var backend = fixture.backend();
     var vtable = backend.vtable.*;
-    vtable.open_scan = Columns.open;
+    vtable.open_scan = NativeColumns.open;
     backend.vtable = &vtable;
     var compiled = try compiler.compile(a, "SELECT n + 1 FROM docs WHERE n >= 0", .{});
     defer compiled.deinit();
@@ -941,30 +951,6 @@ test "SQL native execution batches drain small delivery pages without rescan" {
 
 test "SQL native execution batches retain successful prefixes before semantic errors" {
     const a = std.testing.allocator;
-    const Columns = struct {
-        fn open(raw: *anyopaque, _: std.mem.Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
-            const fixture: *Fixture = @ptrCast(@alignCast(raw));
-            fixture.opened += 1;
-            return .{ .ptr = raw, .next = Fixture.next, .next_columns = nextColumns, .close = Fixture.close };
-        }
-        fn nextColumns(raw: *anyopaque, alloc: std.mem.Allocator, wanted: u32) !catalog.ColumnPage {
-            const fixture: *Fixture = @ptrCast(@alignCast(raw));
-            fixture.calls += 1;
-            const count = @min(wanted, fixture.count - fixture.offset);
-            const values = try alloc.alloc(i64, count);
-            const refs = try alloc.alloc(@import("../storage/rowsource/types.zig").RowRef, count);
-            const selected = try alloc.alloc(usize, count);
-            for (values, refs, selected, 0..) |*value, *ref, *index, i| {
-                value.* = @intCast(fixture.offset + i);
-                ref.* = .{ .relational_key = "r" };
-                index.* = i;
-            }
-            const columns = try alloc.alloc(@import("../storage/rowsource/types.zig").ColumnVector, 1);
-            columns[0] = .{ .name = "n", .values = .{ .i64 = values } };
-            fixture.offset += count;
-            return .{ .batch = .{ .snapshot = .{ .table_id = "t", .snapshot_id = "s" }, .row_refs = refs, .columns = columns }, .selection = selected, .after = if (fixture.offset < fixture.count) "more" else null };
-        }
-    };
     for ([_][]const u8{
         "SELECT 1 / (1 - n) FROM docs",
         "SELECT n FROM docs WHERE 1 / (1 - n) > 0",
@@ -973,7 +959,7 @@ test "SQL native execution batches retain successful prefixes before semantic er
         var fixture: Fixture = .{ .count = 2 };
         var backend = fixture.backend();
         var vtable = backend.vtable.*;
-        if (native) vtable.open_scan = Columns.open;
+        if (native) vtable.open_scan = NativeColumns.open;
         backend.vtable = &vtable;
         var compiled = try compiler.compile(a, sql, .{});
         defer compiled.deinit();
@@ -986,4 +972,24 @@ test "SQL native execution batches retain successful prefixes before semantic er
         try std.testing.expectError(error.SqlDivisionByZero, stream.next(1));
         try std.testing.expectEqual(@as(usize, 1), fixture.closed);
     };
+}
+
+test "SQL native delivery retains prefixes across execution batch boundaries" {
+    const a = std.testing.allocator;
+    var fixture: Fixture = .{ .count = 2 };
+    var backend = fixture.backend();
+    var vtable = backend.vtable.*;
+    vtable.open_scan = NativeColumns.open;
+    backend.vtable = &vtable;
+    var compiled = try compiler.compile(a, "SELECT 1 / (1 - n) FROM docs", .{});
+    defer compiled.deinit();
+    const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .execution_batch_rows = 1, .page_rows = 256 })).?;
+    defer stream.close();
+    var page = try stream.next(2);
+    defer page.deinit();
+    try std.testing.expectEqual(@as(usize, 1), page.output.rows.len);
+    try std.testing.expectEqual(@as(i64, 1), page.output.rows[0][0].integer);
+    try std.testing.expect(!page.exhausted);
+    try std.testing.expectError(error.SqlDivisionByZero, stream.next(2));
+    try std.testing.expectEqual(@as(usize, 1), fixture.closed);
 }

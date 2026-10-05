@@ -257,6 +257,17 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     )
                 ]
                 assert seen == list(reversed(range(count)))
+                # Native execution may evaluate ahead of wire delivery. A later
+                # bad lane must follow the valid prefix, including after restart.
+                rows = cursor.stream(
+                    "SELECT 1 / (1 - amount) FROM lake_events", size=1
+                )
+                assert next(rows) == (1,)
+                with pytest.raises(psycopg.errors.DivisionByZero):
+                    next(rows)
+                cursor.execute("SELECT COUNT(*) FROM lake_events")
+                assert cursor.fetchone() == (count,)
+
         # LIMIT must not fail because speculative lookahead sees an oversized
         # later page; consuming that page must still enforce the decode budget.
         large_root = tmp_path / "large_pages"
