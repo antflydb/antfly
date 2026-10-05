@@ -348,6 +348,21 @@ def test_parquet_attachment_survives_restart_and_streams_over_pgwire(
                     else (9007199254740993 + i % 3, (i % 3) * 0.5 + 0.25)
                     for i in range(count)
                 ]
+                # Repeated exact numerics survive a blocking derived relation,
+                # downstream predicate evaluation, sorting, and portal slicing.
+                retained_numeric = list(
+                    cursor.stream(
+                        "SELECT exact, measure + 0.25 FROM "
+                        "(SELECT amount, exact, measure FROM lake_events ORDER BY amount) q "
+                        "WHERE exact = 9007199254740994 ORDER BY amount DESC",
+                        size=13,
+                    )
+                )
+                assert retained_numeric == [
+                    (9007199254740994, 0.75)
+                    for i in reversed(range(count))
+                    if i % 3 == 1 and i % 7 != 0
+                ]
                 cursor.execute(
                     "SELECT exact, COUNT(*), SUM(measure) FROM lake_events "
                     "WHERE exact IS NOT NULL GROUP BY exact ORDER BY exact"

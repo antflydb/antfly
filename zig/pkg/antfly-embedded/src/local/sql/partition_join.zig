@@ -34,6 +34,9 @@ pub const Join = struct {
     manager: *spill.Manager,
     limits: operators.HashJoin.Limits,
     partitions: usize,
+    workspace_bytes: usize,
+    build_cost: [16]usize = @splat(0),
+    probe_cost: [16]usize = @splat(0),
     outer_left: bool,
     outer_right: bool,
     build: [16]?spill.Sequential = @splat(null),
@@ -131,15 +134,50 @@ pub const Join = struct {
         }
         return null;
     }
+    fn largestPartition(self: *const Join) ?usize {
+        var chosen: ?usize = null;
+        var largest: usize = 0;
+        for (0..self.partitions) |index| {
+            if (self.build[index] == null and self.probes[index] == null) continue;
+            const cost = self.build_cost[index] +| self.probe_cost[index];
+            if (chosen == null or cost > largest) {
+                chosen = index;
+                largest = cost;
+            }
+        }
+        return chosen;
+    }
+    fn finishInputs(self: *Join) !void {
+        if (self.finished) return;
+        for (&self.build) |*file| if (file.*) |*open| try open.seal();
+        for (&self.probes) |*file| if (file.*) |*open| try open.seal();
+        if (self.parallel_builds) {
+            var useful: usize = 0;
+            var largest: usize = 0;
+            for (0..self.partitions) |index| {
+                useful += @intFromBool(self.build[index] != null or self.probes[index] != null);
+                largest = @max(largest, self.build_cost[index]);
+            }
+            var lanes = @min(self.build_lanes, @max(1, useful));
+            // A prepared lookahead can coexist with the active lane. Reduce
+            // fan-out before forcing a partition that fits alone to spill again.
+            while (lanes > 1 and largest > self.workspace_bytes / (lanes + 1)) lanes -= 1;
+            self.build_lanes = lanes;
+            self.parallel_builds = useful != 0 and largest <= self.workspace_bytes / (lanes + 1);
+            self.limits.bytes = @max(8192, if (self.parallel_builds) self.workspace_bytes / (lanes + 1) else self.workspace_bytes);
+        }
+        self.finished = true;
+    }
     fn startBuilds(self: *Join) !void {
         for (self.prepared[0..self.build_lanes], self.preparing[0..self.build_lanes]) |*slot, *task| {
             if (slot.* != null) continue;
             while (self.partition < self.partitions) {
-                const index = self.partition;
+                const index = self.largestPartition() orelse {
+                    self.partition = self.partitions;
+                    break;
+                };
                 self.partition += 1;
-                if (self.build[index] == null and self.probes[index] == null) continue;
-                const child = try Join.create(self.a, self.manager, self.limits.bytes, self.limits.rows, 0, self.outer_left, self.outer_right);
-                child.parallel_builds = false;
+                const child = try Join.createWithLanes(self.manager, self.limits.bytes, self.limits.rows, 0, self.outer_left, self.outer_right, 1, true);
                 child.evaluation = self.evaluation;
                 child.partitions = 0;
                 child.finished = true;
@@ -196,11 +234,8 @@ pub const Join = struct {
     /// Null means EOF or a scheduler fallback; next() handles either case.
     pub fn nextTypedBatch(self: *Join, maximum: usize) !?@import("parallel_output.zig").Pipe.View {
         if (!self.parallel_builds or self.evaluation == null) return null;
-        if (!self.finished) {
-            for (&self.build) |*file| if (file.*) |*open| try open.seal();
-            for (&self.probes) |*file| if (file.*) |*open| try open.seal();
-            self.finished = true;
-        }
+        try self.finishInputs();
+        if (!self.parallel_builds) return null;
         while (true) {
             if (self.active_join) |child| {
                 const pipe = child.output orelse return null;
@@ -233,6 +268,11 @@ pub const Join = struct {
     }
     pub fn create(backing: A, manager: *spill.Manager, bytes: usize, rows: usize, build_bytes: u64, outer_left: bool, outer_right: bool) !*Join {
         _ = backing;
+        return createWithLanes(manager, bytes, rows, build_bytes, outer_left, outer_right, null, false);
+    }
+    // Child workspaces are already assigned by the parent. Serial children
+    // use that allowance directly rather than reserving imaginary siblings.
+    fn createWithLanes(manager: *spill.Manager, bytes: usize, rows: usize, build_bytes: u64, outer_left: bool, outer_right: bool, requested_lanes: ?usize, assigned: bool) !*Join {
         const a = manager.allocator();
         const self = try a.create(Join);
         errdefer a.destroy(self);
@@ -241,8 +281,8 @@ pub const Join = struct {
         const target = @max(@as(usize, 1), bytes / 16);
         const wanted = @min(@as(u64, 16), @max(@as(u64, 2), build_bytes / target + 1));
         const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
-        const lanes = @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
-        self.* = .{ .a = a, .manager = manager, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, bytes / (lanes + 1)), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 and lanes >= 2 };
+        const lanes = requested_lanes orelse @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
+        self.* = .{ .a = a, .manager = manager, .workspace_bytes = bytes, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, if (assigned) bytes else bytes / (lanes + 1)), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 and lanes >= 2 };
         return self;
     }
     pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {
@@ -329,6 +369,10 @@ pub const Join = struct {
             slot.*.?.buffer_bytes = @max(128, @min(4096, self.limits.bytes / 128));
         }
         _ = try slot.*.?.append(.{ .values = values, .keys = keys, .ordinal = ordinal }, spill.none);
+        const costs = if (build) &self.build_cost else &self.probe_cost;
+        costs[partition] +|= @sizeOf(operators.Row);
+        for (values) |value| costs[partition] +|= try operators.datumBytes(value);
+        for (keys) |value| costs[partition] +|= try operators.datumBytes(value);
     }
     pub fn accept(self: *Join, index: usize) !void {
         if (self.active_join) |child| return child.accept(index);
@@ -454,11 +498,7 @@ pub const Join = struct {
         return true;
     }
     pub fn next(self: *Join) anyerror!?Pair {
-        if (!self.finished) {
-            for (&self.build) |*file| if (file.*) |*open| try open.seal();
-            for (&self.probes) |*file| if (file.*) |*open| try open.seal();
-        }
-        self.finished = true;
+        try self.finishInputs();
         if (self.parallel_builds) return self.nextParallel();
         _ = self.candidate.reset(.{ .retain_with_limit = @min(8192, self.limits.bytes / 32) });
         while (try self.prepare()) {
@@ -734,4 +774,30 @@ test "SQL review regression oversized identical-key partition preserves forward 
     var matches: usize = 0;
     while (try join.next()) |_| matches += 1;
     try std.testing.expectEqual(@as(usize, 20000), matches);
+}
+
+test "SQL partition join child keeps its assigned workspace and prioritizes largest work" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const child = try Join.createWithLanes(&manager, 1024 * 1024, 10000, 0, false, false, 1, true);
+    defer child.close();
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), child.limits.bytes);
+    try std.testing.expect(!child.parallel_builds);
+    child.build[0] = try spill.Sequential.init(&manager, 128);
+    child.build[1] = try spill.Sequential.init(&manager, 128);
+    child.build_cost[0] = 100;
+    child.build_cost[1] = 200;
+    try std.testing.expectEqual(@as(?usize, 1), child.largestPartition());
+    child.probe_cost[0] = 1000;
+    try std.testing.expectEqual(@as(?usize, 0), child.largestPartition());
+    child.parallel_builds = true;
+    child.build_lanes = 8;
+    child.build_cost[1] = 700 * 1024;
+    try child.finishInputs();
+    try std.testing.expect(!child.parallel_builds);
+    try std.testing.expectEqual(@as(usize, 1024 * 1024), child.limits.bytes);
 }

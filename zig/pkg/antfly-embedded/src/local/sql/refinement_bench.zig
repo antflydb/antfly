@@ -695,3 +695,52 @@ test "native refinements benchmark dictionary expression results" {
         std.debug.print("native_refinement {{\"case\":\"dictionary_expression\",\"rows\":4096,\"unique\":32,\"sample\":{d},\"expanded_ns\":{d},\"encoded_ns\":{d},\"expanded_peak_bytes\":{d},\"encoded_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, encoded.ns, expanded.peak, encoded.peak });
     }
 }
+
+fn leasedResultDelivery(leased: bool, sorted: bool) !struct { ns: i96, peak: usize, checksum: i64 } {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 16 * 1024 * 1024 };
+    const a = budget.allocator();
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const Cursor = @import("result_cursor.zig").Cursor;
+    const cursor = try Cursor.create(a, &manager, 3);
+    defer cursor.close();
+    var top = try operators.TopK.initWithSpill(a, 4096, &.{.{}}, 256 * 1024, &manager);
+    defer top.deinit();
+    const payload: [1024]u8 = @splat('x');
+    for (0..4096) |index| {
+        const key = Datum.json(.{ .integer = @intCast(if (sorted) 4095 - index else index) });
+        const values = &.{ key, Datum.json(.{ .string = &payload }), Datum{} };
+        if (sorted) try top.add(.{ .values = values, .keys = &.{key}, .ordinal = index }) else try Cursor.append(cursor, values);
+    }
+    if (sorted) try Cursor.takeSorted(cursor, &top, 0, 4096, false);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const start = now();
+    var checksum: i64 = 0;
+    while (cursor.index < cursor.count()) {
+        _ = arena.reset(.free_all);
+        if (!leased) {
+            const store = try cursor.nextBatch(arena.allocator(), 137, 256 * 1024);
+            defer store.deinit();
+            for (0..store.len) |row| checksum += (try store.cell(a, row, 0)).value.integer;
+            continue;
+        }
+        const page = try cursor.nextLease(arena.allocator(), 137, 256 * 1024);
+        defer page.deinit();
+        for (0..page.values.len()) |row| checksum += (try page.values.cell(a, row, 0)).value.integer;
+    }
+    return .{ .ns = now() - start, .peak = budget.peak, .checksum = checksum };
+}
+test "native pipeline refinements benchmark leased blocking delivery" {
+    for ([_]bool{ false, true }) |sorted| for (0..3) |sample| {
+        const before = try leasedResultDelivery(false, sorted);
+        const after = try leasedResultDelivery(true, sorted);
+        try std.testing.expectEqual(before.checksum, after.checksum);
+        try std.testing.expectEqual(@as(i64, 8386560), after.checksum);
+        std.debug.print("native_refinement {{\"case\":\"leased_result_delivery\",\"sorted\":{},\"rows\":4096,\"sample\":{d},\"gather_ns\":{d},\"lease_ns\":{d},\"gather_peak_bytes\":{d},\"lease_peak_bytes\":{d}}}\n", .{ sorted, sample, before.ns, after.ns, before.peak, after.peak });
+    };
+}

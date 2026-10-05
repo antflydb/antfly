@@ -34,12 +34,12 @@ pub const BatchPage = struct {
     exhausted: bool,
     lease: ?*PendingColumns = null,
     row_page: ?Page = null,
-    retained_owner: ?*@import("typed_store.zig").Store = null,
+    spill_lease: ?Spool.Lease = null,
 
     pub fn deinit(self: *BatchPage) void {
         if (self.lease) |lease| lease.deinit();
         if (self.row_page) |*page| page.deinit();
-        if (self.retained_owner) |store| store.deinit();
+        if (self.spill_lease) |lease| lease.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -624,20 +624,20 @@ pub const Stream = struct {
                 return null;
             }
             const owner = try self.budget.allocator().create(Spool);
-            errdefer self.budget.allocator().destroy(owner);
-            owner.manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
-            owner.shared = backend.spill_manager;
+            owner.* = .{
+                .manager = .{ .alloc = self.budget.allocator(), .io = backend.execution_io orelse backend.spill_manager.?.io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) },
+                .shared = backend.spill_manager,
+                .a = self.budget.allocator(),
+                .width = binding.columns.len,
+                .rows = undefined,
+            };
             const manager = owner.shared orelse &owner.manager;
-            errdefer if (owner.shared == null) owner.manager.deinit();
-            owner.a = self.budget.allocator();
-            owner.width = binding.columns.len;
-            owner.rows = try @import("spill.zig").Sequential.init(manager, @max(128, @min(32 * 1024, limits.retained_bytes / 64)));
-            errdefer owner.rows.close();
-            owner.index = 0;
-            owner.sorted = null;
-            owner.sorted_rows = &.{};
-            owner.sorted_offset = 0;
-            owner.sorted_count = 0;
+            owner.rows = @import("spill.zig").Sequential.init(manager, @max(128, @min(32 * 1024, limits.retained_bytes / 64))) catch |err| {
+                if (owner.shared == null) owner.manager.deinit();
+                self.budget.allocator().destroy(owner);
+                return err;
+            };
+            errdefer owner.close();
             self.context.spill = manager;
             self.context.sink = .{ .ptr = owner, .append = Spool.append, .take_sorted = Spool.takeSorted };
             self.context.limits.result_rows = limits.scan_rows;
@@ -770,10 +770,10 @@ pub const Stream = struct {
         var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer arena.deinit();
         if (self.spool) |spool| {
-            const values = try spool.nextBatch(arena.allocator(), max_rows, self.context.limits.page_bytes);
-            self.emitted += values.len;
+            const lease = try spool.nextLease(arena.allocator(), max_rows, self.context.limits.page_bytes);
+            self.emitted += lease.values.len();
             self.exhausted = spool.index == spool.count();
-            return .{ .arena = arena, .columns = self.context.binding.columns, .values = .{ .retained = .{ .store = values, .count = values.len } }, .exhausted = self.exhausted, .retained_owner = values };
+            return .{ .arena = arena, .columns = self.context.binding.columns, .values = lease.values, .exhausted = self.exhausted, .spill_lease = lease };
         }
         if (!(self.pending_columns != null or self.columnsEligible())) {
             var page = try self.pull(max_rows);
@@ -852,6 +852,11 @@ pub const Stream = struct {
         return .{ .arena = arena, .exhausted = self.exhausted, .output = .{ .columns = self.context.binding.columns, .rows = rows[0..read], .sql_nulls = flags[0..read], .command_tag = "SELECT" } };
     }
     fn columnProgram(self: *Stream, a: std.mem.Allocator, program: *const @import("scalar.zig").Program, page: catalog.ColumnPage) ![]const @import("scalar.zig").Datum {
+        if (try @import("vector_eval.zig").evaluateDictionaryColumns(a, program, page, self.context.binding.scalars.columns, self.context.parameters)) |encoded| {
+            const values = try a.alloc(@import("scalar.zig").Datum, encoded.len());
+            for (values, 0..) |*value, index| value.* = try encoded.cell(a, index, 0);
+            return values;
+        }
         if (try @import("vector_eval.zig").evaluateColumnsScheduled(a, program, page, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io)) |values| return values;
         const values = try a.alloc(@import("scalar.zig").Datum, page.selection.len);
         var scratch = std.heap.ArenaAllocator.init(self.budget.allocator());
@@ -1381,7 +1386,7 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
             if (typed) {
                 var result = try stream.nextBatch(7);
                 defer result.deinit();
-                try std.testing.expect(result.values == .retained);
+                try std.testing.expect(result.values == .rows or result.values == .reader);
                 try std.testing.expect(result.values.len() <= 7);
                 for (0..result.values.len()) |row| {
                     if (expected == 1000) try std.testing.expectEqual(@as(i64, @intCast(999 - seen)), (try result.values.cell(result.arena.allocator(), row, 0)).value.integer);
@@ -2130,5 +2135,31 @@ fn retainedDeliveryAllocationScenario(a: std.mem.Allocator) !void {
 test "SQL retained delivery releases leases on every allocation failure" {
     // Initialize shared compiler/kernel caches before measuring allocations.
     try retainedDeliveryAllocationScenario(std.testing.allocator);
-    try std.testing.checkAllAllocationFailures(std.testing.allocator, retainedDeliveryAllocationScenario, .{});
+    // In-place arena growth depends on heap layout. Disable it so every
+    // allocation failure is exercised with the same deterministic sequence.
+    var fixed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(fixed.allocator(), retainedDeliveryAllocationScenario, .{});
+}
+
+test "SQL blocking result pages remain valid after terminal stream failure" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "SELECT n FROM docs ORDER BY n DESC",
+        "SELECT n, row_number() OVER (ORDER BY n) FROM docs ORDER BY n",
+    }, [_]i64{ 999, 0 }) |sql, expected| {
+        var compiled = try compiler.compile(a, sql, .{});
+        defer compiled.deinit();
+        var fixture: Fixture = .{ .count = 1000 };
+        var backend = fixture.backend();
+        backend.execution_io = std.testing.io;
+        const stream = (try Stream.open(a, backend, &compiled, &.{}, .{ .retained_bytes = 2 * 1024 * 1024 })).?;
+        defer stream.close();
+        var first = try stream.nextBatch(7);
+        defer first.deinit();
+        try std.testing.expectEqual(expected, (try first.values.cell(a, 0, 0)).value.integer);
+        try std.testing.expectEqual(error.SqlDivisionByZero, stream.fail(error.SqlDivisionByZero));
+        try std.testing.expect(stream.spool == null);
+        try std.testing.expectError(error.SqlStreamFailed, stream.nextBatch(7));
+        try std.testing.expectEqual(expected, (try first.values.cell(a, 0, 0)).value.integer);
+    }
 }

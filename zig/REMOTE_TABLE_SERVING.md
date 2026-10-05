@@ -61,7 +61,12 @@ public row reads, and sidecar builders accept these representations. Predicate
 and dynamic-filter evaluation reuse dictionary results within each physical page.
 Supported single-input SQL expressions evaluate only referenced dictionary entries
 and retain an encoded intermediate; high-cardinality, lazy and external-function
-expressions use the existing typed/scalar fallbacks.
+expressions use the existing typed/scalar fallbacks. SQL scan predicates use the
+same dictionary kernels. Retained integer and float columns sample cardinality
+without allocating; repeated values use dictionaries and a later high-cardinality
+suffix returns to flat storage. Representation IDs preserve exact integers, float
+bit patterns and SQL NULL separately. Downstream expressions reuse these retained
+dictionaries through selection and slicing. Unique numeric columns stay flat.
 Logical timestamp conversion currently retains its expanded numeric path.
 
 Spilled joins admit borrowed blocks into typed hash state and reuse bounded
@@ -76,14 +81,20 @@ at their spooling boundary. SQL NULL remains separate from JSON null, and dateti
 conversion occurs at encoding. Retained pages must be released before their stream
 closes. Stateless HTTP SELECT encodes these leased columns directly into its bounded,
 atomic response envelope. NULL flags use one bit per cell during encoding;
-integers retain exact decimal-string wire values. Blocking results gather into
-typed delivery columns rather than JSON row/null matrices. Active transactions,
+integers retain exact decimal-string wire values. Blocking delivery leases decoded
+sequential spill blocks and final sort-merge blocks. Pages gather row descriptors
+and retain each distinct block once, without cloning payloads into another column
+store. Sorted page admission accounts for decoded block capacity as well as logical
+result bytes. In-memory sorted rows remain owned by the bounded sort after the
+first leased page; scalar/batch mixing cannot reclaim rows held by earlier pages.
+A page retains its cursor through terminal error cleanup. Active transactions,
 mutations and declined streaming shapes retain their existing result path.
 Operational remote index/materialization selection remains open.
 
 Native partial aggregate handoff uses the `AGS` version 1 binary state codec.
-Its signature binds aggregate kind, input type and DISTINCT semantics; native
-count, i128 sum, compensation and mean fields avoid decimal parsing. Typed
+Its signature uses frozen explicit kind/type IDs, independent of enum declaration
+order, and binds DISTINCT semantics. Native count, i128 sum, compensation and
+mean fields avoid decimal parsing. Typed
 variable payloads retain extrema, DISTINCT membership, pattern NULL and JSON
 NULL separately. All signatures decode before group import. This codec does
 not by itself publish a reusable remote materialization.
@@ -99,13 +110,23 @@ Scan, join and group partition workers choose useful fan-out from shared schedul
 capacity and their total workspace allowance, up to eight concurrent lanes.
 Ordered scan delivery, bounded credits, inline fallback and cancellation remain
 part of the contract. Concurrent statements share admission; planned fan-out is
-advisory and every submitted task still acquires its own lease.
+advisory and every submitted task still acquires its own lease. Spilled joins
+measure partition costs during ingestion, start larger pending partitions first,
+and reduce concurrency when a larger workspace avoids another spill. A child
+uses its assigned allowance directly; it does not divide that allowance again.
 
 The ReleaseSafe wide 100,000-by-100,000 spilled join benchmark produces the same
-aggregate checksum with approximately 0.70 million backing allocations, compared
-with approximately 1.37 million at PR979's reviewed head. These local timings are
-not a cross-machine throughput guarantee. Run `zig build sql-native-pipeline-bench
+aggregate checksum with approximately 0.366 million backing allocations, compared
+with 1.244–1.278 million at branch head `479e4af31` before these changes. The
+new sample retains roughly 9.70 MB of peak statement workspace. Build concurrency
+varied during timing samples, so allocation counts are the useful comparison.
+These local timings are not a cross-machine throughput guarantee. Run `zig build sql-native-pipeline-bench
 -Doptimize=ReleaseSafe` to reproduce allocation and peak-memory measurements.
+The recorded [workspace and lease samples](bench/baselines/native-lake-workspace-and-leases.json)
+include source hashes and the comparison against the reviewed branch. Sequential
+leases reduce delivery work in that fixture. Sorted timings overlap, and leases
+retain more decoded memory than gathering into a small dictionary; decoded-capacity
+admission keeps each page bounded. These are separate tradeoffs from join admission.
 
 ## Query and index UX
 

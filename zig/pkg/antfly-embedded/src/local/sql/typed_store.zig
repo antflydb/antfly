@@ -58,11 +58,96 @@ const Dictionary = struct {
         return if (self.flat) |values| values.items[row] else self.values.items[self.indices.items[row]];
     }
 };
+// Sample once; retain repeated numeric values by ID without penalizing unique
+// keys with a hash lookup on every subsequent append. Float bit patterns keep
+// signed zero and NaN payloads distinct at this physical ownership boundary.
+fn Numeric(comptime T: type) type {
+    return struct {
+        flat: std.ArrayList(T) = .empty,
+        values: std.ArrayList(T) = .empty,
+        indices: std.ArrayList(u32) = .empty,
+        lookup: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+        encoded: bool = false,
+        sampled: bool = false,
+        const empty: @This() = .{};
+        fn key(value: T) u64 {
+            return @bitCast(value);
+        }
+        fn deinit(self: *@This(), a: A) void {
+            self.flat.deinit(a);
+            self.values.deinit(a);
+            self.indices.deinit(a);
+            self.lookup.deinit(a);
+        }
+        fn get(self: @This(), row: usize) T {
+            return if (self.encoded) self.values.items[self.indices.items[row]] else self.flat.items[row];
+        }
+        fn resize(self: *@This(), a: A, count: usize) !void {
+            try self.flat.resize(a, count);
+            @memset(self.flat.items, 0);
+        }
+        fn encodeOne(self: *@This(), a: A, value: T) !void {
+            const slot = try self.lookup.getOrPut(a, key(value));
+            if (!slot.found_existing) {
+                slot.value_ptr.* = @intCast(self.values.items.len);
+                try self.values.append(a, value);
+            }
+            try self.indices.append(a, slot.value_ptr.*);
+        }
+        fn repeatedSample(self: *const @This()) bool {
+            var keys: [512]u64 = undefined;
+            var used: [8]u64 = @splat(0);
+            var count: usize = 0;
+            for (self.flat.items[0..256]) |value| {
+                const bits = key(value);
+                var slot: usize = @intCast((bits *% 0x9e3779b97f4a7c15) >> 55);
+                while (true) : (slot = (slot + 1) & 511) {
+                    const mask = @as(u64, 1) << @as(u6, @intCast(slot % 64));
+                    if (used[slot / 64] & mask == 0) {
+                        used[slot / 64] |= mask;
+                        keys[slot] = bits;
+                        count += 1;
+                        if (count > 128) return false;
+                        break;
+                    }
+                    if (keys[slot] == bits) break;
+                }
+            }
+            return true;
+        }
+        fn append(self: *@This(), a: A, value: T) !void {
+            if (!self.sampled and self.flat.items.len >= 256 and !@call(.never_inline, repeatedSample, .{self})) self.sampled = true;
+            if (!self.sampled and self.flat.items.len >= 256) {
+                // Build a candidate before publishing its representation.
+                var candidate: @This() = .{ .sampled = true, .encoded = true };
+                errdefer candidate.deinit(a);
+                for (self.flat.items) |prior| try candidate.encodeOne(a, prior);
+                self.sampled = true;
+                if (candidate.values.items.len <= self.flat.items.len / 2) {
+                    self.flat.deinit(a);
+                    self.* = candidate;
+                } else candidate.deinit(a);
+            }
+            if (self.encoded and self.values.items.len >= 512 and self.values.items.len > self.indices.items.len / 2) {
+                var flat: std.ArrayList(T) = .empty;
+                errdefer flat.deinit(a);
+                try flat.ensureTotalCapacity(a, self.indices.items.len + 1);
+                for (self.indices.items) |id| flat.appendAssumeCapacity(self.values.items[id]);
+                self.values.clearAndFree(a);
+                self.indices.clearAndFree(a);
+                self.lookup.clearAndFree(a);
+                self.flat = flat;
+                self.encoded = false;
+            }
+            if (self.encoded) try self.encodeOne(a, value) else try self.flat.append(a, value);
+        }
+    };
+}
 const Column = struct {
     const Values = union(enum) {
         unknown,
-        integers: std.ArrayList(i64),
-        numbers: std.ArrayList(f64),
+        integers: Numeric(i64),
+        numbers: Numeric(f64),
         booleans: std.ArrayList(bool),
         strings: Dictionary,
         decimals: Dictionary,
@@ -87,8 +172,8 @@ const Column = struct {
         _ = a;
         const value: std.json.Value = switch (self.values) {
             .unknown => return error.InvalidSqlBackendResponse,
-            .integers => |v| .{ .integer = v.items[row] },
-            .numbers => |v| .{ .float = v.items[row] },
+            .integers => |v| .{ .integer = v.get(row) },
+            .numbers => |v| .{ .float = v.get(row) },
             .booleans => |v| .{ .bool = v.items[row] },
             .strings => |v| .{ .string = v.getText(row) },
             .decimals => |v| .{ .number_string = v.getText(row) },
@@ -118,6 +203,7 @@ const Column = struct {
             switch (self.values) {
                 .unknown => unreachable,
                 .strings, .decimals => |*values| try values.resizeNulls(a, row),
+                inline .integers, .numbers => |*values| try values.resize(a, row),
                 inline else => |*values| {
                     try values.resize(a, row);
                     @memset(values.items, switch (@typeInfo(@TypeOf(values.items)).pointer.child) {
@@ -180,6 +266,19 @@ pub const Store = struct {
     }
     /// Conservative admission estimate that recognizes already retained
     /// dictionary bytes. Capacity growth is still enforced by the allocator.
+    /// Representation identity for expression reuse, including a distinct NULL
+    /// lane. No semantic comparison or coercion is implied by dictionary IDs.
+    pub fn dictionaryId(self: *const Store, row_index: usize, column: usize) !?u64 {
+        if (row_index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
+        const stored = self.columns[column];
+        if (stored.patterns.items.len != 0) return null;
+        const id: u32 = switch (stored.values) {
+            inline .integers, .numbers => |v| if (v.encoded) v.indices.items[row_index] else return null,
+            .strings, .decimals => |v| if (v.flat == null) v.indices.items[row_index] else return null,
+            else => return null,
+        };
+        return if (stored.isNull(row_index)) 0 else @as(u64, id) + 1;
+    }
     pub fn appendBytes(self: *const Store, values: []const Datum) !usize {
         var bytes: usize = 0;
         for (values, 0..) |value, index| {
@@ -275,8 +374,8 @@ pub const Store = struct {
             // Dispatch on the retained physical type, without constructing a
             // Datum or invoking JSON comparison for homogeneous primitive keys.
             const equal_ = switch (stored.values) {
-                .integers => |v| if (value.value == .integer) v.items[row_index] == value.value.integer else null,
-                .numbers => |v| if (value.value == .float and std.math.isFinite(v.items[row_index]) and std.math.isFinite(value.value.float)) v.items[row_index] == value.value.float else null,
+                .integers => |v| if (value.value == .integer) v.get(row_index) == value.value.integer else null,
+                .numbers => |v| if (value.value == .float and std.math.isFinite(v.get(row_index)) and std.math.isFinite(value.value.float)) v.get(row_index) == value.value.float else null,
                 .booleans => |v| if (value.value == .bool) v.items[row_index] == value.value.bool else null,
                 .strings => |v| if (value.value == .string) std.mem.eql(u8, v.getText(row_index), value.value.string) else null,
                 else => null,
@@ -357,4 +456,31 @@ fn batchAllocationScenario(a: A) !void {
 }
 test "SQL retained column batch promotion unwinds every allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, batchAllocationScenario, .{});
+}
+
+fn numericRetentionScenario(a: A) !void {
+    var store = Store.init(a);
+    defer store.deinit();
+    for (0..1024) |row| _ = try store.append(&.{
+        if (row % 7 == 0) Datum{} else Datum.json(.{ .integer = 9007199254740993 + @as(i64, @intCast(row % 3)) }),
+        Datum.json(.{ .float = if (row % 2 == 0) -0.0 else 2.5 }),
+    });
+    try std.testing.expect(store.columns[0].values.integers.encoded);
+    try std.testing.expect(store.columns[1].values.numbers.encoded);
+    for (0..1024) |row| {
+        const value = try store.cell(a, row, 0);
+        try std.testing.expectEqual(row % 7 == 0, value.sql_null);
+        if (!value.sql_null) try std.testing.expectEqual(9007199254740993 + @as(i64, @intCast(row % 3)), value.value.integer);
+        if (row % 2 == 0) try std.testing.expect(std.math.signbit((try store.cell(a, row, 1)).value.float));
+    }
+    // A later high-cardinality suffix returns to flat storage safely.
+    for (0..4096) |row| _ = try store.append(&.{ Datum.json(.{ .integer = @intCast(row) }), Datum.json(.{ .float = @floatFromInt(row) }) });
+    try std.testing.expect(!store.columns[0].values.integers.encoded);
+    try std.testing.expectEqual(@as(i64, 4095), (try store.cell(a, store.len - 1, 0)).value.integer);
+}
+test "SQL retained numeric dictionaries preserve exact values nulls and allocation failure ownership" {
+    // Force allocate/copy growth so the exhaustive fault sequence does not
+    // depend on whether the backing allocator happens to grow in place.
+    var fixed = std.testing.FailingAllocator.init(std.testing.allocator, .{ .resize_fail_index = 0 });
+    try std.testing.checkAllAllocationFailures(fixed.allocator(), numericRetentionScenario, .{});
 }

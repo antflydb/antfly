@@ -821,6 +821,37 @@ pub const Sequential = struct {
     }
 
     pub const Block = struct { rows: []const Row, following: u64 };
+    pub const OwnedBlock = struct {
+        a: Allocator,
+        arena: std.heap.ArenaAllocator,
+        rows: []const Row,
+        refs: std.atomic.Value(usize) = .init(1),
+        pub fn retain(self: *OwnedBlock) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
+        }
+        pub fn release(self: *OwnedBlock) void {
+            if (self.refs.fetchSub(1, .acq_rel) != 1) return;
+            const a = self.a;
+            self.arena.deinit();
+            a.destroy(self);
+        }
+    };
+    /// Transfer a decoded arena without copying its cell payloads. The file
+    /// retains only its forward physical offset; the lease owns this block.
+    pub fn readOwnedBlock(self: *Sequential, offset: u64) !*OwnedBlock {
+        const a = self.file.manager.allocator();
+        const owner = try a.create(OwnedBlock);
+        errdefer a.destroy(owner);
+        const block = try self.readBatchBorrowed(offset, 256);
+        // Typed block descriptors already belong to the transferred arena.
+        // Only the legacy single-row descriptor lives inline in Sequential.
+        const rows = if (self.read_rows.len != 0) block.rows else try self.read_arena.allocator().dupe(Row, block.rows);
+        owner.* = .{ .a = a, .arena = self.read_arena, .rows = rows };
+        self.read_arena = .init(a);
+        self.read_rows = &.{};
+        self.read_single_offset = null;
+        return owner;
+    }
     /// A span of the current decoded block. It expires when another block is
     /// loaded; retaining operators admit the whole span before advancing.
     pub fn readBatchBorrowed(self: *Sequential, offset: u64, maximum: usize) !Block {
@@ -849,6 +880,9 @@ pub const Sort = struct {
     run_levels: [32]u8 = @splat(0),
     outputs: [8]?Sequential = @splat(null),
     heads: [8]?Decoded = @splat(null),
+    owned_heads: [8]?*Sequential.OwnedBlock = @splat(null),
+    owned_positions: [8]usize = @splat(0),
+    leased_reads: bool = false,
     head_arenas: [8]std.heap.ArenaAllocator = undefined,
     output_count: usize = 0,
     max_row_bytes: usize = 0,
@@ -925,6 +959,7 @@ pub const Sort = struct {
             job.destroy();
             self.pending_run = null;
         }
+        for (self.owned_heads) |block| if (block) |owner| owner.release();
         self.arena.deinit();
         self.rows.deinit(self.a);
         for (&self.runs) |*run| if (run.*) |*file| file.close();
@@ -1249,7 +1284,67 @@ pub const Sort = struct {
     pub fn nextValues(self: *Sort, a: Allocator) !?Row {
         return self.nextImpl(a, false);
     }
+    pub const RowLease = struct {
+        row: Row,
+        block: ?*Sequential.OwnedBlock = null,
+        pub fn release(self: RowLease) void {
+            if (self.block) |block| block.release();
+        }
+    };
+    /// Sorted delivery holds decoded run blocks through the transport page.
+    /// Only row descriptors are gathered; wide payload bytes remain in place.
+    pub fn nextLeased(self: *Sort) !?RowLease {
+        try self.finish();
+        if (!self.leased_reads) {
+            for (self.heads[0..self.output_count], 0..) |head, index| if (head) |value| {
+                self.owned_heads[index] = try self.outputs[index].?.readOwnedBlock(value.following - 1);
+                self.owned_positions[index] = 0;
+            };
+            self.leased_reads = true;
+        }
+        var selected: ?usize = null;
+        for (self.heads[0..self.output_count], 0..) |head, index| if (head) |value| {
+            if (selected == null or (try operators.compareRows(value.row, self.heads[selected.?].?.row, self.orders)) == .lt) selected = index;
+        };
+        if (selected) |index| {
+            const head = self.heads[index].?;
+            const owner = self.owned_heads[index].?;
+            owner.retain();
+            errdefer owner.release();
+            self.owned_positions[index] += 1;
+            if (self.owned_positions[index] == owner.rows.len) {
+                self.owned_heads[index] = null;
+                owner.release();
+                if (head.following < self.outputs[index].?.size) {
+                    self.owned_heads[index] = try self.outputs[index].?.readOwnedBlock(head.following);
+                    self.owned_positions[index] = 0;
+                }
+            }
+            self.heads[index] = if (self.owned_heads[index]) |block| blk: {
+                var row = block.rows[self.owned_positions[index]];
+                row.normalized = @import("sort_key.zig").encode(row.keys, self.orders);
+                break :blk .{ .row = row, .next = none, .matched = false, .following = head.following + 1 };
+            } else null;
+            return .{ .row = head.row, .block = owner };
+        }
+        if (self.offset < self.rows.items.len) {
+            const row = self.rows.items[@intCast(self.offset)];
+            self.offset += 1;
+            return .{ .row = row };
+        }
+        return null;
+    }
     fn nextImpl(self: *Sort, a: Allocator, retain_keys: bool) !?Row {
+        if (self.leased_reads) {
+            const lease = (try self.nextLeased()) orelse return null;
+            defer lease.release();
+            const row = lease.row;
+            const values = try a.alloc(Datum, row.values.len);
+            for (row.values, values) |value, *out| out.* = try operators.cloneDatum(a, value);
+            const keys: []Datum = if (retain_keys) try a.alloc(Datum, row.keys.len) else &.{};
+            for (keys, row.keys[0..keys.len]) |*out, value| out.* = try operators.cloneDatum(a, value);
+            return .{ .values = values, .keys = keys, .ordinal = row.ordinal };
+        }
         try self.finish();
         if (self.output_count != 0) {
             var selected: ?usize = null;

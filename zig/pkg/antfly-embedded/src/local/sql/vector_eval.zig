@@ -32,10 +32,22 @@ pub fn evaluateDictionaryColumns(a: std.mem.Allocator, program: *const scalar.Pr
     if (!@import("typed_kernel.zig").supported(program) or program.required_columns.len != 1 or page.selection.len < 4) return null;
     const ordinal = program.required_columns[0];
     if (ordinal >= columns.len) return error.InvalidSqlBackendResponse;
-    const source = page.batch.findColumn(columns[ordinal].name) orelse return null;
-    switch (source.values) {
+    const source = if (page.native == null) page.batch.findColumn(columns[ordinal].name) else null;
+    const native_ordinal = if (page.native) |native| for (native.names, 0..) |name, index| {
+        if (std.mem.eql(u8, name, columns[ordinal].name)) break index;
+    } else return null else null;
+    if (source) |column| switch (column.values) {
         .dictionary_bytes, .dictionary_i64, .dictionary_f64 => {},
         else => return null,
+    } else if (native_ordinal == null) return null;
+    if (page.native) |native| {
+        const physical = page.selection[0];
+        if (physical >= native.values.len()) return error.InvalidSqlBackendResponse;
+        switch (native.values.*) {
+            .retained => |retained| if ((try retained.store.dictionaryId(retained.begin + physical, native_ordinal.?)) == null) return null,
+            .dictionary => if (native_ordinal.? != 0) return null,
+            else => return null,
+        }
     }
     var ids: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     defer ids.deinit(a);
@@ -45,7 +57,14 @@ pub fn evaluateDictionaryColumns(a: std.mem.Allocator, program: *const scalar.Pr
     var owned = true;
     defer if (owned) a.free(indices);
     for (page.selection, indices) |physical, *index| {
-        const id: u64 = if (try source.dictionaryId(physical)) |entry| @as(u64, entry) + 1 else 0;
+        if (page.native) |native| if (physical >= native.values.len()) return error.InvalidSqlBackendResponse;
+        const id: u64 = if (source) |column|
+            if (try column.dictionaryId(physical)) |entry| @as(u64, entry) + 1 else 0
+        else switch (page.native.?.values.*) {
+            .retained => |retained| (try retained.store.dictionaryId(retained.begin + physical, native_ordinal.?)) orelse return null,
+            .dictionary => |dictionary| if (native_ordinal.? == 0) dictionary.indices[physical] else return null,
+            else => return null,
+        };
         const slot = try ids.getOrPut(a, id);
         if (!slot.found_existing) {
             slot.value_ptr.* = @intCast(representatives.items.len);
@@ -801,4 +820,28 @@ fn dictionaryExpressionScenario(a: std.mem.Allocator) !void {
 test "SQL dictionary expressions retain unique results and unwind every failure" {
     try dictionaryExpressionScenario(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, dictionaryExpressionScenario, .{});
+}
+
+test "SQL retained numeric dictionaries reuse expression results after relational ownership" {
+    const a = std.testing.allocator;
+    var store = @import("typed_store.zig").Store.init(a);
+    defer store.deinit();
+    for (0..1024) |index| _ = try store.append(&.{if (index % 3 == 0) Datum{} else Datum.json(.{ .integer = @intCast(index % 3) })});
+    const retained: @import("execution_batch.zig").Batch = .{ .retained = .{ .store = &store, .begin = 17, .count = 12 } };
+    const definitions = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    const page: @import("catalog.zig").ColumnPage = .{ .native = .{ .values = &retained, .names = &.{"n"} }, .selection = &.{ 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0 } };
+    var compiled = try @import("compiler.zig").compileScalar(a, "12 / n", .{});
+    defer compiled.deinit();
+    var program = try scalar.bind(a, compiled.expression, &definitions, &.{}, .{});
+    defer program.deinit();
+    const outputs = try evaluateColumnsEncodedMany(a, &.{&program}, page, &definitions, &.{}, null);
+    defer freeEncodedMany(a, outputs);
+    const batch = outputs[0].?;
+    try std.testing.expect(batch == .dictionary);
+    try std.testing.expectEqual(@as(usize, 3), batch.dictionary.values.len);
+    for (0..12) |row| {
+        const input = try page.cell(a, row, "n");
+        const expected = try program.evaluate(a, &.{.{ .value = input.value, .sql_null = input.sql_null }}, &.{}, .{});
+        try std.testing.expectEqualDeep(expected, try batch.cell(a, row, 0));
+    }
 }

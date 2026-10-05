@@ -140,7 +140,7 @@ pub fn cell(a: A, state: operators.Aggregate) !Datum {
     var encoder: Encoder = .{ .a = a };
     errdefer encoder.bytes.deinit(a);
     try encoder.raw(magic);
-    try encoder.raw(&.{ @backingInt(state.kind), if (state.input_type) |v| @backingInt(v) else 255, @intFromBool(state.distinct), @intFromBool(state.boolean) });
+    try encoder.raw(&.{ kindId(state.kind), typeId(state.input_type), @intFromBool(state.distinct), @intFromBool(state.boolean) });
     try encoder.integer(u64, state.count);
     try encoder.integer(i128, state.integer_sum);
     inline for (.{ state.number_sum, state.compensation, state.mean }) |value| try encoder.integer(u64, @bitCast(value));
@@ -162,7 +162,7 @@ pub fn decode(a: A, value: Datum, spec: operators.AggregateSpec) !operators.Aggr
     var decoder: Decoder = .{ .a = scratch.allocator(), .bytes = value.value.string };
     if (!std.mem.eql(u8, try decoder.raw(4), magic)) return error.InvalidSqlSpill;
     const signature = try decoder.raw(4);
-    if (signature[0] != @backingInt(spec.kind) or signature[1] != (if (spec.input_type) |v| @as(u8, @backingInt(v)) else 255) or signature[2] != @intFromBool(spec.distinct) or signature[3] > 1) return error.InvalidSqlSpill;
+    if (signature[0] != kindId(spec.kind) or signature[1] != typeId(spec.input_type) or signature[2] != @intFromBool(spec.distinct) or signature[3] > 1) return error.InvalidSqlSpill;
     const count = try decoder.integer(u64);
     if (count > std.math.maxInt(i64)) return error.InvalidSqlSpill;
     const sum = try decoder.integer(i128);
@@ -309,4 +309,23 @@ fn codecScenario(backing: A, corruptions: bool) !void {
 test "SQL binary aggregate codec preserves exact states and rejects incomplete or mismatched records" {
     try codecScenario(std.testing.allocator, true);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, codecScenario, .{false});
+}
+
+// Frozen empty COUNT record: explicit kind=1/type=255, zero native state,
+// SQL-null extremum, no distinct members, and no pattern NULL position.
+test "SQL aggregate wire signature uses stable explicit IDs" {
+    const a = std.testing.allocator;
+    var state = try operators.Aggregate.init(a, .count, null);
+    defer state.deinit();
+    const encoded = try cell(a, state);
+    defer a.free(encoded.value.string);
+    var expected: [73]u8 = @splat(0);
+    @memcpy(expected[0..8], "AGS\x01\x01\xff\x00\x00");
+    @memset(expected[65..], 255);
+    try std.testing.expectEqualSlices(u8, &expected, encoded.value.string);
+    var decoded = try decode(a, Datum.json(.{ .string = &expected }), .{ .kind = .count });
+    defer decoded.deinit();
+    try std.testing.expectEqual(@as(u64, 0), decoded.count);
+    try std.testing.expectEqual(@as(u8, 3), typeId(.number));
+    try std.testing.expectEqual(@as(u8, 7), typeId(.uuid));
 }
