@@ -817,3 +817,21 @@ This work is complete when:
   failure and exact semantic error identity are covered by tests;
 - graph gates prevent broad implementation dependencies from returning; and
 - enabling the candidate as the production default receives explicit approval.
+
+### Explicit macOS SDK selection
+
+For cacheable native configuration, pass `-Dmacos-sdk=/absolute/path/to/MacOSX.sdk`
+(or set `SDK_PATH`). The shared SDK helper tracks the selected directory metadata,
+so replacing that SDK invalidates configuration. The CLI option takes precedence
+over `SDK_PATH`. A shared libc configuration makes this SDK authoritative for
+C compilation, linking, and C translation, including generated host tools. All
+storage, inference, and finetuning owners use this helper.
+Automatic `xcrun` discovery remains available and deliberately disables configure
+caching because Xcode selection is an external input. Pin an SDK for repeated
+local or CI builds; keep automatic discovery when following `xcode-select`.
+
+C bindings use the official `translate-c` package pinned to its Zig 0.17 branch.
+Zig extracts package sources into a local `zig-pkg/` cache, which is ignored by Git.
+Debug tools and ownership fixtures use `std.heap.SafeAllocator`; its `deinit()`
+returns a leak count. Memory-bounded fixtures retain a requested-byte cap outside
+the allocator metadata.

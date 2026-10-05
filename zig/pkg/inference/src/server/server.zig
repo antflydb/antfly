@@ -24578,8 +24578,8 @@ test "generate cache compaction ratio validates the HTTP trust boundary" {
 }
 
 test "generate config grammar ownership stays flat on success override and later error" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
+    defer std.debug.assert(gpa.deinit() == 0);
     const allocator = gpa.allocator();
     const request_json =
         \\{"model":"m","messages":[],"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}}}}
@@ -28884,8 +28884,8 @@ test "managed model resolution fails closed when explicit variants coexist" {
 }
 
 test "HTTP model resolution caller ownership stays flat across repeated requests" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
+    defer std.debug.assert(gpa.deinit() == 0);
     const allocator = gpa.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -28909,8 +28909,8 @@ test "HTTP model resolution caller ownership stays flat across repeated requests
 }
 
 test "trusted model resolution caller ownership stays flat across every return shape" {
-    var gpa = std.heap.DebugAllocator(.{}){};
-    defer std.debug.assert(gpa.deinit() == .ok);
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
+    defer std.debug.assert(gpa.deinit() == 0);
     const allocator = gpa.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

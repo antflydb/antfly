@@ -1168,8 +1168,8 @@ test "virtual http network bounds queued HTTP delivery and recovers its drain ow
     const io_http = @import("../common/http/io_http_executor.zig");
     // Native stack unwinding cannot cross VoprIo's switched fiber stacks.
     // Retain allocation/leak checking without collecting those stack traces.
-    var checked_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
-    defer std.debug.assert(checked_allocator.deinit() == .ok);
+    var checked_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(checked_allocator.deinit() == 0);
     const alloc = checked_allocator.allocator();
     var runtime = try vopr.vopr_io.VoprIo.init(.{});
     defer runtime.deinit();

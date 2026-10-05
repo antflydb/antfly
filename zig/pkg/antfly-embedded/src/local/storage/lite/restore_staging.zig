@@ -1175,8 +1175,8 @@ test "lite restore staging expands a self-contained native AFB2 bundle" {
 test "lite restore staging accepts aflite input for normal restore" {
     // Keep leak/safety checks without capturing every allocation/free stack.
     // Opt into tracing when diagnosing a failure.
-    var no_stack_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(no_stack_allocator.deinit() == .ok);
+    var no_stack_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(no_stack_allocator.deinit() == 0);
     const allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else no_stack_allocator.allocator();
     var work_profile = RestoreWorkProfile.init();
 
@@ -1396,8 +1396,8 @@ test "lite restore staging exports stable aflite data while writer has open tran
 test "lite portable backup roundtrips through normal table backup APIs" {
     // Keep leak/safety checks without capturing every allocation/free stack.
     // Opt into tracing when diagnosing a failure.
-    var no_stack_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(no_stack_allocator.deinit() == .ok);
+    var no_stack_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(no_stack_allocator.deinit() == 0);
     const allocator = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else no_stack_allocator.allocator();
     var work_profile = RestoreWorkProfile.init();
 

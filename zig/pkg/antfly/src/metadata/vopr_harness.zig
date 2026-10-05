@@ -75,7 +75,7 @@ const platform_time = @import("antfly_platform").time;
 const usermgr = @import("../usermgr/mod.zig");
 const casbin = @import("antfly_casbin");
 
-const LeanVoprAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const LeanVoprAllocator = std.heap.SafeAllocator;
 // Public API VOPR fixtures can open DBs and hosted indexes from the listener
 // request thread. Debug x86_64 index construction exceeds the partitioned
 // runtime's 4 MiB floor, so match the production HTTP request stack instead
@@ -11474,7 +11474,7 @@ test "metadata-only cluster preserves external data placements without shadow re
 }
 
 test "metadata VOPR http cluster serves public lifecycle from a non-host node after public create" {
-    var vopr_alloc_state: LeanVoprAllocator = .init;
+    var vopr_alloc_state: LeanVoprAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = vopr_alloc_state.deinit();
     const vopr_alloc = vopr_alloc_state.allocator();
 
@@ -11665,7 +11665,7 @@ test "metadata VOPR http cluster serves public lifecycle from a non-host node af
 }
 
 test "metadata VOPR http cluster seeds default admin for auth-enabled public api" {
-    var vopr_alloc_state: LeanVoprAllocator = .init;
+    var vopr_alloc_state: LeanVoprAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = vopr_alloc_state.deinit();
     const vopr_alloc = vopr_alloc_state.allocator();
 
@@ -11759,7 +11759,7 @@ test "metadata VOPR http cluster seeds default admin for auth-enabled public api
 }
 
 test "metadata VOPR http cluster forwards public split flow from a non-host node after public create" {
-    var vopr_alloc_state: LeanVoprAllocator = .init;
+    var vopr_alloc_state: LeanVoprAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = vopr_alloc_state.deinit();
     const vopr_alloc = vopr_alloc_state.allocator();
 
@@ -11964,7 +11964,7 @@ test "metadata VOPR http cluster forwards public merge flow from a non-host node
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    var vopr_alloc_state: LeanVoprAllocator = .init;
+    var vopr_alloc_state: LeanVoprAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = vopr_alloc_state.deinit();
     const vopr_alloc = vopr_alloc_state.allocator();
 

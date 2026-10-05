@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 const AntflyRootImports = @import("../../../build_support/antfly/imports.zig").AntflyRootImports;
 
 /// Freestanding composition has no native cloud authentication or lake I/O.
@@ -76,7 +77,7 @@ pub fn configureBrowserModule(
     mod.addImport("handlebars", handlebars_mod);
     add_snowball_module(b, mod);
 }
-const addMacosSdkPaths = @import("../../../lib/platform/build_support.zig").addMacosSdkPaths;
+const addMacosSdkPaths = @import("antfly_platform").addMacosSdkPaths;
 const addFilteredTestRunArtifact = @import("../../../build_support/antfly/test_support.zig").addFilteredTestRunArtifact;
 const addSnowballModule = @import("snowball.zig").addSnowballModule;
 const selectTestFilters = @import("../../../build_support/antfly/test_support.zig").selectTestFilters;
@@ -353,13 +354,14 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
     });
     capi_conformance_mod.link_libc = true;
-    const capi_header = b.addTranslateC(.{
-        .root_source_file = b.path("pkg/antfly-embedded/include/antfly.h"),
+    const capi_header = Translator.init(b.dependency("translate_c", .{}), .{
+        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
+        .c_source_file = b.path("pkg/antfly-embedded/include/antfly.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    capi_conformance_mod.addImport("antfly_c", capi_header.createModule());
+    capi_conformance_mod.addImport("antfly_c", capi_header.mod);
     const capi_conformance = b.addExecutable(.{
         .name = "antfly-capi-conformance",
         .root_module = capi_conformance_mod,

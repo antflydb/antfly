@@ -21,7 +21,7 @@ const std = @import("std");
 const casbin = @import("antfly_casbin");
 const vopr = @import("vopr");
 const usermgr = @import("antfly_local_sources").usermgr_user_manager;
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const FixtureAllocator = std.heap.SafeAllocator;
 
 pub const Hook = struct {
     vopr_io: *vopr.vopr_io.VoprIo,
@@ -331,7 +331,7 @@ pub const Scenario = struct {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
         state.owner_allocator = allocator;
-        state.fixture_allocator = .init;
+        state.fixture_allocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
         errdefer _ = state.fixture_allocator.deinit();
         const fixture_allocator = state.fixture_allocator.allocator();
         state.allocator = fixture_allocator;
@@ -384,7 +384,7 @@ pub const Scenario = struct {
         state.store.deinit();
         state.sim.deinit();
         const owner_allocator = state.owner_allocator;
-        std.debug.assert(state.fixture_allocator.deinit() == .ok);
+        std.debug.assert(state.fixture_allocator.deinit() == 0);
         owner_allocator.destroy(state);
         world.* = undefined;
     }

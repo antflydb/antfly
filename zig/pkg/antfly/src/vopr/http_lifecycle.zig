@@ -22,7 +22,7 @@ const httpx = @import("httpx");
 const vopr = @import("vopr");
 const http_disconnect = @import("http_disconnect.zig");
 
-const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const VoprTestAllocator = std.heap.SafeAllocator;
 
 const HandlerState = struct {
     echo_calls: usize = 0,
@@ -103,7 +103,7 @@ fn driveUntilListenerStarted(
 }
 
 test "production HTTP lifecycle runs chunked keep-alive pipeline and stream on VoprIo" {
-    var alloc_state: VoprTestAllocator = .init;
+    var alloc_state: VoprTestAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
     var sim = try vopr.vopr_io.VoprIo.init(.{
@@ -218,7 +218,7 @@ test "production HTTP lifecycle runs chunked keep-alive pipeline and stream on V
 }
 
 test "production HTTP lifecycle observes VoprIo hard disconnect behind pipelined input" {
-    var alloc_state: VoprTestAllocator = .init;
+    var alloc_state: VoprTestAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
     var sim = try vopr.vopr_io.VoprIo.init(.{

@@ -3222,7 +3222,7 @@ test "runSuite on single generated 3x2 grayscale fixture without sidecar still r
 }
 
 test "runSuite on single generated 3x2 grayscale fixture under GPA still reports its true current state" {
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -3245,7 +3245,7 @@ test "runSuite on single generated 3x2 grayscale fixture under GPA still reports
 }
 
 test "MxN parity: lossless decode matches for various grayscale dimensions" {
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -3281,7 +3281,7 @@ test "MxN parity: lossless decode matches for various grayscale dimensions" {
 }
 
 test "MxN parity: lossless decode matches for various RGB dimensions" {
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -3619,7 +3619,7 @@ fn fillGrayscaleGradient16(buf: []u16, width: u32, height: u32, bpc: u8) void {
 }
 
 test "checked-in jpeg2000 conformance corpus round-trips through pure zig backend" {
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -5134,7 +5134,7 @@ fn isoConformanceDirPresent(conformance_dir: []const u8) bool {
 }
 
 test "external jpeg2000 iso conformance corpus decodes within baseline" {
-    var gpa = std.heap.DebugAllocator(.{}){};
+    var gpa = std.heap.SafeAllocator.init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 

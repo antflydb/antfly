@@ -7666,8 +7666,8 @@ test "db graph metric runtime planned scheduler sweeps pagerank across reopened 
     var profile = @import("../../test_work_profile.zig").Profile(enum { setup, open, worker, coordinator, close, read }).init();
     defer profile.report("reopened-pagerank");
     const DB = @import("../mod.zig").DB;
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;
@@ -10944,8 +10944,8 @@ test "db graph metric runtime degree canary runUntilIdle falls back to local ora
 
 test "db graph metric runtime default gate runUntilIdle publishes configured graph pagerank metrics" {
     const DB = @import("../mod.zig").DB;
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
 
     var path_buf: [256]u8 = undefined;

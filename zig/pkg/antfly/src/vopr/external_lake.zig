@@ -27,7 +27,7 @@ const lake = @import("antfly_local_sources").serverless_query_lake_parquet_rowgr
 const range_io = @import("antfly_local_sources").serverless_query_lake_range_io;
 const lake_rows = @import("antfly_local_sources").serverless_query_lake_rows;
 const lake_scan_plan = @import("antfly_local_sources").serverless_query_lake_scan_plan;
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const FixtureAllocator = std.heap.SafeAllocator;
 
 pub const Scenario = struct {
     pub const name: []const u8 = "external-lake";
@@ -430,7 +430,7 @@ pub const Scenario = struct {
     pub fn init(allocator: std.mem.Allocator) !World {
         const state = try allocator.create(State);
         errdefer allocator.destroy(state);
-        state.fixture_allocator = .init;
+        state.fixture_allocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
         errdefer _ = state.fixture_allocator.deinit();
         const fixture_alloc = state.fixture_allocator.allocator();
         state.allocator = fixture_alloc;
@@ -457,7 +457,7 @@ pub const Scenario = struct {
     pub fn deinit(world: *World, allocator: std.mem.Allocator) void {
         world.state.cache.deinit(world.state.allocator);
         world.state.sim.deinit();
-        std.debug.assert(world.state.fixture_allocator.deinit() == .ok);
+        std.debug.assert(world.state.fixture_allocator.deinit() == 0);
         allocator.destroy(world.state);
         world.* = undefined;
     }

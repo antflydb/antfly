@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const Translator = @import("translate_c").Translator;
 const onnx_build = @import("onnx_graph").support;
 pub const OnnxModules = onnx_build.Modules;
 const jit_identity = @import("jit_identity.zig");
@@ -467,21 +468,23 @@ fn createCBindings(
     if (!backend.enable_onnx) return .{ .onnx = empty, .ortgenai = empty };
 
     const include_dir = b.fmt("{s}/include", .{backend.onnx_root});
-    const onnx = b.addTranslateC(.{
-        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
+    const onnx = Translator.init(b.dependency("translate_c", .{}), .{
+        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
+        .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/onnx_c.h")),
         .target = target,
         .optimize = .debug,
         .link_libc = true,
     });
     onnx.addIncludePath(b.graph.cwdRelativePath(include_dir));
-    const ortgenai = b.addTranslateC(.{
-        .root_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
+    const ortgenai = Translator.init(b.dependency("translate_c", .{}), .{
+        .libc_file = @import("antfly_platform").macosSdkLibCFile(b, target),
+        .c_source_file = b.path(pathJoin(b, paths.inference_root, "src/backends/ortgenai_c.h")),
         .target = target,
         .optimize = .debug,
         .link_libc = true,
     });
     ortgenai.addIncludePath(b.graph.cwdRelativePath(include_dir));
-    return .{ .onnx = onnx.createModule(), .ortgenai = ortgenai.createModule() };
+    return .{ .onnx = onnx.mod, .ortgenai = ortgenai.mod };
 }
 
 pub fn applyCBindings(module: *std.Build.Module, bindings: CBindings) void {
@@ -822,15 +825,7 @@ pub fn configureMetal(
 }
 
 fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.ResolvedTarget) void {
-    if (target.result.os.tag != .macos) return;
-    const sdk_root = b.graph.environ_map.get("SDK_PATH") orelse sdk: {
-        // xcrun observes the selected Xcode installation outside configure inputs.
-        b.graph.poisonCache();
-        break :sdk std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &target.result) orelse return;
-    };
-    module.addSystemIncludePath(b.graph.cwdRelativePath(b.fmt("{s}/usr/include", .{sdk_root})));
-    module.addLibraryPath(b.graph.cwdRelativePath(b.fmt("{s}/usr/lib", .{sdk_root})));
-    module.addFrameworkPath(b.graph.cwdRelativePath(b.fmt("{s}/System/Library/Frameworks", .{sdk_root})));
+    @import("antfly_platform").addMacosSdkPaths(b, module, target);
 }
 
 fn pathJoin(b: *std.Build, root: []const u8, relative_path: []const u8) []const u8 {

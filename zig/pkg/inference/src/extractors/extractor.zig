@@ -1632,8 +1632,8 @@ test "reader discovery preserves allocation failure" {
 }
 
 test "extractor resolution cleans up and preserves every allocation failure" {
-    var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-    defer std.debug.assert(allocator_state.deinit() == .ok);
+    var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator_state.deinit() == 0);
     const allocator = if (platform.env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1657,7 +1657,7 @@ test "extractor resolution cleans up and preserves every allocation failure" {
             defer extractor.deinit(alloc);
         }
     };
-    std.testing.checkAllAllocationFailures(allocator, Runner.run, .{models_dir}) catch |err| switch (err) {
+    @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{models_dir}) catch |err| switch (err) {
         // Zig 0.17's threaded filesystem I/O can change the number of allocator
         // calls between retries even though every induced OOM remains clean.
         error.NondeterministicMemoryUsage => {},

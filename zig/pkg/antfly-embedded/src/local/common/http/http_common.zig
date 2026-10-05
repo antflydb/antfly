@@ -412,10 +412,11 @@ test "http common types compile" {
 }
 
 test "http response uses its owning allocator" {
-    var owner_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(owner_gpa.deinit() == .ok);
-    var fallback_gpa: std.heap.DebugAllocator(.{}) = .init;
-    defer std.debug.assert(fallback_gpa.deinit() == .ok);
+    // Distinct canaries make a free through the fallback allocator fail.
+    var owner_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x48545401 });
+    defer std.debug.assert(owner_gpa.deinit() == 0);
+    var fallback_gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .canary = 0x48545402 });
+    defer std.debug.assert(fallback_gpa.deinit() == 0);
 
     const owner = owner_gpa.allocator();
     const headers = try owner.alloc(Header, 1);

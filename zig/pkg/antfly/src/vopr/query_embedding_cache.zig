@@ -21,7 +21,7 @@ const std = @import("std");
 const vopr = @import("vopr");
 const cache_budget = @import("antfly_cache_budget");
 const query_cache = @import("antfly_inference_query_embedding_cache");
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const FixtureAllocator = std.heap.SafeAllocator;
 
 pub const Scenario = struct {
     pub const name: []const u8 = "query-embedding-cache";
@@ -143,7 +143,7 @@ pub const Scenario = struct {
             const self = try allocator.create(State);
             errdefer allocator.destroy(self);
             self.owner_allocator = allocator;
-            self.fixture_allocator = .init;
+            self.fixture_allocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             errdefer _ = self.fixture_allocator.deinit();
             const fixture_allocator = self.fixture_allocator.allocator();
             self.* = .{
@@ -164,7 +164,7 @@ pub const Scenario = struct {
             if (self.service_rate_model) |*model| model.deinit();
             self.sim.deinit();
             const owner_allocator = self.owner_allocator;
-            std.debug.assert(self.fixture_allocator.deinit() == .ok);
+            std.debug.assert(self.fixture_allocator.deinit() == 0);
             owner_allocator.destroy(self);
         }
 

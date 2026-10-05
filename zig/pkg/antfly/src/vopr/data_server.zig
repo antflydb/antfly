@@ -25,7 +25,7 @@ const durable_job_lane = @import("../storage/vopr_durable_job_lane.zig");
 const http_common = @import("antfly_local_sources").common_http_http_common;
 const request_lifecycle = @import("request_lifecycle.zig");
 const http_disconnect = @import("http_disconnect.zig");
-const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const VoprTestAllocator = std.heap.SafeAllocator;
 
 const StubMetadataExecutor = struct {
     calls: usize = 0,
@@ -53,7 +53,7 @@ const ScenarioOptions = struct {
 };
 
 fn runProductionDataServerScenario(options: ScenarioOptions) !void {
-    var alloc_state: VoprTestAllocator = .init;
+    var alloc_state: VoprTestAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
     var vopr_io = try vopr.vopr_io.VoprIo.init(.{

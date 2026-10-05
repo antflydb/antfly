@@ -30,7 +30,7 @@ const lite_backend = @import("antfly_local_sources").storage_lite_backend;
 const managed_embedder = @import("antfly_local_sources").inference_managed_embedder;
 const db_embedder = @import("antfly_local_sources").storage_db_enrichment_embedder;
 const lake = @import("antfly_local_sources").serverless_query_lake_parquet_rowgroup;
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const FixtureAllocator = std.heap.SafeAllocator;
 
 pub const Scenario = struct {
     pub const name: []const u8 = "cross-service-resource-pressure";
@@ -571,7 +571,7 @@ pub const Scenario = struct {
         errdefer allocator.destroy(state);
         const fixture_allocator = try allocator.create(FixtureAllocator);
         errdefer allocator.destroy(fixture_allocator);
-        fixture_allocator.* = .init;
+        fixture_allocator.* = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
         errdefer _ = fixture_allocator.deinit();
         const fixture_alloc = fixture_allocator.allocator();
         var sim = try vopr.vopr_io.VoprIo.init(.{
@@ -646,7 +646,7 @@ pub const Scenario = struct {
         state.sim.deinit();
         state.resources.deinit(state.allocator);
         const fixture_allocator = state.fixture_allocator;
-        std.debug.assert(fixture_allocator.deinit() == .ok);
+        std.debug.assert(fixture_allocator.deinit() == 0);
         allocator.destroy(fixture_allocator);
         allocator.destroy(state);
         world.* = undefined;

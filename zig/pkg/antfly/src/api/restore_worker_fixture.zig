@@ -891,7 +891,7 @@ pub fn runWithPolicy(comptime Driver: type, invalid_child: bool, override: ?http
     // This corpus benchmark measures restore work, not Mach-O/DWARF stack
     // unwinding for every allocation. Keep safety and leak checks enabled;
     // ordinary correctness fixtures retain the testing allocator's traces.
-    var benchmark_allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var benchmark_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer if (policy.benchmark_rows > 1) {
         const allocator_status = benchmark_allocator.deinit();
         std.debug.assert(allocator_status == .ok);

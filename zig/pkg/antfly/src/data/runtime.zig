@@ -32027,7 +32027,7 @@ fn runThreeDataServerReplicatedTransitionVoprHistory(
     const internal_service_issuer = "data-runtime-vopr";
     const public_port_base: u16 = 24_100;
     const raft_port_base: u16 = 24_200;
-    var alloc_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+    var alloc_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const alloc = alloc_state.allocator();
     var tmp = @import("antfly_local_sources").common_test_directory.fastTmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM and Raft image backends remain explicit differential boundaries
@@ -55056,7 +55056,7 @@ fn implementationTests() type {
             // Zig's debug stack unwinder cannot walk a suspended fiber stack. Retain
             // allocation accounting while disabling only stack capture, as the other
             // production-shaped VOPR fixtures do.
-            var alloc_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
+            var alloc_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
             defer _ = alloc_state.deinit();
             const alloc = alloc_state.allocator();
             var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) the LSM backend remains an explicit differential boundary

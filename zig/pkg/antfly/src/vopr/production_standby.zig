@@ -281,8 +281,8 @@ test "production standby owners cancel after promotion and drain all borrowed ta
 
 fn testProductionOwners(cancel_after_promotion: bool) !void {
     const vopr = @import("vopr");
-    var allocator: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
-    defer std.debug.assert(allocator.deinit() == .ok);
+    var allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer std.debug.assert(allocator.deinit() == 0);
     const alloc = allocator.allocator();
     var tmp = std.testing.tmpDir(.{}); // vopr-audit: allow(host_filesystem) namespace for unused ancillary API stores; modeled replication uses VoprIo
     defer tmp.cleanup();

@@ -32,7 +32,7 @@ const pkg_antfly_build_runtime = @import("pkg/antfly/build/runtime.zig");
 const RuntimeArtifactRole = @import("build_support/antfly/runtime_roles.zig").RuntimeArtifactRole;
 const RuntimeLibraryUnit = pkg_antfly_build_runtime.RuntimeLibraryUnit;
 
-const lib_platform_build_support = @import("lib/platform/build_support.zig");
+const lib_platform_build_support = @import("antfly_platform");
 const addMacosSdkPaths = lib_platform_build_support.addMacosSdkPaths;
 
 const pkg_antfly_build_tests = @import("pkg/antfly/build/tests.zig");
@@ -53,7 +53,7 @@ const antfly_embedded_build = @import("pkg/antfly-embedded/build/embedded.zig");
 const antfly_storage_build = @import("pkg/antfly-embedded/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
-const platform_build = @import("lib/platform/build_support.zig");
+const platform_build = @import("antfly_platform");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
 const makeLmdbBuildOptions = antfly_storage_build.makeLmdbBuildOptions;
@@ -75,6 +75,7 @@ pub const Artifacts = struct {
 /// Compose owners once. Consumers of this constructor can inspect the same
 /// artifacts used by public targets without maintaining a second build graph.
 pub fn create(b: *std.Build) ?Artifacts {
+    defer @import("antfly_platform").finalizeMacosSdk(b);
     defer @import("pkg/antfly-embedded/build/source_owner.zig").finalize(b);
     const shared = @import("build_support/antfly/dependencies.zig").create(b) orelse return null;
     const api_bench_standalone = shared.api_bench_standalone;
@@ -479,6 +480,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .hash_mod = hash_mod,
         .pdf_standard_fonts_mod = pdf_standard_fonts_mod,
         .font_mod = font_mod,
+        .platform_mod = platform_mod,
     });
     const run_lib_pdf_tests = pdf_tests.run_lib_pdf_tests;
     const pdf_integration = antfly_tests_build.createPdfIntegration(b, .{
@@ -515,7 +517,7 @@ pub fn create(b: *std.Build) ?Artifacts {
         .optimize = pdf_bench_optimize,
     });
     const pdf_bench_fonts = @import("build_support/antfly/fonts.zig").create(b, target, pdf_bench_optimize);
-    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_hash, pdf_bench_font, pdf_bench_fonts);
+    const pdf_bench_pdf = pdf_build.createModule(b, b.path("lib/pdf"), target, pdf_bench_optimize, pdf_bench_image, pdf_bench_hash, pdf_bench_font, pdf_bench_fonts, platform_mod);
     const pdf_bench = pdf_build.addBenchmark(b, .{
         .root = b.path("lib/pdf"),
         .target = target,
@@ -858,7 +860,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     );
     const run_maintenance_process = b.addRunArtifact(maintenance_process);
     run_maintenance_process.has_side_effects = true;
-    if (@import("lib/platform/build_support.zig").canRunNativeProcess(b, maintenance_process)) {
+    if (@import("antfly_platform").canRunNativeProcess(b, maintenance_process)) {
         integration_test_step.dependOn(&run_maintenance_process.step);
     } else {
         // Child processes execute this same target directly. Keep cross-build

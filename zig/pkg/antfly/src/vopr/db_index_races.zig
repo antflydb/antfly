@@ -28,7 +28,7 @@ const embedder_mod = @import("antfly_local_sources").storage_db_enrichment_embed
 const background_runtime = @import("antfly_local_sources").storage_background_runtime;
 const text_merge_runtime = @import("antfly_local_sources").storage_db_maintenance_text_merge_runtime;
 const lsm_backend = @import("antfly_local_sources").storage_lsm_backend_mod;
-const VoprTestAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+const VoprTestAllocator = std.heap.SafeAllocator;
 
 pub const Fixture = struct {
     allocator: std.mem.Allocator,
@@ -1303,7 +1303,7 @@ test "DB index request races VOPR exact replays delete materialize and capture h
     // Zig's debug allocator captures native stack traces by default, which is
     // not defined while executing on a switched fiber stack. Retain allocator
     // safety and leak checking while disabling only that host-only diagnostic.
-    var alloc_state: VoprTestAllocator = .init;
+    var alloc_state: VoprTestAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer _ = alloc_state.deinit();
     const allocator = alloc_state.allocator();
 

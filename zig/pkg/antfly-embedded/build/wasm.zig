@@ -16,7 +16,7 @@
 //! The browser runtime owns one target/profile and never receives native modules.
 const std = @import("std");
 const storage_build = @import("storage.zig");
-const platform_build = @import("../../../lib/platform/build_support.zig");
+const platform_build = @import("antfly_platform");
 const image_build = @import("../../../lib/image/build_support.zig");
 const pdf_build = @import("../../../lib/pdf/build_support.zig");
 const tokenizer_build = @import("../../../lib/tokenizer/build_support.zig");
@@ -104,7 +104,7 @@ pub fn add(b: *std.Build, sentencepiece_proto_source: std.Build.LazyPath) Result
         .target = wasm_target,
         .optimize = optimize,
     });
-    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_hash_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod);
+    const wasm_pdf_mod = pdf_build.createModule(b, b.path("lib/pdf"), wasm_target, optimize, wasm_image_mod, wasm_hash_mod, wasm_font_mod, wasm_pdf_standard_fonts_mod, wasm_platform_mod);
     const wasm_sentencepiece_proto_mod = tokenizer_build.createSentencePieceProtoModule(b, sentencepiece_proto_source, wasm_protobuf_mod);
     wasm_google_mod.addImport("httpx", httpx_mod);
     wasm_google_mod.addImport("antfly_credentials", wasm_credentials_mod);

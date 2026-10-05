@@ -1219,7 +1219,7 @@ test "task stack unwinding terminates before entering the scheduler stack" {
             std.debug.assert(trace.return_addresses.len > 0);
             std.debug.assert(trace.return_addresses.len < addresses.len);
             std.debug.assert(trace.skipped == .none);
-            // DebugAllocator captures allocation/free traces too; keep that
+            // SafeAllocator captures allocation/free traces too; keep that
             // instrumentation enabled on the task stack.
             const allocation = std.testing.allocator.alloc(u8, 17) catch @panic("OOM");
             std.testing.allocator.free(allocation);

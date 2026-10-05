@@ -19,6 +19,11 @@
     .fingerprint = 0xaf6720431d9566e1,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
+        .antfly_platform = .{ .path = "lib/platform" },
+        .translate_c = .{
+            .url = "git+https://codeberg.org/ziglang/translate-c#02ff0c523fb92a38939b04d0145c4a9602a74d56",
+            .hash = "translate_c-2.0.0-Q_BUWltOBwBYABF84EUL208pIFeUIwbBs29FmVBaafN5",
+        },
         .onnx_graph = .{ .path = "lib/onnx" },
         .handlebars = .{
             .path = "lib/handlebars",

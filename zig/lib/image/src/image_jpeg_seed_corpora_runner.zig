@@ -81,7 +81,7 @@ const StatusSummary = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    var gpa: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
 

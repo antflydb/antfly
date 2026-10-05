@@ -14,7 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
-const platform_build = @import("../../lib/platform/build_support.zig");
+const platform_build = @import("antfly_platform");
 const addSnowballModule = @import("../../pkg/antfly-embedded/build/snowball.zig").addSnowballModule;
 
 pub const AntflyRootImports = struct {

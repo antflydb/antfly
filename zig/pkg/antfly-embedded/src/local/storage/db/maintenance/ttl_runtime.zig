@@ -831,8 +831,8 @@ test "ttl runtime executes production pass on borrowed VoprIo" {
     // Zig's Darwin DWARF unwinder walks through VoprIo's synthetic fiber root
     // when the debug allocator captures allocation stacks. Keep allocation
     // safety/leak detection, without asking that unwinder to cross the fiber.
-    var checked: std.heap.DebugAllocator(.{ .stack_trace_frames = 0 }) = .init;
-    defer if (checked.deinit() == .leak) @panic("TTL VoprIo fixture leaked memory");
+    var checked: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+    defer if (checked.deinit() != 0) @panic("TTL VoprIo fixture leaked memory");
     const alloc = checked.allocator();
     var vopr_io = try vopr.vopr_io.VoprIo.init(.{
         .required = .of(&.{ .clock_read, .task_scheduling, .synchronization, .sleep }),

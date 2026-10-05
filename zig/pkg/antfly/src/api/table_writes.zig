@@ -54740,8 +54740,8 @@ fn implementationTests() type {
         }
 
         test "provisioned table read source survives many external write-sync batches before first profiled dense query" {
-            var allocator_state: std.heap.DebugAllocator(.{ .stack_trace_frames = 0, .resize_stack_traces = false }) = .init;
-            defer std.debug.assert(allocator_state.deinit() == .ok);
+            var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
+            defer std.debug.assert(allocator_state.deinit() == 0);
             const alloc = if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_ALLOCATOR_TRACES")) std.testing.allocator else allocator_state.allocator();
             const total_docs: usize = 50_000;
             const batch_size: usize = 250;
