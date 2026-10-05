@@ -349,14 +349,20 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         .optimize = optimize,
     });
     capi_conformance_mod.link_libc = true;
-    capi_conformance_mod.addIncludePath(b.path("pkg/antfly-embedded/include"));
+    const capi_header = b.addTranslateC(.{
+        .root_source_file = b.path("pkg/antfly-embedded/include/antfly.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    capi_conformance_mod.addImport("antfly_c", capi_header.createModule());
     const capi_conformance = b.addExecutable(.{
         .name = "antfly-capi-conformance",
         .root_module = capi_conformance_mod,
     });
     capi_conformance.root_module.linkLibrary(libantfly);
     const run_capi_conformance = b.addRunArtifact(capi_conformance);
-    run_capi_conformance.addDirectoryArg2(b.path("pkg/antfly/capi-conformance/cases"), .{ .make_absolute = true });
+    run_capi_conformance.addDirectoryArg2(b.path("pkg/antfly-embedded/capi-conformance/cases"), .{ .make_absolute = true });
     _ = run_capi_conformance.addOutputDirectoryArg2("capi-conformance-work", .{ .make_absolute = true });
     const capi_conformance_step = b.step("capi-conformance", "Run the shared libantfly conformance cases against the C ABI");
     capi_conformance_step.dependOn(&run_capi_conformance.step);

@@ -129,6 +129,7 @@ def main() -> None:
                 "embedded.build.zig",
                 "lite",
                 "capi-smoke",
+                "capi-conformance",
                 "embedded-capi-check",
                 "embedded-lake-test",
                 "embedded-package-test",

@@ -135,7 +135,10 @@ entry point for process isolation. Public executable names and release packaging
 by this refactor.
 
 The staged-build check removes the entire server package before compiling the
-CLI, public C API, public Zig package, AWS credentials, native lake and WASM products:
+CLI, public C API, public Zig package, AWS credentials, native lake and WASM products.
+The C ABI conformance runner translates the canonical public header at build
+time and executes the shared cases from the embedded package. Both C smoke and
+conformance run without any server sources:
 
 ```sh
 python3 tools/check_embedded_isolated_build.py -- -j1

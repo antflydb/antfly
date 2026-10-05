@@ -14,7 +14,7 @@
 //! Usage: antfly-capi-conformance <cases-dir> <work-dir>
 
 const std = @import("std");
-const c = @cImport(@cInclude("antfly.h"));
+const c = @import("antfly_c");
 
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
