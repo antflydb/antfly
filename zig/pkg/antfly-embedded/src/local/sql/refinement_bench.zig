@@ -644,3 +644,54 @@ test "native pipeline refinements benchmark wide active column cache" {
 test {
     _ = @import("read_stream.zig");
 }
+
+fn dictionaryExpression(encoded: bool, program: *const scalar.Program, page: @import("catalog.zig").ColumnPage, columns: []const scalar.Column) !struct { ns: i96, peak: usize, checksum: i64 } {
+    var budget: @import("memory_budget.zig") = .{ .backing = std.testing.allocator, .limit = 2 * 1024 * 1024 };
+    var arena = std.heap.ArenaAllocator.init(budget.allocator());
+    defer arena.deinit();
+    var checksum: i64 = 0;
+    const start = now();
+    for (0..256) |_| {
+        _ = arena.reset(.free_all);
+        const a = arena.allocator();
+        const result: @import("execution_batch.zig").Batch = if (encoded) (try @import("vector_eval.zig").evaluateDictionaryColumns(a, program, page, columns, &.{})).? else blk: {
+            const values = (try @import("vector_eval.zig").evaluateColumns(a, program, page, columns, &.{})).?;
+            const vectors = try a.alloc([]const Datum, 1);
+            vectors[0] = values;
+            break :blk .{ .vectors = .{ .values = vectors, .count = values.len } };
+        };
+        for (0..result.len()) |row| checksum += (try result.cell(a, row, 0)).value.integer;
+    }
+    return .{ .ns = now() - start, .peak = budget.peak, .checksum = checksum };
+}
+test "native refinements benchmark dictionary expression results" {
+    const a = std.testing.allocator;
+    const types = @import("../storage/rowsource/types.zig");
+    const values = try a.alloc(i64, 32);
+    defer a.free(values);
+    const indices = try a.alloc(u32, 4096);
+    defer a.free(indices);
+    const selection = try a.alloc(usize, 4096);
+    defer a.free(selection);
+    const refs = try a.alloc(types.RowRef, 4096);
+    defer a.free(refs);
+    for (values, 0..) |*value, i| value.* = @intCast(i);
+    for (indices, selection, refs, 0..) |*index, *physical, *ref, i| {
+        index.* = @intCast(i % 32);
+        physical.* = 4095 - i;
+        ref.* = .{ .relational_key = "fixture" };
+    }
+    const columns = [_]scalar.Column{.{ .name = "n", .type = .integer }};
+    const physical = [_]types.ColumnVector{.{ .name = "n", .values = .{ .dictionary_i64 = .{ .values = values, .indices = indices } } }};
+    const page: @import("catalog.zig").ColumnPage = .{ .batch = .{ .snapshot = .{ .table_id = "fixture", .snapshot_id = "immutable" }, .row_refs = refs, .columns = &physical }, .selection = selection };
+    var parsed = try @import("compiler.zig").compileScalar(a, "n * 3 + 7", .{});
+    defer parsed.deinit();
+    var program = try scalar.bind(a, parsed.expression, &columns, &.{}, .{});
+    defer program.deinit();
+    for (0..3) |sample| {
+        const expanded = try dictionaryExpression(false, &program, page, &columns);
+        const encoded = try dictionaryExpression(true, &program, page, &columns);
+        try std.testing.expectEqual(expanded.checksum, encoded.checksum);
+        std.debug.print("native_refinement {{\"case\":\"dictionary_expression\",\"rows\":4096,\"unique\":32,\"sample\":{d},\"expanded_ns\":{d},\"encoded_ns\":{d},\"expanded_peak_bytes\":{d},\"encoded_peak_bytes\":{d}}}\n", .{ sample, expanded.ns, encoded.ns, expanded.peak, encoded.peak });
+    }
+}

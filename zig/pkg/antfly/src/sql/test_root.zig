@@ -30,6 +30,12 @@ test {
     _ = @import("antfly_local_sources").sql_document_row;
     _ = @import("antfly_local_sources").sql_read_stream;
     _ = @import("antfly_local_sources").sql_operators;
+    _ = @import("antfly_local_sources").sql_aggregate_partial;
+    _ = @import("antfly_local_sources").sql_vector_eval;
+    _ = @import("antfly_local_sources").sql_parallel_scheduler;
+    _ = @import("antfly_local_sources").sql_partition_join;
+    _ = @import("antfly_local_sources").sql_spill_grouped;
+    _ = @import("antfly_local_sources").sql_execution_batch;
     _ = @import("plan_cache.zig");
     _ = @import("antfly_local_sources").sql_session;
     _ = @import("antfly_local_sources").sql_setting_catalog;

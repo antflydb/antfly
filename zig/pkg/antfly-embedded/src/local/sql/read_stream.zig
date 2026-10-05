@@ -34,10 +34,12 @@ pub const BatchPage = struct {
     exhausted: bool,
     lease: ?*PendingColumns = null,
     row_page: ?Page = null,
+    retained_owner: ?*@import("typed_store.zig").Store = null,
 
     pub fn deinit(self: *BatchPage) void {
         if (self.lease) |lease| lease.deinit();
         if (self.row_page) |*page| page.deinit();
+        if (self.retained_owner) |store| store.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -332,7 +334,7 @@ const ParallelScan = struct {
     lanes: []Lane,
     storage: []Lane = &.{},
     lane: usize = 0,
-    workers: [2]Worker = undefined,
+    workers: [8]Worker = undefined,
     worker_count: usize = 0,
     const Worker = struct {
         pipeline: *ParallelScan,
@@ -341,7 +343,7 @@ const ParallelScan = struct {
         task: ?@import("parallel_scheduler.zig").Task(anyerror!void) = null,
         fn run(self: *Worker) anyerror!void {
             var index = self.index;
-            while (index < self.pipeline.lanes.len) : (index += 2) {
+            while (index < self.pipeline.lanes.len) : (index += self.pipeline.worker_count) {
                 const lane = &self.pipeline.lanes[index];
                 lane.produce() catch |err| {
                     lane.failure = err;
@@ -393,6 +395,12 @@ const ParallelScan = struct {
             for (children) |child| child.close(child.ptr);
             return null;
         }
+        const fanout = @import("parallel_scheduler.zig").global().fanout(children.len, source.context.limits.retained_bytes / 2, 4 * 1024 * 1024);
+        if (fanout < 2) {
+            for (children) |child| child.close(child.ptr);
+            return null;
+        }
+        const workspace = source.context.limits.retained_bytes / (2 * fanout);
         var moved: usize = 0;
         errdefer for (children[moved..]) |child| child.close(child.ptr);
         const self = try a.create(ParallelScan);
@@ -400,14 +408,14 @@ const ParallelScan = struct {
         errdefer self.close();
         const lanes = try a.alloc(Lane, children.len);
         self.storage = lanes;
-        for (&self.workers, 0..) |*worker, index| {
+        for (self.workers[0..fanout], 0..) |*worker, index| {
             worker.* = .{ .pipeline = self, .index = index, .credit = try PendingColumns.Credit.create(a, io) };
             self.worker_count += 1;
         }
         for (children, lanes, 0..) |child, *lane, index| {
-            const credit = self.workers[index % 2].credit;
+            const credit = self.workers[index % fanout].credit;
             lane.* = .{ .credit = credit, .stream = .{
-                .budget = .{ .backing = a, .limit = source.context.limits.retained_bytes / 4 },
+                .budget = .{ .backing = a, .limit = workspace },
                 .arena = undefined,
                 .context = source.context,
                 .cursor = child,
@@ -432,7 +440,7 @@ const ParallelScan = struct {
         }
         // A producer needs a concurrent consumer for bounded backpressure.
         for (self.workers[0..self.worker_count]) |*worker| {
-            worker.task = @import("parallel_scheduler.zig").global().submit(io, source.context.limits.retained_bytes / 4, Worker.run, .{worker});
+            worker.task = @import("parallel_scheduler.zig").global().submit(io, workspace, Worker.run, .{worker});
             if (worker.task == null) {
                 self.close();
                 return null;
@@ -761,7 +769,13 @@ pub const Stream = struct {
         try self.context.checkpoint();
         var arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer arena.deinit();
-        if (self.spool != null or !(self.pending_columns != null or self.columnsEligible())) {
+        if (self.spool) |spool| {
+            const values = try spool.nextBatch(arena.allocator(), max_rows, self.context.limits.page_bytes);
+            self.emitted += values.len;
+            self.exhausted = spool.index == spool.count();
+            return .{ .arena = arena, .columns = self.context.binding.columns, .values = .{ .retained = .{ .store = values, .count = values.len } }, .exhausted = self.exhausted, .retained_owner = values };
+        }
+        if (!(self.pending_columns != null or self.columnsEligible())) {
             var page = try self.pull(max_rows);
             errdefer page.deinit();
             const output = try arena.allocator().create(runtime.Output);
@@ -945,8 +959,9 @@ pub const Stream = struct {
             try selection.append(a, physical);
             if (self.one_scan_page) try positions.append(a, index + 1);
         }
-        const selected: catalog.ColumnPage = .{ .batch = page.batch, .selection = selection.items };
-        const projections = try a.alloc(?[]const @import("scalar.zig").Datum, self.fields.len);
+        var selected = page;
+        selected.selection = selection.items;
+        const projections = try a.alloc(?@import("execution_batch.zig").Batch, self.fields.len);
         @memset(projections, null);
         var programs: std.ArrayList(*const @import("scalar.zig").Program) = .empty;
         var slots: std.ArrayList(usize) = .empty;
@@ -954,19 +969,28 @@ pub const Stream = struct {
             try programs.append(a, program);
             try slots.append(a, index);
         };
-        const evaluated = try @import("vector_eval.zig").evaluateColumnsManyScheduled(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io);
-        for (evaluated, programs.items, slots.items) |values, program, index| projections[index] = values orelse try self.columnProgram(a, program, selected);
+        const evaluated = try @import("vector_eval.zig").evaluateColumnsEncodedMany(a, programs.items, selected, self.context.binding.scalars.columns, self.context.parameters, self.context.backend.execution_io);
+        for (evaluated, programs.items, slots.items) |values, program, index| {
+            if (values) |batch| {
+                projections[index] = batch;
+            } else {
+                const vector = try self.columnProgram(a, program, selected);
+                const vectors = try a.alloc([]const @import("scalar.zig").Datum, 1);
+                vectors[0] = vector;
+                projections[index] = .{ .vectors = .{ .values = vectors, .count = vector.len } };
+            }
+        }
         const failures = try a.alloc(?anyerror, selection.items.len);
         @memset(failures, null);
         const Projection = struct {
             stream: *Stream,
             page: catalog.ColumnPage,
-            projections: []const ?[]const @import("scalar.zig").Datum,
+            projections: []const ?@import("execution_batch.zig").Batch,
             failures: []?anyerror,
             bytes: usize = 0,
             fn cell(raw: *anyopaque, alloc: std.mem.Allocator, index: usize, ordinal: usize) anyerror!@import("scalar.zig").Datum {
                 const projection_: *@This() = @ptrCast(@alignCast(raw));
-                const cell_ = if (projection_.projections[ordinal]) |values| values[index] else blk: {
+                const cell_ = if (projection_.projections[ordinal]) |values| try values.cell(alloc, index, 0) else blk: {
                     const raw_ = try projection_.page.cell(alloc, index, projection_.stream.fields[ordinal]);
                     break :blk @import("scalar.zig").Datum{ .value = raw_.value, .sql_null = raw_.sql_null, .patterns = raw_.patterns };
                 };
@@ -1020,7 +1044,8 @@ pub const Stream = struct {
                 continue;
             }
             if (self.remaining == 0) break;
-            const one: catalog.ColumnPage = .{ .batch = page.batch, .selection = &.{physical} };
+            var one = page;
+            one.selection = &.{physical};
             var projection_error: ?anyerror = null;
             const row = try a.alloc(@import("scalar.zig").Datum, self.fields.len);
             for (self.fields, self.context.binding.columns, row, 0..) |field, column, *value, ordinal| {
@@ -1330,7 +1355,7 @@ test "SQL decision pull streams carry trusted source routing" {
 }
 
 test "SQL blocking results transfer sorted operators and deliver bounded continuation pages" {
-    for ([_][]const u8{
+    for ([_]bool{ false, true }) |typed| for ([_][]const u8{
         "SELECT n FROM docs ORDER BY n DESC",
         "SELECT n % 37 AS k, count(*) AS c FROM docs GROUP BY n % 37 ORDER BY k",
         "SELECT n, row_number() OVER (ORDER BY n DESC) AS r FROM docs ORDER BY n DESC",
@@ -1353,6 +1378,18 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
         const reads = fixture.calls;
         var seen: usize = 0;
         while (true) {
+            if (typed) {
+                var result = try stream.nextBatch(7);
+                defer result.deinit();
+                try std.testing.expect(result.values == .retained);
+                try std.testing.expect(result.values.len() <= 7);
+                for (0..result.values.len()) |row| {
+                    if (expected == 1000) try std.testing.expectEqual(@as(i64, @intCast(999 - seen)), (try result.values.cell(result.arena.allocator(), row, 0)).value.integer);
+                    seen += 1;
+                }
+                if (result.exhausted) break;
+                continue;
+            }
             var result = try stream.next(7);
             defer result.deinit();
             try std.testing.expect(result.output.rows.len <= 7);
@@ -1372,7 +1409,7 @@ test "SQL blocking results transfer sorted operators and deliver bounded continu
         fixture.cancel = true;
         try std.testing.expectError(error.QueryCanceled, stream.next(1));
         try std.testing.expect(stream.spool == null);
-    }
+    };
 }
 
 const NativeColumns = struct {

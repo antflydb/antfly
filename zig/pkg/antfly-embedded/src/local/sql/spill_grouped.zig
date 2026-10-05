@@ -73,8 +73,9 @@ pub const Grouped = struct {
     fallback: ?*Grouped = null,
     bytes: usize,
     parallel: bool = true,
-    reductions: [2]?*Reduction = @splat(null),
+    reductions: [8]?*Reduction = @splat(null),
     next_lane: usize = 0,
+    reduction_lanes: usize = 0,
     reductions_started: usize = 0,
     result_view: ?@import("parallel_output.zig").Pipe.View = null,
     pub fn init(a: Allocator, manager: *spill.Manager, specs: []const operators.AggregateSpec, key_count: usize, bytes: usize) !Grouped {
@@ -107,9 +108,16 @@ pub const Grouped = struct {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
         const a = arena.allocator();
-        const values = try a.alloc(Datum, 1 + states.len * 7);
+        const values = try a.alloc(Datum, 1 + states.len);
         values[0] = Datum.json(.{ .bool = true });
-        @memcpy(values[1..], try @import("aggregate_partial.zig").encode(a, states));
+        for (states, values[1..]) |state, *value| {
+            if (state.distinct) {
+                var base = try operators.Aggregate.init(a, state.kind, state.input_type);
+                defer base.deinit();
+                base.distinct = true;
+                value.* = try @import("aggregate_partial.zig").cell(a, base);
+            } else value.* = try @import("aggregate_partial.zig").cell(a, state);
+        }
         try self.append(.{ .keys = keys, .values = values, .ordinal = ordinal });
         for (states, 0..) |state, slot| if (state.distinct) {
             for (state.distinct_values.items) |entry| {
@@ -119,7 +127,7 @@ pub const Grouped = struct {
         };
     }
     pub fn appendPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
-        if (cells.len != self.specs.len * 7) return error.InvalidSqlSpill;
+        if (cells.len != self.specs.len) return error.InvalidSqlSpill;
         const values = try self.a.alloc(Datum, cells.len + 1);
         defer self.a.free(values);
         values[0] = Datum.json(.{ .bool = true });
@@ -159,8 +167,17 @@ pub const Grouped = struct {
         }
         return true;
     }
+    fn readyLane(self: *Grouped) ?usize {
+        for (0..self.reduction_lanes) |offset| {
+            const lane = (self.next_lane + offset) % self.reduction_lanes;
+            if (self.reductions[lane] != null) return lane;
+        }
+        return null;
+    }
     fn startReductions(self: *Grouped, exact: bool) !void {
-        for (&self.reductions) |*slot| {
+        if (self.reduction_lanes == 0) self.reduction_lanes = @import("parallel_scheduler.zig").global().fanout(self.partitions.len, self.bytes, 256 * 1024);
+        const workspace = self.bytes / self.reduction_lanes;
+        for (self.reductions[0..self.reduction_lanes]) |*slot| {
             if (slot.* != null) continue;
             while (self.partition_index < self.partitions.len) {
                 const index = self.partition_index;
@@ -168,7 +185,7 @@ pub const Grouped = struct {
                 if (self.partitions[index] == null) continue;
                 try self.partitions[index].?.seal();
                 const job = try self.a.create(Reduction);
-                job.* = .{ .child = Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, self.bytes / 2) catch |err| {
+                job.* = .{ .child = Grouped.init(self.a, self.sort.manager, self.specs, self.sort.orders.len, workspace) catch |err| {
                     self.a.destroy(job);
                     return err;
                 }, .exact = exact };
@@ -179,7 +196,7 @@ pub const Grouped = struct {
                 job.child.partitions[0] = self.partitions[index];
                 self.partitions[index] = null;
                 job.output = try @import("parallel_output.zig").Pipe.create(self.sort.manager, self.bytes / 128);
-                job.task = @import("parallel_scheduler.zig").global().submit(self.sort.manager.io, self.bytes / 2, Reduction.run, .{job});
+                job.task = @import("parallel_scheduler.zig").global().submit(self.sort.manager.io, workspace, Reduction.run, .{job});
                 if (job.task == null) {
                     job.output.?.close();
                     job.output = null;
@@ -192,7 +209,7 @@ pub const Grouped = struct {
     fn nextParallel(self: *Grouped, out: Allocator, exact: bool) !?operators.GroupResult {
         while (true) {
             try self.startReductions(exact);
-            const lane = if (self.reductions[self.next_lane] != null) self.next_lane else 1 - self.next_lane;
+            const lane = self.readyLane() orelse return null;
             const job = self.reductions[lane] orelse return null;
             if (job.exact != exact) return error.InvalidSqlBackendResponse;
             if (job.output) |pipe| {
@@ -212,7 +229,7 @@ pub const Grouped = struct {
             }
             job.close();
             self.reductions[lane] = null;
-            self.next_lane = 1 - lane;
+            self.next_lane = (lane + 1) % self.reduction_lanes;
         }
     }
     fn nextPartition(self: *Grouped, out: Allocator, exact: bool) anyerror!?operators.GroupResult {
@@ -287,7 +304,7 @@ pub const Grouped = struct {
         }
         if (self.partitioned and self.parallel and self.bytes >= 512 * 1024) while (true) {
             try self.startReductions(exact);
-            const lane = if (self.reductions[self.next_lane] != null) self.next_lane else 1 - self.next_lane;
+            const lane = self.readyLane() orelse return null;
             const job = self.reductions[lane] orelse return null;
             if (job.exact != exact) return error.InvalidSqlBackendResponse;
             const result = if (job.output) |pipe| blk: {
@@ -309,7 +326,7 @@ pub const Grouped = struct {
             }
             job.close();
             self.reductions[lane] = null;
-            self.next_lane = 1 - lane;
+            self.next_lane = (lane + 1) % self.reduction_lanes;
         };
         if (self.partitioned) while (true) {
             if (self.local) |local| {
@@ -367,6 +384,7 @@ pub const Grouped = struct {
         defer for (states[0..initialized]) |*state| state.deinit();
         for (states, self.specs) |*state, spec| {
             state.* = try operators.Aggregate.init(self.a, spec.kind, spec.input_type);
+            state.distinct = exact and spec.distinct;
             initialized += 1;
         }
         const pattern_sets = try a.alloc(?*@import("pattern_spill.zig").Set, states.len);
@@ -384,8 +402,12 @@ pub const Grouped = struct {
                 try distinct.add(.{ .keys = &.{ row.values[0], row.values[1] }, .values = &.{row.values[1]}, .ordinal = distinct_ordinal });
                 distinct_ordinal += 1;
             } else if (row.values[0].value != .bool) return error.InvalidSqlSpill else if (row.values[0].value.bool) {
-                if (row.values.len != 1 + states.len * 7) return error.InvalidSqlSpill;
-                for (states, 0..) |*state, i| try merge(state, row.values[1 + i * 7 ..][0..7]);
+                if (row.values.len != 1 + states.len) return error.InvalidSqlSpill;
+                for (states, row.values[1..], self.specs) |*state, value, spec| {
+                    var incoming = try @import("aggregate_partial.zig").decode(a, value, spec);
+                    defer incoming.deinit();
+                    try @import("aggregate_partial.zig").merge(state, incoming);
+                }
             } else {
                 if (row.values.len != states.len + 1) return error.InvalidSqlSpill;
                 for (states, row.values[1..], self.specs, 0..) |*state, input, spec, slot| {
@@ -416,7 +438,9 @@ pub const Grouped = struct {
                 if (last) |prior| if (try same(prior, record.keys)) continue;
                 const slot = std.math.cast(usize, record.keys[0].value.integer) orelse return error.InvalidSqlSpill;
                 if (slot >= states.len) return error.InvalidSqlSpill;
-                if (pattern_sets[slot]) |set| try set.append(record.values[0]) else try states[slot].update(record.values[0]);
+                if (pattern_sets[slot]) |set| {
+                    if (exact) try states[slot].update(record.values[0]) else try set.append(record.values[0]);
+                } else try states[slot].update(record.values[0]);
                 _ = previous.reset(.free_all);
                 const copy = try previous.allocator().alloc(Datum, 2);
                 for (record.keys, copy) |v, *cell| cell.* = try operators.cloneDatum(previous.allocator(), v);
@@ -431,39 +455,6 @@ pub const Grouped = struct {
         };
         self.output_count += 1;
         return .{ .keys = output_keys, .aggregates = aggregates, .ordinal = ordinal };
-    }
-    pub fn merge(state: *operators.Aggregate, cells: []const Datum) !void {
-        const count = std.math.cast(u64, cells[0].value.integer) orelse return error.InvalidSqlSpill;
-        if (count == 0) return;
-        const total = std.math.add(u64, state.count, count) catch return error.SqlNumericOutOfRange;
-        if (total > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
-        switch (state.kind) {
-            .count => {},
-            .sum => if (state.input_type == .integer) {
-                const sum = try std.fmt.parseInt(i128, cells[1].value.number_string, 10);
-                state.integer_sum = std.math.add(i128, state.integer_sum, sum) catch return error.SqlNumericOutOfRange;
-            } else {
-                const adjusted = cells[2].value.float - state.compensation;
-                const sum = state.number_sum + adjusted;
-                if (!std.math.isFinite(sum)) return error.SqlNumericOutOfRange;
-                state.compensation = (sum - state.number_sum) - adjusted;
-                state.number_sum = sum;
-            },
-            .avg => {
-                const incoming = cells[4].value.float;
-                const fraction = @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(total));
-                const delta = incoming - state.mean;
-                state.mean = if (state.count == 0) incoming else if (std.math.isFinite(delta)) state.mean + delta * fraction else state.mean * (1 - fraction) + incoming * fraction;
-                if (!std.math.isFinite(state.mean)) return error.SqlNumericOutOfRange;
-            },
-            .bool_and => state.boolean = state.boolean and cells[5].value.bool,
-            .bool_or => state.boolean = state.boolean or cells[5].value.bool,
-            .min, .max => {
-                try state.update(cells[6]);
-            },
-            .pattern_set => return error.UnsupportedSqlExecution,
-        }
-        state.count = total;
     }
 };
 
@@ -557,9 +548,8 @@ test "SQL full parallel partition reductions preserve exact states and close ear
                 seen[index] = true;
                 try std.testing.expectEqual(@as(u64, index), row.ordinal);
                 if (exact) {
-                    var sum = try operators.Aggregate.init(a, .sum, .integer);
+                    var sum = try @import("aggregate_partial.zig").decode(arena.allocator(), row.aggregates[1], .{ .kind = .sum, .input_type = .integer });
                     defer sum.deinit();
-                    try Grouped.merge(&sum, row.aggregates[7..][0..7]);
                     try std.testing.expectEqual(@as(i64, 96), (try sum.finish()).value.integer);
                 } else {
                     try std.testing.expectEqual(@as(i64, 32), row.aggregates[0].value.integer);

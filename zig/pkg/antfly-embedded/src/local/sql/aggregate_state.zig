@@ -244,7 +244,30 @@ pub const Column = struct {
             else => for (ids, values) |id, value| try self.update(a, id, value),
         }
     }
-    pub fn mergeExact(self: *Column, index: usize, state: operators.Aggregate) !void {
+    pub fn mergeExact(self: *Column, a: A, index: usize, state: operators.Aggregate) !void {
+        if (state.kind != self.spec.kind or state.input_type != self.spec.input_type or state.distinct != self.spec.distinct) return error.InvalidSqlBackendResponse;
+        if (self.values == .dynamic) return @import("aggregate_partial.zig").merge(&self.values.dynamic.items[index], state);
+        if (self.spec.kind == .min or self.spec.kind == .max) {
+            if (state.count == 0) return;
+            const prior = switch (self.values) {
+                .counts, .dynamic => unreachable,
+                inline else => |values| values.items[index].count,
+            };
+            const total = std.math.add(u64, prior, state.count) catch return error.SqlNumericOutOfRange;
+            if (total > std.math.maxInt(i64)) return error.SqlNumericOutOfRange;
+            try self.update(a, index, state.selected.?.row.values[0]);
+            switch (self.values) {
+                .counts, .dynamic => unreachable,
+                inline else => |*values| values.items[index].count = total,
+            }
+            return;
+        }
+        if (self.values == .numbers) {
+            var target = try self.snapshot(a, index);
+            try @import("aggregate_partial.zig").merge(&target, state);
+            self.set(index, target);
+            return;
+        }
         switch (self.values) {
             .counts => |*values| {
                 values.items[index] = std.math.add(u64, values.items[index], state.count) catch return error.SqlNumericOutOfRange;

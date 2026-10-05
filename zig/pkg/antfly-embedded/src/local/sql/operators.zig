@@ -860,8 +860,8 @@ pub const Grouped = struct {
                 const reader: *@This() = @ptrCast(@alignCast(raw));
                 const index = reader.begin + row;
                 if (!reader.exact) return reader.group.state_columns[column].finish(index);
-                const state = try reader.group.state_columns[column / 7].snapshot(alloc, index);
-                return @import("aggregate_partial.zig").cell(alloc, state, column % 7);
+                const state = try reader.group.state_columns[column].snapshot(alloc, index);
+                return @import("aggregate_partial.zig").cell(alloc, state);
             }
         };
         const reader = try a.create(Reader);
@@ -870,7 +870,7 @@ pub const Grouped = struct {
         self.finished = true;
         return .{
             .keys = .{ .retained = .{ .store = &self.key_columns, .begin = begin, .count = count } },
-            .aggregates = .{ .reader = .{ .ptr = reader, .read = Reader.cell, .count = count, .width = self.specs.len * (if (exact) @as(usize, 7) else 1) } },
+            .aggregates = .{ .reader = .{ .ptr = reader, .read = Reader.cell, .count = count, .width = self.specs.len } },
             .ordinals = ordinals,
         };
     }
@@ -1043,26 +1043,40 @@ pub const Grouped = struct {
                 const previous = self.groups.items.len;
                 const slot = try self.resolveGroup(keys);
                 self.groups.items[slot].ordinal = if (slot >= previous) ordinal else @min(self.groups.items[slot].ordinal, ordinal);
-                for (self.state_columns, states) |*column, state| try column.mergeExact(slot, state);
+                for (self.state_columns, states) |*column, state| try column.mergeExact(self.budget.allocator(), slot, state);
             }
         }
         self.rows_seen = std.math.add(u64, self.rows_seen, source.rows_seen) catch return error.SqlNumericOutOfRange;
     }
     pub fn importPartial(self: *Grouped, keys: []const Datum, cells: []const Datum, ordinal: u64) !void {
-        if (cells.len != self.specs.len * 7) return error.InvalidSqlSpill;
+        if (cells.len != self.specs.len) return error.InvalidSqlSpill;
+        var arena = std.heap.ArenaAllocator.init(self.backing);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const states = try a.alloc(Aggregate, self.specs.len);
+        var initialized: usize = 0;
+        defer for (states[0..initialized]) |*state| state.deinit();
+        // Decode and validate every signature before mutating destination state.
+        for (states, cells, self.specs) |*state, value, spec| {
+            state.* = try @import("aggregate_partial.zig").decode(a, value, spec);
+            initialized += 1;
+        }
         var input_storage: [256]Datum = undefined;
         const inputs = input_storage[0..self.specs.len];
         @memset(inputs, .{});
         self.key_count = keys.len;
-        if (self.external == null and self.limits.spill != null and !try self.canRetain(keys, inputs)) try self.startSpill();
-        if (self.external) |external| return external.appendPartial(keys, cells, ordinal);
-        try self.addOrdered(keys, inputs, ordinal);
-        const index = self.last_group.?;
-        for (self.state_columns, 0..) |*column, slot| {
-            var state = try column.snapshot(self.backing, index);
-            try @import("spill_grouped.zig").Grouped.merge(&state, cells[slot * 7 ..][0..7]);
-            column.set(index, state);
+        var state_bytes: usize = 0;
+        for (states) |state| {
+            if (state.selected) |selected| state_bytes +|= (try datumBytes(selected.row.values[0])) *| 4;
+            for (state.distinct_values.items) |entry| state_bytes +|= (try datumBytes(entry.row.row.values[0]) +| @sizeOf(Aggregate)) *| 4;
         }
+        if (self.external == null and self.limits.spill != null and (state_bytes > self.budget.limit -| self.budget.live or !try self.canRetain(keys, inputs))) try self.startSpill();
+        if (self.external) |external| return external.partial(keys, states, ordinal);
+        errdefer self.failed = true;
+        const previous = self.groups.items.len;
+        const index = try self.resolveGroup(keys);
+        self.groups.items[index].ordinal = if (index >= previous) ordinal else @min(self.groups.items[index].ordinal, ordinal);
+        for (self.state_columns, states) |*column, state| try column.mergeExact(self.budget.allocator(), index, state);
     }
     pub fn exportPartial(self: *Grouped, external: *@import("spill_grouped.zig").Grouped) !void {
         var scratch = std.heap.ArenaAllocator.init(self.backing);
@@ -1872,11 +1886,63 @@ test "SQL typed aggregate partial batches preserve i128 sums through cancellatio
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const batch = (try positive.nextResultBatch(arena.allocator(), 64, true)).?;
-    try std.testing.expectEqual(@as(usize, 7), batch.aggregates.width());
-    const sum = try batch.aggregates.cell(arena.allocator(), 0, 1);
-    try std.testing.expectEqualStrings("27670116110564327421", sum.value.number_string);
+    try std.testing.expectEqual(@as(usize, 1), batch.aggregates.width());
+    var sum = try @import("aggregate_partial.zig").decode(arena.allocator(), try batch.aggregates.cell(arena.allocator(), 0, 0), specs[0]);
+    defer sum.deinit();
+    try std.testing.expectEqual(@as(i128, 27670116110564327421), sum.integer_sum);
     try merged.importPartial(try batch.keys.row(arena.allocator(), 0), try batch.aggregates.row(arena.allocator(), 0), batch.ordinals[0]);
     for (0..3) |_| try merged.add(&.{Datum.json(.{ .integer = 7 })}, &.{Datum.json(.{ .integer = -std.math.maxInt(i64) })});
     const result = (try merged.nextResultBatch(arena.allocator(), 64, false)).?;
     try std.testing.expectEqual(@as(i64, 0), (try result.aggregates.cell(a, 0, 0)).value.integer);
+}
+
+test "SQL binary partial import composes typed extrema floats distinct and pattern domains" {
+    const a = std.testing.allocator;
+    const specs = [_]AggregateSpec{
+        .{ .kind = .count },
+        .{ .kind = .sum, .input_type = .integer },
+        .{ .kind = .sum, .input_type = .number },
+        .{ .kind = .avg, .input_type = .number },
+        .{ .kind = .min, .input_type = .integer },
+        .{ .kind = .max, .input_type = .number },
+        .{ .kind = .min, .input_type = .string },
+        .{ .kind = .max, .input_type = .boolean },
+        .{ .kind = .min, .input_type = .json },
+        .{ .kind = .sum, .input_type = .integer, .distinct = true },
+        .{ .kind = .pattern_set, .input_type = .string, .distinct = true },
+    };
+    const target = try Grouped.create(a, &specs, .{});
+    defer target.deinit();
+    const reference = try Grouped.create(a, &specs, .{});
+    defer reference.deinit();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    for (0..2) |partition| {
+        const source = try Grouped.create(a, &specs, .{});
+        defer source.deinit();
+        for (0..3) |i| {
+            const n: i64 = @intCast(i + partition);
+            const row = [_]Datum{
+                Datum.json(.{ .integer = 1 }),                               Datum.json(.{ .integer = n }),
+                Datum.json(.{ .float = @floatFromInt(n) }),                  Datum.json(.{ .float = @floatFromInt(n) }),
+                Datum.json(.{ .integer = n }),                               Datum.json(.{ .float = @floatFromInt(n) }),
+                Datum.json(.{ .string = if (partition == 0) "z" else "a" }), Datum.json(.{ .bool = partition == 1 }),
+                Datum.json(.null),                                           Datum.json(.{ .integer = n }),
+                if (i == 0) Datum{} else Datum.json(.{ .string = "%cat%" }),
+            };
+            try source.add(&.{}, &row);
+            try reference.add(&.{}, &row);
+        }
+        const partial = (try source.nextResultBatch(arena.allocator(), 1, true)).?;
+        try target.importPartial(&.{}, try partial.aggregates.row(arena.allocator(), 0), @intCast(partition));
+    }
+    const actual = try target.resultAt(arena.allocator(), 0);
+    const expected = try reference.resultAt(arena.allocator(), 0);
+    for (actual.aggregates, expected.aggregates) |got, wanted| {
+        try std.testing.expectEqual(wanted.sql_null, got.sql_null);
+        const left = try std.json.Stringify.valueAlloc(arena.allocator(), got.value, .{});
+        const right = try std.json.Stringify.valueAlloc(arena.allocator(), wanted.value, .{});
+        try std.testing.expectEqualStrings(right, left);
+    }
+    try std.testing.expect(!actual.aggregates[8].sql_null and actual.aggregates[8].value == .null);
 }

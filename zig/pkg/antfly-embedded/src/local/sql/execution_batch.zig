@@ -7,6 +7,8 @@ const std = @import("std");
 const scalar = @import("scalar.zig");
 const A = std.mem.Allocator;
 pub const Batch = union(enum) {
+    /// One expression over page-local dictionary entries, including a NULL lane.
+    dictionary: struct { values: []const scalar.Datum, indices: []const u32 },
     /// Stable retained columns; ownership belongs to the enclosing lease.
     retained: struct { store: *const @import("typed_store.zig").Store, begin: usize = 0, count: usize },
     /// Operator-specific column access without constructing a row matrix.
@@ -17,6 +19,7 @@ pub const Batch = union(enum) {
     mapped: struct { source: *const Batch, ordinals: []const usize, kinds: []const @import("ast.zig").ColumnType, selection: []const usize },
     pub fn len(self: Batch) usize {
         return switch (self) {
+            .dictionary => |v| v.indices.len,
             .retained => |v| v.count,
             .reader => |v| v.count,
             .columns => |v| v.page.selection.len,
@@ -27,6 +30,7 @@ pub const Batch = union(enum) {
     }
     pub fn width(self: Batch) usize {
         return switch (self) {
+            .dictionary => 1,
             .retained => |v| v.store.columns.len,
             .reader => |v| v.width,
             .columns => |v| v.definitions.len,
@@ -38,6 +42,7 @@ pub const Batch = union(enum) {
     pub fn cell(self: Batch, a: A, index: usize, column: usize) anyerror!scalar.Datum {
         if (index >= self.len() or column >= self.width()) return error.InvalidSqlBackendResponse;
         return switch (self) {
+            .dictionary => |v| if (v.indices[index] < v.values.len) v.values[v.indices[index]] else error.InvalidSqlBackendResponse,
             .retained => |v| v.store.cell(a, v.begin + index, column),
             .reader => |v| v.read(v.ptr, a, index, column),
             .rows => |v| v[index][column],

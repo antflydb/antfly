@@ -139,12 +139,32 @@ pub const Page = struct {
 /// until the cursor's next pull or close; consumers retain only their results.
 /// SQL names are literal, and null bitmaps distinguish SQL NULL from JSON null.
 pub const ColumnPage = struct {
-    batch: @import("../storage/rowsource/types.zig").ColumnBatch,
+    batch: @import("../storage/rowsource/types.zig").ColumnBatch = .{ .snapshot = .{ .table_id = "sql-relation", .snapshot_id = "statement" }, .row_refs = &.{}, .columns = &.{} },
+    /// Borrowed operator columns, preserving JSON and retained typed storage.
+    /// The pointer avoids embedding mutually recursive Batch/ColumnPage values.
+    native: ?struct { values: *const @import("execution_batch.zig").Batch, names: []const []const u8 } = null,
     selection: []const usize,
     after: ?[]const u8 = null,
+    pub fn validate(self: ColumnPage) !void {
+        if (self.native) |native| {
+            if (native.values.len() != 0 and native.names.len != native.values.width()) return error.InvalidSqlBackendResponse;
+            for (self.selection) |index| if (index >= native.values.len()) return error.InvalidSqlBackendResponse;
+        } else {
+            try self.batch.validate();
+            for (self.selection) |index| if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
+        }
+    }
     pub fn cell(self: ColumnPage, alloc: std.mem.Allocator, row: usize, name: []const u8) !Row.Cell {
         if (row >= self.selection.len) return error.InvalidSqlBackendResponse;
         const index = self.selection[row];
+        if (self.native) |native| {
+            if (index >= native.values.len() or native.names.len != native.values.width()) return error.InvalidSqlBackendResponse;
+            for (native.names, 0..) |column, ordinal| if (std.mem.eql(u8, column, name)) {
+                const value = try native.values.cell(alloc, index, ordinal);
+                return .{ .value = value.value, .sql_null = value.sql_null, .patterns = value.patterns };
+            };
+            return .{ .value = .null, .sql_null = true };
+        }
         if (index >= self.batch.rowCount()) return error.InvalidSqlBackendResponse;
         if (std.mem.eql(u8, name, "_id")) return .{ .value = .{ .string = try @import("../storage/rowsource/identity.zig").allocId(alloc, self.batch.row_refs[index]) }, .sql_null = false };
         const column = self.batch.findColumn(name) orelse return .{ .value = .null, .sql_null = true };
@@ -340,4 +360,22 @@ test "SQL row cells distinguish absent SQL NULL and JSON null and reject invalid
     try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("j"));
     row.sql_nulls = &.{ false, true, true };
     try std.testing.expectError(error.InvalidSqlBackendResponse, row.cell("i"));
+}
+
+test "SQL native column pages preserve selection JSON null and validate schema width" {
+    const Datum = @import("scalar.zig").Datum;
+    const values = [_]Datum{ Datum.json(.{ .integer = 9007199254740993 }), .{}, Datum.json(.null) };
+    const vectors = [_][]const Datum{&values};
+    const batch: @import("execution_batch.zig").Batch = .{ .vectors = .{ .values = &vectors, .count = 3 } };
+    var page: ColumnPage = .{ .native = .{ .values = &batch, .names = &.{"literal.name"} }, .selection = &.{ 2, 0, 1 } };
+    try page.validate();
+    const json_null = try page.cell(std.testing.allocator, 0, "literal.name");
+    try std.testing.expect(!json_null.sql_null and json_null.value == .null);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), (try page.cell(std.testing.allocator, 1, "literal.name")).value.integer);
+    try std.testing.expect((try page.cell(std.testing.allocator, 2, "literal.name")).sql_null);
+    page.selection = &.{3};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validate());
+    page.selection = &.{0};
+    page.native.?.names = &.{};
+    try std.testing.expectError(error.InvalidSqlBackendResponse, page.validate());
 }

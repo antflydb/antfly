@@ -65,10 +65,11 @@ pub const Join = struct {
     output: ?*@import("parallel_output.zig").Pipe = null,
     output_task: ?@import("parallel_scheduler.zig").Task(anyerror!bool) = null,
     parallel_partitions_completed: usize = 0,
-    prepared: [2]?*Join = @splat(null),
-    preparing: [2]?@import("parallel_scheduler.zig").Task(anyerror!bool) = @splat(null),
+    prepared: [8]?*Join = @splat(null),
+    preparing: [8]?@import("parallel_scheduler.zig").Task(anyerror!bool) = @splat(null),
     active_join: ?*Join = null,
     next_build_slot: usize = 0,
+    build_lanes: usize = 2,
     parallel_builds_started: usize = 0,
     fn executePartition(self: *Join) anyerror!bool {
         defer self.closeInputs();
@@ -123,8 +124,15 @@ pub const Join = struct {
         if (row.keys.len != 2 or row.keys[0].value != .bool or row.keys[1].value != .bool or row.values.len != width + self.evaluation.?.right_width) return error.InvalidSqlSpill;
         return .{ .left = if (row.keys[0].value.bool) row.values[0..width] else null, .right = if (row.keys[1].value.bool) row.values[width..] else null };
     }
+    fn readyLane(self: *Join) ?usize {
+        for (0..self.build_lanes) |offset| {
+            const lane = (self.next_build_slot + offset) % self.build_lanes;
+            if (self.prepared[lane] != null) return lane;
+        }
+        return null;
+    }
     fn startBuilds(self: *Join) !void {
-        for (&self.prepared, &self.preparing) |*slot, *task| {
+        for (self.prepared[0..self.build_lanes], self.preparing[0..self.build_lanes]) |*slot, *task| {
             if (slot.* != null) continue;
             while (self.partition < self.partitions) {
                 const index = self.partition;
@@ -168,9 +176,9 @@ pub const Join = struct {
                 self.active_join = null;
             }
             try self.startBuilds();
-            const index: usize = if (self.prepared[self.next_build_slot] != null) self.next_build_slot else 1 - self.next_build_slot;
+            const index = self.readyLane() orelse return null;
             const child = self.prepared[index] orelse return null;
-            self.next_build_slot = 1 - index;
+            self.next_build_slot = (index + 1) % self.build_lanes;
             if (self.preparing[index]) |*task| {
                 const result = task.await(self.manager.io);
                 self.preparing[index] = null;
@@ -210,9 +218,9 @@ pub const Join = struct {
                 self.active_join = null;
             }
             try self.startBuilds();
-            const index: usize = if (self.prepared[self.next_build_slot] != null) self.next_build_slot else 1 - self.next_build_slot;
+            const index = self.readyLane() orelse return null;
             const child = self.prepared[index] orelse return null;
-            self.next_build_slot = 1 - index;
+            self.next_build_slot = (index + 1) % self.build_lanes;
             if (self.preparing[index]) |*task| {
                 const result = task.await(self.manager.io);
                 self.preparing[index] = null;
@@ -233,7 +241,8 @@ pub const Join = struct {
         const target = @max(@as(usize, 1), bytes / 16);
         const wanted = @min(@as(u64, 16), @max(@as(u64, 2), build_bytes / target + 1));
         const partitions = std.math.ceilPowerOfTwo(usize, @intCast(wanted)) catch unreachable;
-        self.* = .{ .a = a, .manager = manager, .limits = .{ .bytes = @max(8192, bytes / 2), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 };
+        const lanes = @import("parallel_scheduler.zig").global().fanout(partitions, bytes, 256 * 1024);
+        self.* = .{ .a = a, .manager = manager, .build_lanes = lanes, .limits = .{ .bytes = @max(8192, bytes / (lanes + 1)), .rows = rows, .spill = manager }, .partitions = partitions, .outer_left = outer_left, .outer_right = outer_right, .probe_arena = .init(a), .scratch = .init(a), .candidate = .init(a), .output_arena = .init(a), .filter = filter, .parallel_builds = bytes >= 512 * 1024 and lanes >= 2 };
         return self;
     }
     pub fn addBatch(self: *Join, build_side: bool, batch: @import("execution_batch.zig").Batch, keys: []const []const Datum, begin: usize) !void {

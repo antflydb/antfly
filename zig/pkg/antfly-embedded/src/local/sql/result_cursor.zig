@@ -34,6 +34,27 @@ pub const Cursor = struct {
         self.index += 1;
         return values;
     }
+    /// Gather blocking output into retained typed columns once. Spill row
+    /// payloads live only in scratch; transport pages own their column store.
+    pub fn nextBatch(self: *Cursor, a: std.mem.Allocator, maximum: usize, byte_limit: usize) !*@import("typed_store.zig").Store {
+        const store = try a.create(@import("typed_store.zig").Store);
+        errdefer a.destroy(store);
+        store.* = .init(a);
+        errdefer store.deinit();
+        var scratch = std.heap.ArenaAllocator.init(self.a);
+        defer scratch.deinit();
+        var bytes: usize = 0;
+        while (self.index < self.count() and store.len < maximum) {
+            _ = scratch.reset(.retain_capacity);
+            const row = try self.read(scratch.allocator());
+            for (row.values) |value| bytes +|= try @import("operators.zig").datumBytes(value);
+            _ = try store.append(row.values);
+            if (self.sorted) |top| if (top.external == null) top.releaseFinishedRow(self.sorted_offset + self.index);
+            self.index += 1;
+            if (bytes >= byte_limit) break;
+        }
+        return store;
+    }
     pub fn count(self: *const Cursor) usize {
         return if (self.sorted != null) self.sorted_count else @intCast(self.rows.size);
     }

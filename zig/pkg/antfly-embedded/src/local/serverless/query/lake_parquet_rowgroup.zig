@@ -474,6 +474,9 @@ fn persistentObjectRangeEntryAgeOrder(
     lhs: *PersistentObjectRangeCacheEntry,
     rhs: *PersistentObjectRangeCacheEntry,
 ) std.math.Order {
+    // Inventory retention uses the same ordinary-before-protected preference
+    // as live eviction. Keep the discovery heap bounded by the entry ceiling.
+    if (lhs.protected != rhs.protected) return if (lhs.protected) .gt else .lt;
     const modified_order = std.math.order(lhs.modified_ns, rhs.modified_ns);
     if (modified_order != .eq) return modified_order;
     if (std.mem.eql(u8, lhs.filename, rhs.filename)) return .eq;
@@ -633,20 +636,9 @@ const PersistentObjectRangeCacheState = struct {
             registered += 1;
         }
         while (self.stats.stored_bytes > self.policy.max_total_bytes or self.stats.entries > self.policy.max_entries) {
-            const victim_node = self.lru.first orelse break;
-            const victim: *PersistentObjectRangeCacheEntry = @alignCast(@fieldParentPtr("lru_node", victim_node));
-            dir.deleteFile(io, victim.filename) catch |err| switch (err) {
-                error.FileNotFound => {},
-                else => return err,
-            };
-            _ = self.entries.remove(victim.filename);
-            self.lru.remove(victim_node);
-            decrementSaturating(&self.stats.stored_bytes, victim.disk_bytes);
-            if (victim.protected) decrementSaturating(&self.stats.protected_stored_bytes, victim.disk_bytes);
-            decrementSaturating(&self.stats.entries, 1);
-            self.stats.evicted_bytes +|= victim.disk_bytes;
-            self.stats.evicted_entries += 1;
-            self.freeEntry(victim);
+            // Recovery may evict protected entries if they alone exceed the
+            // new ceiling, but ordinary ranges must be removed first.
+            if (!self.evictOne(true)) return error.PersistentObjectRangeCacheRecoveryFailed;
         }
     }
 
@@ -9848,4 +9840,38 @@ test "lake persistent cache holds one root owner until shutdown" {
     const bytes = (try successor.readAlloc(a, "key", 5)).?;
     defer a.free(bytes);
     try std.testing.expectEqualStrings("bytes", bytes);
+}
+
+test "lake persistent cache recovery preserves priority when capacity shrinks" {
+    const a = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(a, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const footer = "lake-range:v2:purpose=parquet_footer:identity=older-footer";
+    for ([_]bool{ false, true }) |entries| {
+        const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/shrink-{s}", .{ tmp.sub_path, if (entries) "entries" else "bytes" });
+        defer a.free(root);
+        var policy: PersistentObjectRangeCachePolicy = .{ .max_entries = 4, .max_total_bytes = 8192 };
+        {
+            var disk = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+            defer disk.deinit();
+            _ = disk.enqueueWrite(footer, "meta");
+            disk.flush();
+            _ = disk.enqueueWrite("newer-scan-1", "data");
+            disk.flush();
+            _ = disk.enqueueWrite("newer-scan-2", "more");
+            disk.flush();
+        }
+        if (entries) policy.max_entries = 1 else policy.max_total_bytes = 180;
+        var disk = try PersistentObjectRangeCache.initWithPolicy(io, root, policy);
+        defer disk.deinit();
+        const bytes = (try disk.readAlloc(a, footer, 4)).?;
+        defer a.free(bytes);
+        try std.testing.expectEqualStrings("meta", bytes);
+        try std.testing.expect(disk.statsSnapshot().stored_bytes <= policy.max_total_bytes);
+        try std.testing.expect(disk.statsSnapshot().entries <= policy.max_entries);
+        if (entries) try std.testing.expect((try disk.readAlloc(a, "newer-scan-2", 4)) == null);
+    }
 }

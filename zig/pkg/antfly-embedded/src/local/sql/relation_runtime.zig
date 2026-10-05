@@ -412,7 +412,7 @@ fn Engine(comptime Context: type) type {
                         self.pages += 1;
                         if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
                         const page = try pull(cursor.ptr, self.arena.allocator(), @intCast(maximum));
-                        try page.batch.validate();
+                        try page.validate();
                         if (page.selection.len > maximum or page.selection.len > self.engine.context.limits.scan_rows -| self.engine.visited) return error.SqlProgramLimitExceeded;
                         self.engine.visited += page.selection.len;
                         self.eof = page.after == null;
@@ -486,7 +486,7 @@ fn Engine(comptime Context: type) type {
                                 if (self.pages > self.engine.context.limits.scan_pages) return error.SqlProgramLimitExceeded;
                                 const wanted: u32 = @intCast(@min(self.engine.context.limits.executionRows(), @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.node.columns.len * @sizeOf(Datum) * 16))));
                                 self.column_page = try pull(cursor.ptr, self.arena.allocator(), wanted);
-                                try self.column_page.?.batch.validate();
+                                try self.column_page.?.validate();
                                 if (self.column_page.?.selection.len > wanted) return error.InvalidSqlBackendResponse;
                                 self.page_index = 0;
                                 self.eof = self.column_page.?.after == null;
@@ -1188,46 +1188,19 @@ fn Engine(comptime Context: type) type {
             fn nextColumns(ptr: *anyopaque, a: Allocator, limit: u32) anyerror!catalog.ColumnPage {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
                 if (self.pending_failure) |err| return err;
-                const types = @import("../storage/rowsource/types.zig");
                 const wanted = @min(limit, @max(@as(usize, 1), self.engine.context.limits.retained_bytes / (16 * 1024 + self.iterator.node.columns.len * @sizeOf(Datum) * 16)));
                 var failure: ?anyerror = null;
                 const batch = try self.iterator.nextBatch(a, wanted, &failure);
                 self.pending_failure = failure;
                 if (batch.len() == 0) if (failure) |err| return err;
-                const refs = try a.alloc(types.RowRef, batch.len());
+                const values = try a.create(@import("execution_batch.zig").Batch);
+                values.* = batch;
+                const names = try a.alloc([]const u8, self.iterator.node.columns.len);
+                for (self.iterator.node.columns, names) |definition, *name| name.* = definition.internal;
                 const selection = try a.alloc(usize, batch.len());
-                for (refs, selection, 0..) |*ref, *index, offset| {
-                    self.ordinal += 1;
-                    ref.* = .{ .relational_key = try std.fmt.allocPrint(a, "{d}", .{self.ordinal}) };
-                    index.* = offset;
-                }
-                const columns = try a.alloc(types.ColumnVector, self.iterator.node.columns.len);
-                for (self.iterator.node.columns, columns, 0..) |definition, *column, ordinal| {
-                    const nulls = try a.alloc(u8, batch.len());
-                    const values: types.ColumnValues = switch (definition.type) {
-                        .integer => .{ .i64 = try a.alloc(i64, batch.len()) },
-                        .number => .{ .f64 = try a.alloc(f64, batch.len()) },
-                        .boolean => .{ .bool = try a.alloc(bool, batch.len()) },
-                        .string, .uuid, .datetime => .{ .bytes = try a.alloc([]const u8, batch.len()) },
-                        .json => .{ .json = try a.alloc([]const u8, batch.len()) },
-                    };
-                    for (0..batch.len()) |index| {
-                        const value = try batch.cell(a, index, ordinal);
-                        if (value.patterns != null) return error.InvalidSqlBackendResponse;
-                        nulls[index] = @intFromBool(value.sql_null);
-                        const normalized = if (value.sql_null) std.json.Value.null else try describe.coerceAlloc(a, value.value, definition.type);
-                        switch (values) {
-                            .i64 => |vector| @constCast(vector)[index] = if (value.sql_null) 0 else normalized.integer,
-                            .f64 => |vector| @constCast(vector)[index] = if (value.sql_null) 0 else normalized.float,
-                            .bool => |vector| @constCast(vector)[index] = !value.sql_null and normalized.bool,
-                            .bytes => |vector| @constCast(vector)[index] = if (value.sql_null) "" else normalized.string,
-                            .json => |vector| @constCast(vector)[index] = try std.json.Stringify.valueAlloc(a, normalized, .{}),
-                            else => unreachable,
-                        }
-                    }
-                    column.* = .{ .name = definition.internal, .values = values, .nulls = .{ .bytes = nulls } };
-                }
-                return .{ .batch = .{ .snapshot = .{ .table_id = "sql-relation", .snapshot_id = "statement" }, .row_refs = refs, .columns = columns }, .selection = selection, .after = if (batch.len() != 0) try std.fmt.allocPrint(a, "{d}", .{self.ordinal}) else null };
+                for (selection, 0..) |*index, offset| index.* = offset;
+                self.ordinal += batch.len();
+                return .{ .native = .{ .values = values, .names = names }, .selection = selection, .after = if (batch.len() != 0) try std.fmt.allocPrint(a, "{d}", .{self.ordinal}) else null };
             }
             fn open(ptr: *anyopaque, _: Allocator, _: catalog.Table, _: catalog.Scan) !?catalog.Cursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));

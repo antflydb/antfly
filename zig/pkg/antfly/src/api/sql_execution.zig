@@ -108,6 +108,13 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 }
 
 pub const Adapter = struct {
+    /// A transport may consume borrowed result columns within the same policy,
+    /// settings and snapshot scope as ordinary execution. Mutation and active
+    /// transaction paths continue to own their acknowledgement result.
+    read_delivery: ?struct {
+        ptr: *anyopaque,
+        deliver: *const fn (*anyopaque, std.mem.Allocator, *@import("antfly_local_sources").sql_read_stream.Stream) anyerror!@import("antfly_local_sources").sql_runtime.Result,
+    } = null,
     server: *http_server.ApiHttpServer,
     identity: *?http_server.AuthenticatedIdentity,
     context: operation.RequestContext,
@@ -511,6 +518,12 @@ pub const Adapter = struct {
         var statement_backend = guarded_backend orelse self.backend();
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
+        if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {
+            if (try @import("antfly_local_sources").sql_read_stream.Stream.open(alloc, statement_backend, compiled, parameters, limits)) |stream| {
+                defer stream.close();
+                return delivery.deliver(delivery.ptr, alloc, stream);
+            }
+        };
         return @import("antfly_local_sources").sql_runtime.execute(alloc, statement_backend, compiled, parameters, limits) catch |zig017_err| {
             zig017_return_error = zig017_err;
             return zig017_err;

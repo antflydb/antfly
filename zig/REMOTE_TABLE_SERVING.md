@@ -45,7 +45,7 @@ The following paths remain required before claiming complete remote index servin
 | Range caching | Public SQL/rows RAM → disk → source reads | Shared artifact-reader admission and per-statement explain accounting |
 | Index construction | RowSource sidecar builders, scoped artifact uploads, rebuild planning | Declared remote index scheduling, durable generation publication and public status |
 | Index selection | Snapshot/column/config bindings and candidate/hydration helpers | Catalog-bound SQL/rows/search selection, complete coverage proofs and explicit-index errors |
-| Algebraic execution | Native exact typed reducers; separate legacy lake fold artifacts | Versioned shared state codec, bound semantic matcher and native SQL state import |
+| Algebraic execution | Native exact typed reducers; separate legacy lake fold artifacts | Bound semantic matcher, durable native state artifacts and catalog-selected SQL substitution |
 | Incremental refresh | Immutable file identities and invalidation foundations | Per-file contribution manifests, append merging and delete-aware correction |
 
 This table is an acceptance gate. Helper tests or a configured index alone do not
@@ -59,6 +59,9 @@ not reference dictionary entries. Cached decoded pages retain the dictionary
 lease; uncached pages borrow their cursor's dictionary. SQL kernels, Iceberg equality deletes,
 public row reads, and sidecar builders accept these representations. Predicate
 and dynamic-filter evaluation reuse dictionary results within each physical page.
+Supported single-input SQL expressions evaluate only referenced dictionary entries
+and retain an encoded intermediate; high-cardinality, lazy and external-function
+expressions use the existing typed/scalar fallbacks.
 Logical timestamp conversion currently retains its expanded numeric path.
 
 Spilled joins admit borrowed blocks into typed hash state and reuse bounded
@@ -71,8 +74,32 @@ PostgreSQL delivery reads cells from retained execution columns directly. Result
 views preserve ownership through portal slicing; scroll/hold cursors copy cells
 at their spooling boundary. SQL NULL remains separate from JSON null, and datetime
 conversion occurs at encoding. Retained pages must be released before their stream
-closes. HTTP SQL still uses its bounded materialized result envelope; direct HTTP
-serialization and operational remote index/materialization selection remain open.
+closes. Stateless HTTP SELECT encodes these leased columns directly into its bounded,
+atomic response envelope. NULL flags use one bit per cell during encoding;
+integers retain exact decimal-string wire values. Blocking results gather into
+typed delivery columns rather than JSON row/null matrices. Active transactions,
+mutations and declined streaming shapes retain their existing result path.
+Operational remote index/materialization selection remains open.
+
+Native partial aggregate handoff uses the `AGS` version 1 binary state codec.
+Its signature binds aggregate kind, input type and DISTINCT semantics; native
+count, i128 sum, compensation and mean fields avoid decimal parsing. Typed
+variable payloads retain extrema, DISTINCT membership, pattern NULL and JSON
+NULL separately. All signatures decode before group import. This codec does
+not by itself publish a reusable remote materialization.
+
+The ReleaseSafe dictionary-expression fixture evaluates 4,096 rows with 32
+unique integers, repeated 256 times. Across three local samples, encoded
+execution takes 13.4–14.2 ms versus 34.4–35.1 ms for expanded kernels, with
+24,642 versus 442,644 peak workspace bytes. Both validate the same checksum.
+Run `zig build sql-native-refinement-bench -Doptimize=ReleaseSafe` to reproduce;
+these measurements describe this fixture, not end-to-end lake throughput.
+
+Scan, join and group partition workers choose useful fan-out from shared scheduler
+capacity and their total workspace allowance, up to eight concurrent lanes.
+Ordered scan delivery, bounded credits, inline fallback and cancellation remain
+part of the contract. Concurrent statements share admission; planned fan-out is
+advisory and every submitted task still acquires its own lease.
 
 The ReleaseSafe wide 100,000-by-100,000 spilled join benchmark produces the same
 aggregate checksum with approximately 0.70 million backing allocations, compared
