@@ -81,8 +81,9 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const scope = useRef<AbortController | null>(null);
-  const modelRequests = useRef(new Set<string>());
-  const catalogEpoch = useRef(0);
+  const modelRequests = useRef(new Map<string, symbol>());
+  const modelCatalog = useRef<Record<string, ChatGPTModel[]>>({});
+  const catalogVersions = useRef(new Map<string, number>());
   const refresh = useCallback(
     async (signal: AbortSignal) => {
       const result = await client.chatgpt.accounts(signal);
@@ -95,7 +96,8 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const controller = new AbortController();
     scope.current = controller;
-    catalogEpoch.current++;
+    catalogVersions.current.clear();
+    modelCatalog.current = {};
     setSupported(false);
     setAccounts([]);
     setModels({});
@@ -116,24 +118,37 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
     };
   }, [refresh, isAuthenticated, isLoading]);
 
+  const invalidateModels = useCallback((id: string) => {
+    catalogVersions.current.set(id, (catalogVersions.current.get(id) ?? 0) + 1);
+    delete modelCatalog.current[id];
+    modelRequests.current.delete(id);
+    setModels((current) => {
+      const next = { ...current };
+      delete next[id];
+      return next;
+    });
+  }, []);
   const loadModels = useCallback(
     async (id: string) => {
       const signal = scope.current?.signal;
-      if (!signal || signal.aborted || modelRequests.current.has(id)) return;
-      modelRequests.current.add(id);
-      const epoch = catalogEpoch.current;
+      if (!signal || signal.aborted || modelRequests.current.has(id) || modelCatalog.current[id])
+        return;
+      const request = Symbol(id);
+      modelRequests.current.set(id, request);
+      const version = catalogVersions.current.get(id) ?? 0;
       try {
         const result = await client.chatgpt.models(id, signal);
-        if (!signal.aborted && epoch === catalogEpoch.current)
-          setModels((current) => ({
-            ...current,
-            [id]: result.models.filter((model) => model.visibility === "list"),
-          }));
-      } catch (err) {
-        if (!signal.aborted && epoch === catalogEpoch.current) {
-          modelRequests.current.delete(id);
-          setError(chatGPTErrorMessage(err));
+        if (!signal.aborted && version === (catalogVersions.current.get(id) ?? 0)) {
+          const catalog = result.models.filter((model) => model.visibility === "list");
+          modelCatalog.current[id] = catalog;
+          setModels((current) => ({ ...current, [id]: catalog }));
         }
+      } catch (err) {
+        if (!signal.aborted && version === (catalogVersions.current.get(id) ?? 0))
+          setError(chatGPTErrorMessage(err));
+      } finally {
+        // A stale request must not release a newer request for the same account.
+        if (modelRequests.current.get(id) === request) modelRequests.current.delete(id);
       }
     },
     [client]
@@ -163,11 +178,14 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
           if (signal.aborted) return;
           if (Date.now() >= attempt.expires_at * 1000) throw new Error("Authorization expired");
           const result = await client.chatgpt.attempt(attempt.attempt_id, signal);
+          if (signal.aborted) return;
           if (result.status === "connected") {
-            catalogEpoch.current++;
-            setModels({});
-            modelRequests.current.clear();
+            const connectedId = result.connection_id;
+            if (!connectedId) throw new Error("Missing connected account");
+            invalidateModels(connectedId);
             await refresh(signal);
+            if (signal.aborted) return;
+            await loadModels(connectedId);
             if (!signal.aborted)
               setNotice(
                 "Eligible AI requests will use your ChatGPT plan. You can manage usage in ChatGPT settings."
@@ -201,7 +219,7 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
         if (!signal.aborted) setBusy(false);
       }
     },
-    [client, refresh, busy]
+    [client, refresh, busy, invalidateModels, loadModels]
   );
   const disconnect = useCallback(
     async (id: string) => {
@@ -212,13 +230,7 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
       try {
         const result = await client.chatgpt.disconnect(id, signal);
         if (signal.aborted) return;
-        catalogEpoch.current++;
-        setModels((current) => {
-          const next = { ...current };
-          delete next[id];
-          return next;
-        });
-        modelRequests.current.delete(id);
+        invalidateModels(id);
         await refresh(signal);
         if (!signal.aborted)
           setNotice(
@@ -232,7 +244,7 @@ export function ChatGPTProvider({ children }: { children: ReactNode }) {
         if (!signal.aborted) setBusy(false);
       }
     },
-    [client, refresh, busy]
+    [client, refresh, busy, invalidateModels]
   );
   return (
     <Context.Provider

@@ -364,7 +364,10 @@ The registry lives in `<auth_store_root_dir>/chatgpt/accounts.json` with mode
 that credential store. Updates use an exclusive temporary file, file sync,
 rename and directory sync. Disconnect and reauthorization increment a session
 version; request-long account pins and token leases prevent a tool loop from
-switching accounts or resuming after disconnect/reconnect. Refresh is serialized
+switching accounts or resuming after disconnect/reconnect. Authorization attempts
+also capture the selected account version. Disconnect declines pending sign-ins
+for that registration and unselected attempts for the same owner, so delayed
+callbacks cannot restore a grant; a new sign-in after disconnect remains allowed. Refresh is serialized
 and rotating tokens are saved before inference proceeds.
 
 Generation configuration is `{provider: "chatgpt", connection_id, model}` with
@@ -380,7 +383,9 @@ Antfarm Connections owns authorization and disconnect controls; Chat and RAG
 selectors show eligible accounts and catalog model slugs. Browser state contains
 safe summaries, models and opaque references. Switching the application user or
 API endpoint aborts previous operations and clears account/catalog state.
-Disconnect invalidates pending catalog results. Other generation pickers do not
+Catalog versions are tracked per account. Disconnect invalidates only that
+account’s pending catalog results; discarded requests cannot block a newer fetch.
+Reauthorization reloads the connected account’s catalog. Other generation pickers do not
 offer personal plans for durable or unattended work.
 
 Automated tests use public signed JWT fixtures and a loopback mock auth server.
@@ -396,7 +401,7 @@ Validated in the implementation worktree: `zig build antfly-generating-test
 lib-generating-test antfly -j2` (217 runtime and 13 library tests), Zig OpenAPI
 consistency check, retrieval regression suite, TypeScript SDK build/type checks
 and 399 tests, Antfarm build
-and 160 unit tests, Go SDK tests, Python generation consistency and 257 tests.
+and 164 unit tests, Go SDK tests, Python generation consistency and 257 tests.
 A local standalone HTTP smoke test verified safe summaries, origin rejection,
 authorization startup, PKCE parameters and a declined loopback callback. The
 repository-wide license check reports pre-existing missing/stale headers; the
@@ -408,3 +413,9 @@ smoke test verified pending/connected/declined login, list/models/logout, Basic
 auth, no authorization replay or redirect, safe failure output and unsupported
 provider/path rejection. The CLI help and shell completion registry include the
 new commands. VM import/export was intentionally deferred.
+
+Review regressions cover delayed callbacks after logout, stale authorization
+pins, owner isolation, explicit reconnect, unrelated account catalog fetches,
+replacement request ownership, catalog refresh after reauthorization and owner
+changes during sign-in refresh. The
+217 runtime/generation tests and 164 Antfarm tests pass; Antfarm builds successfully.

@@ -61,6 +61,7 @@ const Attempt = struct {
     verifier: []const u8,
     callback_uri: []const u8,
     selected_id: ?[]const u8,
+    selected_pin: ?Pin = null,
     client_id: []const u8,
     expires_at: i64,
     outcome: Outcome = .{ .status = .pending },
@@ -91,6 +92,7 @@ const Attempt = struct {
         return ctx.text(if (self.outcome.status == .connected) "ChatGPT connection saved. Return to Antfarm." else "ChatGPT connection was not enabled. Return to Antfarm.");
     }
     fn complete(self: *Attempt, ctx: *httpx.Context) !void {
+        if (self.selected_pin) |pin| try pin.check(self.selected_id.?);
         if (ctx.query("error")) |err| {
             self.outcome = .{ .status = if (std.mem.eql(u8, err, "access_denied")) .declined else .@"error" };
             return;
@@ -132,6 +134,7 @@ const Attempt = struct {
             };
         }
         if (existing) |record| if (!std.mem.eql(u8, record.subject, identity.value.sub)) return error.InvalidIdentity;
+        if (self.selected_pin) |pin| try pin.check(self.selected_id.?);
         const id = if (existing) |record| record.connection_id else try self.manager.random(a);
         const record: Record = .{ .connection_id = id, .owner = self.owner, .subject = identity.value.sub, .email = identity.value.email, .client_id = client_id, .access_token = token.value.access_token, .refresh_token = token.value.refresh_token orelse "", .id_token = token.value.id_token.?, .scope = token.value.scope orelse "", .expires_at = now(self.manager.io) + token.value.expires_in };
         if (existing) |old| {
@@ -337,6 +340,8 @@ pub const Manager = struct {
             const rec = try find(&saved.value, owner, id);
             attempt.selected_id = try local.dupe(u8, id);
             attempt.client_id = try local.dupe(u8, rec.client_id);
+            const current = try self.session(id);
+            attempt.selected_pin = .{ .session = current, .epoch = current.epoch.load(.acquire) };
         }
         try attempt.server.get("/auth/callback", httpx.Handler.bind(attempt, Attempt.callback));
         try attempt.server.bind();
@@ -475,8 +480,18 @@ pub const Manager = struct {
         rec.refresh_token = "";
         rec.id_token = "";
         rec.scope = "";
+        const current = try self.session(id);
         try self.save(saved.value);
-        _ = (try self.session(id)).epoch.fetchAdd(1, .acq_rel);
+        _ = current.epoch.fetchAdd(1, .acq_rel);
+        // An unselected registration has no account binding yet. Cancel it for
+        // this owner as well so it cannot revive a disconnected registration.
+        // Keep the bounded callback listener until expiry to reject late redirects.
+        for (self.attempts.items) |attempt| {
+            if (attempt.outcome.status != .pending or !std.mem.eql(u8, attempt.owner, owner)) continue;
+            if (attempt.selected_id) |selected| if (!std.mem.eql(u8, selected, id)) continue;
+            attempt.outcome = .{ .status = .declined };
+            std.crypto.secureZero(u8, @constCast(attempt.verifier));
+        }
         if (refresh.len == 0) return true;
         var http = self.client(a);
         defer http.deinit();
@@ -667,8 +682,32 @@ test "chatgpt mock OAuth rotates refresh and rejects changed subject" {
     var unchanged = try instance.lease(a, "alice", id);
     try std.testing.expectEqualStrings("access-two", unchanged.access_token);
     unchanged.deinit();
+    mock.identity = @embedFile("fixtures/identity.jwt");
+    const pending_signin = try instance.begin(local, "alice", id);
+    const pending_attempt = instance.attempts.items[2];
+    pending_attempt.nonce = "test-nonce";
+    const unselected = try instance.begin(local, "alice", null);
+    const other_owner = try instance.begin(local, "bob", null);
+    const selected_pin = pending_attempt.selected_pin.?;
     try std.testing.expect(try instance.disconnect("alice", id));
+    try std.testing.expectError(error.ChatGPTReconnectRequired, selected_pin.check(id));
+    try std.testing.expectEqual(Status.declined, (try instance.outcome(local, "alice", pending_signin.attempt_id)).status);
+    try std.testing.expectEqual(Status.declined, (try instance.outcome(local, "alice", unselected.attempt_id)).status);
+    try std.testing.expectEqual(Status.pending, (try instance.outcome(local, "bob", other_owner.attempt_id)).status);
+    const late_callback = try std.fmt.allocPrint(local, "{s}?state={s}&code=test&client_id=issued-client", .{ pending_attempt.callback_uri, pending_signin.attempt_id });
+    response = try http.get(late_callback, .{ .timeout_ms = 5000 });
+    try std.testing.expectEqual(@as(u16, 400), response.status.code);
+    response.deinit();
+    try std.testing.expect(!(try instance.summaries(local, "alice"))[0].connected);
     try std.testing.expectError(error.ChatGPTReconnectRequired, instance.lease(a, "alice", id));
+    // A deliberate sign-in started after logout can reconnect the same account.
+    const fresh = try instance.begin(local, "alice", id);
+    const fresh_attempt = instance.attempts.items[5];
+    fresh_attempt.nonce = "test-nonce";
+    const fresh_callback = try std.fmt.allocPrint(local, "{s}?state={s}&code=test&client_id=issued-client", .{ fresh_attempt.callback_uri, fresh.attempt_id });
+    response = try http.get(fresh_callback, .{ .timeout_ms = 5000 });
+    response.deinit();
+    try std.testing.expectEqual(Status.connected, (try instance.outcome(local, "alice", fresh.attempt_id)).status);
 }
 
 test "chatgpt manager persists host identity and partitions personal registrations" {
