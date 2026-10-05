@@ -8643,6 +8643,13 @@ fn parseBleveFuzziness(value: ?query_openapi.Fuzziness, default_edits: u8) !Pars
             if (int_value < 0 or int_value > 2) return error.InvalidQueryRequest;
             return .{ .max_edits = @intCast(int_value), .auto_fuzzy = false };
         },
+        .number_string => |token| {
+            // Public admission preserves number tokens for lossless IDs. The
+            // schema's untyped fuzziness union retains that representation too.
+            const edits = std.fmt.parseInt(u8, token, 10) catch return error.InvalidQueryRequest;
+            if (edits > 2) return error.InvalidQueryRequest;
+            return .{ .max_edits = edits, .auto_fuzzy = false };
+        },
         .string => |str_value| {
             if (!std.mem.eql(u8, str_value, "auto")) return error.UnsupportedQueryRequest;
             return .{ .max_edits = default_edits, .auto_fuzzy = true };
@@ -14345,6 +14352,8 @@ fn consumerTests() type {
             const filters = [_][]const u8{
                 "{\"term\":\"active\",\"path\":\"/status\"}",
                 "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":1}",
+                "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":0}",
+                "{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":2}",
                 "{\"prefix\":\"doc:\",\"path\":\"/id\"}",
                 "{\"regexp\":\"go.*\",\"path\":\"/tier\"}",
                 "{\"wildcard\":\"go*\",\"path\":\"/tier\"}",
@@ -14378,6 +14387,16 @@ fn consumerTests() type {
                 const normalized = owned.req.graph_queries[0].query.params.node_filter.filter_query_json orelse
                     return error.TestUnexpectedResult;
                 try std.testing.expect(normalized.len > 0);
+            }
+
+            for ([_][]const u8{ "-1", "3", "1.5", "256" }) |token| {
+                const request = try std.mem.concat(alloc, u8, &.{
+                    "{\"graph_queries\":{\"walk\":{\"index\":\"g\",\"traverse\":{\"start\":{\"keys\":[\"a\"]},\"filter\":{\"term\":\"gild\",\"path\":\"/tier\",\"fuzziness\":",
+                    token,
+                    "}}}}}",
+                });
+                defer alloc.free(request);
+                try std.testing.expectError(error.InvalidQueryRequest, parseQueryRequest(alloc, null, "docs", request));
             }
 
             // Closed empty-object predicates reject misspelled or future fields at

@@ -95,4 +95,15 @@ test "online graph snapshot receiver rebinds native effects without changing sou
     request.merge_page.?.digest = pages.commandDigest(request);
     try @import("../server_db_adapter.zig").applyOrdered(&receiver, request, .{ .term = 1, .index = 4 });
     try std.testing.expectError(error.NotFound, receiver.core.store.get(alloc, edge));
+    const retired = try internal_keys.graphRetirementKeyAlloc(alloc, edge);
+    defer alloc.free(retired);
+    const stamp = try receiver.core.store.get(alloc, retired);
+    defer alloc.free(stamp);
+    try std.testing.expectEqual(@as(u64, 4), try @import("../graph_cleanup_contract.zig").retirementGeneration(stamp));
+    // Lost acknowledgements must replay the same stamp, never allocate a new
+    // generation that could suppress a subsequently revived relationship.
+    try @import("../server_db_adapter.zig").applyOrdered(&receiver, request, .{ .term = 1, .index = 5 });
+    const replayed = try receiver.core.store.get(alloc, retired);
+    defer alloc.free(replayed);
+    try std.testing.expectEqualSlices(u8, stamp, replayed);
 }

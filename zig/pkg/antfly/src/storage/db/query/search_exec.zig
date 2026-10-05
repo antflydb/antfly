@@ -13472,6 +13472,7 @@ fn searchDenseInternal(
             .graph_results = &.{},
         }, chunk_backed);
         errdefer result.deinit();
+        if (chunk_backed and raw_member_mode) try attachMemberArtifactRefs(alloc, result.hits);
 
         const visible_candidate_count: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
         const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasStableRequestedPage(
@@ -15299,6 +15300,7 @@ pub fn searchSparse(
         }, chunk_backed);
         if (bench_query_profile) postprocess_ns += platform_time.monotonicNs() - postprocess_start_ns;
         errdefer result.deinit();
+        if (chunk_backed and raw_member_mode) try attachMemberArtifactRefs(alloc, result.hits);
 
         const visible_candidate_count: u32 = @intCast(@min(result.hits.len, @as(usize, std.math.maxInt(u32))));
         const needs_more_grouped_candidates = group_chunk_parents and !groupedResultHasStableRequestedPage(
@@ -31718,4 +31720,15 @@ test "highlight cloning cleans up every allocation failure and owns copied data"
     const empty = try types.cloneHighlights(std.testing.allocator, &.{});
     defer types.freeHighlights(std.testing.allocator, empty);
     try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+// Presence filtering uses the physical index's backing artifact. Once it has
+// selected live members, publish their logical identity consistently across
+// text and vector arms, including singleton chunk generators.
+fn attachMemberArtifactRefs(alloc: Allocator, hits: []types.SearchHit) !void {
+    for (hits) |*hit| {
+        if (hit.artifact_ref != null) continue;
+        hit.artifact_ref = (try artifact_ids.decodeArtifactRefAlloc(alloc, hit.id)) orelse
+            try artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id);
+    }
 }

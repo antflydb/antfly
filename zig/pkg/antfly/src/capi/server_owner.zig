@@ -6054,6 +6054,7 @@ pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const ke
     const Capture = struct {
         alloc: Allocator,
         scope: [32]u8,
+        plan_id: [16]u8,
         batch_json: ?[]u8 = null,
         pub fn propose(ptr: *anyopaque, batch: db_mod.types.BatchRequest, context: antfly.capi_dependencies.api_operation.RequestContext) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
@@ -6062,10 +6063,11 @@ pub fn storageOwnerRestoreControlJson(owner_ptr: ?*anyopaque, request: *const ke
             if (batch.restore_staging_scope) |scope| if (!std.mem.eql(u8, &scope, &self.scope)) return error.RestoreStagingScopeChanged;
             var scoped = batch;
             scoped.restore_staging_scope = self.scope;
+            scoped.restore_staging_plan_id = self.plan_id;
             self.batch_json = try antfly.capi_dependencies.api_batch.encodeBatchRequest(self.alloc, scoped);
         }
     };
-    var capture: Capture = .{ .alloc = handle.alloc, .scope = input.value.scope.digest() };
+    var capture: Capture = .{ .alloc = handle.alloc, .scope = input.value.scope.digest(), .plan_id = input.value.scope.plan_id };
     defer if (capture.batch_json) |bytes| handle.alloc.free(bytes);
     const response = restore.executeResident(handle.alloc, &handle.db, .{
         .io = io,

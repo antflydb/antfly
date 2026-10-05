@@ -568,6 +568,9 @@ fn graphResolverFieldValueMatches(field: []const u8, value: std.json.Value) bool
 }
 
 fn graphNodeMappingFieldValueMatches(field: []const u8, value: std.json.Value) bool {
+    // Sources identify stored documents; numeric constants are only valid
+    // for targets, which can also identify external entities.
+    if (std.mem.eql(u8, field, "source")) return isString(value);
     if (std.mem.eql(u8, field, "model")) {
         return value == .string and
             (std.mem.eql(u8, value.string, "document") or std.mem.eql(u8, value.string, "external"));

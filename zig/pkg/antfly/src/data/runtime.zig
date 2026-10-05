@@ -12897,7 +12897,12 @@ pub const DataServer = struct {
                 if (req.restore_staging_scope) |scope| {
                     if (comptime linked_storage) {
                         const owner_source = try self.ensureKernelOwnerSource();
-                        restore_owner_descriptor = (try owner_source.cachedRestoreDescriptor(alloc, group_id, table_name, scope)) orelse return error.RestoreStagingScopeChanged;
+                        // Metadata publication can replace the resident hidden owner
+                        // between control preparation and proposal admission. Recover
+                        // its exact immutable plan instead of treating cache eviction
+                        // as a changed staging scope.
+                        const restore_io = self.dataRaftIo();
+                        restore_owner_descriptor = try owner_source.resolveRestoreDescriptor(alloc, group_id, table_name, scope, req.restore_staging_plan_id, antfly.public_api.ProvisionedKernelOwnerSource.restoreDescriptorUseForBatch(req), .{ .deadline_ns = deadline_ns, .deadline_io = if (restore_io) |*io| @import("antfly_runtime_abi").io_abi.Borrow.init(io) else null, .cancellation = route.visibility_cancellation });
                     } else try admission_source.validateRestoreStagingScope(alloc, table_name, group_id, scope);
                 } else if (route.write_route_fence) |fence| {
                     // Preserve the remaining duration in the catalog's own
