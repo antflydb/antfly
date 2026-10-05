@@ -23,6 +23,7 @@
 comptime {
     _ = @import("db/replay_vector_collectors.zig");
     _ = @import("db/owned_keys.zig");
+    _ = @import("db/read_projection.zig");
     _ = @import("db/graph_field_plan.zig");
     _ = @import("db/managed_admission_owner.zig");
     _ = @import("db/result_collectors.zig");

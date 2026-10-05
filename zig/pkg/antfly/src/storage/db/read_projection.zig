@@ -29,6 +29,7 @@ const assetContentTypeIsJson = @import("document_collectors.zig").assetContentTy
 const freeJsonValue = db_query_projection.freeJsonValue;
 const cloneJsonValue = db_query_projection.cloneJsonValue;
 const putOwnedValue = db_query_projection.putOwnedValue;
+const putClonedValue = @import("../../common/owned_json.zig").putClone;
 
 pub const Source = struct { core: *db_core.DBCore };
 
@@ -213,21 +214,29 @@ pub fn artifactProjectionValue(
         try putOwnedValue(alloc, &obj, "artifact_ref", ref_value);
     }
 
-    try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
+    try putClonedValue(alloc, &obj, "kind", .{ .string = artifactKindText(artifact_ref.kind) });
     const content_type = if (artifact_ref.kind == .asset and artifact_catalog != null)
         try artifact_catalog.?.contentTypeAlloc(alloc, artifact_ref.name)
     else
         try artifactContentTypeAlloc(self, alloc, artifact_ref.kind, artifact_ref.name);
-    try putOwnedValue(alloc, &obj, "content_type", .{ .string = content_type });
-    try putOwnedValue(alloc, &obj, "status", .{ .string = try alloc.dupe(u8, "ready") });
+    {
+        errdefer alloc.free(content_type);
+        try putOwnedValue(alloc, &obj, "content_type", .{ .string = content_type });
+    }
+    try putClonedValue(alloc, &obj, "status", .{ .string = "ready" });
 
     if (enrichment_artifact_codec.sourceHash(raw) catch null) |source_hash| {
-        try putOwnedValue(alloc, &obj, "source_hash", .{ .string = try std.fmt.allocPrint(alloc, "xxh64:{x}", .{source_hash}) });
+        const text = try std.fmt.allocPrint(alloc, "xxh64:{x}", .{source_hash});
+        errdefer alloc.free(text);
+        try putOwnedValue(alloc, &obj, "source_hash", .{ .string = text });
     }
 
     switch (artifact_ref.kind) {
         .chunk => {
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch null;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
             if (parsed) |*owned| {
                 defer owned.deinit();
                 var cloned = try cloneJsonValue(alloc, owned.value);
@@ -235,7 +244,7 @@ pub fn artifactProjectionValue(
                 try db_query_projection.normalizeChunkArtifactForQuery(alloc, &cloned);
                 try putOwnedValue(alloc, &obj, "value", cloned);
             } else {
-                try putOwnedValue(alloc, &obj, "value", .{ .string = try alloc.dupe(u8, raw) });
+                try putClonedValue(alloc, &obj, "value", .{ .string = raw });
             }
         },
         .asset => {
@@ -272,33 +281,30 @@ pub fn appendArtifactProjectionValue(
             }
         }
 
-        var first = try cloneJsonValue(alloc, existing.*);
-        var first_moved = false;
-        errdefer if (!first_moved) freeJsonValue(alloc, &first);
-        var items = std.json.Array.init(alloc);
-        errdefer {
-            for (items.items) |*item| freeJsonValue(alloc, item);
-            items.deinit();
-        }
-        try items.append(first);
-        first_moved = true;
-        try items.append(artifact_value);
-
         var grouped = std.json.ObjectMap.empty;
         errdefer {
             var value = std.json.Value{ .object = grouped };
             freeJsonValue(alloc, &value);
         }
-        try putOwnedValue(alloc, &grouped, "kind", .{ .string = try alloc.dupe(u8, artifactSetKindText(artifact_kind)) });
-        try putOwnedValue(alloc, &grouped, "status", .{ .string = try alloc.dupe(u8, "ready") });
-        try putOwnedValue(alloc, &grouped, "items", .{ .array = items });
+        try putClonedValue(alloc, &grouped, "kind", .{ .string = artifactSetKindText(artifact_kind) });
+        try putClonedValue(alloc, &grouped, "status", .{ .string = "ready" });
+        {
+            var items = std.json.Array.init(alloc);
+            errdefer items.deinit();
+            try items.ensureTotalCapacity(2);
+            try putOwnedValue(alloc, &grouped, "items", .{ .array = items });
+        }
+        // All fallible work is complete. Transfer both original values once,
+        // without cloning the existing tree or consuming the caller on error.
+        const items = &grouped.getPtr("items").?.array;
+        items.appendAssumeCapacity(existing.*);
+        items.appendAssumeCapacity(artifact_value);
 
-        freeJsonValue(alloc, existing);
         existing.* = .{ .object = grouped };
         return;
     }
 
-    try artifacts_obj.put(alloc, try alloc.dupe(u8, artifact_name), artifact_value);
+    try putOwnedValue(alloc, artifacts_obj, artifact_name, artifact_value);
 }
 
 pub fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !std.json.Value {
@@ -307,9 +313,9 @@ pub fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !
         var value = std.json.Value{ .object = obj };
         freeJsonValue(alloc, &value);
     }
-    try putOwnedValue(alloc, &obj, "document_id", .{ .string = try alloc.dupe(u8, artifact_ref.document_id) });
-    try putOwnedValue(alloc, &obj, "name", .{ .string = try alloc.dupe(u8, artifact_ref.name) });
-    try putOwnedValue(alloc, &obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(artifact_ref.kind)) });
+    try putClonedValue(alloc, &obj, "document_id", .{ .string = artifact_ref.document_id });
+    try putClonedValue(alloc, &obj, "name", .{ .string = artifact_ref.name });
+    try putClonedValue(alloc, &obj, "kind", .{ .string = artifactKindText(artifact_ref.kind) });
     if (artifact_ref.chunk_id) |chunk_id| {
         try putOwnedValue(alloc, &obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
     }
@@ -319,8 +325,8 @@ pub fn artifactRefJsonValue(alloc: Allocator, artifact_ref: types.ArtifactRef) !
             var value = std.json.Value{ .object = source_obj };
             freeJsonValue(alloc, &value);
         }
-        try putOwnedValue(alloc, &source_obj, "kind", .{ .string = try alloc.dupe(u8, artifactKindText(source.kind)) });
-        try putOwnedValue(alloc, &source_obj, "name", .{ .string = try alloc.dupe(u8, source.name) });
+        try putClonedValue(alloc, &source_obj, "kind", .{ .string = artifactKindText(source.kind) });
+        try putClonedValue(alloc, &source_obj, "name", .{ .string = source.name });
         if (source.chunk_id) |chunk_id| {
             try putOwnedValue(alloc, &source_obj, "chunk_id", .{ .integer = @intCast(chunk_id) });
         }
@@ -447,4 +453,56 @@ fn decodeArtifactRefIfKnownAlloc(alloc: Allocator, key: []const u8) !?types.Arti
         error.InvalidInternalUserKey => null,
         else => return err,
     };
+}
+
+test "artifact projection reference releases all failed allocations" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var value = try artifactRefJsonValue(alloc, .{
+                .document_id = @constCast("document"),
+                .name = @constCast("embedding"),
+                .kind = .embedding,
+                .chunk_id = 7,
+                .source = .{ .name = @constCast("chunks"), .kind = .chunk, .chunk_id = 3 },
+            });
+            defer freeJsonValue(alloc, &value);
+            try std.testing.expectEqualStrings("document", value.object.get("document_id").?.string);
+            try std.testing.expectEqualStrings("chunks", value.object.get("source").?.object.get("name").?.string);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "artifact projection grouping transfers nested values only on success" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var object = std.json.ObjectMap.empty;
+            defer {
+                var value = std.json.Value{ .object = object };
+                freeJsonValue(alloc, &value);
+            }
+            for (0..4) |i| {
+                var incoming = try artifactRefJsonValue(alloc, .{ .document_id = @constCast("doc"), .name = @constCast("asset"), .kind = .asset });
+                appendArtifactProjectionValue(alloc, &object, "asset", .asset, incoming) catch |err| {
+                    // A failed append must preserve both the existing group
+                    // and this nested value, which is still the caller's.
+                    try std.testing.expectEqualStrings("doc", incoming.object.get("document_id").?.string);
+                    freeJsonValue(alloc, &incoming);
+                    if (i > 0) {
+                        const prior = object.get("asset").?;
+                        if (i == 1) {
+                            try std.testing.expectEqualStrings("doc", prior.object.get("document_id").?.string);
+                        } else {
+                            try std.testing.expectEqual(i, prior.object.get("items").?.array.items.len);
+                        }
+                    } else try std.testing.expectEqual(@as(usize, 0), object.count());
+                    return err;
+                };
+            }
+            const grouped = object.get("asset").?.object;
+            try std.testing.expectEqualStrings("asset_set", grouped.get("kind").?.string);
+            try std.testing.expectEqual(@as(usize, 4), grouped.get("items").?.array.items.len);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }
