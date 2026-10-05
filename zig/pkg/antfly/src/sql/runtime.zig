@@ -31,11 +31,14 @@ pub const Limits = struct {
     retained_bytes: usize = 64 * 1024 * 1024,
     page_rows: u32 = 256,
     /// Native execution batches are independent of response/decision pages.
-    execution_batch_rows: u32 = 1024,
+    execution_batch_rows: u32 = 4096,
     page_bytes: usize = 256 * 1024,
     scan_pages: usize = 65_536,
     spill_bytes: u64 = 1024 * 1024 * 1024,
     spill_root: []const u8 = "/tmp",
+    pub fn executionRows(self: Limits) u32 {
+        return @intCast(@min(self.execution_batch_rows, @max(@as(usize, 1), self.retained_bytes / (16 * 1024))));
+    }
 };
 pub const Column = describe.Column;
 pub const Output = struct {
@@ -154,7 +157,7 @@ fn runBound(alloc: std.mem.Allocator, arena: std.mem.Allocator, backend: catalog
     var manager: ?@import("spill.zig").Manager = null;
     defer if (manager) |*owned| owned.deinit();
     if (backend.spill_manager == null and limits.spill_bytes != 0) if (backend.execution_io) |io| {
-        manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
+        manager = .{ .alloc = alloc, .io = io, .context = backend.ptr, .checkpoint = backend.vtable.checkpoint, .root = limits.spill_root, .max_bytes = limits.spill_bytes, .buffer_bytes = @min(4096, @max(128, limits.retained_bytes / 512)), .max_record_bytes = @max(@as(usize, 1024), @min(@as(usize, 4 * 1024 * 1024), limits.retained_bytes / 32)) };
     };
     const context = Context{ .alloc = alloc, .arena = arena, .backend = backend, .binding = binding, .parameters = parameters, .limits = limits, .spill = backend.spill_manager orelse if (manager) |*owned| owned else null, .sink = sink };
     return context.run(compiled.statement);
@@ -3267,4 +3270,15 @@ test "SQL batched join defers probe expression errors beyond a satisfied limit" 
     var all = try compiler.compile(a, "SELECT a._id FROM things a JOIN things b ON (1 / (1 - CAST(a._id AS BIGINT))) = CAST(b._id AS BIGINT)", .{});
     defer all.deinit();
     try std.testing.expectError(error.SqlDivisionByZero, execute(a, fixture.coordinated(), &all, &.{}, .{ .page_rows = 1 }));
+}
+
+test "SQL review regression nested probe projection preserves satisfied limit" {
+    const a = std.testing.allocator;
+    var fixture: TestBackend = .{ .row_count = 3 };
+    var compiled = try compiler.compile(a, "SELECT a.k FROM (SELECT 1 / (1 - CAST(_id AS BIGINT)) AS k FROM things) a JOIN things b ON a.k = CAST(b._id AS BIGINT) LIMIT 1", .{});
+    defer compiled.deinit();
+    var result = try execute(a, fixture.coordinated(), &compiled, &.{}, .{ .page_rows = 1 });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
+    try std.testing.expectEqualStrings("1", result.output.rows[0][0].string);
 }

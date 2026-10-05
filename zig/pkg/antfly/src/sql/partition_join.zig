@@ -374,7 +374,14 @@ pub const Join = struct {
                                 break;
                             }
                             skew_fallback = true;
-                            // The range scan advanced the borrowed decode head.
+                            // Replay the retained prefix after lookahead. A sequential
+                            // reader cannot seek backward into an expired block.
+                            file.rewind();
+                            var replay: u64 = 0;
+                            while (replay < offset) {
+                                const prior = try file.readBorrowed(replay);
+                                replay = prior.following;
+                            }
                             const current = try file.readBorrowed(offset);
                             try self.hash.?.add(current.row.values, current.row.keys);
                         }
@@ -629,4 +636,22 @@ test "SQL parallel partition joins defer errors beyond the delivered prefix" {
         try std.testing.expectError(error.SqlDivisionByZero, join.next());
     }
     try std.testing.expectEqual(@as(usize, 0), manager.files);
+}
+
+test "SQL review regression oversized identical-key partition preserves forward read position" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = std.heap.page_allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    const join = try Join.create(std.heap.page_allocator, &manager, 2 * 1024 * 1024, 100000, 0, false, false);
+    defer join.close();
+    join.parallel_builds = false;
+    const key = Datum.json(.{ .integer = 42 });
+    for (0..20000) |i| try join.add(true, &.{Datum.json(.{ .integer = @intCast(i) })}, &.{key}, i);
+    try join.add(false, &.{key}, &.{key}, 0);
+    var matches: usize = 0;
+    while (try join.next()) |_| matches += 1;
+    try std.testing.expectEqual(@as(usize, 20000), matches);
 }

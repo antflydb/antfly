@@ -492,8 +492,13 @@ pub const HashJoin = struct {
         owner: *HashJoin,
         keys: []const Datum,
         cursor: ?usize,
+        first: ?Match = null,
 
         pub fn next(self: *Probe) !?Match {
+            if (self.first) |match| {
+                self.first = null;
+                return match;
+            }
             if (self.owner.disk) |*file| while (self.cursor) |index| {
                 _ = self.owner.disk_arena.reset(.free_all);
                 const decoded = try file.read(self.owner.disk_arena.allocator(), index);
@@ -723,6 +728,23 @@ pub const HashJoin = struct {
                     const head = self.disk_heads[value & (self.disk_heads.len - 1)];
                     probe_.cursor = if (head == @import("spill.zig").none) null else @intCast(head);
                 } else probe_.cursor = self.heads.get(value);
+            }
+        }
+        if (self.disk == null) {
+            // Interleave chain traversal across lanes. Keep the first exact
+            // match in the probe and leave remaining duplicates lazy.
+            var pending = true;
+            while (pending) {
+                pending = false;
+                for (probes) |*probe_| {
+                    if (probe_.first != null) continue;
+                    const index = probe_.cursor orelse continue;
+                    probe_.cursor = self.entries.items[index].next;
+                    self.probes += 1;
+                    if (try self.key_columns.equal(self.backing, index, probe_.keys, false)) {
+                        probe_.first = .{ .index = index, .owner = self };
+                    } else if (probe_.cursor != null) pending = true;
+                }
             }
         }
         return probes;

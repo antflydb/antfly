@@ -266,10 +266,24 @@ pub const Store = struct {
     pub fn equal(self: *const Store, a: A, row_index: usize, values: []const Datum, null_equal: bool) !bool {
         if (self.failed or values.len != self.columns.len or row_index >= self.len) return error.InvalidSqlBackendResponse;
         for (values, 0..) |value, column| {
-            const stored = try self.cell(a, row_index, column);
-            if (stored.sql_null or value.sql_null) {
-                if (!null_equal or stored.sql_null != value.sql_null) return false;
-            } else if ((try scalar.compare(stored.value, value.value)) != .eq) return false;
+            const stored = self.columns[column];
+            const is_null = stored.isNull(row_index);
+            if (is_null or value.sql_null) {
+                if (!null_equal or is_null != value.sql_null) return false;
+                continue;
+            }
+            // Dispatch on the retained physical type, without constructing a
+            // Datum or invoking JSON comparison for homogeneous primitive keys.
+            const equal_ = switch (stored.values) {
+                .integers => |v| if (value.value == .integer) v.items[row_index] == value.value.integer else null,
+                .numbers => |v| if (value.value == .float and std.math.isFinite(v.items[row_index]) and std.math.isFinite(value.value.float)) v.items[row_index] == value.value.float else null,
+                .booleans => |v| if (value.value == .bool) v.items[row_index] == value.value.bool else null,
+                .strings => |v| if (value.value == .string) std.mem.eql(u8, v.getText(row_index), value.value.string) else null,
+                else => null,
+            };
+            if (equal_) |matches| {
+                if (!matches) return false;
+            } else if ((try scalar.compare((try stored.cell(a, row_index)).value, value.value)) != .eq) return false;
         }
         return true;
     }

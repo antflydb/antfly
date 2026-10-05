@@ -6,6 +6,8 @@ const std = @import("std");
 const Budget = @import("../../sql/memory_budget.zig");
 const A = std.mem.Allocator;
 pub const Payload = union(enum) {
+    snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan,
+    prepared: *@import("lake_prepared_deletes.zig").Prepared,
     footer: @import("lake_parquet_metadata.zig").ParsedFooter,
     dictionary: @import("lake_parquet_page.zig").Dictionary,
     columns: []const @import("../../storage/rowsource/types.zig").ColumnVector,
@@ -13,7 +15,7 @@ pub const Payload = union(enum) {
 pub const Item = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
-    payload: Payload = undefined,
+    payload: Payload = .{ .columns = &.{} },
     refs: usize = 1,
     cached: bool = false,
     /// A decoded page pins its immutable chunk dictionary in this cache.
@@ -22,6 +24,7 @@ pub const Item = struct {
     fn destroy(self: *Item, cache: *Cache) void {
         const parent = self.dependency;
         const a = self.budget.backing;
+        if (self.payload == .prepared) self.payload.prepared.destroy(self.arena.allocator());
         self.arena.deinit();
         std.debug.assert(self.budget.live == 0);
         a.destroy(self);

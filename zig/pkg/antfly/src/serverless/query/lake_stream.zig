@@ -85,6 +85,8 @@ pub const Stream = struct {
     work: ?*ScanWork = null,
     owns_work: bool = false,
     work_ordinal: ?u32 = null,
+    ordered_next: ?usize = null,
+    ordered_end: usize = 0,
     borrowed_plan: bool = false,
     partition_index: usize = 0,
     partition_count: usize = 1,
@@ -414,7 +416,11 @@ pub const Stream = struct {
                 self.clearFile();
             }
             const index = if (self.work != null and !self.owns_work) {
-                const unit = self.work.?.claim() orelse return null;
+                const unit = if (self.ordered_next) |position| blk: {
+                    if (position == self.ordered_end) return null;
+                    self.ordered_next = position + 1;
+                    break :blk self.work.?.units[position];
+                } else self.work.?.claim() orelse return null;
                 const plan = self.work.?.plans[unit.file].?;
                 self.work_ordinal = unit.ordinal;
                 self.discovered = plan.discovered;
@@ -473,6 +479,7 @@ pub const Stream = struct {
         }
         // Next-file footer lookahead also helps single-row-group datasets.
         for (self.files[self.file_index..]) |index| {
+            if (self.source.lazy_versions and !self.source.pinned_files[index]) continue;
             const upcoming = self.source.inventory.files[index];
             if (!self.fileMatches(upcoming)) continue;
             const object = try @import("lake_range_io.zig").objectRefForExternalFileUri(upcoming);
@@ -482,6 +489,15 @@ pub const Stream = struct {
         }
     }
     fn loadFile(self: *Stream, index: usize) !void {
+        // Metadata and partition pruning happen before statting data objects.
+        // Pin each surviving file once, before any footer or payload read.
+        if (self.source.lazy_versions and !self.source.pinned_files[index]) {
+            var single = self.source.inventory;
+            single.files = self.source.inventory.files[index..][0..1];
+            single.deleted_row_groups = &.{};
+            try iceberg.pinInventoryDataFileObjectVersions(self.source.alloc, self.source.scanner.object_reader.client, &single);
+            self.source.pinned_files[index] = true;
+        }
         var inventory = self.source.inventory;
         inventory.files = self.source.inventory.files[index..][0..1];
         inventory.deleted_row_groups = &.{};
@@ -570,15 +586,57 @@ pub const Stream = struct {
             }
         }.less);
         if (self.source.scanner.iceberg_delete_plan) |delete_plan| {
-            if (self.source.prepared_deletes == null) self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.create(self.source.alloc, .{
-                .reader = self.source.scanner.reader(),
-                .client = self.source.scanner.object_reader.client,
-                .cache = self.source.scanner.cache,
-                .data_inventory = self.source.inventory,
-                .delete_plan = delete_plan,
-                .coalesce_options = self.source.scanner.coalesce_options,
-                .materialization_limits = .{ .max_struct_allocation_bytes = self.limits.max_decoded_bytes, .max_input_bytes = self.limits.max_input_bytes, .max_decoded_bytes = self.limits.max_decoded_bytes },
-            });
+            if (self.source.prepared_deletes == null) {
+                const request: iceberg.DeleteRowRefsReadRequest = .{
+                    .reader = self.source.scanner.reader(),
+                    .client = self.source.scanner.object_reader.client,
+                    .cache = self.source.scanner.cache,
+                    .data_inventory = self.source.inventory,
+                    .delete_plan = delete_plan,
+                    .coalesce_options = self.source.scanner.coalesce_options,
+                    .materialization_limits = .{ .max_struct_allocation_bytes = self.limits.max_decoded_bytes, .max_input_bytes = self.limits.max_input_bytes, .max_decoded_bytes = self.limits.max_decoded_bytes },
+                };
+                if (self.source.scanner.shared_reader) |reader| {
+                    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                    hash.update(&reader.scope);
+                    hash.update("prepared-deletes-v1");
+                    hash.update(self.source.inventory.snapshot_id);
+                    const policy = try std.json.Stringify.valueAlloc(self.alloc, .{ .materialization = request.materialization_limits, .application = request.application_limits }, .{});
+                    defer self.alloc.free(policy);
+                    hash.update(policy);
+                    // Revalidate delete object versions even on an index hit.
+                    // A replaced object never inherits a cached equality set.
+                    var versions = std.crypto.hash.sha2.Sha256.init(.{});
+                    const index_identity = try std.json.Stringify.valueAlloc(self.alloc, .{ .deletes = delete_plan, .inventory = self.source.inventory }, .{});
+                    defer self.alloc.free(index_identity);
+                    hash.update(index_identity);
+                    var cacheable = true;
+                    var delete_client = request.client.?;
+                    for (delete_plan.files) |file| {
+                        const location = try @import("lake_range_io.zig").objectLocationForUri(file.file_path);
+                        var meta = try delete_client.statObject(location.bucket, location.key);
+                        defer meta.deinit(request.client.?.allocator);
+                        if (meta.content_length != file.file_size_in_bytes) return error.IcebergManifestLengthMismatch;
+                        @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&versions, file.file_path, meta.etag orelse "", meta.version_id orelse "");
+                        // An unversioned provider cannot safely reuse an index.
+                        if (meta.etag == null and meta.version_id == null) cacheable = false;
+                    }
+                    const version_key = versions.finalResult();
+                    hash.update(&version_key);
+                    const key = hash.finalResult();
+                    const cached = if (cacheable) reader.cache.decoded.lookup(key) else null;
+                    const lease = cached orelse blk: {
+                        const owned = try reader.cache.decoded.create(64 * 1024 * 1024);
+                        errdefer owned.release();
+                        owned.item.payload = .{ .prepared = try @import("lake_prepared_deletes.zig").Prepared.create(owned.item.arena.allocator(), request) };
+                        try self.context.ensureActive();
+                        if (cacheable and std.mem.eql(u8, &version_key, &owned.item.payload.prepared.object_versions)) reader.cache.decoded.publish(key, owned);
+                        break :blk owned;
+                    };
+                    self.source.delete_lease = lease;
+                    self.source.prepared_deletes = lease.item.payload.prepared;
+                } else self.source.prepared_deletes = try @import("lake_prepared_deletes.zig").Prepared.create(self.source.alloc, request);
+            }
         }
     }
     pub fn countAll(self: *Stream) !?u64 {

@@ -142,6 +142,15 @@ test "lake SQL API binds external catalog sources for aggregates joins public ro
             try std.testing.expectEqual(@as(usize, 1), result.output.rows.len);
             try std.testing.expectEqualStrings(case.expected, result.output.rows[0][0].string);
         }
+        if (std.mem.eql(u8, format, "iceberg")) {
+            var snapshots: usize = 0;
+            var cached = server.lake_read_cache.decoded.entries.valueIterator();
+            while (cached.next()) |entry| if (entry.*.payload == .snapshot) {
+                snapshots += 1;
+            };
+            try std.testing.expectEqual(@as(usize, 1), snapshots);
+            try std.testing.expect(server.lake_read_cache.decoded.hits > 0);
+        }
         // Catalog changes must remain retryable failures, never permission to
         // treat a lake source as unprotected after the latest-main policy fix.
         fixture.policy_catalog_changed = true;

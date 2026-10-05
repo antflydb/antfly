@@ -55,6 +55,7 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
     }
     var rows = try disk.Rows.init(context.alloc, manager, width);
     defer rows.deinit();
+    try rows.enableColumns();
     try appendPage(context, &rows, first.output, bound.input.columns);
     first.deinit();
     first_owned = false;
@@ -86,13 +87,13 @@ pub fn execute(context: anytype, statement: @import("ast.zig").Select) !?@import
         for (0..rows.len) |index| {
             try context.checkpoint();
             _ = scratch.reset(.free_all);
-            const row = try rows.row(index);
+            const ordinal = index;
             const keys = try scratch.allocator().alloc(Datum, orders.len);
-            for (specification.partition, keys[0..specification.partition.len]) |column, *key| key.* = row.values[column];
-            for (specification.order, keys[specification.partition.len..]) |column, *key| key.* = row.values[column];
+            for (specification.partition, keys[0..specification.partition.len]) |column, *key| key.* = try operators.cloneDatum(scratch.allocator(), try rows.cell(index, column));
+            for (specification.order, keys[specification.partition.len..]) |column, *key| key.* = try operators.cloneDatum(scratch.allocator(), try rows.cell(index, column));
             // Sort compact row references; wide payloads stay in their
             // existing row store instead of being copied into every run.
-            try sort.add(.{ .values = &.{Datum.json(.{ .integer = @intCast(index) })}, .keys = keys, .ordinal = row.ordinal });
+            try sort.add(.{ .values = &.{Datum.json(.{ .integer = @intCast(index) })}, .keys = keys, .ordinal = ordinal });
         }
         var layout = try disk.Integers.init(manager);
         defer layout.deinit();

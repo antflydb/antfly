@@ -345,6 +345,10 @@ pub const ServingSource = struct {
     scanner: PinnedExternalObjectStorageLakeRowsScanner,
     iceberg_schema: ?@import("lake_schema.zig").Detected = null,
     partition_rules: ?@import("lake_partition_pruning.zig").Rules = null,
+    plan_lease: ?@import("lake_decoded_cache.zig").Lease = null,
+    delete_lease: ?@import("lake_decoded_cache.zig").Lease = null,
+    lazy_versions: bool = false,
+    pinned_files: []bool = &.{},
     context_store: ?*@import("lake_read_context.zig").Store = null,
     prepared_deletes: ?*@import("lake_prepared_deletes.zig").Prepared = null,
 
@@ -353,6 +357,9 @@ pub const ServingSource = struct {
     }
 
     pub fn openWithContext(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: configured_store.BindingObjectStoreOpenOptions, context: @import("lake_read_context.zig").Context) !ServingSource {
+        return openCached(alloc, schema, options, context, null);
+    }
+    pub fn openCached(alloc: std.mem.Allocator, schema: storage_schema.TableSchema, options: configured_store.BindingObjectStoreOpenOptions, context: @import("lake_read_context.zig").Context, cache: ?*@import("lake_serving_cache.zig").Cache) !ServingSource {
         try context.ensureActive();
         const binding = (schema.external_base_source orelse return error.InvalidExternalTableBinding).binding;
         var store = try configured_store.openBindingObjectStoreAlloc(alloc, binding, options);
@@ -367,8 +374,10 @@ pub const ServingSource = struct {
         errdefer if (iceberg_schema) |*value| value.deinit();
         var partition_rules: ?@import("lake_partition_pruning.zig").Rules = null;
         errdefer if (partition_rules) |*rules| rules.deinit();
+        var plan_lease: ?@import("lake_decoded_cache.zig").Lease = null;
         var deletes: ?serverless_query.LakeIcebergDeletePlan = null;
-        errdefer if (deletes) |*value| value.deinit(alloc);
+        errdefer if (plan_lease == null) if (deletes) |*value| value.deinit(alloc);
+        errdefer if (plan_lease) |lease| lease.release();
         var inventory = switch (binding.format) {
             .parquet => try external_source_api.planParquetPrefixInventoryFromObjectStorageAlloc(alloc, .{
                 .client = client,
@@ -384,12 +393,37 @@ pub const ServingSource = struct {
                 defer alloc.free(uri);
                 const metadata_bytes = try @import("lake_iceberg_snapshot.zig").readFullObjectAlloc(alloc, &client, null, uri, .iceberg_metadata, null, 16 * 1024 * 1024);
                 defer alloc.free(metadata_bytes);
-                var snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(alloc, .{
-                    .client = client,
-                    .source_id = binding.table_id,
-                    .metadata_uri = uri,
-                    .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
-                }, metadata_bytes);
+                var snapshot: @import("lake_iceberg_snapshot.zig").SnapshotWithDeletePlan = undefined;
+                if (cache) |shared| {
+                    // Revalidate the current metadata pointer on every open.
+                    // Only its immutable content and credential scope are reused.
+                    const scope = try cacheScope(alloc, store, binding);
+                    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+                    hash.update(&scope);
+                    hash.update("iceberg-plan-v1");
+                    @import("lake_prepared_deletes.zig").Prepared.hashObjectVersion(&hash, uri, metadata_bytes, binding.snapshot_mode.pinnedSnapshotId() orelse "");
+                    const key = hash.finalResult();
+                    const lease = shared.decoded.lookup(key) orelse blk_lease: {
+                        const owned = try shared.decoded.create(64 * 1024 * 1024);
+                        errdefer owned.release();
+                        owned.item.payload = .{ .snapshot = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(owned.item.arena.allocator(), .{ .client = client, .source_id = binding.table_id, .metadata_uri = uri, .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() }, metadata_bytes) };
+                        try context.ensureActive();
+                        shared.decoded.publish(key, owned);
+                        break :blk_lease owned;
+                    };
+                    plan_lease = lease;
+                    const bytes = try @import("../external_source/codec.zig").encodeAlloc(alloc, lease.item.payload.snapshot.inventory);
+                    defer alloc.free(bytes);
+                    snapshot = .{ .inventory = try @import("../external_source/codec.zig").decodeAlloc(alloc, bytes), .delete_plan = lease.item.payload.snapshot.delete_plan };
+                } else {
+                    const snapshot_owned = try @import("lake_iceberg_snapshot.zig").planSnapshotInventoryAndDeletePlanFromMetadataAlloc(alloc, .{
+                        .client = client,
+                        .source_id = binding.table_id,
+                        .metadata_uri = uri,
+                        .requested_snapshot_id = binding.snapshot_mode.pinnedSnapshotId(),
+                    }, metadata_bytes);
+                    snapshot = snapshot_owned;
+                }
                 deletes = snapshot.delete_plan;
                 errdefer snapshot.inventory.deinit(alloc);
                 if (base) |object_base| {
@@ -409,7 +443,7 @@ pub const ServingSource = struct {
                     if (!std.mem.eql(u8, iceberg_schema.?.fingerprint, snapshot.inventory.schema_fingerprint)) return error.ExternalLakeSnapshotMismatch;
                     if (snapshot.inventory.files.len != 0) partition_rules = try @import("lake_partition_pruning.zig").parseAlloc(alloc, uri, metadata_bytes, snapshot.inventory.snapshot_id, binding.snapshot_mode.pinnedSnapshotId(), snapshot.inventory.schema_fingerprint);
                 }
-                try serverless_query.pinLakeIcebergInventoryDataFileObjectVersionsAlloc(alloc, client, &snapshot.inventory);
+                if (cache == null) try serverless_query.pinLakeIcebergInventoryDataFileObjectVersionsAlloc(alloc, client, &snapshot.inventory);
                 break :blk snapshot.inventory;
             },
             .lance => return error.UnsupportedRowsQuery,
@@ -418,37 +452,55 @@ pub const ServingSource = struct {
         try serverless_query.validateLakeBindingInventory(binding, inventory);
         var scanner = PinnedExternalObjectStorageLakeRowsScanner.init(inventory, client);
         scanner.iceberg_delete_plan = deletes;
-        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema };
+        const lazy_versions = cache != null and binding.format == .iceberg;
+        const pinned_files: []bool = if (lazy_versions) try alloc.alloc(bool, inventory.files.len) else &.{};
+        @memset(pinned_files, false);
+        return .{ .alloc = alloc, .store = store, .inventory = inventory, .scanner = scanner, .context_store = context_store, .partition_rules = partition_rules, .iceberg_schema = iceberg_schema, .plan_lease = plan_lease, .lazy_versions = lazy_versions, .pinned_files = pinned_files };
     }
 
+    fn cacheScope(alloc: std.mem.Allocator, store: object_store_support.OpenedObjectStore, binding: @import("../external_source/catalog_binding.zig").Binding) ![32]u8 {
+        const scope_bytes = try std.json.Stringify.valueAlloc(alloc, .{
+            .credentials = binding.credential_ref,
+            .source_id = binding.table_id,
+            .s3_credentials = if (store.s3_client) |s3| s3.cfg.credentials else null,
+            .source_uri = binding.source_uri,
+            .filesystem_root = if (store.fs_client) |fs| @as(?[]const u8, fs.root_dir) else null,
+            .s3_endpoint = if (store.s3_client) |s3| @as(?[]const u8, s3.cfg.credentials.endpoint) else null,
+            .s3_region = if (store.s3_client) |s3| @as(?[]const u8, s3.cfg.credentials.region) else null,
+            .s3_ssl = if (store.s3_client) |s3| @as(?bool, s3.cfg.credentials.use_ssl) else null,
+            .gcs_bearer = if (store.gcs_client) |gcs| switch (gcs.cfg.auth) {
+                .bearer_token => |token| @as(?[]const u8, token),
+                else => null,
+            } else null,
+            .gcs_token_source = if (store.gcs_client) |gcs| switch (gcs.cfg.auth) {
+                .google_token_source => |source| @as(?usize, @intFromPtr(source)),
+                else => null,
+            } else null,
+            .gcs_endpoint = if (store.gcs_client) |gcs| @as(?[]const u8, gcs.cfg.endpoint) else null,
+        }, .{});
+        defer alloc.free(scope_bytes);
+        var scope: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(scope_bytes, &scope, .{});
+        return scope;
+    }
     pub fn attachCache(self: *ServingSource, cache: *@import("lake_serving_cache.zig").Cache, binding: @import("../external_source/catalog_binding.zig").Binding, context: @import("lake_read_context.zig").Context) !void {
         const reader = try self.alloc.create(@import("lake_serving_cache.zig").Reader);
         errdefer self.alloc.destroy(reader);
-        const scope_bytes = try std.json.Stringify.valueAlloc(self.alloc, .{
-            .credentials = binding.credential_ref,
-            .source_uri = binding.source_uri,
-            .filesystem_root = if (self.store.fs_client) |fs| @as(?[]const u8, fs.root_dir) else null,
-            .s3_endpoint = if (self.store.s3_client) |s3| @as(?[]const u8, s3.cfg.credentials.endpoint) else null,
-            .s3_region = if (self.store.s3_client) |s3| @as(?[]const u8, s3.cfg.credentials.region) else null,
-            .s3_ssl = if (self.store.s3_client) |s3| @as(?bool, s3.cfg.credentials.use_ssl) else null,
-            .gcs_endpoint = if (self.store.gcs_client) |gcs| @as(?[]const u8, gcs.cfg.endpoint) else null,
-        }, .{});
-        defer self.alloc.free(scope_bytes);
-        var scope: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(scope_bytes, &scope, .{});
+        const scope = try cacheScope(self.alloc, self.store, binding);
         reader.* = .{ .base = self.scanner.object_reader, .cache = cache, .scope = scope, .context = context };
         self.scanner.shared_reader = reader;
     }
 
     pub fn deinit(self: *ServingSource) void {
-        if (self.prepared_deletes) |prepared| prepared.destroy(self.alloc);
+        if (self.delete_lease) |lease| lease.release() else if (self.prepared_deletes) |prepared| prepared.destroy(self.alloc);
         if (self.scanner.shared_reader) |reader| {
             reader.drain(true);
             self.alloc.destroy(reader);
         }
-        if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
+        if (self.plan_lease) |lease| lease.release() else if (self.scanner.iceberg_delete_plan) |*value| value.deinit(self.alloc);
         if (self.partition_rules) |*rules| rules.deinit();
         if (self.iceberg_schema) |*value| value.deinit();
+        self.alloc.free(self.pinned_files);
         self.inventory.deinit(self.alloc);
         self.store.deinit();
         if (self.context_store) |store| self.alloc.destroy(store);

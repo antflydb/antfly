@@ -17,7 +17,7 @@ pub const Integers = struct {
     pub fn init(manager: *spill.Manager) !Integers {
         var file = try manager.create();
         errdefer file.close();
-        return .{ .file = file, .buffer = try manager.alloc.alloc(u8, 4096) };
+        return .{ .file = file, .buffer = try manager.alloc.alloc(u8, @min(4096, @max(128, manager.max_record_bytes / 16))) };
     }
     pub fn deinit(self: *Integers) void {
         self.file.manager.alloc.free(self.buffer);
@@ -71,24 +71,32 @@ pub const Rows = struct {
     cache: [4]Entry,
     tick: u64 = 0,
     updates: ?Updates = null,
+    columnar: ?@import("column_spill.zig").Store = null,
+    cell_arena: std.heap.ArenaAllocator,
     const Updates = struct { file: spill.File, offsets: Integers, first_column: usize };
     const Entry = struct { arena: std.heap.ArenaAllocator, index: ?usize = null, row: operators.Row = undefined, touched: u64 = 0 };
     pub fn init(a: A, manager: *spill.Manager, width: usize) !Rows {
         var file = try manager.create();
         errdefer file.close();
         const offsets = try Integers.init(manager);
-        var result = Rows{ .a = a, .file = file, .offsets = offsets, .width = width, .cache = undefined };
+        var result = Rows{ .a = a, .file = file, .offsets = offsets, .width = width, .cell_arena = .init(a), .cache = undefined };
         for (&result.cache) |*entry| entry.* = .{ .arena = std.heap.ArenaAllocator.init(a) };
         return result;
     }
     pub fn deinit(self: *Rows) void {
         for (&self.cache) |*entry| entry.arena.deinit();
+        self.cell_arena.deinit();
+        if (self.columnar) |*store| store.deinit();
         if (self.updates) |*updates| {
             updates.offsets.deinit();
             updates.file.close();
         }
         self.offsets.deinit();
         self.file.close();
+    }
+    pub fn enableColumns(self: *Rows) !void {
+        if (self.len != 0 or self.columnar != null) return error.InvalidSqlSpill;
+        self.columnar = try @import("column_spill.zig").Store.init(self.a, self.file.manager, self.width);
     }
     /// Window outputs use cell records instead of rewriting the input payload
     /// for every function. The fixed offset directory shares the spill quota.
@@ -106,6 +114,11 @@ pub const Rows = struct {
     pub fn append(self: *Rows, input: operators.Row) !void {
         if (self.updates != null) return error.InvalidSqlSpill;
         if (input.values.len != self.width) return error.InvalidSqlSpill;
+        if (self.columnar) |*store| {
+            try store.append(input);
+            self.len += 1;
+            return;
+        }
         const offset = try self.file.append(.{ .values = input.values, .keys = &.{}, .ordinal = input.ordinal }, spill.none);
         try self.offsets.append(@intCast(offset));
         self.len += 1;
@@ -123,7 +136,11 @@ pub const Rows = struct {
         }
         _ = oldest.arena.reset(.free_all);
         oldest.index = null;
-        const decoded = try self.file.read(oldest.arena.allocator(), try self.offsets.at(index));
+        const decoded: spill.Decoded = if (self.columnar) |*store| blk: {
+            const values = try oldest.arena.allocator().alloc(Datum, self.width);
+            for (values, 0..) |*value, column| value.* = try operators.cloneDatum(oldest.arena.allocator(), try store.cell(index, column));
+            break :blk .{ .row = .{ .values = values, .keys = &.{}, .ordinal = try store.ordinals.at(index) }, .next = spill.none, .matched = false, .following = 0 };
+        } else try self.file.read(oldest.arena.allocator(), try self.offsets.at(index));
         if (decoded.row.values.len != self.width) return error.InvalidSqlSpill;
         oldest.row = decoded.row;
         if (self.updates) |*updates| {
@@ -143,6 +160,19 @@ pub const Rows = struct {
     }
     pub fn cell(self: *Rows, index: usize, column: usize) !Datum {
         if (column >= self.width) return error.InvalidSqlSpill;
+        if (index >= self.len) return error.InvalidSqlSpill;
+        if (self.columnar) |*store| {
+            if (self.updates) |*updates| if (column >= updates.first_column) {
+                const offset = try updates.offsets.at(index * (self.width - updates.first_column) + column - updates.first_column);
+                if (offset != std.math.maxInt(usize)) {
+                    _ = self.cell_arena.reset(.free_all);
+                    const decoded = try updates.file.read(self.cell_arena.allocator(), offset);
+                    if (decoded.row.values.len != 1 or decoded.row.ordinal != index) return error.InvalidSqlSpill;
+                    return decoded.row.values[0];
+                }
+            };
+            return store.cell(index, column);
+        }
         return (try self.row(index)).values[column];
     }
     pub fn setCell(self: *Rows, index: usize, column: usize, value: Datum) !void {
@@ -183,7 +213,8 @@ pub const View = struct {
         return self.source.row(try self.indices.at(self.begin + index));
     }
     pub fn cell(self: *View, index: usize, column: usize) !Datum {
-        return (try self.row(index)).values[column];
+        if (index >= self.len) return error.InvalidSqlSpill;
+        return self.source.cell(try self.indices.at(self.begin + index), column);
     }
     pub fn setCell(self: *View, index: usize, column: usize, value: Datum) !void {
         if (index >= self.len) return error.InvalidSqlSpill;
@@ -326,4 +357,45 @@ test "SQL window permutations share wide payloads and original-row sidecars" {
     try std.testing.expectEqual(@as(u64, 2), (try right.row(1)).ordinal);
     try std.testing.expectEqualStrings(text, (try right.cell(1, 0)).value.string);
     try std.testing.expectEqual(payload_bytes, source.file.size);
+}
+
+test "SQL window column blocks skip wide payloads and preserve shared updates" {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = std.testing.allocator, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows = try Rows.init(std.testing.allocator, &manager, 3);
+    defer rows.deinit();
+    try rows.enableColumns();
+    const payload: [8192]u8 = @splat('x');
+    for (0..128) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .integer = @intCast(index) }), Datum.json(.{ .string = &payload }), .{} }, .keys = &.{}, .ordinal = index });
+    try rows.enableColumnUpdates(2);
+    const before = manager.read_bytes;
+    for (0..128) |index| try std.testing.expectEqual(@as(i64, @intCast(index)), (try rows.cell(index, 0)).value.integer);
+    try std.testing.expect(manager.read_bytes - before < payload.len * 128 / 8);
+    try rows.setCell(42, 2, Datum.json(.{ .integer = 99 }));
+    try std.testing.expectEqual(@as(i64, 99), (try rows.cell(42, 2)).value.integer);
+    try std.testing.expectEqualStrings(&payload, (try rows.row(42)).values[1].value.string);
+}
+
+fn columnAllocationScenario(a: A) !void {
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows = try Rows.init(a, &manager, 2);
+    defer rows.deinit();
+    try rows.enableColumns();
+    for (0..3) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .integer = @intCast(index) }), .{} }, .keys = &.{}, .ordinal = index });
+    try rows.enableColumnUpdates(1);
+    _ = try rows.cell(0, 0);
+    try rows.setCell(1, 1, Datum.json(.{ .integer = 7 }));
+    try std.testing.expectEqual(@as(i64, 7), (try rows.row(1)).values[1].value.integer);
+}
+test "SQL window column blocks unwind every allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, columnAllocationScenario, .{});
 }

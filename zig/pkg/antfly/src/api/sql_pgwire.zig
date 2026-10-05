@@ -1023,9 +1023,16 @@ const GuardedCatalog = struct {
             return self.inner.set_dynamic_filter.?(self.inner.ptr, filter);
         }
         fn splitScan(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize) !?[]catalog.Cursor {
+            return splitImpl(raw, alloc, workers, false);
+        }
+        fn splitOrdered(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize) !?[]catalog.Cursor {
+            return splitImpl(raw, alloc, workers, true);
+        }
+        fn splitImpl(raw: *anyopaque, alloc: std.mem.Allocator, workers: usize, ordered: bool) !?[]catalog.Cursor {
             const self: *@This() = @ptrCast(@alignCast(raw));
             try self.guard.checkRead(self.table);
-            const children = (try self.inner.split_scan.?(self.inner.ptr, alloc, workers)) orelse return null;
+            const split = if (ordered) self.inner.split_ordered.? else self.inner.split_scan.?;
+            const children = (try split(self.inner.ptr, alloc, workers)) orelse return null;
             defer alloc.free(children);
             var wrapped: usize = 0;
             errdefer for (children[wrapped..]) |child| child.close(child.ptr);
@@ -1053,6 +1060,7 @@ const GuardedCatalog = struct {
                 .count_rows = if (self.inner.count_rows != null) countRows else null,
                 .set_dynamic_filter = if (self.inner.set_dynamic_filter != null) setDynamicFilter else null,
                 .split_scan = if (self.inner.split_scan != null) splitScan else null,
+                .split_ordered = if (self.inner.split_ordered != null) splitOrdered else null,
             };
         }
         fn close(raw: *anyopaque) void {

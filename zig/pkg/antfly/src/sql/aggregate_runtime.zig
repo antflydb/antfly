@@ -253,15 +253,15 @@ pub fn execute(context: anytype, statement: ast.Select) !@import("runtime.zig").
             try grouped.addGlobalCount(count);
             metadata_counted = true;
         };
-        const parallel = !external and !predicates.empty and !metadata_counted and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.execution_batch_rows });
+        const parallel = !external and !predicates.empty and !metadata_counted and try @import("parallel_aggregate.zig").execute(context, bound, grouped, &scan, table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .limit = context.limits.executionRows() });
         while (!predicates.empty and !metadata_counted and !parallel) {
             try context.checkpoint();
             pages += 1;
             if (pages > context.limits.scan_pages) return error.SqlProgramLimitExceeded;
             var arena = std.heap.ArenaAllocator.init(context.alloc);
             defer arena.deinit();
-            if (!external) if (try scan.columns(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.execution_batch_rows })) |column_page| {
-                if (column_page.selection.len > context.limits.execution_batch_rows) return error.InvalidSqlBackendResponse;
+            if (!external) if (try scan.columns(context, arena.allocator(), table, .{ .fields = fields[0..field_count], .primary_key = predicates.primary_key, .conditions = predicates.terms.items, .after = after, .limit = context.limits.executionRows() })) |column_page| {
+                if (column_page.selection.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
                 if (column_page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
                 visited += column_page.selection.len;
                 try addColumns(context, bound, grouped, arena.allocator(), column_page);

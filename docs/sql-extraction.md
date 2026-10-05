@@ -97,6 +97,15 @@ temporary memory. Closing or canceling a cursor cancels and joins every worker
 before releasing source metadata. Prefetch failures stay speculative: required
 reads still enforce pinned versions, deadlines and cancellation.
 
+Iceberg admissions revalidate the metadata pointer and content, then lease an
+immutable snapshot plan from the decoded cache. Each admission owns its mutable
+file-version state. Partition and file-bound pruning happen before data-object
+HEAD requests; surviving files are pinned once before reading their footers.
+Prepared equality/position delete indexes also use cache-owned immutable leases,
+keyed by plan/applicability, limits and provider versions. Unversioned objects
+bypass index reuse. Request cancellation handles and footer-derived position
+offsets remain outside cached membership state.
+
 Each stream admits at most 100,000,000 examined rows. Parquet decoding aligns
 independent column pages and decodes each column dictionary once. Up to four
 column decoders overlap provider reads and page decoding; allocation admission
@@ -247,6 +256,28 @@ admission is serialized, and task leases release only after await/cancel joins
 workers, including cancellation before start. Statement memory/disk budgets
 remain separate from this global concurrency allowance. This uses the existing
 I/O runtime rather than creating independent pools for each operator.
+
+Window inputs spill as bounded column blocks with disk directories and a
+four-block decode cache. Key sorting and frame arguments load only requested
+columns; window outputs retain the shared cell sidecar. Spill I/O buffers and
+execution chunks scale with the statement memory quota. Native execution chunks
+have a 4,096-row upper bound, independent of response-page size.
+
+Large eligible lake scans can split into ordered ranges whose workers run the
+complete scan/filter/projection pipeline. Bounded typed queues apply backpressure;
+the consumer preserves source order and delivers valid rows before a later
+worker error. Early LIMIT completion and cancellation join workers before
+releasing the parent snapshot. OFFSET, small scans/budgets, external decision
+expressions and scheduler saturation use the existing serial pipeline.
+Homogeneous hash keys compare retained primitive columns directly; batch hashing
+avoids transposing Datum rows and probing interleaves independent bucket chains.
+
+The local key-only window fixture measured about 20x lower elapsed time with
+column blocks across three samples. Physical reads decreased by about 32% for
+its repeated, compressed 8 KiB payloads. These numbers measure decoding and local
+spill reads, not total query throughput. Raw samples and the existing join
+comparison cases are recorded in
+[`native-lake-column-pipeline-refinements.json`](../zig/bench/baselines/native-lake-column-pipeline-refinements.json).
 
 Further tuning includes richer statistics-driven costing, runtime filters
 through derived/computed scan mappings, and more parallel aggregate/join

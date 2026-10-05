@@ -31,7 +31,7 @@ pub fn openWithCache(alloc: Allocator, table: catalog.Table, request: catalog.Sc
     errdefer alloc.destroy(source);
     const schema: @import("../storage/schema.zig").TableSchema = .{ .storage_mode = .relational, .external_base_source = table.external_base_source };
     const normalized = try context.platformDeadline();
-    source.* = try serving.ServingSource.openWithContext(alloc, schema, options, .{ .io = io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
+    source.* = try serving.ServingSource.openCached(alloc, schema, options, .{ .io = io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) }, cache);
     errdefer source.deinit();
     if (cache) |shared| try source.attachCache(shared, table.external_base_source.?.binding, .{ .io = io, .deadline_ns = normalized.deadline_ns, .cancellation = @import("../storage/object_storage.zig").CancellationToken.fromCallback(normalized.cancellation.ptr, normalized.cancellation.is_cancelled_fn) });
     const cursor = try openPinned(alloc, table, request, context, source);
@@ -126,7 +126,7 @@ pub fn openPinned(alloc: Allocator, table: catalog.Table, request: catalog.Scan,
         estimated_rows +|= file.row_count;
         estimated_bytes +|= file.byte_len;
     }
-    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .close = Owner.close };
+    return .{ .estimated_rows = if (source.inventory.format == .iceberg) estimated_rows else null, .estimated_bytes = estimated_bytes, .ptr = owner, .next = Owner.next, .next_columns = Owner.nextColumns, .count_rows = Owner.countRows, .set_dynamic_filter = Owner.setDynamicFilter, .split_scan = Owner.splitScan, .split_ordered = Owner.splitOrdered, .close = Owner.close };
 }
 
 fn appendColumn(alloc: Allocator, columns: *std.ArrayList([]const u8), table: catalog.Table, name: []const u8) !void {
@@ -402,6 +402,26 @@ const Owner = struct {
         _ = self;
         return .{ .rows = output, .owned_arena = arena, .after = page.after };
     }
+    fn splitOrdered(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
+        const children = (try splitScan(raw, a, maximum)) orelse return null;
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        const work = self.stream.work.?;
+        std.mem.sort(@import("../serverless/query/lake_stream.zig").ScanWork.Unit, work.units, self.stream.source.inventory, struct {
+            fn less(inventory: @import("../serverless/external_source/types.zig").Inventory, left: @import("../serverless/query/lake_stream.zig").ScanWork.Unit, right: @import("../serverless/query/lake_stream.zig").ScanWork.Unit) bool {
+                if (left.file == right.file) return left.ordinal < right.ordinal;
+                const identities = @import("../storage/rowsource/identity.zig");
+                const l = identities.fileDigest(inventory.source_id, inventory.snapshot_id, inventory.files[left.file].file_id);
+                const r = identities.fileDigest(inventory.source_id, inventory.snapshot_id, inventory.files[right.file].file_id);
+                return std.mem.order(u8, &l, &r) == .lt;
+            }
+        }.less);
+        for (children, 0..) |child, index| {
+            const owner: *Owner = @ptrCast(@alignCast(child.ptr));
+            owner.stream.ordered_next = index * work.units.len / children.len;
+            owner.stream.ordered_end = (index + 1) * work.units.len / children.len;
+        }
+        return children;
+    }
     fn splitScan(raw: *anyopaque, a: Allocator, maximum: usize) !?[]catalog.Cursor {
         const self: *Owner = @ptrCast(@alignCast(raw));
         if (self.started or self.dynamic != null or self.stream.partition_count != 1) return null;
@@ -541,6 +561,7 @@ const TestLake = struct {
         base: storage.ObjectStorage,
         vtable: storage.ObjectStorage.VTable,
         reads: usize = 0,
+        stats: usize = 0,
         bytes: usize = 0,
         fn client(self: *Meter) storage.ObjectStorage {
             self.vtable.get_object = get;
@@ -552,6 +573,7 @@ const TestLake = struct {
             const self: *Meter = @ptrCast(@alignCast(raw));
             var base = self.base;
             base.allocator = alloc;
+            self.stats += 1;
             return base.statObject(bucket, key);
         }
         fn get(raw: *anyopaque, alloc: Allocator, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
@@ -583,7 +605,7 @@ const TestLake = struct {
         self.source = .{ .alloc = alloc, .store = .{ .alloc = alloc, .client = client, .owns_client = false, .bucket = @constCast("bucket"), .prefix = @constCast("events") }, .inventory = self.inventory, .scanner = serving.PinnedExternalObjectStorageLakeRowsScanner.init(self.inventory, self.meter.client()) };
     }
     fn deinit(self: *TestLake, alloc: Allocator) void {
-        if (self.source.prepared_deletes) |prepared| prepared.destroy(alloc);
+        if (self.source.delete_lease) |lease| lease.release() else if (self.source.prepared_deletes) |prepared| prepared.destroy(alloc);
         if (self.source.scanner.shared_reader) |reader| alloc.destroy(reader);
         self.inventory.deinit(alloc);
         self.memory.deinit();
@@ -770,6 +792,8 @@ test "lake SQL typed stream applies Iceberg equality and position deletes before
     const alloc = std.testing.allocator;
     const parquet = @import("../serverless/query/lake_parquet_rowgroup.zig");
     const iceberg = @import("../serverless/query/lake_iceberg_snapshot.zig");
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(alloc);
+    defer cache.deinit();
     var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(alloc) };
     try lake.populate(alloc, 1, &.{ 1, 2, 3, 4, 5 });
     defer lake.deinit(alloc);
@@ -794,6 +818,7 @@ test "lake SQL typed stream applies Iceberg equality and position deletes before
     plan.files[0].equality_columns[0] = try alloc.dupe(u8, "amount");
     plan.files[1] = .{ .content = .position_deletes, .file_path = try alloc.dupe(u8, "s3://bucket/deletes/pos.parquet"), .file_format = try alloc.dupe(u8, "PARQUET"), .snapshot_id = 12, .data_sequence_number = 7, .file_sequence_number = 9, .record_count = 1, .file_size_in_bytes = pos_bytes.len };
     lake.source.scanner.iceberg_delete_plan = plan;
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{});
     const cursor = try openPinned(alloc, lake.table, .{ .fields = &.{"amount"}, .limit = 1 }, .{}, &lake.source);
     defer cursor.close(cursor.ptr);
     try std.testing.expectEqual(@as(?u64, null), try cursor.count_rows.?(cursor.ptr));
@@ -813,6 +838,20 @@ test "lake SQL typed stream applies Iceberg equality and position deletes before
     defer alias_page.deinit();
     try std.testing.expectEqual(@as(usize, 3), alias_page.rows.len);
     try std.testing.expectEqual(prepared, lake.source.prepared_deletes.?);
+    try std.testing.expectEqual(@as(usize, 3), prepared.decoded_pages);
+    // A second source admission reuses membership without retaining a request.
+    var reopened = lake.source;
+    reopened.prepared_deletes = null;
+    reopened.delete_lease = null;
+    defer if (reopened.delete_lease) |lease| lease.release();
+    const cached_cursor = try openPinned(alloc, lake.table, .{ .fields = &.{"amount"}, .limit = 8 }, .{}, &reopened);
+    defer cached_cursor.close(cached_cursor.ptr);
+    const reads = lake.meter.reads;
+    const cached_page = try cached_cursor.next(cached_cursor.ptr, alloc, 8);
+    defer cached_page.deinit();
+    try std.testing.expectEqual(@as(usize, 3), cached_page.rows.len);
+    try std.testing.expectEqual(prepared, reopened.prepared_deletes.?);
+    try std.testing.expectEqual(reads, lake.meter.reads);
     try std.testing.expectEqual(@as(usize, 3), prepared.decoded_pages);
     var mismatched = lake.table;
     mismatched.external_base_source.?.binding.schema_fingerprint = "another-schema";
@@ -1190,4 +1229,81 @@ test "lake SQL shared tasks cover single file row groups exactly once" {
     // Parent remains readable after children consume the queue.
     const parent_count = (try parent.count_rows.?(parent.ptr)).?;
     try std.testing.expectEqual(parent_count, row_count);
+}
+
+test "lake SQL lazy Iceberg versions stat only surviving files once" {
+    const a = std.testing.allocator;
+    const external = @import("../serverless/external_source/types.zig");
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 2, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    var schema = try @import("../serverless/query/lake_schema.zig").icebergSchema(a, "{\"current-schema-id\":7,\"schemas\":[{\"schema-id\":7,\"fields\":[{\"id\":1,\"name\":\"amount\",\"required\":true,\"type\":\"long\"}]}]}", null);
+    defer schema.deinit();
+    lake.source.iceberg_schema = schema;
+    lake.inventory.format = .iceberg;
+    lake.source.inventory = lake.inventory;
+    lake.table.external_base_source.?.binding.format = .iceberg;
+    lake.source.lazy_versions = true;
+    lake.source.pinned_files = try a.alloc(bool, 2);
+    defer a.free(lake.source.pinned_files);
+    @memset(lake.source.pinned_files, false);
+    var zero: [8]u8 = @splat(0);
+    lake.inventory.files[0].lower_bounds = try external.FieldMetric.cloneAll(a, &.{.{ .field_id = 1, .value = &zero }});
+    lake.inventory.files[0].upper_bounds = try external.FieldMetric.cloneAll(a, &.{.{ .field_id = 1, .value = &zero }});
+    // This file must be pruned before any HEAD or footer request.
+    var client = lake.memory.client();
+    try client.deleteObject("bucket", "events/0.parquet", .{});
+    for (0..2) |_| {
+        const cursor = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .conditions = &.{.{ .column = "amount", .op = .eq, .value = .{ .integer = 2 } }}, .limit = 8 }, .{}, &lake.source);
+        defer cursor.close(cursor.ptr);
+        const page = try cursor.next(cursor.ptr, a, 8);
+        defer page.deinit();
+        try std.testing.expectEqual(@as(usize, 1), page.rows.len);
+        try std.testing.expectEqual(@as(i64, 2), page.rows[0].value.object.get("amount").?.integer);
+        try std.testing.expectEqual(@as(usize, 1), lake.meter.stats);
+        try std.testing.expect(!lake.source.pinned_files[0] and lake.source.pinned_files[1]);
+    }
+}
+
+test "lake SQL ordered splits preserve serial identity ordering" {
+    const a = std.testing.allocator;
+    var cache = @import("../serverless/query/lake_serving_cache.zig").Cache.init(a);
+    defer cache.deinit();
+    var lake: TestLake = .{ .memory = TestLake.storage.MemoryObjectStorage.init(a) };
+    try lake.populate(a, 3, &.{ 1, 2, 3 });
+    defer lake.deinit(a);
+    try lake.source.attachCache(&cache, lake.table.external_base_source.?.binding, .{ .io = std.testing.io });
+    var ids: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (ids.items) |id| a.free(id);
+        ids.deinit(a);
+    }
+    {
+        const serial = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 4 }, .{}, &lake.source);
+        defer serial.close(serial.ptr);
+        while (true) {
+            const page = try serial.next(serial.ptr, a, 4);
+            defer page.deinit();
+            for (page.rows) |row| try ids.append(a, try a.dupe(u8, row.id));
+            if (page.after == null) break;
+        }
+    }
+    const parent = try openPinned(a, lake.table, .{ .fields = &.{"amount"}, .limit = 4 }, .{}, &lake.source);
+    defer parent.close(parent.ptr);
+    const children = (try parent.split_ordered.?(parent.ptr, a, 2)).?;
+    defer {
+        for (children) |child| child.close(child.ptr);
+        a.free(children);
+    }
+    var seen: usize = 0;
+    for (children) |child| while (true) {
+        const page = try child.next(child.ptr, a, 2);
+        defer page.deinit();
+        for (page.rows) |row| {
+            try std.testing.expectEqualStrings(ids.items[seen], row.id);
+            seen += 1;
+        }
+        if (page.after == null) break;
+    };
+    try std.testing.expectEqual(ids.items.len, seen);
 }

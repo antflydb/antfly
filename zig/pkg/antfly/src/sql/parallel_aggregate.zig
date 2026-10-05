@@ -24,11 +24,11 @@ const Work = struct {
             var arena = std.heap.ArenaAllocator.init(context.alloc);
             defer arena.deinit();
             context.arena = arena.allocator();
-            const page = self.cursor.next_columns.?(self.cursor.ptr, arena.allocator(), context.limits.execution_batch_rows) catch |err| return switch (err) {
+            const page = self.cursor.next_columns.?(self.cursor.ptr, arena.allocator(), context.limits.executionRows()) catch |err| return switch (err) {
                 error.OutOfMemory => error.ParallelAggregateMemoryExceeded,
                 else => err,
             };
-            if (page.selection.len > context.limits.execution_batch_rows) return error.InvalidSqlBackendResponse;
+            if (page.selection.len > context.limits.executionRows()) return error.InvalidSqlBackendResponse;
             const visited = self.visited.fetchAdd(page.selection.len, .monotonic);
             if (page.selection.len > context.limits.scan_rows -| visited) return error.SqlProgramLimitExceeded;
             if (self.pages.fetchAdd(1, .monotonic) >= context.limits.scan_pages) return error.SqlProgramLimitExceeded;

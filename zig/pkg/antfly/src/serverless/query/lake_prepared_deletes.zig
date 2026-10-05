@@ -12,29 +12,41 @@ const types = @import("../../storage/rowsource/types.zig");
 const A = std.mem.Allocator;
 pub const Prepared = struct {
     arena: std.heap.ArenaAllocator,
-    request: iceberg.DeleteRowRefsReadRequest,
+    delete_files: []const iceberg.IcebergDeleteFile,
     equality: []Equality,
     positions: std.AutoHashMapUnmanaged(Position, void) = .empty,
     columns: []const []const u8,
     files: std.StringHashMapUnmanaged(FileIndex) = .empty,
     decoded_pages: usize = 0,
-    mutex: std.atomic.Mutex = .unlocked,
-    const FileIndex = struct { index: usize, equality: []const usize = &.{}, prefixes: ?[]const u64 = null };
+    object_versions: [32]u8 = undefined,
+    const FileIndex = struct { index: usize, equality: []const usize = &.{} };
     const Equality = struct { file: usize, keys: std.StringHashMapUnmanaged(void) = .empty };
     const Position = struct { file: usize, ordinal: u64 };
+    pub fn hashObjectVersion(hash: *std.crypto.hash.sha2.Sha256, uri: []const u8, etag: []const u8, version: []const u8) void {
+        for ([_][]const u8{ uri, etag, version }) |part| {
+            var length: [8]u8 = undefined;
+            std.mem.writeInt(u64, &length, @intCast(part.len), .little);
+            hash.update(&length);
+            hash.update(part);
+        }
+    }
     pub fn create(a: A, request: iceberg.DeleteRowRefsReadRequest) !*Prepared {
         const self = try a.create(Prepared);
         errdefer a.destroy(self);
-        self.* = .{ .arena = .init(a), .request = request, .equality = &.{}, .columns = &.{} };
+        self.* = .{ .arena = .init(a), .delete_files = &.{}, .equality = &.{}, .columns = &.{} };
         errdefer self.arena.deinit();
         const owned = self.arena.allocator();
         var equalities: std.ArrayList(Equality) = .empty;
         var columns: std.ArrayList([]const u8) = .empty;
         var scanned: u64 = 0;
         var key_bytes: usize = 0;
+        var versions = std.crypto.hash.sha2.Sha256.init(.{});
         for (request.delete_plan.files, 0..) |file, file_index| {
             var inventory = try iceberg.singleDeleteFileInventoryAlloc(a, request.data_inventory, file, request.client, if (file.content == .equality_deletes) "iceberg-equality-delete" else "iceberg-position-delete");
             defer inventory.deinit(a);
+            for (inventory.files) |entry| {
+                hashObjectVersion(&versions, entry.object_uri, entry.etag, entry.version_id);
+            }
             const names: []const []const u8 = if (file.content == .equality_deletes) file.equality_columns else &.{ "file_path", "pos" };
             var discovered = if (file.content == .equality_deletes)
                 try iceberg.discoverEqualityColumnsAlloc(a, request, inventory, file.equality_ids, names)
@@ -47,7 +59,7 @@ pub const Prepared = struct {
                 if (for (columns.items) |prior| {
                     if (std.mem.eql(u8, prior, name)) break true;
                 } else false) continue;
-                try columns.append(owned, name);
+                try columns.append(owned, try owned.dupe(u8, name));
             }
             for (discovered.row_group_plan.row_groups) |group| {
                 var limits = request.materialization_limits;
@@ -88,8 +100,14 @@ pub const Prepared = struct {
             for (self.equality, 0..) |entry, equality_index| {
                 if (try iceberg.equalityDeleteAppliesToFile(file, request.delete_plan.files[entry.file])) try applicable.append(owned, equality_index);
             }
-            try self.files.put(owned, file.file_id, .{ .index = index, .equality = applicable.items });
+            try self.files.put(owned, try owned.dupe(u8, file.file_id), .{ .index = index, .equality = applicable.items });
         }
+        // Cached indexes retain only immutable, owned metadata. Provider and
+        // request cancellation handles must never escape source admission.
+        const bytes = try std.json.Stringify.valueAlloc(a, request.delete_plan.files, .{});
+        defer a.free(bytes);
+        self.object_versions = versions.finalResult();
+        self.delete_files = try std.json.parseFromSliceLeaky([]iceberg.IcebergDeleteFile, owned, bytes, .{ .allocate = .alloc_always });
         return self;
     }
     pub fn destroy(self: *Prepared, a: A) void {
@@ -100,18 +118,12 @@ pub const Prepared = struct {
         const ref = batch.row_refs[index];
         const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
         if (self.positions.count() != 0) {
-            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-            const prefixes = self.positionPrefixes(info, file) catch |err| {
-                self.mutex.unlock();
-                return err;
-            };
-            self.mutex.unlock();
-            const ordinal = try std.math.add(u64, ref.external.row_ordinal, prefixes[ref.external.row_group_ordinal]);
+            const ordinal = try std.math.add(u64, ref.external.row_ordinal, try positionPrefix(file, ref.external.row_group_ordinal));
             if (self.positions.contains(.{ .file = info.index, .ordinal = ordinal })) return true;
         }
         for (info.equality) |equality_index| {
             const equality = self.equality[equality_index];
-            const delete_file = self.request.delete_plan.files[equality.file];
+            const delete_file = self.delete_files[equality.file];
             const key = try deletes.projectedEqualityKeyFromBatchRowAlloc(a, batch, index, delete_file.equality_columns);
             defer a.free(key);
             if (equality.keys.contains(key)) return true;
@@ -125,15 +137,15 @@ pub const Prepared = struct {
         try batch.validate();
         const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
         if (self.positions.count() != 0) {
-            while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
-            const prefixes = self.positionPrefixes(info, file) catch |err| {
-                self.mutex.unlock();
-                return err;
-            };
-            self.mutex.unlock();
+            var group: ?u32 = null;
+            var prefix: u64 = 0;
             for (batch.row_refs, selected) |ref, *keep| {
                 if (!keep.*) continue;
-                const ordinal = try std.math.add(u64, ref.external.row_ordinal, prefixes[ref.external.row_group_ordinal]);
+                if (group != ref.external.row_group_ordinal) {
+                    prefix = try positionPrefix(file, ref.external.row_group_ordinal);
+                    group = ref.external.row_group_ordinal;
+                }
+                const ordinal = try std.math.add(u64, ref.external.row_ordinal, prefix);
                 if (self.positions.contains(.{ .file = info.index, .ordinal = ordinal })) keep.* = false;
             }
         }
@@ -141,9 +153,9 @@ pub const Prepared = struct {
         defer key.deinit(a);
         for (info.equality, 0..) |equality_index, set_index| {
             const equality = self.equality[equality_index];
-            const names = self.request.delete_plan.files[equality.file].equality_columns;
+            const names = self.delete_files[equality.file].equality_columns;
             const repeated = for (info.equality[0..set_index]) |earlier| {
-                if (sameFields(names, self.request.delete_plan.files[self.equality[earlier].file].equality_columns)) break true;
+                if (sameFields(names, self.delete_files[self.equality[earlier].file].equality_columns)) break true;
             } else false;
             if (repeated) continue;
             const columns = try a.alloc(?types.ColumnVector, names.len);
@@ -180,7 +192,7 @@ pub const Prepared = struct {
                 }
                 for (info.equality[set_index..]) |candidate| {
                     const entry = self.equality[candidate];
-                    if (sameFields(names, self.request.delete_plan.files[entry.file].equality_columns) and entry.keys.contains(key.items)) {
+                    if (sameFields(names, self.delete_files[entry.file].equality_columns) and entry.keys.contains(key.items)) {
                         keep.* = false;
                         break;
                     }
@@ -195,19 +207,15 @@ pub const Prepared = struct {
     }
     pub fn bindFile(self: *Prepared, file: @import("../external_source/types.zig").FileEntry) !void {
         if (self.positions.count() == 0) return;
-        const info = self.files.getPtr(file.file_id) orelse return error.ExternalSourceFileNotFound;
-        _ = try self.positionPrefixes(info, file);
+        if (!self.files.contains(file.file_id)) return error.ExternalSourceFileNotFound;
+        if (file.row_groups.len != 0) _ = try positionPrefix(file, @intCast(file.row_groups.len - 1));
     }
-    fn positionPrefixes(self: *Prepared, info: *FileIndex, file: @import("../external_source/types.zig").FileEntry) ![]const u64 {
-        if (info.prefixes == null) {
-            const prefixes = try self.arena.allocator().alloc(u64, file.row_groups.len);
-            var total: u64 = 0;
-            for (file.row_groups, prefixes) |group, *prefix| {
-                prefix.* = total;
-                total = try std.math.add(u64, total, group.row_count);
-            }
-            info.prefixes = prefixes;
-        }
-        return info.prefixes.?;
+    // Footer-derived offsets belong to the request's file plan. The cached
+    // membership index remains immutable and its retained size cannot grow.
+    fn positionPrefix(file: @import("../external_source/types.zig").FileEntry, ordinal: u32) !u64 {
+        if (ordinal >= file.row_groups.len) return error.InvalidParquetRowGroupBatch;
+        var total: u64 = 0;
+        for (file.row_groups[0..ordinal]) |group| total = try std.math.add(u64, total, group.row_count);
+        return total;
     }
 };

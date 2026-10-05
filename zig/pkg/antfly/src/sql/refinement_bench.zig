@@ -561,3 +561,37 @@ test "native refinements benchmark shared window permutations" {
         std.debug.print("native_refinement {{\"case\":\"shared_window_permutations\",\"rows\":256,\"payload_bytes\":{d},\"sample\":{d},\"copy_ns\":{d},\"shared_ns\":{d},\"copy_written_bytes\":{d},\"shared_written_bytes\":{d}}}\n", .{ width, sample, baseline.ns, refined.ns, baseline.written, refined.written });
     };
 }
+
+fn windowColumnReads(columnar: bool, count: usize) !struct { ns: i96, read_bytes: u64, checksum: i64 } {
+    const a = std.testing.allocator;
+    const Hook = struct {
+        fn check(_: *anyopaque) !void {}
+    };
+    var dummy: u8 = 0;
+    var manager: spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = Hook.check };
+    defer manager.deinit();
+    var rows = try disk.Rows.init(a, &manager, 2);
+    defer rows.deinit();
+    if (columnar) try rows.enableColumns();
+    const payload: [8192]u8 = @splat('x');
+    for (0..count) |index| try rows.append(.{ .values = &.{ Datum.json(.{ .integer = @intCast(index) }), Datum.json(.{ .string = &payload }) }, .keys = &.{}, .ordinal = index });
+    if (rows.columnar) |*store| try store.flush();
+    const before = manager.read_bytes;
+    const start = now();
+    var checksum: i64 = 0;
+    // Two key passes model sorting and partition/frame evaluation.
+    for (0..2) |_| for (0..count) |index| {
+        checksum += (try rows.cell(index, 0)).value.integer;
+    };
+    return .{ .ns = now() - start, .read_bytes = manager.read_bytes - before, .checksum = checksum };
+}
+test "native refinements benchmark column-addressable window keys" {
+    for (0..3) |sample| {
+        const first = try windowColumnReads(sample % 2 != 0, 512);
+        const second = try windowColumnReads(sample % 2 == 0, 512);
+        const baseline = if (sample % 2 == 0) first else second;
+        const refined = if (sample % 2 == 0) second else first;
+        try std.testing.expectEqual(baseline.checksum, refined.checksum);
+        std.debug.print("native_refinement {{\"case\":\"column_window_keys\",\"rows\":512,\"payload_bytes\":8192,\"sample\":{d},\"row_ns\":{d},\"column_ns\":{d},\"row_read_bytes\":{d},\"column_read_bytes\":{d}}}\n", .{ sample, baseline.ns, refined.ns, baseline.read_bytes, refined.read_bytes });
+    }
+}

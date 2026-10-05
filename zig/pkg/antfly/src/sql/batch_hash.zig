@@ -41,17 +41,34 @@ pub fn columns(a: A, values: []const []const scalar.Datum, count: usize, grouped
 pub fn rows(a: A, values: []const []const scalar.Datum, grouped: bool) ![]?u64 {
     const width = if (values.len == 0) 0 else values[0].len;
     for (values) |row| if (row.len != width) return error.InvalidSqlBackendResponse;
-    const storage = try a.alloc(scalar.Datum, width * values.len);
-    defer a.free(storage);
-    const vectors = try a.alloc([]const scalar.Datum, width);
-    defer a.free(vectors);
-    for (vectors, 0..) |*vector, column| {
-        const cells = storage[column * values.len ..][0..values.len];
-        for (values, cells) |row, *out| {
-            if (row.len != width) return error.InvalidSqlBackendResponse;
-            out.* = row[column];
+    const states = try a.alloc(std.hash.Wyhash, values.len);
+    defer a.free(states);
+    for (states) |*state| state.* = .init(0);
+    const result = try a.alloc(?u64, values.len);
+    errdefer a.free(result);
+    @memset(result, 0);
+    // Work directly on the row views: no width*rows Datum transpose.
+    for (0..width) |column| {
+        var text: std.StringHashMapUnmanaged(u64) = .empty;
+        defer text.deinit(a);
+        for (values, states, result) |row, *state, *valid| {
+            const cell = row[column];
+            if (!grouped and cell.sql_null) valid.* = null;
+            if (valid.* == null) continue;
+            const semantic = if (cell.sql_null) 0 else if (cell.value == .string) blk: {
+                if (text.get(cell.value.string)) |hash| break :blk hash;
+                const hash = try scalar.semanticHash(cell.value);
+                if (text.count() < 4096) try text.put(a, cell.value.string, hash);
+                break :blk hash;
+            } else try scalar.semanticHash(cell.value);
+            var bytes: [9]u8 = undefined;
+            bytes[0] = @intFromBool(cell.sql_null);
+            std.mem.writeInt(u64, bytes[1..9], semantic, .little);
+            state.update(if (grouped) &bytes else bytes[1..9]);
         }
-        vector.* = cells;
     }
-    return columns(a, vectors, values.len, grouped);
+    for (states, result) |*state, *out| if (out.* != null) {
+        out.* = state.final();
+    };
+    return result;
 }

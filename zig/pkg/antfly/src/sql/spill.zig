@@ -739,6 +739,12 @@ pub const Sequential = struct {
             }
         }
     }
+    /// Start a new sequential pass; borrowed rows from the old pass expire.
+    pub fn rewind(self: *Sequential) void {
+        self.read_first = 0;
+        self.read_offset = 0;
+        self.read_rows = &.{};
+    }
     pub fn readBorrowed(self: *Sequential, offset: u64) !Decoded {
         try self.seal();
         if (offset >= self.size) return error.InvalidSqlSpill;
