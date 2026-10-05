@@ -45,6 +45,7 @@ import {
 } from "lucide-react";
 import type React from "react";
 import { useCallback, useMemo, useReducer, useRef, useState } from "react";
+import { chatGPTErrorMessage } from "@/components/chatgpt-provider";
 import {
   formatGeneratorSummary,
   GENERATOR_DEFAULT_CONFIG,
@@ -347,9 +348,10 @@ const RagPlaygroundPage: React.FC = () => {
   }, [effectiveGenerator?.model, effectiveGenerator?.provider]);
 
   const handleError = useCallback((e: string) => {
-    setError(e);
+    const message = e.includes("ChatGPT") ? chatGPTErrorMessage(new Error(e)) : e;
+    setError(message);
     setIsLoading(false);
-    dispatchPipeline({ type: "ERROR", error: e });
+    dispatchPipeline({ type: "ERROR", error: message });
   }, []);
 
   // --- Derived data from pipeline state for stats badges ---
@@ -687,6 +689,7 @@ const RagPlaygroundPage: React.FC = () => {
                     <div className="space-y-4">
                       <Label className="text-sm font-medium">Generator</Label>
                       <GeneratorSelector
+                        allowPersonalConnections
                         value={generatorOverride}
                         onChange={setGeneratorOverride}
                         defaultConfig={GENERATOR_DEFAULT_CONFIG}

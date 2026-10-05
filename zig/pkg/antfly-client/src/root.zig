@@ -252,3 +252,39 @@ test "list indexes response timeout bounds readiness preflight" {
     try std.testing.expect(!unexpected.load(.acquire));
     try std.testing.expect(!succeeded.load(.acquire));
 }
+
+test "personal connections preserve owner auth and forbid replay" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const Assert = struct {
+        fn request(info: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Basic dXNlcjpwYXNz", info.header("Authorization").?);
+            try std.testing.expectEqualStrings("{\"connection_id\":\"account-1\"}", info.body);
+        }
+    };
+    for ([_]u16{ 200, 503 }) |status| {
+        var server = try httpx.TestServer.start(alloc, io, &.{.{
+            .method = .POST,
+            .path = "/db/v1/connections/chatgpt/authorize",
+            .respond = .{ .status = status, .body = "{\"attempt_id\":\"attempt-1\",\"authorization_url\":\"https://auth.openai.com/api/accounts/authorize?state=test\",\"expires_at\":123}" },
+            .assert_request = Assert.request,
+        }});
+        defer server.deinit();
+        var serving = try io.concurrent(httpx.TestServer.handleOne, .{&server});
+        defer serving.cancel(io) catch {};
+        var http = httpx.Client.initWithConfig(alloc, io, .{ .retry_policy = .{ .retry_only_idempotent = false, .max_retries = 3, .initial_delay_ms = 0 }, .timeouts = .{ .request_ms = 1000 } });
+        defer http.deinit();
+        var client = try AntflyClient.init(alloc, &http, server.baseUrl());
+        defer client.deinit();
+        try client.setBearer("previous-owner");
+        try client.setBasicAuth("user", "pass");
+        var response = try client.authorizeChatGPT(.{ .connection_id = "account-1" });
+        defer response.deinit();
+        try std.testing.expectEqual(status, response.status_code);
+        if (status == 200) try std.testing.expectEqualStrings("attempt-1", response.data.?.value.attempt_id);
+        try serving.await(io);
+        try std.testing.expectEqual(@as(usize, 1), server.route_hits[0]);
+        try std.testing.expectError(error.InvalidConnectionId, client.getChatGPTAttempt("../other"));
+        try std.testing.expectError(error.InvalidConnectionId, client.disconnectChatGPT("account?redirect=other"));
+    }
+}

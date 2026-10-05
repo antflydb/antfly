@@ -45,6 +45,7 @@ import {
 } from "@/components/ai-elements/prompt-input";
 import { Source, Sources, SourcesContent, SourcesTrigger } from "@/components/ai-elements/sources";
 import { Suggestion, Suggestions } from "@/components/ai-elements/suggestion";
+import { chatGPTErrorMessage } from "@/components/chatgpt-provider";
 import { getChatRequestGenerator } from "@/components/playground/chat-generator";
 import {
   GENERATOR_DEFAULT_CONFIG,
@@ -206,6 +207,7 @@ const ChatPlaygroundPage: React.FC = () => {
                     <div className="space-y-4">
                       <Label className="text-sm font-medium">Generator</Label>
                       <GeneratorSelector
+                        allowPersonalConnections
                         value={generatorOverride}
                         onChange={setGeneratorOverride}
                         defaultConfig={GENERATOR_DEFAULT_CONFIG}
@@ -505,7 +507,7 @@ const ChatPlaygroundPage: React.FC = () => {
                   )}
                   renderError={(error) => (
                     <div className="mb-3 mx-1 p-3 bg-destructive/10 border border-destructive/30 rounded-none text-destructive text-sm">
-                      {error}
+                      {error.includes("ChatGPT") ? chatGPTErrorMessage(new Error(error)) : error}
                     </div>
                   )}
                 />

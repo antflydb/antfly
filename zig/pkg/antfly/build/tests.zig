@@ -597,6 +597,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_generating_runtime_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "chatgpt",
             "generating backend",
             "local generation budgets",
             "local generation bridge",
@@ -934,6 +935,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = antfly_client_pkg_mod,
         .filters = &.{
             "antfly client pkg compiles",
+            "personal connections preserve owner auth and forbid replay",
             "get index response timeout bounds the complete HTTP request",
             "list indexes response timeout bounds readiness preflight",
             "SQL client preserves typed parameters receipts and forbids replay",

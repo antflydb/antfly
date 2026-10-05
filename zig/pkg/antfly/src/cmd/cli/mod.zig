@@ -30,12 +30,15 @@ pub const backup = @import("backup.zig");
 pub const agents = @import("agents.zig");
 pub const internal = @import("internal.zig");
 pub const auth = @import("auth.zig");
+pub const connections = @import("connections.zig");
 
 pub const OutputFormat = enum { json, table_fmt };
 
 pub const GlobalConfig = struct {
     url: []const u8 = "http://127.0.0.1:8080",
     token: ?[]const u8 = null,
+    username: ?[]const u8 = null,
+    password: ?[]const u8 = null,
     output: OutputFormat = .json,
 };
 
@@ -73,6 +76,7 @@ pub fn isHelpArg(arg: []const u8) bool {
 }
 
 pub fn commandUsage(command: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, command, "connections")) return connections.usage;
     if (std.mem.eql(u8, command, "sql")) return
     \\usage: antfly sql --statement '<SQL>' [--parameters '<JSON array>']
     \\                  [--database <name>] [--namespace <name>] [--limit <1..4096>]
@@ -227,6 +231,7 @@ test "client commands expose help without a server" {
 /// Supported env vars:
 ///   ANTFLY_URL    — server base URL (default http://127.0.0.1:8080)
 ///   ANTFLY_TOKEN  — bearer token for authentication
+///   ANTFLY_USERNAME / ANTFLY_PASSWORD — Basic authentication (exclusive with token)
 pub fn parseGlobalFlags() GlobalConfig {
     var config = GlobalConfig{};
     if (platform.env.getenv("ANTFLY_URL")) |raw| {
@@ -235,11 +240,17 @@ pub fn parseGlobalFlags() GlobalConfig {
     if (platform.env.getenv("ANTFLY_TOKEN")) |raw| {
         config.token = raw;
     }
+    config.username = platform.env.getenv("ANTFLY_USERNAME");
+    config.password = platform.env.getenv("ANTFLY_PASSWORD");
     return config;
 }
 
 pub fn initClient(allocator: std.mem.Allocator, http: *httpx.Client, config: GlobalConfig) !antfly_client.AntflyClient {
     var client = try antfly_client.AntflyClient.init(allocator, http, config.url);
+    errdefer client.deinit();
+    if ((config.username == null) != (config.password == null)) return error.BasicAuthRequiresUsernameAndPassword;
+    if (config.token != null and config.username != null) return error.ConflictingAuthentication;
+    if (config.username) |username| try client.setBasicAuth(username, config.password.?);
     if (config.token) |token| {
         try client.setBearer(token);
     }
@@ -307,4 +318,5 @@ test "cli mod compiles" {
     _ = agents;
     _ = internal;
     _ = auth;
+    _ = connections;
 }

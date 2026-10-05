@@ -502,10 +502,13 @@ export {
 import { Client } from "./sdk.js";
 export default Client;
 
+export { ChatGPTConnectionError } from "./client.js";
 export * from "./models.js";
-
 export type {
   CatalogTablespaceBindingRequest,
+  ChatGPTAccount,
+  ChatGPTBegin,
+  ChatGPTOutcome,
   CreateTablespaceRequest,
   DatabaseCatalogRecord,
   NamespaceCatalogRecord,

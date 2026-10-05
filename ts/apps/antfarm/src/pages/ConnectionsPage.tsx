@@ -23,6 +23,7 @@ import {
 import type { ComponentType } from "react";
 import { useState } from "react";
 import { AntyEmptyState, ErrorState } from "@/components/branded-empty-state";
+import { ChatGPTConnections } from "@/components/chatgpt-connections";
 import {
   CONNECTED_MODEL_KINDS,
   OTHER_MODELS_GROUP,
@@ -509,6 +510,7 @@ export default function ConnectionsPage() {
         </DashboardPageActions>
       </DashboardPageHeader>
 
+      <ChatGPTConnections />
       {connections.length === 0 ? (
         <AntyEmptyState
           title="No connections configured"

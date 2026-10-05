@@ -82,6 +82,7 @@ pub fn runFromIterator(
     if (std.mem.eql(u8, command, "agents")) return cli.agents.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "backup")) return cli.backup.runBackup(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "restore")) return cli.backup.runRestore(init.gpa, io, &client, args);
+    if (std.mem.eql(u8, command, "connections")) return cli.connections.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "auth")) return cli.auth.run(init.gpa, io, &client, args);
     if (std.mem.eql(u8, command, "internal")) return cli.internal.run(init.gpa, io, &client, args);
     return error.InvalidArguments;

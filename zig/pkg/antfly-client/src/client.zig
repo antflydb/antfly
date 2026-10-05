@@ -66,6 +66,58 @@ pub const AntflyClient = struct {
         self.inner.base_url = url;
     }
 
+    // Personal connection operations must never redirect credentials or replay authorization.
+    pub fn authorizeChatGPT(self: *AntflyClient, body: openapi.types.ChatGPTAuthorize) !openapi.ApiResponse(openapi.types.ChatGPTBegin) {
+        const encoded = try httpx.json.Json.stringifyRequest(self.allocator, body);
+        defer self.allocator.free(encoded);
+        return self.connectionRequest(openapi.types.ChatGPTBegin, "/db/v1/connections/chatgpt/authorize", encoded);
+    }
+
+    pub fn listChatGPTAccounts(self: *AntflyClient) !openapi.ApiResponse(openapi.types.ChatGPTAccounts) {
+        return self.connectionRequest(openapi.types.ChatGPTAccounts, "/db/v1/connections/chatgpt/accounts", null);
+    }
+
+    pub fn getChatGPTAttempt(self: *AntflyClient, id: []const u8) !openapi.ApiResponse(openapi.types.ChatGPTOutcome) {
+        const path = try self.connectionPath("/db/v1/connections/chatgpt/attempts/", id, "");
+        defer self.allocator.free(path);
+        return self.connectionRequest(openapi.types.ChatGPTOutcome, path, null);
+    }
+
+    pub fn listChatGPTModels(self: *AntflyClient, id: []const u8) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
+        const path = try self.connectionPath("/db/v1/connections/", id, "/chatgpt/models");
+        defer self.allocator.free(path);
+        return self.connectionRequest(std.json.ArrayHashMap(std.json.Value), path, null);
+    }
+
+    pub fn disconnectChatGPT(self: *AntflyClient, id: []const u8) !openapi.ApiResponse(openapi.types.ChatGPTDisconnect) {
+        const path = try self.connectionPath("/db/v1/connections/", id, "/chatgpt/disconnect");
+        defer self.allocator.free(path);
+        return self.connectionRequest(openapi.types.ChatGPTDisconnect, path, "{}");
+    }
+
+    fn connectionPath(self: *AntflyClient, prefix: []const u8, id: []const u8, suffix: []const u8) ![]u8 {
+        if (id.len == 0 or id.len > 256) return error.InvalidConnectionId;
+        for (id) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return error.InvalidConnectionId;
+        return std.fmt.allocPrint(self.allocator, "{s}{s}{s}", .{ prefix, id, suffix });
+    }
+
+    fn connectionRequest(self: *AntflyClient, comptime T: type, path: []const u8, body: ?[]const u8) !openapi.ApiResponse(T) {
+        const url = try std.fmt.allocPrint(self.allocator, "{s}{s}", .{ self.inner.base_url, path });
+        defer self.allocator.free(url);
+        const headers: ?[]const [2][]const u8 = if (self.inner.auth_header) |*header| @as(*const [1][2][]const u8, header) else null;
+        const options: httpx.RequestOptions = .{
+            .json = body,
+            .headers = headers,
+            .max_response_size = 1 << 20,
+            .timeout_ms = 15_000,
+            .max_retries = 0,
+            .follow_redirects = false,
+            .cookies_enabled = false,
+        };
+        var response = if (body != null) try self.inner.http.post(url, options) else try self.inner.http.get(url, options);
+        return openapi.ApiResponse(T).fromResponse(self.allocator, &response);
+    }
+
     // --- Auth ---
 
     pub fn setBearer(self: *AntflyClient, token: []const u8) !void {
@@ -73,22 +125,24 @@ pub const AntflyClient = struct {
     }
 
     pub fn setBasicAuth(self: *AntflyClient, username: []const u8, password: []const u8) !void {
-        self.inner.freeAuth();
+        if (self.inner.auth_header) |header| self.allocator.free(header[1]);
+        self.inner.auth_header = null;
         const cred = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ username, password });
         defer self.allocator.free(cred);
         const encoded = try base64Encode(self.allocator, cred);
-        const header_val = try std.fmt.allocPrint(self.allocator, "Basic {s}", .{encoded});
         defer self.allocator.free(encoded);
+        const header_val = try std.fmt.allocPrint(self.allocator, "Basic {s}", .{encoded});
         self.inner.auth_header = .{ "Authorization", header_val };
     }
 
     pub fn setApiKey(self: *AntflyClient, key_id: []const u8, key_secret: []const u8) !void {
-        self.inner.freeAuth();
+        if (self.inner.auth_header) |header| self.allocator.free(header[1]);
+        self.inner.auth_header = null;
         const cred = try std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ key_id, key_secret });
         defer self.allocator.free(cred);
         const encoded = try base64Encode(self.allocator, cred);
-        const header_val = try std.fmt.allocPrint(self.allocator, "ApiKey {s}", .{encoded});
         defer self.allocator.free(encoded);
+        const header_val = try std.fmt.allocPrint(self.allocator, "ApiKey {s}", .{encoded});
         self.inner.auth_header = .{ "Authorization", header_val };
     }
 
@@ -296,7 +350,7 @@ pub const AntflyClient = struct {
     }
 
     pub fn closePreparedSQL(self: *AntflyClient, prepared_id: []const u8) !openapi.ApiResponse(std.json.ArrayHashMap(std.json.Value)) {
-        return self.inner.closePreparedSQL(prepared_id);
+        return self.inner.closePreparedSQL(prepared_id, null);
     }
 
     fn sqlPost(self: *AntflyClient, comptime T: type, path: []const u8, request: anytype) !openapi.ApiResponse(T) {

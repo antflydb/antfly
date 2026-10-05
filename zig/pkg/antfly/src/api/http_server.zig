@@ -1619,6 +1619,8 @@ test "session maintenance activation follows current range leadership without fo
 }
 
 pub const ApiHttpServerConfig = struct {
+    /// Node-local personal connection owner; never populated by distributed configuration.
+    chatgpt: ?*@import("../chatgpt/manager.zig").Manager = null,
     pgwire: ?common_config.Config.PgwireConfig = null,
     restore_validation: ?@import("restore_catalog.zig").ValidationPort = null,
     auth_enabled: bool = false,

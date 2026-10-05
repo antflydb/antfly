@@ -13,6 +13,8 @@
 // limitations.
 
 const std = @import("std");
+const chatgpt_manager = @import("../chatgpt/manager.zig");
+const chatgpt_responses = @import("../chatgpt/responses.zig");
 const httpx = @import("httpx");
 const lib = @import("antfly_generating");
 const inference = @import("../inference/mod.zig");
@@ -30,6 +32,7 @@ const provider_defaults = @import("../common/provider_defaults.zig");
 
 const remote_generate_max_timeout_ms: u64 = 300_000;
 
+pub const ChatGPTFailure = chatgpt_responses.Failure;
 pub const Role = lib.Role;
 pub const ContentPart = lib.ContentPart;
 pub const ChatMessageContent = lib.ChatMessageContent;
@@ -79,6 +82,10 @@ test "embedded canonical generation preserves tool definitions returned calls an
 pub const parseConfigFromValue = lib.parseConfigFromValue;
 
 pub const BackendFactory = struct {
+    chatgpt: ?*chatgpt_manager.Manager = null,
+    personal_owner: ?[]const u8 = null,
+    chatgpt_failure: ?*ChatGPTFailure = null,
+    chatgpt_pin: ?chatgpt_manager.Pin = null,
     alloc: std.mem.Allocator,
     http: *httpx.Client,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
@@ -103,6 +110,10 @@ pub const BackendFactory = struct {
     }
 
     pub const Options = struct {
+        chatgpt: ?*chatgpt_manager.Manager = null,
+        personal_owner: ?[]const u8 = null,
+        chatgpt_failure: ?*ChatGPTFailure = null,
+        chatgpt_pin: ?chatgpt_manager.Pin = null,
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
         inference_api_key: ?[]const u8 = null,
@@ -122,6 +133,10 @@ pub const BackendFactory = struct {
         if (execution.routing.source_table.len == 0)
             execution.routing.source_table = options.source_table;
         return .{
+            .chatgpt = options.chatgpt,
+            .personal_owner = options.personal_owner,
+            .chatgpt_failure = options.chatgpt_failure,
+            .chatgpt_pin = options.chatgpt_pin,
             .alloc = alloc,
             .http = http,
             .antfly_provider = options.antfly_provider,
@@ -144,7 +159,34 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
+        if (cfg.provider == .chatgpt) {
+            try cfg.validate();
+            const manager = self.chatgpt orelse return error.ChatGPTInteractiveOnly;
+            const owner = self.personal_owner orelse return error.ChatGPTInteractiveOnly;
+            const state = try alloc.create(ChatGPTBackend);
+            state.* = .{ .alloc = alloc, .provider = .{ .http = self.http, .failure = self.chatgpt_failure, .pin = self.chatgpt_pin, .registrations = manager, .owner = owner, .connection_id = cfg.connection_id.?, .tools_json = cfg.tools_json, .tool_choice_json = cfg.tool_choice_json, .reasoning_effort = if (cfg.reasoning_effort) |effort| @tagName(effort) else null, .max_response_bytes = self.max_response_bytes orelse 16 * 1024 * 1024 }, .context = self.request_context };
+            return .{ .ptr = state, .vtable = &.{ .generate = ChatGPTBackend.generate, .deinit = ChatGPTBackend.deinit } };
+        }
         return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.max_response_bytes, self.execution, self.request_context, self.limits);
+    }
+};
+
+const ChatGPTBackend = struct {
+    alloc: std.mem.Allocator,
+    provider: chatgpt_responses.Provider,
+    context: ?RequestContext,
+    fn generate(raw: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.context) |context| {
+            try context.check();
+            self.provider.timeout_ms = try context.remainingTimeoutMs() orelse 120_000;
+            if (context.cancellation) |token| self.provider.cancellation = httpx.CancellationToken.fromCallback(token.ptr, token.is_cancelled_fn);
+        }
+        return self.provider.generate(alloc, model, messages);
+    }
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.alloc.destroy(self);
     }
 };
 
@@ -601,6 +643,7 @@ pub fn executeChainWithOptions(
     options: BackendFactory.Options,
     messages: []const ChatMessage,
 ) !GenerateResult {
+    for (chain) |link| if (link.generator.provider == .chatgpt and (chain.len != 1 or link.retry != null)) return error.ChatGPTBillingFallbackForbidden;
     var factory_impl = BackendFactory.initWithOptions(alloc, http, options);
     return try lib.executeChainWithIo(alloc, http.io, chain, factory_impl.factory(), messages);
 }

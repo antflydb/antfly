@@ -189,6 +189,7 @@ pub const Registry = struct {
     }
 
     pub fn registerGeneratorConfig(self: *Registry, name: []const u8, cfg: generating.GeneratorConfig) !void {
+        if (cfg.provider == .chatgpt) return error.ChatGPTInteractiveOnly;
         try cfg.validate();
         const key = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(key);

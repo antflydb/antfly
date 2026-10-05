@@ -90,6 +90,15 @@ from .catalog_tablespace_binding_request import CatalogTablespaceBindingRequest
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
+from .chat_gpt_account import ChatGPTAccount
+from .chat_gpt_accounts import ChatGPTAccounts
+from .chat_gpt_authorize import ChatGPTAuthorize
+from .chat_gpt_begin import ChatGPTBegin
+from .chat_gpt_disconnect import ChatGPTDisconnect
+from .chat_gpt_generator_config import ChatGPTGeneratorConfig
+from .chat_gpt_generator_config_provider import ChatGPTGeneratorConfigProvider
+from .chat_gpt_outcome import ChatGPTOutcome
+from .chat_gpt_outcome_status import ChatGPTOutcomeStatus
 from .chat_message import ChatMessage
 from .chat_message_role import ChatMessageRole
 from .chat_tool_name import ChatToolName
@@ -927,6 +936,7 @@ from .linkup_search_config import LinkupSearchConfig
 from .linkup_search_config_depth import LinkupSearchConfigDepth
 from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .linkup_search_config_provider import LinkupSearchConfigProvider
+from .list_chat_gpt_models_response_200 import ListChatGPTModelsResponse200
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
 from .list_restore_jobs_phase import ListRestoreJobsPhase
 from .list_restore_jobs_scope import ListRestoreJobsScope
@@ -1470,6 +1480,15 @@ __all__ = (
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
+    "ChatGPTAccount",
+    "ChatGPTAccounts",
+    "ChatGPTAuthorize",
+    "ChatGPTBegin",
+    "ChatGPTDisconnect",
+    "ChatGPTGeneratorConfig",
+    "ChatGPTGeneratorConfigProvider",
+    "ChatGPTOutcome",
+    "ChatGPTOutcomeStatus",
     "ChatMessage",
     "ChatMessageRole",
     "ChatToolName",
@@ -2297,6 +2316,7 @@ __all__ = (
     "LinkupSearchConfigDepth",
     "LinkupSearchConfigOutputType",
     "LinkupSearchConfigProvider",
+    "ListChatGPTModelsResponse200",
     "ListDocumentArtifactManifestsDetail",
     "ListRestoreJobsPhase",
     "ListRestoreJobsScope",

@@ -5099,6 +5099,14 @@ pub fn runFromIterator(
     if (ha_lease_watchdog) |*watchdog| watchdog.bindOwnedProcessBootID();
     defer if (ha_lease_watchdog) |*watchdog| watchdog.deinit(alloc);
 
+    // Personal OAuth credentials stay outside replicated metadata. Enable only
+    // loopback standalone; multi-user/distributed serving needs its own boundary.
+    const chatgpt_manager = @import("../chatgpt/manager.zig");
+    const chatgpt_root = try std.fs.path.join(alloc, &.{ resolved.auth_store_root_dir, "chatgpt" });
+    defer alloc.free(chatgpt_root);
+    var chatgpt: ?chatgpt_manager.Manager = if (std.mem.eql(u8, public_listener.bind_host, "127.0.0.1") or std.mem.eql(u8, public_listener.bind_host, "::1") or std.mem.eql(u8, public_listener.bind_host, "localhost")) try chatgpt_manager.Manager.init(alloc, setup_io.io(), chatgpt_root) else null;
+    defer if (chatgpt) |*manager| manager.deinit();
+
     // Initialize DataServer without starting its listener — the unified
     // httpx.Server will serve the public API instead.
     var data_server = antfly.data.runtime.DataServer.initFromLocalMetadataSources(alloc, .{
@@ -5122,6 +5130,7 @@ pub fn runFromIterator(
             .ha_remote_apply_mutations_enabled = haRemoteApplyMutationsEnabled(ha_sync_policy.policy),
             .ha_catalog_create_enabled = ha_role_requested and cli.ha_table_id == 0 and cli.ha_shard_id == 0,
             .auth_enabled = auth_enabled,
+            .chatgpt = if (chatgpt) |*manager| manager else null,
             .experimental = cli.experimental,
             .mcp_max_tool_result_bytes = if (loaded_config) |*cfg| cfg.mcp.max_tool_result_bytes else antfly.common.config.default_mcp_max_tool_result_bytes,
             .pgwire = if (loaded_config) |*cfg| cfg.pgwire else null,

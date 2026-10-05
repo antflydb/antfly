@@ -44,6 +44,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/connections/chatgpt/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** authorizeChatGPT */
+        post: operations["authorizeChatGPT"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/connections/chatgpt/attempts/{attempt_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** getChatGPTAttempt */
+        get: operations["getChatGPTAttempt"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/connections/chatgpt/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** listChatGPTAccounts */
+        get: operations["listChatGPTAccounts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/connections/{connection_id}/chatgpt/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** listChatGPTModels */
+        get: operations["listChatGPTModels"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/connections/{connection_id}/chatgpt/disconnect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** disconnectChatGPT */
+        post: operations["disconnectChatGPT"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/connections": {
         parameters: {
             query?: never;
@@ -4373,6 +4458,34 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ChatGPTAuthorize: {
+            connection_id?: string;
+        };
+        ChatGPTBegin: {
+            attempt_id: string;
+            authorization_url: string;
+            /** Format: int64 */
+            expires_at: number;
+        };
+        ChatGPTOutcome: {
+            /** @enum {string} */
+            status: "pending" | "exchanging" | "connected" | "declined" | "expired" | "error";
+            connection_id?: string;
+            error?: string;
+        };
+        ChatGPTAccount: {
+            connection_id: string;
+            email: string;
+            label: string;
+            connected: boolean;
+            plan_enabled: boolean;
+        };
+        ChatGPTAccounts: {
+            accounts: components["schemas"]["ChatGPTAccount"][];
+        };
+        ChatGPTDisconnect: {
+            revocation_confirmed: boolean;
+        };
         /**
          * @description Logical SQL result type. Integer values are decimal strings to preserve exact precision in every client.
          * @enum {string}
@@ -13156,6 +13269,15 @@ export interface components {
          * @enum {string}
          */
         OpenAIReasoningEffort: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+        /** @description Personal ChatGPT plan for interactive generation. Credentials stay in the local runtime. */
+        ChatGPTGeneratorConfig: {
+            /** @enum {string} */
+            provider: "chatgpt";
+            reasoning_effort?: components["schemas"]["OpenAIReasoningEffort"];
+            model: string;
+            /** @description Opaque personal registration owned by the authenticated caller. */
+            connection_id: string;
+        };
         /** @description Configuration for the OpenAI generative AI provider. */
         OpenAIGeneratorConfig: {
             /** @enum {string} */
@@ -13247,7 +13369,7 @@ export interface components {
          * @description Generator providers implemented by Antfly's generation runtime.
          * @enum {string}
          */
-        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "openrouter" | "antfly";
+        GeneratorProvider: "gemini" | "vertex" | "ollama" | "openai" | "chatgpt" | "openrouter" | "antfly";
         /**
          * @description A unified configuration for a generative AI provider.
          * @example {
@@ -13257,7 +13379,7 @@ export interface components {
          *       "max_tokens": 2048
          *     }
          */
-        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"]) & {
+        GeneratorConfig: (components["schemas"]["GoogleGeneratorConfig"] | components["schemas"]["VertexGeneratorConfig"] | components["schemas"]["OllamaGeneratorConfig"] | components["schemas"]["AntflyGeneratorConfig"] | components["schemas"]["ChatGPTGeneratorConfig"] | components["schemas"]["OpenAIGeneratorConfig"] | components["schemas"]["OpenRouterGeneratorConfig"]) & {
             rate_limit?: components["schemas"]["RateLimitConfig"];
             provider: components["schemas"]["GeneratorProvider"];
         };
@@ -20711,6 +20833,188 @@ export interface operations {
                 };
             };
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    authorizeChatGPT: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["ChatGPTAuthorize"];
+            };
+        };
+        responses: {
+            /** @description Personal ChatGPT connection result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatGPTBegin"];
+                };
+            };
+            /** @description Personal connections unavailable to this caller or deployment */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection or attempt not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getChatGPTAttempt: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                attempt_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Personal ChatGPT connection result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatGPTOutcome"];
+                };
+            };
+            /** @description Personal connections unavailable to this caller or deployment */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection or attempt not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listChatGPTAccounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Personal ChatGPT connection result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatGPTAccounts"];
+                };
+            };
+            /** @description Personal connections unavailable to this caller or deployment */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection or attempt not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listChatGPTModels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Personal ChatGPT connection result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Personal connections unavailable to this caller or deployment */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection or attempt not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    disconnectChatGPT: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                connection_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Personal ChatGPT connection result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatGPTDisconnect"];
+                };
+            };
+            /** @description Personal connections unavailable to this caller or deployment */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Connection or attempt not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     listConnections: {
