@@ -1416,6 +1416,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
         .filters = &.{
             "live repair admission supersedes cached vector serviceability",
+            // Own the complete status contract suite; table-write integration
+            // borrows these contracts without collecting them a second time.
+            "api.runtime_status.consumerTests.Suite.test.",
             "coverage policy accepts only the public embeddings contract",
             "index configs receive persistent private incarnations across index kinds",
             "create table parser preserves supported metadata fields",

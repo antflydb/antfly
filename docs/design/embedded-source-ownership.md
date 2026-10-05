@@ -102,6 +102,12 @@ selections and duplicate ownership still fail. Explicitly allowed empty selectio
 retain their existing behavior. Once the union is validated, an individual owner
 may be empty even under `--require-no-skips`; selected tests still cannot skip.
 Inventory listing includes both owners and never treats listing as execution.
+Aggregate ownership follows the contract being tested. The coverage/status owner
+collects the complete runtime-status contract suite; table-write and graph
+consumers borrow it. HTTP transport contracts stay with the HTTP runtime owner,
+while SQL execution and session contracts stay with public API parity. Lake's
+sidecar selection does not collect general engine or segment contracts. These
+exclusions apply only to aggregate runs; focused targets retain their selections.
 Calling finalization twice does not duplicate
 partitions or inventories. Small real-build fixtures cover these contracts in
 `tools/test_local_test_partitions.py`; the normal product suites exercise the
