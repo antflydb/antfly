@@ -1299,28 +1299,38 @@ fn cancel(
 const Group = struct {
     ptr: *Io.Group,
 
+    // Keep the lock in the token: unlocking an empty group must publish null
+    // as the final access to caller-owned group memory. A lock in group.state
+    // would still be written after Io.Group.await's null-token fast path returns.
     const List = packed struct(usize) {
         cancel_requested: bool,
         awaiter_delayed: bool,
-        fibers: Fiber.PackedPtr,
+        locked: bool,
+        fibers: PackedPtr,
     };
     fn listPtr(group: Group) *List {
         return @ptrCast(&group.ptr.token);
     }
 
-    const Mutex = packed struct(u32) {
-        locked: bool,
-        contended: bool,
-        shared2: u30,
+    // Group tokens need three flag bits. Fibers are at least eight-byte aligned
+    // on both supported architectures, independently of their four-byte minimum.
+    const PackedPtr = enum(@Int(.unsigned, @bitSizeOf(usize) - 3)) {
+        null = 0,
+        all_ones = std.math.maxInt(@Int(.unsigned, @bitSizeOf(usize) - 3)),
+        _,
+
+        const Split = packed struct(usize) { low: u3, high: PackedPtr };
+        fn pack(ptr: ?*Fiber) PackedPtr {
+            comptime assert(@alignOf(Fiber) >= 8);
+            const split: Split = @bitCast(@intFromPtr(ptr));
+            assert(split.low == 0);
+            return split.high;
+        }
+        fn unpack(ptr: PackedPtr) ?*Fiber {
+            const split: Split = .{ .low = 0, .high = ptr };
+            return @ptrFromInt(@as(usize, @bitCast(split)));
+        }
     };
-    fn mutexPtr(group: Group) *Group.Mutex {
-        return switch (comptime builtin.cpu.arch.endian()) {
-            .little => @ptrCast(&group.ptr.state),
-            .big => @ptrCast(@alignCast(
-                @as([*]u8, @ptrCast(&group.ptr.state)) + @sizeOf(usize) - @sizeOf(u32),
-            )),
-        };
-    }
 
     const Awaiter = packed struct(usize) {
         locked: bool,
@@ -1337,12 +1347,11 @@ const Group = struct {
     // none of them yield, so use a short thread-level spin lock.
     fn lock(group: Group, ev: *Evented) void {
         _ = ev;
-        const mutex = group.mutexPtr();
         while (@atomicRmw(
-            Group.Mutex,
-            mutex,
+            List,
+            group.listPtr(),
             .Or,
-            .{ .locked = true, .contended = false, .shared2 = 0 },
+            .{ .locked = true, .cancel_requested = false, .awaiter_delayed = false, .fibers = .null },
             .acquire,
         ).locked) std.atomic.spinLoopHint();
     }
@@ -1350,10 +1359,10 @@ const Group = struct {
     fn unlock(group: Group, ev: *Evented) void {
         _ = ev;
         const old_state = @atomicRmw(
-            Group.Mutex,
-            group.mutexPtr(),
+            List,
+            group.listPtr(),
             .And,
-            .{ .locked = false, .contended = false, .shared2 = std.math.maxInt(u30) },
+            .{ .locked = false, .cancel_requested = true, .awaiter_delayed = true, .fibers = .all_ones },
             .release,
         );
         assert(old_state.locked);
@@ -1369,6 +1378,7 @@ const Group = struct {
         if (old_head) |head| head.link.group.prev = fiber;
         fiber.link.group.next = old_head;
         @atomicStore(List, list_ptr, .{
+            .locked = true,
             .cancel_requested = list.cancel_requested,
             .awaiter_delayed = list.awaiter_delayed,
             .fibers = .pack(fiber),
@@ -1385,6 +1395,7 @@ const Group = struct {
             prev.link.group.next = fiber.link.group.next;
         } else if (fiber.link.group.next) |new_head| {
             @atomicStore(List, list_ptr, .{
+                .locked = true,
                 .cancel_requested = list.cancel_requested,
                 .awaiter_delayed = list.awaiter_delayed,
                 .fibers = .pack(new_head),
@@ -1396,6 +1407,7 @@ const Group = struct {
                 awaiting == .group_blocked or list.cancel_requested)
             {
                 @atomicStore(List, list_ptr, .{
+                    .locked = true,
                     .cancel_requested = false,
                     .awaiter_delayed = false,
                     .fibers = .null,
@@ -1406,11 +1418,13 @@ const Group = struct {
             }
             // Race with `Fiber.requestCancel`
             @atomicStore(List, list_ptr, .{
+                .locked = true,
                 .cancel_requested = false,
                 .awaiter_delayed = true,
                 .fibers = .null,
             }, .monotonic);
         } else @atomicStore(List, list_ptr, .{
+            .locked = true,
             .cancel_requested = false,
             .awaiter_delayed = false,
             .fibers = .null,
@@ -1451,7 +1465,7 @@ const Group = struct {
             List,
             list_ptr,
             .Or,
-            .{ .cancel_requested = true, .awaiter_delayed = false, .fibers = .null },
+            .{ .locked = false, .cancel_requested = true, .awaiter_delayed = false, .fibers = .null },
             .monotonic,
         );
         // A parent may itself be canceled while Group.cancel is joining its
@@ -1470,7 +1484,7 @@ const Group = struct {
         @atomicStore(
             List,
             list_ptr,
-            .{ .cancel_requested = false, .awaiter_delayed = false, .fibers = .null },
+            .{ .locked = true, .cancel_requested = false, .awaiter_delayed = false, .fibers = .null },
             .release,
         );
         return if (maybe_awaiter) |_| true else list.awaiter_delayed;
@@ -5180,4 +5194,18 @@ fn inheritParentHandle(handle: c.fd_t) Io.InheritParentHandleError!void {
         .INTR => continue,
         else => |err| return unexpectedErrno(err),
     };
+}
+
+test "empty group token remains non-null until its final unlock" {
+    // Stop completion immediately before its final unlock. Io.Group.await and
+    // cancel must not take their null-token fast path in this interval.
+    var ev: Evented = undefined; // Group locking does not access backend state.
+    var storage: Io.Group = .init;
+    const group: Group = .{ .ptr = &storage };
+    group.lock(&ev);
+    try std.testing.expect(storage.token.load(.acquire) != null);
+    try std.testing.expectEqual(@as(usize, 0), storage.state);
+    group.unlock(&ev);
+    try std.testing.expectEqual(@as(?*anyopaque, null), storage.token.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), storage.state);
 }

@@ -409,8 +409,19 @@ pub fn create(b: *std.Build) ?Artifacts {
     });
     evented_enrichment_test_mod.addImport("antfly_platform", platform_mod);
     const evented_enrichment_tests = b.addTest(.{ .root_module = evented_enrichment_test_mod });
-    b.step("evented-enrichment-test", "Test enrichment Evented lifetime, concurrent tasks, cancellation, and file I/O")
-        .dependOn(&b.addRunArtifact(evented_enrichment_tests).step);
+    const evented_enrichment_step = b.step("evented-enrichment-test", "Test enrichment Evented lifetime, concurrent tasks, cancellation, and file I/O");
+    evented_enrichment_step.dependOn(&b.addRunArtifact(evented_enrichment_tests).step);
+    if (target.result.os.tag == .macos and
+        (target.result.cpu.arch == .aarch64 or target.result.cpu.arch == .x86_64))
+    {
+        const dispatch_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("lib/platform/src/dispatch_compat.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }) });
+        evented_enrichment_step.dependOn(&b.addRunArtifact(dispatch_tests).step);
+    }
 
     const objectstore_mod = b.createModule(.{
         .root_source_file = b.path("lib/objectstore/src/root.zig"),

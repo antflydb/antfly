@@ -105,6 +105,37 @@ test "Dispatch teardown drains group child cleanup after join" {
     }
 }
 
+test "Dispatch completed groups stop accessing caller-owned storage" {
+    if (builtin.os.tag != .macos or !std.Io.fiber.supported) return error.SkipZigTest;
+    const Work = struct {
+        fn run() void {}
+    };
+    // Debug poisons each 60 MiB fiber allocation; keep that run bounded.
+    const iterations: usize = if (builtin.mode == .debug) 128 else 20_000;
+    const groups = try std.heap.c_allocator.alloc(std.Io.Group, iterations);
+    defer std.heap.c_allocator.free(groups);
+    const marker = std.math.maxInt(usize);
+    {
+        var ev: Evented = undefined;
+        try ev.init(std.heap.c_allocator, .{ .backing_allocator_needs_mutex = false });
+        defer ev.deinit();
+        const io = ev.io();
+        for (groups) |*group| {
+            group.* = .init;
+            group.async(io, Work.run, .{});
+            while (group.token.load(.acquire) != null) std.atomic.spinLoopHint();
+            try group.await(io);
+            // Model reuse immediately after the empty-token fast path returns.
+            // Retain the allocation until cleanup drains so a late write is
+            // reported as a failed assertion rather than corrupting freed memory.
+            @atomicStore(usize, &group.state, marker, .seq_cst);
+        }
+    }
+    for (groups) |*group| {
+        try std.testing.expectEqual(marker, @atomicLoad(usize, &group.state, .seq_cst));
+    }
+}
+
 test "Evented groups can be reused after await and cancellation" {
     if ((builtin.os.tag != .macos and builtin.os.tag != .linux) or !std.Io.fiber.supported)
         return error.SkipZigTest;
